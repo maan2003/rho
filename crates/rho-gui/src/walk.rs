@@ -964,6 +964,7 @@ fn prompt_row(
 /// are the only ones a rewrap has to do.
 fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
     let tool = UiTool {
+        timing: Default::default(),
         id: "generated-tool".to_owned(),
         name: "shell_command".to_owned(),
         arguments: "generated arguments ".repeat(32),
@@ -1005,6 +1006,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
             }),
         ]);
         return UiAgentState {
+            exec_timings: Default::default(),
             blocks,
             status: UiAgentStatus::Streaming,
             context_used: None,
@@ -1039,6 +1041,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         }),
     ]);
     UiAgentState {
+        exec_timings: Default::default(),
         blocks,
         status: UiAgentStatus::Streaming,
         context_used: None,

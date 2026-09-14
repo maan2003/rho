@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use rho_core::{ToolCall, ToolOutput, ToolSpec, UnixMs};
+use rho_core::UnixMs;
 use tokio::sync::Notify;
 
 /// What a cell's `set_checkin` asked for: how long the model is left alone,
@@ -102,58 +102,13 @@ impl SourceWaker {
     }
 }
 
-/// One running invocation of a tool.
-///
-/// Output comes out in two shapes because a provider takes exactly one result
-/// per call and everything after it is an update:
-/// `REQ-provider-transcript-protocol`. The split is here rather than left to
-/// the core to sort out, so the required one cannot be missing.
-pub trait ToolSession: Send {
-    /// Independently scheduled sources. IDs are stable and never reused within
-    /// an invocation.
-    fn sources(&self) -> Vec<(u64, SourceFacts)>;
-
-    fn python_exec(&self) -> Option<Arc<crate::PythonExec>> {
-        None
-    }
-
-    /// Whether the core can forget this call: nothing left to say, ever.
-    ///
-    /// Asked after output has been collected, so the last thing a tool says is
-    /// always taken.
-    fn done(&self) -> bool;
-
-    /// The call's one answer, taken the first time the core has anything to say
-    /// about the call at all.
-    ///
-    /// Required, and asked for exactly once. A tool that has nothing yet says
-    /// so in its own words here; nobody else can, and an empty success
-    /// invented by the core reads as a cell that ran quietly.
-    fn first_output(&mut self) -> ToolOutput;
-
-    /// Everything since, in whatever shape the tool judges best. Called only
-    /// at a request boundary, so a long-lived tool decides how to represent
-    /// minutes of activity in one block.
-    ///
-    /// Returning `None` means "nothing new".
-    fn more_output(&mut self) -> Option<ToolOutput>;
-
-    /// Wind down: stop the work and finish soon.
-    ///
-    /// The tool still gets to produce its last words; the core keeps it around
-    /// until [`ToolSession::done`].
-    fn cancel(&mut self);
-}
-
-pub trait Tool: Send + Sync + 'static {
-    fn spec(&self) -> ToolSpec;
-
-    /// Start the work. Call [`SourceWaker::wake`] whenever the status
-    /// changes; the core will come and ask.
-    fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession>;
-
-    /// Python-only source stream; no source executes before an explicit permit.
-    fn start_stream(&self, _waker: SourceWaker) -> Option<Box<dyn ToolSession>> {
-        None
-    }
+/// Whether a call or one of its nested sources has been drained. The core
+/// owns this bookkeeping; what the source is doing is the tool's to report.
+/// For the outer call this also selects the provider's result/update shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyState {
+    /// Still awaiting its first contribution at a request boundary.
+    Owed,
+    /// Already drained; subsequent output is an update.
+    Sent,
 }

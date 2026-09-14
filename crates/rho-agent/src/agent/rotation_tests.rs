@@ -87,12 +87,15 @@ fn latest_send(agent: &Agent) -> (Option<crate::ContextChange>, Vec<ContextBlock
     events
         .into_iter()
         .rev()
-        .find_map(|event| match event {
-            AgentEvent::ContextSent { change, blocks, .. } => {
-                Some((Some(change), blocks.into_owned()))
+        .find_map(|event| {
+            let native = event.native_event()?;
+            match native {
+                NativeEvent::RequestStarted { input, context, .. } => Some((
+                    context.clone(),
+                    input.clone(),
+                )),
+                _ => None,
             }
-            AgentEvent::Sent { blocks, .. } => Some((None, blocks.into_owned())),
-            _ => None,
         })
         .unwrap()
 }
@@ -138,7 +141,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     );
     assert_eq!(agent.user.len(), 1);
     assert_eq!(
-        rho_core::context_window_start(&agent.history),
+        rho_core::context_window_start(&agent.provider_input()),
         0,
         "preparation still sees the old context"
     );
@@ -159,7 +162,10 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
         matches!(agent.decide(UnixMs::now()), Boundary::Now { wake } if wake.trigger == WakeTrigger::ContextRotation)
     );
     agent.start_request(UnixMs::now(), None).await;
-    assert_eq!(rho_core::context_window_start(&agent.history), marker);
+    assert_eq!(
+        rho_core::context_window_start(&agent.provider_input()),
+        marker
+    );
     assert!(agent.context.marker.is_none());
     assert!(agent.user.is_empty());
     assert_eq!(agent.context_used, None);
@@ -170,13 +176,16 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
             .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
     );
     assert!(
-        matches!(&*agent.history[0], ContextBlock::UserMessage { .. }),
+        matches!(
+            &*agent.provider_input()[0],
+            ContextBlock::UserMessage { .. }
+        ),
         "full history is untouched"
     );
     let (_, events) = agent.db.read().agent_events(agent.agent_id);
     let replayed = replay::replay(events);
     assert_eq!(rho_core::context_window_start(&replayed.history), marker);
-    assert_eq!(replayed.history, agent.history);
+    assert_eq!(replayed.history, agent.provider_input());
     assert_eq!(replayed.context_used, None);
     assert!(replayed.user.is_empty());
 }
@@ -319,15 +328,10 @@ async fn cancellation_stops_preparation_even_with_buffered_input() {
 
 #[test]
 fn preparation_mirror_does_not_drain_the_ui_queue() {
-    let event = AgentEvent::ContextSent {
-        change: ContextChange::Preparing {
+    let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted { context: Some(ContextChange::Preparing {
             retain_from: 0,
             repair: false,
-        },
-        blocks: Cow::Owned(Vec::new()),
-        at: UnixMs(5),
-        wake: None,
-    };
+        }), input: Vec::from(Vec::new()), at: UnixMs(5), wake: None });
     assert_eq!(
         crate::mirror::strip(&event),
         Some(rho_ui_proto::mirror::MirrorEvent::Results {
@@ -394,12 +398,7 @@ async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
             ContextChange::Marked { retain_from: 0 }
         };
         agent
-            .persist(AgentEvent::ContextSent {
-                blocks: Cow::Owned(vec![]),
-                change: change.clone(),
-                at: UnixMs(1),
-                wake: None,
-            })
+            .persist(AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![]), context: Some(change.clone()), at: UnixMs(1), wake: None }))
             .await;
         agent.context.sent(&change);
         agent.context_used = agent.session.auto_compact_token_limit();
@@ -500,14 +499,14 @@ async fn ordinary_roles_keep_standard_manual_and_automatic_compaction() {
         }
         agent.start_request(UnixMs::now(), None).await;
         assert!(matches!(
-            &**agent.history.last().unwrap(),
+            &**agent.provider_input().last().unwrap(),
             ContextBlock::CompactionTrigger
         ));
         assert!(agent.context.marker.is_none());
         assert!(agent.context.preparation.is_none());
         assert!(
             !agent
-                .history
+                .provider_input()
                 .iter()
                 .any(|block| matches!(&**block, ContextBlock::DeveloperMessage { .. }))
         );
@@ -547,7 +546,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
             !agent.latest_python_exec.as_ref().unwrap().1.facts().failed,
             "switch {index}: {:?}",
             agent
-                .tools
+                .execs
                 .values_mut()
                 .map(|tool| tool.session.first_output())
                 .collect::<Vec<_>>()
@@ -558,7 +557,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
                 agent.start_request(UnixMs::now(), None).await;
                 agent.session.abort();
                 reply(&mut agent, vec![message("done")], 100).await;
-                if agent.tools.is_empty() {
+                if agent.execs.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -620,21 +619,15 @@ async fn role_switches_cancel_pending_rotation_durably() {
 
     // Model the marker and an interrupted preparation.
     let change = ContextChange::Preparing {
-        retain_from: agent.history.len() as u64,
+        retain_from: agent.provider_input().len() as u64,
         repair: false,
     };
     let blocks = vec![ContextBlock::DeveloperMessage {
         text: context::MARKER.into(),
     }];
     agent
-        .persist(AgentEvent::ContextSent {
-            blocks: Cow::Borrowed(&blocks),
-            change: change.clone(),
-            at: UnixMs::now(),
-            wake: None,
-        })
+        .persist(AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: blocks.clone(), context: Some(change.clone()), at: UnixMs::now(), wake: None }))
         .await;
-    agent.history.extend(blocks.into_iter().map(Arc::new));
     agent.context.sent(&change);
     agent
         .change_role(AgentRole::Engineer {
@@ -647,7 +640,7 @@ async fn role_switches_cancel_pending_rotation_durably() {
 
     let (_, events) = agent.db.read().agent_events(agent.agent_id);
     let restored = replay::replay(events);
-    assert_eq!(restored.history.len(), agent.history.len());
+    assert_eq!(restored.history.len(), agent.provider_input().len());
     assert!(restored.context.marker.is_none());
     assert!(restored.context.preparation.is_none());
     assert!(restored.recovery_notes.is_empty());

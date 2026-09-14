@@ -24,10 +24,6 @@ than by running a supervisor, extension protocol, or daemon process graph.
   ChatGPT quota observations are attributed to that daemon-local namespace;
   `Inference` polls every enabled configured namespace and the GUI keeps each
   host/namespace history as an independent graph series.
-  The explicit `eng-gemini` binding is a narrow exception: its deep session
-  uses Antigravity `gemini-3.7-flash-low` with one manually configured profile,
-  full transcript replay, and function tools only. It never enters ChatGPT
-  account routing. Generated title/activity sidecars remain on ChatGPT.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. Loading restores that logical state cheaply; the
@@ -64,8 +60,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Python or live jobs. Notes are shared workset files outside code checkouts; rotation
   injects only a bounded metadata inventory, not their contents. See
   [DESIGN-context-rotation](specs/DESIGN-context-rotation.md).
-  `rho-agent-tools` is the real tools in the
-  shape that loop consumes.
+  Native `NativeEvent` records are canonical; provider context is a disposable
+  replay projection. Claude Code owns its own history and compaction instead.
+  The two concrete runtimes share a pure boundary and `rho-agent-tools`' concrete
+  notebook, jobs, and leased output—not a universal runtime or tool-session trait.
 - `rho-fs-view` owns the state root (`~/.local/state/rho`) and the agent
   filesystem view; `WORKSET.md` is its design note and `VIEW.md` the
   requirements the view is built towards. A workset is one plain
@@ -393,7 +391,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Python exposes only `exec` and accepts at most one call per model response.
   The notebook is the only tool surface for every native role: JavaScript code
   mode, direct tools and the core `wait` tool are gone. A job is foreground or
-  background by which cell registered it, and each request's `Sent` event
+  background by which cell registered it, and each native `RequestStarted` event
   records why it went out (`WakeFacts`).
 
 Claude Code follows the same boundary: the notebook is served to it as an
@@ -403,12 +401,12 @@ is no separate stdio MCP server and no per-agent MCP configuration in the
 account; an earlier `rho mcp-agent-tools` registration is removed from an
 account's `.claude.json` when the account is prepared.
 
-The Claude engineer roles (`eng-ultra`, `eng-alt`) give the agent Rho's Python
+All Claude roles, including historical advisor bindings, give the agent Rho's Python
 notebook as its only tool. `rho-agent`'s Claude loop hosts the notebook itself and serves it to
 Claude Code as an in-process MCP server (`py`, tool `exec`, so the model sees
 `mcp__py__exec`) over the same stdin/stdout control protocol: the loop sends the
 `initialize` control request naming the server, answers the CLI's `mcp_message`
-control requests, and holds each `tools/call` open until the native `boundary`
+control requests, and holds each `tools/call` open until the shared `boundary`
 decision — fed the notebook's own `PythonExec`/`PythonOperation` sources and
 the CLI's queued user input — says the model should look. Older cells' later
 output rides along with the next exec reply; an idle model is woken with it as
@@ -419,6 +417,19 @@ process) that the view namespace bind-mounts over the account's file, the same
 way the generated `CLAUDE.md` is. The notebook's host functions (images,
 collaboration, web search, papercuts) are the ones a native Python-mode agent
 gets, built by the same `host_tools` constructor.
+
+Provider calls and notebook executions share `ExecId`; jobs and transport IDs
+remain separate. The CLI forwards its provider ID in MCP metadata, which Rho
+validates before durable admission. Rewind never erases admission evidence.
+Output remains leased until ownership transfers: the native request record or
+Claude's durable outbox commits before notebook acknowledgment. Unconfirmed Claude
+handoffs recover as attributed reports, never source replay or duplicate tool
+results. Successful transport write does not prove remote consumption.
+
+Provider timing is recorded independently of execution: first block, argument
+end, response end, boundary, and handoff. The shared GUI fold overlays these facts
+on live and committed rows and preserves them when later job output arrives.
+`WakeFacts` retains occurrence, observation, deadline and trigger separately.
 
 Claude turn cancellation uses Claude Code's streaming control protocol and
 keeps a healthy child process alive; queued Rho-authored messages are cancelled

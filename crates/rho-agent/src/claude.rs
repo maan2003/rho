@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
+    AgentId,
     AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
     AgentRuntime, AgentWriteTxnExt, ClaudeRewind, EngineerIntelligence, SessionBinding, UnixMillis,
 };
@@ -81,7 +81,6 @@ impl ClaudeAgent {
             parent,
         );
         write.commit();
-        let python_mode = mode.claude_python();
 
         let pool_events = pool.clone();
         let multi_agent = pool
@@ -119,7 +118,6 @@ impl ClaudeAgent {
                 pool_events,
                 role,
                 head,
-                python_mode,
             ),
         ))
     }
@@ -146,7 +144,6 @@ impl ClaudeAgent {
             record.config.binding.claude_effort().ok_or_else(|| {
                 anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
             })?;
-        let python_mode = record.config.binding.claude_python();
         let primary_repo = record.place().cwd.clone();
         // A moved agent's file is where its old place looked, until it is
         // brought here; found nowhere, the session is one never spoken to.
@@ -270,7 +267,6 @@ impl ClaudeAgent {
             pool_events,
             record.config.role,
             head,
-            python_mode,
         ))
     }
 
@@ -291,7 +287,6 @@ impl ClaudeAgent {
         pool_events: std::sync::Weak<crate::pool::AgentPool>,
         role: crate::db::AgentRole,
         head: crate::db::AgentHead,
-        python_mode: bool,
     ) -> Self {
         let status = Arc::new(RwLock::new(AgentStatus {
             kind: state.kind.clone(),
@@ -299,22 +294,12 @@ impl ClaudeAgent {
         }));
         let head = Arc::new(RwLock::new(head));
         let (control, control_rx) = mpsc::unbounded_channel();
-        let last_presentation_source = {
-            let records = db
-                .read()
-                .agent_presentation_source_tail(agent_id, crate::PRESENTATION_SOURCE_TAIL_BYTES);
-            crate::presentation_sources(agent_id, &records)
-                .last()
-                .map(|source| source.through)
-        };
-        let presentation_session = Arc::new(tokio::sync::Mutex::new(
-            crate::presentation::Session::new(inference.clone()),
-        ));
+        let pending_output = db.read().agent_pending_claude_output(agent_id);
+        let title = crate::title::Task::new(inference.clone());
         let loop_state = ClaudeLoop {
             db,
             claude,
             inference,
-            presentation_session,
             agent_id,
             view: Arc::clone(&view),
             model,
@@ -325,12 +310,13 @@ impl ClaudeAgent {
             claude_prompt_path: None,
             claude_settings_path: None,
             claude_account: None,
-            python_mode,
             python: None,
+            pending_output,
             python_wake: None,
             python_recheck: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
+            response_execs: BTreeMap::new(),
             queued_turns: VecDeque::new(),
             turn_usage: None,
             cancelling: false,
@@ -345,8 +331,7 @@ impl ClaudeAgent {
             multi_agent,
             pool_events,
             role,
-            presentation: ClaudePresentationState::default(),
-            last_presentation_source,
+            title,
             projection: Projection::default(),
         };
         tokio::spawn(loop_state.run());
@@ -463,13 +448,6 @@ impl ClaudeAgent {
             .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
     }
 
-    /// Whether anyone is looking at this agent; titles and activity are
-    /// made only then.
-    pub(crate) fn set_watched(&self, watching: bool) {
-        let _ = self
-            .control
-            .send(ClaudeControl::PresentationWatch { watching });
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -501,17 +479,7 @@ enum ClaudeControl {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    PresentationWatch {
-        watching: bool,
-    },
-    PresentationStarted {
-        generation: u64,
-        acknowledged: oneshot::Sender<bool>,
-    },
-    PresentationFinished {
-        generation: u64,
-        result: Result<Option<AgentPresentationUpdate>, String>,
-    },
+    TitleFinished(Result<String, String>),
     /// Tell the live tail whole, for a client that just started looking.
     TellTail,
 }
@@ -522,9 +490,6 @@ struct ClaudeLoop {
     /// the daemon rather than resolved here.
     claude: rho_claude::accounts::ClaudePaths,
     inference: Inference,
-    /// The agent's one persistent Luna session, shared by activity updates
-    /// and turn reports so both keep one prompt prefix warm.
-    presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
     agent_id: AgentId,
     view: Arc<Lazy<Arc<crate::View>>>,
     /// The primary workdir's repo, which is where Claude files the
@@ -543,10 +508,10 @@ struct ClaudeLoop {
     claude_account: Option<String>,
     /// Whether this agent's only tool is Rho's Python notebook, served to
     /// Claude Code in-process over MCP.
-    python_mode: bool,
     /// The notebook, once the first spawn has built it. Outlives the
     /// process: cells keep running across a respawn.
     python: Option<python_host::PythonHost>,
+    pending_output: Option<crate::ClaudeOutputBatch>,
     /// Why the notebook last spoke, until the transcript row it produced
     /// arrives to carry it.
     python_wake: Option<crate::WakeFacts>,
@@ -554,6 +519,7 @@ struct ClaudeLoop {
     python_recheck: Option<rho_core::UnixMs>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
+    response_execs: BTreeMap<usize, rho_core::ExecId>,
     queued_turns: VecDeque<ClaudeTurn>,
     /// Usage of the in-flight message: `message_start` seeds it,
     /// `message_delta` overlays the final counts (`message_start`'s
@@ -577,28 +543,10 @@ struct ClaudeLoop {
     multi_agent: Option<MultiAgentTools>,
     pool_events: std::sync::Weak<crate::pool::AgentPool>,
     role: crate::db::AgentRole,
-    presentation: ClaudePresentationState,
-    last_presentation_source: Option<AgentEventPos>,
+    title: crate::title::Task,
     /// What the projection of Claude's log keeps from one line to the
     /// next: usage already told, calls awaiting their result's times.
     projection: Projection,
-}
-
-#[derive(Default)]
-struct ClaudePresentationState {
-    watched: bool,
-    dirty: bool,
-    generation: u64,
-    last_started: Option<tokio::time::Instant>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for ClaudeLoop {
-    fn drop(&mut self) {
-        if let Some(task) = self.presentation.task.take() {
-            task.abort();
-        }
-    }
 }
 
 struct ClaudeTurn {
@@ -690,9 +638,6 @@ impl ClaudeLoop {
                 &kind,
                 self.execution_generation != initial_execution_generation,
             ) {
-                // The activity throttle coalesces within a turn; the next
-                // turn's first update should not inherit this one's spacing.
-                self.presentation.last_started = None;
                 if let Some(pool) = self.pool_events.upgrade() {
                     pool.settle_turn(self.agent_id).await;
                     // set_kind notified before the durable disposition changed;
@@ -706,10 +651,28 @@ impl ClaudeLoop {
     async fn handle_control(&mut self, control: ClaudeControl) {
         match control {
             ClaudeControl::UserMessage {
-                content,
+                mut content,
                 uuid,
                 accepted,
             } => {
+                if !matches!(content.first(), Some(ContentPart::Text { text }) if text.trim_start().starts_with('/')) {
+                    let control = self.control.clone();
+                    self.title.start(&self.db, self.agent_id, &rho_core::text_content(&content), move |result| {
+                        if let Some(control) = control.upgrade() {
+                            let _ = control.send(ClaudeControl::TitleFinished(result));
+                        }
+                    }).await;
+                }
+                // Keep CLI slash commands intact. Any retained output remains
+                // queued until the command finishes and the CLI is idle.
+                let slash_command = matches!(content.first(), Some(ContentPart::Text { text }) if text.trim_start().starts_with('/'));
+                let output = self.pending_output.as_ref().filter(|_| !slash_command);
+                let output_id = output.map(|batch| batch.id);
+                if let Some(batch) = output {
+                    let mut combined = batch.message();
+                    combined.append(&mut content);
+                    content = combined;
+                }
                 self.cancelling = false;
                 if let Some(host) = &mut self.python {
                     host.user_spoke();
@@ -774,8 +737,13 @@ impl ClaudeLoop {
                         let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
                     }
                     self.fail(error).await;
-                } else if let Some(accepted) = accepted {
-                    let _ = accepted.send(Ok(()));
+                } else {
+                    if let Some(id) = output_id {
+                        self.output_handed_off(id).await;
+                    }
+                    if let Some(accepted) = accepted {
+                        let _ = accepted.send(Ok(()));
+                    }
                 }
             }
             ClaudeControl::SetEffort { effort, reply } => {
@@ -822,143 +790,19 @@ impl ClaudeLoop {
             ClaudeControl::Rewind { turns, reply } => {
                 let _ = reply.send(self.rewind(turns).await);
             }
-            ClaudeControl::PresentationWatch { watching } => {
-                if watching == self.presentation.watched {
-                    return;
-                }
-                self.presentation.watched = watching;
-                if watching {
-                    self.presentation.dirty = true;
-                    self.schedule_presentation();
-                } else {
-                    if let Some(task) = self.presentation.task.take() {
-                        task.abort();
-                    }
-                    self.presentation.generation = self.presentation.generation.wrapping_add(1);
-                    self.presentation.dirty = false;
-                    self.presentation.last_started = None;
-                }
-            }
-            ClaudeControl::PresentationStarted {
-                generation,
-                acknowledged,
-            } => {
-                let accepted = self.presentation.generation == generation
-                    && self.presentation.watched
-                    && self.presentation.task.is_some();
-                if accepted {
-                    self.presentation.dirty = false;
-                    self.presentation.last_started = Some(tokio::time::Instant::now());
-                }
-                let _ = acknowledged.send(accepted);
-            }
             ClaudeControl::TellTail => {
                 self.teller.lock().expect("poison").reset();
                 self.published();
             }
-            ClaudeControl::PresentationFinished { generation, result } => {
-                if self.presentation.generation != generation {
-                    return;
-                }
-                self.presentation.task = None;
-                match result {
-                    Ok(Some(update)) if self.last_presentation_source == Some(update.through) => {
-                        let _ = self.persist_presentation(update).await;
-                    }
-                    Ok(Some(_)) | Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("rho-agent: Claude presentation generation failed: {error}");
-                    }
-                }
-                self.schedule_presentation();
-            }
+            ClaudeControl::TitleFinished(result) => {
+                crate::title::finish(&self.db, self.agent_id, result).await;
+                self.published();
+            },
         }
     }
 
-    async fn persist_presentation(
-        &mut self,
-        update: AgentPresentationUpdate,
-    ) -> Option<AgentPresentationCache> {
-        let mut write = self.db.write().await;
-        let cache = write.apply_agent_presentation(UnixMillis::now(), self.agent_id, &update)?;
-        write.commit();
-        if let Some(pool) = self.pool_events.upgrade() {
-            pool.publish_presentation_changed(
-                self.agent_id,
-                cache.generated_title.clone(),
-                cache.activity.clone(),
-            );
-        }
-        Some(cache)
-    }
 
-    fn reset_presentation(&mut self) {
-        if let Some(task) = self.presentation.task.take() {
-            task.abort();
-        }
-        self.presentation.generation = self.presentation.generation.wrapping_add(1);
-        self.presentation.last_started = None;
-        self.presentation.dirty = self.presentation.watched;
-    }
 
-    fn schedule_presentation(&mut self) {
-        if !self.presentation.watched
-            || !self.presentation.dirty
-            || self.presentation.task.is_some()
-        {
-            return;
-        }
-        self.presentation.dirty = false;
-        self.presentation.generation = self.presentation.generation.wrapping_add(1);
-        let generation = self.presentation.generation;
-        let now = tokio::time::Instant::now();
-        let delay = self
-            .presentation
-            .last_started
-            .and_then(|started| {
-                crate::presentation::MIN_INTERVAL.checked_sub(now.duration_since(started))
-            })
-            .unwrap_or_default();
-        let db = self.db.clone();
-        let session = Arc::clone(&self.presentation_session);
-        let agent_id = self.agent_id;
-        let control = self.control.clone();
-        self.presentation.task = Some(tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let result = if !crate::presentation::has_input(&db, agent_id) {
-                Ok(None)
-            } else {
-                match crate::presentation::acquire_request().await {
-                    Ok(permit) => {
-                        let (acknowledged, accepted) = oneshot::channel();
-                        let Some(control) = control.upgrade() else {
-                            return;
-                        };
-                        if control
-                            .send(ClaudeControl::PresentationStarted {
-                                generation,
-                                acknowledged,
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                        drop(control);
-                        if !accepted.await.unwrap_or(false) {
-                            return;
-                        }
-                        crate::presentation::generate(db, session, agent_id, permit)
-                            .await
-                            .map_err(|error| format!("{error:#}"))
-                    }
-                    Err(error) => Err(format!("{error:#}")),
-                }
-            };
-            if let Some(control) = control.upgrade() {
-                let _ = control.send(ClaudeControl::PresentationFinished { generation, result });
-            }
-        }));
-    }
 
     async fn close_process(&mut self) {
         self.forget_pending_exec();
@@ -1264,17 +1108,6 @@ impl ClaudeLoop {
             }),
         );
         write.commit();
-        self.last_presentation_source = None;
-        self.reset_presentation();
-        self.schedule_presentation();
-        if let Some(pool) = self.pool_events.upgrade() {
-            let record = self.db.read().get_agent(self.agent_id);
-            pool.publish_presentation_changed(
-                self.agent_id,
-                record.generated_title,
-                record.activity,
-            );
-        }
         self.pending_rewind = true;
 
         self.state.queued_inputs.clear();
@@ -1330,17 +1163,15 @@ impl ClaudeLoop {
         if let Some(tools) = &self.multi_agent {
             options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
         }
-        if self.python_mode {
-            self.ensure_python(&view)?;
-            // Tool search would defer the one tool behind a lookup; the deny
-            // list in the generated settings removes ToolSearch too. The
-            // timeout is the CLI's ceiling on an open exec call.
-            options.set_env("ENABLE_TOOL_SEARCH", "false");
-            options.set_env(
-                "MCP_TOOL_TIMEOUT",
-                python_host::EXEC_TIMEOUT.as_millis().to_string(),
-            );
-        }
+        self.ensure_python(&view)?;
+        // Tool search would defer the one tool behind a lookup; the deny
+        // list in the generated settings removes ToolSearch too. The
+        // timeout is the CLI's ceiling on an open exec call.
+        options.set_env("ENABLE_TOOL_SEARCH", "false");
+        options.set_env(
+            "MCP_TOOL_TIMEOUT",
+            rho_claude::mcp::EXEC_TIMEOUT.as_millis().to_string(),
+        );
         self.configure_claude_home(&view, &mut options, &account)
             .await?;
         let mut command = options.command().await?;
@@ -1355,8 +1186,8 @@ impl ClaudeLoop {
                 .as_mut()
                 .expect("spawned above")
                 .initialize_sdk_mcp(&[SdkMcpServer {
-                    name: python_host::SERVER_NAME.to_owned(),
-                    timeout: Some(python_host::EXEC_TIMEOUT),
+                    name: rho_claude::mcp::SERVER_NAME.to_owned(),
+                    timeout: Some(rho_claude::mcp::EXEC_TIMEOUT),
                 }])
                 .await?;
             self.await_control_response(request_id, "Claude Code rejected the Python MCP server")
@@ -1372,7 +1203,7 @@ impl ClaudeLoop {
         if self.python.is_some() {
             return Ok(());
         }
-        let (shell, others) = crate::agent::host_tools(
+        let (shell, others) = crate::notebook::host_tools(
             view,
             self.role,
             self.agent_id,
@@ -1381,7 +1212,7 @@ impl ClaudeLoop {
             &self.pool_events,
         );
         let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
-        let tool = rho_agent_tools::PythonTool::new(shell, others)
+        let tool = rho_agent_tools::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
         self.python = Some(python_host::PythonHost::new(tool, specs));
         Ok(())
@@ -1430,7 +1261,7 @@ impl ClaudeLoop {
         // A Python-mode agent runs on the account's own settings with every
         // Claude tool denied, so the notebook is all the model has. The
         // generated file covers the account's `settings.json`.
-        let settings = if self.python_mode {
+        let settings = {
             let base = self.claude.account_settings(account)?;
             let settings = rho_claude::settings::deny_all_but_own_tools(&base);
             let text = serde_json::to_string_pretty(&settings)?;
@@ -1443,8 +1274,6 @@ impl ClaudeLoop {
                 )?
                 .into_std_path_buf(),
             )
-        } else {
-            None
         };
         view.set_claude_home(rho_fs_view::ClaudeHome {
             account: account_dir.into_std_path_buf(),
@@ -1539,13 +1368,6 @@ impl ClaudeLoop {
                         })
                         .await;
                     }
-                    crate::presentation::spawn_turn_report(
-                        self.db.clone(),
-                        self.pool_events.clone(),
-                        Arc::clone(&self.presentation_session),
-                        self.agent_id,
-                        &final_text,
-                    );
                     // Queued sends run next inside the CLI: staying in the
                     // streaming state avoids a false turn end between them.
                     if self.queued_turns.is_empty() {
@@ -1571,7 +1393,7 @@ impl ClaudeLoop {
                     &event.event,
                     rho_claude::protocol::MessageStreamEvent::MessageStop
                 );
-                if let Err(error) = self.handle_stream_event(event.event) {
+                if let Err(error) = self.handle_stream_event(event.event).await {
                     self.fail(error).await;
                     return;
                 }
@@ -1630,19 +1452,59 @@ impl ClaudeLoop {
             ControlRequest::McpMessage {
                 server_name,
                 message: rpc,
-            } if server_name == python_host::SERVER_NAME => match python_host::handle_rpc(&rpc) {
-                python_host::Rpc::Reply(value) => Ok(serde_json::json!({ "mcp_response": value })),
-                python_host::Rpc::Ignore => Ok(serde_json::json!({})),
-                python_host::Rpc::Exec { id, source } => match self.python.as_mut() {
-                    Some(host) => {
-                        match host.exec(request_id.clone(), id, source, rho_core::UnixMs::now()) {
-                            Some(refused) => Ok(serde_json::json!({ "mcp_response": refused })),
-                            None => return,
+            } if server_name == rho_claude::mcp::SERVER_NAME => {
+                match rho_claude::mcp::handle_rpc(&rpc) {
+                    rho_claude::mcp::Rpc::Reply(value) => {
+                        Ok(serde_json::json!({ "mcp_response": value }))
+                    }
+                    rho_claude::mcp::Rpc::Ignore => Ok(serde_json::json!({})),
+                    rho_claude::mcp::Rpc::Exec {
+                        id,
+                        exec_id,
+                        source,
+                    } => {
+                        let already_admitted = self
+                            .db
+                            .read()
+                            .agent_exec_was_admitted(self.agent_id, &exec_id);
+                        if self.cancelling
+                            || self.response_execs.values().next() != Some(&exec_id)
+                            || already_admitted
+                        {
+                            Err("Only the first exec in a provider response may run, once. This call was not executed; earlier side effects are not undone.".into())
+                        } else if self.python.as_ref().is_none_or(|host| !host.can_admit()) {
+                            Err(
+                                "The notebook is unavailable or already has an open exec reply."
+                                    .into(),
+                            )
+                        } else {
+                            let now = rho_core::UnixMs::now();
+                            let mut write = self.db.write().await;
+                            write.append_agent_event(
+                                self.agent_id,
+                                &AgentEvent::ClaudeExecAdmitted {
+                                    call: rho_core::ExecCall {
+                                        id: exec_id.clone(),
+                                        source: source.clone(),
+                                    },
+                                    at: now,
+                                },
+                            );
+                            write.commit();
+                            match self.python.as_mut().expect("checked above").exec(
+                                request_id.clone(),
+                                id,
+                                exec_id,
+                                source,
+                                now,
+                            ) {
+                                Some(refused) => Ok(serde_json::json!({ "mcp_response": refused })),
+                                None => return,
+                            }
                         }
                     }
-                    None => Err("the Python notebook is not running".to_owned()),
-                },
-            },
+                }
+            }
             ControlRequest::McpMessage { server_name, .. } => {
                 Err(format!("unknown MCP server {server_name}"))
             }
@@ -1655,9 +1517,9 @@ impl ClaudeLoop {
         &mut self,
         request_id: &str,
         reply: Result<serde_json::Value, String>,
-    ) {
+    ) -> bool {
         let Some(process) = self.process.as_mut() else {
-            return;
+            return false;
         };
         let result = match reply {
             Ok(value) => process.respond_control(request_id, value).await,
@@ -1668,6 +1530,9 @@ impl ClaudeLoop {
                 "rho-agent: Claude control response of {} failed: {error:#}",
                 self.agent_id.encoded()
             );
+            false
+        } else {
+            true
         }
     }
 
@@ -1676,69 +1541,123 @@ impl ClaudeLoop {
     /// waiting, or an idle model is woken with it as a message. A working
     /// model with no call open hears it at its next call or turn end.
     async fn python_tick(&mut self) {
-        let Some(host) = self.python.as_mut() else {
-            return;
-        };
         let now = rho_core::UnixMs::now();
-        let oldest_user = self.state.queued_inputs.iter().map(|input| input.at).min();
-        // The model can be reached through an open call, or as an idle
-        // process that takes a message. Otherwise it is mid-turn, and the
-        // notebook waits for its next call.
         let idle = matches!(self.state.kind, AgentStateKind::Idle)
             && self.process.is_some()
             && self.queued_turns.is_empty()
             && !self.pending_rewind;
+        let Some(host) = self.python.as_mut() else {
+            return;
+        };
+        let oldest_user = self.state.queued_inputs.iter().map(|input| input.at).min();
         let available = host.has_pending() || idle;
-        match host.decide(available, oldest_user, now) {
-            crate::agent::boundary::Boundary::No { recheck } => {
-                self.python_recheck = recheck;
-            }
-            crate::agent::boundary::Boundary::AbortAndResend
-            | crate::agent::boundary::Boundary::RetryExhausted => {
+        match host.decide(available, oldest_user, self.pending_output.is_some(), now) {
+            crate::boundary::Boundary::No { recheck } => self.python_recheck = recheck,
+            crate::boundary::Boundary::AbortAndResend
+            | crate::boundary::Boundary::RetryExhausted => {
                 self.python_recheck = None;
             }
-            crate::agent::boundary::Boundary::Now { wake } => {
+            crate::boundary::Boundary::Now { wake } => {
                 self.python_recheck = None;
-                if let Some((pending, drained)) = host.answer_pending() {
-                    // Recorded on the transcript row the results become.
-                    self.python_wake = Some(wake);
+                if let Some((pending, mut drained)) = host.answer_pending() {
+                    let batch = self.record_output(&mut drained, wake, now).await;
                     let reply = serde_json::json!({
                         "mcp_response": {
-                            "jsonrpc": "2.0",
-                            "id": pending.rpc_id,
+                            "jsonrpc": "2.0", "id": pending.rpc_id,
                             "result": drained.into_mcp_result(),
                         },
                     });
-                    self.respond_control(&pending.request_id, Ok(reply)).await;
+                    self.observe_exec(
+                        pending.exec_id.clone(),
+                        rho_core::ExecMilestone::Boundary,
+                        now,
+                    )
+                    .await;
+                    if self.respond_control(&pending.request_id, Ok(reply)).await {
+                        self.output_handed_off(batch).await;
+                        self.observe_exec(
+                            pending.exec_id,
+                            rho_core::ExecMilestone::HandedOff,
+                            rho_core::UnixMs::now(),
+                        )
+                        .await;
+                    } else {
+                        // The outbox survives both this process and the notebook. A
+                        // future user send carries its output, never reruns its source.
+                        self.close_process().await;
+                        self.fail(anyhow::anyhow!(
+                            "Claude Code output transport failed; notebook output is retained"
+                        ))
+                        .await;
+                    }
                 } else if idle {
-                    let drained = host.drain_idle();
-                    if drained.is_empty() {
+                    let mut drained = host.drain_idle();
+                    if drained.is_empty() && self.pending_output.is_none() {
                         return;
                     }
-                    self.python_wake = Some(wake);
-                    let mut content = vec![ContentPart::Text {
-                        text: "Output from Python cells that were still running when your last \
-                               turn ended:"
-                            .to_owned(),
-                    }];
-                    for output in drained.own.into_iter().chain(drained.updates) {
-                        content.push(ContentPart::Text {
-                            text: (*output.output).clone(),
-                        });
-                        content.extend(output.images.iter().map(|image| ContentPart::Image {
-                            media_type: image.media_type.clone(),
-                            data: image.data.clone(),
-                        }));
-                    }
+                    let batch = self.record_output(&mut drained, wake, now).await;
                     self.handle_control(ClaudeControl::UserMessage {
-                        content,
-                        uuid: Uuid::new_v4().to_string(),
+                        content: Vec::new(),
+                        uuid: batch.to_string(),
                         accepted: None,
                     })
                     .await;
                 }
             }
         }
+    }
+
+    async fn record_output(
+        &mut self,
+        drained: &mut python_host::Drained,
+        wake: crate::WakeFacts,
+        at: rho_core::UnixMs,
+    ) -> Uuid {
+        if let Some(retained) = &self.pending_output {
+            drained
+                .updates
+                .splice(0..0, retained.outputs.iter().cloned());
+        }
+        let batch = crate::ClaudeOutputBatch {
+            id: Uuid::new_v4(),
+            outputs: drained
+                .own
+                .iter()
+                .chain(drained.updates.iter())
+                .cloned()
+                .collect(),
+            wake: wake.clone(),
+            at,
+        };
+        let id = batch.id;
+        let mut write = self.db.write().await;
+        write.append_agent_event(
+            self.agent_id,
+            &AgentEvent::ClaudeOutput {
+                batch: batch.clone(),
+            },
+        );
+        write.commit();
+        self.pending_output = Some(batch);
+        self.python_wake = Some(wake);
+        self.python
+            .as_mut()
+            .expect("drained a notebook")
+            .acknowledge();
+        id
+    }
+
+    async fn output_handed_off(&mut self, id: Uuid) {
+        let mut write = self.db.write().await;
+        write.append_agent_event(
+            self.agent_id,
+            &AgentEvent::ClaudeOutputHandedOff {
+                id,
+                at: rho_core::UnixMs::now(),
+            },
+        );
+        write.commit();
+        self.pending_output = None;
     }
 
     /// Stops the notebook's cells and answers an open exec call as
@@ -1836,12 +1755,8 @@ impl ClaudeLoop {
             | TranscriptLine::Compacted { context_used } => *context_used,
             TranscriptLine::User { .. } | TranscriptLine::ToolResults { .. } => None,
         };
-        let said = matches!(
-            line,
-            TranscriptLine::User { .. } | TranscriptLine::Assistant { .. }
-        );
         let mut write = self.db.write().await;
-        let pos = write.append_agent_event(
+        write.append_agent_event(
             self.agent_id,
             &AgentEvent::Transcript {
                 uuid,
@@ -1853,11 +1768,6 @@ impl ClaudeLoop {
         write.commit();
         if reported.is_some() {
             self.state.context_used = reported;
-        }
-        if said {
-            self.last_presentation_source = Some(pos);
-            self.presentation.dirty = true;
-            self.schedule_presentation();
         }
     }
 
@@ -2049,6 +1959,9 @@ impl ClaudeLoop {
     }
 
     async fn fail(&mut self, error: anyhow::Error) {
+        if let Some(host) = &mut self.python {
+            host.failed(rho_core::UnixMs::now(), Arc::from(error.to_string()));
+        }
         // The row first, so what Claude had said is kept and the tail
         // the loop tells next follows it.
         let partial = std::mem::take(&mut self.pending_response);
@@ -2076,10 +1989,52 @@ impl ClaudeLoop {
         }));
     }
 
-    fn handle_stream_event(
+    async fn observe_exec(
+        &self,
+        id: rho_core::ExecId,
+        milestone: rho_core::ExecMilestone,
+        at: rho_core::UnixMs,
+    ) {
+        let mut write = self.db.write().await;
+        write.append_agent_event(
+            self.agent_id,
+            &AgentEvent::ExecObserved { id, milestone, at },
+        );
+        write.commit();
+    }
+
+    async fn handle_stream_event(
         &mut self,
         event: rho_claude::protocol::MessageStreamEvent,
     ) -> anyhow::Result<()> {
+        let now = rho_core::UnixMs::now();
+        match &event {
+            rho_claude::protocol::MessageStreamEvent::MessageStart { .. } => {
+                self.response_execs.clear()
+            }
+            rho_claude::protocol::MessageStreamEvent::ContentBlockStart {
+                index,
+                content_block: rho_claude::protocol::StreamContentBlock::ToolUse { id, name, .. },
+            } if name == "mcp__py__exec" => {
+                let id = rho_core::ExecId::try_from(id.as_str())?;
+                self.response_execs.insert(*index, id.clone());
+                self.observe_exec(id, rho_core::ExecMilestone::FirstBlock, now)
+                    .await;
+            }
+            rho_claude::protocol::MessageStreamEvent::ContentBlockStop { index } => {
+                if let Some(id) = self.response_execs.get(index).cloned() {
+                    self.observe_exec(id, rho_core::ExecMilestone::ArgumentsFinished, now)
+                        .await;
+                }
+            }
+            rho_claude::protocol::MessageStreamEvent::MessageStop => {
+                for id in self.response_execs.values().cloned().collect::<Vec<_>>() {
+                    self.observe_exec(id, rho_core::ExecMilestone::ResponseFinished, now)
+                        .await;
+                }
+            }
+            _ => {}
+        }
         match event {
             rho_claude::protocol::MessageStreamEvent::MessageStart { message } => {
                 self.pending_response = PendingInferenceResponse::default();
@@ -2142,6 +2097,24 @@ impl ClaudeLoop {
             | rho_claude::protocol::MessageStreamEvent::Other => {}
         }
         Ok(())
+    }
+}
+
+impl crate::ClaudeOutputBatch {
+    fn message(&self) -> Vec<ContentPart> {
+        let mut content = vec![ContentPart::Text {
+            text: "Retained Python output from existing work. It may already have reached you if the host restarted during handoff; do not rerun its source.\n".into(),
+        }];
+        for (id, output) in &self.outputs {
+            content.push(ContentPart::Text {
+                text: format!("Exec {}:\n{}\n", id.as_str(), output.output),
+            });
+            content.extend(output.images.iter().map(|image| ContentPart::Image {
+                media_type: image.media_type.clone(),
+                data: image.data.clone(),
+            }));
+        }
+        content
     }
 }
 

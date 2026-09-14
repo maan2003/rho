@@ -23,6 +23,7 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
     // its last rows visible rather than hiding the turn whole.
     history.extend((0..16).map(|ix| {
         UiBlock::Tool(UiTool {
+            timing: Default::default(),
             id: format!("tool-{ix}"),
             name: "shell_command".to_owned(),
             arguments: format!("echo {ix}"),

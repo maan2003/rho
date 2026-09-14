@@ -85,13 +85,20 @@ impl Layered {
         self.state
             .blocks
             .extend(self.fold.blocks[from..].iter().cloned());
-        self.state.blocks.extend(
-            self.tail
-                .items
-                .iter()
-                .flatten()
-                .map(|item| Arc::new(block(item))),
-        );
+        self.state
+            .blocks
+            .extend(self.tail.items.iter().flatten().map(|item| {
+                let mut block = block(item);
+                if let UiBlock::Tool(tool) = &mut block {
+                    tool.timing = self
+                        .fold
+                        .exec_timings
+                        .get(&tool.id)
+                        .copied()
+                        .unwrap_or_default();
+                }
+                Arc::new(block)
+            }));
         self.state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
@@ -102,17 +109,25 @@ impl Layered {
         };
         self.state.context_used = self.fold.context_used;
         self.state.usage = self.fold.usage.clone();
+        self.state.exec_timings = self.fold.exec_timings.clone();
     }
 
     fn compose(&mut self) {
         let mut state = self.fold.clone();
-        state.blocks.extend(
-            self.tail
-                .items
-                .iter()
-                .flatten()
-                .map(|item| Arc::new(block(item))),
-        );
+        state
+            .blocks
+            .extend(self.tail.items.iter().flatten().map(|item| {
+                let mut block = block(item);
+                if let UiBlock::Tool(tool) = &mut block {
+                    tool.timing = self
+                        .fold
+                        .exec_timings
+                        .get(&tool.id)
+                        .copied()
+                        .unwrap_or_default();
+                }
+                Arc::new(block)
+            }));
         state
             .blocks
             .extend(self.tail.queue.iter().cloned().map(Arc::new));
@@ -219,6 +234,7 @@ pub fn block(item: &Item) -> UiBlock {
             name,
             arguments,
         } => UiBlock::Tool(UiTool {
+            timing: Default::default(),
             id: id.clone(),
             name: name.clone(),
             arguments: arguments.clone(),
@@ -267,6 +283,7 @@ impl AgentStore {
         layered.fold.status = delta.status;
         layered.fold.context_used = delta.context_used;
         layered.fold.usage = delta.usage;
+        layered.fold.exec_timings = delta.exec_timings;
         layered.compose_from(from);
         let mut summary = FrameSummary {
             first_changed_block: Some(from),
@@ -341,6 +358,7 @@ pub fn turn_open(status: UiAgentStatus) -> bool {
 
 fn empty_state() -> UiAgentState {
     UiAgentState {
+        exec_timings: Default::default(),
         blocks: Vec::new(),
         status: UiAgentStatus::Idle,
         context_used: None,
@@ -402,6 +420,60 @@ mod tests {
                 .collect(),
             ..empty_state()
         }
+    }
+
+    #[test]
+    fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
+        use rho_core::{ExecMilestone, UnixMs};
+        use rho_ui_proto::mirror::{AgentPos, MirrorEvent};
+
+        use crate::fold::TranscriptFold;
+        let mut store = AgentStore::default();
+        let mut transcript = TranscriptFold::default();
+        store.apply_live(agent(), Live::Requesting);
+        store.apply_live(
+            agent(),
+            Live::Item {
+                index: 0,
+                item: Item::ToolCall {
+                    id: "exec-1".into(),
+                    name: "exec".into(),
+                    arguments: "print(1)".into(),
+                },
+            },
+        );
+        for (pos, milestone, at) in [
+            (0, ExecMilestone::FirstBlock, 10),
+            (1, ExecMilestone::ArgumentsFinished, 20),
+        ] {
+            transcript.tell(
+                AgentPos(pos),
+                &MirrorEvent::ExecObserved {
+                    id: "exec-1".into(),
+                    milestone,
+                    at: UnixMs(at),
+                },
+            );
+            store.apply_fold_delta(agent(), transcript.delta().unwrap());
+        }
+        let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
+            panic!("live exec")
+        };
+        assert_eq!(tool.timing.first_block_at, Some(UnixMs(10)));
+        assert_eq!(tool.timing.arguments_finished_at, Some(UnixMs(20)));
+        transcript.tell(
+            AgentPos(2),
+            &MirrorEvent::Rewound {
+                to: AgentPos(1),
+                at: UnixMs(30),
+            },
+        );
+        store.apply_fold_delta(agent(), transcript.delta().unwrap());
+        let UiBlock::Tool(tool) = &*store.get(&agent()).unwrap().blocks[0] else {
+            panic!("live exec")
+        };
+        assert_eq!(tool.timing.arguments_finished_at, None);
+        assert_eq!(tool.timing.first_block_at, Some(UnixMs(10)));
     }
 
     #[test]

@@ -3047,7 +3047,6 @@ impl Workspace {
                     "eng-high-notes" => Some(EngineerIntelligence::HighNotes),
                     "eng-ultra" => Some(EngineerIntelligence::Ultra),
                     "eng-alt" => Some(EngineerIntelligence::Alt),
-                    "eng-gemini" => Some(EngineerIntelligence::Gemini),
                     _ => None,
                 };
                 match intelligence {
@@ -6152,6 +6151,7 @@ impl Workspace {
             .state(&agent_id)
             .cloned()
             .unwrap_or_else(|| rho_agents::state::UiAgentState {
+                exec_timings: Default::default(),
                 blocks: Vec::new(),
                 status: rho_agents::state::UiAgentStatus::Idle,
                 context_used: None,
@@ -8905,7 +8905,6 @@ fn agent_role_label(config: AgentRole) -> String {
             EngineerIntelligence::HighNotes => "eng-high-notes",
             EngineerIntelligence::Ultra => "eng-ultra",
             EngineerIntelligence::Alt => "eng-alt",
-            EngineerIntelligence::Gemini => "eng-gemini",
         },
     }
     .to_owned()

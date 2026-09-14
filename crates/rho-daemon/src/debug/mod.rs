@@ -65,7 +65,7 @@ enum DebugCommand {
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high,
-        /// eng-high-notes, eng-ultra, eng-alt, eng-gemini, pm, advisor,
+        /// eng-high-notes, eng-ultra, eng-alt, pm, advisor,
         /// advisor-cheap, or advisor-high.
         role: String,
     },
@@ -187,9 +187,6 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-alt" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         },
-        "eng-gemini" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Gemini,
-        },
         "advisor" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         },
@@ -200,7 +197,7 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
             intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-high-notes, eng-ultra, eng-alt, eng-gemini, pm, advisor, advisor-cheap, or advisor-high"
+            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-high-notes, eng-ultra, eng-alt, pm, advisor, advisor-cheap, or advisor-high"
         ),
     })
 }
@@ -394,10 +391,11 @@ async fn print_context(
                 let mut context_used = None;
                 let mut responses = 0usize;
                 for event in &events {
-                    if let rho_agent::AgentEvent::Replied {
-                        context_used: response_context_used,
-                        ..
-                    } = event
+                    if let Some(native) = event.native_event()
+                        && let rho_agent::native::NativeEvent::ResponseFinished {
+                            context_used: response_context_used,
+                            ..
+                        } = native
                     {
                         responses += 1;
                         if response_context_used.is_some() {
@@ -620,7 +618,6 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 EngineerIntelligence::HighNotes => "high-notes",
                 EngineerIntelligence::Ultra => "ultra",
                 EngineerIntelligence::Alt => "alt",
-                EngineerIntelligence::Gemini => "gemini",
             };
             format!("engineer {intelligence}")
         }
@@ -638,12 +635,7 @@ mod render_prompt_tests {
     #[test]
     fn parses_render_prompt_roles() {
         assert_eq!(parse_role("eng").unwrap(), AgentRole::default());
-        assert_eq!(
-            parse_role("eng-gemini").unwrap(),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Gemini,
-            }
-        );
+        assert!(parse_role("eng-gemini").is_err());
         assert_eq!(
             parse_role("advisor-high").unwrap(),
             AgentRole::Advisor {

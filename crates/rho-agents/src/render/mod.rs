@@ -508,7 +508,41 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     spans.push(Span::new(status, tool_status_class(tool.status)));
 
     let mut timer = None;
-    if tool.status == UiToolStatus::Running {
+    if let Some(first) = tool.timing.first_block_at {
+        let timing = tool.timing;
+        let phases = [
+            ("args", Some(first), timing.arguments_finished_at),
+            (
+                "response",
+                timing.arguments_finished_at,
+                timing.response_finished_at,
+            ),
+            ("wait", timing.response_finished_at, timing.boundary_at),
+            ("handoff", timing.boundary_at, timing.handed_off_at),
+        ];
+        for (label, start, end) in phases {
+            let Some(start) = start else { continue };
+            if let Some(end) = end {
+                let millis = end.0.saturating_sub(start.0);
+                let value = if millis < 1000 {
+                    format!("{millis}ms")
+                } else {
+                    format_tool_duration(Duration::from_millis(millis))
+                };
+                spans.push(Span::new(format!(" {label} {value}"), StyleClass::Time));
+            } else if timing.handed_off_at.is_none() && tool.status == UiToolStatus::Running {
+                spans.push(Span::new(format!(" {label}"), StyleClass::Time));
+                timer = Some(InlaySpec {
+                    span_index: spans.len(),
+                    content: InlayContent::RunningDuration {
+                        started_at_ms: start.0,
+                    },
+                });
+                spans.push(Span::new("", StyleClass::Time));
+                break;
+            }
+        }
+    } else if tool.status == UiToolStatus::Running {
         if let Some(started_at) = tool.started_at {
             timer = Some(InlaySpec {
                 span_index: spans.len(),
@@ -657,6 +691,7 @@ mod tests {
 
     fn tool(status: UiToolStatus) -> UiTool {
         UiTool {
+            timing: Default::default(),
             id: "tool-1".to_owned(),
             name: "shell_command".to_owned(),
             arguments: "echo ok".to_owned(),
@@ -976,5 +1011,27 @@ mod tests {
                 "visibility of {block:?}"
             );
         }
+    }
+    #[test]
+    fn exec_timing_names_provider_phases_not_python_duration() {
+        let mut exec = tool(UiToolStatus::Success);
+        exec.timing = rho_core::ExecTiming {
+            first_block_at: Some(UnixMs(100)),
+            arguments_finished_at: Some(UnixMs(2100)),
+            response_finished_at: Some(UnixMs(2600)),
+            boundary_at: Some(UnixMs(5600)),
+            handed_off_at: Some(UnixMs(5620)),
+        };
+        // These historical fields must not win over observed provider facts.
+        exec.started_at = Some(UnixMs(0));
+        exec.finished_at = Some(UnixMs(999999));
+        let mut spans = Vec::new();
+        assert_eq!(push_tool_spans(&mut spans, &exec, 999999), None);
+        let text = text_of(&spans);
+        assert!(
+            text.contains("args 2s response 500ms wait 3s handoff 20ms"),
+            "{text}"
+        );
+        assert!(!text.contains("16m"));
     }
 }

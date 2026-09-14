@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub mod accounts;
+pub mod mcp;
 pub mod protocol;
 pub mod settings;
 mod transcript;

@@ -1,119 +1,82 @@
-# ARCH-rho-agent: the Rho runtime loop
+# ARCH-rho-agent: concrete runtimes with shared notebook mechanisms
 
-An agent harness built around one question, asked after every event: *should the
-next request start now?*
+## Ownership
 
-## Shape
+The native `Agent` and `ClaudeLoop` are separate concrete runtimes. There is no
+universal runtime trait and Claude Code is not a raw inference provider.
+Each runtime serializes its controls, persistence, scheduling, and publication.
 
-One `Agent` task owns all mutable state and runs a single loop — ask the
-question, act on the answer, wait for the next event — until the last handle is
-dropped. `AgentHandle` is the only outside view: commands in over an unbounded
-channel, state out as a published `AgentState`.
+Native conversation authority is the append-only `NativeEvent` log. Provider
+input, restart recovery, and presentation are disposable projections, not another
+independently mutated history. Historical block records normalize at the read
+boundary. Claude Code instead owns its session, history, and compaction; Rho
+records bounded transcript observations, execution admission, output ownership,
+and timing, and controls its in-process MCP server.
 
-Everything that produces transcript blocks is a **source**: the user queue, the
-mail queue, each called cell, and each job (a command or a host operation) a
-cell registered. Jobs are independently scheduled sources even when their
-output travels on one shared `exec` call. A source accumulates on its own and
-reports plain facts — when something arrived, whether a job has ended and how,
-which cell the foreground is. It chooses no durations and starts no requests
+`rho-inference` owns native wire adaptation and validates the model action as
+prose or one custom Python `exec`. `rho-claude` owns CLI transport and MCP protocol
+adaptation. Neither adapter owns Rho's scheduling or persistence.
+
+## Shared mechanisms, not shared runtime ownership
+
+Every role exposes only the Python notebook, with at most one new exec per
+model response. Earlier cells and jobs can remain live across later responses.
+`rho-agent-tools` owns the concrete notebook, cells, jobs, and leased output;
+host functions are callable inside Python, not through a top-level tool registry.
+`notebook` builds host functions for both runtimes.
+
+The provider call identity is the `ExecId` of the notebook execution. Command
+identities and transport correlation IDs are separate. Claude MCP admission uses
+the provider tool-use identity forwarded by the CLI, never its JSON-RPC ID.
+Admission survives transcript rewind because rewind does not undo external effects.
+
+Sources accumulate independently and expose facts, never scheduling decisions
 ([DECISION-pull-based-sources](DECISION-pull-based-sources.md)).
+The shared pure `boundary` reads all facts, model patience, runtime availability
+and standing, and the supplied clock. It has no store, provider, task, or native
+phase dependency
+([DECISION-boundary-is-the-only-decision](DECISION-boundary-is-the-only-decision.md)).
+A cancelled or failed runtime waits for fresh input as specified by
+[DECISION-stopped-agents-wait-for-fresh-input](DECISION-stopped-agents-wait-for-fresh-input.md).
 
-Being a source is a role, not a module. The two queues are plain vectors on the
-`Agent`, and `SourceKind` — the facts a source reports — is declared in
-`boundary.rs` beside the only code that reads it.
+## Durable ownership and recovery
 
-`boundary` is a pure function of every source's facts, the model's latest turn,
-the current `Phase`, and the clock. It is the only part of the crate that
-decides anything
-([DECISION-boundary-is-the-only-decision](DECISION-boundary-is-the-only-decision.md));
-the rest — spawning, draining, persisting, publishing — is mechanism.
+Native Python units may execute while a response streams, only after admission
+commits. Provider interruption is not EOF, and admitted effects are never replayed.
+Settlement, model completion, and job completion are distinct facts
+([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
-`Phase` is what the agent is up to and the first thing the decision reads.
-Either a request is in flight or it is not, and when it is not the only two
-questions left are what the next request must open with (`owed`) and whether
-anything has happened that bears on speaking (`standing`) — so `Phase::Idle`
-carries both and nothing else has to. `standing` is facts, not a verdict, on the
-same principle as a source: `Asked` says somebody asked for a request the sources
-would not have made, `Cancelled`/`Failed` say what happened and when, and whether
-either still stops the agent is `boundary`'s reading of them against the user
-queue
-([DECISION-stopped-agents-wait-for-fresh-input](DECISION-stopped-agents-wait-for-fresh-input.md)).
-`boundary` never reads `owed`. Loading an agent is not its own state; it only
-supplies `owed` differently ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
+Output reads lease a stable contribution until acknowledgment. Native inputs use
+exec-specific replies and reports carrying complete text, images, and status;
+wire tool classification belongs to inference adaptation. Native requests
+commit contributions before acknowledging notebook buffers. Claude transfers them
+to a durable outbox before transport; a failed handoff leaves them recoverable.
+Retained batches participate in boundary scheduling and stop rules; when a later
+exec is open, its reply carries retained output as reports. The replacement batch
+owns both old and new contributions before fresh leases are acknowledged.
+A recovered Claude batch becomes an attributed report, not another initial tool
+result and never replayed source. Transport handoff is not proof of consumption.
 
-## Boundaries and direction
+One initial reply answers an exec; subsequent contributions are reports
+([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)).
+The notebook supplies its own words
+([DECISION-the-core-never-speaks-for-a-tool](DECISION-the-core-never-speaks-for-a-tool.md)).
+Reaping waits for final contribution acknowledgment, not merely Python return.
 
-The loop depends on `boundary`, the tools it has been given, `Store`, and an
-`rho-inference` session. Nothing depends on `boundary`, and `boundary` reaches
-nothing: no store, no provider, no task, no clock but the instant it is handed.
-It is handed every source's facts at once and reads them together; no source
-knows about another, or about the clock. The Claude runtime asks the same
-`boundary` for its Python-notebook agents: an open `exec` call from Claude Code
-is answered, and an idle model woken, exactly when the decision says so.
-
-Tools come from the caller as a list of `Tool` implementations, keyed on the way
-in by the name the model calls them by; a call in flight is a `ToolSession`. A
-registry type would have been that map with pass-through methods, so there is
-not one. The Python notebook is the whole surface: one `exec` per model
-response, and nothing else to call. Why each request went out is recorded with
-it as `WakeFacts`, on `Sent` natively and on the Claude `Transcript` row the
-notebook produced. Complete top-level Python units may execute while the response streams, but only
-after durable agent admission. Provider failure stops admission without treating
-the suffix as EOF or replaying earlier units. An admitted prefix becomes the
-original call's accepted source and ends the model turn normally; its cell and
-commands retain ordinary boundary waiting and check-in semantics. Only failures
-before admission use transport retry backoff. Continuations rebuild input by
-draining sources, rather than resending a cached provider request (with the
-dedicated-preparation exception in DECISION-pull-based-sources). Its shared Rust execution
-handle and each host operation report distinct source facts; a provider reply
-does not mean that Python finished. Native callbacks synchronously update the
-handle from the interpreter thread, including its model-authored patience.
-The boundary reads the latest response's execution handle directly; an old
-execution never changes a newer response's interval. The core can cancel work
-and still collects its parting output
-([DECISION-model-sets-the-pace](DECISION-model-sets-the-pace.md)).
-
-A session hands its output over in two shapes, and the split is in the trait
-rather than sorted out by the core: `first_output` is required and taken once,
-`more_output` is optional and taken forever after. That is the provider's
-one-result-per-call rule made unmissable
-([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)). Both
-carry the tool's words and only the tool's words
-([DECISION-the-core-never-speaks-for-a-tool](DECISION-the-core-never-speaks-for-a-tool.md)),
-which is also why the tool says when it may be forgotten: `done` is asked after
-the drain beside it, so the last thing a tool has to say is always taken, and
-the core never decides on its behalf that there is nothing more to hear.
-
-## Persistence
-
-`Store` is an append-only redb event log. History belongs to a *lineage* rather
-than to an agent, and an agent points at the one it is currently on; loading
-walks back to the root and replays forwards
-([DECISION-history-only-branches](DECISION-history-only-branches.md)).
-Instructions are deliberately not among the stored fields
+Loading alone starts no requests
+([DECISION-a-restart-does-not-resume-by-itself](DECISION-a-restart-does-not-resume-by-itself.md)).
+Instructions are code, not stored authority
 ([DECISION-instructions-are-code](DECISION-instructions-are-code.md)).
+The notes role rotates the active provider window without replacing Python or
+jobs; notes remain external effects
+([DESIGN-context-rotation](../../../specs/DESIGN-context-rotation.md)).
 
-The opt-in `eng-high-notes` role retains a verbatim suffix of full history; the active
-window boundary is a typed `ContextRotation` transcript item, persisted with
-its ordinary drain. Early marker and preparation events describe scheduling, not
-a separate active-window authority. Preparation supplies response/cell-completion facts to `boundary`; it
-holds unrelated sources without cancelling their work. Provider continuation is
-reset at rotation, not the Python surface. Shared workset filesystem notes are outside
-code checkouts and transcript lineage; children inherit the same directory,
-and only a bounded metadata inventory is injected.
-See [DESIGN-context-rotation](../../../specs/DESIGN-context-rotation.md).
+## Read-only presentation
 
-## Invariants
-
-- The transcript has exactly one writer, so it has a total order.
-- An accepted input reaches disk before it becomes live state, and a command's
-  ack fires only after that command's own handling.
-- The drain, the append and the send are one persisted event, so no crash can
-  leave a queue drained into a transcript that never went out.
-- No source chooses a duration. Sources may relay the model’s turn-local
-  patience; every scheduling rule remains in `boundary`. A quiet successful
-  setter-only completion does not defeat the interval it just conveyed.
-- Nothing outside the core decides *when*; the core never decides *what* a
-  source has to say.
-- A drain's block order is the provider's, not the clock's, as constrained by
-  [REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md).
+Native and Claude observations share the GUI projection, not a conversation
+writer. Timing identifies provider first block, argument completion, response
+completion, boundary, and transport handoff. It does not measure Python execution.
+`WakeFacts` separately records source occurrence, observation, deadline, and trigger.
+Native argument completion observes the provider's argument-end event, not
+item completion or Python EOF. Live and committed tool rows use the same observed timing; later output must not
+rewrite the original result's status or duration.

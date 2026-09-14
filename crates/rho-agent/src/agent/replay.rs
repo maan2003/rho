@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rho_core::{ContextBlock, InferenceResponseItem, MessageSender, ToolCall};
+use rho_core::{ContextBlock, InferenceResponseItem, MessageSender};
 
 use super::MailItem;
 use crate::{AgentEvent, InputKind, QueuedInput};
@@ -18,7 +18,7 @@ pub(crate) struct Replayed {
     pub recovery_streams: Vec<rho_core::ToolCallId>,
     /// Calls history left hanging: every one of them gets a placeholder
     /// result in the next request (`SPEC-restart-recovery`).
-    pub owed: Vec<ToolCall>,
+    pub owed: Vec<rho_core::ExecId>,
     pub user: Vec<QueuedInput>,
     pub mail: Vec<MailItem>,
     pub context_used: Option<u64>,
@@ -39,11 +39,82 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
 
     let mut notes_rotation = false;
     for event in events {
-        if let AgentEvent::Sent { blocks, .. }
-        | AgentEvent::ContextSent { blocks, .. }
-        | AgentEvent::Replied { blocks, .. } = &event
-        {
-            for block in blocks.iter() {
+        if let Some(native) = event.native_event() {
+            use crate::native::NativeEvent;
+            let blocks = match native {
+                NativeEvent::RequestStarted {
+                    input,
+                    context: change,
+                    ..
+                } => {
+                    let blocks = input.clone();
+                    if !matches!(change, Some(crate::ContextChange::Preparing { .. })) {
+                        user.clear();
+                        mail.clear();
+                    }
+                    if let Some(change) = change {
+                        context.sent(change);
+                    } else {
+                        if blocks.contains(&ContextBlock::CompactionTrigger) {
+                            context.rotated();
+                        }
+                        if blocks
+                            .iter()
+                            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
+                        {
+                            context.rotated();
+                            context_used = None;
+                        }
+                    }
+                    blocks
+                }
+                NativeEvent::ResponseFinished {
+                    output,
+                    context_used: replied,
+                    ..
+                } => {
+                    for block in output {
+                        if let ContextBlock::InferenceResponse { items, .. } = block {
+                            context.replied(items);
+                        }
+                    }
+                    context_used = *replied;
+                    output.clone()
+                }
+                NativeEvent::RequestFailed { .. } => Vec::new(),
+                NativeEvent::PythonStream { event, .. } => {
+                    use crate::PythonStreamEvent;
+                    match event {
+                        PythonStreamEvent::Opened { item } => {
+                            if let InferenceResponseItem::ToolCall { id, .. } = item {
+                                streams.insert(id.clone(), (item.clone(), String::new(), 0));
+                            }
+                        }
+                        PythonStreamEvent::Admitted { call_id, source } => {
+                            if let Some((_, admitted, _)) = streams.get_mut(call_id) {
+                                admitted.push_str(source);
+                            }
+                        }
+                        PythonStreamEvent::Settled {
+                            call_id,
+                            end,
+                            error,
+                        } => {
+                            if let Some((_, _, completed)) = streams.get_mut(call_id)
+                                && error.is_none()
+                            {
+                                *completed = *end as usize;
+                            }
+                        }
+                        PythonStreamEvent::Closed { .. } => {}
+                        PythonStreamEvent::Acknowledged { call_id } => {
+                            streams.remove(call_id);
+                        }
+                    }
+                    Vec::new()
+                }
+            };
+            for block in &blocks {
                 if let ContextBlock::InferenceResponse { items, .. } = block {
                     for item in items {
                         if let InferenceResponseItem::ToolCall { id, .. } = item {
@@ -52,81 +123,14 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                     }
                 }
             }
+            history.extend(blocks.into_iter().map(Arc::new));
+            continue;
         }
         match event {
             AgentEvent::Accepted(input) => queue(input, &mut user, &mut mail),
-            AgentEvent::QueueCleared | AgentEvent::Cleared { .. } => {
+            AgentEvent::Cleared { .. } => {
                 user.clear();
                 mail.clear();
-            }
-            // A drain is total: whatever was queued rode in these blocks.
-            AgentEvent::Sent { blocks, .. } => {
-                if blocks.contains(&ContextBlock::CompactionTrigger) {
-                    context.rotated();
-                }
-                if blocks
-                    .iter()
-                    .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-                {
-                    context.rotated();
-                    context_used = None;
-                }
-                history.extend(blocks.into_owned().into_iter().map(Arc::new));
-                user.clear();
-                mail.clear();
-            }
-            AgentEvent::ContextSent { blocks, change, .. } => {
-                if !matches!(change, crate::ContextChange::Preparing { .. }) {
-                    user.clear();
-                    mail.clear();
-                }
-                context.sent(&change);
-                history.extend(blocks.into_owned().into_iter().map(Arc::new));
-            }
-            AgentEvent::PythonStream { event, .. } => {
-                use crate::PythonStreamEvent;
-                match event {
-                    PythonStreamEvent::Opened { item } => {
-                        let InferenceResponseItem::ToolCall { id, .. } = &item else {
-                            continue;
-                        };
-                        streams.insert(id.clone(), (item, String::new(), 0));
-                    }
-                    PythonStreamEvent::Admitted { call_id, source } => {
-                        if let Some((_, admitted, _)) = streams.get_mut(&call_id) {
-                            admitted.push_str(&source);
-                        }
-                    }
-                    PythonStreamEvent::Settled {
-                        call_id,
-                        end,
-                        error,
-                    } => {
-                        if let Some((_, _, completed)) = streams.get_mut(&call_id)
-                            && error.is_none()
-                        {
-                            *completed = end as usize;
-                        }
-                    }
-                    // Interpreter return is not durable delivery of progress.
-                    PythonStreamEvent::Closed { .. } => {}
-                    PythonStreamEvent::Acknowledged { call_id } => {
-                        streams.remove(&call_id);
-                    }
-                }
-            }
-            AgentEvent::Replied {
-                blocks,
-                context_used: replied,
-                ..
-            } => {
-                for block in blocks.iter() {
-                    if let ContextBlock::InferenceResponse { items, .. } = block {
-                        context.replied(items);
-                    }
-                }
-                history.extend(blocks.into_owned().into_iter().map(Arc::new));
-                context_used = replied;
             }
             AgentEvent::Created { role, .. } => notes_rotation = role.uses_notes_rotation(),
             AgentEvent::RoleChanged { role, .. } => {
@@ -142,9 +146,15 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             // Config, creation and what a reader is told are the head's
             // business, never context. A `Rewound` never reaches replay:
             // the read that hands over the visible log has applied it.
-            AgentEvent::Transcript { .. }
+            AgentEvent::Native(_)
+            | AgentEvent::ClaudeOutput { .. }
+            | AgentEvent::ClaudeOutputHandedOff { .. }
+            | AgentEvent::ClaudeExecAdmitted { .. }
+            | AgentEvent::ExecObserved { .. }
+            | AgentEvent::Transcript { .. }
             | AgentEvent::Turn { .. }
-            | AgentEvent::Presented { .. }
+            | AgentEvent::TitleAttempted { .. }
+            | AgentEvent::Titled { .. }
             | AgentEvent::Wants { .. }
             | AgentEvent::Rewound { .. }
             | AgentEvent::Failed { .. }
@@ -222,29 +232,18 @@ fn queue(input: QueuedInput, user: &mut Vec<QueuedInput>, mail: &mut Vec<MailIte
 }
 
 /// Every call in history that no result answers, in the order made.
-pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<ToolCall> {
-    let mut unanswered: Vec<ToolCall> = Vec::new();
+pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_core::ExecId> {
+    let mut unanswered: Vec<rho_core::ExecId> = Vec::new();
     for block in history {
         match &**block {
             ContextBlock::InferenceResponse { items, .. } => {
                 unanswered.extend(items.iter().filter_map(|item| match item {
-                    InferenceResponseItem::ToolCall {
-                        id,
-                        name,
-                        tool_type,
-                        arguments,
-                        ..
-                    } => Some(ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        tool_type: *tool_type,
-                        arguments: arguments.clone(),
-                    }),
+                    InferenceResponseItem::ToolCall { id, .. } => Some(id.clone()),
                     _ => None,
                 }));
             }
             ContextBlock::ToolResults { results } => {
-                unanswered.retain(|call| !results.iter().any(|result| result.call_id == call.id));
+                unanswered.retain(|call| !results.iter().any(|result| &result.call_id == call));
             }
             ContextBlock::UserMessage { .. }
             | ContextBlock::ToolUpdate(_)
@@ -258,7 +257,6 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<ToolCall> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
 
     use rho_core::{ContentPart, MessageDelivery, UnixMs};
     use senax_encoder::{Decode, Encode};
@@ -302,6 +300,29 @@ mod tests {
     }
 
     #[test]
+    fn native_records_project_the_same_protocol_history_without_a_second_authority() {
+        let legacy = vec![
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::UserMessage {
+                    sender: MessageSender::User,
+                    content: text_parts("go"),
+                }]), at: UnixMs(1), wake: None, context: None }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
+                    items: vec![tool_call("same-id")],
+                    provider_response_id: Some("response-1".try_into().unwrap()),
+                }]), context_used: Some(42), usage: None, at: UnixMs(2) }),
+        ];
+        let current = legacy
+            .iter()
+            .map(|event| AgentEvent::Native(event.native_event().unwrap().clone()))
+            .collect();
+        let old = replay(legacy);
+        let new = replay(current);
+        assert_eq!(new.history, old.history);
+        assert_eq!(new.owed, old.owed);
+        assert_eq!(new.context_used, old.context_used);
+    }
+
+    #[test]
     fn current_events_replay_verbatim_and_a_send_empties_the_queues() {
         let input = QueuedInput {
             source: MessageSender::User,
@@ -323,23 +344,14 @@ mod tests {
 
         let replayed = replay(vec![
             AgentEvent::Accepted(input.clone()),
-            AgentEvent::Sent {
-                blocks: Cow::Owned(vec![ContextBlock::UserMessage {
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::UserMessage {
                     sender: MessageSender::User,
                     content: text_parts("go"),
-                }]),
-                at: rho_core::UnixMs(0),
-                wake: None,
-            },
-            AgentEvent::Replied {
-                blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
+                }]), at: rho_core::UnixMs(0), wake: None, context: None }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("c")],
                     provider_response_id: None,
-                }]),
-                context_used: Some(40),
-                usage: None,
-                at: rho_core::UnixMs(0),
-            },
+                }]), context_used: Some(40), usage: None, at: rho_core::UnixMs(0) }),
         ]);
         assert!(replayed.user.is_empty());
         assert_eq!(replayed.history.len(), 2);
@@ -356,7 +368,7 @@ mod tests {
                 delivery: MessageDelivery::NextRequest,
                 at: UnixMs(1),
             }),
-            AgentEvent::QueueCleared,
+            AgentEvent::Cleared { at: UnixMs(0) },
         ]);
         assert!(replayed.user.is_empty());
         assert!(replayed.history.is_empty());
@@ -384,10 +396,7 @@ mod tests {
             let events: Vec<_> = journal[..cut]
                 .iter()
                 .cloned()
-                .map(|event| AgentEvent::PythonStream {
-                    event,
-                    at: rho_core::UnixMs(0),
-                })
+                .map(|event| AgentEvent::Native(crate::native::NativeEvent::PythonStream { event, at: rho_core::UnixMs(0) }))
                 .collect();
             let replayed = replay(events.clone());
             if cut == 1 {
@@ -421,11 +430,7 @@ mod tests {
                 }],
             });
             let mut events = events;
-            events.push(AgentEvent::Sent {
-                blocks: Cow::Owned(blocks),
-                at: rho_core::UnixMs(1),
-                wake: None,
-            });
+            events.push(AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(blocks), at: rho_core::UnixMs(1), wake: None, context: None }));
             let twice = replay(events);
             assert!(twice.owed.is_empty());
             assert!(
@@ -439,37 +444,21 @@ mod tests {
     fn a_later_success_does_not_erase_an_earlier_unsettled_stream() {
         use crate::PythonStreamEvent;
         let replayed = replay(vec![
-            AgentEvent::PythonStream {
-                event: PythonStreamEvent::Opened {
+            AgentEvent::Native(crate::native::NativeEvent::PythonStream { event: PythonStreamEvent::Opened {
                     item: tool_call("first"),
-                },
-                at: rho_core::UnixMs(0),
-            },
-            AgentEvent::PythonStream {
-                event: PythonStreamEvent::Admitted {
+                }, at: rho_core::UnixMs(0) }),
+            AgentEvent::Native(crate::native::NativeEvent::PythonStream { event: PythonStreamEvent::Admitted {
                     call_id: rho_core::ToolCallId::try_from("first").unwrap(),
                     source: "await work()\n".into(),
-                },
-                at: rho_core::UnixMs(0),
-            },
-            AgentEvent::Replied {
-                blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
+                }, at: rho_core::UnixMs(0) }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("first")],
                     provider_response_id: None,
-                }]),
-                context_used: None,
-                usage: None,
-                at: rho_core::UnixMs(1),
-            },
-            AgentEvent::Replied {
-                blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
+                }]), context_used: None, usage: None, at: rho_core::UnixMs(1) }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("second")],
                     provider_response_id: None,
-                }]),
-                context_used: None,
-                usage: None,
-                at: rho_core::UnixMs(2),
-            },
+                }]), context_used: None, usage: None, at: rho_core::UnixMs(2) }),
         ]);
         assert_eq!(replayed.owed.len(), 2);
         assert!(replayed.recovery_blocks.is_empty());
@@ -480,10 +469,7 @@ mod tests {
     fn closed_and_replied_do_not_retire_progress_before_durable_acknowledgement() {
         use crate::PythonStreamEvent;
         let id = rho_core::ToolCallId::try_from("c").unwrap();
-        let journal = |event| AgentEvent::PythonStream {
-            event,
-            at: rho_core::UnixMs(0),
-        };
+        let journal = |event| AgentEvent::Native(crate::native::NativeEvent::PythonStream { event, at: rho_core::UnixMs(0) });
         for close_first in [false, true] {
             let mut events = vec![
                 journal(PythonStreamEvent::Opened {
@@ -502,15 +488,10 @@ mod tests {
             let close = journal(PythonStreamEvent::Closed {
                 call_id: id.clone(),
             });
-            let reply = AgentEvent::Replied {
-                blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
+            let reply = AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("c")],
                     provider_response_id: None,
-                }]),
-                context_used: None,
-                usage: None,
-                at: rho_core::UnixMs(0),
-            };
+                }]), context_used: None, usage: None, at: rho_core::UnixMs(0) });
             events.extend(if close_first {
                 vec![close, reply]
             } else {

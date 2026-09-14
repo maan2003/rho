@@ -6,10 +6,10 @@ use rho_core::UnixMs;
 use rho_db::RhoDb;
 use tokio::sync::watch;
 
+use crate::InferenceSession;
 use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
 use crate::config::{InferenceModel, InferenceProfile};
 use crate::responses::{InferenceAuth, PromptCacheKey, QuotaUpdate, RouteSelector};
-use crate::session::InferenceSession;
 
 /// Provider account policy, quota, persistence, and session creation. Cheap to
 /// clone.
@@ -103,20 +103,44 @@ impl Inference {
         model: InferenceModel,
         prompt_cache_key: PromptCacheKey,
     ) -> InferenceSession {
-        match model {
-            InferenceModel::Gemini37FlashLow => {
-                InferenceSession::new_antigravity(profile, prompt_cache_key)
+        InferenceSession::new_deep(self.clone(), profile, model, prompt_cache_key)
+    }
+
+    /// A single text-only exchange. The caller owns its deadline and any retry.
+    /// Dropping this future drops the session and cancels its socket task.
+    pub async fn text(&self, instructions: Arc<str>, input: String) -> anyhow::Result<String> {
+        use rho_core::{ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
+            InferenceResponseItem, MessageSender, PendingInferenceResponse};
+        let mut session = InferenceSession::new_title(self.clone(), PromptCacheKey::generate());
+        session.request(InferenceRequest {
+            instructions,
+            input: vec![Arc::new(ContextBlock::UserMessage {
+                sender: MessageSender::User,
+                content: vec![ContentPart::Text { text: input }],
+            })],
+            agent_id_labels: Default::default(),
+        });
+        let mut pending = PendingInferenceResponse::default();
+        loop {
+            match session.run().await {
+                InferenceEvent::ContextItem { index, event } => pending.apply(index, event),
+                InferenceEvent::Finished { .. } => {
+                    let mut text = String::new();
+                    for item in pending.finish()? {
+                        match item {
+                            InferenceResponseItem::AssistantMessage { content, .. } => {
+                                text.push_str(&rho_core::text_content(&content));
+                            }
+                            InferenceResponseItem::ToolCall { .. } => anyhow::bail!("text completion returned a tool call"),
+                            _ => {}
+                        }
+                    }
+                    return Ok(text);
+                }
+                InferenceEvent::Failed { error } | InferenceEvent::TemporaryFailure { error, .. } => anyhow::bail!("{error:#}"),
+                _ => {}
             }
-            _ => InferenceSession::new_responses(self.clone(), profile, model, prompt_cache_key),
         }
-    }
-
-    pub fn title_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {
-        InferenceSession::new_title(self.clone(), prompt_cache_key)
-    }
-
-    pub fn status_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {
-        InferenceSession::new_status(self.clone(), prompt_cache_key)
     }
 
     /// Returns the account decision already made by the account manager.

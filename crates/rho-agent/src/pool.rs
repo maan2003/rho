@@ -60,8 +60,6 @@ pub struct AgentPool {
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
-    presentation_changes: broadcast::Sender<AgentPresentationChanged>,
-    turn_reports: broadcast::Sender<AgentTurnReported>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
 }
 
@@ -81,20 +79,6 @@ pub struct AgentCreated {
 pub struct AgentTurnCompleted {
     pub agent_id: AgentId,
     pub final_answer: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct AgentPresentationChanged {
-    pub agent_id: AgentId,
-    pub generated_title: Option<String>,
-    pub activity: Option<String>,
-}
-
-/// Broadcast after a runtime persisted a turn report, for client fan-out.
-#[derive(Clone, Debug)]
-pub struct AgentTurnReported {
-    pub agent_id: AgentId,
-    pub report: crate::db::TurnReport,
 }
 
 impl AgentPool {
@@ -122,8 +106,6 @@ impl AgentPool {
             live: std::sync::Mutex::new(HashSet::new()),
             load_locks: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
-            presentation_changes: broadcast::channel(64).0,
-            turn_reports: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
         });
         let weak = Arc::downgrade(&pool);
@@ -149,20 +131,6 @@ impl AgentPool {
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
         self.created.subscribe()
-    }
-
-    pub fn subscribe_presentation_changes(&self) -> broadcast::Receiver<AgentPresentationChanged> {
-        self.presentation_changes.subscribe()
-    }
-
-    pub fn subscribe_turn_reports(&self) -> broadcast::Receiver<AgentTurnReported> {
-        self.turn_reports.subscribe()
-    }
-
-    pub(crate) fn publish_turn_report(&self, agent_id: AgentId, report: crate::db::TurnReport) {
-        let _ = self
-            .turn_reports
-            .send(AgentTurnReported { agent_id, report });
     }
 
     pub async fn publish_completed_turn(self: &Arc<Self>, completed: AgentTurnCompleted) {
@@ -227,18 +195,6 @@ impl AgentPool {
         self.flush_agent_usage(Some(agent_id)).await;
     }
 
-    pub(crate) fn publish_presentation_changed(
-        &self,
-        agent_id: AgentId,
-        generated_title: Option<String>,
-        activity: Option<String>,
-    ) {
-        let _ = self.presentation_changes.send(AgentPresentationChanged {
-            agent_id,
-            generated_title,
-            activity,
-        });
-    }
 
     pub fn db(&self) -> &RhoDb {
         &self.db
@@ -314,27 +270,17 @@ impl AgentPool {
                 .copied()
                 .collect::<HashSet<_>>()
         };
-        let (joined, left) = {
+        let joined = {
             let mut live = self.live.lock().expect("poison");
-            let left = live
-                .iter()
-                .copied()
-                .filter(|agent_id| !union.contains(agent_id))
-                .collect::<Vec<_>>();
             let joined = union
                 .iter()
                 .copied()
                 .filter(|agent_id| !live.contains(agent_id))
                 .collect::<Vec<_>>();
             *live = union;
-            (joined, left)
+            joined
         };
         let agents = self.agents.lock().await;
-        for agent_id in left {
-            if let Some(agent) = agents.get(&agent_id) {
-                agent.set_watched(false);
-            }
-        }
         for agent_id in joined {
             if let Some(agent) = agents.get(&agent_id) {
                 self.attach_live(agent_id, agent);
@@ -348,7 +294,6 @@ impl AgentPool {
         if !self.live.lock().expect("poison").contains(&agent_id) {
             return;
         }
-        agent.set_watched(true);
         agent.tell_tail();
     }
 
@@ -458,8 +403,7 @@ impl AgentPool {
             | SessionBinding::ResponsesAstra(_)
             | SessionBinding::AdvisorSol(_)
             | SessionBinding::AdvisorTerra(_)
-            | SessionBinding::AdvisorAstra(_)
-            | SessionBinding::AntigravityFlashLow(_) => {
+            | SessionBinding::AdvisorAstra(_) => {
                 let (agent_id, agent) = AgentHandle::create(
                     self.db.clone(),
                     self.inference.clone(),
@@ -825,12 +769,6 @@ pub enum RunningAgent {
 impl RunningAgent {
     /// Whether anyone is looking at this agent; titles and activity are
     /// made only then.
-    pub(crate) fn set_watched(&self, watching: bool) {
-        match self {
-            Self::Rho(agent) => agent.set_watched(watching),
-            Self::Claude(agent) => agent.set_watched(watching),
-        }
-    }
 
     /// The agent's view, ready once its place is: a new agent's clone may
     /// still be in flight.

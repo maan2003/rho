@@ -287,6 +287,11 @@ pub enum MirrorEvent {
         text: String,
         at: UnixMs,
     },
+    ExecObserved {
+        id: String,
+        milestone: rho_core::ExecMilestone,
+        at: UnixMs,
+    },
 }
 
 impl MirrorEvent {
@@ -307,7 +312,8 @@ impl MirrorEvent {
             | Self::Wants { at, .. }
             | Self::Rewound { at, .. }
             | Self::Failed { at, .. }
-            | Self::ClaudeMessage { at, .. } => *at,
+            | Self::ClaudeMessage { at, .. }
+            | Self::ExecObserved { at, .. } => *at,
         }
     }
 }

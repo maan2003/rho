@@ -14,13 +14,59 @@
 //! and never wake for something the model cannot act on.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rho_agent_tools::{CellFacts, JobFacts};
 use rho_core::UnixMs;
 
-use super::{Phase, Standing};
 use crate::{WakeEvent, WakeFacts, WakeKind, WakeTrigger};
+
+/// The last thing to happen to an idle agent that bears on whether it should
+/// speak, and when it happened.
+///
+/// Facts rather than a verdict: what any of them is worth is `boundary`'s to
+/// say. Nothing here survives a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// Nothing either way; the sources decide. The ordinary case, and what a
+    /// loaded agent always comes back as.
+    Nothing,
+    /// Somebody asked for a request the sources would not have made: a retry,
+    /// or a compaction that ate the turn the model still owed a reply to.
+    Asked,
+    Retry {
+        since: UnixMs,
+        failed_at: UnixMs,
+        attempts: u32,
+        compaction_owes_reply: bool,
+        error: Arc<str>,
+    },
+    /// The user cancelled at `at`, and nothing has been asked since.
+    Cancelled { at: UnixMs },
+    /// The request in flight then failed for good, saying `error`.
+    Failed { at: UnixMs, error: Arc<str> },
+}
+
+impl Standing {
+    /// Whether the agent is stopped, given the oldest thing the user has
+    /// queued.
+    ///
+    /// A stop waits for fresh input; a user message or peer mail after it lifts
+    /// it: `DECISION-stopped-agents-wait-for-fresh-input`. Derived from the
+    /// queue rather than recorded, because the queue already says it.
+    pub(crate) fn stopped(&self, fresh_input_at: Option<UnixMs>) -> bool {
+        match self {
+            Self::Nothing | Self::Asked | Self::Retry { .. } => false,
+            // A cancel empties the queues and a failed request had already
+            // drained them, so anything dated at or after the stop is somebody
+            // typing since. Anything older was already on its way.
+            Self::Cancelled { at } | Self::Failed { at, .. } => {
+                !fresh_input_at.is_some_and(|oldest| oldest >= *at)
+            }
+        }
+    }
+}
 
 /// One source, whether or not it has anything to say.
 ///
@@ -30,6 +76,8 @@ use crate::{WakeEvent, WakeFacts, WakeKind, WakeTrigger};
 /// is a fact too. `DECISION-boundary-is-the-only-decision`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceKind {
+    /// A previously selected output batch still awaits transport handoff.
+    Delivery,
     /// Typed input is whole on arrival, so it never has more to say.
     /// `interrupt` is the one rule no other source has: a message worth
     /// throwing away an in-flight request for.
@@ -183,7 +231,7 @@ impl Observations {
 pub(crate) fn boundary(
     sources: &[SourceKind],
     turn: Option<&ModelTurn>,
-    phase: &Phase,
+    available: Option<&Standing>,
     observations: &mut Observations,
     now: UnixMs,
 ) -> Boundary {
@@ -201,8 +249,8 @@ pub(crate) fn boundary(
         .max();
     // Rules 1 and 2. Exhaustive rather than a run of early returns, because
     // with those the precedence lived in the order they were written.
-    let standing = match phase {
-        Phase::Requesting(_) => {
+    let standing = match available {
+        None => {
             let preparing = sources
                 .iter()
                 .any(|source| matches!(source, SourceKind::Preparation { .. }));
@@ -220,10 +268,10 @@ pub(crate) fn boundary(
         }
         // `DECISION-stopped-agents-wait-for-fresh-input`. Nothing is observed
         // here either: a cancelled cell's last words start no clock.
-        Phase::Idle { standing, .. } if standing.stopped(fresh_input_at) => return NEVER,
+        Some(standing) if standing.stopped(fresh_input_at) => return NEVER,
         // What the next request owes is not itself a reason to make one, so
         // `owed` is never read here: only `standing` is.
-        Phase::Idle { standing, .. } => standing,
+        Some(standing) => standing,
     };
 
     if !matches!(standing, Standing::Retry { .. })
@@ -344,7 +392,10 @@ pub(crate) fn boundary(
                     pending.push((facts.cell, facts.registered_at.0, kind, end.at));
                 }
             }
-            SourceKind::User { .. } | SourceKind::Mail { .. } | SourceKind::Preparation { .. } => {}
+            SourceKind::Delivery
+            | SourceKind::User { .. }
+            | SourceKind::Mail { .. }
+            | SourceKind::Preparation { .. } => {}
         }
     }
     // Start each event's clock the first time it is seen from here, and stop
@@ -479,6 +530,12 @@ pub(crate) fn boundary(
             };
             event.deadline.map(|deadline| (deadline, trigger))
         }));
+    }
+    if sources
+        .iter()
+        .any(|source| matches!(source, SourceKind::Delivery))
+    {
+        candidates.push((now, WakeTrigger::Delivery));
     }
     candidates.extend(checkin_at.map(|at| (at, WakeTrigger::Checkin)));
 

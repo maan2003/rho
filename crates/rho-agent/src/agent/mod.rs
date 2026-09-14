@@ -11,7 +11,6 @@
 //!
 //! `specs/ARCH-rho-agent.md` has the shape and the invariants.
 
-pub(crate) mod boundary;
 mod context;
 mod notes;
 pub(crate) mod replay;
@@ -21,51 +20,44 @@ mod streaming;
 #[cfg(test)]
 mod tests;
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use rho_agent_tools::{FutureTool, SourceWaker, Tool, ToolSession};
+use rho_agent_tools::{PythonCell, ReplyState, SourceWaker};
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageDelivery, MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall,
-    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolUpdate, UnixMs,
+    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
-use rho_web_search::WebSearchTools;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use self::boundary::{Boundary, ModelAsked, ModelTurn, Observations, SourceKind, boundary};
+use crate::boundary::{
+    Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
+};
 use crate::db::{
-    AgentEventPos, AgentHead, AgentPresentationUpdate, AgentProfileWriteTxnExt as _,
+    AgentEventPos, AgentHead, AgentProfileWriteTxnExt as _,
     AgentReadTxnExt as _, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket,
     AgentUsageModel, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding, TurnEdge,
     TurnOutcome, UnixMillis,
 };
 use crate::lazy::Lazy;
-use crate::multi_agent_tools::{self, MultiAgentTools};
+use crate::multi_agent_tools::MultiAgentTools;
+use crate::native::NativeEvent;
+use crate::notebook::host_tools;
 use crate::pool::{AgentPool, AgentTurnCompleted};
-use crate::presentation::{self, Sidecar, SidecarMessage};
+
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
-    StartPlace, ToolPreview, View, assistant_text, final_answer_text, prompt,
+    StartPlace, ToolPreview, View, final_answer_text, prompt,
 };
 
 /// Whether the model's turn made a call it is waiting on. Only the notebook
 /// says anything about pacing, through `set_checkin` inside the call.
-fn asked_of(calls: &[ToolCall]) -> ModelAsked {
-    if calls.is_empty() {
-        ModelAsked::Nothing
-    } else {
-        ModelAsked::Calls
-    }
-}
 
 // -- what is waiting to reach the model -------------------------------------
 //
@@ -90,7 +82,7 @@ pub(crate) struct MailItem {
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
-    tools: BTreeMap<ToolName, Arc<dyn Tool>>,
+    notebook: Arc<rho_agent_tools::PythonNotebook>,
     prompt: PromptInputs,
 }
 
@@ -189,10 +181,6 @@ impl AgentHandle {
             .deep_config()
             .ok_or_else(|| anyhow::anyhow!("cannot create a Rho runtime for a Claude mode"))?;
         let model = mode.deep_model().expect("deep config implies a deep model");
-        anyhow::ensure!(
-            model != InferenceModel::Gemini37FlashLow,
-            "the Rho runtime does not support the reduced Antigravity transcript protocol"
-        );
         let prompt_cache_key = PromptCacheKey::generate();
         // One transaction spans agent id allocation and the record write.
         let mut write = db.write().await;
@@ -253,10 +241,6 @@ impl AgentHandle {
             .binding
             .deep_model()
             .expect("deep config implies a deep model");
-        anyhow::ensure!(
-            model != InferenceModel::Gemini37FlashLow,
-            "the Rho runtime does not support the reduced Antigravity transcript protocol"
-        );
         let parent = record.parent;
         let (_, events) = db.read().agent_events(agent_id);
         let replayed = replay::replay(events);
@@ -295,15 +279,7 @@ impl AgentHandle {
     ) -> Self {
         let session = inference.deep_session(profile, model, prompt_cache_key);
         let total_usage = db.read().agent_usage_total(agent_id);
-        let last_source = {
-            let records = db
-                .read()
-                .agent_presentation_source_tail(agent_id, crate::PRESENTATION_SOURCE_TAIL_BYTES);
-            crate::presentation_sources(agent_id, &records)
-                .last()
-                .map(|source| source.through)
-        };
-        let sidecar = Sidecar::new(inference.clone(), last_source);
+        let title = crate::title::Task::new(inference.clone());
         let surface_inputs = SurfaceInputs {
             view: Arc::clone(&view),
             agent_id,
@@ -323,7 +299,6 @@ impl AgentHandle {
             pool,
             surface: surface_inputs.lazy(role),
             model,
-            history: replayed.history,
             context: replayed.context,
             session,
             // The same phase a fresh agent starts in. Being loaded from a
@@ -336,7 +311,7 @@ impl AgentHandle {
             },
             user: replayed.user,
             mail: replayed.mail,
-            tools: BTreeMap::new(),
+            execs: BTreeMap::new(),
             observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: replayed.recovery_notes,
@@ -346,7 +321,7 @@ impl AgentHandle {
             turn: None,
             latest_python_exec: None,
             total_usage,
-            sidecar,
+            title,
             working: false,
             wake: Arc::new(Notify::new()),
             status: Arc::clone(&status),
@@ -506,11 +481,6 @@ impl AgentHandle {
 
     /// Whether anyone is looking at this agent; titles and activity are
     /// made only then.
-    pub(crate) fn set_watched(&self, watching: bool) {
-        let _ = self
-            .control
-            .send(Control::Presentation(SidecarMessage::Watch { watching }));
-    }
 
     /// Hand a command to the loop and wait for it to land. An error means
     /// the agent stopped before it got there.
@@ -551,7 +521,7 @@ enum Control {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    Presentation(SidecarMessage),
+    TitleFinished(Result<String, String>),
     /// Tell the live tail whole, for a client that just started looking.
     TellTail,
 }
@@ -578,99 +548,28 @@ pub(crate) enum Phase {
     /// calls nothing is going to answer, which after a restart is every call
     /// history left hanging (`SPEC-restart-recovery`). Ordinarily empty.
     Idle {
-        owed: Vec<ToolCall>,
+        owed: Vec<rho_core::ExecId>,
         standing: Standing,
     },
     /// A request is in flight, and nothing but an interrupt may disturb it.
     Requesting(InFlight),
 }
 
-/// The last thing to happen to an idle agent that bears on whether it should
-/// speak, and when it happened.
-///
-/// Facts rather than a verdict: what any of them is worth is `boundary`'s to
-/// say. Nothing here survives a restart.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Standing {
-    /// Nothing either way; the sources decide. The ordinary case, and what a
-    /// loaded agent always comes back as.
-    Nothing,
-    /// Somebody asked for a request the sources would not have made: a retry,
-    /// or a compaction that ate the turn the model still owed a reply to.
-    Asked,
-    Retry {
-        since: UnixMs,
-        failed_at: UnixMs,
-        attempts: u32,
-        compaction_owes_reply: bool,
-        error: Arc<str>,
-    },
-    /// The user cancelled at `at`, and nothing has been asked since.
-    Cancelled { at: UnixMs },
-    /// The request in flight then failed for good, saying `error`.
-    Failed { at: UnixMs, error: Arc<str> },
-}
-
-impl Standing {
-    /// Whether the agent is stopped, given the oldest thing the user has
-    /// queued.
-    ///
-    /// A stop waits for fresh input; a user message or peer mail after it lifts
-    /// it: `DECISION-stopped-agents-wait-for-fresh-input`. Derived from the
-    /// queue rather than recorded, because the queue already says it.
-    fn stopped(&self, fresh_input_at: Option<UnixMs>) -> bool {
-        match self {
-            Self::Nothing | Self::Asked | Self::Retry { .. } => false,
-            // A cancel empties the queues and a failed request had already
-            // drained them, so anything dated at or after the stop is somebody
-            // typing since. Anything older was already on its way.
-            Self::Cancelled { at } | Self::Failed { at, .. } => {
-                !fresh_input_at.is_some_and(|oldest| oldest >= *at)
-            }
-        }
-    }
-}
-
-/// Whether a call or one of its nested sources has been drained. The core
-/// owns this bookkeeping; what the source is doing is the tool's to report.
-/// For the outer call this also selects the provider's result/update shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolCallAnswer {
-    /// Still awaiting its first contribution at a request boundary.
-    Owed,
-    /// Already drained; subsequent output is an update.
-    Sent,
-}
-
 /// The notebook takes one cell per model response, and there is nothing else
 /// to call.
-fn validate_tool_calls(calls: &[ToolCall]) -> Result<(), &'static str> {
-    if calls.len() > 1 || calls.iter().any(|call| call.name.as_str() != "exec") {
-        Err("Python mode permits at most one exec call per model response; no calls were executed")
-    } else {
-        Ok(())
-    }
-}
-
 /// The core's bookkeeping for one call: which tool, how much of its story the
 /// model has, and since when it has been holding something. The output itself
 /// lives in the session, which is asked for it at every boundary.
-struct RunningTool {
-    call: ToolCall,
-    started_at: UnixMs,
-    session: Box<dyn ToolSession>,
-    answer: ToolCallAnswer,
+struct RunningExec {
+    call: rho_core::ExecCall,
+    first_block_at: UnixMs,
+    session: Box<PythonCell>,
+    answer: ReplyState,
 }
 
-impl RunningTool {
+impl RunningExec {
     fn output_order(&self, latest: Option<&ToolCallId>) -> (bool, u64) {
-        (
-            Some(&self.call.id) != latest,
-            self.session
-                .python_exec()
-                .map(|exec| exec.sequence())
-                .unwrap_or(0),
-        )
+        (Some(&self.call.id) != latest, self.session.sequence())
     }
 
     fn sources(&self) -> impl Iterator<Item = SourceKind> + '_ {
@@ -692,6 +591,7 @@ impl RunningTool {
 /// that call before the next boundary drains its output.
 #[derive(Clone, Default)]
 pub(crate) struct InFlight {
+    handoff: Vec<rho_core::ExecId>,
     pending: PendingInferenceResponse,
     /// The prior attempt's failure, displayed while its fresh continuation
     /// runs.
@@ -711,8 +611,8 @@ struct Agent {
     surface: Arc<Lazy<Surface>>,
     model: InferenceModel,
 
-    /// The transcript. Append-only, and this struct is its sole writer.
-    history: Vec<Arc<ContextBlock>>,
+    /// Live window policy; provider context itself is derived from the event
+    /// log.
     context: context::Window,
 
     session: InferenceSession,
@@ -724,7 +624,7 @@ struct Agent {
     /// Everyone's mail, in arrival order.
     mail: Vec<MailItem>,
     /// One entry per call the model has made and nothing has answered.
-    tools: BTreeMap<ToolCallId, RunningTool>,
+    execs: BTreeMap<ToolCallId, RunningExec>,
     /// When each pending event was first seen: the clocks the boundary's
     /// patiences run on.
     observations: Observations,
@@ -741,7 +641,7 @@ struct Agent {
     latest_python_exec: Option<(ToolCallId, Arc<rho_agent_tools::PythonExec>)>,
     /// Cumulative provider-reported usage across this agent's requests.
     total_usage: AgentUsageBucket,
-    sidecar: Sidecar,
+    title: crate::title::Task,
     /// Whether the last published state counted as a running turn, so the
     /// story is told once per edge.
     working: bool,
@@ -761,7 +661,6 @@ struct Agent {
 
 impl Drop for Agent {
     fn drop(&mut self) {
-        self.sidecar.abort();
     }
 }
 
@@ -852,7 +751,10 @@ impl Agent {
         boundary(
             &sources,
             self.turn.as_ref(),
-            &self.phase,
+            match &self.phase {
+                Phase::Idle { standing, .. } => Some(standing),
+                Phase::Requesting(_) => None,
+            },
             &mut self.observations,
             now,
         )
@@ -880,7 +782,7 @@ impl Agent {
         // What each call is, with nothing decided about it: every one of
         // these is something the tool observed, and what any of them is
         // worth is `boundary`'s business.
-        for tool in self.tools.values() {
+        for tool in self.execs.values() {
             let latest = self
                 .latest_python_exec
                 .as_ref()
@@ -893,7 +795,7 @@ impl Agent {
         // A quiet completed exec may leave the transcript session, but its
         // check-in remains authoritative for this model turn.
         if let Some((id, exec)) = &self.latest_python_exec
-            && !self.tools.contains_key(id)
+            && !self.execs.contains_key(id)
         {
             sources.push(SourceKind::Cell {
                 facts: exec.facts(),
@@ -910,7 +812,7 @@ impl Agent {
             && let Some(preparation) = &self.context.preparation
         {
             let returned = preparation.call.as_ref().is_none_or(|id| {
-                self.tools.get(id).is_none_or(|tool| {
+                self.execs.get(id).is_none_or(|tool| {
                     tool.session
                         .sources()
                         .iter()
@@ -941,7 +843,26 @@ impl Agent {
                     return;
                 };
                 match event {
-                    InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {}
+                    InferenceEvent::RequestSent => {
+                        let handed_off = std::mem::take(&mut in_flight.handoff);
+                        for id in handed_off {
+                            self.persist(AgentEvent::ExecObserved {
+                                id,
+                                milestone: rho_core::ExecMilestone::HandedOff,
+                                at: now,
+                            })
+                            .await;
+                        }
+                    }
+                    InferenceEvent::StreamingStarted => {}
+                    InferenceEvent::ExecArgumentsFinished { id } => {
+                        self.persist(AgentEvent::ExecObserved {
+                            id,
+                            milestone: rho_core::ExecMilestone::ArgumentsFinished,
+                            at: now,
+                        })
+                        .await;
+                    }
                     InferenceEvent::ContextItem { index, event } => {
                         in_flight.pending.apply(index, event);
                         if let Err(error) = self.update_stream(now).await {
@@ -959,12 +880,12 @@ impl Agent {
                         let partial = std::mem::take(&mut in_flight.pending);
                         let error = error.to_string();
                         let has_execution = self.abandon_stream(now).await;
-                        self.persist(AgentEvent::Failed {
+                        self.persist(AgentEvent::Native(NativeEvent::RequestFailed {
                             partial,
-                            error: Cow::Borrowed(&error),
+                            error: error.clone(),
                             retrying: true,
                             at: now,
-                        })
+                        }))
                         .await;
                         self.session.abort();
                         if has_execution {
@@ -1001,10 +922,22 @@ impl Agent {
                         provider_response_id,
                     } => {
                         let finished = in_flight.pending.finish();
+                        let exec = in_flight.stream.clone();
+                        if let Some(id) = exec {
+                            self.persist(AgentEvent::ExecObserved {
+                                id,
+                                milestone: rho_core::ExecMilestone::ResponseFinished,
+                                at: now,
+                            })
+                            .await;
+                        }
                         match finished {
                             // Finished streaming, but what arrived does not
                             // assemble into a response.
                             Err(error) => {
+                                let Phase::Requesting(in_flight) = &mut self.phase else {
+                                    unreachable!()
+                                };
                                 let partial = std::mem::take(&mut in_flight.pending);
                                 self.fail(now, partial, error.to_string()).await
                             }
@@ -1030,11 +963,11 @@ impl Agent {
                 self.tell(&kind);
             }
             Control::User(input, done) => {
-                let pos = self.persist(AgentEvent::Accepted(input.clone())).await;
+                self.persist(AgentEvent::Accepted(input.clone())).await;
                 if let InputKind::Message { content } = &input.kind
                     && !rho_core::text_content(content).trim().is_empty()
                 {
-                    self.source_committed(pos);
+                    self.name(&rho_core::text_content(content)).await;
                 }
                 // Queueing it is the whole of it. Whether this revives an
                 // agent that had stopped is `Standing::stopped`'s reading of
@@ -1051,7 +984,7 @@ impl Agent {
                 at,
                 done,
             } => {
-                let pos = self
+                self
                     .persist(AgentEvent::Accepted(QueuedInput {
                         source: MessageSender::Agent { id: sender },
                         kind: InputKind::Message {
@@ -1062,7 +995,7 @@ impl Agent {
                     }))
                     .await;
                 if !rho_core::text_content(&content).trim().is_empty() {
-                    self.source_committed(pos);
+                    self.name(&rho_core::text_content(&content)).await;
                 }
                 self.mail.push(MailItem {
                     sender,
@@ -1079,7 +1012,7 @@ impl Agent {
                 // does not kill tools, so a tool still chooses its own last
                 // words.
                 self.abandon_stream(now).await;
-                for tool in self.tools.values_mut() {
+                for tool in self.execs.values_mut() {
                     tool.session.cancel();
                 }
                 // A cancel is not an answer, so what is owed outlives it.
@@ -1117,7 +1050,7 @@ impl Agent {
             Control::Rewind { turns, reply } => {
                 let _ = reply.send(self.rewind(turns).await);
             }
-            Control::Presentation(message) => self.handle_presentation(message).await,
+            Control::TitleFinished(result) => crate::title::finish(&self.db, self.agent_id, result).await,
         }
     }
 
@@ -1129,12 +1062,12 @@ impl Agent {
         // A terminal failure must not leave an unreplied preparation gate
         // blocking fresh input or an explicit retry.
         self.context.preparation = None;
-        self.persist(AgentEvent::Failed {
+        self.persist(AgentEvent::Native(NativeEvent::RequestFailed {
             partial,
-            error: std::borrow::Cow::Borrowed(error.as_str()),
+            error: error.clone(),
             retrying: false,
             at: now,
-        })
+        }))
         .await;
         self.phase = Phase::Idle {
             owed: Vec::new(),
@@ -1162,7 +1095,7 @@ impl Agent {
             "{what} is not available with queued inputs"
         );
         anyhow::ensure!(
-            self.tools.is_empty() && !self.session.has_active_request(),
+            self.execs.is_empty() && !self.session.has_active_request(),
             "{what} is not available while work is running"
         );
         Ok(())
@@ -1223,9 +1156,6 @@ impl Agent {
         }
         if current.uses_notes_rotation() != role.uses_notes_rotation() {
             self.context.rotated();
-            self.history.push(Arc::new(ContextBlock::DeveloperMessage {
-                text: context::POLICY_CHANGED.into(),
-            }));
             // Same-model roles still change the developer instructions.
             self.session.abort();
         }
@@ -1265,7 +1195,6 @@ impl Agent {
         }
         let (_, events) = self.db.read().agent_events(self.agent_id);
         let replayed = replay::replay(events);
-        self.history = replayed.history;
         self.context = replayed.context;
         self.recovery_notes = replayed.recovery_notes;
         self.recovery_blocks = replayed.recovery_blocks;
@@ -1284,76 +1213,16 @@ impl Agent {
         self.session.abort();
         // A rewind is told, not undone: the last title and activity still
         // stand.
-        let last_source = {
-            let records = self.db.read().agent_presentation_source_tail(
-                self.agent_id,
-                crate::PRESENTATION_SOURCE_TAIL_BYTES,
-            );
-            crate::presentation_sources(self.agent_id, &records)
-                .last()
-                .map(|source| source.through)
-        };
-        self.sidecar.reset(last_source);
-        self.schedule_presentation();
-        if let Some(pool) = self.pool.upgrade() {
-            let head = self.db.read().get_agent(self.agent_id);
-            pool.publish_presentation_changed(self.agent_id, head.generated_title, head.activity);
-        }
         Ok(())
     }
 
-    // -- the presentation sidecar -------------------------------------------
-
-    fn source_committed(&mut self, through: AgentEventPos) {
-        self.sidecar.source_committed(through);
-        self.schedule_presentation();
-    }
-
-    fn schedule_presentation(&mut self) {
+    async fn name(&mut self, input: &str) {
         let control = self.control.clone();
-        self.sidecar
-            .schedule(self.db.clone(), self.agent_id, move |message| {
-                control
-                    .upgrade()
-                    .is_some_and(|control| control.send(Control::Presentation(message)).is_ok())
-            });
-    }
-
-    async fn handle_presentation(&mut self, message: SidecarMessage) {
-        match message {
-            SidecarMessage::Watch { watching } => {
-                if self.sidecar.watch(watching) {
-                    self.schedule_presentation();
-                }
+        self.title.start(&self.db, self.agent_id, input, move |result| {
+            if let Some(control) = control.upgrade() {
+                let _ = control.send(Control::TitleFinished(result));
             }
-            SidecarMessage::Started {
-                generation,
-                acknowledged,
-            } => {
-                let _ = acknowledged.send(self.sidecar.started(generation));
-            }
-            SidecarMessage::Finished { generation, result } => {
-                let Some(update) = self.sidecar.finished(generation, result) else {
-                    return;
-                };
-                if let Some(update) = update {
-                    self.persist_presentation(update).await;
-                }
-                self.schedule_presentation();
-            }
-        }
-    }
-
-    async fn persist_presentation(&mut self, update: AgentPresentationUpdate) {
-        let cache = {
-            let mut write = self.db.write().await;
-            let cache = write.apply_agent_presentation(UnixMillis::now(), self.agent_id, &update);
-            write.commit();
-            cache
-        };
-        if let (Some(cache), Some(pool)) = (cache, self.pool.upgrade()) {
-            pool.publish_presentation_changed(self.agent_id, cache.generated_title, cache.activity);
-        }
+        }).await;
     }
 
     // -- acting on it -------------------------------------------------------
@@ -1396,11 +1265,6 @@ impl Agent {
         } else {
             Arc::clone(&prompt.text)
         };
-        let tool_specs = surface
-            .tools
-            .values()
-            .map(|tool| tool.spec())
-            .collect::<Arc<[ToolSpec]>>();
         let notes_path = prompt.notes;
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
@@ -1421,18 +1285,19 @@ impl Agent {
             } => Some((*since, *attempts)),
             _ => None,
         };
-        let pending_compaction =
-            self.history
-                .iter()
-                .skip(rho_core::context_window_start(&self.history))
-                .rev()
-                .find_map(|block| match &**block {
-                    ContextBlock::CompactionTrigger => Some(true),
-                    ContextBlock::InferenceResponse { .. }
-                    | ContextBlock::ContextRotation { .. } => Some(false),
-                    _ => None,
-                })
-                .unwrap_or(false);
+        let history = self.provider_input();
+        let pending_compaction = history
+            .iter()
+            .skip(rho_core::context_window_start(&history))
+            .rev()
+            .find_map(|block| match &**block {
+                ContextBlock::CompactionTrigger => Some(true),
+                ContextBlock::InferenceResponse { .. } | ContextBlock::ContextRotation { .. } => {
+                    Some(false)
+                }
+                _ => None,
+            })
+            .unwrap_or(false);
         let manual = pending_compaction
             || self
                 .user
@@ -1471,7 +1336,7 @@ impl Agent {
                 })
             } else {
                 let failed = preparation.call.as_ref().is_some_and(|id| {
-                    self.tools.get(id).is_some_and(|tool| {
+                    self.execs.get(id).is_some_and(|tool| {
                         tool.session.sources().iter().any(|(_, source)| {
                         matches!(source, rho_agent_tools::SourceFacts::Cell(facts) if facts.failed)
                     })
@@ -1502,7 +1367,7 @@ impl Agent {
                 retain_from: self
                     .context
                     .marker
-                    .unwrap_or_else(|| self.context.fallback_start(&self.history))
+                    .unwrap_or_else(|| self.context.fallback_start(&history))
                     as u64,
                 repair: false,
             })
@@ -1518,14 +1383,16 @@ impl Agent {
             Phase::Requesting(_) => Vec::new(),
         };
         let delivered = self
-            .tools
+            .execs
             .iter()
             .filter(|(id, tool)| {
-                !preparing || tool.answer == ToolCallAnswer::Owed || preparation_call == Some(*id)
+                !preparing || tool.answer == ReplyState::Owed || preparation_call == Some(*id)
             })
             .map(|(id, _)| id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut blocks = std::mem::take(&mut self.recovery_blocks);
+        let mut blocks: Vec<ContextBlock> = std::mem::take(&mut self.recovery_blocks)
+            .into_iter()
+            .collect();
         if cancel_rotation {
             blocks.push(ContextBlock::DeveloperMessage {
                 text: context::MANUAL_COMPACTION.into(),
@@ -1533,24 +1400,19 @@ impl Agent {
         }
         self.collect_stream_notes(Some(&delivered));
         if !owed.is_empty() {
-            blocks.push(ContextBlock::ToolResults {
-                results: owed
-                    .iter()
-                    .map(|call| ToolResult {
-                        call_id: call.id.clone(),
-                        tool_type: call.tool_type,
-                        body: ToolOutput {
-                            full_output: None,
-                            images: std::sync::Arc::new(Vec::new()),
-                            output: Arc::new(String::new()),
-                            status: ToolOutputStatus::Cancelled,
-                        },
-                        started_at: now,
-                        finished_at: now,
-                        metadata: None,
-                    })
-                    .collect(),
-            });
+            blocks.extend(owed.iter().map(|id| {
+                rho_inference::exec::output(&rho_core::ExecOutput::Reply {
+                    id: id.clone(),
+                    body: ToolOutput {
+                        full_output: None,
+                        images: Default::default(),
+                        output: Arc::new(String::new()),
+                        status: ToolOutputStatus::Cancelled,
+                    },
+                    first_block_at: now,
+                    at: now,
+                })
+            }));
             // What the empty results cannot say themselves.
             blocks.push(ContextBlock::UserMessage {
                 sender: MessageSender::User,
@@ -1569,10 +1431,8 @@ impl Agent {
         // first contribution becomes its `ToolResult` and every later one a
         // `ToolUpdate`, because a provider accepts exactly one result per call
         // id: `REQ-provider-transcript-protocol`.
-        let mut results: Vec<ToolResult> = Vec::new();
-        let mut updates = Vec::new();
         let latest = self.latest_python_exec.as_ref().map(|(id, _)| id);
-        let mut tools = self.tools.values_mut().collect::<Vec<_>>();
+        let mut tools = self.execs.values_mut().collect::<Vec<_>>();
         tools.sort_by_key(|tool| tool.output_order(latest));
         for tool in tools {
             if !delivered.contains(&tool.call.id) {
@@ -1584,8 +1444,7 @@ impl Agent {
             // nothing yet. The facts are for `boundary` and are not read
             // here, nor is `done`, which is asked below.
             match tool.answer {
-                ToolCallAnswer::Owed => {
-                    tool.answer = ToolCallAnswer::Sent;
+                ReplyState::Owed => {
                     let mut body = tool.session.first_output();
                     if self
                         .streams
@@ -1602,51 +1461,27 @@ impl Agent {
                             body.output,
                         ));
                     }
-                    results.push(ToolResult {
-                        call_id: tool.call.id.clone(),
-                        tool_type: tool.call.tool_type,
+                    blocks.push(rho_inference::exec::output(&rho_core::ExecOutput::Reply {
+                        id: tool.call.id.clone(),
                         body,
-                        started_at: tool.started_at,
-                        // A result carries `finished_at`, so answering a call
-                        // that has already ended says both things at once.
-                        finished_at: now,
-                        metadata: None,
-                    });
+                        first_block_at: tool.first_block_at,
+                        at: now,
+                    }));
                 }
-                ToolCallAnswer::Sent => {
+                ReplyState::Sent => {
                     if let Some(output) = tool.session.more_output() {
-                        updates.push(ContextBlock::ToolUpdate(ToolUpdate {
-                            call_id: tool.call.id.clone(),
-                            tool_type: tool.call.tool_type,
-                            output: output.output,
-                            full_output: output.full_output,
+                        blocks.push(rho_inference::exec::output(&rho_core::ExecOutput::Report {
+                            id: tool.call.id.clone(),
+                            body: output,
                             at: now,
                         }));
                     }
                 }
             }
-            if tool.session.python_exec().is_some() {
-                if !results.is_empty() {
-                    blocks.push(ContextBlock::ToolResults {
-                        results: std::mem::take(&mut results),
-                    });
-                }
-                blocks.append(&mut updates);
-            }
         }
-        // Asked after the drain, so whatever a tool said last has been taken:
-        // a tool that answers `true` here has had its last chance to speak and
-        // is choosing not to want another. Nothing to record — a reaped call is
-        // one the transcript has finished talking about.
-        self.tools
-            .retain(|id, tool| !delivered.contains(id) || !tool.session.done());
         // Everything pending went into this request; the next event's clock
         // starts fresh.
         self.observations.clear();
-        if !results.is_empty() {
-            blocks.push(ContextBlock::ToolResults { results });
-        }
-        blocks.extend(updates);
         if !preparing {
             // One block per sender: several messages from the same peer collapse,
             // so a chatty one costs the model one block rather than five.
@@ -1701,7 +1536,7 @@ impl Agent {
             } else if self.context.marker.is_some() {
                 context::PREPARE.to_owned()
             } else {
-                context::fallback_notice(&self.history, *retain_from as usize)
+                context::fallback_notice(&history, *retain_from as usize)
             };
             blocks.push(ContextBlock::DeveloperMessage { text });
         } else if let Some(retain_from) = rotate {
@@ -1732,7 +1567,7 @@ impl Agent {
                 .is_some_and(|(limit, used)| used >= limit.saturating_sub(context::RETAIN_TOKENS))
         {
             change = Some(crate::ContextChange::Marked {
-                retain_from: (self.history.len() + blocks.len()) as u64,
+                retain_from: (history.len() + blocks.len()) as u64,
             });
             blocks.push(ContextBlock::DeveloperMessage {
                 text: context::MARKER.to_owned(),
@@ -1757,41 +1592,57 @@ impl Agent {
                     .any(|block| !matches!(block, ContextBlock::CompactionTrigger)
                         && !matches!(block, ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION)));
 
+        let handoff = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContextBlock::ToolResults { results } => Some(results),
+                _ => None,
+            })
+            .flatten().map(|result| result.call_id.clone())
+            .collect::<Vec<_>>();
+        for id in &handoff {
+            self.persist(AgentEvent::ExecObserved {
+                id: id.clone(),
+                milestone: rho_core::ExecMilestone::Boundary,
+                at: now,
+            })
+            .await;
+        }
+
         // The drain, the append and the send are one event because they are one
         // thing: a crash between them would leave a transcript nobody drained
         // into and a queue nobody emptied.
+        self.persist(AgentEvent::Native(NativeEvent::RequestStarted {
+            input: blocks,
+            context: change.clone(),
+            wake,
+            at: now,
+        }))
+        .await;
         if let Some(change) = &change {
-            self.persist(AgentEvent::ContextSent {
-                blocks: Cow::Borrowed(&blocks),
-                change: change.clone(),
-                at: now,
-                wake,
-            })
-            .await;
             self.context.sent(change);
-        } else {
-            self.persist(AgentEvent::Sent {
-                blocks: Cow::Borrowed(&blocks),
-                at: now,
-                wake,
-            })
-            .await;
         }
         if rotate.is_some() {
             self.context.rotated();
             self.context_used = None;
             self.session.abort();
         }
-        self.history.extend(blocks.into_iter().map(Arc::new));
+        for (id, exec) in &mut self.execs {
+            if delivered.contains(id) && exec.session.acknowledge_output() {
+                exec.answer = ReplyState::Sent;
+            }
+        }
+        self.execs
+            .retain(|id, exec| !delivered.contains(id) || !exec.session.done());
         self.acknowledge_streams(now, &delivered).await;
-        self.session.request_once(InferenceRequest {
+        self.session.request(InferenceRequest {
             instructions,
-            input: self.history.clone(),
+            input: self.provider_input(),
 
             agent_id_labels: Default::default(),
-            tools: tool_specs,
         });
         self.phase = Phase::Requesting(InFlight {
+            handoff,
             retry,
             previous_failure,
             compaction_owes_reply,
@@ -1826,37 +1677,18 @@ impl Agent {
         };
         self.context_used = context_used;
 
-        let calls: Vec<ToolCall> = items
-            .iter()
-            .filter_map(|item| match item {
-                InferenceResponseItem::ToolCall {
-                    id,
-                    name,
-                    tool_type,
-                    arguments,
-                    ..
-                } => Some(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    tool_type: *tool_type,
-                    arguments: arguments.clone(),
-                }),
-                _ => None,
-            })
-            .collect();
-        if let Err(error) = validate_tool_calls(&calls) {
-            self.fail(now, PendingInferenceResponse::default(), error.into())
-                .await;
-            return;
-        }
-        let final_text = calls.is_empty().then(|| final_answer_text(&items));
+        let call = match rho_inference::exec::call(&items) {
+            Ok(call) => call,
+            Err(error) => {
+                self.fail(now, PendingInferenceResponse::default(), error.into())
+                    .await;
+                return;
+            }
+        };
+        let final_text = call.is_none().then(|| final_answer_text(&items));
 
         let preparing = self.context.preparation.is_some();
         self.context.replied(&items);
-        let block = ContextBlock::InferenceResponse {
-            items,
-            provider_response_id,
-        };
         // What the response cost rides on the reply itself, so a reader
         // can price the transcript from the log alone.
         let turn_usage = usage.as_ref().map(|usage| AgentUsageBucket {
@@ -1871,24 +1703,14 @@ impl Agent {
             requests: 1,
             ..AgentUsageBucket::default()
         });
-        let pos = self
-            .persist(AgentEvent::Replied {
-                blocks: Cow::Borrowed(std::slice::from_ref(&block)),
+        self
+            .persist(AgentEvent::Native(NativeEvent::ResponseFinished {
+                output: vec![ContextBlock::InferenceResponse { items, provider_response_id }],
                 context_used,
                 usage: turn_usage.clone(),
                 at: now,
-            })
+            }))
             .await;
-        let spoke = match &block {
-            ContextBlock::InferenceResponse { items, .. } => {
-                !assistant_text(items).trim().is_empty()
-            }
-            _ => false,
-        };
-        if spoke {
-            self.source_committed(pos);
-        }
-        self.history.push(Arc::new(block));
 
         if let Some(turn_usage) = turn_usage {
             self.total_usage.add(&turn_usage);
@@ -1910,14 +1732,18 @@ impl Agent {
         self.latest_python_exec = None;
         self.turn = Some(ModelTurn {
             spoke_at: now,
-            asked: asked_of(&calls),
+            asked: if call.is_some() {
+                ModelAsked::Calls
+            } else {
+                ModelAsked::Nothing
+            },
         });
-        for call in calls {
+        if let Some(call) = call {
             if let Some(stream) = self.streams.get_mut(&call.id) {
                 stream.canonical = true;
                 self.latest_python_exec = Some((call.id.clone(), stream.exec.clone()));
             } else {
-                self.spawn_tool(call, now);
+                self.start_exec(call, now);
             }
         }
 
@@ -1945,90 +1771,39 @@ impl Agent {
                 })
                 .await;
             }
-            presentation::spawn_turn_report(
-                self.db.clone(),
-                self.pool.clone(),
-                self.sidecar.session(),
-                self.agent_id,
-                &final_text,
-            );
         }
     }
 
     // -- tools --------------------------------------------------------------
 
-    fn spawn_tool(&mut self, call: ToolCall, now: UnixMs) {
-        /// A session that is already over, so a call that fails before any work
-        /// starts reaches the model through exactly the same path as any other
-        /// tool output.
-        struct BornExited {
-            output: ToolOutput,
-            at: UnixMs,
-        }
-
-        impl ToolSession for BornExited {
-            fn sources(&self) -> Vec<(u64, rho_agent_tools::SourceFacts)> {
-                // A cell that failed on arrival: an error the model reads.
-                vec![(
-                    u64::MAX,
-                    rho_agent_tools::SourceFacts::Cell(rho_agent_tools::CellFacts {
-                        cell: u64::MAX,
-                        started: true,
-                        returned: Some(self.at),
-                        failed: true,
-                        output_since: Some(self.at),
-                        notified_at: None,
-                        checkin: None,
-                        foreground_cell: 0,
-                    }),
-                )]
-            }
-            fn done(&self) -> bool {
-                true
-            }
-
-            fn first_output(&mut self) -> ToolOutput {
-                self.output.clone()
-            }
-
-            fn more_output(&mut self) -> Option<ToolOutput> {
-                None
-            }
-
-            fn cancel(&mut self) {}
-        }
-
-        let tool = self
+    fn start_exec(&mut self, call: rho_core::ExecCall, now: UnixMs) {
+        let session = self
             .surface
             .get_if_ready()
-            .and_then(|surface| surface.tools.get(&call.name));
-        let session: Box<dyn ToolSession> = match tool {
-            Some(tool) => tool.run(call.clone(), SourceWaker::new(Arc::clone(&self.wake))),
-            None => Box::new(BornExited {
-                output: ToolOutput {
-                    full_output: None,
-                    images: std::sync::Arc::new(Vec::new()),
-                    output: Arc::new(format!("unknown tool: {}", call.name.as_str())),
-                    status: ToolOutputStatus::Error,
-                },
-                at: now,
-            }),
-        };
-        if let Some(exec) = session.python_exec() {
-            self.latest_python_exec = Some((call.id.clone(), exec));
-        }
-        self.tools.insert(
+            .expect("the notebook is initialized before inference")
+            .notebook
+            .exec(call.clone(), SourceWaker::new(Arc::clone(&self.wake)));
+        self.latest_python_exec = Some((call.id.clone(), session.execution()));
+        self.execs.insert(
             call.id.clone(),
-            RunningTool {
-                started_at: now,
+            RunningExec {
+                first_block_at: now,
                 call,
                 session,
-                answer: ToolCallAnswer::Owed,
+                answer: ReplyState::Owed,
             },
         );
     }
 
     // -- plumbing -----------------------------------------------------------
+
+    /// Provider context is a disposable projection of the committed event log.
+    /// Neither execution nor streaming maintains a second authoritative
+    /// transcript.
+    fn provider_input(&self) -> Vec<Arc<ContextBlock>> {
+        let (_, events) = self.db.read().agent_events(self.agent_id);
+        replay::replay(events).history
+    }
 
     /// Append to the raw log; the journal and every mirror follow from it.
     async fn persist(&mut self, event: AgentEvent<'_>) -> AgentEventPos {
@@ -2078,22 +1853,27 @@ impl Agent {
             // something queued is about to go: a turn is running.
             Phase::Idle { .. }
                 if self
-                    .tools
+                    .execs
                     .values()
-                    .any(|tool| tool.answer == ToolCallAnswer::Owed)
+                    .any(|tool| tool.answer == ReplyState::Owed)
                     || self.context.preparation.is_some()
                     || deadline.is_some() =>
             {
                 AgentStateKind::ToolCalling {
                     previews: self
-                        .tools
+                        .execs
                         .iter()
                         .map(|(id, tool)| {
                             (
                                 id.clone(),
                                 ToolPreview {
-                                    call: tool.call.clone(),
-                                    started_at: tool.started_at,
+                                    call: ToolCall {
+                                        id: tool.call.id.clone(),
+                                        name: ToolName::try_from("exec").unwrap(),
+                                        tool_type: rho_core::ToolType::Custom,
+                                        arguments: tool.call.source.clone(),
+                                    },
+                                    started_at: tool.first_block_at,
                                     metadata: None,
                                 },
                             )
@@ -2167,9 +1947,6 @@ impl Agent {
                 write.commit();
             }
             if !working {
-                // The activity throttle coalesces within a turn; the next
-                // turn's first update should not inherit this one's spacing.
-                self.sidecar.turn_settled();
                 if let Some(pool) = self.pool.upgrade() {
                     pool.settle_turn(self.agent_id).await;
                 }
@@ -2186,7 +1963,6 @@ fn usage_model(model: InferenceModel) -> AgentUsageModel {
         InferenceModel::Gpt6Astra => AgentUsageModel::ASTRA,
         InferenceModel::Gpt56Terra => AgentUsageModel::TERRA,
         InferenceModel::Gpt56Luna => AgentUsageModel::LUNA,
-        InferenceModel::Gemini37FlashLow => AgentUsageModel::GEMINI,
         _ => AgentUsageModel::GPT,
     }
 }
@@ -2216,12 +1992,12 @@ fn surface(
             async move { notes::directory(view.workset()) }
         })
     });
-    let tool: Arc<dyn Tool> = Arc::new(
-        rho_agent_tools::PythonTool::new(shell, others)
+    let notebook = Arc::new(
+        rho_agent_tools::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
     );
     Ok(Surface {
-        tools: BTreeMap::from([(tool.spec().name, tool)]),
+        notebook,
         prompt: PromptInputs {
             view,
             multi_agent,
@@ -2231,58 +2007,6 @@ fn surface(
     })
 }
 
-/// What every runtime's tools are built from: the shell, and the host
-/// functions Rho answers itself (images, collaboration, web search,
-/// papercuts). The native runtime lists them beside the shell or behind a
-/// code-mode `exec`; the Claude runtime serves them through its Python
-/// notebook. `inference` and `pool` may be absent for a rendering, which
-/// gets specs that cannot be called.
-pub(crate) fn host_tools(
-    view: &Arc<View>,
-    role: AgentRole,
-    agent_id: AgentId,
-    inference: Option<&Inference>,
-    multi_agent: Option<&MultiAgentTools>,
-    pool: &std::sync::Weak<AgentPool>,
-) -> (ShellTools, Vec<Arc<dyn FutureTool>>) {
-    let shell = ShellTools::new(
-        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        Arc::clone(view),
-    )
-    .with_env("RHO_AGENT_ID", agent_id.encoded());
-    let mut others: Vec<Arc<dyn FutureTool>> = vec![Arc::new(ImageTool(
-        crate::image_tool::ImageTools::new(Arc::clone(view)),
-    ))];
-    if let Some(multi_agent) = multi_agent {
-        others.extend(
-            multi_agent_tools::agent_tool_specs(role)
-                .into_iter()
-                .map(|spec| {
-                    Arc::new(AgentTool {
-                        tools: multi_agent.clone(),
-                        spec,
-                    }) as Arc<dyn FutureTool>
-                }),
-        );
-    }
-    others.push(match inference {
-        Some(inference) => Arc::new(WebSearchTools::new(
-            inference.clone(),
-            agent_id.encoded().to_owned(),
-        )),
-        // A rendering has no provider behind it; the spec is what it is for.
-        None => Arc::new(SpecOnly(rho_web_search::web_search_spec())),
-    });
-    others.push(match pool.upgrade() {
-        Some(pool) => Arc::new(crate::papercut::PapercutTool {
-            db: pool.db().clone(),
-            agent_id,
-        }),
-        None => Arc::new(SpecOnly(crate::papercut::PapercutTool::spec())),
-    });
-    (shell, others)
-}
-
 /// The model-facing surface of a role, for a reader: the prompt and the tool
 /// specs a new agent of that role would get, without a pool behind them.
 pub fn render_agent_surface(
@@ -2290,7 +2014,7 @@ pub fn render_agent_surface(
     role: AgentRole,
 ) -> anyhow::Result<crate::RenderedAgentSurface> {
     let binding = role.session_profile()?;
-    if binding.claude_python() {
+    if binding.claude_model().is_some() {
         let placeholder = AgentId::from_counter(1, &crate::db::AgentIdDomain(0))
             .expect("counter 1 is within prefix-id capacity");
         let (_, others) = host_tools(
@@ -2304,13 +2028,7 @@ pub fn render_agent_surface(
         let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         return Ok(crate::RenderedAgentSurface {
             system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role, Some(&specs)),
-            tools: Arc::from([crate::claude::python_host::exec_spec()]),
-        });
-    }
-    if binding.claude_model().is_some() {
-        return Ok(crate::RenderedAgentSurface {
-            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role, None),
-            tools: Arc::from([]),
+            tools: Arc::from([rho_claude::mcp::exec_spec()]),
         });
     }
     binding
@@ -2326,57 +2044,6 @@ pub fn render_agent_surface(
             role,
             &surface.prompt.host_specs,
         ),
-        tools: surface.tools.values().map(|tool| tool.spec()).collect(),
+        tools: Arc::from([rho_inference::exec::spec()]),
     })
-}
-
-/// A tool that exists only to be listed: calling it is an error.
-struct SpecOnly(ToolSpec);
-
-impl FutureTool for SpecOnly {
-    fn spec(&self) -> ToolSpec {
-        self.0.clone()
-    }
-
-    fn call(&self, _call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        let name = self.0.name.clone();
-        Box::pin(async move {
-            ToolOutput {
-                full_output: None,
-                images: std::sync::Arc::new(Vec::new()),
-                output: Arc::new(format!("{} is not available here", name.as_str())),
-                status: ToolOutputStatus::Error,
-            }
-        })
-    }
-}
-
-struct ImageTool(crate::image_tool::ImageTools);
-
-impl FutureTool for ImageTool {
-    fn spec(&self) -> ToolSpec {
-        crate::image_tool::ImageTools::spec()
-    }
-
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        let tools = self.0.clone();
-        Box::pin(async move { tools.call(call).await })
-    }
-}
-
-/// One of the collaboration tools, answered by the pool.
-struct AgentTool {
-    tools: MultiAgentTools,
-    spec: ToolSpec,
-}
-
-impl FutureTool for AgentTool {
-    fn spec(&self) -> ToolSpec {
-        self.spec.clone()
-    }
-
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        let tools = self.tools.clone();
-        Box::pin(async move { multi_agent_tools::call_agent_tool(tools, call).await })
-    }
 }

@@ -12,167 +12,40 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use base64::Engine as _;
-use rho_agent_tools::{PythonExec, PythonTool, SourceWaker, Tool, ToolSession};
-use rho_core::{
-    ToolCall, ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs,
-};
-use serde_json::{Value, json};
+use rho_agent_tools::{PythonCell, PythonExec, PythonNotebook, ReplyState, SourceWaker};
+use rho_claude::mcp::{reply, text_item, tool_result};
+#[cfg(test)]
+use rho_core::ToolOutputStatus;
+use rho_core::{ExecCall, ExecId, ToolOutput, ToolSpec, UnixMs};
+use serde_json::Value;
 use tokio::sync::Notify;
 
-use crate::agent::boundary::{Boundary, ModelAsked, ModelTurn, Observations, SourceKind, boundary};
-use crate::agent::{InFlight, Phase, Standing, ToolCallAnswer};
-
-/// The server's name in Claude Code, which is where the model's tool name
-/// `mcp__py__exec` comes from: Claude Code offers no other naming.
-pub(crate) const SERVER_NAME: &str = "py";
-pub(crate) const TOOL_NAME: &str = "exec";
-
-/// How long Claude Code lets one exec call stay open. Above the longest
-/// check-in a cell can ask for (an hour) with room for the patience around
-/// it, so the CLI never fails a call the boundary is holding on purpose.
-pub(crate) const EXEC_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
-
-const EXEC_DESCRIPTION: &str = "Run Python in Rho's persistent notebook. Returns once the cell \
-has something worth reporting (it returned, produced output, a check-in fired, or a message \
-arrived), with the output so far; cells keep running afterwards and later output is attached to \
-the next exec result.";
-
-/// The tool as a Rho spec, for renderings of the surface.
-pub(crate) fn exec_spec() -> ToolSpec {
-    ToolSpec {
-        name: ToolName::try_from(TOOL_NAME).expect("exec is a valid tool name"),
-        tool_type: ToolType::Function,
-        description: EXEC_DESCRIPTION.into(),
-        input_schema: exec_input_schema(),
-        format: None,
-    }
-}
-
-fn exec_input_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "source": { "type": "string", "description": "Python source to run as one cell." }
-        },
-        "required": ["source"],
-    })
-}
-
-/// The tool as MCP lists it. `anthropic/alwaysLoad` keeps it out of the
-/// deferred set should tool search ever be on after all.
-fn tool_listing() -> Value {
-    json!({
-        "name": TOOL_NAME,
-        "description": EXEC_DESCRIPTION,
-        "inputSchema": exec_input_schema(),
-        "_meta": { "anthropic/alwaysLoad": true },
-    })
-}
-
-/// What one JSON-RPC message from the CLI asks for.
-#[derive(Debug, PartialEq)]
-pub(crate) enum Rpc {
-    /// Answered on the spot.
-    Reply(Value),
-    /// A cell to run; the reply waits on the boundary.
-    Exec { id: Value, source: String },
-    /// A notification: nothing to say back beyond acknowledging the control
-    /// request.
-    Ignore,
-}
-
-/// Sorts one JSON-RPC message: the MCP handshake and listing are answered
-/// here, a call of `exec` is handed back to run.
-pub(crate) fn handle_rpc(message: &Value) -> Rpc {
-    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
-    let Some(id) = message.get("id").cloned() else {
-        return Rpc::Ignore;
-    };
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-    match method {
-        "initialize" => Rpc::Reply(reply(
-            id,
-            json!({
-                "protocolVersion": params
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .unwrap_or("2025-06-18"),
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "rho-python", "version": env!("CARGO_PKG_VERSION") },
-            }),
-        )),
-        "ping" => Rpc::Reply(reply(id, json!({}))),
-        "tools/list" => Rpc::Reply(reply(id, json!({ "tools": [tool_listing()] }))),
-        "tools/call" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            if name != TOOL_NAME {
-                return Rpc::Reply(error_reply(id, -32602, format!("unknown tool {name}")));
-            }
-            match params
-                .get("arguments")
-                .and_then(|arguments| arguments.get("source"))
-                .and_then(Value::as_str)
-            {
-                Some(source) => Rpc::Exec {
-                    id,
-                    source: source.to_owned(),
-                },
-                None => Rpc::Reply(reply(
-                    id,
-                    tool_result(
-                        vec![text_item("exec takes {\"source\": \"<python>\"}")],
-                        true,
-                    ),
-                )),
-            }
-        }
-        _ => Rpc::Reply(error_reply(
-            id,
-            -32601,
-            format!("method {method} is not supported"),
-        )),
-    }
-}
-
-fn reply(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
-}
-
-fn error_reply(id: Value, code: i64, message: String) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
-fn tool_result(content: Vec<Value>, is_error: bool) -> Value {
-    json!({ "content": content, "isError": is_error })
-}
-
-fn text_item(text: &str) -> Value {
-    json!({ "type": "text", "text": text })
-}
+use crate::boundary::{
+    Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
+};
 
 /// One exec call the CLI is waiting on.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PendingExec {
     /// The control request carrying the call, which the reply answers.
     pub request_id: String,
     /// The JSON-RPC id of the `tools/call`.
     pub rpc_id: Value,
+    pub exec_id: ExecId,
     cell: u64,
 }
 
 /// The core's bookkeeping for one cell, as the native runtime keeps it for a
 /// call: how much of its story the model has.
 struct Cell {
-    session: Box<dyn ToolSession>,
-    answer: ToolCallAnswer,
+    session: Box<PythonCell>,
+    answer: ReplyState,
 }
 
 /// One notebook, its cells, and the exec call (if any) the CLI is waiting on.
 pub(crate) struct PythonHost {
-    tool: PythonTool,
+    tool: PythonNotebook,
     /// The host functions the notebook exposes, for the prompt.
     host_specs: Vec<ToolSpec>,
     /// Woken by any cell with something new; the loop asks the boundary.
@@ -196,9 +69,9 @@ pub(crate) struct PythonHost {
 /// Everything waiting for the model at one boundary.
 pub(crate) struct Drained {
     /// The open call's own answer, when there was one.
-    pub own: Option<ToolOutput>,
+    pub own: Option<(ExecId, ToolOutput)>,
     /// What older cells have said since the model last looked.
-    pub updates: Vec<ToolOutput>,
+    pub updates: Vec<(ExecId, ToolOutput)>,
 }
 
 impl Drained {
@@ -206,47 +79,13 @@ impl Drained {
         self.own.is_none() && self.updates.is_empty()
     }
 
-    /// The MCP `tools/call` result carrying all of it.
     pub(crate) fn into_mcp_result(self) -> Value {
-        let mut content = Vec::new();
-        let mut is_error = false;
-        if let Some(own) = &self.own {
-            is_error = own.status == ToolOutputStatus::Error;
-            content.extend(output_items(own, None));
-        }
-        for update in &self.updates {
-            content.extend(output_items(
-                update,
-                Some("Later output from an earlier cell:\n"),
-            ));
-        }
-        tool_result(content, is_error)
+        rho_claude::mcp::exec_result(self.own.map(|(_, output)| output), self.updates)
     }
-}
-
-fn output_items(output: &ToolOutput, prefix: Option<&str>) -> Vec<Value> {
-    // A cell that answered with nothing because older cells speak in the
-    // same reply gets no item of its own; the older cells' items follow.
-    let mut items = Vec::new();
-    if prefix.is_some() || !output.output.is_empty() {
-        items.push(text_item(&format!(
-            "{}{}",
-            prefix.unwrap_or_default(),
-            output.output
-        )));
-    }
-    items.extend(output.images.iter().map(|image| {
-        json!({
-            "type": "image",
-            "data": base64::engine::general_purpose::STANDARD.encode(&image.data),
-            "mimeType": image.media_type,
-        })
-    }));
-    items
 }
 
 impl PythonHost {
-    pub(crate) fn new(tool: PythonTool, host_specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn new(tool: PythonNotebook, host_specs: Vec<ToolSpec>) -> Self {
         Self {
             tool,
             host_specs,
@@ -276,16 +115,16 @@ impl PythonHost {
         &mut self,
         request_id: String,
         rpc_id: Value,
+        exec_id: ExecId,
         source: String,
         now: UnixMs,
     ) -> Option<Value> {
-        if self.pending.is_some() {
+        if !self.can_admit() {
             return Some(reply(
                 rpc_id,
                 tool_result(
                     vec![text_item(
-                        "Python mode permits one exec call at a time; this call was not run. Wait \
-                         for the open call to return, then put the work in one cell.",
+                        "The notebook is stopped or already has an open exec reply; this call was not run.",
                     )],
                     true,
                 ),
@@ -293,29 +132,25 @@ impl PythonHost {
         }
         let cell = self.next_cell;
         self.next_cell += 1;
-        let call = ToolCall {
-            id: ToolCallId::try_from(format!("py-{cell}").as_str())
-                .expect("cell ids are valid identifiers"),
-            name: ToolName::try_from(TOOL_NAME).expect("exec is a valid tool name"),
-            tool_type: ToolType::Custom,
-            arguments: source,
+        let call = ExecCall {
+            id: exec_id.clone(),
+            source,
         };
         let session = self
             .tool
-            .run(call, SourceWaker::new(Arc::clone(&self.notify)));
-        if let Some(exec) = session.python_exec() {
-            self.latest = Some((cell, exec));
-        }
+            .exec(call, SourceWaker::new(Arc::clone(&self.notify)));
+        self.latest = Some((cell, session.execution()));
         self.cells.insert(
             cell,
             Cell {
                 session,
-                answer: ToolCallAnswer::Owed,
+                answer: ReplyState::Owed,
             },
         );
         self.pending = Some(PendingExec {
             request_id,
             rpc_id,
+            exec_id,
             cell,
         });
         self.turn = Some(ModelTurn {
@@ -378,6 +213,14 @@ impl PythonHost {
         sources
     }
 
+    pub(crate) fn can_admit(&self) -> bool {
+        self.pending.is_none() && !self.standing.stopped(None)
+    }
+
+    pub(crate) fn failed(&mut self, at: UnixMs, error: Arc<str>) {
+        self.standing = Standing::Failed { at, error };
+    }
+
     /// Whether an exec call is open, waiting on the boundary.
     pub(crate) fn has_pending(&self) -> bool {
         self.pending.is_some()
@@ -392,20 +235,17 @@ impl PythonHost {
         &mut self,
         available: bool,
         user_oldest_at: Option<UnixMs>,
+        retained_output: bool,
         now: UnixMs,
     ) -> Boundary {
-        let phase = if available {
-            Phase::Idle {
-                owed: Vec::new(),
-                standing: self.standing.clone(),
-            }
-        } else {
-            Phase::Requesting(InFlight::default())
-        };
+        let mut sources = self.sources(user_oldest_at);
+        if retained_output {
+            sources.push(SourceKind::Delivery);
+        }
         boundary(
-            &self.sources(user_oldest_at),
+            &sources,
             self.turn.as_ref(),
-            &phase,
+            available.then_some(&self.standing),
             &mut self.observations,
             now,
         )
@@ -413,7 +253,7 @@ impl PythonHost {
 
     /// Answers the open call with everything waiting.
     pub(crate) fn answer_pending(&mut self) -> Option<(PendingExec, Drained)> {
-        let pending = self.pending.take()?;
+        let pending = self.pending.clone()?;
         let drained = self.drain(Some(pending.cell));
         Some((pending, drained))
     }
@@ -436,27 +276,38 @@ impl PythonHost {
         for id in order {
             let cell = self.cells.get_mut(&id).expect("listed above");
             match cell.answer {
-                ToolCallAnswer::Owed => {
-                    cell.answer = ToolCallAnswer::Sent;
+                ReplyState::Owed => {
                     let output = cell.session.first_output();
                     if Some(id) == own {
-                        drained.own = Some(output);
+                        drained.own = Some((cell.session.execution().id().clone(), output));
                     } else {
-                        drained.updates.push(output);
+                        drained
+                            .updates
+                            .push((cell.session.execution().id().clone(), output));
                     }
                 }
-                ToolCallAnswer::Sent => {
+                ReplyState::Sent => {
                     if let Some(output) = cell.session.more_output() {
-                        drained.updates.push(output);
+                        drained
+                            .updates
+                            .push((cell.session.execution().id().clone(), output));
                     }
                 }
             }
         }
-        // Asked after the drain, so whatever a cell said last has been taken.
-        self.cells.retain(|_, cell| !cell.session.done());
-        // Everything pending went out; the next event's clock starts fresh.
-        self.observations.clear();
         drained
+    }
+
+    /// The transport (or durable outbox) now owns the leased contributions.
+    pub(crate) fn acknowledge(&mut self) {
+        for cell in self.cells.values_mut() {
+            if cell.session.acknowledge_output() {
+                cell.answer = ReplyState::Sent;
+            }
+        }
+        self.cells.retain(|_, cell| !cell.session.done());
+        self.pending = None;
+        self.observations.clear();
     }
 
     /// Stops every cell and forgets the open call, which the caller answers
@@ -481,58 +332,58 @@ impl PythonHost {
 mod tests {
     use super::*;
 
-    #[test]
-    fn lists_exec_as_always_loaded() {
-        let Rpc::Reply(reply) =
-            handle_rpc(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
-        else {
-            panic!("tools/list is answered on the spot");
-        };
-        assert_eq!(reply["id"], 1);
-        let tools = reply["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "exec");
-        assert_eq!(tools[0]["_meta"]["anthropic/alwaysLoad"], true);
-        assert_eq!(tools[0]["inputSchema"]["required"], json!(["source"]));
-    }
-
-    #[test]
-    fn hands_exec_calls_back_and_refuses_the_rest() {
-        assert_eq!(
-            handle_rpc(&json!({
-                "jsonrpc": "2.0", "id": "c1", "method": "tools/call",
-                "params": {"name": "exec", "arguments": {"source": "print(1)"}},
-            })),
-            Rpc::Exec {
-                id: json!("c1"),
-                source: "print(1)".into()
-            }
+    #[tokio::test]
+    async fn cancellation_refuses_buffered_exec_and_retained_output_can_answer_a_fresh_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let notebook = PythonNotebook::new(
+            rho_tool_shell::ShellTools::in_directory(
+                std::time::Duration::from_secs(5),
+                temp.path().to_str().unwrap().into(),
+                Default::default(),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut host = PythonHost::new(notebook, Vec::new());
+        host.cancel(UnixMs(10));
+        assert!(!host.can_admit());
+        assert!(
+            host.exec(
+                "late".into(),
+                serde_json::json!(1),
+                "late".try_into().unwrap(),
+                "raise AssertionError('must not run')".into(),
+                UnixMs(11)
+            )
+            .is_some()
         );
-        let Rpc::Reply(reply) = handle_rpc(&json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "exec", "arguments": {}},
-        })) else {
-            panic!("a call without source is answered on the spot");
-        };
-        assert_eq!(reply["result"]["isError"], true);
-        let Rpc::Reply(reply) = handle_rpc(&json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {"name": "other", "arguments": {}},
-        })) else {
-            panic!("an unknown tool is refused on the spot");
-        };
-        assert_eq!(reply["error"]["code"], -32602);
-        assert_eq!(
-            handle_rpc(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
-            Rpc::Ignore
+        assert!(host.cells.is_empty());
+        assert!(matches!(
+            host.decide(true, None, true, UnixMs(11)),
+            Boundary::No { recheck: None }
+        ));
+        host.user_spoke();
+        assert!(host.can_admit());
+        assert!(
+            host.exec(
+                "fresh".into(),
+                serde_json::json!(2),
+                "fresh".try_into().unwrap(),
+                "pass".into(),
+                UnixMs(12)
+            )
+            .is_none()
         );
-        let Rpc::Reply(reply) = handle_rpc(&json!({
-            "jsonrpc": "2.0", "id": 4, "method": "initialize",
-            "params": {"protocolVersion": "2024-11-05"},
-        })) else {
-            panic!("initialize is answered on the spot");
-        };
-        assert_eq!(reply["result"]["protocolVersion"], "2024-11-05");
+        assert!(matches!(
+            host.decide(true, None, true, UnixMs(12)),
+            Boundary::Now { .. }
+        ));
+        let (pending, drained) = host
+            .answer_pending()
+            .expect("retained output cannot block an open MCP reply");
+        assert_eq!(pending.exec_id.as_str(), "fresh");
+        assert!(drained.own.is_some());
+        host.acknowledge();
     }
 
     #[test]
@@ -548,8 +399,14 @@ mod tests {
             status,
         };
         let result = Drained {
-            own: Some(output("ran", ToolOutputStatus::Error)),
-            updates: vec![output("later", ToolOutputStatus::Success)],
+            own: Some((
+                "current".try_into().unwrap(),
+                output("ran", ToolOutputStatus::Error),
+            )),
+            updates: vec![(
+                "older".try_into().unwrap(),
+                output("later", ToolOutputStatus::Success),
+            )],
         }
         .into_mcp_result();
         assert_eq!(result["isError"], true);
@@ -558,13 +415,13 @@ mod tests {
         assert_eq!(content[0]["text"], "ran");
         assert_eq!(content[1]["type"], "image");
         assert_eq!(content[1]["data"], "AQID");
-        assert_eq!(
-            content[2]["text"],
-            "Later output from an earlier cell:\nlater"
-        );
+        assert_eq!(content[2]["text"], "Later output from exec older:\nlater");
         let result = Drained {
             own: None,
-            updates: vec![output("later", ToolOutputStatus::Error)],
+            updates: vec![(
+                "older".try_into().unwrap(),
+                output("later", ToolOutputStatus::Error),
+            )],
         }
         .into_mcp_result();
         assert_eq!(

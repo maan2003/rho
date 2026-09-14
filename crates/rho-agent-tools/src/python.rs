@@ -5,22 +5,23 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
+use rho_core::{
+    ExecCall, ExecId, ToolCall, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs,
+};
 use rho_python::{Event, Input, Sender, Session};
 use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools, decode_output_lossy};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::{Finished, FutureTool, JobEnd, SourceWaker, Tool, ToolSession, output};
+use crate::{FutureTool, JobEnd, SourceWaker, output};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
 
-pub struct PythonTool {
+pub struct PythonNotebook {
     session: Session,
     shared: Arc<Shared>,
-    spec: ToolSpec,
     runtime: tokio::runtime::Handle,
 }
 struct Shared {
@@ -372,7 +373,7 @@ Available tools:
     description
 }
 
-impl PythonTool {
+impl PythonNotebook {
     pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
         let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         let shared = Arc::new(Shared {
@@ -401,18 +402,11 @@ impl PythonTool {
         Ok(Self {
             session,
             shared,
-            spec: ToolSpec {
-                name: ToolName::try_from("exec").unwrap(),
-                tool_type: ToolType::Custom,
-                description: "Execute Python in the persistent notebook.".into(),
-                input_schema: Value::Null,
-                format: Some(rho_core::ToolFormat::Text),
-            },
             runtime,
         })
     }
 }
-impl Drop for PythonTool {
+impl Drop for PythonNotebook {
     fn drop(&mut self) {
         for cell in self.shared.cells.lock().unwrap().values() {
             let mut cell = cell.lock().unwrap();
@@ -424,19 +418,16 @@ impl Drop for PythonTool {
         }
     }
 }
-impl Tool for PythonTool {
-    fn spec(&self) -> ToolSpec {
-        self.spec.clone()
+impl PythonNotebook {
+    pub fn exec(&self, call: ExecCall, waker: SourceWaker) -> Box<PythonCell> {
+        self.start(call.id, Some(call.source), waker)
     }
-    fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession> {
-        self.start(Some(call.arguments), waker)
-    }
-    fn start_stream(&self, waker: SourceWaker) -> Option<Box<dyn ToolSession>> {
-        Some(self.start(None, waker))
+    pub fn start_stream(&self, id: ExecId, waker: SourceWaker) -> Box<PythonCell> {
+        self.start(id, None, waker)
     }
 }
-impl PythonTool {
-    fn start(&self, source: Option<String>, waker: SourceWaker) -> Box<dyn ToolSession> {
+impl PythonNotebook {
+    fn start(&self, id: ExecId, source: Option<String>, waker: SourceWaker) -> Box<PythonCell> {
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
             cell,
@@ -465,6 +456,7 @@ impl PythonTool {
             .unwrap()
             .insert(cell, Arc::clone(&link));
         let exec = Arc::new(PythonExec {
+            id,
             cell,
             link,
             shared: Arc::clone(&self.shared),
@@ -477,10 +469,12 @@ impl PythonTool {
             None => sender.stream(cell, exec.clone()),
         };
         if let Err(error) = result {
-            self.shared.cells.lock().unwrap().remove(&cell);
-            return Box::new(Finished::error(cell, error));
+            let mut state = exec.link.lock().unwrap();
+            state.fail(&error);
+            state.returned = Some(UnixMs::now());
+            state.finished = state.returned;
         }
-        Box::new(PythonCell(exec))
+        Box::new(PythonCell(exec, None))
     }
 }
 async fn resolve(sender: &Sender, request: u64, result: Result<Value, String>) {
@@ -846,6 +840,7 @@ async fn host_call(
     }
 }
 pub struct PythonExec {
+    id: ExecId,
     cell: u64,
     link: Arc<Mutex<ExecState>>,
     shared: Arc<Shared>,
@@ -853,6 +848,10 @@ pub struct PythonExec {
     runtime: tokio::runtime::Handle,
 }
 impl PythonExec {
+    pub fn id(&self) -> &ExecId {
+        &self.id
+    }
+
     pub fn stream_progress(&self) -> PythonStreamProgress {
         let state = self.link.lock().unwrap();
         PythonStreamProgress {
@@ -909,7 +908,7 @@ impl PythonExec {
         }
     }
 }
-struct PythonCell(Arc<PythonExec>);
+pub struct PythonCell(Arc<PythonExec>, Option<ToolOutput>);
 impl std::ops::Deref for PythonCell {
     type Target = PythonExec;
     fn deref(&self) -> &PythonExec {
@@ -1168,8 +1167,8 @@ impl PythonCell {
         Some(result)
     }
 }
-impl ToolSession for PythonCell {
-    fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+impl PythonCell {
+    pub fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
         use crate::{JobFacts, SourceFacts};
         // Keep the cell marker distinct from zero-based host request IDs.
         let mut sources = vec![(u64::MAX, SourceFacts::Cell(self.facts()))];
@@ -1206,19 +1205,31 @@ impl ToolSession for PythonCell {
         }));
         sources
     }
-    fn python_exec(&self) -> Option<Arc<PythonExec>> {
-        Some(self.0.clone())
+    pub fn execution(&self) -> Arc<PythonExec> {
+        self.0.clone()
     }
-    fn done(&self) -> bool {
-        self.link.lock().unwrap().delivered
+    pub fn done(&self) -> bool {
+        self.1.is_none() && self.link.lock().unwrap().delivered
     }
-    fn first_output(&mut self) -> ToolOutput {
-        self.render(true).unwrap()
+    /// Lease the first contribution. Repeated reads return this same snapshot
+    /// until its owner has committed or handed it off and acknowledges it.
+    pub fn first_output(&mut self) -> ToolOutput {
+        if self.1.is_none() {
+            self.1 = self.render(true);
+        }
+        self.1.clone().expect("a first contribution always exists")
     }
-    fn more_output(&mut self) -> Option<ToolOutput> {
-        self.render(false)
+    pub fn more_output(&mut self) -> Option<ToolOutput> {
+        if self.1.is_none() {
+            self.1 = self.render(false);
+        }
+        self.1.clone()
     }
-    fn cancel(&mut self) {
+    /// Release a leased contribution only after its recipient owns it.
+    pub fn acknowledge_output(&mut self) -> bool {
+        self.1.take().is_some()
+    }
+    pub fn cancel(&mut self) {
         self.sender.cancel(self.cell);
         self.link.lock().unwrap().cancelled.send_replace(true);
         for job in &self.link.lock().unwrap().jobs {

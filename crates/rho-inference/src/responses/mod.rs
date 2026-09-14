@@ -16,7 +16,6 @@ mod ws;
 pub use oauth::{InferenceAuth, ResolvedOAuth};
 pub use route::InferenceRouteProbe;
 pub(crate) use route::RouteSelector;
-pub(crate) use session::transient_backoff;
 pub use session::{InferenceSession, PromptCacheKey};
 pub use wire::OpenAiResponsesProviderData;
 pub(crate) use wire::QuotaUpdate;

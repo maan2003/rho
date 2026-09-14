@@ -14,6 +14,7 @@ use super::{
 
 fn ran(command: &str) -> UiBlock {
     UiBlock::Tool(UiTool {
+        timing: Default::default(),
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: serde_json::json!({ "command": command }).to_string(),
@@ -82,5 +83,34 @@ fn a_command_with_a_blank_line_keeps_its_own_buffer(cx: &mut TestAppContext) {
     assert_eq!(
         languageless, 1,
         "a call a code span cannot hold was left in a markdown buffer"
+    );
+}
+
+#[gpui::test]
+fn exec_provider_phases_reach_the_editor_without_execution_duration(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let UiBlock::Tool(mut tool) = ran("pass") else {
+        unreachable!()
+    };
+    tool.name = "exec".into();
+    tool.arguments = "print('hello')".into();
+    tool.timing = rho_core::ExecTiming {
+        first_block_at: Some(rho_core::UnixMs(100)),
+        arguments_finished_at: Some(rho_core::UnixMs(2100)),
+        response_finished_at: Some(rho_core::UnixMs(2600)),
+        boundary_at: Some(rho_core::UnixMs(5600)),
+        handed_off_at: Some(rho_core::UnixMs(5620)),
+    };
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(Vec::new(), vec![user("go"), UiBlock::Tool(tool)]),
+    );
+    cx.run_until_parked();
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("args 2s response 500ms wait 3s handoff 20ms"),
+        "{text:?}"
     );
 }

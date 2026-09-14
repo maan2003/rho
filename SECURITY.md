@@ -21,12 +21,6 @@ AI APIs.
   minutes.
   Only namespace names, percentages, and reset times are persisted or sent to
   clients; provider account identifiers remain memory-only.
-- The explicit `eng-gemini` mode reads one separate Antigravity credential file
-  under `auth.d/antigravity/`; it is never scanned as a ChatGPT namespace or
-  considered by ChatGPT routing. Its refresh token, access token, and Google
-  project id remain daemon-side. GenerateContent responses are capped at 8 MiB,
-  HTTP/error text is bounded, and dropping or aborting the session cancels its
-  request/retry task.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
 - Authenticated clients and view-aware tools may supply image files. Rho accepts
@@ -693,8 +687,23 @@ Tests cover validation, concurrent appends, and reopening the database.
 ## Python code mode (`rho-python`, `rho-agent-tools`)
 
 Every role works in the Python notebook: native agents have it as their only
-tool, and Claude engineers get it as an in-process MCP server with Claude's
+tool, and all Claude roles get it as an in-process MCP server with Claude's
 own tools denied.
+
+- Native and Claude runtimes admit at most one new Python exec per provider
+  response. The provider call ID is the notebook execution ID; Claude's MCP
+  transport IDs are not execution identities. Missing provider identity is
+  rejected, not guessed. Admission commits before source evaluation and remains
+  effective after transcript rewind. Retrying a transport must not replay admitted
+  source; this does not claim external effects are transactional.
+- Output reads lease a stable snapshot. Native request records and Claude output
+  batches commit before those leases are acknowledged or cells reaped. Claude
+  records transport handoff separately; after a crash in the handoff gap it may
+  repeat an attributed report, never execute its source again. A successful write
+  is not evidence of remote consumption. This output guarantee does not make
+  ordinary Claude user/mail input durable.
+- Exec timing describes provider and handoff milestones, not Python execution
+  completion or proof of external effects.
 
 - Model-authored Python runs in-process on a dedicated RustPython thread, with
   persistent globals and cooperative top-level-await cells. The crate boundary

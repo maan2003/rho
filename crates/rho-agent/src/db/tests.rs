@@ -373,21 +373,10 @@ fn agent_role_resolves_opinionated_bindings() {
     );
     for intelligence in [EngineerIntelligence::Ultra, EngineerIntelligence::Alt] {
         assert!(
-            profile(intelligence).claude_python(),
+            profile(intelligence).claude_model().is_some(),
             "every Claude engineer works in the Python notebook"
         );
     }
-    assert!(matches!(
-        profile(EngineerIntelligence::Gemini),
-        SessionBinding::AntigravityFlashLow(InferenceProfile {
-            effort: ReasoningEffort::Medium,
-            fast_mode: false,
-        })
-    ));
-    assert_eq!(
-        profile(EngineerIntelligence::Gemini).deep_model(),
-        Some(InferenceModel::Gemini37FlashLow)
-    );
     assert!(matches!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::High,
@@ -778,58 +767,11 @@ async fn a_rewind_hides_rows_and_is_itself_visible() {
         Some(user_event("old branch"))
     );
     // The tail walk backward skips it too.
-    let tail = read
-        .agent_presentation_source_tail(agent_id, usize::MAX)
-        .into_iter()
-        .map(|(pos, _)| pos.pos)
-        .collect::<Vec<_>>();
-    assert_eq!(tail, [1, 4]);
+
 }
 
 #[tokio::test]
-async fn a_presentation_update_is_rejected_when_its_source_was_rewound_away() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = create(&mut write, None, None);
-    let first = write.append_agent_event(agent_id, &user_event("first"));
-    let second = write.append_agent_event(agent_id, &user_event("later"));
-    let update = AgentPresentationUpdate {
-        generated_title: PresentationField::Set("first-subject".to_owned()),
-        activity: PresentationField::Set("reading first request".to_owned()),
-        through: first,
-    };
-    assert!(
-        write
-            .apply_agent_presentation(UnixMs(2), agent_id, &update)
-            .is_some()
-    );
-    write.append_agent_event(agent_id, &user_event("even later"));
-
-    write.rewind_agent(UnixMs(3), agent_id, second);
-
-    // A completion based on the discarded input cannot write after the
-    // rewind, even if it reaches the serialized loop late.
-    let stale = AgentPresentationUpdate {
-        generated_title: PresentationField::Set("discarded".to_owned()),
-        activity: PresentationField::Unchanged,
-        through: second,
-    };
-    assert!(
-        write
-            .apply_agent_presentation(UnixMs(4), agent_id, &stale)
-            .is_none()
-    );
-    write.commit();
-
-    let record = db.read().get_agent(agent_id);
-    assert_eq!(record.generated_title.as_deref(), Some("first-subject"));
-    assert_eq!(record.activity.as_deref(), Some("reading first request"));
-}
-
-#[tokio::test]
-async fn the_head_folds_title_activity_turns_and_user_contact() {
+async fn the_head_folds_title_turns_and_user_contact() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
@@ -840,9 +782,8 @@ async fn the_head_folds_title_activity_turns_and_user_contact() {
     write.tell_turn(UnixMs(2), child, TurnEdge::Started);
     write.append_agent_event(
         child,
-        &AgentEvent::Presented {
-            title: PresentationField::Set("story-log".to_owned()),
-            activity: PresentationField::Set("writing the fold".to_owned()),
+        &AgentEvent::Titled {
+            title: Some("story-log".to_owned()),
             at: UnixMs(3),
         },
     );
@@ -852,7 +793,7 @@ async fn the_head_folds_title_activity_turns_and_user_contact() {
     // The spawner's name beats the sidecar's title.
     assert_eq!(head.title(), Some("named"));
     assert_eq!(head.generated_title.as_deref(), Some("story-log"));
-    assert_eq!(head.activity.as_deref(), Some("writing the fold"));
+    assert!(head.title_attempted);
     assert!(head.turn_running);
     assert!(!head.user_interacted);
     assert_eq!(head.last_turn_ended, None);
@@ -947,4 +888,174 @@ fn notes_role_has_high_model_and_effort_but_a_distinct_binding() {
         senax_encoder::unpack::<SessionBinding>(&mut packed).unwrap(),
         notes_binding
     );
+}
+
+#[tokio::test]
+async fn rewind_cannot_erase_exec_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = create(&mut write, None, None);
+    let exec = rho_core::ExecCall {
+        id: "once".try_into().unwrap(),
+        source: "side_effect()".into(),
+    };
+    write.append_agent_event(
+        agent_id,
+        &AgentEvent::ClaudeExecAdmitted {
+            call: exec.clone(),
+            at: UnixMs(1),
+        },
+    );
+    write.rewind_agent(UnixMs(2), agent_id, AgentEventPos::new(1));
+    write.commit();
+    assert!(db.read().agent_exec_was_admitted(agent_id, &exec.id));
+    assert!(
+        !db.read()
+            .agent_events(agent_id)
+            .1
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ClaudeExecAdmitted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn claude_output_survives_restart_and_rewind_until_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rho.redb");
+    let mut batch = crate::ClaudeOutputBatch {
+        id: uuid::Uuid::new_v4(),
+        outputs: vec![(
+            "exec-once".try_into().unwrap(),
+            rho_core::ToolOutput {
+                output: std::sync::Arc::new("already ran".into()),
+                full_output: None,
+                images: Default::default(),
+                status: rho_core::ToolOutputStatus::Success,
+            },
+        )],
+        wake: crate::WakeFacts::interrupt(),
+        at: UnixMs(2),
+    };
+    let agent_id = {
+        let db = RhoDb::open(&path);
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let id = create(&mut write, None, None);
+        write.append_agent_event(
+            id,
+            &AgentEvent::ClaudeOutput {
+                batch: batch.clone(),
+            },
+        );
+        // An interrupted handoff is replaced only by a batch owning both
+        // the retained contribution and the fresh exec's output.
+        batch.id = uuid::Uuid::new_v4();
+        batch.outputs.push((
+            "exec-fresh".try_into().unwrap(),
+            rho_core::ToolOutput {
+                output: std::sync::Arc::new("new output".into()),
+                ..batch.outputs[0].1.clone()
+            },
+        ));
+        write.append_agent_event(
+            id,
+            &AgentEvent::ClaudeOutput {
+                batch: batch.clone(),
+            },
+        );
+        write.rewind_agent(UnixMs(3), id, AgentEventPos::new(1));
+        write.commit();
+        id
+    };
+    let db = RhoDb::open(&path);
+    assert_eq!(
+        db.read().agent_pending_claude_output(agent_id),
+        Some(batch.clone())
+    );
+    let mut write = db.write().await;
+    write.append_agent_event(
+        agent_id,
+        &AgentEvent::ClaudeOutputHandedOff {
+            id: batch.id,
+            at: UnixMs(4),
+        },
+    );
+    write.commit();
+    assert_eq!(db.read().agent_pending_claude_output(agent_id), None);
+    drop(db);
+    assert_eq!(
+        RhoDb::open(&path)
+            .read()
+            .agent_pending_claude_output(agent_id),
+        None
+    );
+}
+
+#[tokio::test]
+async fn native_later_image_survives_reopen_and_provider_projection() {
+    use rho_core::{ContextBlock, ExecOutput, ToolOutput, ToolOutputStatus};
+
+    use crate::native::NativeEvent;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rho.redb");
+    let first = ToolOutput {
+        output: std::sync::Arc::new("running".into()),
+        images: Default::default(),
+        full_output: None,
+        status: ToolOutputStatus::Success,
+    };
+    let image = rho_core::ImageContent {
+        media_type: "image/png".into(),
+        data: vec![1, 2, 3],
+        detail: rho_core::ImageDetail::Original,
+    };
+    let later = ToolOutput {
+        output: std::sync::Arc::new("later".into()),
+        images: std::sync::Arc::new(vec![image.clone()]),
+        ..first.clone()
+    };
+    let agent = {
+        let db = RhoDb::open(&path);
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let id = create(&mut write, None, None);
+        for output in [
+            ExecOutput::Reply {
+                id: "exec-1".try_into().unwrap(),
+                body: first,
+                first_block_at: UnixMs(1),
+                at: UnixMs(2),
+            },
+            ExecOutput::Report {
+                id: "exec-1".try_into().unwrap(),
+                body: later,
+                at: UnixMs(3),
+            },
+        ] {
+            write.append_agent_event(
+                id,
+                &AgentEvent::Native(NativeEvent::RequestStarted {
+                    input: vec![rho_inference::exec::output(&output)],
+                    context: None,
+                    wake: None,
+                    at: UnixMs(3),
+                }),
+            );
+        }
+        write.commit();
+        id
+    };
+    let db = RhoDb::open(&path);
+    let (_, events) = db.read().agent_events(agent);
+    let native = events.last().unwrap().native_event().unwrap();
+    let NativeEvent::RequestStarted { input, .. } = native else {
+        panic!("request")
+    };
+    let ContextBlock::ToolUpdate(update) = input[0].clone() else {
+        panic!("later output must not be another result")
+    };
+    assert_eq!(update.images.as_ref(), &[image]);
+    assert_eq!(update.output.as_str(), "later");
 }

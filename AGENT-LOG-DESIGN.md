@@ -7,6 +7,23 @@ reference for the user's facts; this is the daemon's side of the same
 idea: an agent is an append-only log the daemon owns, and everything
 else about it is derived.
 
+## Current runtime ownership
+
+Native conversation authority is `AgentEvent::Native(NativeEvent)`, not an
+independently mutated block history. Provider input, restart recovery, and GUI
+presentation are projections. Earlier block-shaped records are decoded at the
+read boundary. Claude Code owns its own conversation and compaction; Rho's Claude
+records are observations, admission evidence, and an output outbox, not a native
+conversation imposed on the CLI.
+
+Execution admission and pending output are external-effects facts and survive
+conversation rewind. Notebook output is acknowledged only after durable ownership
+transfer. Provider timing observations are shared read-only presentation for both
+runtimes, never execution-duration evidence.
+
+The store evolution below is historical design context; current runtime
+responsibilities are specified in `crates/rho-agent/specs/ARCH-rho-agent.md`.
+
 ## The problem
 
 The daemon keeps five things per agent: an `AgentRecord` (role,

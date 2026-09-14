@@ -1,0 +1,201 @@
+{
+  "cli_version": "2.1.72",
+  "description": "Real Claude Code SDK forwarding against a local synthetic Anthropic response (no live inference).",
+  "events": [
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "id": "msg_trace_0",
+          "type": "message",
+          "role": "assistant",
+          "model": "claude-sonnet-4-6",
+          "content": [],
+          "stop_reason": null,
+          "stop_sequence": null,
+          "usage": {
+            "input_tokens": 100,
+            "output_tokens": 20
+          }
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "2a2db4c6-7d58-4740-8839-02b5b707567f"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "tool_use",
+          "id": "toolu_trace_exec_1",
+          "name": "mcp__py__exec",
+          "input": {}
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "1146c216-399d-4f0e-bd3b-85d1c1b18dcc"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "input_json_delta",
+          "partial_json": "{\"source\": \"print(42)\"}"
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "74baa98d-f07c-4196-9081-a5f189ebb771"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_stop",
+        "index": 0
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "f26233bd-f456-49a5-a0fe-25fa0e42eeb2"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "tool_use",
+          "stop_sequence": null
+        },
+        "usage": {
+          "output_tokens": 20
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "6e5e9658-75d7-4280-929d-83e242ca7497"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_stop"
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "2096767f-c89a-46d6-a868-dc8fc8b9fdbf"
+    },
+    {
+      "type": "control_request",
+      "request_id": "10b5e940-6cf4-44b5-856d-d8d3489878c2",
+      "request": {
+        "subtype": "mcp_message",
+        "server_name": "py",
+        "message": {
+          "method": "tools/call",
+          "params": {
+            "name": "exec",
+            "arguments": {
+              "source": "print(42)"
+            },
+            "_meta": {
+              "claudecode/toolUseId": "toolu_trace_exec_1",
+              "progressToken": 2
+            }
+          },
+          "jsonrpc": "2.0",
+          "id": 2
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_start",
+        "message": {
+          "id": "msg_trace_1",
+          "type": "message",
+          "role": "assistant",
+          "model": "claude-sonnet-4-6",
+          "content": [],
+          "stop_reason": null,
+          "stop_sequence": null,
+          "usage": {
+            "input_tokens": 100,
+            "output_tokens": 20
+          }
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "7bebb47e-4a21-4cfe-8924-4e2ab8e3e580"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "text",
+          "text": ""
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "12f5d5f8-832f-4701-8080-ba792b76e415"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "text_delta",
+          "text": "Done."
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "9f830eed-ec3e-4228-a5b7-a9d688919324"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "content_block_stop",
+        "index": 0
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "18381701-5133-4540-81d2-a3a8041505b3"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn",
+          "stop_sequence": null
+        },
+        "usage": {
+          "output_tokens": 20
+        }
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "daf10ab3-434b-4df2-a24c-625006f7761a"
+    },
+    {
+      "type": "stream_event",
+      "event": {
+        "type": "message_stop"
+      },
+      "session_id": "0a9bb1fb-5d71-4743-bfdb-51fa12519289",
+      "parent_tool_use_id": null,
+      "uuid": "b64b0153-2f40-47db-bed1-bd0ae53a3f17"
+    }
+  ]
+}

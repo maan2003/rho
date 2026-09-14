@@ -3,8 +3,7 @@
 `rho-inference` is a library crate for inference provider integrations. Its
 Responses module builds request bodies from `rho-core` inference requests,
 opens ChatGPT/Codex WebSockets, parses streamed inference events, and manages
-file-backed OAuth credentials. Its reduced Antigravity module sends bounded
-GenerateContent requests for the explicit Gemini agent mode.
+file-backed OAuth credentials.
 
 ## Runtime and trust boundaries
 
@@ -14,8 +13,6 @@ GenerateContent requests for the explicit Gemini agent mode.
   semi-trusted inputs.
 - OAuth credential JSON files contain bearer and refresh tokens and must be
   treated as secrets.
-- Antigravity additionally stores a Google project id and uses embedded OAuth
-  application credentials to refresh its manually supplied refresh token.
 - Provider debug files under the rho state directory can contain full request
   bodies, tool results, and raw provider events. They must not include auth
   headers or OAuth tokens, but should still be treated as transcript-sensitive
@@ -64,9 +61,6 @@ GenerateContent requests for the explicit Gemini agent mode.
   operations need explicit timeout/cancellation behavior.
 - Unbounded memory/task growth: inference streams should apply backpressure and
   stop promptly when the returned stream is dropped.
-- Antigravity HTTP requests have a five-minute timeout, an 8 MiB response cap,
-  bounded error text, and cancellable task ownership. Transient transport,
-  429, and 5xx failures use the existing bounded retry schedule.
 - Transient provider/transport stream failures (for example overload, rate
   limit, and mid-turn WebSocket loss) are retried in the active turn for up to
   eight hours with jittered Fibonacci backoff capped at 30 minutes before
@@ -99,9 +93,6 @@ GenerateContent requests for the explicit Gemini agent mode.
   Late results from dropped calls become standalone named outputs, preserving
   images without emitting orphan call ids. Tests cover retained call/result pairs,
   late output projection, pre-activation cache rejection, and post-activation chaining.
-- Antigravity rejects rotation items, developer notices, images, custom tools, tool updates, and compaction before
-  network I/O. Remote function names and ids pass through validated `rho-core`
-  types, while thought signatures persist as tagged opaque provider data.
 
 Future changes touching credentials, WebSocket pooling, stream task lifecycle,
 event parsing, prompt-cache/thread ids, or replay behavior must update this file

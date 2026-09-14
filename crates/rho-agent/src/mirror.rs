@@ -2,7 +2,9 @@
 //! a client keeps of it, and the journal observer that tells the daemon
 //! about every append after it commits (`AGENT-LOG-DESIGN.md`).
 
-use rho_core::{AgentId, ContextBlock, InferenceResponseItem, MessageSender, UnixMs};
+#[cfg(test)]
+use rho_core::ContextBlock;
+use rho_core::{AgentId, InferenceResponseItem, MessageSender, UnixMs};
 use rho_db::RhoDb;
 use rho_ui_proto::mirror::{
     AgentPos, Live, LogEntry, MirrorEvent, RuntimeKind, Seq, SpawnedBy, ToolCallLine, ToolLine,
@@ -10,6 +12,7 @@ use rho_ui_proto::mirror::{
 };
 
 use crate::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
+use crate::PresentationField;
 use crate::{AgentEvent, InputKind, QueuedInput};
 
 /// One row, the moment it became durable. `event` is `None` for the rows
@@ -120,6 +123,66 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
     {
         return None;
     }
+    if let Some(native) = event.native_event() {
+        use crate::native::NativeEvent;
+        return match native {
+            NativeEvent::RequestStarted {
+                input, context, at, ..
+            } => {
+                let results = input
+                    .iter()
+                    .flat_map(|item| match item {
+                        rho_core::ContextBlock::ToolResults { results } => {
+                            results.iter().map(tool_outcome).collect::<Vec<_>>()
+                        }
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                Some(
+                    if matches!(context, Some(crate::ContextChange::Preparing { .. })) {
+                        MirrorEvent::Results { results, at: *at }
+                    } else {
+                        MirrorEvent::Sent {
+                            results,
+                            compaction: input.iter().any(|item| {
+                                matches!(
+                                    item,
+                                    rho_core::ContextBlock::CompactionTrigger | rho_core::ContextBlock::ContextRotation { .. }
+                                )
+                            }),
+                            at: *at,
+                        }
+                    },
+                )
+            }
+            NativeEvent::ResponseFinished {
+                output,
+                context_used,
+                usage: cost,
+                at,
+                ..
+            } => Some(replied(
+                &output.iter().filter_map(|entry| match entry {
+                    rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None,
+                }).flatten().collect::<Vec<_>>(),
+                *context_used,
+                cost.as_ref().map(usage),
+                *at,
+            )),
+            NativeEvent::RequestFailed {
+                partial,
+                error,
+                retrying,
+                at,
+            } => Some(MirrorEvent::Failed {
+                text: partial_text(partial),
+                error: error.clone(),
+                retrying: *retrying,
+                at: *at,
+            }),
+            NativeEvent::PythonStream { .. } => None,
+        };
+    }
     let message = |sender: &MessageSender, content: &[rho_core::ContentPart], delivery, at| {
         MirrorEvent::Message {
             from: match sender {
@@ -132,6 +195,17 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         }
     };
     Some(match event {
+        AgentEvent::TitleAttempted { .. } => return None,
+        AgentEvent::Titled { title, at } => MirrorEvent::Presented {
+            title: title.clone().map_or(PresentationField::Clear, PresentationField::Set),
+            activity: PresentationField::Unchanged,
+            at: *at,
+        },
+        AgentEvent::ExecObserved { id, milestone, at } => MirrorEvent::ExecObserved {
+            id: id.as_str().to_owned(),
+            milestone: *milestone,
+            at: *at,
+        },
         AgentEvent::Accepted(QueuedInput {
             source,
             kind,
@@ -141,72 +215,13 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             InputKind::Message { content } => message(source, content, *delivery, *at),
             InputKind::Compaction => MirrorEvent::CompactionRequested { at: *at },
         },
-        AgentEvent::Sent { blocks, at, .. } | AgentEvent::ContextSent { blocks, at, .. } => {
-            let results = blocks
-                .iter()
-                .flat_map(|block| match block {
-                    ContextBlock::ToolResults { results } => {
-                        results.iter().map(tool_outcome).collect::<Vec<_>>()
-                    }
-                    ContextBlock::ToolUpdate(update) => vec![ToolOutcome {
-                        id: update.call_id.as_str().to_owned(),
-                        status: ToolStatus::Success,
-                        started_at: update.at,
-                        finished_at: update.at,
-                    }],
-                    _ => Vec::new(),
-                })
-                .collect();
-            if matches!(
-                event,
-                AgentEvent::ContextSent {
-                    change: crate::ContextChange::Preparing { .. },
-                    ..
-                }
-            ) {
-                MirrorEvent::Results { results, at: *at }
-            } else {
-                MirrorEvent::Sent {
-                    results,
-                    compaction: blocks.iter().any(|block| {
-                        matches!(
-                            block,
-                            ContextBlock::CompactionTrigger | ContextBlock::ContextRotation { .. }
-                        )
-                    }),
-                    at: *at,
-                }
-            }
-        }
-        AgentEvent::Replied {
-            blocks,
-            context_used,
-            usage: cost,
-            at,
-        } => {
-            let items = blocks
-                .iter()
-                .flat_map(|block| match block {
-                    ContextBlock::InferenceResponse { items, .. } => items.as_slice(),
-                    _ => &[],
-                })
-                .collect::<Vec<_>>();
-            replied(&items, *context_used, cost.as_ref().map(usage), *at)
-        }
-        AgentEvent::Failed {
-            partial,
-            error,
-            retrying,
-            at,
-        } => MirrorEvent::Failed {
-            text: partial_text(partial),
-            error: error.to_string(),
-            retrying: *retrying,
-            at: *at,
-        },
-        AgentEvent::QueueCleared => MirrorEvent::QueueCleared { at: UnixMs(0) },
+        AgentEvent::Native(_)
+        | AgentEvent::Failed { .. } => unreachable!("normalized above"),
         AgentEvent::Cleared { at } => MirrorEvent::QueueCleared { at: *at },
-        AgentEvent::RuntimeRebound { .. } | AgentEvent::PythonStream { .. } => return None,
+        AgentEvent::RuntimeRebound { .. }
+        | AgentEvent::ClaudeExecAdmitted { .. }
+        | AgentEvent::ClaudeOutput { .. }
+        | AgentEvent::ClaudeOutputHandedOff { .. } => return None,
         // Claude's transcript, told in the runtime-neutral words a reader
         // already knows: a person's line is a message, the model's a
         // reply, the results a request that carried them.
@@ -295,15 +310,6 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         },
         AgentEvent::Turn { edge, at } => MirrorEvent::Turn {
             edge: edge.clone(),
-            at: *at,
-        },
-        AgentEvent::Presented {
-            title,
-            activity,
-            at,
-        } => MirrorEvent::Presented {
-            title: title.clone(),
-            activity: activity.clone(),
             at: *at,
         },
         AgentEvent::Wants { want, summary, at } => MirrorEvent::Wants {
@@ -442,7 +448,6 @@ fn is_compaction_summary(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
 
     use rho_core::{
         ContentPart, MessageDelivery, ToolOutput, ToolOutputStatus, ToolResult, ToolUpdate,
@@ -452,8 +457,7 @@ mod tests {
 
     #[test]
     fn a_sent_keeps_statuses_and_leaves_output_behind() {
-        let event = AgentEvent::Sent {
-            blocks: Cow::Owned(vec![ContextBlock::ToolResults {
+        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::ToolResults {
                 results: vec![ToolResult {
                     call_id: "call-1".try_into().unwrap(),
                     tool_type: rho_core::ToolType::Function,
@@ -467,10 +471,7 @@ mod tests {
                     finished_at: UnixMs(2),
                     metadata: None,
                 }],
-            }]),
-            at: UnixMs(3),
-            wake: None,
-        };
+            }]), at: UnixMs(3), wake: None, context: None });
         let stripped = strip(&event).unwrap();
         assert_eq!(
             stripped,
@@ -489,28 +490,21 @@ mod tests {
     }
 
     #[test]
-    fn a_sent_update_is_a_result_whose_detail_can_be_requested() {
-        let event = AgentEvent::Sent {
-            blocks: Cow::Owned(vec![ContextBlock::ToolUpdate(ToolUpdate {
+    fn a_later_report_does_not_rewrite_the_first_results_status_or_duration() {
+        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::ToolUpdate(ToolUpdate {
+                status: None,
+                images: Default::default(),
                 call_id: "call-1".try_into().unwrap(),
                 tool_type: rho_core::ToolType::Custom,
                 output: std::sync::Arc::new("bounded".to_owned()),
                 full_output: Some(std::sync::Arc::new("complete".to_owned())),
                 at: UnixMs(2),
-            })]),
-            at: UnixMs(3),
-            wake: None,
-        };
+            })]), at: UnixMs(3), wake: None, context: None });
 
         assert_eq!(
             strip(&event),
             Some(MirrorEvent::Sent {
-                results: vec![ToolOutcome {
-                    id: "call-1".into(),
-                    status: ToolStatus::Success,
-                    started_at: UnixMs(2),
-                    finished_at: UnixMs(2),
-                }],
+                results: vec![],
                 compaction: false,
                 at: UnixMs(3),
             })

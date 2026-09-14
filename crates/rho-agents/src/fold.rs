@@ -220,6 +220,7 @@ impl Digest {
             | MirrorEvent::CompactionRequested { .. }
             | MirrorEvent::QueueCleared { .. }
             | MirrorEvent::Sent { .. }
+            | MirrorEvent::ExecObserved { .. }
             | MirrorEvent::Results { .. }
             | MirrorEvent::Replied { .. }
             | MirrorEvent::Failed { .. } => {}
@@ -340,6 +341,8 @@ pub fn transcript(events: &[(AgentPos, MirrorEvent)]) -> UiAgentState {
 /// entry costs what it changes and never a walk of the whole mirror.
 #[derive(Clone, Debug, Default)]
 pub struct TranscriptFold {
+    exec_timings: Arc<std::collections::BTreeMap<String, rho_core::ExecTiming>>,
+    timing_events: Vec<(AgentPos, String, rho_core::ExecMilestone, UnixMs)>,
     /// One past the newest position folded.
     next: AgentPos,
     /// Shared with every state handed out, so a row costs the blocks it
@@ -367,6 +370,7 @@ pub struct TranscriptFold {
 /// already was, so a reader replaces a suffix rather than a state.
 #[derive(Clone, Debug)]
 pub struct FoldDelta {
+    pub exec_timings: Arc<std::collections::BTreeMap<String, rho_core::ExecTiming>>,
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
@@ -421,6 +425,7 @@ impl TranscriptFold {
         let from = self.dirty_from.take()?;
         let state = self.state();
         Some(FoldDelta {
+            exec_timings: state.exec_timings,
             from,
             blocks: self.composed_from(from),
             status: state.status,
@@ -464,6 +469,24 @@ impl TranscriptFold {
         self.next = pos.next();
         self.digest.tell(pos, event);
         match event {
+            MirrorEvent::ExecObserved { id, milestone, at } => {
+                self.timing_events.push((pos, id.clone(), *milestone, *at));
+                Arc::make_mut(&mut self.exec_timings)
+                    .entry(id.clone())
+                    .or_default()
+                    .observe(*milestone, *at);
+                let changed = self
+                    .blocks
+                    .iter()
+                    .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if &tool.id == id));
+                self.touch(changed.unwrap_or(self.blocks.len()));
+                if let Some(index) = changed
+                    && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
+                {
+                    tool.timing = self.exec_timings[id];
+                }
+            }
+
             MirrorEvent::Message {
                 from,
                 text,
@@ -537,6 +560,7 @@ impl TranscriptFold {
                     self.push(
                         pos,
                         UiBlock::Tool(UiTool {
+                            timing: self.exec_timings.get(&call.id).copied().unwrap_or_default(),
                             id: call.id.clone(),
                             name: call.name.clone(),
                             // What the model sent, whole. `what` is the
@@ -642,6 +666,23 @@ impl TranscriptFold {
             // A rewind is told rather than unwritten, so the reader is the
             // one that hides what it undid.
             MirrorEvent::Rewound { to, .. } => {
+                self.timing_events.retain(|(pos, ..)| pos < to);
+                let timings = Arc::make_mut(&mut self.exec_timings);
+                timings.clear();
+                for (_, id, milestone, at) in &self.timing_events {
+                    timings
+                        .entry(id.clone())
+                        .or_default()
+                        .observe(*milestone, *at);
+                }
+                // Earlier tool rows may have been updated by a now-rewound handoff.
+                for block in &mut self.blocks {
+                    if let UiBlock::Tool(tool) = Arc::make_mut(block) {
+                        tool.timing = timings.get(&tool.id).copied().unwrap_or_default();
+                    }
+                }
+                self.touch(0);
+
                 let kept = self.told_at.iter().take_while(|told| *told < to).count();
                 self.touch(kept);
                 self.blocks.truncate(kept);
@@ -670,6 +711,7 @@ impl TranscriptFold {
                 .map(|(_, queued)| Arc::new(queued.clone())),
         );
         UiAgentState {
+            exec_timings: self.exec_timings.clone(),
             blocks,
             // Never `Streaming`: this is the mirror, not the live tail. A
             // turn that was running when the client last heard is the
@@ -1287,5 +1329,47 @@ mod tests {
             rho_ui_proto::WorksetMode::Exposed
         );
         assert_eq!(mirrored.identity.place.cwd, test_place().cwd);
+    }
+    #[test]
+    fn exec_observations_survive_commit_and_rewind_without_retiming() {
+        use rho_core::ExecMilestone::*;
+        let mut fold = TranscriptFold::default();
+        let tell = |fold: &mut TranscriptFold, pos, milestone, at| {
+            fold.tell(
+                AgentPos(pos),
+                &MirrorEvent::ExecObserved {
+                    id: "exec-1".into(),
+                    milestone,
+                    at: UnixMs(at),
+                },
+            );
+        };
+        tell(&mut fold, 0, FirstBlock, 10);
+        tell(&mut fold, 1, ArgumentsFinished, 20);
+        let early = fold.state();
+        assert_eq!(
+            early.exec_timings["exec-1"].first_block_at,
+            Some(UnixMs(10))
+        );
+        tell(&mut fold, 2, ResponseFinished, 30);
+        tell(&mut fold, 3, Boundary, 40);
+        tell(&mut fold, 4, HandedOff, 50);
+        // Redelivery of one observation is idempotent even at a new log position.
+        tell(&mut fold, 5, FirstBlock, 99);
+        assert_eq!(
+            fold.state().exec_timings["exec-1"].first_block_at,
+            Some(UnixMs(10))
+        );
+        fold.tell(
+            AgentPos(6),
+            &MirrorEvent::Rewound {
+                to: AgentPos(3),
+                at: UnixMs(60),
+            },
+        );
+        let timing = fold.state().exec_timings["exec-1"];
+        assert_eq!(timing.response_finished_at, Some(UnixMs(30)));
+        assert_eq!(timing.boundary_at, None);
+        assert_eq!(timing.handed_off_at, None);
     }
 }

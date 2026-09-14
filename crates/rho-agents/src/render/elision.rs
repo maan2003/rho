@@ -193,6 +193,7 @@ mod tests {
 
     fn tool(id: &str) -> UiBlock {
         UiBlock::Tool(UiTool {
+            timing: Default::default(),
             id: id.to_owned(),
             name: "shell".to_owned(),
             arguments: String::new(),

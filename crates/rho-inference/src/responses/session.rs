@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Result;
 use rho_core::{InferenceEvent, InferenceRequest};
@@ -98,25 +98,13 @@ struct Turn {
     debug_sequence: Option<u64>,
     /// Raw provider text frames observed for the in-flight send attempt.
     raw_events: Vec<serde_json::Value>,
-    /// Transient provider/transport retry count for this turn.
-    retry_attempts: u32,
-    /// The point after which transient failures become terminal.
-    retry_deadline: Option<Instant>,
+
 }
 
 #[derive(Clone, Copy)]
 enum TurnPhase {
-    /// A request is waiting to be sent. `replay` means the previous attempt hit
-    /// a stale `previous_response_id`, so this send must be a full replay.
-    Queued {
-        replay: bool,
-        not_before: Option<Instant>,
-    },
-    /// A request is on the wire and we are reading its response.
-    InFlight {
-        replay: bool,
-        used_previous_response_id: bool,
-    },
+    Queued,
+    InFlight,
 }
 
 /// What a session asks for and where it asks, all of it settled by the caller
@@ -127,7 +115,6 @@ enum TurnPhase {
 /// built from what was true when the request was made.
 #[derive(Clone)]
 pub(crate) struct SessionConfig {
-    pub(crate) agent_retries: bool,
     pub(crate) base_url: String,
     pub(crate) inference: Inference,
     pub(crate) mode: InferenceSessionMode,
@@ -197,7 +184,6 @@ struct SessionTask {
 pub(crate) enum InferenceSessionMode {
     Deep(InferenceProfile),
     Title,
-    Status,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -242,9 +228,6 @@ impl ResponsesConfig {
         }
     }
 
-    fn status() -> Self {
-        Self::title()
-    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -272,9 +255,6 @@ impl From<InferenceModel> for ResponsesModel {
             InferenceModel::Gpt56Luna => Self::Gpt56Luna,
             InferenceModel::Gpt56Terra => Self::Gpt56Terra,
             InferenceModel::Gpt6Astra => Self::Gpt6Astra,
-            InferenceModel::Gemini37FlashLow => {
-                unreachable!("Antigravity models do not use ResponsesConfig")
-            }
         }
     }
 }
@@ -371,7 +351,6 @@ impl InferenceSession {
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self::new(SessionConfig {
-            agent_retries: false,
             base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Deep(config),
@@ -382,7 +361,6 @@ impl InferenceSession {
 
     pub(crate) fn new_title(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
         Self::new(SessionConfig {
-            agent_retries: false,
             base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Title,
@@ -391,16 +369,6 @@ impl InferenceSession {
         })
     }
 
-    pub(crate) fn new_status(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
-        Self::new(SessionConfig {
-            agent_retries: false,
-            base_url: inference.responses_base_url().to_owned(),
-            inference,
-            mode: InferenceSessionMode::Status,
-            responses_config: ResponsesConfig::status(),
-            prompt_cache_key,
-        })
-    }
 
     fn new(config: SessionConfig) -> Self {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -421,7 +389,7 @@ impl InferenceSession {
                 self.config.responses_config = ResponsesConfig::deep(config, model.into());
                 true
             }
-            InferenceSessionMode::Title | InferenceSessionMode::Status => false,
+            InferenceSessionMode::Title => false,
         }
     }
 
@@ -464,13 +432,7 @@ impl InferenceSession {
         })
     }
 
-    /// A single attempt; recoverable failures return to the agent's boundary.
-    pub fn request_once(&mut self, request: InferenceRequest) {
-        self.config.agent_retries = true;
-        self.request(request);
-    }
-
-    /// Queue a turn. The work happens in the task.
+    /// Queue one attempt. Recoverable failures return to the caller, never resend.
     pub fn request(&mut self, request: InferenceRequest) {
         self.epochs += 1;
         self.awaiting = Some(self.epochs);
@@ -530,8 +492,8 @@ impl InferenceSession {
             if matches!(
                 event,
                 InferenceEvent::Finished { .. } | InferenceEvent::Failed { .. }
-            ) || (self.config.agent_retries
-                && matches!(event, InferenceEvent::TemporaryFailure { .. }))
+                | InferenceEvent::TemporaryFailure { .. }
+            )
             {
                 self.awaiting = None;
             }
@@ -606,16 +568,11 @@ impl SessionTask {
     fn request(&mut self, request: InferenceRequest) {
         self.turn = Some(Turn {
             request,
-            phase: TurnPhase::Queued {
-                replay: false,
-                not_before: None,
-            },
+            phase: TurnPhase::Queued,
             response: ResponseState::new(),
             streaming_started: false,
             debug_sequence: None,
             raw_events: Vec::new(),
-            retry_attempts: 0,
-            retry_deadline: None,
         });
     }
 
@@ -643,15 +600,9 @@ impl SessionTask {
             // once: what the phase says is settled before anything below is
             // awaited, and re-reading it afterwards only invites a second
             // answer.
-            if let Some(TurnPhase::Queued { replay, not_before }) =
+            if let Some(TurnPhase::Queued) =
                 self.turn.as_ref().map(|turn| turn.phase)
             {
-                if let Some(not_before) = not_before {
-                    let now = Instant::now();
-                    if not_before > now {
-                        tokio::time::sleep(not_before - now).await;
-                    }
-                }
                 if let Err(error) = self.ensure_connection().await {
                     self.connection = None;
                     self.fail_turn(error).await;
@@ -667,7 +618,7 @@ impl SessionTask {
                 let mut body = ResponsesRequest::from_inference_request(
                     &self.config,
                     request,
-                    (!replay).then_some(cached_response_id).flatten().as_deref(),
+                    cached_response_id.as_deref(),
                 );
                 let connection = self.connection.as_ref().unwrap();
                 body.prompt_cache_key = self
@@ -677,10 +628,7 @@ impl SessionTask {
                 let turn = self.turn.as_mut().unwrap();
                 turn.debug_sequence = Some(debug_sequence);
                 turn.raw_events.clear();
-                turn.phase = TurnPhase::InFlight {
-                    replay,
-                    used_previous_response_id: body.previous_response_id.is_some(),
-                };
+                turn.phase = TurnPhase::InFlight;
                 self.maybe_debug_write_provider_request(debug_sequence, &body);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
                     self.on_socket_failure(error).await;
@@ -833,23 +781,15 @@ impl SessionTask {
         }
     }
 
-    /// Classify failure. Agent-owned sessions end the attempt here; standalone
-    /// sessions may queue an internal retry.
+    /// End the attempt without resending any generated source.
     async fn fail_turn(&mut self, error: anyhow::Error) {
-        match self.on_turn_error(error).await {
-            ErrorAction::Retry { error, retrying_at } => {
-                self.emit(temporary_failure(error, retrying_at))
-            }
-            ErrorAction::Fail(error) => self.emit(InferenceEvent::Failed {
-                error: error.into(),
-            }),
-        }
+        let event = self.on_turn_error(error).await;
+        self.emit(event);
     }
 
     /// Preserve account-health handling and invalidate broken connection state.
-    /// Agent-owned sessions report retryability without resending; standalone
-    /// sessions retain their bounded transport retry policy.
-    async fn on_turn_error(&mut self, error: anyhow::Error) -> ErrorAction {
+    /// Report retryability without resending; callers decide whether to retry.
+    async fn on_turn_error(&mut self, error: anyhow::Error) -> InferenceEvent {
         if let Some(turn) = &self.turn
             && let Some(sequence) = turn.debug_sequence
         {
@@ -863,126 +803,29 @@ impl SessionTask {
         if error.downcast_ref::<AuthFailure>().is_some() {
             self.turn = None;
             self.connection = None;
-            return ErrorAction::Fail(error);
+            return InferenceEvent::Failed { error: error.into() };
         }
-        if self.config.agent_retries {
-            let mut retryable =
-                is_transient_turn_error(&error) || super::is_stale_previous_response_error(&error);
-            if is_quota_exhaustion_error(&error) {
-                retryable = false;
-                if let Some(selected) = &self.selected_auth
-                    && self.config.inference.mark_rate_limited(selected).await
-                    && let Ok(replacement) = self.config.inference.select().await
-                {
-                    self.selected_auth = Some(replacement);
-                    retryable = true;
-                }
-            }
-            // Never reuse a partial response or a stale previous-response chain.
-            self.turn = None;
-            self.connection = None;
-            return if retryable {
-                ErrorAction::Retry {
-                    error,
-                    retrying_at: Instant::now(),
-                }
-            } else {
-                ErrorAction::Fail(error)
-            };
-        }
-        let quota_exhaustion = is_quota_exhaustion_error(&error);
-        let quota_failover = quota_exhaustion && self.selected_auth.is_some();
-        if quota_failover {
-            let selected = self.selected_auth.as_ref().unwrap().clone();
-            if self.config.inference.mark_rate_limited(&selected).await {
-                let Ok(replacement) = self.config.inference.select().await else {
-                    self.turn = None;
-                    self.connection = None;
-                    self.selected_auth = None;
-                    return ErrorAction::Fail(error);
-                };
+        let mut retryable =
+            is_transient_turn_error(&error) || super::is_stale_previous_response_error(&error);
+        if is_quota_exhaustion_error(&error) {
+            retryable = false;
+            if let Some(selected) = &self.selected_auth
+                && self.config.inference.mark_rate_limited(selected).await
+                && let Ok(replacement) = self.config.inference.select().await
+            {
                 self.selected_auth = Some(replacement);
-                let turn = self.turn.as_mut().unwrap();
-                turn.phase = TurnPhase::Queued {
-                    replay: true,
-                    not_before: None,
-                };
-                turn.streaming_started = false;
-                turn.debug_sequence = None;
-                turn.raw_events.clear();
-                turn.response = ResponseState::new();
-                self.connection = None;
-                return ErrorAction::Retry {
-                    error,
-                    retrying_at: Instant::now(),
-                };
+                retryable = true;
             }
         }
-        if quota_exhaustion {
-            self.turn = None;
-            self.connection = None;
-            return ErrorAction::Fail(error);
-        }
-        let stale_previous_response = matches!(
-            &self.turn,
-            Some(Turn {
-                phase: TurnPhase::InFlight { replay: false, .. },
-                ..
-            })
-        ) && super::is_stale_previous_response_error(&error)
-            && self.turn_has_previous_response_id();
-        if stale_previous_response {
-            let turn = self.turn.as_mut().unwrap();
-            turn.phase = TurnPhase::Queued {
-                replay: true,
-                not_before: None,
-            };
-            turn.streaming_started = false;
-            turn.debug_sequence = None;
-            turn.raw_events.clear();
-            turn.response = ResponseState::new();
-            // Replay on a clean socket.
-            self.connection = None;
-            ErrorAction::Retry {
-                error,
-                retrying_at: Instant::now(),
-            }
-        } else if self.turn.is_some() && is_transient_turn_error(&error) {
-            let now = Instant::now();
-            let deadline = *self
-                .turn
-                .as_mut()
-                .unwrap()
-                .retry_deadline
-                .get_or_insert(now + TRANSIENT_RETRY_WINDOW);
-            if now >= deadline {
-                self.turn = None;
-                self.connection = None;
-                return ErrorAction::Fail(error);
-            }
-            let remaining = deadline - now;
-            let turn = self.turn.as_mut().unwrap();
-            turn.retry_attempts += 1;
-            let delay = transient_backoff(turn.retry_attempts).min(remaining);
-            let retrying_at = now + delay;
-            let replay = match turn.phase {
-                TurnPhase::Queued { replay, .. } | TurnPhase::InFlight { replay, .. } => replay,
-            };
-            turn.phase = TurnPhase::Queued {
-                replay,
-                not_before: Some(retrying_at),
-            };
-            turn.streaming_started = false;
-            turn.debug_sequence = None;
-            turn.raw_events.clear();
-            turn.response = ResponseState::new();
-            self.connection = None;
-            ErrorAction::Retry { error, retrying_at }
+        // Never reuse a partial response or a stale previous-response chain.
+        self.turn = None;
+        self.connection = None;
+        return if retryable {
+            temporary_failure(error, Instant::now())
         } else {
-            self.turn = None;
-            self.connection = None;
-            ErrorAction::Fail(error)
-        }
+            InferenceEvent::Failed { error: error.into() }
+        };
+
     }
 
     fn next_debug_sequence(&mut self) -> u64 {
@@ -1054,18 +897,6 @@ impl SessionTask {
         Ok(())
     }
 
-    fn turn_has_previous_response_id(&self) -> bool {
-        matches!(
-            &self.turn,
-            Some(Turn {
-                phase: TurnPhase::InFlight {
-                    used_previous_response_id: true,
-                    ..
-                },
-                ..
-            })
-        )
-    }
 
     /// Ensure a usable connection, reopening when missing, when OAuth rotated
     /// the bearer, or when nearing the server's age cap.
@@ -1175,20 +1006,6 @@ pub(crate) fn debug_file_name(
     )
 }
 
-enum ErrorAction {
-    /// The turn is being replayed internally; surface a recoverable failure
-    /// carrying the error that triggered it.
-    Retry {
-        error: anyhow::Error,
-        retrying_at: Instant,
-    },
-    /// The turn is dead; surface a terminal failure.
-    Fail(anyhow::Error),
-}
-
-const TRANSIENT_RETRY_WINDOW: Duration = Duration::from_secs(8 * 60 * 60);
-const TRANSIENT_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
-
 pub(crate) fn redact_image_data(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(values) => values.iter_mut().for_each(redact_image_data),
@@ -1204,18 +1021,6 @@ pub(crate) fn redact_image_data(value: &mut serde_json::Value) {
     }
 }
 
-pub(crate) fn transient_backoff(attempt: u32) -> Duration {
-    let mut previous = 1_u64;
-    let mut current = 1_u64;
-    for _ in 2..attempt {
-        let next = previous.saturating_add(current);
-        previous = current;
-        current = next;
-    }
-    let base = Duration::from_secs(current).min(TRANSIENT_MAX_DELAY);
-    let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0.9..1.1);
-    base.mul_f64(jitter).min(TRANSIENT_MAX_DELAY)
-}
 
 pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
     if let Some(error) = error.downcast_ref::<ProviderError>() {
@@ -1286,22 +1091,15 @@ mod account_selection_tests {
                     instructions: std::sync::Arc::from(""),
                     input: Vec::new(),
                     agent_id_labels: std::collections::BTreeMap::new(),
-                    tools: Vec::new().into(),
                 },
-                phase: TurnPhase::Queued {
-                    replay: false,
-                    not_before: None,
-                },
+                phase: TurnPhase::Queued,
                 response: ResponseState::new(),
                 streaming_started: false,
                 debug_sequence: None,
                 raw_events: Vec::new(),
-                retry_attempts: 0,
-                retry_deadline: None,
-            }),
+                    }),
             config: SessionConfig {
-                agent_retries: false,
-                base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+                    base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
                 inference: Inference::for_test(auth),
                 mode: InferenceSessionMode::Title,
                 responses_config: ResponsesConfig::title(),
@@ -1315,24 +1113,10 @@ mod account_selection_tests {
         assert!(matches!(
             task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
                 .await,
-            ErrorAction::Retry { .. }
+            InferenceEvent::TemporaryFailure { .. }
         ));
         assert_eq!(task.selected_auth, Some(selected.clone()));
 
-        task.turn.as_mut().unwrap().streaming_started = true;
-        assert!(matches!(
-            task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
-                .await,
-            ErrorAction::Retry { .. }
-        ));
-        assert_eq!(task.selected_auth, Some(selected.clone()));
-
-        task.config.agent_retries = true;
-        assert!(matches!(
-            task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
-                .await,
-            ErrorAction::Retry { .. }
-        ));
         assert!(
             task.turn.is_none(),
             "agent retry must not queue an internal resend"

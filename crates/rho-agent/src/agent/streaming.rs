@@ -1,7 +1,9 @@
 //! Streaming admission belongs to the agent: write intent before permitting
 //! Python, and write settlement before admitting another unit. Provider EOF
 //! and transport loss are deliberately different operations.
-use rho_core::{StreamingContextItem, StreamingContextItemState};
+#[cfg(test)]
+use rho_core::StreamingContextItem;
+use rho_inference::exec::set_source;
 
 use super::*;
 use crate::PythonStreamEvent;
@@ -19,32 +21,6 @@ pub(super) struct Stream {
     pub canonical: bool,
     recovery: bool,
     pub interrupted: bool,
-}
-
-fn call(item: &InferenceResponseItem) -> ToolCall {
-    let InferenceResponseItem::ToolCall {
-        id,
-        name,
-        tool_type,
-        arguments,
-        ..
-    } = item
-    else {
-        unreachable!()
-    };
-    ToolCall {
-        id: id.clone(),
-        name: name.clone(),
-        tool_type: *tool_type,
-        arguments: arguments.clone(),
-    }
-}
-
-fn set_source(item: &mut InferenceResponseItem, source: String) {
-    let InferenceResponseItem::ToolCall { arguments, .. } = item else {
-        unreachable!()
-    };
-    *arguments = source;
 }
 
 pub(super) fn progress_note(
@@ -72,33 +48,14 @@ impl Agent {
         let Phase::Requesting(in_flight) = &self.phase else {
             return Ok(());
         };
-        let mut calls = Vec::new();
-        for (index, state) in in_flight.pending.items.iter().enumerate() {
-            if let StreamingContextItemState::Pending(item)
-            | StreamingContextItemState::Finished(item) = state
-                && matches!(item, StreamingContextItem::ToolCall { .. })
-            {
-                calls.push((
-                    index,
-                    item.to_context_item().map_err(|error| error.to_string())?,
-                ));
-            }
-        }
-        if calls.len() > 1 {
-            return Err("Python streaming permits only one exec call; previously admitted code is not undone".into());
-        }
-        let Some((index, item)) = calls.pop() else {
+        let Some((index, item, incoming)) = rho_inference::exec::stream(&in_flight.pending)? else {
             return if in_flight.stream.is_some() {
                 Err("Provider removed an active streaming exec call".into())
             } else {
                 Ok(())
             };
         };
-        let incoming = call(&item);
-        if incoming.name.as_str() != "exec" || incoming.tool_type != rho_core::ToolType::Custom {
-            return Err("Python streaming requires a custom exec call".into());
-        }
-        if incoming.arguments.len() > 1024 * 1024 {
+        if incoming.source.len() > 1024 * 1024 {
             return Err("Streaming Python source exceeds 1 MiB".into());
         }
         if let Some(id) = &in_flight.stream {
@@ -110,56 +67,56 @@ impl Agent {
             set_source(&mut identity, String::new());
             if index != stream.index
                 || identity != stream.item
-                || !incoming.arguments.starts_with(&stream.source)
+                || !incoming.source.starts_with(&stream.source)
             {
                 return Err(
                     "Provider changed previously received Python source or call metadata".into(),
                 );
             }
-            let fragment = incoming.arguments[stream.source.len()..].to_owned();
-            stream.source = incoming.arguments;
-            self.tools.get_mut(id).unwrap().call.arguments = stream.source.clone();
+            let fragment = incoming.source[stream.source.len()..].to_owned();
+            stream.source = incoming.source;
+            self.execs.get_mut(id).unwrap().call.source = stream.source.clone();
             if !stream.stopped && !stream.closed && !fragment.is_empty() {
                 stream.exec.feed(fragment, false)?;
             }
             return Ok(());
         }
-        if self.tools.contains_key(&incoming.id) || self.history.iter().any(|block| {
-            matches!(&**block, ContextBlock::InferenceResponse { items, .. } if items.iter().any(|item| {
-                matches!(item, InferenceResponseItem::ToolCall { id, .. } if id == &incoming.id)
-            }))
-        }) {
+        if self.execs.contains_key(&incoming.id)
+            || self
+                .db
+                .read()
+                .agent_exec_was_admitted(self.agent_id, &incoming.id)
+        {
             return Err("Provider reused an earlier tool call identity".into());
         }
-        let tool = self
-            .surface
-            .get_if_ready()
-            .unwrap()
-            .tools
-            .get(&incoming.name)
-            .unwrap();
-        let session = tool
-            .start_stream(SourceWaker::new(self.wake.clone()))
-            .ok_or("Python tool does not support streaming")?;
-        let exec = session
-            .python_exec()
-            .ok_or("Python stream failed to start")?;
+        let tool = &self.surface.get_if_ready().unwrap().notebook;
+        let session = tool.start_stream(incoming.id.clone(), SourceWaker::new(self.wake.clone()));
+        let exec = session.execution();
         let mut identity = item;
         set_source(&mut identity, String::new());
-        self.persist(AgentEvent::PythonStream {
+        self.persist(AgentEvent::ExecObserved {
+            id: incoming.id.clone(),
+            milestone: rho_core::ExecMilestone::FirstBlock,
+            at: now,
+        })
+        .await;
+        self.persist(AgentEvent::Native(NativeEvent::PythonStream {
             event: PythonStreamEvent::Opened {
                 item: identity.clone(),
             },
             at: now,
-        })
+        }))
         .await;
-        self.tools.insert(
+        self.execs.insert(
             incoming.id.clone(),
-            RunningTool {
-                call: incoming.clone(),
-                started_at: now,
+            RunningExec {
+                call: rho_core::ExecCall {
+                    id: incoming.id.clone(),
+                    source: incoming.source.clone(),
+                },
+                first_block_at: now,
                 session,
-                answer: ToolCallAnswer::Owed,
+                answer: ReplyState::Owed,
             },
         );
         self.latest_python_exec = Some((incoming.id.clone(), exec.clone()));
@@ -169,7 +126,7 @@ impl Agent {
                 exec: exec.clone(),
                 item: identity,
                 index,
-                source: incoming.arguments.clone(),
+                source: incoming.source.clone(),
                 admitted: 0,
                 settled: 0,
                 completed: 0,
@@ -184,7 +141,7 @@ impl Agent {
             unreachable!()
         };
         in_flight.stream = Some(incoming.id);
-        exec.feed(incoming.arguments, false)
+        exec.feed(incoming.source, false)
     }
 
     pub(super) async fn advance_streams(&mut self, now: UnixMs, admit: bool) {
@@ -195,14 +152,14 @@ impl Agent {
             if let Some((end, error)) = progress.settled
                 && end > stream.settled
             {
-                self.persist(AgentEvent::PythonStream {
+                self.persist(AgentEvent::Native(NativeEvent::PythonStream {
                     event: PythonStreamEvent::Settled {
                         call_id: id.clone(),
                         end: end as u64,
                         error: error.clone(),
                     },
                     at: now,
-                })
+                }))
                 .await;
                 stream.settled = end;
                 stream.recovery |= stream.stopped;
@@ -214,12 +171,12 @@ impl Agent {
                 }
             }
             if progress.returned && !stream.closed {
-                self.persist(AgentEvent::PythonStream {
+                self.persist(AgentEvent::Native(NativeEvent::PythonStream {
                     event: PythonStreamEvent::Closed {
                         call_id: id.clone(),
                     },
                     at: now,
-                })
+                }))
                 .await;
                 stream.closed = true;
             }
@@ -232,13 +189,13 @@ impl Agent {
             {
                 // Compiler offsets refer to the validated original UTF-8 source.
                 let source = stream.source[stream.admitted..end].to_owned();
-                self.persist(AgentEvent::PythonStream {
+                self.persist(AgentEvent::Native(NativeEvent::PythonStream {
                     event: PythonStreamEvent::Admitted {
                         call_id: id.clone(),
                         source,
                     },
                     at: now,
-                })
+                }))
                 .await;
                 stream.admitted = end;
                 if let Err(error) = stream.exec.permit(end) {
@@ -294,12 +251,12 @@ impl Agent {
         stream.exec.stop_stream();
         if stream.admitted == 0 {
             self.streams.remove(&id);
-            self.tools.remove(&id);
+            self.execs.remove(&id);
             self.latest_python_exec = None;
-            self.persist(AgentEvent::PythonStream {
+            self.persist(AgentEvent::Native(NativeEvent::PythonStream {
                 event: PythonStreamEvent::Acknowledged { call_id: id },
                 at: now,
-            })
+            }))
             .await;
             return false;
         }
@@ -307,20 +264,15 @@ impl Agent {
         set_source(&mut item, stream.source[..stream.admitted].to_owned());
         stream.canonical = true;
         self.context.replied(std::slice::from_ref(&item));
-        let block = ContextBlock::InferenceResponse {
-            items: vec![item],
-            provider_response_id: None,
-        };
         // Give the admitted, syntactically complete prefix its one place in
         // history before the normal boundary drains its result.
-        self.persist(AgentEvent::Replied {
-            blocks: Cow::Borrowed(std::slice::from_ref(&block)),
+        self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
+            output: vec![ContextBlock::InferenceResponse { items: vec![item], provider_response_id: None }],
             context_used: self.context_used,
             usage: None,
             at: now,
-        })
+        }))
         .await;
-        self.history.push(Arc::new(block));
         true
     }
 
@@ -339,12 +291,12 @@ impl Agent {
             .collect::<Vec<_>>();
         ids.extend(std::mem::take(&mut self.recovery_streams));
         for id in ids {
-            self.persist(AgentEvent::PythonStream {
+            self.persist(AgentEvent::Native(NativeEvent::PythonStream {
                 event: PythonStreamEvent::Acknowledged {
                     call_id: id.clone(),
                 },
                 at: now,
-            })
+            }))
             .await;
             self.streams.remove(&id);
         }
@@ -384,6 +336,7 @@ impl Agent {
 pub(in crate::agent) mod tests {
     use rho_core::{AppendString, ContextItemEvent, ProviderResponseItemId, ToolType};
     use rho_inference::OpenAiResponsesProviderData;
+    use rho_tool_shell::ShellTools;
 
     use super::*;
 
@@ -437,8 +390,8 @@ pub(in crate::agent) mod tests {
         );
         write.commit();
         let head = db.read().get_agent(id);
-        let tool: Arc<dyn Tool> = Arc::new(
-            rho_agent_tools::PythonTool::new(
+        let notebook = Arc::new(
+            rho_agent_tools::PythonNotebook::new(
                 ShellTools::in_directory(
                     Duration::from_secs(5),
                     directory.to_str().unwrap().into(),
@@ -455,7 +408,7 @@ pub(in crate::agent) mod tests {
                 host_specs: Vec::new(),
                 notes: Some(Lazy::ready(directory.join("notes"))),
             },
-            tools: BTreeMap::from([(tool.spec().name, tool)]),
+            notebook,
         };
         let (control, control_rx) = mpsc::unbounded_channel();
         Agent {
@@ -464,13 +417,12 @@ pub(in crate::agent) mod tests {
             pool: Default::default(),
             surface: Arc::new(Lazy::ready(surface)),
             model,
-            history: Vec::new(),
             context: Default::default(),
             session: inference.deep_session(profile, model, key),
             phase: Phase::Requesting(InFlight::default()),
             user: Vec::new(),
             mail: Vec::new(),
-            tools: BTreeMap::new(),
+            execs: BTreeMap::new(),
             observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: Vec::new(),
@@ -480,7 +432,7 @@ pub(in crate::agent) mod tests {
             turn: None,
             latest_python_exec: None,
             total_usage: Default::default(),
-            sidecar: Sidecar::new(inference, None),
+            title: crate::title::Task::new(inference),
             working: false,
             wake: Arc::new(Notify::new()),
             status: Arc::new(RwLock::new(AgentStatus {
@@ -543,7 +495,7 @@ pub(in crate::agent) mod tests {
         // The response is still in flight, but the command is already running.
         assert!(matches!(agent.phase, Phase::Requesting(_)));
         until(&mut agent, |agent| {
-            agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)|
+            agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
             matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
         )
         })
@@ -581,7 +533,7 @@ pub(in crate::agent) mod tests {
         assert!(recovered.recovery_notes[0].contains("successfully evaluated"));
         agent.start_request(UnixMs::now(), None).await;
         agent.session.abort();
-        assert!(agent.history.iter().any(|block| matches!(&**block,
+        assert!(agent.provider_input().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         assert!(replay::replay(events).recovery_notes.is_empty());
@@ -616,7 +568,7 @@ pub(in crate::agent) mod tests {
             }
         ));
         until(&mut agent, |agent| agent.streams.values().next().unwrap().closed
-            && agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)|
+            && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
                 matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
             )).await;
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
@@ -629,13 +581,13 @@ pub(in crate::agent) mod tests {
             std::fs::read_to_string(directory.path().join("marker")).unwrap(),
             "x"
         );
-        assert!(agent.history.iter().any(|block| matches!(&**block,
+        assert!(agent.provider_input().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
-        assert!(agent.history.iter().any(|block| matches!(&**block,
+        assert!(agent.provider_input().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result|
                 result.body.output.contains("Your response was interrupted while generating this tool call.")
                 && result.body.output.contains("fresh-output")))));
-        assert!(!agent.history.iter().any(|block| matches!(&**block,
+        assert!(!agent.provider_input().iter().any(|block| matches!(&**block,
             ContextBlock::UserMessage { content, .. } if rho_core::text_content(content).contains("stream disconnected"))));
         assert!(agent.recovery_notes.is_empty());
         assert!(matches!(&agent.phase, Phase::Requesting(in_flight) if in_flight.retry.is_none()));
@@ -681,7 +633,7 @@ pub(in crate::agent) mod tests {
                 "x"
             );
             assert!(!directory.path().join("wrong").exists());
-            assert_eq!(agent.tools.len(), 1);
+            assert_eq!(agent.execs.len(), 1);
         }
     }
 
@@ -734,8 +686,8 @@ pub(in crate::agent) mod tests {
         .await
         .unwrap();
         assert!(agent.streams.is_empty());
-        assert!(agent.tools.is_empty());
-        assert!(agent.history.is_empty());
+        assert!(agent.execs.is_empty());
+        assert!(agent.provider_input().is_empty());
         assert!(!directory.path().join("wrong").exists());
     }
 
@@ -875,13 +827,26 @@ pub(in crate::agent) mod tests {
                         ..
                     }
                 ));
-                let ContextBlock::InferenceResponse { items, .. } =
-                    &**agent.history.last().unwrap()
+                let history = agent.provider_input();
+                let ContextBlock::InferenceResponse { items, .. } = &**history.last().unwrap()
                 else {
                     unreachable!()
                 };
-                assert_eq!(call(&items[0]).arguments, prefix);
-                assert_eq!(call(&items[0]).id.as_str(), "one");
+                assert_eq!(
+                    rho_inference::exec::call(&items[..1])
+                        .unwrap()
+                        .unwrap()
+                        .source,
+                    prefix
+                );
+                assert_eq!(
+                    rho_inference::exec::call(&items[..1])
+                        .unwrap()
+                        .unwrap()
+                        .id
+                        .as_str(),
+                    "one"
+                );
 
                 if !await_job {
                     until(&mut agent, |agent| {
@@ -904,7 +869,7 @@ pub(in crate::agent) mod tests {
                 std::fs::write(directory.path().join("release"), "").unwrap();
                 until(&mut agent, |agent| {
                     agent.streams.values().next().unwrap().closed
-                        && agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
+                        && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
                             matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
                         })
                 }).await;
@@ -942,8 +907,8 @@ pub(in crate::agent) mod tests {
             }
         ));
         assert!(agent.streams.is_empty());
-        assert!(agent.tools.is_empty());
-        assert!(agent.history.is_empty());
+        assert!(agent.execs.is_empty());
+        assert!(agent.provider_input().is_empty());
         assert!(agent.recovery_notes.is_empty());
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);

@@ -2,8 +2,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent_tools::{PythonTool, SourceWaker, Tool};
-use rho_core::{ToolCall, ToolType};
+use rho_agent_tools::{PythonNotebook, SourceWaker};
+use rho_core::ExecCall;
 use rho_fs_view::{Mode, PathOverrides, StoreService, UserEnvironment, Worksets};
 use rho_tool_shell::ShellTools;
 
@@ -31,20 +31,19 @@ fn main() {
         let view = workset
             .enter(Mode::View { home_skeleton: None }, camino::Utf8Path::new("/src/project"))
             .unwrap();
-        let tool = PythonTool::new(ShellTools::new(Duration::from_secs(5), view), vec![]).unwrap();
+        let tool = PythonNotebook::new(ShellTools::new(Duration::from_secs(5), view), vec![]).unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut cell = tool.run(ToolCall {
+        let mut cell = tool.exec(ExecCall {
             id: "view".try_into().unwrap(),
-            name: "exec".try_into().unwrap(),
-            tool_type: ToolType::Custom,
-            arguments: "assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into(),
+            source: "assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into(),
         }, SourceWaker::new(wake.clone()));
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !cell.python_exec().unwrap().quiescent() {
+            while !cell.execution().quiescent() {
                 wake.notified().await;
             }
         }).await.unwrap();
         let output = cell.first_output();
+        cell.acknowledge_output();
         assert_eq!(output.status, rho_core::ToolOutputStatus::Success, "{output:?}");
         assert!(output.output.contains("/src/project"), "{output:?}");
         assert_eq!(std::fs::read_to_string(work.join("project/value")).unwrap(), "python");

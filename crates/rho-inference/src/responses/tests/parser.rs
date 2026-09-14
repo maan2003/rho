@@ -353,17 +353,47 @@ fn does_not_classify_user_actionable_stream_errors_for_retry() {
     )));
 }
 
-#[test]
-fn transient_retry_backoff_uses_capped_jittered_fibonacci() {
-    let first = super::transient_backoff(1);
-    let second = super::transient_backoff(2);
-    let third = super::transient_backoff(3);
-    let seventeenth = super::transient_backoff(17);
-    let eighteenth = super::transient_backoff(18);
 
-    assert!((Duration::from_millis(900)..Duration::from_millis(1100)).contains(&first));
-    assert!((Duration::from_millis(900)..Duration::from_millis(1100)).contains(&second));
-    assert!((Duration::from_millis(1800)..Duration::from_millis(2200)).contains(&third));
-    assert!((Duration::from_secs(1437)..Duration::from_secs(1757)).contains(&seventeenth));
-    assert!((Duration::from_secs(1620)..=Duration::from_secs(1800)).contains(&eighteenth));
+#[test]
+fn argument_end_is_distinct_from_item_end_and_response_end() {
+    let mut state = ResponseState::default();
+    state
+        .apply_event(
+            &json!({"type":"response.output_item.added","output_index":0,
+        "item":{"type":"custom_tool_call","id":"item-exec","call_id":"exec-1","name":"exec"}}),
+        )
+        .unwrap();
+    state.apply_event(&json!({"type":"response.custom_tool_call_input.delta","output_index":0,"delta":"pass"})).unwrap();
+    let (done, events) = state
+        .apply_event(
+            &json!({"type":"response.custom_tool_call_input.done","output_index":0,"input":"pass"}),
+        )
+        .unwrap();
+    assert!(!done);
+    assert!(
+        matches!(events.as_slice(), [InferenceEvent::ExecArgumentsFinished { id }] if id.as_str() == "exec-1")
+    );
+    let (done, events) = state.apply_event(&json!({"type":"response.output_item.done","output_index":0,
+        "item":{"type":"custom_tool_call","id":"item-exec","call_id":"exec-1","name":"exec","input":"pass"}})).unwrap();
+    assert!(!done);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        InferenceEvent::ContextItem {
+            event: rho_core::ContextItemEvent::Finish,
+            ..
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, InferenceEvent::ExecArgumentsFinished { .. }))
+    );
+    let (done, events) = state
+        .apply_event(&json!({"type":"response.completed"}))
+        .unwrap();
+    assert!(done);
+    assert!(matches!(
+        events.as_slice(),
+        [InferenceEvent::Finished { .. }]
+    ));
 }

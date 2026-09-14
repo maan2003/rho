@@ -23,10 +23,51 @@ senax_encoder::declare_senax_tagged_trait!(
 );
 
 validated_string_type!(
-    /// Identifies a tool call so its result can be matched back to it.
-    pub ToolCallId,
+    /// Provider-issued identity of an exec, shared with its notebook cell and reports.
+    pub ExecId,
     crate::util::validate_identifier
 );
+
+/// Provider/host observations, never Python execution timestamps.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
+)]
+pub enum ExecMilestone {
+    FirstBlock,
+    ArgumentsFinished,
+    ResponseFinished,
+    Boundary,
+    /// The host successfully handed the reply to its transport, not evidence
+    /// that the remote model consumed it.
+    HandedOff,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
+)]
+pub struct ExecTiming {
+    pub first_block_at: Option<UnixMs>,
+    pub arguments_finished_at: Option<UnixMs>,
+    pub response_finished_at: Option<UnixMs>,
+    pub boundary_at: Option<UnixMs>,
+    pub handed_off_at: Option<UnixMs>,
+}
+
+impl ExecTiming {
+    pub fn observe(&mut self, milestone: ExecMilestone, at: UnixMs) {
+        let field = match milestone {
+            ExecMilestone::FirstBlock => &mut self.first_block_at,
+            ExecMilestone::ArgumentsFinished => &mut self.arguments_finished_at,
+            ExecMilestone::ResponseFinished => &mut self.response_finished_at,
+            ExecMilestone::Boundary => &mut self.boundary_at,
+            ExecMilestone::HandedOff => &mut self.handed_off_at,
+        };
+        field.get_or_insert(at);
+    }
+}
+
+/// Legacy protocol vocabulary; encoded identically to the exec identity.
+pub type ToolCallId = ExecId;
 
 validated_string_type!(
     /// Name of a tool, shared by [`ToolSpec`] and the [`ToolCall`] that invokes it.
@@ -121,8 +162,6 @@ pub enum EngineerIntelligence {
     Mini,
     Alt,
     Cheap,
-    /// Reduced function-tool agent backed by Gemini through Antigravity.
-    Gemini,
     /// High engineer with shared-notes context rotation.
     HighNotes,
 }
@@ -140,7 +179,6 @@ enum StoredEngineerIntelligence {
     Mini,
     Alt,
     Cheap,
-    Gemini,
     Python,
     UltraPython,
     HighNotes,
@@ -158,7 +196,6 @@ impl senax_encoder::Decoder for EngineerIntelligence {
             Stored::Mini => Self::Mini,
             Stored::Alt => Self::Alt,
             Stored::Cheap => Self::Cheap,
-            Stored::Gemini => Self::Gemini,
         })
     }
 }
@@ -352,6 +389,14 @@ pub struct ToolSpec {
     pub format: Option<ToolFormat>,
 }
 
+/// The only model-issued action in either Rho runtime. Host operations remain
+/// independently callable inside its Python source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ExecCall {
+    pub id: ExecId,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolCall {
     pub id: ToolCallId,
@@ -406,12 +451,30 @@ pub struct ToolResult {
     /// Wire shape for replaying this result to the provider.
     pub tool_type: ToolType,
     pub body: ToolOutput,
-    /// When tool execution began.
+    /// Historical call display start. Exec lifecycle observations are
+    /// authoritative.
     pub started_at: UnixMs,
-    /// When tool execution finished.
+    /// Historical first-result timestamp, not proof that Python or its jobs
+    /// finished.
     pub finished_at: UnixMs,
     /// Tool-specific UI/runtime metadata. Not sent to providers.
     pub metadata: Option<ToolResultMetadata>,
+}
+
+/// Complete notebook contributions, independent of provider wire tool types.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum ExecOutput {
+    Reply {
+        id: ExecId,
+        body: ToolOutput,
+        first_block_at: UnixMs,
+        at: UnixMs,
+    },
+    Report {
+        id: ExecId,
+        body: ToolOutput,
+        at: UnixMs,
+    },
 }
 
 /// An extra output item for a tool call that has (or will have) its own
@@ -420,6 +483,9 @@ pub struct ToolResult {
 /// call id retains transcript attribution across compaction.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ToolUpdate {
+    /// Status of this contribution when recorded natively; unknown on old wire-only reports.
+    #[senax(default)]
+    pub status: Option<ToolOutputStatus>,
     /// The [`ToolCall`] this update annotates.
     pub call_id: ToolCallId,
     /// Wire shape for replaying this update to the provider.
@@ -431,6 +497,8 @@ pub struct ToolUpdate {
     /// When the tool emitted the update (a single instant; updates have no
     /// duration).
     pub at: UnixMs,
+    #[senax(default)]
+    pub images: Arc<Vec<ImageContent>>,
 }
 
 impl ToolUpdate {
@@ -537,7 +605,6 @@ pub struct InferenceRequest {
     // arc is used to avoid cloning context blocks too much between requests
     pub input: Vec<Arc<ContextBlock>>,
     pub agent_id_labels: std::collections::BTreeMap<AgentId, Arc<str>>,
-    pub tools: Arc<[ToolSpec]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -701,6 +768,8 @@ pub enum ContextItemEvent {
 
 #[derive(Debug, Clone)]
 pub enum InferenceEvent {
+    /// Provider argument generation ended; not item completion or Python EOF.
+    ExecArgumentsFinished { id: ExecId },
     ContextItem {
         index: usize,
         event: ContextItemEvent,
@@ -855,6 +924,7 @@ mod tests {
     fn tool_update_without_complete_record_decodes_from_legacy_shape() {
         #[derive(Encode)]
         struct LegacyToolUpdate {
+            status: None,
             call_id: ToolCallId,
             tool_type: ToolType,
             output: Arc<String>,
@@ -862,6 +932,7 @@ mod tests {
         }
 
         let mut encoded = senax_encoder::encode(&LegacyToolUpdate {
+            status: None,
             call_id: "call-1".try_into().unwrap(),
             tool_type: ToolType::Custom,
             output: Arc::new("done".to_owned()),

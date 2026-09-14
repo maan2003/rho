@@ -27,7 +27,10 @@ use crate::db::{
 };
 
 pub mod agent;
+mod boundary;
 mod claude;
+pub mod native;
+mod notebook;
 pub use agent::{AgentHandle, render_agent_surface};
 
 pub mod db;
@@ -38,10 +41,8 @@ pub mod mirror;
 pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
-pub mod presentation;
+mod title;
 pub mod prompt;
-
-const PRESENTATION_SOURCE_TAIL_BYTES: usize = 12 * 1024;
 
 /// Model-facing prompt and top-level tools for a newly created role. Dynamic
 /// agent identity/team text and stateful integration hosts are omitted.
@@ -61,48 +62,6 @@ pub enum AgentEvent<'a> {
     /// An input entered a queue: user text, mail, or a `/compact`. It becomes
     /// context when a later `Sent` carries it.
     Accepted(QueuedInput),
-    /// A boundary: every source was drained into `blocks`, they were appended
-    /// to history, and a request went out carrying all of it.
-    ///
-    /// One event rather than an append and a start, because it was always one
-    /// thing — and because the drain, the append and the send cannot come
-    /// apart even in a crash. `blocks` can be empty: a retry or a resume
-    /// sends with nothing pending, which is a fact worth being able to write
-    /// down.
-    Sent {
-        blocks: Cow<'a, [ContextBlock]>,
-        #[senax(default)]
-        at: UnixMs,
-        /// Why the request went out when it did; absent on rows from before
-        /// the scheduler recorded it.
-        #[senax(default)]
-        wake: Option<WakeFacts>,
-    },
-    /// A request boundary that also advances context rotation. Preparation
-    /// preserves queued input; other context boundaries drain it normally.
-    ContextSent {
-        blocks: Cow<'a, [ContextBlock]>,
-        change: ContextChange,
-        at: UnixMs,
-        wake: Option<WakeFacts>,
-    },
-    /// The model answered, and the request is over.
-    Replied {
-        blocks: Cow<'a, [ContextBlock]>,
-        /// Context-window occupancy after this response (all input plus
-        /// output tokens), or `None` when it compacted or usage was missing.
-        context_used: Option<u64>,
-        /// What the response cost, as the provider reported it. Told
-        /// here, at the response, so a reader can price the transcript
-        /// without a usage table (`AGENT-LOG-DESIGN.md`).
-        #[senax(default)]
-        usage: Option<crate::db::AgentUsageBucket>,
-        #[senax(default)]
-        at: UnixMs,
-    },
-    /// All queued items were dropped (cancel). Written before the log
-    /// carried times; `Cleared` is what is written now.
-    QueueCleared,
     Cleared {
         at: UnixMs,
     },
@@ -111,12 +70,10 @@ pub enum AgentEvent<'a> {
         edge: TurnEdge,
         at: UnixMs,
     },
-    /// The sidecar's title and activity, applied.
-    Presented {
-        title: PresentationField,
-        activity: PresentationField,
-        at: UnixMs,
-    },
+    /// The lifetime naming opportunity was consumed, before network dispatch.
+    TitleAttempted { at: UnixMs },
+    /// Generated naming metadata; a spawn or user name always takes precedence.
+    Titled { title: Option<String>, at: UnixMs },
     /// What the last turn asks of the person.
     Wants {
         want: AgentWant,
@@ -203,11 +160,39 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         at: UnixMs,
     },
-    /// Durable admission and settlement of streaming Python units.
-    PythonStream {
-        event: PythonStreamEvent,
+    /// A provider/host lifecycle observation shared only for presentation.
+    /// It neither changes native context nor claims ownership of Claude
+    /// history.
+    ExecObserved {
+        id: rho_core::ExecId,
+        milestone: rho_core::ExecMilestone,
         at: UnixMs,
     },
+    /// Claude owns its conversation; this records only Rho's permission to
+    /// execute a cell, committed before the notebook can perform side effects.
+    ClaudeExecAdmitted {
+        call: rho_core::ExecCall,
+        at: UnixMs,
+    },
+    /// Canonical native conversation records; legacy block rows are read-only.
+    Native(native::NativeEvent),
+    ClaudeOutput {
+        batch: ClaudeOutputBatch,
+    },
+    ClaudeOutputHandedOff {
+        id: uuid::Uuid,
+        at: UnixMs,
+    },
+}
+
+/// Leased notebook contributions transferred to durable host ownership before
+/// contacting Claude Code. A handoff does not prove remote consumption.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct ClaudeOutputBatch {
+    pub id: uuid::Uuid,
+    pub outputs: Vec<(rho_core::ExecId, rho_core::ToolOutput)>,
+    pub wake: WakeFacts,
+    pub at: UnixMs,
 }
 
 /// Durable context transitions; indices refer to the complete block history,
@@ -253,6 +238,8 @@ impl WakeFacts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum WakeTrigger {
+    /// A previously selected durable output batch is handed off.
+    Delivery,
     /// The user's message threw away an in-flight request.
     Interrupt,
     /// A request somebody asked for outright: a retry, a compaction.
@@ -365,12 +352,6 @@ pub enum InputKind {
     Compaction,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum PresentationSpeaker {
-    User,
-    Agent,
-    Assistant,
-}
 
 /// What one transcript line says, as far as a reader needs. Bodies are
 /// whole: the wire strips them.
@@ -404,13 +385,6 @@ pub struct TranscriptCall {
 
 /// A text-only, durably committed transcript source for the presentation
 /// sidecar.
-#[derive(Clone, Debug)]
-pub struct PresentationSource {
-    pub agent_id: AgentId,
-    pub through: AgentEventPos,
-    pub speaker: PresentationSpeaker,
-    pub text: String,
-}
 
 /// What a loop publishes about itself: its phase, and how much input
 /// waits. Everything else a reader wants is in the log.
@@ -508,7 +482,7 @@ pub enum AgentStateKind {
     /// Loaded from a log that ended with calls nobody answered: the next
     /// request owes them placeholder results and a note.
     UnfinishedTurn {
-        outstanding_calls: Arc<[ToolCall]>,
+        outstanding_calls: Arc<[rho_core::ExecId]>,
     },
     // Permanent error, thread is paused
     Error(FailedInferenceResponse),
@@ -665,97 +639,6 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     }
 }
 
-pub(crate) fn assistant_text(items: &[InferenceResponseItem]) -> String {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            InferenceResponseItem::AssistantMessage { content, .. } => Some(
-                content
-                    .iter()
-                    .filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        ContentPart::Image { .. } => None,
-                    })
-                    .collect::<String>(),
-            ),
-            _ => None,
-        })
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The text a reply carries, if any. A `Replied` event holds one response
-/// block; anything else in it is not the model speaking.
-fn replied_text(blocks: &[ContextBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContextBlock::InferenceResponse { items, .. } => Some(assistant_text(items)),
-            _ => None,
-        })
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub(crate) fn presentation_sources(
-    agent_id: AgentId,
-    records: &[(AgentEventPos, AgentEvent<'static>)],
-) -> Vec<PresentationSource> {
-    let found = |through: &AgentEventPos, speaker, text: String| {
-        (!text.trim().is_empty()).then_some(PresentationSource {
-            agent_id,
-            through: *through,
-            speaker,
-            text,
-        })
-    };
-    let speaker_of = |sender: &MessageSender| match sender {
-        MessageSender::User => PresentationSpeaker::User,
-        MessageSender::Agent { .. } => PresentationSpeaker::Agent,
-    };
-    records
-        .iter()
-        .filter_map(|(through, event)| match event {
-            AgentEvent::Accepted(QueuedInput {
-                source,
-                kind: InputKind::Message { content },
-                ..
-            }) => found(through, speaker_of(source), rho_core::text_content(content)),
-            AgentEvent::Replied { blocks, .. } => found(
-                through,
-                PresentationSpeaker::Assistant,
-                replied_text(blocks),
-            ),
-            AgentEvent::Transcript {
-                line: TranscriptLine::User { text },
-                ..
-            } => found(through, PresentationSpeaker::User, text.clone()),
-            AgentEvent::Transcript {
-                line: TranscriptLine::Assistant { text, .. },
-                ..
-            } => found(through, PresentationSpeaker::Assistant, text.clone()),
-            AgentEvent::Transcript { .. }
-            | AgentEvent::Accepted(_)
-            | AgentEvent::Sent { .. }
-            | AgentEvent::ContextSent { .. }
-            | AgentEvent::QueueCleared
-            | AgentEvent::Cleared { .. }
-            | AgentEvent::Turn { .. }
-            | AgentEvent::Presented { .. }
-            | AgentEvent::Wants { .. }
-            | AgentEvent::Rewound { .. }
-            | AgentEvent::PythonStream { .. }
-            | AgentEvent::Failed { .. }
-            | AgentEvent::Created { .. }
-            | AgentEvent::RoleChanged { .. }
-            | AgentEvent::ModeChanged { .. }
-            | AgentEvent::Notice { .. }
-            | AgentEvent::RuntimeRebound { .. } => None,
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod encoding_tests {
@@ -785,39 +668,16 @@ mod encoding_tests {
                 delivery: MessageDelivery::NextRequest,
                 at: UnixMs(8),
             }),
-            AgentEvent::Sent {
-                blocks: Cow::Owned(vec![ContextBlock::CompactionTrigger]),
-                at: UnixMs(9),
-                wake: None,
-            },
-            AgentEvent::Replied {
-                blocks: Cow::Owned(Vec::new()),
-                context_used: Some(12),
-                usage: None,
-                at: UnixMs(10),
-            },
-            AgentEvent::ContextSent {
-                blocks: Cow::Owned(vec![ContextBlock::DeveloperMessage {
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::CompactionTrigger]), at: UnixMs(9), wake: None, context: None }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(Vec::new()), context_used: Some(12), usage: None, at: UnixMs(10) }),
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::DeveloperMessage {
                     text: "boundary".into(),
-                }]),
-                change: ContextChange::Marked { retain_from: 1 },
-                at: UnixMs(11),
-                wake: None,
-            },
-            AgentEvent::ContextSent {
-                blocks: Cow::Owned(Vec::new()),
-                change: ContextChange::Preparing {
+                }]), context: Some(ContextChange::Marked { retain_from: 1 }), at: UnixMs(11), wake: None }),
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(Vec::new()), context: Some(ContextChange::Preparing {
                     retain_from: 1,
                     repair: true,
-                },
-                at: UnixMs(11),
-                wake: None,
-            },
-            AgentEvent::Sent {
-                blocks: Cow::Owned(vec![ContextBlock::ContextRotation { retain_from: 1 }]),
-                at: UnixMs(11),
-                wake: None,
-            },
+                }), at: UnixMs(11), wake: None }),
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::ContextRotation { retain_from: 1 }]), at: UnixMs(11), wake: None, context: None }),
             AgentEvent::Cleared { at: UnixMs(11) },
             AgentEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Errored {
@@ -825,9 +685,8 @@ mod encoding_tests {
                 }),
                 at: UnixMs(12),
             },
-            AgentEvent::Presented {
-                title: PresentationField::Set("title".to_owned()),
-                activity: PresentationField::Clear,
+            AgentEvent::Titled {
+                title: Some("title".to_owned()),
                 at: UnixMs(13),
             },
             AgentEvent::Wants {
@@ -839,7 +698,7 @@ mod encoding_tests {
                 to: crate::db::AgentEventPos::new(3),
                 at: UnixMs(15),
             },
-            AgentEvent::QueueCleared,
+            AgentEvent::Cleared { at: UnixMs(0) },
             AgentEvent::ModeChanged {
                 mode: WorksetMode::Exposed,
                 at: UnixMs(16),
@@ -860,7 +719,15 @@ mod encoding_tests {
                 wake: None,
             },
         ];
-        for event in events {
+        let current = events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .native_event()
+                    .map(|event| AgentEvent::Native(event.clone()))
+            })
+            .collect::<Vec<_>>();
+        for event in events.into_iter().chain(current) {
             let mut buffer = bytes::BytesMut::new();
             event.encode(&mut buffer).expect("encode");
             let mut reader = buffer.freeze();

@@ -21,6 +21,8 @@ pub struct UiAgentState {
     /// Cumulative billable usage for this agent across all of its turns.
     #[senax(default)]
     pub usage: UiAgentUsage,
+    #[senax(default)]
+    pub exec_timings: std::sync::Arc<std::collections::BTreeMap<String, rho_core::ExecTiming>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -123,6 +125,8 @@ pub struct UiTool {
     pub started_at: Option<UnixMs>,
     pub finished_at: Option<UnixMs>,
     pub metadata: Option<UiToolMetadata>,
+    #[senax(default)]
+    pub timing: rho_core::ExecTiming,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

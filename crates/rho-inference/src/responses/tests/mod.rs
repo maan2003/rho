@@ -8,8 +8,8 @@ use futures_util::{Sink, Stream};
 use rho_core::{
     ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
     InferenceResponseItem, MessagePhase, PendingInferenceResponse, ProviderResponseId,
-    StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat, ToolGrammarSyntax,
-    ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType, UnixMs, text_content,
+    StreamingContextItem, TokenUsage, ToolCall, ToolCallId,
+    ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, UnixMs, text_content,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::oauth::{InferenceAuth, OAuthFile, ResponsesOAuthCredentials};
 use super::session::{
     ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
-    is_quota_exhaustion_error, is_transient_turn_error, transient_backoff,
+    is_quota_exhaustion_error, is_transient_turn_error,
 };
 use super::wire::{
     OpenAiResponsesProviderData, ResponseState, ResponsesRequest, openai_provider_specific_data,
@@ -169,12 +169,11 @@ fn tool_name(name: &str) -> ToolName {
     ToolName::try_from(name).unwrap()
 }
 
-fn inference_request(input: Vec<Arc<ContextBlock>>, tools: Vec<ToolSpec>) -> InferenceRequest {
+fn inference_request(input: Vec<Arc<ContextBlock>>) -> InferenceRequest {
     InferenceRequest {
         instructions: Arc::from(""),
         input,
         agent_id_labels: std::collections::BTreeMap::new(),
-        tools: tools.into(),
     }
 }
 

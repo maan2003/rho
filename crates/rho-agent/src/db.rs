@@ -41,7 +41,6 @@ const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
 const JOURNAL: TableDefinition<u64, (AgentId, u64)> = TableDefinition::new("journal");
 /// Where each Claude agent's transcript rows stop: the session file they
 /// came from and one past the last line copied. Written with the rows.
-const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
@@ -55,7 +54,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "b4e2c7a1";
+const CURRENT_AGENT_DB_FORMAT: &str = "d8f63a20";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,7 +63,10 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+mod migration;
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "b4e2c7a1", to: CURRENT_AGENT_DB_FORMAT, migrate: migration::migrate,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -141,7 +143,6 @@ impl AgentUsageModel {
     pub const OPUS: Self = Self(3);
     pub const TERRA: Self = Self(4);
     pub const LUNA: Self = Self(5);
-    pub const GEMINI: Self = Self(6);
     pub const ASTRA: Self = Self(7);
 
     pub fn name(self) -> &'static str {
@@ -151,7 +152,6 @@ impl AgentUsageModel {
             Self::OPUS => "opus",
             Self::TERRA => "terra",
             Self::LUNA => "luna",
-            Self::GEMINI => "gemini",
             Self::ASTRA => "astra",
             _ => "unknown",
         }
@@ -220,7 +220,6 @@ pub(crate) fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) ->
             Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
             Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
             Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
-            Some(InferenceModel::Gemini37FlashLow) => AgentUsageModel::GEMINI,
             _ => AgentUsageModel::GPT,
         },
         AgentRuntime::Claude { .. } => match binding.claude_model() {
@@ -307,19 +306,8 @@ impl From<rho_ui_proto::mirror::AgentPos> for AgentEventPos {
 /// A sidecar-derived title/activity update. `through` is a durable source
 /// position, not the position where this update happens to be recorded. That
 /// distinction makes a late result harmless after rewind.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AgentPresentationUpdate {
-    pub generated_title: PresentationField,
-    pub activity: PresentationField,
-    pub through: AgentEventPos,
-}
 
 /// The title and activity a reader sees, and what seeds a fresh Luna turn.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AgentPresentationCache {
-    pub generated_title: Option<String>,
-    pub activity: Option<String>,
-}
 
 pub type UnixMillis = UnixMs;
 
@@ -350,7 +338,9 @@ pub struct AgentConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentHead {
     pub config: AgentConfig,
-    /// The sidecar title. A spawn name always takes precedence.
+    /// Naming is attempted at most once, including across rewind and restart.
+    pub title_attempted: bool,
+    /// A generated title. A spawn name always takes precedence.
     pub generated_title: Option<String>,
     /// The last durable, model-derived activity label.
     pub activity: Option<String>,
@@ -369,14 +359,6 @@ pub struct AgentHead {
     pub next: AgentEventPos,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct TurnReport {
-    pub needs_you: bool,
-    /// Activity-shaped few-word label of the outcome. Defaulted so records
-    /// written before the rename from `one_liner` still decode.
-    #[senax(default)]
-    pub summary: String,
-}
 
 impl AgentHead {
     pub fn config(&self) -> AgentRole {
@@ -466,9 +448,6 @@ pub enum SessionBinding {
     /// Terra-backed cheap advisory agent. Appended so persisted modes keep
     /// decoding.
     AdvisorTerra(InferenceProfile),
-    /// Reduced function-tool Gemini agent. Appended for persisted
-    /// compatibility.
-    AntigravityFlashLow(InferenceProfile),
     /// GPT-6 Astra-backed engineer.
     ResponsesAstra(InferenceProfile),
     /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
@@ -493,7 +472,6 @@ enum StoredSessionBinding {
     ClaudeAdvisor { effort: ClaudeEffort },
     AdvisorSol(InferenceProfile),
     AdvisorTerra(InferenceProfile),
-    AntigravityFlashLow(InferenceProfile),
     ResponsesAstra(InferenceProfile),
     AdvisorAstra(InferenceProfile),
     ResponsesSolPython(InferenceProfile),
@@ -518,7 +496,6 @@ impl senax_encoder::Decoder for SessionBinding {
             Stored::ClaudeAdvisor { effort } => Self::ClaudeAdvisor { effort },
             Stored::AdvisorSol(config) => Self::AdvisorSol(config),
             Stored::AdvisorTerra(config) => Self::AdvisorTerra(config),
-            Stored::AntigravityFlashLow(config) => Self::AntigravityFlashLow(config),
             Stored::ResponsesAstra(config) => Self::ResponsesAstra(config),
             Stored::ResponsesAstraNotes(config) => Self::ResponsesAstraNotes(config),
             Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
@@ -570,12 +547,6 @@ impl AgentRoleSessionProfile for AgentRole {
             } => SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::Medium,
             },
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Gemini,
-            } => SessionBinding::AntigravityFlashLow(InferenceProfile {
-                effort: ReasoningEffort::Medium,
-                fast_mode: false,
-            }),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
             } => SessionBinding::AdvisorSol(deep(ReasoningEffort::High)),
@@ -621,7 +592,6 @@ impl SessionBinding {
         }
         let intelligence = match self {
             Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
-            Self::AntigravityFlashLow(_) => EngineerIntelligence::Gemini,
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
             }
@@ -670,7 +640,6 @@ impl SessionBinding {
             | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
-            Self::AntigravityFlashLow(config) => Some(config),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -684,7 +653,6 @@ impl SessionBinding {
             Self::ResponsesAstra(_) | Self::ResponsesAstraNotes(_) | Self::AdvisorAstra(_) => {
                 Some(InferenceModel::Gpt6Astra)
             }
-            Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini37FlashLow),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -702,7 +670,6 @@ impl SessionBinding {
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
-            Self::AntigravityFlashLow(_) => None,
         }
     }
 
@@ -721,18 +688,7 @@ impl SessionBinding {
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
-            Self::AntigravityFlashLow(_) => None,
         }
-    }
-}
-
-impl SessionBinding {
-    /// Whether this Claude session runs with Rho's Python notebook as its
-    /// only tool, served in-process over MCP, instead of Claude's built-ins.
-    /// Every Claude engineer does; only a stored Claude advisor keeps the
-    /// built-ins.
-    pub fn claude_python(self) -> bool {
-        matches!(self, Self::ClaudeFable { .. } | Self::ClaudeOpus { .. })
     }
 }
 
@@ -770,15 +726,15 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
+    fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch>;
+    /// Admission is an external-effects fact, never undone by transcript
+    /// rewind.
+    fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_core::ExecId) -> bool;
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
     /// Newest text-bearing visible rows, read backward and bounded before
     /// decoding/building a Luna request.
-    fn agent_presentation_source_tail(
-        &self,
-        agent_id: AgentId,
-        max_source_bytes: usize,
-    ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
+
     /// How far the journal runs; zero when nothing has been appended.
     fn journal_head(&self) -> Seq;
     /// Journal entries after `since`, at most `limit`, with the rows they
@@ -822,12 +778,7 @@ pub trait AgentWriteTxnExt {
     /// Applies an update only when its source is still visible. The
     /// returned cache is the acknowledged source of truth for a sidecar
     /// session; `None` means its result was made stale by a rewind.
-    fn apply_agent_presentation(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        update: &AgentPresentationUpdate,
-    ) -> Option<AgentPresentationCache>;
+
 
     /// Takes back history from `to` on: told at a new position, so what
     /// the agent walked away from stays in the log
@@ -1035,43 +986,46 @@ impl AgentReadTxnExt for ReadTxn {
         visible_rows(rows(log.range(agent_range(agent_id))))
     }
 
+    fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch> {
+        let mut pending: Option<crate::ClaudeOutputBatch> = None;
+        let log = self.open_table(AGENT_LOG);
+        for (_, event) in rows(log.range(agent_range(agent_id))) {
+            match event {
+                AgentEvent::ClaudeOutput { batch } => pending = Some(batch),
+                AgentEvent::ClaudeOutputHandedOff { id, .. }
+                    if pending.as_ref().is_some_and(|batch| batch.id == id) =>
+                {
+                    pending = None
+                }
+                _ => {}
+            }
+        }
+        pending
+    }
+
+    fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_core::ExecId) -> bool {
+        let log = self.open_table(AGENT_LOG);
+        rows(log.range(agent_range(agent_id))).any(|(_, event)| {
+            if let AgentEvent::ClaudeExecAdmitted { call, .. } = &event {
+                return &call.id == exec;
+            }
+            match event.native_event() {
+                Some(crate::native::NativeEvent::PythonStream {
+                    event: crate::PythonStreamEvent::Admitted { call_id, .. }, ..
+                }) => call_id == exec,
+                Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =>
+                    output.iter().filter_map(|entry| match entry { rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None }).flatten().any(|item| matches!(item, rho_core::InferenceResponseItem::ToolCall { id, .. } if id == exec)),
+                _ => false,
+            }
+        })
+    }
+
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>> {
         self.open_table(AGENT_LOG)
             .get(&(agent_id, pos.pos))
             .map(|value| value.value().into_owned())
     }
 
-    fn agent_presentation_source_tail(
-        &self,
-        agent_id: AgentId,
-        max_source_bytes: usize,
-    ) -> Vec<(AgentEventPos, AgentEvent<'static>)> {
-        let log = self.open_table(AGENT_LOG);
-        let mut hidden = Hidden::default();
-        let mut selected = Vec::new();
-        let mut source_bytes = 0_usize;
-        let mut scanned_events = 0_usize;
-        for (position, event) in rows(log.range(agent_range(agent_id)).rev()) {
-            if !hidden.visible(position, &event) {
-                continue;
-            }
-            if scanned_events >= MAX_PRESENTATION_SOURCE_SCANNED_EVENTS {
-                break;
-            }
-            scanned_events += 1;
-            let bytes = presentation_event_text_bytes(&event);
-            if bytes == 0 {
-                continue;
-            }
-            source_bytes = source_bytes.saturating_add(bytes.min(1024));
-            selected.push((position, event));
-            if source_bytes >= max_source_bytes {
-                break;
-            }
-        }
-        selected.reverse();
-        selected
-    }
 
     fn journal_head(&self) -> Seq {
         Seq(self
@@ -1286,29 +1240,6 @@ impl AgentWriteTxnExt for WriteTxn {
             .expect("agent id counter exceeds prefix-id capacity")
     }
 
-    fn apply_agent_presentation(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        update: &AgentPresentationUpdate,
-    ) -> Option<AgentPresentationCache> {
-        if !agent_event_visible_write(self, agent_id, update.through) {
-            return None;
-        }
-        self.append_agent_event(
-            agent_id,
-            &AgentEvent::Presented {
-                title: update.generated_title.clone(),
-                activity: update.activity.clone(),
-                at: now,
-            },
-        );
-        let head = agent_head_write(self, agent_id).expect("agent id missing");
-        Some(AgentPresentationCache {
-            generated_title: head.generated_title,
-            activity: head.activity,
-        })
-    }
 
     fn rewind_agent(
         &mut self,
@@ -1566,6 +1497,7 @@ fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) ->
                 };
                 head = Some(AgentHead {
                     config: created_config(&event),
+                    title_attempted: false,
                     generated_title: None,
                     activity: None,
                     turn_running: false,
@@ -1585,19 +1517,13 @@ fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) ->
     head
 }
 
-fn agent_head_write(write: &mut WriteTxn, agent_id: AgentId) -> Option<AgentHead> {
+pub(crate) fn agent_head_write(write: &mut WriteTxn, agent_id: AgentId) -> Option<AgentHead> {
     let log = write.open_table(AGENT_LOG);
     fold_head(rows(log.range(agent_range(agent_id))))
 }
 
-/// Whether `position` still stands in the agent's history, read from a
-/// write transaction: a backward walk from the tail, so only the rows
-/// after it are decoded.
-fn agent_event_visible_write(
-    write: &mut WriteTxn,
-    agent_id: AgentId,
-    position: AgentEventPos,
-) -> bool {
+/// Whether a rewind destination is still in the visible history.
+fn agent_event_visible_write(write: &mut WriteTxn, agent_id: AgentId, position: AgentEventPos) -> bool {
     let log = write.open_table(AGENT_LOG);
     let mut hidden = Hidden::default();
     for (pos, event) in rows(log.range(agent_range(agent_id)).rev()) {
@@ -1607,67 +1533,6 @@ fn agent_event_visible_write(
         }
     }
     false
-}
-fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
-    match event {
-        AgentEvent::Accepted(crate::QueuedInput {
-            kind: crate::InputKind::Message { content },
-            ..
-        }) => text_bytes(content),
-        AgentEvent::Replied { blocks, .. } => blocks
-            .iter()
-            .map(|block| match block {
-                rho_core::ContextBlock::InferenceResponse { items, .. } => {
-                    assistant_text_bytes(items)
-                }
-                _ => 0,
-            })
-            .sum(),
-        AgentEvent::Transcript {
-            line:
-                crate::TranscriptLine::User { text } | crate::TranscriptLine::Assistant { text, .. },
-            ..
-        } => text.len(),
-        AgentEvent::Transcript { .. }
-        | AgentEvent::Accepted(_)
-        | AgentEvent::Sent { .. }
-        | AgentEvent::ContextSent { .. }
-        | AgentEvent::QueueCleared
-        | AgentEvent::Cleared { .. }
-        | AgentEvent::Turn { .. }
-        | AgentEvent::Presented { .. }
-        | AgentEvent::Wants { .. }
-        | AgentEvent::Rewound { .. }
-        | AgentEvent::PythonStream { .. }
-        | AgentEvent::Failed { .. }
-        | AgentEvent::Created { .. }
-        | AgentEvent::RoleChanged { .. }
-        | AgentEvent::ModeChanged { .. }
-        | AgentEvent::Notice { .. }
-        | AgentEvent::RuntimeRebound { .. } => 0,
-    }
-}
-
-fn text_bytes(content: &[rho_core::ContentPart]) -> usize {
-    content
-        .iter()
-        .filter_map(|part| match part {
-            rho_core::ContentPart::Text { text } => Some(text.len()),
-            rho_core::ContentPart::Image { .. } => None,
-        })
-        .sum()
-}
-
-fn assistant_text_bytes(items: &[crate::InferenceResponseItem]) -> usize {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            crate::InferenceResponseItem::AssistantMessage { content, .. } => {
-                Some(text_bytes(content))
-            }
-            _ => None,
-        })
-        .sum()
 }
 
 /// The config a `Created` event states. Panics on any other event: only
@@ -1700,20 +1565,6 @@ fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
 
 /// One event's effect on the head.
 fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
-    let mut presented = |title: &PresentationField, activity: &PresentationField| {
-        match title {
-            PresentationField::Set(title) => {
-                head.generated_title = Some(title.clone());
-            }
-            PresentationField::Clear => head.generated_title = None,
-            PresentationField::Unchanged => {}
-        }
-        match activity {
-            PresentationField::Set(activity) => head.activity = Some(activity.clone()),
-            PresentationField::Clear => head.activity = None,
-            PresentationField::Unchanged => {}
-        }
-    };
     match event {
         AgentEvent::Created { .. } => head.config = created_config(event),
         AgentEvent::RoleChanged { role, binding, .. } => {
@@ -1746,9 +1597,11 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 };
             }
         },
-        AgentEvent::Presented {
-            title, activity, ..
-        } => presented(title, activity),
+        AgentEvent::TitleAttempted { .. } => head.title_attempted = true,
+        AgentEvent::Titled { title, .. } => {
+            head.title_attempted = true;
+            head.generated_title = title.clone();
+        }
         AgentEvent::Turn { edge, at } => match edge {
             TurnEdge::Started => head.turn_running = true,
             TurnEdge::Ended(_) => {
@@ -1763,14 +1616,14 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             head.pending_notice = None;
         }
         AgentEvent::Accepted(_)
-        | AgentEvent::Sent { .. }
-        | AgentEvent::ContextSent { .. }
-        | AgentEvent::Replied { .. }
-        | AgentEvent::QueueCleared
         | AgentEvent::Cleared { .. }
         | AgentEvent::Wants { .. }
         | AgentEvent::Rewound { .. }
-        | AgentEvent::PythonStream { .. }
+        | AgentEvent::ClaudeOutput { .. }
+        | AgentEvent::ClaudeOutputHandedOff { .. }
+        | AgentEvent::ClaudeExecAdmitted { .. }
+        | AgentEvent::ExecObserved { .. }
+        | AgentEvent::Native(_)
         | AgentEvent::Failed { .. }
         | AgentEvent::Transcript { .. } => {}
     }

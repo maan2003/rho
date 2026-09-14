@@ -3,11 +3,11 @@ use std::time::Duration;
 use rho_agent_tools::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 use rho_core::ToolType;
 
-use super::boundary::{
+use super::*;
+use crate::boundary::{
     DEFAULT_WAIT, FAILURE_PATIENCE, FOREGROUND_PATIENCE, MAIL_BURST, MAIL_PATIENCE,
     NOTIFY_PATIENCE, Observations, USER_PATIENCE,
 };
-use super::*;
 use crate::{WakeKind, WakeTrigger};
 
 fn call(id: &str) -> ToolCall {
@@ -50,7 +50,10 @@ impl Ask {
         boundary(
             &self.sources,
             self.turn.as_ref(),
-            &self.phase,
+            match &self.phase {
+                Phase::Idle { standing, .. } => Some(standing),
+                Phase::Requesting(_) => None,
+            },
             &mut self.observations,
             now,
         )
@@ -882,7 +885,7 @@ fn what_a_restart_owes_and_when_it_pays_are_two_questions() {
     let mut owing = ask(idle_queues());
     owing.turn = None;
     owing.phase = Phase::Idle {
-        owed: vec![call("gone")],
+        owed: vec!["gone".try_into().unwrap()],
         standing: Standing::Nothing,
     };
     assert_eq!(
@@ -891,7 +894,7 @@ fn what_a_restart_owes_and_when_it_pays_are_two_questions() {
         "what is owed is not a reason to send"
     );
     owing.phase = Phase::Idle {
-        owed: vec![call("gone")],
+        owed: vec!["gone".try_into().unwrap()],
         standing: Standing::Asked,
     };
     assert_eq!(owing.wake(UnixMs(0)).trigger, WakeTrigger::Asked);
@@ -950,17 +953,6 @@ fn the_wake_records_the_room() {
     assert_eq!(wake.events[0].source, 11);
 }
 
-#[test]
-fn python_accepts_one_exec_or_final_prose_not_multiple_calls() {
-    let exec = call("exec-1");
-    assert!(validate_tool_calls(&[]).is_ok());
-    assert!(validate_tool_calls(std::slice::from_ref(&exec)).is_ok());
-    assert!(validate_tool_calls(&[exec.clone(), exec.clone()]).is_err());
-    let mut other = call("other");
-    other.name = ToolName::try_from("not-exec").unwrap();
-    assert!(validate_tool_calls(&[other]).is_err());
-}
-
 // -- tool plumbing ----------------------------------------------------------
 
 #[tokio::test]
@@ -975,8 +967,8 @@ async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
     assert!(woken.await.is_ok(), "the permit survives until awaited");
 }
 
-fn python_tool(directory: &tempfile::TempDir) -> rho_agent_tools::PythonTool {
-    rho_agent_tools::PythonTool::new(
+fn python_tool(directory: &tempfile::TempDir) -> rho_agent_tools::PythonNotebook {
+    rho_agent_tools::PythonNotebook::new(
         rho_tool_shell::ShellTools::in_directory(
             Duration::from_secs(20),
             directory.path().to_str().unwrap().into(),
@@ -988,7 +980,7 @@ fn python_tool(directory: &tempfile::TempDir) -> rho_agent_tools::PythonTool {
 }
 
 /// The call's sources as the loop reports them for the model's latest cell.
-fn latest_sources(running: &RunningTool) -> Vec<SourceKind> {
+fn latest_sources(running: &RunningExec) -> Vec<SourceKind> {
     running
         .sources()
         .map(|source| match source {
@@ -1001,7 +993,7 @@ fn latest_sources(running: &RunningTool) -> Vec<SourceKind> {
         .collect()
 }
 
-async fn until_jobs_registered(running: &RunningTool, wake: &Arc<Notify>, count: usize) {
+async fn until_jobs_registered(running: &RunningExec, wake: &Arc<Notify>, count: usize) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let jobs = running
@@ -1021,7 +1013,7 @@ async fn until_jobs_registered(running: &RunningTool, wake: &Arc<Notify>, count:
 }
 
 async fn until_job_ends(
-    running: &RunningTool,
+    running: &RunningExec,
     wake: &Arc<Notify>,
     registered_index: usize,
 ) -> UnixMs {
@@ -1053,11 +1045,20 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     let wake = Arc::new(Notify::new());
     let mut invocation = call("python-sources");
     invocation.arguments = "command('echo first')\nsecond = command('while [ ! -f release ]; do sleep 0.01; done; echo second')\nawait second\ncommand('while [ ! -f finish ]; do sleep 0.01; done; echo third')".into();
-    let mut running = RunningTool {
-        session: tool.run(invocation.clone(), SourceWaker::new(wake.clone())),
-        call: invocation,
-        started_at: UnixMs::now(),
-        answer: ToolCallAnswer::Owed,
+    let mut running = RunningExec {
+        session: tool.exec(
+            rho_core::ExecCall {
+                id: invocation.id.clone(),
+                source: invocation.arguments.clone(),
+            },
+            SourceWaker::new(wake.clone()),
+        ),
+        call: rho_core::ExecCall {
+            id: invocation.id,
+            source: invocation.arguments,
+        },
+        first_block_at: UnixMs::now(),
+        answer: ReplyState::Owed,
     };
     // The cell registers its second command a moment after the first, which
     // can end before then; the announcement below needs both on the books.
@@ -1075,8 +1076,9 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
 
     // Exactly the normal request drain: the provider gets one exec result,
     // and each source has contributed what it had.
-    running.answer = ToolCallAnswer::Sent;
+    running.answer = ReplyState::Sent;
     let first = running.session.first_output();
+    running.session.acknowledge_output();
     assert!(
         first
             .output
@@ -1105,14 +1107,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     std::fs::write(directory.path().join("release"), "").unwrap();
     let second_at = until_job_ends(&running, &wake, 0).await;
     tokio::time::timeout(Duration::from_secs(10), async {
-        while running
-            .session
-            .python_exec()
-            .unwrap()
-            .facts()
-            .returned
-            .is_none()
-        {
+        while running.session.execution().facts().returned.is_none() {
             wake.notified().await;
         }
     })
@@ -1128,7 +1123,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
 
     std::fs::write(directory.path().join("finish"), "").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !running.session.python_exec().unwrap().quiescent() {
+        while !running.session.execution().quiescent() {
             wake.notified().await;
         }
     })
@@ -1141,6 +1136,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
         "nothing to batch once every command ends"
     );
     let last = running.session.more_output().unwrap();
+    running.session.acknowledge_output();
     assert_eq!(
         last.output.matches("Process exited with code 0").count(),
         2,
@@ -1159,14 +1155,23 @@ async fn python_output_order_puts_latest_first_then_older_cells_in_execution_ord
     // that must not move their updates behind an older unacknowledged call.
     for id in ["z-oldest", "a-older", "m-latest"] {
         let invocation = call(id);
-        running.push(RunningTool {
-            session: tool.run(invocation.clone(), SourceWaker::new(Default::default())),
-            call: invocation,
-            started_at: UnixMs(0),
+        running.push(RunningExec {
+            session: tool.exec(
+                rho_core::ExecCall {
+                    id: invocation.id.clone(),
+                    source: invocation.arguments.clone(),
+                },
+                SourceWaker::new(Default::default()),
+            ),
+            call: rho_core::ExecCall {
+                id: invocation.id,
+                source: invocation.arguments,
+            },
+            first_block_at: UnixMs(0),
             answer: if id == "z-oldest" {
-                ToolCallAnswer::Owed
+                ReplyState::Owed
             } else {
-                ToolCallAnswer::Sent
+                ReplyState::Sent
             },
         });
     }
@@ -1179,4 +1184,39 @@ async fn python_output_order_puts_latest_first_then_older_cells_in_execution_ord
             .collect::<Vec<_>>(),
         ["m-latest", "z-oldest", "a-older"],
     );
+}
+
+#[test]
+fn retained_output_obeys_stop_and_provider_availability() {
+    let sources = [SourceKind::Delivery];
+    let mut observations = Observations::default();
+    assert!(matches!(
+        boundary(
+            &sources,
+            None,
+            Some(&Standing::Cancelled { at: UnixMs(1) }),
+            &mut observations,
+            UnixMs(2)
+        ),
+        Boundary::No { recheck: None }
+    ));
+    assert!(matches!(
+        boundary(&sources, None, None, &mut observations, UnixMs(2)),
+        Boundary::No { recheck: None }
+    ));
+    assert!(matches!(
+        boundary(
+            &sources,
+            None,
+            Some(&Standing::Nothing),
+            &mut observations,
+            UnixMs(2)
+        ),
+        Boundary::Now {
+            wake: crate::WakeFacts {
+                trigger: WakeTrigger::Delivery,
+                ..
+            }
+        }
+    ));
 }

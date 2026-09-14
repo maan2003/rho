@@ -47,7 +47,7 @@ It emits, ahead of everything the sources drain:
 Settling at the first request rather than at load means an agent that is only
 opened and read is never written to, and it puts the note beside the request it
 explains. It also makes recovery idempotent: those call ids appear in a
-`ToolResults` block of the resulting `AgentEvent::Sent`, so a second restart
+`ToolResults` block of the resulting `NativeEvent::RequestStarted`, so a second restart
 derives an `owed` without them.
 
 Nothing else may consume `owed`. In particular `boundary` never reads it: what a
@@ -62,7 +62,7 @@ Recovery rebuilds history, queues, and streaming Python admission evidence, but
 never treats interrupted work as permission to execute it again. Two consequences:
 
 - an interrupted request with no streaming Python leaves no context beyond its
-  `Sent`; a streamed call is preserved under its original provider identity,
+  `RequestStarted`; a streamed call is preserved under its original provider identity,
   even when the response never finished. The next request carries the exact
   successfully evaluated prefix and identifies admitted-but-unsettled source as
   possibly partially executed. Admission is not proof of execution, and Python
@@ -86,7 +86,7 @@ and `owed` survives every move:
 
 `Standing::Nothing` hands the question to the sources, which can mean *never* in
 practice, and after a restart it commonly does: there are no tools and no model
-turn, and the queues were drained by the `Sent` that preceded the model's last
+turn, and the queues were drained by the `RequestStarted` that preceded the model's last
 reply, so the sources may name no moment at all. Such an agent is
 `AgentActivity::Live` and silent until a person or a peer gives it something.
 Whatever is owed is settled by that request when it comes, however long that
@@ -135,3 +135,18 @@ about execution whose live state has been lost.
 Interpreter return and provider completion do not retire execution evidence.
 It remains recoverable until its progress or result has been durably delivered
 at a request boundary.
+
+### Claude ownership
+
+Claude Code restores its own conversation; Rho does not replay it as native
+provider input. Notebook admission and output ownership remain Rho's durable
+facts. An admitted provider identity must never execute again, even after rewind.
+A restart does not restore the Python namespace or its jobs.
+
+Before releasing notebook output, Rho commits its attributed contributions.
+A transport failure leaves that batch pending across restart. The next eligible
+send carries it as a report, not a second initial result or a request to rerun
+code. A completed handoff retires the batch; a crash between write and recorded
+handoff can repeat the report, but cannot authorize repeating its side effects.
+Handoff does not claim the remote model consumed the report. Slash commands retain
+their command semantics; pending reports can wait for the CLI to become idle.

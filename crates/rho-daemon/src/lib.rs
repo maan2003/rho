@@ -1656,7 +1656,6 @@ fn hourly_global_usage_series(
         AgentUsageModel::OPUS,
         AgentUsageModel::TERRA,
         AgentUsageModel::LUNA,
-        AgentUsageModel::GEMINI,
         AgentUsageModel::ASTRA,
     ]
     .into_iter()
@@ -3430,35 +3429,45 @@ fn agent_detail(
     pos: rho_ui_proto::mirror::AgentPos,
 ) -> rho_ui_proto::mirror::DetailBody {
     use rho_ui_proto::mirror::DetailBody;
-    match db.read().agent_event(agent_id, pos.into()) {
-        Some(
-            rho_agent::AgentEvent::Sent { blocks, .. }
-            | rho_agent::AgentEvent::ContextSent { blocks, .. },
-        ) => DetailBody::Results(
-            blocks
-                .iter()
-                .flat_map(|block| match block {
-                    rho_core::ContextBlock::ToolResults { results } => {
-                        results.iter().map(detail_result).collect::<Vec<_>>()
-                    }
-                    rho_core::ContextBlock::ToolUpdate(update) => {
-                        vec![detail_update(update)]
-                    }
-                    _ => Vec::new(),
-                })
-                .collect(),
-        ),
-        Some(rho_agent::AgentEvent::Replied { blocks, .. }) => DetailBody::Response(
-            blocks
-                .iter()
-                .flat_map(|block| match block {
-                    rho_core::ContextBlock::InferenceResponse { items, .. } => {
-                        items.iter().filter_map(detail::item).collect::<Vec<_>>()
-                    }
-                    _ => Vec::new(),
-                })
-                .collect(),
-        ),
+    let event = db.read().agent_event(agent_id, pos.into());
+    if let Some(native) = event.as_ref().and_then(rho_agent::AgentEvent::native_event) {
+        use rho_agent::native::NativeEvent;
+        return match native {
+            NativeEvent::RequestStarted { input, .. } => DetailBody::Results(
+                input
+                    .iter()
+                    .flat_map(|item| match item {
+                        rho_core::ContextBlock::ToolResults { results } => {
+                            results.iter().map(detail_result).collect::<Vec<_>>()
+                        }
+                        rho_core::ContextBlock::ToolUpdate(update) => vec![detail_update(&update)],
+                        _ => Vec::new(),
+                    })
+                    .collect(),
+            ),
+            NativeEvent::ResponseFinished { output, .. } => {
+                DetailBody::Response(output.iter().filter_map(|entry| match entry {
+                    rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None,
+                }).flatten().filter_map(detail::item).collect())
+            }
+            NativeEvent::RequestFailed { partial, .. } => DetailBody::Response(
+                partial
+                    .items
+                    .iter()
+                    .filter_map(|slot| match slot {
+                        rho_core::StreamingContextItemState::Pending(item)
+                        | rho_core::StreamingContextItemState::Finished(item) => item
+                            .to_context_item()
+                            .ok()
+                            .and_then(|item| detail::item(&item)),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            NativeEvent::PythonStream { .. } => DetailBody::Nothing,
+        };
+    }
+    match event {
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
                 (!text.is_empty())
@@ -3708,6 +3717,7 @@ mod tests {
         assert_eq!(super::detail_result(&result).output, "complete host record");
 
         let update = rho_core::ToolUpdate {
+            images: Default::default(),
             call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
             tool_type: rho_core::ToolType::Custom,
             output: Arc::new("bounded update".to_owned()),
@@ -3832,7 +3842,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(series.len(), 7);
+        assert_eq!(series.len(), 6);
         assert_eq!(series[0].model, "fable");
         assert_eq!(series[0].buckets.len(), 1);
         assert_eq!(series[0].buckets[0].bucket_start_ms, 0);
@@ -3840,10 +3850,8 @@ mod tests {
         assert_eq!(series[0].buckets[0].requests, 2);
         assert_eq!(series[1].model, "gpt");
         assert_eq!(series[1].buckets[0].bucket_start_ms, 60 * 60 * 1_000);
-        assert_eq!(series[5].model, "gemini");
+        assert_eq!(series[5].model, "astra");
         assert!(series[5].buckets.is_empty());
-        assert_eq!(series[6].model, "astra");
-        assert!(series[6].buckets.is_empty());
     }
 
     #[test]

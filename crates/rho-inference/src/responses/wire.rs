@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 use rho_core::{
     AppendString, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
     InferenceResponseItem, MessagePhase, ProviderResponseId, ProviderResponseItemId,
-    ProviderSpecificData, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolFormat,
-    ToolGrammarSyntax, ToolName, ToolResult, ToolSpec, ToolType, text_content,
+    ProviderSpecificData, StreamingContextItem, TokenUsage, ToolCall, ToolCallId,
+    ToolName, ToolResult, ToolType, text_content,
 };
 use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde::Serialize;
@@ -260,7 +260,7 @@ impl ResponsesRequest {
         previous_response: Option<(String, usize)>,
     ) -> Self {
         // Resolve names before incremental replay or compaction hides calls.
-        let tool_names = request
+        let tool_calls = request
             .input
             .iter()
             .filter_map(|block| match &**block {
@@ -269,9 +269,12 @@ impl ResponsesRequest {
             })
             .flatten()
             .filter_map(|item| match item {
-                InferenceResponseItem::ToolCall { id, name, .. } => {
-                    Some((id.clone(), name.clone()))
-                }
+                InferenceResponseItem::ToolCall {
+                    id,
+                    name,
+                    tool_type,
+                    ..
+                } => Some((id.clone(), (name.clone(), *tool_type))),
                 _ => None,
             })
             .collect::<std::collections::HashMap<_, _>>();
@@ -301,12 +304,15 @@ impl ResponsesRequest {
         }
         let timeline = trim_before_latest_compaction(&timeline);
 
-        let mut tools = request
-            .tools
-            .iter()
-            .cloned()
-            .map(convert_tool_spec)
-            .collect::<Vec<_>>();
+        let mut tools = if matches!(session.mode, super::session::InferenceSessionMode::Deep(_)) {
+            let spec = crate::exec::spec();
+            vec![json!({
+                "type": "custom", "name": spec.name.as_str(),
+                "description": spec.description, "format": { "type": "text" },
+            })]
+        } else {
+            Vec::new()
+        };
         let mut input = Vec::new();
         for item in timeline
             .iter()
@@ -320,14 +326,14 @@ impl ResponsesRequest {
                 // output as a standalone update, not an orphan result. Keep
                 // image content and the original callable name.
                 let mut output =
-                    convert_tool_result(result.clone(), tool_names.get(&result.call_id));
+                    convert_tool_result(result.clone(), tool_calls.get(&result.call_id));
                 let object = output.as_object_mut().unwrap();
                 object.remove("call_id");
                 object.insert("type".into(), json!("function_call_output"));
                 object.insert("namespace".into(), json!("functions"));
                 input.push(output);
             } else {
-                convert_timeline_item(item.clone(), &tool_names, &mut input);
+                convert_timeline_item(item.clone(), &tool_calls, &mut input);
             }
         }
         // The Responses API requires a manual compaction trigger to be the
@@ -338,7 +344,7 @@ impl ResponsesRequest {
                 .iter()
                 .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
         {
-            convert_timeline_item(WireTimelineItem::CompactionTrigger, &tool_names, &mut input);
+            convert_timeline_item(WireTimelineItem::CompactionTrigger, &tool_calls, &mut input);
         }
 
         let prompt_cache_key = session
@@ -491,7 +497,7 @@ fn append_block_items(
 
 fn convert_timeline_item(
     item: WireTimelineItem,
-    tool_names: &std::collections::HashMap<ToolCallId, ToolName>,
+    tool_calls: &std::collections::HashMap<ToolCallId, (ToolName, ToolType)>,
     out: &mut Vec<Value>,
 ) {
     match item {
@@ -504,12 +510,12 @@ fn convert_timeline_item(
             "type": "compaction_trigger",
         })),
         WireTimelineItem::ToolResult(result) => {
-            let name = tool_names.get(&result.call_id);
+            let name = tool_calls.get(&result.call_id);
             out.push(convert_tool_result(result, name));
         }
         WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(
             &update,
-            tool_names.get(&update.call_id),
+            tool_calls.get(&update.call_id).map(|(name, _)| name),
         )),
         WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
     }
@@ -776,41 +782,37 @@ fn message_phase_wire(phase: MessagePhase) -> &'static str {
     }
 }
 
-fn convert_tool_result(result: ToolResult, name: Option<&ToolName>) -> Value {
-    let output_type = match result.tool_type {
+fn output_content(text: &str, images: &[rho_core::ImageContent]) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    use base64::Engine as _;
+    let mut content = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        content.push(json!({ "type": "input_text", "text": text }));
+    }
+    content.extend(images.iter().map(|image| json!({
+        "type": "input_image",
+        "image_url": format!("data:{};base64,{}", image.media_type, base64::engine::general_purpose::STANDARD.encode(&image.data)),
+        "detail": image.detail,
+    })));
+    Value::Array(content)
+}
+
+fn convert_tool_result(result: ToolResult, call: Option<&(ToolName, ToolType)>) -> Value {
+    // Historical unresolved calls retain their wire shape from the original
+    // provider item. Native execution policy only names an exec identity.
+    let output_type = match call.map(|(_, kind)| *kind).unwrap_or(result.tool_type) {
         ToolType::Function => "function_call_output",
         ToolType::Custom => "custom_tool_call_output",
     };
-    let output = if result.body.images.is_empty() {
-        json!(result.body.output.as_ref())
-    } else {
-        use base64::Engine as _;
-        let mut content = Vec::with_capacity(result.body.images.len() + 1);
-        if !result.body.output.is_empty() {
-            content.push(json!({
-                "type": "input_text",
-                "text": result.body.output.as_ref(),
-            }));
-        }
-        content.extend(result.body.images.iter().map(|image| {
-            json!({
-                "type": "input_image",
-                "image_url": format!(
-                    "data:{};base64,{}",
-                    image.media_type,
-                    base64::engine::general_purpose::STANDARD.encode(&image.data)
-                ),
-                "detail": image.detail,
-            })
-        }));
-        Value::Array(content)
-    };
+    let output = output_content(&result.body.output, &result.body.images);
     let mut item = json!({
         "type": output_type,
         "call_id": result.call_id.as_str(),
         "output": output,
     });
-    if let Some(name) = name {
+    if let Some((name, _)) = call {
         item["name"] = json!(name.as_str());
     }
     item
@@ -822,55 +824,12 @@ fn convert_tool_update(update: &rho_core::ToolUpdate, name: Option<&ToolName>) -
     let mut item = json!({
         "type": "function_call_output",
         "namespace": "functions",
-        "output": update.output.as_ref(),
+        "output": output_content(&update.output, &update.images),
     });
     if let Some(name) = name {
         item["name"] = json!(name.as_str());
     }
     item
-}
-
-fn convert_tool_spec(tool: ToolSpec) -> Value {
-    let mut wire = match tool.tool_type {
-        ToolType::Function => json!({
-            "type": "function",
-            "name": tool.name.as_str(),
-            "strict": Value::Null,
-            "description": tool.description,
-            "parameters": tool.input_schema,
-        }),
-        ToolType::Custom => {
-            let mut wire = json!({
-                "type": "custom",
-                "name": tool.name.as_str(),
-                "description": tool.description,
-            });
-            if let Some(format) = tool.format {
-                wire["format"] = convert_tool_format(format);
-            }
-            wire
-        }
-    };
-    if wire["description"].as_str().is_some_and(str::is_empty) {
-        wire.as_object_mut().expect("object").remove("description");
-    }
-    wire
-}
-
-fn convert_tool_format(format: ToolFormat) -> Value {
-    match format {
-        ToolFormat::Text => json!({
-            "type": "text",
-        }),
-        ToolFormat::Grammar { syntax, definition } => json!({
-            "type": "grammar",
-            "syntax": match syntax {
-                ToolGrammarSyntax::Lark => "lark",
-                ToolGrammarSyntax::Regex => "regex",
-            },
-            "definition": definition,
-        }),
-    }
 }
 
 fn trim_before_latest_compaction(timeline: &[WireTimelineItem]) -> &[WireTimelineItem] {
@@ -1017,6 +976,11 @@ impl ResponseState {
                         arguments.push_str(delta);
                     }
                     self.emit_update(index, &mut updates);
+                }
+            }
+            "response.custom_tool_call_input.done" => {
+                if let Some(ItemBuilder::ToolCall { id, .. }) = self.builder_mut(index) {
+                    updates.push(InferenceEvent::ExecArgumentsFinished { id: id.clone() });
                 }
             }
             "response.output_item.done" => {

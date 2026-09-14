@@ -1970,6 +1970,7 @@ fn tool(
     finished_at: Option<u64>,
 ) -> UiTool {
     UiTool {
+        timing: Default::default(),
         id: id.to_owned(),
         name: "shell_command".to_owned(),
         arguments: "echo ok".to_owned(),
@@ -1986,6 +1987,7 @@ fn tool(
 fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
     let blocks = history.into_iter().chain(live).map(Arc::new).collect();
     UiAgentState {
+        exec_timings: Default::default(),
         blocks,
         status: UiAgentStatus::Streaming,
         context_used: None,
@@ -2376,6 +2378,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                 state,
                 index,
                 UiBlock::Tool(UiTool {
+                    timing: Default::default(),
                     id: format!("t1.{}", blocks_count - 1),
                     name: "shell_command".to_owned(),
                     arguments: format!("echo {tick}"),
@@ -3200,6 +3203,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
         state(
             vec![user("run")],
             vec![UiBlock::Tool(UiTool {
+                timing: Default::default(),
                 id: "tool-1".to_owned(),
                 name: "shell_command".to_owned(),
                 arguments: "echo".to_owned(),
@@ -3280,6 +3284,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
     let pending = (0..16)
         .map(|ix| {
             UiBlock::Tool(UiTool {
+                timing: Default::default(),
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),
@@ -3965,6 +3970,7 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
         cx,
         agent(1),
         UiAgentState {
+            exec_timings: Default::default(),
             blocks: vec![
                 Arc::new(user("go")),
                 Arc::new(assistant("done", Some(UiMessagePhase::FinalAnswer))),
@@ -3997,6 +4003,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
         cx,
         agent(1),
         UiAgentState {
+            exec_timings: Default::default(),
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
@@ -4062,6 +4069,7 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
         cx,
         agent_id,
         UiAgentState {
+            exec_timings: Default::default(),
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
@@ -5866,6 +5874,7 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
 fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let ran = UiBlock::Tool(UiTool {
+        timing: Default::default(),
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: r#"{"command":"echo **bold** and _under_"}"#.to_owned(),
