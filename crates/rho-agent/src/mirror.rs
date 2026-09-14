@@ -207,17 +207,6 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         AgentEvent::QueueCleared => MirrorEvent::QueueCleared { at: UnixMs(0) },
         AgentEvent::Cleared { at } => MirrorEvent::QueueCleared { at: *at },
         AgentEvent::RuntimeRebound { .. } | AgentEvent::PythonStream { .. } => return None,
-        AgentEvent::ClaudePresentationSource {
-            speaker, text, at, ..
-        } => MirrorEvent::ClaudeMessage {
-            speaker: match speaker {
-                crate::PresentationSpeaker::User => rho_ui_proto::mirror::Speaker::User,
-                crate::PresentationSpeaker::Agent => rho_ui_proto::mirror::Speaker::Agent,
-                crate::PresentationSpeaker::Assistant => rho_ui_proto::mirror::Speaker::Assistant,
-            },
-            text: text.to_string(),
-            at: *at,
-        },
         // Claude's transcript, told in the runtime-neutral words a reader
         // already knows: a person's line is a message, the model's a
         // reply, the results a request that carried them.
@@ -294,10 +283,6 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 .name()
                 .to_owned()
             }),
-            at: *at,
-        },
-        AgentEvent::WorkdirAdded { at } => MirrorEvent::Notice {
-            text: String::new(),
             at: *at,
         },
         AgentEvent::Notice { text, at } => MirrorEvent::Notice {

@@ -159,18 +159,6 @@ pub enum AgentEvent<'a> {
     },
 
     // -- the runtimes' shared config log --------------------------------------
-    /// A text-only message confirmed in Claude Code's external transcript,
-    /// as the Claude runtime wrote it before `Transcript` (6 Sep). Never
-    /// written now; read so older logs still fold.
-    ClaudePresentationSource {
-        source_id: uuid::Uuid,
-        speaker: PresentationSpeaker,
-        /// The message whole (rows from before the mirror existed hold
-        /// the first kilobyte only).
-        text: Cow<'a, str>,
-        #[senax(default)]
-        at: UnixMs,
-    },
     /// The agent coming into being: the first event of every agent's log,
     /// and the base the head's config is folded from. A spawn name given
     /// here is why no title is generated for that agent.
@@ -190,12 +178,6 @@ pub enum AgentEvent<'a> {
         role: AgentRole,
         /// `None` when only the role moved and the session binding stands.
         binding: Option<SessionBinding>,
-        #[senax(default)]
-        at: UnixMs,
-    },
-    /// Written by nothing since worksets; read so a log that has one
-    /// still folds (it changes nothing).
-    WorkdirAdded {
         #[senax(default)]
         at: UnixMs,
     },
@@ -739,9 +721,6 @@ pub(crate) fn presentation_sources(
                 PresentationSpeaker::Assistant,
                 replied_text(blocks),
             ),
-            AgentEvent::ClaudePresentationSource { speaker, text, .. } => {
-                found(through, *speaker, text.to_string())
-            }
             AgentEvent::Transcript {
                 line: TranscriptLine::User { text },
                 ..
@@ -764,7 +743,6 @@ pub(crate) fn presentation_sources(
             | AgentEvent::Failed { .. }
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }
-            | AgentEvent::WorkdirAdded { .. }
             | AgentEvent::Notice { .. }
             | AgentEvent::RuntimeRebound { .. } => None,
         })
@@ -854,12 +832,6 @@ mod encoding_tests {
                 at: UnixMs(15),
             },
             AgentEvent::QueueCleared,
-            AgentEvent::ClaudePresentationSource {
-                source_id: uuid::uuid!("00000000-0000-4000-8000-000000000001"),
-                speaker: PresentationSpeaker::Assistant,
-                text: Cow::Borrowed("confirmed response"),
-                at: UnixMs(16),
-            },
             AgentEvent::Transcript {
                 uuid: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
                 line: TranscriptLine::Assistant {

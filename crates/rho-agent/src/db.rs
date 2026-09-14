@@ -55,7 +55,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = old_rows::TO;
+const CURRENT_AGENT_DB_FORMAT: &str = "b4e2c7a1";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,11 +64,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: old_rows::FROM,
-    to: old_rows::TO,
-    migrate: old_rows::run,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1541,10 +1537,7 @@ fn carries_notice(event: &AgentEvent<'_>) -> bool {
             source: rho_core::MessageSender::User,
             kind: crate::InputKind::Message { .. },
             ..
-        }) | AgentEvent::ClaudePresentationSource {
-            speaker: crate::PresentationSpeaker::User,
-            ..
-        } | AgentEvent::Transcript {
+        }) | AgentEvent::Transcript {
             line: crate::TranscriptLine::User { .. },
             ..
         }
@@ -1618,7 +1611,6 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
                 _ => 0,
             })
             .sum(),
-        AgentEvent::ClaudePresentationSource { text, .. } => text.len(),
         AgentEvent::Transcript {
             line:
                 crate::TranscriptLine::User { text } | crate::TranscriptLine::Assistant { text, .. },
@@ -1638,7 +1630,6 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
         | AgentEvent::Failed { .. }
         | AgentEvent::Created { .. }
         | AgentEvent::RoleChanged { .. }
-        | AgentEvent::WorkdirAdded { .. }
         | AgentEvent::Notice { .. }
         | AgentEvent::RuntimeRebound { .. } => 0,
     }
@@ -1718,8 +1709,8 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 head.config.binding = *binding;
             }
         }
-        AgentEvent::WorkdirAdded { .. } => {}
-        // An empty notice is nothing to say (a rewritten `WorkdirAdded`).
+        // An empty notice is nothing to say (what the old `WorkdirAdded`
+        // rows became).
         AgentEvent::Notice { text, .. } => {
             if !text.is_empty() {
                 head.pending_notice = Some(text.to_string());
@@ -1767,7 +1758,6 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::Rewound { .. }
         | AgentEvent::PythonStream { .. }
         | AgentEvent::Failed { .. }
-        | AgentEvent::ClaudePresentationSource { .. }
         | AgentEvent::Transcript { .. } => {}
     }
 }
@@ -1943,8 +1933,6 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
 }
-
-mod old_rows;
 
 #[cfg(test)]
 pub(crate) mod tests;
