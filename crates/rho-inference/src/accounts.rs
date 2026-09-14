@@ -56,8 +56,8 @@ pub struct InferenceQuotaSeries {
     pub points: Vec<InferenceQuotaPoint>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SelectedAuth {
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
+pub struct SelectedAuth {
     pub(crate) auth: InferenceAuth,
     pub(crate) namespace: Option<String>,
     pub(crate) account_id: Option<String>,

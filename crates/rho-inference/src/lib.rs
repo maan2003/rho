@@ -8,13 +8,13 @@ mod inference;
 mod responses;
 
 pub use accounts::{
-    InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState,
+    InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState, SelectedAuth,
 };
 pub use auth_cli::{AuthArgs, run_auth_cli};
-pub use inference::{Inference, InferenceConfig};
+pub use inference::{Inference, InferenceConfig, InferenceHost};
 pub use responses::{
-    InferenceAuth, InferenceRouteProbe, InferenceSession, OpenAiResponsesProviderData,
-    PromptCacheKey, ResolvedOAuth,
+    DialRoute, InferenceAuth, InferenceRouteProbe, InferenceSession, OpenAiResponsesProviderData,
+    PromptCacheKey, QuotaUpdate, ResolvedOAuth, RouteSelection,
 };
 
 /// Installs the TLS crypto provider if nothing has yet. Any HTTP client built

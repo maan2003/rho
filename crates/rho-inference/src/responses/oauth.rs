@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
 use rand::seq::SliceRandom;
+use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,12 +23,12 @@ const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const REFRESH_EXPIRY_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub struct InferenceAuth {
     kind: InferenceAuthKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 enum InferenceAuthKind {
     OAuthFile(OAuthFile),
 }
@@ -61,7 +62,7 @@ pub struct ResolvedOAuth {
     pub account_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 pub(crate) struct OAuthFile {
     path: PathBuf,
 }

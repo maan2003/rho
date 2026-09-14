@@ -18,8 +18,8 @@ use super::session::{
     ReasoningContext, ResponsesEffort, ServiceTier, SessionConfig, TextVerbosity,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct QuotaUpdate {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct QuotaUpdate {
     pub(crate) weekly_used_percent: u8,
     pub(crate) weekly_reset_at_unix: Option<i64>,
     pub(crate) routing_used_percent: u8,

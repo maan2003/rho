@@ -14,6 +14,10 @@ The public surface is intentionally small:
 - `Inference::new_with_config` is the isolated-QA assembly path. It accepts
   an explicit Responses base URL and does not start the ChatGPT-only quota
   poller for non-default endpoints.
+- `Inference::from_host` creates session transport without opening a database or
+  starting pollers. Its `InferenceHost` supplies account selection, quota and
+  rate-limit reporting, and route observations from the daemon. Provider
+  connections and OAuth-file resolution stay with the session.
 - `InferenceSession` configures prompt-cache/thread behavior and owns one warm
   WebSocket. The session task snapshots the account manager's existing
   selection when it accepts each new request and reconnects when it differs

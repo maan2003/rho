@@ -28,8 +28,8 @@ const ROUTES: [DialRoute; 3] = [DialRoute::Dns, DialRoute::PinnedA, DialRoute::P
 
 /// A bounded set of ChatGPT edge paths. Fixed routes still use chatgpt.com as
 /// the WebSocket URL and TLS server name; only the TCP destination changes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DialRoute {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode)]
+pub enum DialRoute {
     Dns,
     PinnedA,
     PinnedB,
@@ -59,8 +59,8 @@ pub(crate) struct RouteSelector {
     db: Option<RhoDb>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RouteSelection {
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
+pub struct RouteSelection {
     route: DialRoute,
     account: Option<RouteAccount>,
 }
@@ -113,7 +113,7 @@ impl RouteMeasurement {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
 struct RouteAccount {
     namespace: Option<String>,
     account_id: Option<String>,
@@ -131,6 +131,32 @@ impl RouteAccount {
         match (&self.account_id, &selected.account_id) {
             (Some(probed), Some(requested)) => probed == requested,
             _ => self.namespace == selected.namespace,
+        }
+    }
+}
+
+impl RouteSelection {
+    pub(crate) fn for_session(
+        &self,
+        config: &ResponsesConfig,
+        selected: Option<&SelectedAuth>,
+    ) -> DialRoute {
+        if config.model == ResponsesModel::Gpt56Luna && config.service_tier == ServiceTier::Normal {
+            let route = self;
+            if route.route == DialRoute::Dns
+                || selected.is_some_and(|selected| {
+                    route
+                        .account
+                        .as_ref()
+                        .is_some_and(|account| account.matches(selected))
+                })
+            {
+                route.route
+            } else {
+                DialRoute::Dns
+            }
+        } else {
+            DialRoute::Dns
         }
     }
 }
@@ -161,30 +187,6 @@ impl RouteSelector {
             .filter(|record| record.observed_at_ms >= since.0)
             .map(Into::into)
             .collect()
-    }
-
-    pub(crate) fn for_session(
-        &self,
-        config: &ResponsesConfig,
-        selected: Option<&SelectedAuth>,
-    ) -> DialRoute {
-        if config.model == ResponsesModel::Gpt56Luna && config.service_tier == ServiceTier::Normal {
-            let route = self.selected.borrow();
-            if route.route == DialRoute::Dns
-                || selected.is_some_and(|selected| {
-                    route
-                        .account
-                        .as_ref()
-                        .is_some_and(|account| account.matches(selected))
-                })
-            {
-                route.route
-            } else {
-                DialRoute::Dns
-            }
-        } else {
-            DialRoute::Dns
-        }
     }
 
     pub(crate) async fn probe_once(&self, inference: &Inference) {
@@ -469,21 +471,21 @@ mod tests {
         });
 
         assert_eq!(
-            routes.for_session(
+            routes.selected.borrow().for_session(
                 &luna_config(ServiceTier::Normal),
                 Some(&selected("one", "account-1")),
             ),
             DialRoute::PinnedA
         );
         assert_eq!(
-            routes.for_session(
+            routes.selected.borrow().for_session(
                 &luna_config(ServiceTier::Normal),
                 Some(&selected("two", "account-2")),
             ),
             DialRoute::Dns
         );
         assert_eq!(
-            routes.for_session(
+            routes.selected.borrow().for_session(
                 &luna_config(ServiceTier::Priority),
                 Some(&selected("one", "account-1")),
             ),

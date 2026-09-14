@@ -32,6 +32,11 @@ file-backed OAuth credentials.
   namespace names, percentages, and reset times—never OAuth tokens or provider
   account identifiers. Account identifiers remain memory-only for alias
   deduplication. Session creation and account selection never request quota.
+- Worker-local sessions delegate account and route policy through `InferenceHost`.
+  They do not open provider tables or start account/route pollers. The selected
+  credential reference and account identity can cross the trusted local worker
+  channel, but must not enter user-facing state or protocol diagnostics. Quota
+  and rate-limit reports retain the selected account's identity.
 - Explicit non-production Responses endpoints suppress the ChatGPT usage
   poller, so an isolated QA daemon cannot make a live provider side request.
 - Production inference owns one route-probe task. At most once per 30 minutes,

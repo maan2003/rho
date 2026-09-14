@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use rho_core::UnixMs;
 use rho_db::RhoDb;
 use tokio::sync::watch;
@@ -9,20 +10,47 @@ use tokio::sync::watch;
 use crate::InferenceSession;
 use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
 use crate::config::{InferenceModel, InferenceProfile};
-use crate::responses::{InferenceAuth, PromptCacheKey, QuotaUpdate, RouteSelector};
+use crate::responses::{
+    DialRoute, InferenceAuth, PromptCacheKey, QuotaUpdate, RouteSelection, RouteSelector,
+};
 
 /// Provider account policy, quota, persistence, and session creation. Cheap to
 /// clone.
 #[derive(Clone, Debug)]
 pub struct Inference(Arc<Inner>);
 
+/// The session-facing daemon services. A worker receives account decisions and
+/// route observations; it never opens the account database or starts pollers.
+pub trait InferenceHost: std::fmt::Debug + Send + Sync {
+    fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>>;
+    fn mark_rate_limited(&self, selected: SelectedAuth) -> BoxFuture<'_, bool>;
+    fn observe_quota(&self, selected: SelectedAuth, quota: QuotaUpdate) -> BoxFuture<'_, ()>;
+    fn route_updates(&self) -> watch::Receiver<RouteSelection>;
+    fn report_connect_failure(
+        &self,
+        route: DialRoute,
+        selected: Option<SelectedAuth>,
+    ) -> BoxFuture<'_, ()>;
+}
+
+#[derive(Debug)]
+enum Backend {
+    Daemon {
+        accounts: Arc<AccountManager>,
+        routes: RouteSelector,
+    },
+    Host(Arc<dyn InferenceHost>),
+    #[cfg(test)]
+    Fixed {
+        auth: InferenceAuth,
+        routes: RouteSelector,
+    },
+}
+
 #[derive(Debug)]
 struct Inner {
-    accounts: Option<Arc<AccountManager>>,
+    backend: Backend,
     responses_base_url: Arc<str>,
-    routes: RouteSelector,
-    #[cfg(test)]
-    fixed_auth: Option<InferenceAuth>,
 }
 
 impl Inference {
@@ -52,11 +80,11 @@ impl Inference {
         let production_chatgpt =
             &*config.responses_base_url == crate::responses::DEFAULT_CHATGPT_BASE_URL;
         let inference = Self(Arc::new(Inner {
-            accounts: Some(accounts),
+            backend: Backend::Daemon {
+                accounts,
+                routes: RouteSelector::new(Some(db)),
+            },
             responses_base_url: config.responses_base_url,
-            routes: RouteSelector::new(Some(db)),
-            #[cfg(test)]
-            fixed_auth: None,
         }));
         if production_chatgpt {
             inference.spawn_route_prober();
@@ -67,19 +95,50 @@ impl Inference {
     #[cfg(test)]
     pub(crate) fn for_test(auth: InferenceAuth) -> Self {
         Self(Arc::new(Inner {
-            accounts: None,
+            backend: Backend::Fixed {
+                auth,
+                routes: RouteSelector::new(None),
+            },
             responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
-            routes: RouteSelector::new(None),
-            fixed_auth: Some(auth),
         }))
     }
 
-    pub(crate) fn responses_base_url(&self) -> &str {
+    pub fn responses_base_url(&self) -> &str {
         &self.0.responses_base_url
     }
 
-    pub(crate) fn routes(&self) -> &RouteSelector {
-        &self.0.routes
+    /// Session transport without daemon-owned account state or background work.
+    pub fn from_host(host: Arc<dyn InferenceHost>, config: InferenceConfig) -> Self {
+        Self(Arc::new(Inner {
+            backend: Backend::Host(host),
+            responses_base_url: config.responses_base_url,
+        }))
+    }
+
+    pub fn route_updates(&self) -> watch::Receiver<RouteSelection> {
+        match &self.0.backend {
+            Backend::Daemon { routes, .. } => routes.subscribe(),
+            Backend::Host(host) => host.route_updates(),
+            #[cfg(test)]
+            Backend::Fixed { routes, .. } => routes.subscribe(),
+        }
+    }
+
+    pub(crate) fn route_for_session(
+        &self,
+        config: &crate::responses::session::ResponsesConfig,
+        selected: Option<&SelectedAuth>,
+    ) -> DialRoute {
+        self.route_updates().borrow().for_session(config, selected)
+    }
+
+    pub async fn report_connect_failure(&self, route: DialRoute, selected: Option<&SelectedAuth>) {
+        match &self.0.backend {
+            Backend::Daemon { routes, .. } => routes.report_connect_failure(route, selected),
+            Backend::Host(host) => host.report_connect_failure(route, selected.cloned()).await,
+            #[cfg(test)]
+            Backend::Fixed { routes, .. } => routes.report_connect_failure(route, selected),
+        }
     }
 
     fn spawn_route_prober(&self) {
@@ -90,7 +149,9 @@ impl Inference {
                     return;
                 };
                 let inference = Inference(inner);
-                inference.0.routes.probe_once(&inference).await;
+                if let Backend::Daemon { routes, .. } = &inference.0.backend {
+                    routes.probe_once(&inference).await;
+                }
                 drop(inference);
                 tokio::time::sleep(RouteSelector::probe_interval()).await;
             }
@@ -153,32 +214,34 @@ impl Inference {
         Ok(self.select().await?.auth)
     }
 
-    pub(crate) async fn select(&self) -> anyhow::Result<SelectedAuth> {
-        if let Some(accounts) = &self.0.accounts {
-            accounts.select().await
-        } else {
+    pub async fn select(&self) -> anyhow::Result<SelectedAuth> {
+        match &self.0.backend {
+            Backend::Daemon { accounts, .. } => accounts.select().await,
+            Backend::Host(host) => host.select().await,
             #[cfg(test)]
-            if let Some(auth) = &self.0.fixed_auth {
-                return Ok(SelectedAuth {
-                    auth: auth.clone(),
-                    namespace: None,
-                    account_id: None,
-                });
-            }
-            anyhow::bail!("inference account manager is unavailable")
+            Backend::Fixed { auth, .. } => Ok(SelectedAuth {
+                auth: auth.clone(),
+                namespace: None,
+                account_id: None,
+            }),
         }
     }
 
-    pub(crate) async fn mark_rate_limited(&self, selected: &SelectedAuth) -> bool {
-        let Some(accounts) = &self.0.accounts else {
-            return false;
-        };
-        accounts.mark_rate_limited(selected).await
+    pub async fn mark_rate_limited(&self, selected: &SelectedAuth) -> bool {
+        match &self.0.backend {
+            Backend::Daemon { accounts, .. } => accounts.mark_rate_limited(selected).await,
+            Backend::Host(host) => host.mark_rate_limited(selected.clone()).await,
+            #[cfg(test)]
+            Backend::Fixed { .. } => false,
+        }
     }
 
-    pub(crate) async fn observe_quota(&self, selected: &SelectedAuth, quota: QuotaUpdate) {
-        if let Some(accounts) = &self.0.accounts {
-            accounts.observe_quota(selected, quota).await;
+    pub async fn observe_quota(&self, selected: &SelectedAuth, quota: QuotaUpdate) {
+        match &self.0.backend {
+            Backend::Daemon { accounts, .. } => accounts.observe_quota(selected, quota).await,
+            Backend::Host(host) => host.observe_quota(selected.clone(), quota).await,
+            #[cfg(test)]
+            Backend::Fixed { .. } => {}
         }
     }
 
@@ -199,11 +262,17 @@ impl Inference {
     }
 
     pub fn route_probe_history(&self, since: UnixMs) -> Vec<crate::responses::InferenceRouteProbe> {
-        self.0.routes.history(since)
+        match &self.0.backend {
+            Backend::Daemon { routes, .. } => routes.history(since),
+            _ => Vec::new(),
+        }
     }
 
     fn accounts(&self) -> &AccountManager {
-        self.0.accounts.as_ref().expect("inference account manager")
+        let Backend::Daemon { accounts, .. } = &self.0.backend else {
+            panic!("account administration belongs to the daemon")
+        };
+        accounts
     }
 }
 
@@ -235,5 +304,99 @@ impl Default for InferenceConfig {
         Self {
             responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Host {
+        selected: SelectedAuth,
+        routes: RouteSelector,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl InferenceHost for Host {
+        fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>> {
+            Box::pin(async {
+                self.calls.lock().unwrap().push("select");
+                Ok(self.selected.clone())
+            })
+        }
+        fn mark_rate_limited(&self, selected: SelectedAuth) -> BoxFuture<'_, bool> {
+            Box::pin(async move {
+                assert_eq!(selected, self.selected);
+                self.calls.lock().unwrap().push("rate-limit");
+                true
+            })
+        }
+        fn observe_quota(&self, selected: SelectedAuth, quota: QuotaUpdate) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                assert_eq!(selected, self.selected);
+                assert_eq!(quota.weekly_used_percent, 17);
+                self.calls.lock().unwrap().push("quota");
+            })
+        }
+        fn route_updates(&self) -> watch::Receiver<RouteSelection> {
+            self.routes.subscribe()
+        }
+        fn report_connect_failure(
+            &self,
+            route: DialRoute,
+            selected: Option<SelectedAuth>,
+        ) -> BoxFuture<'_, ()> {
+            Box::pin(async move {
+                assert_eq!(selected.as_ref(), Some(&self.selected));
+                self.calls.lock().unwrap().push("route-failure");
+                self.routes.report_connect_failure(route, selected.as_ref());
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_sessions_delegate_policy_without_opening_a_store_or_selecting_early() {
+        let host = Arc::new(Host {
+            selected: SelectedAuth {
+                auth: InferenceAuth::oauth_file("/unused/credentials.json"),
+                namespace: Some("account".into()),
+                account_id: Some("identity".into()),
+            },
+            routes: RouteSelector::new(None),
+            calls: Mutex::new(Vec::new()),
+        });
+        let inference = Inference::from_host(
+            host.clone(),
+            InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
+        );
+        assert!(host.calls.lock().unwrap().is_empty());
+        assert_eq!(inference.responses_base_url(), "http://127.0.0.1:1");
+        let selected = inference.select().await.unwrap();
+        let quota = QuotaUpdate {
+            weekly_used_percent: 17,
+            weekly_reset_at_unix: Some(123),
+            routing_used_percent: 23,
+            routing_reset_at_unix: None,
+        };
+        let bytes = senax_encoder::encode(&(selected.clone(), quota)).unwrap();
+        let decoded: (SelectedAuth, QuotaUpdate) =
+            senax_encoder::decode(&mut bytes.as_ref()).unwrap();
+        assert_eq!(decoded, (selected.clone(), quota));
+        inference.observe_quota(&selected, quota).await;
+        assert!(inference.mark_rate_limited(&selected).await);
+        inference
+            .report_connect_failure(DialRoute::Dns, Some(&selected))
+            .await;
+        assert_eq!(
+            *inference.route_updates().borrow(),
+            *host.routes.subscribe().borrow()
+        );
+        assert_eq!(
+            *host.calls.lock().unwrap(),
+            vec!["select", "quota", "rate-limit", "route-failure"]
+        );
     }
 }

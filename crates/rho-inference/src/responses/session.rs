@@ -510,7 +510,7 @@ impl SessionTask {
     /// split exists to hold, and it is why the task may have a `select!` where
     /// the caller may not.
     async fn drive(mut self, mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>) {
-        let mut route_updates = self.config.inference.routes().subscribe();
+        let mut route_updates = self.config.inference.route_updates();
         loop {
             tokio::select! {
                 biased;
@@ -647,7 +647,7 @@ impl SessionTask {
                 tokio::select! {
                     changed = route_updates.changed() => {
                         if changed.is_ok() {
-                            let desired = self.config.inference.routes().for_session(
+                            let desired = self.config.inference.route_for_session(
                                 &self.config.responses_config,
                                 self.selected_auth.as_ref(),
                             );
@@ -767,8 +767,8 @@ impl SessionTask {
         if let Some(connection) = &self.connection {
             self.config
                 .inference
-                .routes()
-                .report_connect_failure(connection.route, self.selected_auth.as_ref());
+                .report_connect_failure(connection.route, self.selected_auth.as_ref())
+                .await;
         }
         match self.turn.is_some() {
             true => self.fail_turn(error).await,
@@ -914,8 +914,7 @@ impl SessionTask {
             let route = self
                 .config
                 .inference
-                .routes()
-                .for_session(&self.config.responses_config, Some(&selected));
+                .route_for_session(&self.config.responses_config, Some(&selected));
             connection.bearer_token == resolved.bearer_token
                 && connection.client_secret == resolved.client_secret
                 && connection.route == route
@@ -938,8 +937,7 @@ impl SessionTask {
         let mut route = self
             .config
             .inference
-            .routes()
-            .for_session(&self.config.responses_config, Some(&selected));
+            .route_for_session(&self.config.responses_config, Some(&selected));
         let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
         let mut result = ws::connect(request, route).await;
         if let Err(error) = &result
@@ -948,8 +946,8 @@ impl SessionTask {
         {
             self.config
                 .inference
-                .routes()
-                .report_connect_failure(route, Some(&selected));
+                .report_connect_failure(route, Some(&selected))
+                .await;
             route = super::route::DialRoute::Dns;
             let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
             result = ws::connect(request, route).await;

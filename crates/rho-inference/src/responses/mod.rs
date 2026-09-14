@@ -7,18 +7,17 @@
 
 pub(crate) mod oauth;
 mod route;
-mod session;
+pub(crate) mod session;
 #[cfg(test)]
 mod tests;
 mod wire;
 mod ws;
 
 pub use oauth::{InferenceAuth, ResolvedOAuth};
-pub use route::InferenceRouteProbe;
 pub(crate) use route::RouteSelector;
+pub use route::{DialRoute, InferenceRouteProbe, RouteSelection};
 pub use session::{InferenceSession, PromptCacheKey};
-pub use wire::OpenAiResponsesProviderData;
-pub(crate) use wire::QuotaUpdate;
+pub use wire::{OpenAiResponsesProviderData, QuotaUpdate};
 
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 pub(crate) const OPENAI_BETA_WS: &str = "responses_websockets=2026-02-06";
