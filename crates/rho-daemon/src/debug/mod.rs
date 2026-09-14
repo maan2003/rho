@@ -470,12 +470,23 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
+    drop(db);
+    let db = RhoDb::open(&snapshot.path);
 
     let read = db.read();
     let agents = read.list_agents();
     let mut events = 0usize;
-    for (agent_id, _) in &agents {
-        events += read.agent_events(*agent_id).1.len();
+    for (agent_id, head) in &agents {
+        // Rewinds hide rows, not their admission evidence. Validate the current
+        // codec against every rewritten raw position after reopening the store.
+        for pos in 0..head.next.pos {
+            anyhow::ensure!(
+                read.agent_event(*agent_id, rho_agent::db::AgentEventPos::new(pos))
+                    .is_some(),
+                "missing raw event {agent_id:?} at {pos}"
+            );
+            events += 1;
+        }
     }
 
     let mut output = String::new();
@@ -483,7 +494,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "snapshot: {}", snapshot.path.display())?;
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "agents decoded: {}", agents.len())?;
-    writeln!(output, "events decoded: {events}")?;
+    writeln!(output, "raw events decoded after reopen: {events}")?;
     // The fused migration drops the old layout; a migration check is the
     // place that says whether any of it is still there.
     for table in [

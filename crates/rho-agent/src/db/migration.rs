@@ -420,6 +420,21 @@ mod tests {
         const TAG: &'static str = "migration-test.future-provider";
     }
 
+    // Exact former payload shape, deliberately not registered as a provider.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode)]
+    enum SignatureAttachment {
+        Standalone,
+        NextPart,
+    }
+    #[derive(Clone, Debug, PartialEq, Encode, Decode)]
+    struct RetiredThinking {
+        signature: String,
+        attachment: SignatureAttachment,
+    }
+    impl senax_encoder::TaggedSenax for RetiredThinking {
+        const TAG: &'static str = "google.antigravity.thought-signature";
+    }
+
     fn response(id: &str, items: Vec<InferenceResponseItem>) -> ContextBlock {
         ContextBlock::InferenceResponse {
             items,
@@ -457,6 +472,12 @@ mod tests {
                 }),
                 content: "raw thinking, preserved durably".into(),
                 summary: vec!["raw summary".into()],
+            },
+            InferenceResponseItem::Unknown {
+                provider_specific: Box::new(RetiredThinking {
+                    signature: "opaque retired signature".into(),
+                    attachment: SignatureAttachment::NextPart,
+                }),
             },
             InferenceResponseItem::Unknown {
                 provider_specific: Box::new(FutureData {
@@ -707,5 +728,103 @@ mod tests {
                 .into_owned(),
             Event::Sent { .. }
         ));
+    }
+    #[test]
+    fn retired_provider_configuration_rows_migrate_to_the_default_engineer() {
+        #[derive(Encode)]
+        enum Intelligence {
+            Gemini,
+        }
+        #[derive(Encode)]
+        enum Workflow {
+            PrFriendly,
+        }
+        #[derive(Encode)]
+        enum Role {
+            Engineer {
+                intelligence: Intelligence,
+            },
+            WorkflowEngineer {
+                intelligence: Intelligence,
+                workflow: Workflow,
+            },
+        }
+        #[derive(Encode)]
+        enum Binding {
+            AntigravityFlashLow(rho_inference::config::InferenceProfile),
+        }
+        #[derive(Encode)]
+        enum Row {
+            Created {
+                role: Role,
+                binding: Binding,
+                runtime: AgentRuntime,
+                place: Place,
+                spawned_by: AgentSpawnedBy,
+                spawn_name: Option<String>,
+                created_at: UnixMs,
+            },
+            RoleChanged {
+                role: Role,
+                binding: Option<Binding>,
+                at: UnixMs,
+            },
+        }
+        let binding = || {
+            Binding::AntigravityFlashLow(rho_inference::config::InferenceProfile {
+                effort: rho_inference::config::ReasoningEffort::Xhigh,
+                fast_mode: true,
+            })
+        };
+        let mut rows = vec![Row::Created {
+            role: Role::Engineer {
+                intelligence: Intelligence::Gemini,
+            },
+            binding: binding(),
+            runtime: super::super::tests::test_agent_runtime(),
+            place: super::super::tests::test_workspace(),
+            spawned_by: AgentSpawnedBy::Direct,
+            spawn_name: Some("keep-this-name".into()),
+            created_at: UnixMs(1),
+        }];
+        for bound in [None, Some(binding())] {
+            rows.push(Row::RoleChanged {
+                role: Role::WorkflowEngineer {
+                    intelligence: Intelligence::Gemini,
+                    workflow: Workflow::PrFriendly,
+                },
+                binding: bound,
+                at: UnixMs(2),
+            });
+        }
+        use crate::db::AgentRoleSessionProfile as _;
+        let expected = AgentRole::default().session_profile().unwrap();
+        for (index, row) in rows.iter().enumerate() {
+            let mut bytes = senax_encoder::encode(row).unwrap();
+            let old: Event<'static> = senax_encoder::decode(&mut bytes).unwrap();
+            let current = old.current(true);
+            match &current {
+                AgentEvent::Created {
+                    role,
+                    binding,
+                    spawn_name,
+                    ..
+                } => {
+                    assert_eq!(*role, AgentRole::default());
+                    assert_eq!(*binding, expected);
+                    assert_eq!(spawn_name.as_deref(), Some("keep-this-name"));
+                }
+                AgentEvent::RoleChanged { role, binding, .. } => {
+                    assert_eq!(*role, AgentRole::default());
+                    assert_eq!(*binding, (index == 2).then_some(expected));
+                }
+                _ => panic!("configuration changed event kind"),
+            }
+            let mut encoded = senax_encoder::encode(&current).unwrap();
+            assert_eq!(
+                senax_encoder::decode::<AgentEvent<'static>>(&mut encoded).unwrap(),
+                current
+            );
+        }
     }
 }

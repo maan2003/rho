@@ -20,10 +20,11 @@ fn astra_bindings_round_trip() {
 }
 
 #[test]
-fn python_suffixed_bindings_fold_into_their_models() {
+fn retired_bindings_fold_into_live_models() {
     #[derive(Encode)]
     #[allow(dead_code)]
     enum LegacySessionBinding {
+        AntigravityFlashLow(InferenceProfile),
         ResponsesSolPython(InferenceProfile),
         ClaudeFablePython { effort: ClaudeEffort },
     }
@@ -32,6 +33,13 @@ fn python_suffixed_bindings_fold_into_their_models() {
         fast_mode: false,
     };
     for (legacy, expected) in [
+        (
+            LegacySessionBinding::AntigravityFlashLow(InferenceProfile {
+                effort: ReasoningEffort::Xhigh,
+                fast_mode: true,
+            }),
+            AgentRole::default().session_profile().unwrap(),
+        ),
         (
             LegacySessionBinding::ResponsesSolPython(profile),
             SessionBinding::ResponsesSol(profile),

@@ -478,6 +478,8 @@ enum StoredSessionBinding {
     ResponsesSolPython(InferenceProfile),
     ClaudeFablePython { effort: ClaudeEffort },
     ResponsesAstraNotes(InferenceProfile),
+    // Retired provider, not a creatable session. Decode into the default native policy.
+    AntigravityFlashLow(InferenceProfile),
 }
 
 impl senax_encoder::Decoder for SessionBinding {
@@ -490,6 +492,9 @@ impl senax_encoder::Decoder for SessionBinding {
             Stored::ResponsesSol(config) | Stored::CoordinatorSol(config) => {
                 Self::ResponsesSol(config)
             }
+            Stored::AntigravityFlashLow(_profile) => AgentRole::default()
+                .session_profile()
+                .expect("default engineer binding"),
             Stored::ResponsesLuna(config) => Self::ResponsesLuna(config),
             Stored::ResponsesTerra(config) | Stored::CoordinatorTerra(config) => {
                 Self::ResponsesTerra(config)

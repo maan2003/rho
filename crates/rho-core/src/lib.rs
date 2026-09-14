@@ -182,6 +182,8 @@ enum StoredEngineerIntelligence {
     Python,
     UltraPython,
     HighNotes,
+    // The retired provider's records fold into the standard native role.
+    Gemini,
 }
 
 impl senax_encoder::Decoder for EngineerIntelligence {
@@ -189,7 +191,7 @@ impl senax_encoder::Decoder for EngineerIntelligence {
         use StoredEngineerIntelligence as Stored;
         Ok(match Stored::decode(reader)? {
             Stored::Low => Self::Low,
-            Stored::Medium | Stored::Python => Self::Medium,
+            Stored::Medium | Stored::Python | Stored::Gemini => Self::Medium,
             Stored::High => Self::High,
             Stored::HighNotes => Self::HighNotes,
             Stored::Ultra | Stored::UltraPython => Self::Ultra,
@@ -971,14 +973,19 @@ mod tests {
     }
 
     #[test]
-    fn python_intelligences_fold_into_their_models() {
+    fn retired_intelligences_fold_into_live_models() {
         #[derive(Encode)]
         #[allow(dead_code)]
         enum LegacyEngineerIntelligence {
             Python,
             UltraPython,
+            Gemini,
         }
         for (legacy, expected) in [
+            (
+                LegacyEngineerIntelligence::Gemini,
+                EngineerIntelligence::Medium,
+            ),
             (
                 LegacyEngineerIntelligence::Python,
                 EngineerIntelligence::Medium,
