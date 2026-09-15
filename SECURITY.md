@@ -317,12 +317,12 @@ AI APIs.
   than forwarding raw review text.
 - Inter-agent mail activates parked recipients internally and waits for the
   recipient loop to accept the input; it never creates a GUI subscription.
-  Native Rho acknowledges only after committing the queued event, so successful
-  delivery survives daemon restart. Claude acknowledges only after writing the
-  input to its live CLI process, but has no separate RhoDB mailbox; a daemon or
+  Native Rho acknowledges after enqueueing the event for ordered replication;
+  a crash can lose an unflushed accepted message. Claude acknowledges only after
+  writing the input to its live CLI process, but has no separate RhoDB mailbox; a daemon or
   CLI crash after that write but before Claude records the input may lose that
   rare message by design. Agent-response subscriptions use the same delivery
-  path: native recipients acknowledge after queue persistence, while Claude
+  path: native recipients acknowledge after replication enqueueing, while Claude
   recipients retain the weaker acceptance guarantee above. A crash before a
   response is queued, or a transient delivery failure, can lose that response;
   subscriptions are not an outbox and do not replay missed deliveries.
@@ -692,11 +692,17 @@ own tools denied.
 - Native and Claude runtimes admit at most one new Python exec per provider
   response. The provider call ID is the notebook execution ID; Claude's MCP
   transport IDs are not execution identities. Missing provider identity is
-  rejected, not guessed. Admission commits before source evaluation and remains
-  effective after transcript rewind. Retrying a transport must not replay admitted
+  rejected, not guessed. Claude admission commits before source evaluation. Native
+  admission identities stay in worker memory, seeded from committed calls across
+  all branches at startup; rewind does not clear them. A crash may lose native
+  unflushed conversation and identity evidence. Retrying a transport must not replay admitted
   source; this does not claim external effects are transactional.
-- Output reads lease a stable snapshot. Native request records and Claude output
-  batches commit before those leases are acknowledged or cells reaped. Claude
+- Output reads lease a stable snapshot. Native requests transfer owned output
+  into an ordered bounded replication queue before acknowledging leases or reaping
+  cells. Request/response batches and response usage commit atomically in a background
+  writer; the main loop stops on writer failure, without retrying uncertain writes.
+  Rewind, profile changes, terminal publication and shutdown drain the writer.
+  Claude output batches still commit before leases are acknowledged or cells reaped. Claude
   records transport handoff separately; after a crash in the handoff gap it may
   repeat an attributed report, never execute its source again. A successful write
   is not evidence of remote consumption. This output guarantee does not make

@@ -89,9 +89,7 @@ impl Agent {
             }
             return Ok(());
         }
-        if self.execs.contains_key(&incoming.id)
-            || self.host.exec_was_admitted(incoming.id.clone()).await?
-        {
+        if !self.admitted.insert(incoming.id.clone()) {
             return Err(anyhow::anyhow!(
                 "Provider reused an earlier tool call identity"
             ));
@@ -402,6 +400,9 @@ pub(in crate::agent) mod tests {
             db,
             agent_id: id,
             agent: Agent {
+                writer: super::super::persistence::Writer::new(host.clone()),
+                pending_events: Vec::new(),
+                admitted: Default::default(),
                 provider_history: None,
                 name_updates: host.names(),
                 host,
@@ -461,7 +462,7 @@ pub(in crate::agent) mod tests {
     }
 
     #[tokio::test]
-    async fn provider_projection_tracks_only_acknowledged_appends() {
+    async fn provider_projection_tracks_the_queued_tail_and_converges_after_flush() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
         assert!(agent.provider_input().await.unwrap().is_empty());
@@ -479,57 +480,106 @@ pub(in crate::agent) mod tests {
                 ))
                 .await
                 .unwrap();
+            agent.flush_events().await.unwrap();
             let (_, events) = agent.db.read().agent_events(agent.agent_id);
             assert_eq!(
                 agent.provider_input().await.unwrap(),
                 replay::replay(events).history
             );
         }
-        let committed = agent.provider_input().await.unwrap();
-        let (client, server) = crate::worker::testing::pair();
-        agent.host = client.host();
-        drop(server);
-        agent.host.closed().await;
-        assert!(
+    }
+
+    #[tokio::test]
+    async fn blocked_database_does_not_block_live_history_and_usage_commits_with_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        assert!(agent.provider_input().await.unwrap().is_empty());
+        let db = agent.db.clone();
+        let blocked = db.write().await;
+        let before = db.read().agent_events(agent.agent_id).1.len();
+        tokio::time::timeout(Duration::from_secs(1), async {
             agent
                 .persist(AgentEvent::Native(
                     crate::native::NativeEvent::RequestStarted {
                         input: vec![rho_core::ContextBlock::DeveloperMessage {
-                            text: "uncommitted".into()
+                            text: "queued".into(),
                         }],
                         context: None,
                         wake: None,
-                        at: UnixMs::now(),
-                    }
+                        at: UnixMs(300_000),
+                    },
                 ))
                 .await
-                .is_err()
+                .unwrap();
+            agent
+                .persist(AgentEvent::Native(
+                    crate::native::NativeEvent::ResponseFinished {
+                        output: vec![rho_core::ContextBlock::InferenceResponse {
+                            items: Vec::new(),
+                            provider_response_id: None,
+                        }],
+                        context_used: None,
+                        usage: Some(crate::db::AgentUsageBucket {
+                            requests: 1,
+                            output_tokens: 7,
+                            ..Default::default()
+                        }),
+                        at: UnixMs(300_001),
+                    },
+                ))
+                .await
+                .unwrap();
+            assert_eq!(agent.provider_input().await.unwrap().len(), 2);
+        })
+        .await
+        .expect("submissions must not wait for the database lock");
+        assert_eq!(db.read().agent_events(agent.agent_id).1.len(), before);
+        assert_eq!(db.read().agent_usage_total(agent.agent_id).requests, 0);
+        drop(blocked);
+        agent.flush_events().await.unwrap();
+        let read = db.read();
+        let events = read.agent_events(agent.agent_id).1;
+        assert_eq!(events.len(), before + 2);
+        assert_eq!(read.agent_usage_total(agent.agent_id).requests, 1);
+        assert_eq!(read.agent_usage_total(agent.agent_id).output_tokens, 7);
+        drop(read);
+        assert_eq!(
+            agent.provider_input().await.unwrap(),
+            replay::replay(events).history
         );
-        assert_eq!(agent.provider_input().await.unwrap(), committed);
+        agent.flush_events().await.unwrap();
+        assert_eq!(db.read().agent_usage_total(agent.agent_id).requests, 1);
     }
 
     #[tokio::test]
-    async fn store_disconnect_is_fatal_before_stream_admission() {
+    async fn replication_disconnect_fails_barriers_and_stops_the_loop() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
-        let before = agent.db.read().agent_event_records(agent.agent_id);
         let (client, server) = crate::worker::testing::pair();
-        agent.host = client.host();
+        let host = client.host();
+        agent.writer = super::super::persistence::Writer::new(host.clone());
         drop(server);
-        agent.host.closed().await;
-        let error = agent
-            .handle(update("disconnected", "open('wrong', 'w').write('x')\n"))
-            .await
-            .unwrap_err();
-        assert!(error.is::<crate::worker::StoreError>());
+        host.closed().await;
+        // Submission may succeed before the writer observes the failure.
+        let _ = agent
+            .persist(AgentEvent::Native(
+                crate::native::NativeEvent::RequestStarted {
+                    input: Vec::new(),
+                    context: None,
+                    wake: None,
+                    at: UnixMs::now(),
+                },
+            ))
+            .await;
         assert!(
-            matches!(agent.phase, Phase::Requesting(_)),
-            "no provider retry or failure transition"
+            agent
+                .flush_events()
+                .await
+                .unwrap_err()
+                .is::<crate::worker::StoreError>()
         );
-        assert!(agent.execs.is_empty());
-        assert!(agent.streams.is_empty());
-        assert!(!directory.path().join("wrong").exists());
-        assert_eq!(agent.db.read().agent_event_records(agent.agent_id), before);
+        let error = agent.run().await.unwrap_err();
+        assert!(error.is::<crate::worker::StoreError>());
     }
 
     #[tokio::test]
@@ -627,6 +677,7 @@ pub(in crate::agent) mod tests {
             std::fs::read_to_string(directory.path().join("marker")).unwrap(),
             "x"
         );
+        agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert_eq!(recovered.owed.len(), 1);
@@ -635,6 +686,7 @@ pub(in crate::agent) mod tests {
         agent.session.abort();
         assert!(agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
+        agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         assert!(replay::replay(events).owed.is_empty());
     }
@@ -673,6 +725,7 @@ pub(in crate::agent) mod tests {
             && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
                 matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
             )).await;
+        agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert_eq!(recovered.owed.len(), 1);
@@ -824,6 +877,7 @@ pub(in crate::agent) mod tests {
             1,
             "an outstanding await cannot be acknowledged as settled"
         );
+        agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert!(
@@ -843,6 +897,7 @@ pub(in crate::agent) mod tests {
                 .closed
         })
         .await;
+        agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         assert!(
             replay::replay(events)
@@ -1052,6 +1107,7 @@ pub(in crate::agent) mod tests {
         assert!(agent.execs.is_empty());
         assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(agent.recovery_notes.is_empty());
+        agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert!(recovered.history.is_empty());

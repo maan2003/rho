@@ -16,7 +16,7 @@ use crate::db::{
     AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding, TurnEdge,
 };
 
-pub(super) const VERSION: u32 = 3;
+pub(super) const VERSION: u32 = 4;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -59,6 +59,8 @@ pub(super) enum Request<'a> {
     Head,
     History,
     Append(AgentEvent<'a>),
+    AppendBatch(Vec<AgentEvent<'static>>),
+    AdmittedIds,
     ExecAdmitted(ExecId),
     Profile {
         role: AgentRole,
@@ -83,6 +85,7 @@ pub(super) enum Request<'a> {
         edge: TurnEdge,
     },
     SelectAccount,
+    SelectResolved,
     ResolveAuth(rho_inference::InferenceAuth),
     RateLimited(SelectedAuth),
     Quota {
@@ -106,11 +109,13 @@ pub(super) enum Reply {
     },
     Position(AgentEventPos),
     Admitted(bool),
+    AdmittedIds(Vec<ExecId>),
     ClaudeAccount(String),
     ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
     Usage(AgentUsageBucket),
     Error(String),
     Account(SelectedAuth),
+    SelectedResolved(SelectedAuth, rho_inference::ResolvedAuth),
     Auth(rho_inference::ResolvedAuth),
     RateLimited(bool),
     Done,
@@ -217,6 +222,7 @@ pub(crate) struct Host {
     closed: watch::Receiver<bool>,
     names: watch::Receiver<Option<AgentHead>>,
     publication: Arc<Publication>,
+    team: tokio::sync::OnceCell<Option<crate::multi_agent_tools::Team>>,
 }
 
 impl std::fmt::Debug for Host {
@@ -230,7 +236,7 @@ impl std::fmt::Debug for Host {
 /// A failed persistence operation has unknown commit status. Runtimes must
 /// return this to their supervisor, never handle it as a provider retry.
 #[derive(Debug)]
-pub(crate) struct StoreError(anyhow::Error);
+pub(crate) struct StoreError(pub(crate) anyhow::Error);
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -359,6 +365,7 @@ impl Host {
             closed: connection_closed,
             names: name_updates,
             publication,
+            team: Default::default(),
         })
     }
 
@@ -385,10 +392,15 @@ impl Host {
     }
 
     pub(crate) async fn team(&self) -> anyhow::Result<Option<crate::multi_agent_tools::Team>> {
-        match self.request(Request::Team).await? {
-            Reply::Team(team) => Ok(team),
-            _ => anyhow::bail!("unexpected team reply"),
-        }
+        self.team
+            .get_or_try_init(|| async {
+                match self.request(Request::Team).await? {
+                    Reply::Team(team) => Ok(team),
+                    _ => anyhow::bail!("unexpected team reply"),
+                }
+            })
+            .await
+            .cloned()
     }
     pub(crate) async fn shared_tool(&self, call: rho_core::ToolCall) -> rho_core::ToolOutput {
         match self.request(Request::SharedTool(call)).await {
@@ -497,6 +509,24 @@ impl Host {
             _ => Err(StoreError(anyhow::anyhow!("unexpected append reply"))),
         }
     }
+    pub(crate) async fn append_batch(
+        &self,
+        events: Vec<AgentEvent<'static>>,
+    ) -> Result<(), StoreError> {
+        self.change(Request::AppendBatch(events)).await
+    }
+
+    pub(crate) async fn admitted_ids(&self) -> Result<Vec<ExecId>, StoreError> {
+        match self
+            .request(Request::AdmittedIds)
+            .await
+            .map_err(StoreError)?
+        {
+            Reply::AdmittedIds(ids) => Ok(ids),
+            _ => Err(StoreError(anyhow::anyhow!("unexpected admission reply"))),
+        }
+    }
+
     pub(crate) async fn exec_was_admitted(&self, id: ExecId) -> Result<bool, StoreError> {
         match self
             .request(Request::ExecAdmitted(id))
@@ -601,6 +631,17 @@ impl Host {
 }
 
 impl InferenceHost for Host {
+    fn select_resolved(
+        &self,
+    ) -> BoxFuture<'_, anyhow::Result<(SelectedAuth, rho_inference::ResolvedAuth)>> {
+        Box::pin(async {
+            match self.request(Request::SelectResolved).await? {
+                Reply::SelectedResolved(selected, resolved) => Ok((selected, resolved)),
+                _ => anyhow::bail!("unexpected account service reply"),
+            }
+        })
+    }
+
     fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>> {
         Box::pin(async {
             match self.request(Request::SelectAccount).await? {
@@ -701,6 +742,65 @@ mod tests {
                 .contains("connection closed")
         );
         assert!(host.waiters.lock().unwrap().calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_snapshot_is_fetched_once_and_survives_service_disconnect() {
+        let (client, mut server) = crate::worker::testing::pair();
+        let host = client.host();
+        let request = tokio::spawn({
+            let host = host.clone();
+            async move { host.team().await }
+        });
+        let Message::Request {
+            id,
+            body: Request::Team,
+        } = server.read().await.unwrap()
+        else {
+            panic!()
+        };
+        server
+            .write(&Message::Reply {
+                id,
+                body: Reply::Team(Some(crate::multi_agent_tools::Team {
+                    agent: "eng-once".into(),
+                    parent: Some("eng-parent".into()),
+                    spawned_by: crate::db::AgentSpawnedBy::Engineer,
+                })),
+            })
+            .await
+            .unwrap();
+        assert_eq!(request.await.unwrap().unwrap().unwrap().agent, "eng-once");
+        drop(server);
+        host.closed().await;
+        let identity = host.team().await.unwrap().unwrap();
+        assert_eq!(identity.agent, "eng-once");
+        assert_eq!(identity.parent.as_deref(), Some("eng-parent"));
+    }
+
+    #[tokio::test]
+    async fn account_selection_and_credentials_are_one_request() {
+        let (client, mut server) = crate::worker::testing::pair();
+        let host = client.host();
+        let request = tokio::spawn(async move { host.select_resolved().await });
+        let Message::Request {
+            id,
+            body: Request::SelectResolved,
+        } = server.read().await.unwrap()
+        else {
+            panic!()
+        };
+        server
+            .write(&Message::Reply {
+                id,
+                body: Reply::Error("no credentials".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            request.await.unwrap().unwrap_err().to_string(),
+            "no credentials"
+        );
     }
 
     #[tokio::test]

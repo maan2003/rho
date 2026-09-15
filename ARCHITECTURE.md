@@ -29,7 +29,11 @@ policy, credential refresh, and naming. Completion publication queues delivery
 without awaiting recipient acceptance, so reciprocal subscriptions cannot stall
 serialized runtime loops. Explicit accepted-delivery APIs remain awaitable.
 An uncertain persistence result terminates the runtime rather than retrying a
-possibly committed mutation.
+possibly committed mutation. Native request/response batches replicate through a
+bounded, ordered background writer, not an inference-loop commit barrier. Usage
+is accounted in the response transaction; timing rides with conversation batches.
+The worker owns its volatile tail; recovery sees only complete committed batches.
+Rewind, profile changes, terminal publication and shutdown explicitly drain it.
 
 Agent activation and retirement serialize under a cancellation-safe per-agent
 lock. Retirement requires permission from the runtime's serialized boundary,
@@ -483,8 +487,8 @@ gets, built by the same `host_tools` constructor.
 Provider calls and notebook executions share `ExecId`; jobs and transport IDs
 remain separate. The CLI forwards its provider ID in MCP metadata, which Rho
 validates before durable admission. Rewind never erases admission evidence.
-Output remains leased until ownership transfers: the native request record or
-Claude's durable outbox commits before notebook acknowledgment. Unconfirmed Claude
+Output remains leased until ownership transfers: the native worker queues an owned request batch before notebook acknowledgment;
+Claude's durable outbox commits before acknowledgment. Unconfirmed Claude
 handoffs recover as attributed reports, never source replay or duplicate tool
 results. Successful transport write does not prove remote consumption.
 
@@ -520,8 +524,8 @@ retain normal shell/patch capabilities plus messaging but cannot spawn or
 interrupt. User-facing handles remain `eng-*` and `adv-*` over `AgentId`.
 Mail delivery is an internal daemon operation, not a UI protocol lifecycle.
 It activates a parked recipient when necessary and awaits a per-delivery
-acceptance channel. Native Rho acknowledges after its queued event is committed;
-Claude acknowledges after its process-local input queue accepts the message,
+acceptance channel. Native Rho acknowledges after its event enters the ordered
+replication queue; a crash can lose an unflushed accepted message. Claude acknowledges after its process-local input queue accepts the message,
 which intentionally may be lost if the daemon restarts before Claude records
 it.
 The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning
@@ -633,9 +637,9 @@ state machines. `AgentPool` flushes usage and persists top-level disposition
 only when no newer queued turn took over, or when a terminal failure prevents
 queued work from proceeding. Attention watchers only project current runtime
 state plus that durable disposition and never infer completion from snapshots.
-User-input disposition changes are likewise committed by the serialized native
+User-input disposition changes are likewise ordered by the serialized native
 or Claude runtime loop when it accepts the input, not by the calling daemon
-connection, so an older completion cannot overwrite a newer queued input.
+connection (native writes replicate asynchronously), so an older completion cannot overwrite a newer queued input.
 Each UI control connection independently subscribes and
 unsubscribes agent state; activation does not imply observation by any GUI.
 `Ready` derives parked-agent attention from persisted disposition alone.

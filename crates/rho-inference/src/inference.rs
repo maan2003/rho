@@ -23,6 +23,15 @@ pub struct Inference(Arc<Inner>);
 /// route observations; it never opens the account database or starts pollers.
 pub trait InferenceHost: std::fmt::Debug + Send + Sync {
     fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>>;
+    fn select_resolved(
+        &self,
+    ) -> BoxFuture<'_, anyhow::Result<(SelectedAuth, crate::ResolvedAuth)>> {
+        Box::pin(async {
+            let selected = self.select().await?;
+            let resolved = self.resolve_auth(selected.auth.clone()).await?;
+            Ok((selected, resolved))
+        })
+    }
     fn resolve_auth(
         &self,
         auth: InferenceAuth,
@@ -225,6 +234,15 @@ impl Inference {
             return host.resolve_auth(auth).await;
         }
         Ok(tokio::task::spawn_blocking(move || auth.resolve()).await??)
+    }
+
+    pub async fn select_resolved(&self) -> anyhow::Result<(SelectedAuth, crate::ResolvedAuth)> {
+        if let Backend::Host(host) = &self.0.backend {
+            return host.select_resolved().await;
+        }
+        let selected = self.select().await?;
+        let resolved = self.resolve_auth(selected.auth.clone()).await?;
+        Ok((selected, resolved))
     }
 
     pub async fn select(&self) -> anyhow::Result<SelectedAuth> {

@@ -22,8 +22,9 @@ Restarting is not a state of its own. A loaded agent and a fresh one are both
 
 No notebook or managed job handle survives a restart. OS descendants may survive
 an unexpected worker death and continue external effects. Only coherent conversation
-boundaries are persisted; streaming source, unit admission, and settlement are
-in memory. Recent execution, source, and output may be absent from the saved
+boundaries are replicated asynchronously as ordered atomic batches. Recovery
+uses only the committed prefix; a crash can lose the worker's unflushed tail.
+Streaming source, unit admission, and settlement are in memory. Recent execution, source, and output may be absent from the saved
 conversation. External effects are not rolled back, and recovery must not claim
 an exact executed prefix.
 

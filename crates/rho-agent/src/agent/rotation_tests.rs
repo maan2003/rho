@@ -83,9 +83,10 @@ async fn cell_returned(agent: &Agent) {
     .unwrap();
 }
 
-fn latest_send(
+async fn latest_send(
     agent: &super::streaming::tests::TestAgent,
 ) -> (Option<crate::ContextChange>, Vec<ContextBlock>) {
+    agent.writer.flush().await.unwrap();
     let (_, events) = agent.db.read().agent_events(agent.agent_id);
     events
         .into_iter()
@@ -117,7 +118,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
         .await
         .unwrap();
     agent.start_request(UnixMs(2), None).await.unwrap();
-    let (change, _) = latest_send(&agent);
+    let (change, _) = latest_send(&agent).await;
     assert_eq!(change, Some(ContextChange::Marked { retain_from: 1 }));
     let marker = agent.context.marker.unwrap();
     reply(&mut agent, vec![message("working")], limit).await;
@@ -130,7 +131,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
         .await
         .unwrap();
     agent.start_request(UnixMs(4), None).await.unwrap();
-    let (change, blocks) = latest_send(&agent);
+    let (change, blocks) = latest_send(&agent).await;
     assert_eq!(
         change,
         Some(ContextChange::Preparing {
@@ -175,6 +176,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     assert_eq!(agent.context_used, None);
     assert!(
         latest_send(&agent)
+            .await
             .1
             .iter()
             .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
@@ -232,11 +234,11 @@ async fn preparation_waits_for_python_and_allows_only_one_repair() {
     assert!(matches!(agent.decide(UnixMs::now()), Boundary::Now { .. }));
     agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(matches!(
-        latest_send(&agent).0,
+        latest_send(&agent).await.0,
         Some(ContextChange::Preparing { repair: true, .. })
     ));
     assert_eq!(agent.user.len(), 1);
-    assert!(latest_send(&agent).1.iter().any(|block| matches!(block,
+    assert!(latest_send(&agent).await.1.iter().any(|block| matches!(block,
         ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("write failed")))));
 
     reply(
@@ -249,6 +251,7 @@ async fn preparation_waits_for_python_and_allows_only_one_repair() {
     agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(
         latest_send(&agent)
+            .await
             .1
             .iter()
             .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
@@ -285,6 +288,7 @@ async fn preparation_preserves_python_state_and_does_not_wait_for_old_jobs() {
     agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(
         latest_send(&agent)
+            .await
             .1
             .iter()
             .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
@@ -393,7 +397,7 @@ async fn terminal_preparation_failure_allows_fresh_input_and_explicit_retry() {
         assert!(matches!(agent.decide(UnixMs(13)), Boundary::Now { .. }));
         agent.start_request(UnixMs(13), None).await.unwrap();
         assert!(matches!(
-            latest_send(&agent).0,
+            latest_send(&agent).await.0,
             Some(ContextChange::Preparing { repair: false, .. })
         ));
     }
@@ -443,7 +447,7 @@ async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
             .await
             .unwrap();
         agent.start_request(UnixMs(3), None).await.unwrap();
-        let (change, blocks) = latest_send(&agent);
+        let (change, blocks) = latest_send(&agent).await;
         assert!(change.is_none());
         assert!(matches!(
             blocks.last(),
@@ -486,6 +490,7 @@ async fn failed_preparation_without_headroom_rotates_without_repair() {
     agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(
         latest_send(&agent)
+            .await
             .1
             .iter()
             .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))

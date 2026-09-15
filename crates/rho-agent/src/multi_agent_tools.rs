@@ -20,8 +20,9 @@ use crate::MessageDelivery;
 use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
 use crate::pool::AgentPool;
 
-/// Fresh presentation identities for a prompt. Pool capabilities never cross
-/// into the worker, and shortened handles are resolved again for each request.
+/// Startup presentation identities for a worker's prompts. Pool capabilities
+/// never cross into the worker; its snapshot keeps the original handles even
+/// if later role changes or allocations change their preferred presentation.
 #[derive(Clone, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct Team {
     pub agent: String,

@@ -910,6 +910,7 @@ async fn rewind_cannot_erase_exec_admission() {
     write.rewind_agent(UnixMs(2), agent_id, AgentEventPos::new(1));
     write.commit();
     assert!(db.read().agent_exec_was_admitted(agent_id, &exec.id));
+    assert!(db.read().agent_admitted_ids(agent_id).contains(&exec.id));
     assert!(
         !db.read()
             .agent_events(agent_id)

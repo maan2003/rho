@@ -13,6 +13,7 @@
 
 mod context;
 mod notes;
+mod persistence;
 pub(crate) mod replay;
 #[cfg(test)]
 mod rotation_tests;
@@ -41,8 +42,8 @@ use crate::boundary::{
     Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
 };
 use crate::db::{
-    AgentEventPos, AgentHead, AgentRole, AgentRoleSessionProfile as _, AgentRuntime,
-    AgentUsageBucket, AgentUsageModel, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMillis,
+    AgentHead, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket,
+    AgentUsageModel, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMillis,
 };
 #[cfg(test)]
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
@@ -174,6 +175,7 @@ impl AgentHandle {
         replayed: replay::Replayed,
         head: AgentHead,
         total_usage: AgentUsageBucket,
+        admitted: std::collections::HashSet<ToolCallId>,
     ) -> (Self, Agent) {
         let session = inference.deep_session(profile, model, prompt_cache_key);
         let name_updates = host.names();
@@ -191,6 +193,9 @@ impl AgentHandle {
         let (control, control_rx) = mpsc::unbounded_channel();
         host.observe(&status);
         let mut agent = Agent {
+            writer: persistence::Writer::new(host.clone()),
+            pending_events: Vec::new(),
+            admitted,
             host,
             surface: surface_inputs.lazy(role),
             model,
@@ -511,13 +516,16 @@ pub(crate) struct InFlight {
 
 pub(crate) struct Agent {
     host: Arc<crate::worker::Host>,
+    writer: persistence::Writer,
+    pending_events: Vec<AgentEvent<'static>>,
+    admitted: std::collections::HashSet<ToolCallId>,
     surface: Arc<Lazy<Surface>>,
     model: InferenceModel,
 
     /// Live window policy; provider context itself is derived from the event
     /// log.
     context: context::Window,
-    // Disposable projection of acknowledged log appends, never persistence authority.
+    // Live projection, including the ordered tail queued for replication.
     provider_history: Option<Vec<Arc<ContextBlock>>>,
 
     session: InferenceSession,
@@ -583,6 +591,8 @@ impl Agent {
             .binding
             .deep_model()
             .expect("deep profile has a model");
+        host.team().await?;
+        let admitted = host.admitted_ids().await?.into_iter().collect();
         let total_usage = host.usage_total().await?;
         let (_, rows) = host.history().await?;
         let replayed = replay::recover(rows.into_iter().map(|(_, event)| event).collect());
@@ -598,6 +608,7 @@ impl Agent {
             replayed,
             head,
             total_usage,
+            admitted,
         ))
     }
 
@@ -621,11 +632,13 @@ impl Agent {
         self.streams.clear();
         self.execs.clear();
         self.latest_python_exec = None;
+        self.flush_events().await?;
         Ok(())
     }
 
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         loop {
+            self.writer.check()?;
             // One question per event. Either it says to wait and hands over the
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
@@ -683,6 +696,7 @@ impl Agent {
                 let Self {
                     control_rx,
                     name_updates,
+                    writer,
                     session,
                     wake,
                     ..
@@ -691,6 +705,7 @@ impl Agent {
                 // no policy, because policy is `boundary` and nowhere else.
                 tokio::select! {
                     biased;
+                    error = writer.failed() => return Err(error.into()),
                     named = name_updates.changed() => {
                         named.map_err(|_| anyhow::anyhow!("agent services disconnected"))?;
                         Some(Event::Named(name_updates.borrow_and_update().clone().expect("name update")))
@@ -1072,6 +1087,7 @@ impl Agent {
                 error: Arc::from(error.as_str()),
             },
         };
+        self.flush_events().await?;
         self.host.failed(error).await?;
         Ok(())
     }
@@ -1141,6 +1157,7 @@ impl Agent {
             self.session.set_deep_config(profile, model),
             "agent does not have a configurable inference session"
         );
+        self.flush_events().await?;
         self.host.profile(role, binding).await?;
         self.provider_history = None;
         {
@@ -1165,6 +1182,7 @@ impl Agent {
     async fn rewind(&mut self, turns: u32) -> anyhow::Result<()> {
         anyhow::ensure!(turns > 0, ":rewind turns must be greater than zero");
         self.ensure_settled(":rewind")?;
+        self.flush_events().await?;
         let cursor = {
             let (_, records) = self.host.history().await?;
             let user_positions = records
@@ -1206,6 +1224,7 @@ impl Agent {
     }
 
     async fn name(&mut self, input: &str) -> anyhow::Result<()> {
+        self.flush_events().await?;
         let stored = self.host.name(input).await?;
         let mut head = self.head.write().expect("poison");
         head.generated_title = stored.generated_title;
@@ -1709,7 +1728,6 @@ impl Agent {
 
         if let Some(turn_usage) = turn_usage {
             self.total_usage.add(&turn_usage);
-            self.host.record_usage(turn_usage).await?;
         }
 
         // Everything the request carried goes with it, except whether it still
@@ -1757,6 +1775,7 @@ impl Agent {
             && !compacted
             && !preparing
         {
+            self.flush_events().await?;
             self.host.completed(final_text).await?;
         }
         Ok(())
@@ -1785,11 +1804,10 @@ impl Agent {
 
     // -- plumbing -----------------------------------------------------------
 
-    /// Provider context is a disposable projection of the committed event log.
-    /// Cache only acknowledged appends. Role changes invalidate the projection;
-    /// rewind and process load rebuild it from the visible log.
+    /// Live provider context includes the ordered, not-yet-durable tail.
     async fn provider_input(&mut self) -> anyhow::Result<Vec<Arc<ContextBlock>>> {
         if self.provider_history.is_none() {
+            self.flush_events().await?;
             let (_, records) = self.host.history().await?;
             self.provider_history =
                 Some(replay::replay(records.into_iter().map(|(_, event)| event).collect()).history);
@@ -1797,8 +1815,13 @@ impl Agent {
         Ok(self.provider_history.as_ref().unwrap().clone())
     }
 
-    /// Append to the raw log; the journal and every mirror follow from it.
-    async fn persist(&mut self, event: AgentEvent<'_>) -> anyhow::Result<AgentEventPos> {
+    /// Timing travels with the next conversation boundary. The bounded writer
+    /// preserves order without making healthy inference wait for disk.
+    async fn persist(&mut self, event: AgentEvent<'static>) -> anyhow::Result<()> {
+        if matches!(event, AgentEvent::ExecObserved { .. }) {
+            self.pending_events.push(event);
+            return Ok(());
+        }
         let blocks = event.native_event().map(|event| {
             event
                 .blocks()
@@ -1807,11 +1830,34 @@ impl Agent {
                 .map(Arc::new)
                 .collect::<Vec<_>>()
         });
-        let position = self.host.append(event).await?;
+        if let Some(NativeEvent::ResponseFinished { output, .. }) = event.native_event() {
+            for block in output {
+                if let ContextBlock::InferenceResponse { items, .. } = block {
+                    self.admitted
+                        .extend(items.iter().filter_map(|item| match item {
+                            InferenceResponseItem::ToolCall { id, .. } => Some(id.clone()),
+                            _ => None,
+                        }));
+                }
+            }
+        }
+        self.pending_events.push(event);
+        self.writer
+            .append(std::mem::take(&mut self.pending_events))
+            .await?;
         if let (Some(history), Some(blocks)) = (&mut self.provider_history, blocks) {
             history.extend(blocks);
         }
-        Ok(position)
+        Ok(())
+    }
+
+    async fn flush_events(&mut self) -> anyhow::Result<()> {
+        if !self.pending_events.is_empty() {
+            self.writer
+                .append(std::mem::take(&mut self.pending_events))
+                .await?;
+        }
+        Ok(self.writer.flush().await?)
     }
 
     /// What a reader sees, built from the loop's own state. `deadline` is
@@ -1924,6 +1970,9 @@ impl Agent {
                     _ => TurnOutcome::Completed,
                 })
             };
+            if !working {
+                self.flush_events().await?;
+            }
             self.host.turn(now, edge).await?;
             if !working {
                 self.host.settled().await?;

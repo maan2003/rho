@@ -8,12 +8,13 @@ One workset process contains its agents' runtimes, notebooks, local tools,
 jobs, provider transports, retained terminals, and interactive shells. The daemon alone owns the shared
 database, account and route policy, naming tasks, workset allocation, pool,
 subscriptions, and UI projection. Each runtime serializes its own controls and
-scheduling and commits domain operations through acknowledged daemon services.
+scheduling. Native events replicate through an ordered, bounded background writer;
+Claude's durable operations retain acknowledged daemon services.
 There is no in-daemon runtime fallback.
 
-Native conversation authority is the append-only `NativeEvent` log. Provider
-input, restart recovery, and presentation are disposable projections, not another
-independently mutated history. Requests and responses use the same canonical grouped entries consumed by
+The append-only `NativeEvent` log owns the recoverable conversation prefix. The
+native worker owns an ordered volatile tail; live provider input includes that
+tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
 inference. A temporary atomic database migration rewrites historical raw rows
 at their original positions, preserving response boundaries, IDs, provider data,
 and context-window offsets; normal replay does not normalize legacy events. Claude Code instead owns its session, history, and compaction; Rho
@@ -29,7 +30,11 @@ workset control and terminal/shell traffic. Bounded fragments preserve per-port
 order; routing and fair writes do not await runtime work. Completion publication
 does not await recipient acceptance, keeping reciprocal subscriptions outside
 serialized actor-loop dependencies. Lost persistence acknowledgements stop the
-runtime; uncertain mutations are not retried.
+runtime; uncertain mutations are not retried. Native inference does not wait for
+healthy commit acknowledgments: request batches include pending timing, and
+response batches include usage accounting in the same transaction. Explicit
+barriers synchronize rewind, profile changes, terminal publication and shutdown.
+A crash may lose the unflushed tail, but cannot expose a partial database batch.
 
 The workset process builds one filesystem namespace before starting threads.
 Normal execution inherits it. Claude launcher children alone clone it to install
@@ -79,9 +84,10 @@ completion, and job completion are distinct live facts
 
 Output reads lease a stable contribution until acknowledgment. Notebook replies and reports project once into canonical native inputs carrying
 complete text, images, and status. Historical function-call evidence remains
-replay data, not an active tool capability. Native requests
-commit contributions before acknowledging notebook buffers. Claude transfers them
-to a durable outbox before transport; a failed handoff leaves them recoverable.
+replay data, not an active tool capability. Native requests enqueue owned
+contributions before acknowledging notebook buffers, without waiting for disk.
+Claude transfers them to a durable outbox before transport; a failed handoff
+leaves them recoverable.
 Retained batches participate in boundary scheduling and stop rules; when a later
 exec is open, its reply carries retained output as reports. The replacement batch
 owns both old and new contributions before fresh leases are acknowledged.

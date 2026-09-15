@@ -738,6 +738,7 @@ pub trait AgentReadTxnExt {
     /// Admission is an external-effects fact, never undone by transcript
     /// rewind.
     fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_core::ExecId) -> bool;
+    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_core::ExecId>;
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
     /// Newest text-bearing visible rows, read backward and bounded before
@@ -1008,6 +1009,32 @@ impl AgentReadTxnExt for ReadTxn {
             }
         }
         pending
+    }
+
+    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_core::ExecId> {
+        let log = self.open_table(AGENT_LOG);
+        let mut ids = Vec::new();
+        // All branches, not only visible history: rewind must not reuse identities.
+        for (_, event) in rows(log.range(agent_range(agent_id))) {
+            if let AgentEvent::ClaudeExecAdmitted { call, .. } = &event {
+                ids.push(call.id.clone());
+            }
+            if let Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =
+                event.native_event()
+            {
+                for block in output {
+                    if let rho_core::ContextBlock::InferenceResponse { items, .. } = block {
+                        ids.extend(items.iter().filter_map(|item| match item {
+                            rho_core::InferenceResponseItem::ToolCall { id, .. } => {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        }));
+                    }
+                }
+            }
+        }
+        ids
     }
 
     fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_core::ExecId) -> bool {

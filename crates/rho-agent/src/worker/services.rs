@@ -374,6 +374,28 @@ impl Services {
                 write.commit();
                 Reply::Position(position)
             }
+            Request::AppendBatch(events) => {
+                let mut write = self.db.write().await;
+                for event in &events {
+                    write.append_agent_event(self.agent, event);
+                    if let Some(crate::native::NativeEvent::ResponseFinished {
+                        usage: Some(usage),
+                        at,
+                        ..
+                    }) = event.native_event()
+                    {
+                        let mut usage = usage.clone();
+                        usage.bucket_start_ms = at.0 / crate::db::AGENT_USAGE_BUCKET_MS
+                            * crate::db::AGENT_USAGE_BUCKET_MS;
+                        write.add_agent_usage(self.agent, &usage);
+                    }
+                }
+                write.commit();
+                Reply::Done
+            }
+            Request::AdmittedIds => {
+                Reply::AdmittedIds(self.db.read().agent_admitted_ids(self.agent))
+            }
             Request::ExecAdmitted(id) => {
                 Reply::Admitted(self.db.read().agent_exec_was_admitted(self.agent, &id))
             }
@@ -422,6 +444,10 @@ impl Services {
                 Reply::Done
             }
             Request::ResolveAuth(auth) => Reply::Auth(self.inference.resolve_auth(auth).await?),
+            Request::SelectResolved => {
+                let (selected, resolved) = self.inference.select_resolved().await?;
+                Reply::SelectedResolved(selected, resolved)
+            }
             Request::SelectAccount => Reply::Account(self.inference.select().await?),
             Request::RateLimited(selected) => {
                 Reply::RateLimited(self.inference.mark_rate_limited(&selected).await)

@@ -168,6 +168,7 @@ struct SessionTask {
     connection: Option<WebSocketConnection>,
     /// The account chosen for the current request and warm connection.
     selected_auth: Option<SelectedAuth>,
+    resolved_auth: Option<crate::ResolvedAuth>,
     /// The active turn, if one has been requested.
     turn: Option<Turn>,
     config: SessionConfig,
@@ -442,6 +443,7 @@ impl InferenceSession {
                 SessionTask {
                     connection: None,
                     selected_auth: None,
+                    resolved_auth: None,
                     turn: None,
                     config: config.clone(),
                     debug_counter: 0,
@@ -539,8 +541,9 @@ impl SessionTask {
                         }
                         self.config = config;
                         self.epoch = epoch;
-                        match self.config.inference.select().await {
-                            Ok(selected) => {
+                        match self.config.inference.select_resolved().await {
+                            Ok((selected, resolved)) => {
+                                self.resolved_auth = Some(resolved);
                                 if self.selected_auth.as_ref().is_none_or(|previous| {
                                     previous.namespace != selected.namespace
                                         || previous.auth != selected.auth
@@ -553,6 +556,7 @@ impl SessionTask {
                             Err(error) => {
                                 self.connection = None;
                                 self.selected_auth = None;
+                                self.resolved_auth = None;
                                 self.emit(InferenceEvent::Failed { error: error.into() });
                             }
                         }
@@ -809,9 +813,10 @@ impl SessionTask {
             retryable = false;
             if let Some(selected) = &self.selected_auth
                 && self.config.inference.mark_rate_limited(selected).await
-                && let Ok(replacement) = self.config.inference.select().await
+                && let Ok((replacement, resolved)) = self.config.inference.select_resolved().await
             {
                 self.selected_auth = Some(replacement);
+                self.resolved_auth = Some(resolved);
                 retryable = true;
             }
         }
@@ -904,12 +909,15 @@ impl SessionTask {
         };
 
         let auth = selected.auth.clone();
-        let resolved = self
-            .config
-            .inference
-            .resolve_auth(auth)
-            .await
-            .map_err(AuthFailure)?;
+        let resolved = match self.resolved_auth.take() {
+            Some(resolved) => resolved,
+            None => self
+                .config
+                .inference
+                .resolve_auth(auth)
+                .await
+                .map_err(AuthFailure)?,
+        };
         selected.account_id = resolved.account_id.clone();
         self.selected_auth = Some(selected.clone());
 
@@ -1084,6 +1092,7 @@ mod account_selection_tests {
         let mut task = SessionTask {
             connection: None,
             selected_auth: Some(selected.clone()),
+            resolved_auth: None,
             turn: Some(Turn {
                 request: InferenceRequest {
                     instructions: std::sync::Arc::from(""),
