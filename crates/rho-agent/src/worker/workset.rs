@@ -47,6 +47,7 @@ pub enum Reply {
 
 #[derive(Encode, Decode)]
 pub(super) enum Message {
+    Policy(super::policy::Message),
     Action { id: u64, action: Action },
     Attach { id: u64, port: Port, attach: Attach },
     Reply { id: u64, body: Reply },

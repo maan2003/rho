@@ -237,6 +237,7 @@ impl Process {
         let (commands, mut command_rx) = mpsc::unbounded_channel();
         let routing_commands = commands.clone();
         let routes = agents.clone();
+        let inference = pool.inference().clone();
         // The supervisor owns the child before any cancellable bootstrap I/O.
         let (connected, connection) = oneshot::channel();
         tokio::spawn(async move {
@@ -248,7 +249,11 @@ impl Process {
                 socket.write_all(&bytes).await?;
                 let (sender, mut receiver, mut writer) = transport::connect(socket);
                 let _ = connected.send(sender.clone());
+                let (policy_incoming, policy_messages) = mpsc::channel(32);
+                let policy = super::policy::serve(inference, sender.clone(), policy_messages);
+                tokio::pin!(policy);
                 let result = tokio::select! {
+                    result = &mut policy => result,
                     result = &mut writer => result.context("workset writer failed")?.map_err(anyhow::Error::from),
                     result = async {
                         while let Some(message) = command_rx.recv().await {
@@ -270,10 +275,15 @@ impl Process {
                                     }
                                 }
                                 transport::Port::Workset => {
-                                    let super::workset::Message::Reply { id, body } = super::workset::decode(&packet.bytes)? else {
-                                        anyhow::bail!("unexpected workset reply");
-                                    };
-                                    if let Some((reply, _admission)) = replies.lock().expect("poison").remove(&id) { let _ = reply.send(body); }
+                                    match super::workset::decode(&packet.bytes)? {
+                                        super::workset::Message::Reply { id, body } => {
+                                            if let Some((reply, _admission)) = replies.lock().expect("poison").remove(&id) { let _ = reply.send(body); }
+                                        }
+                                        super::workset::Message::Policy(message) => {
+                                            policy_incoming.try_send(message).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
+                                        }
+                                        _ => anyhow::bail!("unexpected workset reply"),
+                                    }
                                 }
                                 port @ (transport::Port::Terminal(_) | transport::Port::Shell(_)) => {
                                     let mut clients = client_routes.lock().expect("poison");

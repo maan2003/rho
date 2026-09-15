@@ -18,7 +18,9 @@ The public surface is intentionally small:
   starting pollers. Its `InferenceHost` supplies account selection, quota and
   rate-limit reporting, and route observations from the daemon. Provider
   connections stay with the session; credential-file reads and refresh stay
-  in the daemon. Workers read pushed credential snapshots for new requests and
+  in the daemon. One workset-level policy client shares pushed credential and
+  route snapshots across agent sessions. Policy RPCs and pushes retain FIFO
+  ordering on that workset channel. Workers read pushed credential snapshots for new requests and
   retain the pinned-account resolution RPC for reconnects.
 - `InferenceSession` configures prompt-cache/thread behavior and owns one warm
   WebSocket. The session task snapshots the account manager's existing

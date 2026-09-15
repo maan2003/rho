@@ -155,6 +155,14 @@ pub(super) async fn run(
         clients: Arc::default(),
     });
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let policy = super::policy::Host::new(sender.clone(), next.clone());
+    let inference = rho_inference::Inference::from_host(
+        policy.clone(),
+        rho_inference::InferenceConfig::with_responses_base_url(
+            startup.responses_base_url.clone(),
+        )?,
+    );
+
     let mut tasks = tokio::task::JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = 'connection: loop {
@@ -188,6 +196,11 @@ pub(super) async fn run(
                 };
                 use super::workset::{Message as W, Reply};
                 match message {
+                    W::Policy(message) => {
+                        if let Err(error) = policy.receive(message) {
+                            break Err(error);
+                        }
+                    }
                     W::Action { id, action } => {
                         let execution = execution.clone();
                         let sender = sender.clone();
@@ -277,7 +290,7 @@ pub(super) async fn run(
         let host = Host::connect(sender.clone(), packet.port, messages, next.clone());
         let base = base.clone();
         let claude = startup.claude.clone();
-        let responses = startup.responses_base_url.clone();
+        let inference = inference.clone();
         tasks.spawn(async move {
             let result = async {
                 let namespace = base.for_cwd(&bootstrap.cwd)?;
@@ -285,10 +298,6 @@ pub(super) async fn run(
                     let namespace = namespace.clone();
                     async move { Ok(namespace) }
                 }));
-                let inference = rho_inference::Inference::from_host(
-                    host.clone(),
-                    rho_inference::InferenceConfig::with_responses_base_url(responses)?,
-                );
                 let head = host.head().await?;
                 match head.config.runtime {
                     crate::db::AgentRuntime::Rho { .. } => {
@@ -317,6 +326,7 @@ pub(super) async fn run(
                 .await;
         });
     };
+    policy.disconnect();
     agents.lock().expect("poison").clear();
     execution.clients.lock().expect("poison").clear();
     while tasks.join_next().await.is_some() {}

@@ -26,7 +26,10 @@ prose or one custom Python `exec`. `rho-claude` owns CLI transport and MCP proto
 adaptation. Neither adapter owns Rho's scheduling or persistence.
 
 One private Senax Unix connection multiplexes agent services and controls with
-workset control and terminal/shell traffic. Bounded fragments preserve per-port
+workset control and terminal/shell traffic. Inference policy has one daemon
+subscription and one shared client per workset, not per agent. Its pushes and
+RPC replies share workset FIFO ordering; agent retirement does not close it.
+Bounded fragments preserve per-port
 order; routing and fair writes do not await runtime work. Completion publication
 does not await recipient acceptance, keeping reciprocal subscriptions outside
 serialized actor-loop dependencies. Lost persistence acknowledgements stop the

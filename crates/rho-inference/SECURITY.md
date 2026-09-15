@@ -32,7 +32,10 @@ file-backed OAuth credentials.
   namespace names, percentages, and reset times—never OAuth tokens or provider
   account identifiers. Account identifiers remain memory-only for alias
   deduplication. Session creation and account selection never request quota.
-- Worker-local sessions delegate account and route policy through `InferenceHost`.
+- Worker-local sessions share one workset-scoped `InferenceHost` for account
+  and route policy. Retiring an agent does not close that shared client; workset
+  disconnect does. Policy pushes and acknowledgments retain one FIFO ordering
+  domain, independent of agent-specific persistence/control ports.
   They do not open provider tables or start account/route pollers. The selected
   credential reference, resolved bearer, per-session secret, and account identity
   can cross the trusted local worker channel, but must not enter user-facing state or protocol diagnostics. Quota

@@ -71,7 +71,9 @@ security, resource-isolation, or rollback boundary.
   route policy through IPC, without another database or policy poller. A lazy,
   daemon-wide credential publisher pushes revisioned pending/ready/unavailable
   snapshots on selection changes, credential-file events, and refresh deadlines.
-  Worker request setup reads that snapshot locally; changes take effect on
+  One workset-level policy client shares credential and route snapshots across
+  its agents. Policy RPCs and pushes use the workset FIFO, independently of
+  agent retirement. Worker request setup reads that snapshot locally; changes take effect on
   receipt. Rate-limit acknowledgments fence replacement delivery. Reconnects
   still resolve their pinned account through the daemon. The
   daemon projects safe settings/quota DTOs and merges Claude presentation.

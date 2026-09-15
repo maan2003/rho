@@ -25,7 +25,6 @@ pub(super) struct Services {
     next_control: Arc<std::sync::atomic::AtomicU64>,
     pub ready: tokio::sync::watch::Sender<bool>,
     pub db: RhoDb,
-    pub inference: Inference,
     pub agent: AgentId,
     pub status: tokio::sync::watch::Sender<crate::AgentStatus>,
     pool: std::sync::Weak<crate::pool::AgentPool>,
@@ -42,7 +41,7 @@ impl Services {
     ) -> Self {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (ready, _) = tokio::sync::watch::channel(false);
-        let title = tokio::sync::Mutex::new(crate::title::Task::new(inference.clone()));
+        let title = tokio::sync::Mutex::new(crate::title::Task::new(inference));
         let (status, _) = tokio::sync::watch::channel(crate::AgentStatus {
             kind: crate::AgentStateKind::Idle,
             queued: 0,
@@ -58,7 +57,6 @@ impl Services {
             next_control,
             ready,
             db,
-            inference,
             agent,
             title,
             pool,
@@ -136,8 +134,6 @@ impl Services {
             let (outgoing, mut messages) = mpsc::channel::<Message<'static>>(32);
             let mut calls = JoinSet::new();
             let mut teller = crate::live::Teller::default();
-            let mut routes = self.inference.route_updates();
-            let mut credentials = self.inference.credential_updates();
             let result = tokio::select! {
                 result = async {
                     loop {
@@ -224,24 +220,6 @@ impl Services {
                         let Some(message) = message else { return Ok(()); };
                         writer.send(port, ipc::encode(&message)?).await?;
                     }
-                } => result,
-                result = async {
-                    loop {
-                        let route = routes.borrow_and_update().clone();
-                        outgoing.send(Message::Route(route)).await?;
-                        routes.changed().await?;
-                    }
-                    #[allow(unreachable_code)]
-                    Ok::<(), anyhow::Error>(())
-                } => result,
-                result = async {
-                    loop {
-                        let snapshot = credentials.borrow_and_update().clone();
-                        outgoing.send(Message::Credentials(snapshot)).await?;
-                        credentials.changed().await?;
-                    }
-                    #[allow(unreachable_code)]
-                    Ok::<(), anyhow::Error>(())
                 } => result,
             };
             {
@@ -451,30 +429,6 @@ impl Services {
                 let mut write = self.db.write().await;
                 write.tell_turn(at, self.agent, edge);
                 write.commit();
-                Reply::Done
-            }
-            Request::ResolveAuth(auth) => Reply::Auth(self.inference.resolve_auth(auth).await?),
-            Request::SelectAccount => Reply::Account(self.inference.select().await?),
-            Request::RateLimited(selected) => {
-                let changed = self.inference.mark_rate_limited(&selected).await;
-                // Install the replacement before the retry can select again.
-                // Older background pushes are rejected by snapshot revision.
-                let snapshot = self.inference.credential_snapshot().await?;
-                outgoing.send(Message::Credentials(snapshot)).await?;
-                Reply::RateLimited(changed)
-            }
-            Request::Quota { selected, quota } => {
-                self.inference.observe_quota(&selected, quota).await;
-                Reply::Done
-            }
-            Request::RouteFailed { route, selected } => {
-                self.inference
-                    .report_connect_failure(route, selected.as_ref())
-                    .await;
-                let route = self.inference.route_updates().borrow().clone();
-                // The caller observes the demotion before its acknowledgement.
-                // Revision checking also rejects older watch notifications.
-                outgoing.send(Message::Route(route)).await?;
                 Reply::Done
             }
         };
