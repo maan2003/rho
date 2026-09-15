@@ -98,7 +98,11 @@
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
           # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
           paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) ] ++ (with pkgs; [
-            bashInteractive bzip2 coreutils-full cpio curl diffutils gawk
+            bashInteractive bzip2
+            # Keep small commands from loading the multicall binary's unrelated
+            # libraries (notably OpenSSL) on every exec.
+            (coreutils-full.override { singleBinary = false; })
+            cpio curl diffutils gawk
             getent getconf gnugrep gnupatch gnused gnutar gzip xz less
             ncurses netcat procps time util-linux which zstd
             perl rsync strace
