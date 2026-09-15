@@ -697,7 +697,6 @@ impl ShellTools {
             }
         }
         let resolved = self.environments.resolve(directory.clone(), base).await?;
-        command.env_clear().envs(resolved.environment.iter());
         let server = {
             let mut cached = self.executor.lock().await;
             if let Some(BashEnvironment {
@@ -709,6 +708,8 @@ impl ShellTools {
             {
                 server.clone()
             } else {
+                // A reused supervisor already owns the resolved environment.
+                command.env_clear().envs(resolved.environment.iter());
                 let server = fork_server::Server::start(command)
                     .await
                     .context("start native Bash executor")?;
