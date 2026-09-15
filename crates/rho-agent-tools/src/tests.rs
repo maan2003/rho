@@ -1154,6 +1154,19 @@ async fn benchmark_awaited_command() {
             ShellTools::in_directory(Duration::from_secs(30), cwd, PathOverrides::default()),
             Vec::new(),
         );
+        // Optional untimed Python setup supports same-binary profiling/A-B runs.
+        if let Ok(source) = std::env::var("RHO_BENCH_SETUP") {
+            let wake = Arc::new(Notify::new());
+            let mut cell = notebook.exec(
+                call("benchmark-setup", json!(source)),
+                SourceWaker::new(wake.clone()),
+            );
+            until(&wake, &cell, Signal::Ended).await;
+            let output = cell.first_output();
+            cell.acknowledge_output();
+            assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+            assert!(cell.done());
+        }
         let mut samples = Vec::new();
         for n in 0..1010 {
             let wake = Arc::new(Notify::new());

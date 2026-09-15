@@ -159,28 +159,7 @@ class _NotebookLoop(asyncio.SelectorEventLoop):
     # determines when the work attributed to a notebook cell has finished.
     def _run_once(self):
         super()._run_once()
-        active = {handle._context.get(_cell) for handle in [*self._ready, *self._scheduled]
-                  if not handle.cancelled()}
-        for key in self._selector.get_map().values():
-            active.update(handle._context.get(_cell) for handle in key.data
-                          if handle is not None and not handle.cancelled())
-        for cell, state in list(_cells.items()):
-            if state['tasks'] or state['workers'] or cell in active:
-                continue
-            root = state['root']
-            if not root.done():
-                continue
-            error = state['error']
-            if root.cancelled():
-                error = error or 'CancelledError'
-            elif root.exception() is not None:
-                error = error or _format_error(root.exception())
-            errors = [error] if error else []
-            for task in state['errors']:
-                if task is not root and task._log_traceback:
-                    errors.append(_format_error(task.exception()))
-            del _cells[cell]
-            _send('finished', cell=cell, error='\n'.join(errors) or None)
+        _settle_cells(self, _cell, _cells, _format_error, _emit)
 
 
 def _loop_error(loop, context):

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -6,9 +6,127 @@ use std::time::{Duration, Instant};
 
 use rustpython_vm::builtins::PyDictRef;
 use rustpython_vm::function::{ArgIntoFloat, OptionalArg};
-use rustpython_vm::{Interpreter, PyResult, TryFromObject, VirtualMachine};
+use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyResult, TryFromObject, VirtualMachine};
 
 use crate::{Cancellation, CellId, Event, Input, MAX_MESSAGE_BYTES};
+
+/// Account for cell-owned work after an ordinary asyncio iteration. Python
+/// objects remain on the interpreter thread; scheduling and I/O stay in
+/// asyncio.
+fn settle_cells(
+    event_loop: PyObjectRef,
+    cell_context: PyObjectRef,
+    cells: PyDictRef,
+    format_error: PyObjectRef,
+    emit: PyObjectRef,
+    vm: &VirtualMachine,
+) -> PyResult<()> {
+    if cells.is_empty() {
+        return Ok(());
+    }
+    let mut active = HashSet::new();
+    let mut visit = |handle: PyObjectRef| -> PyResult<()> {
+        // Like BaseEventLoop itself, inspect its Handle fields directly.
+        if vm.is_none(&handle) || handle.get_attr("_cancelled", vm)?.try_to_bool(vm)? {
+            return Ok(());
+        }
+        let context = handle.get_attr("_context", vm)?;
+        let cell: Option<u64> = vm
+            .call_method(&context, "get", (cell_context.clone(),))?
+            .try_into_value(vm)?;
+        if let Some(cell) = cell {
+            active.insert(cell);
+        }
+        Ok(())
+    };
+    for name in ["_ready", "_scheduled"] {
+        let handles = event_loop
+            .get_attr(name, vm)?
+            .get_iter(vm)?
+            .into_iter::<PyObjectRef>(vm)
+            .collect::<PyResult<Vec<_>>>()?;
+        for handle in handles {
+            visit(handle)?;
+        }
+    }
+    // Avoid the Python Mapping/ValuesView iterator stack over the selector's
+    // backing dict. SelectorEventLoop owns this standard selector implementation.
+    let selector_keys: PyDictRef = event_loop
+        .get_attr("_selector", vm)?
+        .get_attr("_fd_to_key", vm)?
+        .try_into_value(vm)?;
+    for key in selector_keys.values_vec() {
+        for handle in key
+            .get_attr("data", vm)?
+            .get_iter(vm)?
+            .into_iter::<PyObjectRef>(vm)
+        {
+            visit(handle?)?;
+        }
+    }
+    // Snapshot before deleting entries or invoking exception formatting.
+    for (cell_key, state) in cells.items_vec() {
+        let cell: u64 = cell_key.clone().try_into_value(vm)?;
+        let state: PyDictRef = state.try_into_value(vm)?;
+        if state.get_item("tasks", vm)?.try_to_bool(vm)?
+            || state.get_item("workers", vm)?.try_to_bool(vm)?
+            || active.contains(&cell)
+        {
+            continue;
+        }
+        let root = state.get_item("root", vm)?;
+        if !vm.call_method(&root, "done", ())?.try_to_bool(vm)? {
+            continue;
+        }
+        let mut error = state.get_item("error", vm)?;
+        if vm.call_method(&root, "cancelled", ())?.try_to_bool(vm)? {
+            if !error.clone().try_to_bool(vm)? {
+                error = vm.ctx.new_str("CancelledError").into();
+            }
+        } else if !vm.is_none(vm.call_method(&root, "exception", ())?.as_object())
+            && !error.clone().try_to_bool(vm)?
+        {
+            error = format_error.call((vm.call_method(&root, "exception", ())?,), vm)?;
+        }
+        let mut errors = Vec::new();
+        if error.clone().try_to_bool(vm)? {
+            errors.push(error);
+        }
+        for task in state
+            .get_item("errors", vm)?
+            .get_iter(vm)?
+            .into_iter::<PyObjectRef>(vm)
+        {
+            let task = task?;
+            if !task.is(&root) && task.get_attr("_log_traceback", vm)?.try_to_bool(vm)? {
+                errors.push(format_error.call((vm.call_method(&task, "exception", ())?,), vm)?);
+            }
+        }
+        cells.del_item(&*cell_key, vm)?;
+        let error = if errors.is_empty() {
+            vm.ctx.none()
+        } else {
+            vm.call_method(
+                vm.ctx.new_str("\n").as_object(),
+                "join",
+                (vm.ctx.new_list(errors),),
+            )?
+        };
+        let fields = vm.ctx.new_dict();
+        fields.set_item("cell", cell_key, vm)?;
+        fields.set_item(
+            "error",
+            if error.clone().try_to_bool(vm)? {
+                error
+            } else {
+                vm.ctx.none()
+            },
+            vm,
+        )?;
+        emit.call(("finished", fields), vm)?;
+    }
+    Ok(())
+}
 
 fn field<T: TryFromObject>(fields: &PyDictRef, name: &str, vm: &VirtualMachine) -> PyResult<T> {
     fields.get_item(name, vm)?.try_into_value(vm)
@@ -300,6 +418,10 @@ pub(super) fn spawn(
                     );
                     for (name, function) in [
                         ("_emit", emit),
+                        (
+                            "_settle_cells",
+                            vm.new_function("_settle_cells", settle_cells),
+                        ),
                         ("_stream_next", stream_next),
                         ("_receive", receive),
                         ("_cancel_requested", checkpoint),

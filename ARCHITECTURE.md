@@ -430,7 +430,9 @@ security, resource-isolation, or rollback boundary.
   output, execution lifecycle, and patience callbacks update that handle
   synchronously before Python continues; no Python object crosses threads.
   Async host completions wake the interpreter through eventfd and resolve its
-  futures on the interpreter thread. Lifecycle events cross a typed native
+  futures on the interpreter thread. Rust accounts for cell-owned tasks,
+  workers, callbacks, timers and selector registrations to determine quiescence;
+  asyncio still owns scheduling and I/O. Lifecycle events cross a typed native
   bridge; arbitrary tool arguments retain Python's JSON encoding semantics.
   Native VM checkpoints check cancellation and callback deadlines every 1,024
   instructions, entering Python only when interruption is pending. They do not

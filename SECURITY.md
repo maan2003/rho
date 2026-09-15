@@ -753,6 +753,8 @@ own tools denied.
   acquire that managed lifecycle automatically.
 - Standard asyncio owns Python task scheduling, timers, and I/O. Rust messages
   wake its selector through an eventfd; cell context follows tasks and callbacks.
+  Native Rust accounting checks attributed activity and reports cell completion
+  on the interpreter thread, without moving Python objects across threads.
   Asyncio networking and subprocesses have ordinary unsandboxed Python access,
   not the managed lifecycle of `command()`. Native extension wheels are unsupported.
   Real Python threads are enabled. Notebook-created threads inherit cell context

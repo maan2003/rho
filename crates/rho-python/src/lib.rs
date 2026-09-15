@@ -1623,6 +1623,63 @@ assert process.returncode == 0
     }
 
     #[tokio::test]
+    async fn selector_callbacks_keep_returned_cells_alive_and_report_errors() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import socket
+reader, writer = socket.socketpair()
+loop = asyncio.get_running_loop()
+def ready():
+    reader.recv(1)
+    loop.remove_reader(reader)
+    reader.close()
+    raise ValueError('reader failure')
+loop.add_reader(reader, ready)
+text('watching')
+"#
+                .into(),
+            })
+            .unwrap();
+        assert!(matches!(next(&mut rx).await, Event::Text { cell: 1, .. }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err()
+        );
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 2,
+                source: "writer.send(b'x'); writer.close()".into(),
+            })
+            .unwrap();
+        let mut finished = Vec::new();
+        while finished.len() < 2 {
+            let event = next(&mut rx).await;
+            match event {
+                Event::Finished {
+                    cell: 1,
+                    error: Some(error),
+                } => {
+                    assert!(error.contains("ValueError: reader failure"), "{error}");
+                    finished.push(1);
+                }
+                Event::Finished {
+                    cell: 2,
+                    error: None,
+                } => finished.push(2),
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        finished.sort();
+        assert_eq!(finished, [1, 2]);
+    }
+
+    #[tokio::test]
     async fn large_output_requests_are_capped_without_rejecting_the_cell() {
         let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
