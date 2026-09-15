@@ -12,13 +12,7 @@ pub(super) struct Stream {
     item: InferenceResponseItem,
     index: usize,
     source: String,
-    admitted: usize,
-    settled: usize,
-    completed: usize,
-    stopped: bool,
-    closed: bool,
     pub canonical: bool,
-    recovery: bool,
     pub interrupted: bool,
 }
 
@@ -81,7 +75,7 @@ impl Agent {
             let fragment = incoming.source[stream.source.len()..].to_owned();
             stream.source = incoming.source;
             self.execs.get_mut(id).unwrap().call.source = stream.source.clone();
-            if !stream.stopped && !stream.closed && !fragment.is_empty() {
+            if !fragment.is_empty() {
                 stream
                     .exec
                     .feed(fragment, false)
@@ -125,13 +119,7 @@ impl Agent {
                 item: identity,
                 index,
                 source: incoming.source.clone(),
-                admitted: 0,
-                settled: 0,
-                completed: 0,
-                stopped: false,
-                closed: false,
                 canonical: false,
-                recovery: false,
                 interrupted: false,
             },
         );
@@ -144,41 +132,13 @@ impl Agent {
     }
 
     pub(super) fn advance_streams(&mut self, admit: bool) {
-        let ids = self.streams.keys().cloned().collect::<Vec<_>>();
-        for id in ids {
-            let mut stream = self.streams.remove(&id).unwrap();
-            let progress = stream.exec.stream_progress();
-            if let Some((end, error)) = progress.settled
-                && end > stream.settled
-            {
-                stream.settled = end;
-                stream.recovery |= stream.stopped;
-                if error.is_none() {
-                    stream.completed = end;
-                } else {
-                    stream.stopped = true;
-                    stream.exec.stop_stream();
-                }
+        if !admit {
+            return;
+        }
+        for stream in self.streams.values() {
+            if let Err(error) = stream.exec.admit_stream_unit() {
+                self.recovery_notes.push(error);
             }
-            if progress.returned && !stream.closed {
-                stream.closed = true;
-            }
-            if admit
-                && !stream.stopped
-                && !stream.closed
-                && stream.settled == stream.admitted
-                && let Some(end) = progress.ready
-                && end > stream.admitted
-            {
-                stream.admitted = end;
-                if let Err(error) = stream.exec.permit(end) {
-                    stream.stopped = true;
-                    stream.recovery = true;
-                    stream.exec.stop_stream();
-                    self.recovery_notes.push(error);
-                }
-            }
-            self.streams.insert(id, stream);
         }
     }
 
@@ -204,10 +164,8 @@ impl Agent {
         if calls[0] != &expected {
             return Err("Provider final exec differs from its streamed source".into());
         }
-        if !stream.closed && !stream.stopped {
-            // Only validated successful response completion closes the last unit.
-            stream.exec.feed(String::new(), true)?;
-        }
+        // Only validated successful response completion closes the last unit.
+        stream.exec.feed(String::new(), true)?;
         Ok(())
     }
 
@@ -219,17 +177,17 @@ impl Agent {
             return Ok(false);
         };
         let stream = self.streams.get_mut(&id).unwrap();
-        stream.stopped = true;
         stream.interrupted = true;
         stream.exec.stop_stream();
-        if stream.admitted == 0 {
+        let progress = stream.exec.stream_progress();
+        if progress.admitted == 0 {
             self.streams.remove(&id);
             self.execs.remove(&id);
             self.latest_python_exec = None;
             return Ok(false);
         }
         let mut item = stream.item.clone();
-        set_source(&mut item, stream.source[..stream.admitted].to_owned());
+        set_source(&mut item, stream.source[..progress.admitted].to_owned());
         stream.canonical = true;
         self.context.replied(std::slice::from_ref(&item));
         // Give the admitted, syntactically complete prefix its one place in
@@ -255,7 +213,11 @@ impl Agent {
         let ids = self
             .streams
             .iter()
-            .filter(|(id, stream)| delivered.contains(*id) && stream.closed && stream.canonical)
+            .filter(|(id, stream)| {
+                delivered.contains(*id)
+                    && stream.exec.stream_progress().returned
+                    && stream.canonical
+            })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in ids {
@@ -271,23 +233,24 @@ impl Agent {
             if delivered.is_some_and(|ids| !ids.contains(id)) {
                 continue;
             }
+            let progress = stream.exec.take_stream_report();
             if !stream.interrupted
-                && (stream.recovery || (stream.closed && stream.completed != stream.source.len()))
+                && (progress.recovery
+                    || (progress.returned && progress.completed != stream.source.len()))
             {
                 self.recovery_notes.push(progress_note(
                     id,
                     &stream.source,
-                    stream.completed,
-                    stream.admitted,
-                    if stream.completed == stream.admitted {
+                    progress.completed,
+                    progress.admitted,
+                    if progress.completed == progress.admitted {
                         "no outstanding admitted statement"
-                    } else if stream.settled < stream.admitted && !stream.closed {
+                    } else if progress.settled < progress.admitted && !progress.returned {
                         "admitted and still running or waiting to run"
                     } else {
                         "did not complete successfully; any side effects remain"
                     },
                 ));
-                stream.recovery = false;
             }
         }
     }
@@ -594,7 +557,15 @@ pub(in crate::agent) mod tests {
         // settlement must never need the writer, including the very first unit.
         let writer = db.write().await;
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().completed == source.len()
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .completed
+                == source.len()
         })
         .await;
         drop(writer);
@@ -635,7 +606,15 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().completed > 0
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .completed
+                > 0
         })
         .await;
         let cell = agent.latest_python_exec.as_ref().unwrap().1.sequence();
@@ -666,7 +645,14 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().closed
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .returned
         })
         .await;
         assert_eq!(
@@ -704,7 +690,15 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().completed == prefix.len()
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .completed
+                == prefix.len()
         })
         .await;
         agent
@@ -721,7 +715,7 @@ pub(in crate::agent) mod tests {
                 ..
             }
         ));
-        until(&mut agent, |agent| agent.streams.values().next().unwrap().closed
+        until(&mut agent, |agent| agent.streams.values().next().unwrap().exec.stream_progress().returned
             && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
                 matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
             )).await;
@@ -756,7 +750,15 @@ pub(in crate::agent) mod tests {
             let prefix = "Path('marker').write_text('x')\n";
             agent.handle(update("one", prefix)).await.unwrap();
             until(&mut agent, |agent| {
-                agent.streams.values().next().unwrap().completed == prefix.len()
+                agent
+                    .streams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .exec
+                    .stream_progress()
+                    .completed
+                    == prefix.len()
             })
             .await;
             let bad = match fault {
@@ -781,7 +783,14 @@ pub(in crate::agent) mod tests {
                 }
             ));
             until(&mut agent, |agent| {
-                agent.streams.values().next().unwrap().closed
+                agent
+                    .streams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .exec
+                    .stream_progress()
+                    .returned
             })
             .await;
             assert_eq!(
@@ -830,7 +839,17 @@ pub(in crate::agent) mod tests {
         let decision = agent.decide(UnixMs::now());
         assert_eq!(decision, Boundary::AbortAndResend);
         agent.advance_streams(decision != Boundary::AbortAndResend);
-        assert_eq!(agent.streams.values().next().unwrap().admitted, 0);
+        assert_eq!(
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .admitted,
+            0
+        );
         let exec = agent.streams.values().next().unwrap().exec.clone();
         agent.abandon_stream(UnixMs::now()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -853,7 +872,15 @@ pub(in crate::agent) mod tests {
         let source = "import asyncio\ngate = asyncio.Event()\nawait gate.wait()\n";
         agent.handle(update("one", source)).await.unwrap();
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().admitted == source.len()
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .admitted
+                == source.len()
         })
         .await;
         agent
@@ -894,7 +921,9 @@ pub(in crate::agent) mod tests {
                 .streams
                 .get(&ToolCallId::try_from("one").unwrap())
                 .unwrap()
-                .closed
+                .exec
+                .stream_progress()
+                .returned
         })
         .await;
         agent.flush_events().await.unwrap();
@@ -940,7 +969,14 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().closed
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .returned
         })
         .await;
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -980,7 +1016,15 @@ pub(in crate::agent) mod tests {
         let source = "assert survives_rewind == 42\nPath('survived').write_text('yes')\n";
         agent.handle(update("two", source)).await.unwrap();
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().completed == source.len()
+            agent
+                .streams
+                .values()
+                .next()
+                .unwrap()
+                .exec
+                .stream_progress()
+                .completed
+                == source.len()
         })
         .await;
         assert_eq!(
@@ -1004,7 +1048,15 @@ pub(in crate::agent) mod tests {
                     .await
                     .unwrap();
                 until(&mut agent, |agent| {
-                    agent.streams.values().next().unwrap().admitted == prefix.len()
+                    agent
+                        .streams
+                        .values()
+                        .next()
+                        .unwrap()
+                        .exec
+                        .stream_progress()
+                        .admitted
+                        == prefix.len()
                 })
                 .await;
                 agent
@@ -1046,7 +1098,14 @@ pub(in crate::agent) mod tests {
 
                 if !await_job {
                     until(&mut agent, |agent| {
-                        agent.streams.values().next().unwrap().closed
+                        agent
+                            .streams
+                            .values()
+                            .next()
+                            .unwrap()
+                            .exec
+                            .stream_progress()
+                            .returned
                     })
                     .await;
                 }
@@ -1064,7 +1123,7 @@ pub(in crate::agent) mod tests {
                 }
                 std::fs::write(directory.path().join("release"), "").unwrap();
                 until(&mut agent, |agent| {
-                    agent.streams.values().next().unwrap().closed
+                    agent.streams.values().next().unwrap().exec.stream_progress().returned
                         && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
                             matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
                         })

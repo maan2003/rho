@@ -62,11 +62,15 @@ fn session_id(internal_id: u64) -> u32 {
     (1_000 + 100 * left + right) as u32
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PythonStreamProgress {
     pub returned: bool,
     pub ready: Option<usize>,
-    pub settled: Option<(usize, Option<String>)>,
+    pub admitted: usize,
+    pub settled: usize,
+    pub completed: usize,
+    pub stopped: bool,
+    pub recovery: bool,
 }
 
 struct ExecState {
@@ -912,11 +916,27 @@ impl PythonExec {
         let state = self.link.lock().unwrap();
         PythonStreamProgress {
             returned: state.returned.is_some(),
-            ..state.stream.clone()
+            ..state.stream
         }
     }
 
+    /// Snapshot recovery facts and acknowledge their notification together,
+    /// without acknowledging output or changing execution admission.
+    pub fn take_stream_report(&self) -> PythonStreamProgress {
+        let mut state = self.link.lock().unwrap();
+        let progress = PythonStreamProgress {
+            returned: state.returned.is_some(),
+            ..state.stream
+        };
+        state.stream.recovery = false;
+        progress
+    }
+
     pub fn feed(&self, source: String, eof: bool) -> Result<(), String> {
+        let state = self.link.lock().unwrap();
+        if state.stream.stopped || state.returned.is_some() {
+            return Ok(());
+        }
         self.sender.send(Input::StreamFeed {
             cell: self.cell,
             source,
@@ -924,15 +944,40 @@ impl PythonExec {
         })
     }
 
-    pub fn permit(&self, end: usize) -> Result<(), String> {
-        self.sender.send(Input::StreamPermit {
+    /// The caller has chosen to allow execution. Admit at most one ready unit;
+    /// this method owns progress bookkeeping, not scheduling policy.
+    pub fn admit_stream_unit(&self) -> Result<(), String> {
+        let mut state = self.link.lock().unwrap();
+        let progress = &state.stream;
+        let Some(end) = progress.ready else {
+            return Ok(());
+        };
+        if state.returned.is_some()
+            || progress.stopped
+            || progress.settled != progress.admitted
+            || end <= progress.admitted
+        {
+            return Ok(());
+        }
+        state.stream.admitted = end;
+        let result = self.sender.send(Input::StreamPermit {
             cell: self.cell,
             end,
-        })
+        });
+        if result.is_err() {
+            state.stream.stopped = true;
+            state.stream.recovery = true;
+        }
+        drop(state);
+        if result.is_err() {
+            self.stop_stream();
+        }
+        result
     }
 
     /// Stop source admission, not the active unit or its managed commands.
     pub fn stop_stream(&self) {
+        self.link.lock().unwrap().stream.stopped = true;
         let sender = self.sender.clone();
         let cell = self.cell;
         self.runtime.spawn(async move {
@@ -981,8 +1026,21 @@ impl rho_python::Execution for PythonExec {
             }
             Event::UnitSettled { end, error, .. } => {
                 let mut state = self.link.lock().unwrap();
-                state.stream.settled = Some((end, error));
+                let progress = &mut state.stream;
+                if end > progress.settled {
+                    progress.settled = end;
+                    progress.recovery |= progress.stopped;
+                    if error.is_none() {
+                        progress.completed = end;
+                    } else {
+                        progress.stopped = true;
+                    }
+                }
                 state.waker.wake();
+                drop(state);
+                if error.is_some() {
+                    self.stop_stream();
+                }
             }
             Event::Call {
                 request,

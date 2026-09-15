@@ -1199,3 +1199,86 @@ async fn benchmark_awaited_command() {
     .await
     .unwrap();
 }
+
+async fn stream_until(
+    wake: &Arc<Notify>,
+    cell: &PythonCell,
+    want: impl Fn(&crate::PythonStreamProgress) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !want(&cell.stream_progress()) {
+            wake.notified().await;
+        }
+    })
+    .await
+    .expect("stream progress timed out");
+}
+
+#[tokio::test]
+async fn streaming_progress_settles_after_stop_without_agent_reconciliation() {
+    let directory = tempfile::tempdir().unwrap();
+    let notebook = python(shell_in(&directory), Vec::new());
+    let wake = Arc::new(Notify::new());
+    let cell = notebook.start_stream(
+        ToolCallId::try_from("stream").unwrap(),
+        SourceWaker::new(wake.clone()),
+    );
+    let setup = "gate = asyncio.Event()\n";
+    let prefix = format!("{setup}await gate.wait()\n");
+    cell.feed(
+        format!("{prefix}Path('wrong').write_text('suffix')\n"),
+        false,
+    )
+    .unwrap();
+    stream_until(&wake, &cell, |p| p.ready == Some(setup.len())).await;
+    assert_eq!(cell.stream_progress().admitted, 0);
+    cell.admit_stream_unit().unwrap();
+    stream_until(&wake, &cell, |p| p.ready == Some(prefix.len())).await;
+    assert_eq!(cell.stream_progress().completed, setup.len());
+    cell.admit_stream_unit().unwrap();
+    cell.admit_stream_unit().unwrap();
+    assert_eq!(cell.stream_progress().admitted, prefix.len());
+    cell.stop_stream();
+    cell.admit_stream_unit().unwrap();
+    let release = notebook.exec(
+        call("release", json!("gate.set()")),
+        SourceWaker::new(wake.clone()),
+    );
+    stream_until(&wake, &cell, |p| p.returned).await;
+    let report = cell.take_stream_report();
+    assert!(report.stopped);
+    assert!(report.recovery);
+    assert_eq!(report.admitted, prefix.len());
+    assert_eq!(report.settled, prefix.len());
+    assert_eq!(report.completed, prefix.len());
+    assert!(!cell.take_stream_report().recovery);
+    assert!(!directory.path().join("wrong").exists());
+    until(&wake, &release, Signal::Ended).await;
+}
+
+#[tokio::test]
+async fn failed_stream_unit_stops_admission_and_keeps_successful_prefix_distinct() {
+    let directory = tempfile::tempdir().unwrap();
+    let notebook = python(shell_in(&directory), Vec::new());
+    let wake = Arc::new(Notify::new());
+    let cell = notebook.start_stream(
+        ToolCallId::try_from("stream").unwrap(),
+        SourceWaker::new(wake.clone()),
+    );
+    let failed = "raise ValueError('failed unit')\n";
+    cell.feed(
+        format!("{failed}Path('wrong').write_text('suffix')\n"),
+        false,
+    )
+    .unwrap();
+    stream_until(&wake, &cell, |p| p.ready == Some(failed.len())).await;
+    cell.admit_stream_unit().unwrap();
+    stream_until(&wake, &cell, |p| p.returned).await;
+    cell.admit_stream_unit().unwrap();
+    let progress = cell.stream_progress();
+    assert!(progress.stopped);
+    assert_eq!(progress.admitted, failed.len());
+    assert_eq!(progress.settled, failed.len());
+    assert_eq!(progress.completed, 0);
+    assert!(!directory.path().join("wrong").exists());
+}
