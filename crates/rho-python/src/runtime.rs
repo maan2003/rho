@@ -24,6 +24,20 @@ fn settle_cells(
     if cells.is_empty() {
         return Ok(());
     }
+    // Owned tasks/workers already prove activity. Scan callbacks and I/O only
+    // when at least one cell could actually finish this iteration.
+    let mut candidates = Vec::new();
+    for (key, state) in cells.items_vec() {
+        let state: PyDictRef = state.try_into_value(vm)?;
+        if !state.get_item("tasks", vm)?.try_to_bool(vm)?
+            && !state.get_item("workers", vm)?.try_to_bool(vm)?
+        {
+            candidates.push((key, state));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
     let mut active = HashSet::new();
     let mut visit = |handle: PyObjectRef| -> PyResult<()> {
         // Like BaseEventLoop itself, inspect its Handle fields directly.
@@ -65,13 +79,9 @@ fn settle_cells(
         }
     }
     // Snapshot before deleting entries or invoking exception formatting.
-    for (cell_key, state) in cells.items_vec() {
+    for (cell_key, state) in candidates {
         let cell: u64 = cell_key.clone().try_into_value(vm)?;
-        let state: PyDictRef = state.try_into_value(vm)?;
-        if state.get_item("tasks", vm)?.try_to_bool(vm)?
-            || state.get_item("workers", vm)?.try_to_bool(vm)?
-            || active.contains(&cell)
-        {
+        if active.contains(&cell) {
             continue;
         }
         let root = state.get_item("root", vm)?;
