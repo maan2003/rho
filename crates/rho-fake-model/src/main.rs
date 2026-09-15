@@ -20,6 +20,9 @@ struct Args {
     /// Disable injected terminal faults for throughput/proof runs.
     #[arg(long)]
     no_faults: bool,
+    /// Sequential tool exchanges in the real-tool-rounds scenario.
+    #[arg(long, default_value_t = rho_fake_model::REAL_TOOL_ROUNDS)]
+    rounds: usize,
 }
 
 #[tokio::main]
@@ -28,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let mut config = FakeModelConfig::seeded(args.seed);
     config.bind = args.bind;
     config.scenario = args.scenario;
+    config.real_tool_rounds = args.rounds;
     if args.wall_clock_timing || args.scenario == Scenario::SlowTrickle {
         config.timing.mode = TimingMode::Timed;
     }

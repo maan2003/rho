@@ -146,6 +146,7 @@ pub struct FakeModelConfig {
     pub seed: u64,
     pub bind: SocketAddr,
     pub scenario: Scenario,
+    pub real_tool_rounds: usize,
     pub timing: StreamTiming,
     pub distribution: PersonaDistribution,
 }
@@ -156,6 +157,7 @@ impl FakeModelConfig {
             seed,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             scenario: Scenario::Baseline,
+            real_tool_rounds: REAL_TOOL_ROUNDS,
             timing: StreamTiming::default(),
             distribution: PersonaDistribution::default(),
         }
@@ -176,7 +178,7 @@ pub struct MetricsSnapshot {
     pub busy_us: u64,
     /// No active model request within the request window.
     pub idle_us: u64,
-    /// Most recent idle intervals, capped at 256 samples.
+    /// Most recent idle intervals; real-tool proofs retain their entire run.
     pub idle_gaps_us: Vec<u64>,
 }
 
@@ -212,6 +214,7 @@ struct Metrics {
     peak_active_requests: AtomicU64,
     max_input_tool_output_bytes: AtomicU64,
     activity: Mutex<Activity>,
+    gap_limit: usize,
 }
 #[derive(Default)]
 struct Activity {
@@ -250,7 +253,11 @@ impl FakeModel {
             .await
             .with_context(|| format!("bind fake model on {}", config.bind))?;
         let address = listener.local_addr()?;
-        let metrics = Arc::new(Metrics::default());
+        anyhow::ensure!(config.real_tool_rounds > 0, "rounds must be positive");
+        let metrics = Arc::new(Metrics {
+            gap_limit: config.real_tool_rounds.saturating_add(2).max(256),
+            ..Default::default()
+        });
         let observations = Arc::new(Mutex::new(Vec::new()));
         let state = AppState {
             config: Arc::new(config),
@@ -583,14 +590,17 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             .collect();
         let completed = outputs
             .last()
-            .into_iter()
-            .filter_map(|item| {
+            .and_then(|item| {
                 let output = item.get("output")?.to_string();
-                (1..=REAL_TOOL_ROUNDS)
-                    .rev()
-                    .find(|step| output.contains(&format!("rho-e2e-step-{step}:ok")))
+                output
+                    .rsplit_once("rho-e2e-step-")?
+                    .1
+                    .split_once(":ok")?
+                    .0
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|step| (1..=state.config.real_tool_rounds).contains(step))
             })
-            .max()
             .unwrap_or(0);
         if (!outputs.is_empty() && completed == 0) || tools.iter().all(|tool| tool.name != "exec") {
             events.push(
@@ -600,7 +610,7 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             );
             return events;
         }
-        if completed < REAL_TOOL_ROUNDS {
+        if completed < state.config.real_tool_rounds {
             let step = completed + 1;
             let path = format!(".rho-fake-rounds-{}", state.config.seed);
             let init = if step == 1 {
@@ -800,7 +810,10 @@ fn synthetic_result_bytes(scenario: Scenario, seed: u64, request_number: u64) ->
 fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest) -> String {
     match state.config.scenario {
         Scenario::RealToolRounds => {
-            format!("Verified {REAL_TOOL_ROUNDS} sequential real shell commands and their outputs.")
+            format!(
+                "Verified {} sequential real shell commands and their outputs.",
+                state.config.real_tool_rounds
+            )
         }
         Scenario::ClarifyingQuestion => {
             "Could you clarify which behavior you want me to implement?".to_owned()
@@ -980,7 +993,7 @@ fn begin_request(metrics: &Arc<Metrics>, ordinal: &AtomicU64) -> (u64, RequestGu
     activity.first.get_or_insert(now);
     if activity.active == 0 {
         if let Some(last) = activity.last {
-            if activity.gaps.len() == 256 {
+            if activity.gaps.len() == metrics.gap_limit.max(256) {
                 activity.gaps.pop_front();
             }
             activity.gaps.push_back((now - last).as_micros() as u64);

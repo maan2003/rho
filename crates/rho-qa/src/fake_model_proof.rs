@@ -36,6 +36,9 @@ pub struct Args {
     /// Provider behavior to exercise.
     #[arg(long, value_enum, default_value_t)]
     scenario: Scenario,
+    /// Sequential exchanges for real-tool-rounds.
+    #[arg(long, default_value_t = REAL_TOOL_ROUNDS)]
+    rounds: usize,
     /// Directory containing rho-daemon and rho-fake-model. Defaults to the
     /// directory containing this rho-qa executable.
     #[arg(long)]
@@ -81,6 +84,7 @@ pub fn run(args: Args) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     ensure_network_namespace()?;
     ensure!(args.seconds > 0, "--seconds must be greater than zero");
+    ensure!(args.rounds > 0, "--rounds must be greater than zero");
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -130,6 +134,8 @@ async fn run_async(args: Args) -> Result<()> {
         "--scenario",
         args.scenario.as_str(),
         "--no-faults",
+        "--rounds",
+        &args.rounds.to_string(),
     ])
     .stdout(Stdio::piped())
     .stderr(File::create(root.path().join("fake-model.stderr.log"))?);
@@ -242,6 +248,7 @@ async fn run_async(args: Args) -> Result<()> {
             && all_idle
             && scenario_complete(
                 args.scenario,
+                args.rounds,
                 failed,
                 calls,
                 compacted,
@@ -448,17 +455,22 @@ async fn run_async(args: Args) -> Result<()> {
         "MODEL_TIMING window_us={} busy_us={} idle_us={}",
         metrics.request_window_us, metrics.busy_us, metrics.idle_us
     );
-    println!("MODEL_IDLE_GAPS_US {:?}", metrics.idle_gaps_us);
-    println!("TOOL_DURATIONS_MS {:?}", tool_durations_ms);
+    if args.rounds <= REAL_TOOL_ROUNDS {
+        println!("MODEL_IDLE_GAPS_US {:?}", metrics.idle_gaps_us);
+        println!("TOOL_DURATIONS_MS {:?}", tool_durations_ms);
+    }
     if args.scenario == Scenario::RealToolRounds {
         ensure!(
-            metrics.idle_gaps_us.len() >= REAL_TOOL_ROUNDS,
+            metrics.idle_gaps_us.len() >= args.rounds,
             "missing model request gaps"
         );
-        let gaps = &metrics.idle_gaps_us[metrics.idle_gaps_us.len() - REAL_TOOL_ROUNDS..];
-        for start in (0..REAL_TOOL_ROUNDS).step_by(20) {
-            let end = (start + 20).min(REAL_TOOL_ROUNDS);
+        let gaps = &metrics.idle_gaps_us[metrics.idle_gaps_us.len() - args.rounds..];
+        for start in (0..args.rounds).step_by((args.rounds / 10).max(20)) {
+            let end = (start + (args.rounds / 10).max(20)).min(args.rounds);
             let first = start.max(1); // exclude the first, cold tool round
+            if first >= end {
+                continue;
+            }
             let mut sorted = gaps[first..end].to_vec();
             sorted.sort_unstable();
             println!(
@@ -482,6 +494,7 @@ async fn run_async(args: Args) -> Result<()> {
     latencies.sort_unstable();
     let scenario_error = verify_scenario(
         args.scenario,
+        args.rounds,
         &ScenarioResults {
             failed,
             retrying,
@@ -532,6 +545,7 @@ async fn run_async(args: Args) -> Result<()> {
 
 fn scenario_complete(
     scenario: Scenario,
+    rounds: usize,
     failed: u64,
     calls: usize,
     compacted: u64,
@@ -540,9 +554,7 @@ fn scenario_complete(
     latencies: &[u64],
 ) -> bool {
     match scenario {
-        Scenario::RealToolRounds => {
-            calls == REAL_TOOL_ROUNDS && results == REAL_TOOL_ROUNDS && !latencies.is_empty()
-        }
+        Scenario::RealToolRounds => calls == rounds && results == rounds && !latencies.is_empty(),
         Scenario::Baseline => false,
         Scenario::RateLimit => failed >= 2 && !latencies.is_empty(),
         Scenario::StreamCut => failed >= 1 && !latencies.is_empty(),
@@ -565,12 +577,12 @@ struct ScenarioResults<'a> {
     model_result_max: u64,
 }
 
-fn verify_scenario(scenario: Scenario, results: &ScenarioResults<'_>) -> Result<()> {
+fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<'_>) -> Result<()> {
     match scenario {
         Scenario::RealToolRounds => {
             ensure!(
-                results.calls == REAL_TOOL_ROUNDS
-                    && results.result_sizes.len() == REAL_TOOL_ROUNDS
+                results.calls == rounds
+                    && results.result_sizes.len() == rounds
                     && results.failed == 0,
                 "real-tool-rounds did not complete all expected successful tool exchanges"
             );
@@ -827,6 +839,7 @@ mod tests {
     fn real_rounds_require_all_calls_and_results() {
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
+            REAL_TOOL_ROUNDS,
             0,
             REAL_TOOL_ROUNDS,
             0,
@@ -836,6 +849,7 @@ mod tests {
         ));
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
+            REAL_TOOL_ROUNDS,
             0,
             REAL_TOOL_ROUNDS - 1,
             0,
@@ -845,6 +859,7 @@ mod tests {
         ));
         assert!(scenario_complete(
             Scenario::RealToolRounds,
+            REAL_TOOL_ROUNDS,
             0,
             REAL_TOOL_ROUNDS,
             0,
