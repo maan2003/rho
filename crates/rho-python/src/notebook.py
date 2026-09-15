@@ -65,24 +65,22 @@ def _format_error(exc):
         tb = tb.tb_next
     return '\n'.join(lines)
 
-def _trace(frame, event, arg):
+def _execution_checkpoint(frame, timed_out, cancel_pending):
+    # Called only after the native checkpoint detects pending interruption.
+    # Runtime/asyncio bookkeeping is not an interruptible dispatch boundary.
     filename = frame.f_code.co_filename
-    # These frames cannot be interrupted. Returning None on entry skips their
-    # line events; calls into user/library code still enter this global hook.
-    if event == 'call':
-        module = frame.f_globals.get('__name__', '')
-        if filename == '<rho-runtime>' or module.split('.')[0] in ('asyncio', '_asyncio'):
-            return None
-    if (filename.startswith('<rho-cell-')
+    module = frame.f_globals.get('__name__', '')
+    if filename == '<rho-runtime>' or module.split('.')[0] in ('asyncio', '_asyncio'):
+        return
+    if (cancel_pending and filename.startswith('<rho-cell-')
             and (_cells.get(_cell.get(None), {}).get('cancelled', False)
                  or _cancel_requested(_cell.get(0), False))):
         raise asyncio.CancelledError()
-    if (_sync_watchdog() and _cell.get(None) in _cells and _interruptible(frame)):
+    if (timed_out and _cell.get(None) in _cells and _interruptible(frame)):
         # Consume this deadline before unwinding, so another ready cell cannot
-        # inherit it. Cancellation of workers remains independent of this timer.
+        # inherit it. Workers never consume the notebook's event-loop budget.
         _sync_watchdog(_SYNC_TIMEOUT)
         raise TimeoutError('Cell interrupted after blocking the event loop for 2 minutes')
-    return _trace
 
 
 _handle_run = asyncio.Handle._run
@@ -103,9 +101,6 @@ def _run_handle(handle):
     finally:
         _task_dispatch = previous
         _sync_watchdog(_SYNC_TIMEOUT)
-        # A trace exception may disable tracing. Re-arm at a protected dispatch
-        # boundary, including between callbacks in the same event-loop tick.
-        sys.settrace(_trace)
 
 
 asyncio.Handle._run = _run_handle
@@ -255,7 +250,9 @@ threading.Thread._bootstrap_inner = _bootstrap_thread
 
 
 def _send(kind, **fields):
-    _emit(json.dumps(dict(kind=kind, **fields)))
+    if kind == 'call':
+        fields['arguments'] = json.dumps(fields['arguments'])
+    _emit(kind, fields)
 
 
 def _budget(value):
@@ -572,8 +569,6 @@ def _receive_ready():
 
 def _run():
     _loop.add_reader(_inbox_fd, _receive_ready)
-    sys.settrace(_trace)
-    threading.settrace(_trace)
     _heartbeat()
     try:
         _loop.run_forever()
@@ -591,6 +586,4 @@ def _run():
             while any(state['workers'] for state in _cells.values()):
                 await asyncio.sleep(0.01)
         _loop.run_until_complete(shutdown())
-        sys.settrace(None)
-        threading.settrace(None)
         _loop.close()

@@ -763,13 +763,25 @@ own tools denied.
   PyYAML and HTTPX are supplied from the Nix-pinned package closure; Rustls provides
   TLS and SQLite is compiled into the runtime.
   A ten-second event-loop heartbeat and per-callback timing detect synchronous
-  blocking. After two minutes, tracing raises a timeout in the executing user
+  blocking. Native VM checkpoints run every 1,024 instructions. After two minutes,
+  a checkpoint raises a timeout in the executing user
   task or callback, including imported Python code, at a safe dispatch boundary.
   Awaiting I/O and executor workers do not consume this blocking budget. Other
   cells and pending work remain live; this does not cancel an entire cell's jobs.
-  Python can exhaust memory, disable tracing, catch cancellation, or block in
-  native computation. Cancellation of Python is best-effort; Rust command and
+  Cancellation acknowledgement does not clear interruption while attributed
+  threads or executor work remain alive. User tracing remains independent.
+  Python can exhaust memory, catch cancellation, or block in native computation. Cancellation of Python is best-effort; Rust command and
   nested-tool cancellation do not depend on Python cooperation.
+- Managed commands use watched direnv environment generations and a native Bash
+  supervisor with immutable environment. Cache invalidation covers discovery,
+  symlinks, replacement, and direnv-declared inputs, not arbitrary undeclared
+  inputs read by envrc code. Resolution failure does not reuse stale values.
+  The supervisor forks before shell initialization and never evaluates shell
+  code itself; each child runs normal startup and owns fresh cwd/state/stdio.
+  Only three stdio descriptors reach the child; lifecycle traffic is separate.
+  Cancellation kills the command's process group and waits for its leader.
+  Disconnect fails pending work without replay; detached descendants and
+  external effects are not contained or rolled back.
 - Commands, stdin writes, and nested tools share eager Rust-owned registration;
   awaiting a Python result is not what starts or owns the work. Their source remains
   attached to the actual provider `exec` call until evaluation and attached work

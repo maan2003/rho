@@ -6,6 +6,8 @@
 //! failures are surfaced as tool errors.
 
 mod apply_patch;
+mod environment;
+mod fork_server;
 #[cfg(test)]
 mod truncate;
 
@@ -15,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
@@ -54,11 +56,19 @@ const MAX_STDIN_WRITE_YIELD_MS: u64 = 30_000;
 /// After a poll sees output, gather the rest of the burst before returning.
 const POLL_SETTLE: Duration = Duration::from_millis(200);
 
+#[derive(Debug)]
+struct BashEnvironment {
+    environment: Arc<environment::Environment>,
+    server: Arc<fork_server::Server>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ShellTools {
     exec: ExecContext,
     env: Vec<(String, String)>,
     processes: Arc<ProcessManager>,
+    environments: Arc<environment::Worker>,
+    executor: Arc<Mutex<Option<BashEnvironment>>>,
 }
 
 /// Collects output until the process exits or `yield_time` passes. With
@@ -217,7 +227,7 @@ struct ProcessManager {
 struct ProcessSession {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     output_tasks: Vec<tokio::task::JoinHandle<io::Result<()>>>,
-    stdin: Option<tokio::process::ChildStdin>,
+    stdin: Option<tokio::net::unix::pipe::Sender>,
     wait_task: tokio::task::JoinHandle<io::Result<std::process::ExitStatus>>,
     status: Option<std::process::ExitStatus>,
     output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -335,15 +345,15 @@ impl SpawnedProcess {
     }
 
     /// The process's stdin, once; `None` if already taken.
-    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+    pub fn take_stdin(&mut self) -> Option<tokio::net::unix::pipe::Sender> {
         self.session.stdin.take()
     }
 }
 
 impl Drop for ProcessSession {
     fn drop(&mut self) {
-        // Cancelling the waiter drops its `Child`; `kill_on_drop` terminates a
-        // live command and Tokio's orphan queue takes responsibility for reap.
+        // Dropping the waiter's job guard queues cancellation; the native
+        // supervisor kills the process group and reaps its leader.
         self.wait_task.abort();
         for task in &self.output_tasks {
             task.abort();
@@ -369,6 +379,8 @@ impl ShellTools {
             exec: ExecContext::View(view),
             env: Vec::new(),
             processes: Arc::new(ProcessManager::default()),
+            environments: Arc::new(environment::Worker::default()),
+            executor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -385,6 +397,8 @@ impl ShellTools {
             },
             env: Vec::new(),
             processes: Arc::new(ProcessManager::default()),
+            environments: Arc::new(environment::Worker::default()),
+            executor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -627,8 +641,7 @@ impl ShellTools {
     }
 
     async fn spawn_process(&self, cmd: &str, workdir: Option<&str>) -> Result<ProcessSession> {
-        let mut command = Command::new("direnv");
-        command.args(["exec", "."]);
+        let mut command = Command::new(format!("{}/bin/rho-bash", rho_fs_view::AGENT_BASE));
         command.env_remove("DIRENV_DIFF");
         command.env_remove("DIRENV_DIR");
         command.env_remove("DIRENV_FILE");
@@ -636,10 +649,6 @@ impl ShellTools {
         for (name, value) in &self.env {
             command.env(name, value);
         }
-        // A pipeline reports its last failing stage, so `cargo test | tail`
-        // fails when the tests do rather than when `tail` does.
-        command.args(["bash", "-o", "pipefail", "-c"]).arg(cmd);
-        command.kill_on_drop(true);
         let cwd = workdir.map(Utf8Path::new);
         match &self.exec {
             ExecContext::Directory {
@@ -663,49 +672,77 @@ impl ShellTools {
             }
         }
 
-        command.stdin(std::process::Stdio::piped());
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        #[cfg(target_os = "linux")]
-        {
-            let parent = rustix::process::getpid();
-            unsafe {
-                command.pre_exec(move || {
-                    rustix::process::set_parent_process_death_signal(Some(
-                        rustix::process::Signal::KILL,
-                    ))?;
-                    if rustix::process::getppid() != Some(parent) {
-                        return Err(io::Error::other("command owner exited during spawn"));
-                    }
-                    Ok(())
-                });
+        let directory = command
+            .as_std()
+            .get_current_dir()
+            .expect("configured cwd")
+            .to_owned();
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            std::env::current_dir()?.join(directory)
+        };
+        let mut base = match &self.exec {
+            ExecContext::Directory { .. } => std::env::vars_os().collect(),
+            ExecContext::View(_) => environment::Environment::new(),
+        };
+        for (key, value) in command.as_std().get_envs() {
+            match value {
+                Some(value) => {
+                    base.insert(key.to_owned(), value.to_owned());
+                }
+                None => {
+                    base.remove(key);
+                }
             }
         }
-        let mut child = command.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture command stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
+        let resolved = self.environments.resolve(directory.clone(), base).await?;
+        command.env_clear().envs(resolved.environment.iter());
+        let server = {
+            let mut cached = self.executor.lock().await;
+            if let Some(BashEnvironment {
+                environment,
+                server,
+            }) = cached.as_ref()
+                && environment == &resolved.environment
+                && !server.closed()
+            {
+                server.clone()
+            } else {
+                let server = fork_server::Server::start(command)
+                    .await
+                    .context("start native Bash executor")?;
+                *cached = Some(BashEnvironment {
+                    environment: resolved.environment.clone(),
+                    server: server.clone(),
+                });
+                server
+            }
+        };
+        let (stdin, child_stdin) = tokio::net::unix::pipe::pipe()?;
+        let (child_stdout, stdout) = tokio::net::unix::pipe::pipe()?;
+        let (child_stderr, stderr) = tokio::net::unix::pipe::pipe()?;
+        let fds = [
+            child_stdin.into_blocking_fd()?,
+            child_stdout.into_blocking_fd()?,
+            child_stderr.into_blocking_fd()?,
+        ];
+        let mut job = server
+            .spawn(cmd, &directory, &fds)
+            .await
+            .context("start Bash command")?;
+        drop(fds);
         let (output_tx, output_rx) = mpsc::unbounded_channel();
+        if !resolved.diagnostics.is_empty() {
+            let _ = output_tx.send(resolved.diagnostics);
+        }
         let stdout_task = tokio::spawn(read_output_chunks(stdout, output_tx.clone()));
         let stderr_task = tokio::spawn(read_output_chunks(stderr, output_tx));
-
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let wait_task = tokio::spawn(async move {
             tokio::select! {
-                status = child.wait() => status,
-                _ = stopped => {
-                    child.start_kill()?;
-                    child.wait().await
-                }
+                status = job.wait() => status,
+                _ = stopped => { job.cancel(); job.wait().await }
             }
         });
         Ok(ProcessSession {

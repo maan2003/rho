@@ -16,8 +16,8 @@ without constructing another mount namespace. Claude alone clones the namespace
 in its launcher child and installs private account, projects, prompt, and settings
 overlays using precomputed syscall-only operations before exec.
 
-Exactly one private Unix socketpair carries agent, workset, terminal, and shell
-traffic. Agent IDs and client ports route messages; connection-wide request IDs
+Exactly one private Unix socketpair between daemon and workset process carries
+agent, workset, terminal, and shell traffic. Agent IDs and client ports route messages; connection-wide request IDs
 correlate replies. Bounded Senax fragments preserve logical messages and atomic
 domain operations; per-port FIFO and fair scheduling prevent bulk traffic from
 monopolizing the writer. Readers route without awaiting runtime progress.
@@ -357,8 +357,8 @@ security, resource-isolation, or rollback boundary.
   shifted bindings can be pressed in the rig and screenshotted.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-fs-view` for daemon-owned commands. Workset-control
-  subprocesses use that environment directly; agent execution shells and
-  Claude processes add the working directory's environment through `direnv exec`.
+  subprocesses use that environment directly. Agent commands use watched direnv
+  environment generations; Claude processes use `direnv exec` directly.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent
   View and lets Brush load normal Bash-compatible interactive configuration
   (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
@@ -409,7 +409,15 @@ security, resource-isolation, or rollback boundary.
 - `rho-tool-shell` owns Codex-compatible unified command sessions:
   `exec_command` yields a process session id when a command remains live and
   `write_stdin` writes to or polls that session. Command continuation state is
-  per agent because each agent owns its `ShellTools` instance.
+  per agent because each agent owns its `ShellTools` instance. Cold or invalidated
+  environment generations run direnv; kernel watches validate reuse, including
+  environment discovery and declared inputs. A generation uses a native,
+  single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
+  namespace. It forks before Bash initialization; each child performs ordinary
+  noninteractive startup, including `BASH_ENV`, with independent cwd, shell
+  state, and stdio. The private sequenced-packet control channel carries only
+  launch/lifecycle messages and passed stdio descriptors. Commands are never
+  replayed after a supervisor disconnect. Interactive Brush shells are unchanged.
 - `rho-web-search` owns the Codex-compatible client-side `web__run` tool and
   the bounded conversion of tool execution context into ChatGPT search input.
   `rho-agent` assembles it as a built-in tool and supplies the configured model,
@@ -421,7 +429,11 @@ security, resource-isolation, or rollback boundary.
   output, execution lifecycle, and patience callbacks update that handle
   synchronously before Python continues; no Python object crosses threads.
   Async host completions wake the interpreter through eventfd and resolve its
-  futures on the interpreter thread. Shared globals and ordinary asyncio remain.
+  futures on the interpreter thread. Lifecycle events cross a typed native
+  bridge; arbitrary tool arguments retain Python's JSON encoding semantics.
+  Native VM checkpoints check cancellation and callback deadlines every 1,024
+  instructions, entering Python only when interruption is pending. They do not
+  install or replace `sys.settrace`. Shared globals and ordinary asyncio remain.
   Python runs with private cwd state inside the agent's workset view;
   this is path mapping, not a sandbox.
 - `rho-agent-tools` owns each `PythonExec` and its independently registered host

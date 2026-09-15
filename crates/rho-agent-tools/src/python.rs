@@ -155,7 +155,7 @@ struct Job {
     id: u64,
     name: String,
     state: Mutex<JobState>,
-    stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    stdin: tokio::sync::Mutex<Option<tokio::net::unix::pipe::Sender>>,
     cancel: Notify,
     budget: usize,
     ready: tokio::sync::watch::Sender<bool>,

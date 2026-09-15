@@ -10,7 +10,9 @@
 
 mod runtime;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -113,6 +115,12 @@ pub trait Execution: Send + Sync {
 
 type Executions = Arc<Mutex<HashMap<CellId, Arc<dyn Execution>>>>;
 
+/// Delivery acknowledgement must not stop interruption of a cell's workers.
+enum Cancellation {
+    Pending,
+    Delivered,
+}
+
 /// A cloneable sender, not an owner of the interpreter's lifetime.
 ///
 /// Inputs go through an unbounded outbox that one thread forwards, in
@@ -126,7 +134,7 @@ pub struct Sender {
     tx: mpsc::SyncSender<Input>,
     outbox: mpsc::Sender<Input>,
     executions: Executions,
-    cancelled: Arc<Mutex<HashSet<CellId>>>,
+    cancelled: Arc<Mutex<HashMap<CellId, Cancellation>>>,
     wake: Arc<OwnedFd>,
 }
 
@@ -174,7 +182,10 @@ impl Sender {
     }
 
     pub fn cancel(&self, cell: CellId) {
-        self.cancelled.lock().unwrap().insert(cell);
+        self.cancelled
+            .lock()
+            .unwrap()
+            .insert(cell, Cancellation::Pending);
         // The shared flag also interrupts a cell that is currently executing
         // Python bytecode and therefore cannot drain its inbox yet.
         let _ = self.tx.try_send(Input::Cancel { cell });
@@ -197,7 +208,7 @@ impl Session {
         let (tx, rx) = mpsc::sync_channel(256);
         let (outbox, outbox_rx) = mpsc::channel::<Input>();
         let executions: Executions = Default::default();
-        let cancelled = Arc::new(Mutex::new(HashSet::new()));
+        let cancelled = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let space = Arc::new(tokio::sync::Notify::new());
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
@@ -707,7 +718,10 @@ await asyncio.Event().wait()
                 break;
             }
         }
-        let cancellation_retained = sender.cancelled.lock().unwrap().contains(&1);
+        let cancellation_retained = matches!(
+            sender.cancelled.lock().unwrap().get(&1),
+            Some(Cancellation::Pending)
+        );
         // Always release the notebook, including when testing a broken checkpoint.
         std::fs::write(release, "").unwrap();
         assert!(cancellation_retained);
@@ -934,6 +948,110 @@ with tempfile.TemporaryDirectory() as directory:
     }
 
     #[tokio::test]
+    async fn runtime_events_do_not_call_the_python_json_encoder() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import json
+def forbidden(*args, **kwargs):
+    raise AssertionError('runtime event called Python JSON encoder')
+json.dumps = forbidden
+text('Ω "quoted"')
+set_checkin(after_seconds=3, wake_on_tools=False)
+"#
+                .into(),
+            })
+            .unwrap();
+        match next(&mut rx).await {
+            Event::Text { cell: 1, text, .. } => assert_eq!(text, "Ω \"quoted\"\n"),
+            event => panic!("{event:?}"),
+        }
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Checkin {
+                cell: 1,
+                seconds: 3,
+                wake_on_tools: false
+            }
+        ));
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Finished {
+                cell: 1,
+                error: None
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_events_keep_payload_limits_and_python_argument_semantics() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+send = text.__globals__['_send']
+request = command.__globals__['_request']
+try:
+    send('text', cell=1, text='x' * (1024 * 1024), max_tokens=1, important=False)
+except ValueError as error:
+    assert '1 MiB' in str(error)
+else:
+    raise AssertionError('accepted oversized event')
+cycle = []
+cycle.append(cycle)
+for value, error_type in [(cycle, ValueError), (object(), TypeError), (float('nan'), ValueError)]:
+    try:
+        request('echo', {'value': value})
+    except error_type:
+        pass
+    else:
+        raise AssertionError('accepted invalid arguments')
+await request('echo', {'nested': [None, True, 3.5, {'Ω': 'quoted"\\\n'}], 'tuple': (1, 2)})
+"#
+                .into(),
+            })
+            .unwrap();
+        let request = match next(&mut rx).await {
+            Event::Call {
+                cell: 1,
+                request,
+                name,
+                arguments,
+            } => {
+                assert_eq!(name, "echo");
+                assert_eq!(
+                    arguments,
+                    serde_json::json!({
+                        "nested": [null, true, 3.5, {"Ω": "quoted\"\\\n"}], "tuple": [1, 2],
+                    })
+                );
+                request
+            }
+            event => panic!("{event:?}"),
+        };
+        session
+            .sender()
+            .send(Input::Resolve {
+                request,
+                value: Value::Null,
+                error: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Finished {
+                cell: 1,
+                error: None
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn command_starts_without_await_and_can_be_awaited_later() {
         let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
@@ -1058,7 +1176,7 @@ print('waiter survived')
             .sender()
             .send(Input::Execute {
                 cell: 6,
-                source: "assert sys.gettrace() is not None\nreleased.set()\nworker_released.set()"
+                source: "assert sys.gettrace() is None\nreleased.set()\nworker_released.set()"
                     .into(),
             })
             .unwrap();
@@ -1172,7 +1290,7 @@ assert all(isinstance(error, RuntimeError) and 'invalid-yield' in str(error)
             .sender()
             .send(Input::Execute {
                 cell: 3,
-                source: "import sys\nawait asyncio.sleep(0.3)\nassert sys.gettrace() is not None"
+                source: "import sys\nawait asyncio.sleep(0.3)\nassert sys.gettrace() is None"
                     .into(),
             })
             .unwrap();
@@ -1183,6 +1301,69 @@ assert all(isinstance(error, RuntimeError) and 'invalid-yield' in str(error)
                 error: None
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_cancellation_still_interrupts_released_workers() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import threading
+release = threading.Event()
+started = threading.Event()
+stopped = threading.Event()
+def worker():
+    try:
+        started.set()
+        release.wait()
+        while True:
+            pass
+    except BaseException:
+        stopped.set()
+threading.Thread(target=worker).start()
+await asyncio.to_thread(started.wait)
+notify('ready')
+await asyncio.sleep(30)
+"#
+                .into(),
+            })
+            .unwrap();
+        assert!(matches!(next(&mut rx).await, Event::Text { cell: 1, .. }));
+        session.sender().cancel(1);
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 2,
+                source: r#"
+while not text.__globals__['_cells'][1]['cancelled']:
+    await asyncio.sleep(0)
+release.set()
+await asyncio.to_thread(stopped.wait)
+text('worker stopped')
+"#
+                .into(),
+            })
+            .unwrap();
+        let mut finished = HashSet::new();
+        let mut output = false;
+        while finished.len() < 2 {
+            match next(&mut rx).await {
+                Event::Text { cell: 2, text, .. } => {
+                    assert_eq!(text, "worker stopped\n");
+                    output = true;
+                }
+                Event::Finished { cell, error } => {
+                    assert_eq!(error.is_some(), cell == 1, "{error:?}");
+                    finished.insert(cell);
+                }
+                event => panic!("{event:?}"),
+            }
+        }
+        assert!(output);
+        assert!(session.sender().sender.cancelled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1205,7 +1386,7 @@ assert all(isinstance(error, RuntimeError) and 'invalid-yield' in str(error)
             .sender()
             .send(Input::Execute {
                 cell: 2,
-                source: "import sys\nassert sys.gettrace() is not None\ntext(survives)".into(),
+                source: "import sys\nassert sys.gettrace() is None\ntext(survives)".into(),
             })
             .unwrap();
         assert!(matches!(next(&mut rx).await, Event::Text{text,..} if text.trim() == "42"));

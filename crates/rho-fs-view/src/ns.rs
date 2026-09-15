@@ -345,9 +345,7 @@ impl Namespace {
     ) -> anyhow::Result<()> {
         self.configure_environment(command);
         // Syscall-only; preopened provider mount sources remain usable until exec.
-        unsafe {
-            command.pre_exec(close_inherited_fds_on_exec);
-        }
+        crate::command_stdio_only(command);
         command.current_dir(namespace_cwd(self.visible_root(), &self.cwd, cwd)?);
         Ok(())
     }
@@ -547,7 +545,7 @@ mod tests {
     }
 }
 
-fn close_inherited_fds_on_exec() -> std::io::Result<()> {
+pub(crate) fn close_inherited_fds_on_exec() -> std::io::Result<()> {
     if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } < 0 {
         return Err(std::io::Error::last_os_error());
     }

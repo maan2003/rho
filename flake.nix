@@ -75,13 +75,29 @@
             exact = true;
           }];
         });
+        rhoBash = pkgs.bash.overrideAttrs (old: {
+          pname = "rho-bash";
+          # Local fork until published; only the URL needs to change afterward.
+          src = builtins.fetchGit {
+            url = "file:///src/bash";
+            rev = "a22f90f2ebc876af59730c1bd5a08310d305cc34";
+          };
+          # The fork already includes GNU's patch releases.
+          patches = [ "${nixpkgs}/pkgs/shells/bash/pgrp-pipe-5.patch" ];
+          preConfigure = (old.preConfigure or "") + ''
+            touch configure y.tab.c y.tab.h
+          '';
+          postInstall = (old.postInstall or "") + ''
+            ln -s bash "$out/bin/rho-bash"
+          '';
+        });
         agentBase = pkgs.buildEnv {
           name = "rho-agent-base";
           # NixOS's core and default system packages (nixos/modules/config/
           # system-path.nix), minus what has no meaning in a view (acl,
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
           # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
-          paths = [ rhoGit findutils ] ++ (with pkgs; [
+          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) ] ++ (with pkgs; [
             bashInteractive bzip2 coreutils-full cpio curl diffutils gawk
             getent getconf gnugrep gnupatch gnused gnutar gzip xz less
             ncurses netcat procps time util-linux which zstd
@@ -435,7 +451,7 @@
             ;
         };
 
-        legacyPackages = multiBuild // { inherit rhoGit agentBase; };
+        legacyPackages = multiBuild // { inherit rhoGit agentBase rhoBash; };
 
         devShells = flakeboxLib.mkShells {
           channel = "latest";
