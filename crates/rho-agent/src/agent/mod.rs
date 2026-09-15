@@ -1296,10 +1296,13 @@ impl Agent {
             } => Some((*since, *attempts)),
             _ => None,
         };
-        let history = self.provider_input().await?;
+        if self.provider_history.is_none() {
+            self.provider_input().await?;
+        }
+        let history = self.provider_history.as_ref().unwrap();
         let pending_compaction = history
             .iter()
-            .skip(rho_core::context_window_start(&history))
+            .skip(rho_core::context_window_start(history))
             .rev()
             .find_map(|block| match &**block {
                 ContextBlock::CompactionTrigger => Some(true),
@@ -1378,7 +1381,7 @@ impl Agent {
                 retain_from: self
                     .context
                     .marker
-                    .unwrap_or_else(|| self.context.fallback_start(&history))
+                    .unwrap_or_else(|| self.context.fallback_start(history))
                     as u64,
                 repair: false,
             })
@@ -1408,6 +1411,7 @@ impl Agent {
             });
         }
         self.collect_stream_notes(Some(&delivered));
+        let history = self.provider_history.as_ref().unwrap();
         if !owed.is_empty() {
             blocks.extend(owed.iter().map(|id| {
                 rho_inference::exec::output(&rho_core::ExecOutput::Reply {
@@ -1545,7 +1549,7 @@ impl Agent {
             } else if self.context.marker.is_some() {
                 context::PREPARE.to_owned()
             } else {
-                context::fallback_notice(&history, *retain_from as usize)
+                context::fallback_notice(history, *retain_from as usize)
             };
             blocks.push(ContextBlock::DeveloperMessage { text });
         } else if let Some(retain_from) = rotate {

@@ -84,7 +84,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
         Arc::new(ContextBlock::CompactionTrigger),
     ]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
     assert!(json.get("generate").is_none());
 
@@ -119,7 +119,7 @@ fn text_completion_declares_no_tools() {
     session.config.mode = super::super::session::InferenceSessionMode::Title;
     let request = inference_request(vec![user_block("hello")]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("tool_choice").is_none());
@@ -141,7 +141,7 @@ fn renders_text_and_image_user_content() {
     })]);
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -174,7 +174,7 @@ fn renders_agent_mail_with_supplied_short_label() {
         agent_id_labels,
     };
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(
@@ -195,7 +195,7 @@ fn stamps_phase_on_assistant_messages_when_supported() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -210,7 +210,7 @@ fn serializes_configured_reasoning_effort() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -237,7 +237,7 @@ fn serializes_configured_reasoning_context() {
     session.config.responses_config.text_verbosity = TextVerbosity::Medium;
     let request = inference_request(vec![user_block("hello")]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["reasoning"]["context"], "current_turn");
@@ -254,7 +254,7 @@ fn serializes_required_instructions() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -273,7 +273,7 @@ fn serializes_prompt_cache_key() {
     );
     let request = inference_request(vec![user_block("hello")]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(
@@ -292,7 +292,7 @@ fn previous_response_hint_slices_input_in_provider() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         Some("resp_1"),
     );
     let json = serde_json::to_value(body).unwrap();
@@ -312,7 +312,7 @@ fn previous_response_hint_requires_connection_cached_match() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         Some("other_resp"),
     );
     let json = serde_json::to_value(body).unwrap();
@@ -331,7 +331,7 @@ fn previous_response_without_valid_boundary_replays_full_history() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -349,7 +349,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
     ]);
     let sliced = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request.clone(),
+        &request,
         Some("resp_1"),
     ))
     .unwrap();
@@ -363,7 +363,7 @@ fn stale_previous_response_error_builds_full_replay_request() {
     )));
     let replay = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     ))
     .unwrap();
@@ -392,7 +392,7 @@ fn chatgpt_codex_request_omits_compaction_request_by_default() {
         PromptCacheKey::from_bytes(*b"testkey1"),
         None,
     );
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert!(json.get("context_management").is_none());
@@ -411,7 +411,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
     );
     let request = inference_request(vec![user_block("hello")]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["content"][0]["text"], "hello");
@@ -431,7 +431,7 @@ fn chatgpt_codex_with_compaction_requests_configured_threshold() {
     );
     let request = inference_request(vec![user_block("hello")]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["input"][0]["content"][0]["text"], "hello");
@@ -454,7 +454,7 @@ fn compaction_trigger_is_the_last_provider_input_item() {
         Arc::new(ContextBlock::CompactionTrigger),
     ]);
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["context_management"][0]["type"], "compaction");
@@ -484,7 +484,7 @@ fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffi
         user_block("prepare notes"),
     ]);
     session.set_context_rotation(true);
-    let body = ResponsesRequest::from_inference_request(&session.config, request.clone(), None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
     assert!(json.get("context_management").is_none());
     assert!(!json["input"].to_string().contains("compaction_trigger"));
@@ -492,7 +492,7 @@ fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffi
     assert!(json["input"].to_string().contains("retained"));
 
     session.set_context_rotation(false);
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
     assert_eq!(
         json["input"].as_array().unwrap().last().unwrap()["type"],
@@ -523,7 +523,7 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -552,7 +552,7 @@ fn skips_compaction_without_encrypted_content() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -577,7 +577,7 @@ fn replays_reasoning_provider_item() {
 
     let body = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     ))
     .unwrap();
@@ -635,7 +635,7 @@ fn serializes_custom_tool_calls_and_results() {
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -728,7 +728,7 @@ fn exec_updates_are_named_and_unpaired_across_compaction_and_incremental_replay(
                 blocks.push(update.clone());
                 let body = serde_json::to_value(ResponsesRequest::from_inference_request(
                     &session.config,
-                    inference_request(blocks),
+                    &inference_request(blocks),
                     cached,
                 ))
                 .unwrap();
@@ -774,7 +774,7 @@ fn astra_responses_lite_moves_tools_and_instructions_into_input() {
     let mut request = inference_request(vec![user_block("hello")]);
     request.instructions = Arc::from("You are rho.");
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["model"], "gpt-6-astra");
@@ -815,7 +815,7 @@ fn responses_lite_previous_response_skips_developer_prefix() {
     ]);
     request.instructions = Arc::from("You are rho.");
 
-    let body = ResponsesRequest::from_inference_request(&session.config, request, Some("resp_1"));
+    let body = ResponsesRequest::from_inference_request(&session.config, &request, Some("resp_1"));
     let json = serde_json::to_value(body).unwrap();
 
     assert_eq!(json["previous_response_id"], "resp_1");
@@ -893,7 +893,7 @@ fn current_exec_reply_precedes_background_updates_and_is_only_paired_once() {
     for cached in [None, Some("resp-current")] {
         let body = serde_json::to_value(ResponsesRequest::from_inference_request(
             &session.config,
-            inference_request(blocks.clone()),
+            &inference_request(blocks.clone()),
             cached,
         ))
         .unwrap();
@@ -983,7 +983,7 @@ fn rotated_context_keeps_developer_notices_and_old_tool_output_without_orphan_ca
         .push(Arc::new(ContextBlock::ContextRotation { retain_from: 2 }));
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         Some("old-response"),
     );
     let json = serde_json::to_value(body).unwrap();
@@ -1033,7 +1033,7 @@ fn rotated_context_preserves_retained_call_result_pairs() {
         .push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
-        request,
+        &request,
         None,
     );
     let json = serde_json::to_value(body).unwrap();
@@ -1053,7 +1053,7 @@ fn rotation_activation_invalidates_retained_old_continuations_but_not_new_ones()
         inference_response(Some("prepared-in-old-window"), Vec::new()),
     ]);
     // Merely announcing the boundary must not discard anything.
-    let before = ResponsesRequest::from_inference_request(&session.config, request.clone(), None);
+    let before = ResponsesRequest::from_inference_request(&session.config, &request, None);
     assert_eq!(before.input[0]["content"][0]["text"], "old context");
 
     request
@@ -1062,7 +1062,7 @@ fn rotation_activation_invalidates_retained_old_continuations_but_not_new_ones()
     request.input.push(user_block("resume"));
     let rotated = ResponsesRequest::from_inference_request(
         &session.config,
-        request.clone(),
+        &request,
         Some("prepared-in-old-window"),
     );
     assert!(rotated.previous_response_id.is_none());
@@ -1075,11 +1075,59 @@ fn rotation_activation_invalidates_retained_old_continuations_but_not_new_ones()
         .push(inference_response(Some("fresh-window"), Vec::new()));
     request.input.push(user_block("next"));
     let continued =
-        ResponsesRequest::from_inference_request(&session.config, request, Some("fresh-window"));
+        ResponsesRequest::from_inference_request(&session.config, &request, Some("fresh-window"));
     assert_eq!(
         continued.previous_response_id.as_deref(),
         Some("fresh-window")
     );
     assert_eq!(continued.input.len(), 1);
     assert_eq!(continued.input[0]["content"][0]["text"], "next");
+}
+
+#[test]
+fn incremental_results_resolve_both_old_and_recent_call_metadata() {
+    let mut blocks = Vec::new();
+    for index in 0..1000 {
+        blocks.push(inference_response(
+            Some(&format!("response-{index}")),
+            vec![InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific(
+                    "custom_tool_call",
+                    json!({
+                        "type": "custom_tool_call", "id": format!("item-{index}"),
+                        "call_id": format!("call-{index}"), "name": format!("tool-{index}"),
+                        "input": "pass",
+                    }),
+                ),
+                id: tool_call_id(&format!("call-{index}")),
+                name: tool_name(&format!("tool-{index}")),
+                tool_type: ToolType::Custom,
+                arguments: "pass".into(),
+            }],
+        ));
+    }
+    blocks.push(Arc::new(ContextBlock::ToolResults {
+        results: [0, 999]
+            .into_iter()
+            .map(|index| {
+                let mut result =
+                    tool_result_success(tool_call_id(&format!("call-{index}")), "done");
+                result.tool_type = ToolType::Custom;
+                result
+            })
+            .collect(),
+    }));
+    let request = inference_request(blocks);
+    let body = ResponsesRequest::from_inference_request(
+        &test_inference_service("gpt-test").config,
+        &request,
+        Some("response-999"),
+    );
+    assert_eq!(body.previous_response_id.as_deref(), Some("response-999"));
+    assert_eq!(body.input.len(), 2);
+    for (result, index) in body.input.iter().zip([0, 999]) {
+        assert_eq!(result["type"], "custom_tool_call_output");
+        assert_eq!(result["call_id"], format!("call-{index}"));
+        assert_eq!(result["name"], format!("tool-{index}"));
+    }
 }

@@ -614,7 +614,7 @@ impl SessionTask {
                     .as_ref()
                     .and_then(|connection| connection.cached_response_id.as_deref())
                     .map(str::to_owned);
-                let request = self.turn.as_ref().unwrap().request.clone();
+                let request = &self.turn.as_ref().unwrap().request;
                 let mut body = ResponsesRequest::from_inference_request(
                     &self.config,
                     request,

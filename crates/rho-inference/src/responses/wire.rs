@@ -208,17 +208,17 @@ impl ResponsesRequest {
 
     pub(crate) fn from_inference_request(
         session: &SessionConfig,
-        request: InferenceRequest,
+        request: &InferenceRequest,
         cached_response_id: Option<&str>,
     ) -> Self {
         let context_start = rho_core::context_window_start(&request.input);
         let mut previous_response = None;
         if let Some(cached_response_id) = cached_response_id {
-            for (index, block) in request.input.iter().enumerate().skip(context_start) {
+            for (index, block) in request.input.iter().enumerate().skip(context_start).rev() {
                 if matches!(&**block, ContextBlock::ContextRotation { .. }) {
                     // Even retained preparation responses still contain the
                     // old server context. Only post-activation chains are safe.
-                    previous_response = None;
+                    break;
                 }
                 let ContextBlock::InferenceResponse {
                     provider_response_id,
@@ -233,7 +233,7 @@ impl ResponsesRequest {
                     .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
 
                 if has_compaction {
-                    previous_response = None;
+                    break;
                 } else if provider_response_id
                     .as_ref()
                     .is_some_and(|id| id.as_str() == cached_response_id)
@@ -241,6 +241,7 @@ impl ResponsesRequest {
                     previous_response = provider_response_id
                         .as_ref()
                         .map(|id| (id.as_str().to_owned(), index + 1));
+                    break;
                 }
             }
         }
@@ -255,41 +256,10 @@ impl ResponsesRequest {
 
     fn from_inference_request_with_previous(
         session: &SessionConfig,
-        request: InferenceRequest,
+        request: &InferenceRequest,
         context_start: usize,
         previous_response: Option<(String, usize)>,
     ) -> Self {
-        // Resolve names before incremental replay or compaction hides calls.
-        let tool_calls = request
-            .input
-            .iter()
-            .filter_map(|block| match &**block {
-                ContextBlock::InferenceResponse { items, .. } => Some(items),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|item| match item {
-                InferenceResponseItem::ToolCall {
-                    id,
-                    name,
-                    tool_type,
-                    ..
-                } => Some((id.clone(), (name.clone(), *tool_type))),
-                _ => None,
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        let retained_calls = request.input[context_start..]
-            .iter()
-            .filter_map(|block| match &**block {
-                ContextBlock::InferenceResponse { items, .. } => Some(items),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|item| match item {
-                InferenceResponseItem::ToolCall { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect::<std::collections::HashSet<_>>();
         let input_blocks = if let Some((_, next_block_index)) = previous_response.as_ref() {
             &request.input[*next_block_index..]
         } else {
@@ -310,6 +280,47 @@ impl ResponsesRequest {
                 _ => None,
             })
             .unwrap_or((0, 0));
+
+        // Resolve only the calls referenced by the outgoing suffix. Rebuilding
+        // indexes of the entire conversation makes each warm request more costly.
+        let mut needed = std::collections::HashSet::new();
+        for block in input_blocks.iter().skip(first_block) {
+            match &**block {
+                ContextBlock::ToolResults { results } => {
+                    needed.extend(results.iter().map(|result| &result.call_id));
+                }
+                ContextBlock::ToolUpdate(update) => {
+                    needed.insert(&update.call_id);
+                }
+                _ => {}
+            }
+        }
+        let mut tool_calls = std::collections::HashMap::new();
+        let mut retained_calls = std::collections::HashSet::new();
+        // Last definition wins, as in full replay. Old calls can still supply
+        // names for late output after rotation, without becoming retained calls.
+        for (index, block) in request.input.iter().enumerate().rev() {
+            if needed.is_empty() {
+                break;
+            }
+            if let ContextBlock::InferenceResponse { items, .. } = &**block {
+                for item in items.iter().rev() {
+                    if let InferenceResponseItem::ToolCall {
+                        id,
+                        name,
+                        tool_type,
+                        ..
+                    } = item
+                        && needed.remove(id)
+                    {
+                        tool_calls.insert(id.clone(), (name.clone(), *tool_type));
+                        if index >= context_start {
+                            retained_calls.insert(id.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         let mut tools = if matches!(session.mode, super::session::InferenceSessionMode::Deep(_)) {
             let spec = crate::exec::spec();
@@ -387,7 +398,7 @@ impl ResponsesRequest {
         // continuing from a previous response the server already holds the
         // prefix, so only fresh replays carry it.
         let use_responses_lite = config.model.use_responses_lite();
-        let mut instructions = request.instructions;
+        let mut instructions = request.instructions.clone();
         let mut client_metadata = None;
         let mut parallel_tool_calls = None;
         if use_responses_lite {
