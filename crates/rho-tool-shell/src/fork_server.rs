@@ -468,6 +468,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn five_pristine_spares_are_one_shot_replenished_and_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start(command()).await.unwrap();
+        let (_, output, _) = run(&server, dir.path(), "printf %s \"$PPID\"").await;
+        let parent: u32 = std::str::from_utf8(&output).unwrap().parse().unwrap();
+        let children = format!("/proc/{parent}/task/{parent}/children");
+        let mut used = std::collections::HashSet::new();
+        let mut idle = Vec::new();
+        for _ in 0..8 {
+            idle = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let ids: Vec<u32> = std::fs::read_to_string(&children)
+                        .unwrap()
+                        .split_whitespace()
+                        .map(|id| id.parse().unwrap())
+                        .collect();
+                    assert!(ids.len() <= 5, "{ids:?}");
+                    if ids.len() == 5 {
+                        break ids;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(idle.iter().all(|pid| !used.contains(pid)));
+            let (_, output, _) = run(&server, dir.path(), "printf %s \"$$\"").await;
+            let pid: u32 = std::str::from_utf8(&output).unwrap().parse().unwrap();
+            assert!(
+                idle.contains(&pid),
+                "command did not use an existing spare: {pid} {idle:?}"
+            );
+            assert!(used.insert(pid), "reused a process after user code");
+        }
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while Path::new(&format!("/proc/{parent}")).exists()
+                || idle
+                    .iter()
+                    .any(|pid| Path::new(&format!("/proc/{pid}")).exists())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spare_pool_exhaustion_falls_back_to_fork_and_all_jobs_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::start(command()).await.unwrap();
+        let fds = std::array::from_fn(|_| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .unwrap()
+                .into()
+        });
+        let mut starts = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let server = server.clone();
+            let cwd = dir.path().to_owned();
+            let fds = fds.each_ref().map(|fd: &OwnedFd| fd.try_clone().unwrap());
+            starts.spawn(async move { server.spawn("sleep 30", &cwd, &fds).await.unwrap() });
+        }
+        let mut jobs = Vec::new();
+        while let Some(job) = starts.join_next().await {
+            jobs.push(job.unwrap());
+        }
+        for job in &mut jobs {
+            job.cancel();
+        }
+        for mut job in jobs {
+            let status = tokio::time::timeout(Duration::from_secs(3), job.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!status.success());
+        }
+        assert!(run(&server, dir.path(), "true").await.0.success());
+    }
+
+    #[tokio::test]
     async fn shell_time_starts_at_command_admission() {
         let dir = tempfile::tempdir().unwrap();
         let mut command = command();

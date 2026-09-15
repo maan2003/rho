@@ -80,7 +80,7 @@
           # Local fork until published; only the URL needs to change afterward.
           src = builtins.fetchGit {
             url = "file:///src/bash";
-            rev = "944f009fc28012ae04ef73bf283313a62218ab74";
+            rev = "5235dc200be034fea114d99ef74705914920c910";
           };
           # The fork already includes GNU's patch releases.
           patches = [ "${nixpkgs}/pkgs/shells/bash/pgrp-pipe-5.patch" ];

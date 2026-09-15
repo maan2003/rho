@@ -778,6 +778,9 @@ own tools denied.
   supervisor with immutable environment. Cache invalidation covers discovery,
   symlinks, replacement, and direnv-declared inputs, not arbitrary undeclared
   inputs read by envrc code. Resolution failure does not reuse stale values.
+  Up to five pristine pre-forked children wait for one command each. They receive
+  cwd and stdio only at admission; no child that ran user code is reused. Idle
+  children have parent-death protection and are killed/reaped at supervisor shutdown.
   The single-threaded Bash supervisor warms variables and builtins but never
   runs command bodies or startup files. Each child refreshes process identity,
   cwd, timing and random state, initializes job control with its own stdio,
