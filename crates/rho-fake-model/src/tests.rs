@@ -323,7 +323,7 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
     let server = FakeModel::start(config).await.unwrap();
     let url = server.openai_base_url().replace("http://", "ws://") + "/codex/responses";
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    for step in 0..=6 {
+    for step in 0..=super::REAL_TOOL_ROUNDS {
         let input = if step == 0 {
             vec![json!({"role":"user","content":"exercise real tools"})]
         } else {
@@ -349,7 +349,7 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
             .filter(|event| event["type"] == "response.custom_tool_call_input.delta")
             .filter_map(|event| event["delta"].as_str())
             .collect();
-        if step < 6 {
+        if step < super::REAL_TOOL_ROUNDS {
             assert!(code.contains("await command("), "{code}");
             assert!(
                 code.contains(&format!("rho-e2e-step-{}:ok", step + 1)),
@@ -360,8 +360,8 @@ async fn real_tool_rounds_requires_each_output_before_advancing() {
         }
     }
     let metrics = server.metrics();
-    assert_eq!(metrics.requests, 7);
-    assert_eq!(metrics.idle_gaps_us.len(), 6);
+    assert_eq!(metrics.requests, super::REAL_TOOL_ROUNDS as u64 + 1);
+    assert_eq!(metrics.idle_gaps_us.len(), super::REAL_TOOL_ROUNDS);
     assert!(
         metrics
             .request_window_us

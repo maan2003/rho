@@ -3,6 +3,8 @@
 //! Only the model is fake: callers use the same HTTP and WebSocket protocols
 //! as production and can run the real daemon, agent loop, tools, and GUI.
 
+pub const REAL_TOOL_ROUNDS: usize = 100;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,7 +42,7 @@ pub enum Scenario {
     /// Corpus-shaped normal traffic with the configured low-rate faults.
     #[default]
     Baseline,
-    /// OpenAI: six sequential real shell commands, each output validated before
+    /// OpenAI: 100 sequential real shell commands, each output validated before
     /// continuing.
     RealToolRounds,
     /// Return a rate limit, then an overload, then allow retries to succeed.
@@ -584,7 +586,7 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             .into_iter()
             .filter_map(|item| {
                 let output = item.get("output")?.to_string();
-                (1..=6)
+                (1..=REAL_TOOL_ROUNDS)
                     .rev()
                     .find(|step| output.contains(&format!("rho-e2e-step-{step}:ok")))
             })
@@ -598,7 +600,7 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             );
             return events;
         }
-        if completed < 6 {
+        if completed < REAL_TOOL_ROUNDS {
             let step = completed + 1;
             let path = format!(".rho-fake-rounds-{}", state.config.seed);
             let init = if step == 1 {
@@ -798,7 +800,7 @@ fn synthetic_result_bytes(scenario: Scenario, seed: u64, request_number: u64) ->
 fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest) -> String {
     match state.config.scenario {
         Scenario::RealToolRounds => {
-            "Verified six sequential real shell commands and their outputs.".into()
+            format!("Verified {REAL_TOOL_ROUNDS} sequential real shell commands and their outputs.")
         }
         Scenario::ClarifyingQuestion => {
             "Could you clarify which behavior you want me to implement?".to_owned()

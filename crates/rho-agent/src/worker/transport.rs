@@ -32,7 +32,8 @@ struct Chunk {
     port: Port,
     offset: u64,
     last: bool,
-    bytes: Vec<u8>,
+    // A raw blob: Vec<u8> tags each byte and can exceed the wire chunk limit.
+    bytes: Bytes,
 }
 
 struct Outgoing {
@@ -131,7 +132,7 @@ impl Writer {
                 port,
                 offset: message.offset as u64,
                 last: end == message.bytes.len(),
-                bytes: message.bytes[message.offset..end].to_vec(),
+                bytes: message.bytes.slice(message.offset..end),
             };
             let mut bytes = bytes::BytesMut::new();
             senax_encoder::encode_to(&chunk, &mut bytes)
@@ -233,7 +234,7 @@ mod tests {
         let (left, right) = UnixStream::pair().unwrap();
         let (sender, _, writing) = connect(left);
         let (_, mut receiver, other_writing) = connect(right);
-        let large = Bytes::from(vec![7; CHUNK_BYTES * 8]);
+        let large = Bytes::from(vec![255; CHUNK_BYTES * 8]);
         sender.send(Port::Terminal(1), large.clone()).await.unwrap();
         sender
             .send(Port::Terminal(1), Bytes::from_static(b"after"))

@@ -30,6 +30,16 @@ pub enum NativeEvent {
     },
 }
 
+impl NativeEvent {
+    pub(crate) fn blocks(&self) -> &[ContextBlock] {
+        match self {
+            Self::RequestStarted { input, .. } => input,
+            Self::ResponseFinished { output, .. } => output,
+            Self::RequestFailed { .. } => &[],
+        }
+    }
+}
+
 impl crate::AgentEvent<'_> {
     pub fn native_event(&self) -> Option<&NativeEvent> {
         match self {

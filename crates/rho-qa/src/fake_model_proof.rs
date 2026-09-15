@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_core::{AgentId, AgentRole, ContentPart, MessageDelivery};
-use rho_fake_model::Scenario;
+use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_ui_proto::client::Client;
 use rho_ui_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};
 use rho_ui_proto::{ClientMessage, ServerMessage, StartMode};
@@ -450,6 +450,28 @@ async fn run_async(args: Args) -> Result<()> {
     );
     println!("MODEL_IDLE_GAPS_US {:?}", metrics.idle_gaps_us);
     println!("TOOL_DURATIONS_MS {:?}", tool_durations_ms);
+    if args.scenario == Scenario::RealToolRounds {
+        ensure!(
+            metrics.idle_gaps_us.len() >= REAL_TOOL_ROUNDS,
+            "missing model request gaps"
+        );
+        let gaps = &metrics.idle_gaps_us[metrics.idle_gaps_us.len() - REAL_TOOL_ROUNDS..];
+        for start in (0..REAL_TOOL_ROUNDS).step_by(20) {
+            let end = (start + 20).min(REAL_TOOL_ROUNDS);
+            let first = start.max(1); // exclude the first, cold tool round
+            let mut sorted = gaps[first..end].to_vec();
+            sorted.sort_unstable();
+            println!(
+                "WARM_ROUNDS {}-{} gap_mean_us={} gap_p50_us={} gap_p95_us={} tool_mean_ms={:.2}",
+                first + 1,
+                end,
+                sorted.iter().sum::<u64>() / sorted.len() as u64,
+                percentile(&sorted, 50),
+                percentile(&sorted, 95),
+                tool_durations_ms[first..end].iter().sum::<u64>() as f64 / (end - first) as f64
+            );
+        }
+    }
     println!(
         "END_TO_END_US total={} model_active={} between_requests={} outside_request_window={}",
         scenario_us,
@@ -518,7 +540,9 @@ fn scenario_complete(
     latencies: &[u64],
 ) -> bool {
     match scenario {
-        Scenario::RealToolRounds => calls == 6 && results == 6 && !latencies.is_empty(),
+        Scenario::RealToolRounds => {
+            calls == REAL_TOOL_ROUNDS && results == REAL_TOOL_ROUNDS && !latencies.is_empty()
+        }
         Scenario::Baseline => false,
         Scenario::RateLimit => failed >= 2 && !latencies.is_empty(),
         Scenario::StreamCut => failed >= 1 && !latencies.is_empty(),
@@ -545,8 +569,10 @@ fn verify_scenario(scenario: Scenario, results: &ScenarioResults<'_>) -> Result<
     match scenario {
         Scenario::RealToolRounds => {
             ensure!(
-                results.calls == 6 && results.result_sizes.len() == 6 && results.failed == 0,
-                "real-tool-rounds did not complete six successful tool exchanges"
+                results.calls == REAL_TOOL_ROUNDS
+                    && results.result_sizes.len() == REAL_TOOL_ROUNDS
+                    && results.failed == 0,
+                "real-tool-rounds did not complete all expected successful tool exchanges"
             );
         }
         Scenario::Baseline => {}
@@ -786,7 +812,7 @@ fn tree_commit() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use rho_fake_model::Scenario;
+    use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 
     use super::{only_loopback, percentile, scenario_complete};
 
@@ -798,32 +824,32 @@ mod tests {
     }
 
     #[test]
-    fn real_rounds_require_all_six_calls_and_results() {
+    fn real_rounds_require_all_calls_and_results() {
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
             0,
-            6,
+            REAL_TOOL_ROUNDS,
             0,
             0,
-            5,
+            REAL_TOOL_ROUNDS - 1,
             &[1]
         ));
         assert!(!scenario_complete(
             Scenario::RealToolRounds,
             0,
-            5,
+            REAL_TOOL_ROUNDS - 1,
             0,
             0,
-            6,
+            REAL_TOOL_ROUNDS,
             &[1]
         ));
         assert!(scenario_complete(
             Scenario::RealToolRounds,
             0,
-            6,
+            REAL_TOOL_ROUNDS,
             0,
             0,
-            6,
+            REAL_TOOL_ROUNDS,
             &[1]
         ));
     }

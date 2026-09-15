@@ -48,13 +48,13 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     for event in events {
         if let Some(native) = event.native_event() {
             use crate::native::NativeEvent;
-            let blocks = match native {
+            match native {
                 NativeEvent::RequestStarted {
                     input,
                     context: change,
                     ..
                 } => {
-                    let blocks = input.clone();
+                    let blocks = input;
                     if !matches!(change, Some(crate::ContextChange::Preparing { .. })) {
                         user.clear();
                         mail.clear();
@@ -73,7 +73,6 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                             context_used = None;
                         }
                     }
-                    blocks
                 }
                 NativeEvent::ResponseFinished {
                     output,
@@ -86,11 +85,10 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                         }
                     }
                     context_used = *replied;
-                    output.clone()
                 }
-                NativeEvent::RequestFailed { .. } => Vec::new(),
+                NativeEvent::RequestFailed { .. } => {}
             };
-            history.extend(blocks.into_iter().map(Arc::new));
+            history.extend(native.blocks().iter().cloned().map(Arc::new));
             continue;
         }
         match event {

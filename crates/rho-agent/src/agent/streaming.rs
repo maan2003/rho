@@ -402,6 +402,7 @@ pub(in crate::agent) mod tests {
             db,
             agent_id: id,
             agent: Agent {
+                provider_history: None,
                 name_updates: host.names(),
                 host,
                 surface: Arc::new(Lazy::ready(surface)),
@@ -457,6 +458,54 @@ pub(in crate::agent) mod tests {
         })
         .await
         .expect("stream did not settle");
+    }
+
+    #[tokio::test]
+    async fn provider_projection_tracks_only_acknowledged_appends() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        assert!(agent.provider_input().await.unwrap().is_empty());
+        for index in 0..3 {
+            agent
+                .persist(AgentEvent::Native(
+                    crate::native::NativeEvent::RequestStarted {
+                        input: vec![rho_core::ContextBlock::DeveloperMessage {
+                            text: format!("round {index}"),
+                        }],
+                        context: None,
+                        wake: None,
+                        at: UnixMs::now(),
+                    },
+                ))
+                .await
+                .unwrap();
+            let (_, events) = agent.db.read().agent_events(agent.agent_id);
+            assert_eq!(
+                agent.provider_input().await.unwrap(),
+                replay::replay(events).history
+            );
+        }
+        let committed = agent.provider_input().await.unwrap();
+        let (client, server) = crate::worker::testing::pair();
+        agent.host = client.host();
+        drop(server);
+        agent.host.closed().await;
+        assert!(
+            agent
+                .persist(AgentEvent::Native(
+                    crate::native::NativeEvent::RequestStarted {
+                        input: vec![rho_core::ContextBlock::DeveloperMessage {
+                            text: "uncommitted".into()
+                        }],
+                        context: None,
+                        wake: None,
+                        at: UnixMs::now(),
+                    }
+                ))
+                .await
+                .is_err()
+        );
+        assert_eq!(agent.provider_input().await.unwrap(), committed);
     }
 
     #[tokio::test]

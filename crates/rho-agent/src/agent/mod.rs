@@ -195,6 +195,7 @@ impl AgentHandle {
             surface: surface_inputs.lazy(role),
             model,
             context: replayed.context,
+            provider_history: Some(replayed.history),
             session,
             // The same phase a fresh agent starts in. Being loaded from a
             // log is not its own kind of state, and coming up is never by
@@ -516,6 +517,8 @@ pub(crate) struct Agent {
     /// Live window policy; provider context itself is derived from the event
     /// log.
     context: context::Window,
+    // Disposable projection of acknowledged log appends, never persistence authority.
+    provider_history: Option<Vec<Arc<ContextBlock>>>,
 
     session: InferenceSession,
     phase: Phase,
@@ -1139,6 +1142,7 @@ impl Agent {
             "agent does not have a configurable inference session"
         );
         self.host.profile(role, binding).await?;
+        self.provider_history = None;
         {
             let mut head = self.head.write().expect("poison");
             head.config.role = role;
@@ -1182,6 +1186,7 @@ impl Agent {
         let (_, records) = self.host.history().await?;
         let replayed = replay::replay(records.into_iter().map(|(_, event)| event).collect());
         self.context = replayed.context;
+        self.provider_history = Some(replayed.history);
         self.recovery_notes = replayed.recovery_notes;
         self.streams.clear();
         self.latest_python_exec = None;
@@ -1621,9 +1626,10 @@ impl Agent {
         self.execs
             .retain(|id, exec| !delivered.contains(id) || !exec.session.done());
         self.acknowledge_streams(&delivered);
+        let input = self.provider_input().await?;
         self.session.request(InferenceRequest {
             instructions,
-            input: self.provider_input().await?,
+            input,
 
             agent_id_labels: Default::default(),
         });
@@ -1780,16 +1786,32 @@ impl Agent {
     // -- plumbing -----------------------------------------------------------
 
     /// Provider context is a disposable projection of the committed event log.
-    /// Neither execution nor streaming maintains a second authoritative
-    /// transcript.
-    async fn provider_input(&self) -> anyhow::Result<Vec<Arc<ContextBlock>>> {
-        let (_, records) = self.host.history().await?;
-        Ok(replay::replay(records.into_iter().map(|(_, event)| event).collect()).history)
+    /// Cache only acknowledged appends. Role changes invalidate the projection;
+    /// rewind and process load rebuild it from the visible log.
+    async fn provider_input(&mut self) -> anyhow::Result<Vec<Arc<ContextBlock>>> {
+        if self.provider_history.is_none() {
+            let (_, records) = self.host.history().await?;
+            self.provider_history =
+                Some(replay::replay(records.into_iter().map(|(_, event)| event).collect()).history);
+        }
+        Ok(self.provider_history.as_ref().unwrap().clone())
     }
 
     /// Append to the raw log; the journal and every mirror follow from it.
     async fn persist(&mut self, event: AgentEvent<'_>) -> anyhow::Result<AgentEventPos> {
-        Ok(self.host.append(event).await?)
+        let blocks = event.native_event().map(|event| {
+            event
+                .blocks()
+                .iter()
+                .cloned()
+                .map(Arc::new)
+                .collect::<Vec<_>>()
+        });
+        let position = self.host.append(event).await?;
+        if let (Some(history), Some(blocks)) = (&mut self.provider_history, blocks) {
+            history.extend(blocks);
+        }
+        Ok(position)
     }
 
     /// What a reader sees, built from the loop's own state. `deadline` is
