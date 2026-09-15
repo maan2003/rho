@@ -315,3 +315,100 @@ async fn openai_events(client: &reqwest::Client, server: &FakeModel, request: Va
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()
 }
+
+#[tokio::test]
+async fn real_tool_rounds_requires_each_output_before_advancing() {
+    let mut config = FakeModelConfig::seeded(0);
+    config.scenario = Scenario::RealToolRounds;
+    let server = FakeModel::start(config).await.unwrap();
+    let url = server.openai_base_url().replace("http://", "ws://") + "/codex/responses";
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    for step in 0..=6 {
+        let input = if step == 0 {
+            vec![json!({"role":"user","content":"exercise real tools"})]
+        } else {
+            vec![
+                json!({"type":"custom_tool_call_output","call_id":format!("call_fake_{}_0",step-1),
+                "output":format!("Process exited with code 0\nrho-e2e-step-{step}:ok\n")}),
+            ]
+        };
+        socket
+            .send(Message::Text(
+                json!({"type":"response.create","model":"fake",
+            "input":input,
+            "tools":if step == 0 { vec![json!({"type":"custom","name":"exec"})] } else { vec![] },
+            "previous_response_id":if step == 0 { None } else { Some(format!("resp_fake_{:016x}_{}",0,step-1)) }})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let events = read_turn(&mut socket).await;
+        let code: String = events
+            .iter()
+            .filter(|event| event["type"] == "response.custom_tool_call_input.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect();
+        if step < 6 {
+            assert!(code.contains("await command("), "{code}");
+            assert!(
+                code.contains(&format!("rho-e2e-step-{}:ok", step + 1)),
+                "{code}"
+            );
+        } else {
+            assert!(code.is_empty());
+        }
+    }
+    let metrics = server.metrics();
+    assert_eq!(metrics.requests, 7);
+    assert_eq!(metrics.idle_gaps_us.len(), 6);
+    assert!(
+        metrics
+            .request_window_us
+            .abs_diff(metrics.busy_us + metrics.idle_us)
+            <= 1
+    );
+    socket
+        .send(Message::Text(
+            json!({"type":"response.create","model":"fake",
+                "tools":[{"type":"custom","name":"exec"}],
+                "input":[{"type":"custom_tool_call_output","output":"rho-e2e-step-1:ok"},
+                         {"type":"custom_tool_call_output","output":"Process exited with code 1"}]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let mut failed = false;
+    for _ in 0..2 {
+        let event: Value =
+            serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                .unwrap();
+        failed |= event["type"] == "response.failed";
+    }
+    assert!(failed, "must not advance based on stale successful output");
+    server.shutdown().await.unwrap();
+}
+
+#[test]
+fn request_timing_counts_overlap_once_and_closes_cancelled_requests() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    let metrics = Arc::new(super::Metrics::default());
+    let ordinal = AtomicU64::new(0);
+    let (_, first) = super::begin_request(&metrics, &ordinal);
+    let (_, second) = super::begin_request(&metrics, &ordinal);
+    drop(first); // aborted handler/body
+    assert_eq!(super::snapshot(&metrics).active_requests, 1);
+    super::end_request(second, true);
+    let snapshot = super::snapshot(&metrics);
+    assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.completed_turns, 1);
+    assert_eq!(snapshot.peak_active_requests, 2);
+    assert_eq!(snapshot.idle_us, 0);
+    assert_eq!(snapshot.busy_us, snapshot.request_window_us);
+    let (_, third) = super::begin_request(&metrics, &ordinal);
+    drop(third);
+    assert_eq!(super::snapshot(&metrics).idle_gaps_us.len(), 1);
+}

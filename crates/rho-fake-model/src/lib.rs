@@ -6,7 +6,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use axum::Router;
@@ -16,6 +16,7 @@ use axum::extract::{Json, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt as _;
 use bytes::Bytes;
 use clap::ValueEnum;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -39,6 +40,9 @@ pub enum Scenario {
     /// Corpus-shaped normal traffic with the configured low-rate faults.
     #[default]
     Baseline,
+    /// OpenAI: six sequential real shell commands, each output validated before
+    /// continuing.
+    RealToolRounds,
     /// Return a rate limit, then an overload, then allow retries to succeed.
     RateLimit,
     /// End the first stream during a text delta, then allow retries to succeed.
@@ -59,6 +63,7 @@ impl Scenario {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
+            Self::RealToolRounds => "real-tool-rounds",
             Self::RateLimit => "rate-limit",
             Self::StreamCut => "stream-cut",
             Self::SlowTrickle => "slow-trickle",
@@ -155,7 +160,7 @@ impl FakeModelConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MetricsSnapshot {
     pub requests: u64,
     pub completed_turns: u64,
@@ -163,6 +168,14 @@ pub struct MetricsSnapshot {
     pub active_requests: u64,
     pub peak_active_requests: u64,
     pub max_input_tool_output_bytes: u64,
+    /// First request admission through latest completion (or now while active).
+    pub request_window_us: u64,
+    /// Union of request servicing intervals, not CPU time.
+    pub busy_us: u64,
+    /// No active model request within the request window.
+    pub idle_us: u64,
+    /// Most recent idle intervals, capped at 256 samples.
+    pub idle_gaps_us: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -196,7 +209,19 @@ struct Metrics {
     active_requests: AtomicU64,
     peak_active_requests: AtomicU64,
     max_input_tool_output_bytes: AtomicU64,
+    activity: Mutex<Activity>,
 }
+#[derive(Default)]
+struct Activity {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    busy_since: Option<Instant>,
+    active: u64,
+    busy: Duration,
+    gaps: std::collections::VecDeque<u64>,
+}
+
+type ResponseTools = std::collections::VecDeque<(String, Vec<ProviderTool>)>;
 
 #[derive(Clone)]
 struct AppState {
@@ -204,6 +229,7 @@ struct AppState {
     next_request: Arc<AtomicU64>,
     metrics: Arc<Metrics>,
     observations: Arc<Mutex<Vec<Observation>>>,
+    response_tools: Arc<Mutex<ResponseTools>>,
 }
 
 /// A running fake server. Dropping it requests shutdown; `shutdown` also waits
@@ -229,6 +255,7 @@ impl FakeModel {
             next_request: Arc::new(AtomicU64::new(0)),
             metrics: metrics.clone(),
             observations: observations.clone(),
+            response_tools: Arc::default(),
         };
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))
@@ -241,12 +268,20 @@ impl FakeModel {
             .with_state(state);
         let (stop, mut stopped) = watch::channel(false);
         let task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    while !*stopped.borrow() && stopped.changed().await.is_ok() {}
-                })
-                .await
-                .context("serve fake model")
+            axum::serve(
+                listener.tap_io(|socket| {
+                    // Immediate chunks must not wait for Nagle/delayed-ACK batching.
+                    socket
+                        .set_nodelay(true)
+                        .expect("set fake-model TCP_NODELAY");
+                }),
+                app,
+            )
+            .with_graceful_shutdown(async move {
+                while !*stopped.borrow() && stopped.changed().await.is_ok() {}
+            })
+            .await
+            .context("serve fake model")
         });
         Ok(Self {
             address,
@@ -301,7 +336,27 @@ async fn metrics_handler(State(state): State<AppState>) -> Json<MetricsSnapshot>
 }
 
 fn snapshot(metrics: &Metrics) -> MetricsSnapshot {
+    let activity = metrics.activity.lock().unwrap();
+    let end = if activity.active > 0 {
+        Some(Instant::now())
+    } else {
+        activity.last
+    };
+    let window = activity
+        .first
+        .zip(end)
+        .map(|(start, end)| end - start)
+        .unwrap_or_default();
+    let busy = activity.busy
+        + activity
+            .busy_since
+            .map(|start| end.unwrap() - start)
+            .unwrap_or_default();
     MetricsSnapshot {
+        idle_gaps_us: activity.gaps.iter().copied().collect(),
+        request_window_us: window.as_micros() as u64,
+        busy_us: busy.as_micros() as u64,
+        idle_us: window.saturating_sub(busy).as_micros() as u64,
         requests: metrics.requests.load(Ordering::Relaxed),
         completed_turns: metrics.completed_turns.load(Ordering::Relaxed),
         bytes_streamed: metrics.bytes_streamed.load(Ordering::Relaxed),
@@ -356,7 +411,7 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
         if envelope.kind != "response.create" {
             continue;
         }
-        let request_number = begin_request(&state.metrics, &state.next_request);
+        let (request_number, request_guard) = begin_request(&state.metrics, &state.next_request);
         observe_input_tool_outputs(&state.metrics, &envelope.request);
         let events = openai_turn(&state, request_number, &envelope.request);
         for (index, event) in events.into_iter().enumerate() {
@@ -375,19 +430,19 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
                 bytes.len(),
             );
             if socket.send(Message::Text(bytes.into())).await.is_err() {
-                break;
+                return;
             }
             if outcome(&state.config, request_number) == TerminalOutcome::Disconnect
                 && ((state.config.scenario == Scenario::StreamCut && is_text_delta(&event))
                     || (state.config.scenario != Scenario::StreamCut && index >= 2))
             {
                 let _ = socket.close().await;
-                end_request(&state.metrics, false);
+                end_request(request_guard, false);
                 return;
             }
         }
         end_request(
-            &state.metrics,
+            request_guard,
             outcome(&state.config, request_number) == TerminalOutcome::Complete,
         );
     }
@@ -397,11 +452,11 @@ async fn openai_http(
     State(state): State<AppState>,
     Json(request): Json<OpenAiRequest>,
 ) -> Response {
-    let request_number = begin_request(&state.metrics, &state.next_request);
+    let (request_number, request_guard) = begin_request(&state.metrics, &state.next_request);
     observe_input_tool_outputs(&state.metrics, &request);
     let terminal = outcome(&state.config, request_number);
     if terminal != TerminalOutcome::Complete && terminal != TerminalOutcome::Disconnect {
-        end_request(&state.metrics, false);
+        end_request(request_guard, false);
         return openai_error_response(terminal, request_number);
     }
     let events = openai_turn(&state, request_number, &request);
@@ -423,14 +478,14 @@ async fn openai_http(
             yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
             if cut {
                 yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "seeded stream cut"));
-                end_request(&metrics, false);
+                end_request(request_guard, false);
                 return;
             }
             if terminal == TerminalOutcome::Disconnect && index >= 2 {
                 break;
             }
         }
-        end_request(&metrics, terminal == TerminalOutcome::Complete);
+        end_request(request_guard, terminal == TerminalOutcome::Complete);
     };
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
@@ -499,8 +554,68 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
         .input
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"));
-    let tools = request_tools(request);
-    if state.config.scenario == Scenario::ReasoningCompaction {
+    let mut tools = request_tools(request);
+    {
+        let mut remembered = state.response_tools.lock().unwrap();
+        if tools.is_empty()
+            && let Some(previous) = &request.previous_response_id
+            && let Some((_, inherited)) = remembered.iter().find(|(id, _)| id == previous)
+        {
+            tools = inherited.clone();
+        }
+        if remembered.len() == 256 {
+            remembered.pop_front();
+        }
+        remembered.push_back((response_id.clone(), tools.clone()));
+    }
+    if state.config.scenario == Scenario::RealToolRounds && (!tools.is_empty() || has_tool_result) {
+        let outputs: Vec<_> = request
+            .input
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("function_call_output" | "custom_tool_call_output")
+                )
+            })
+            .collect();
+        let completed = outputs
+            .last()
+            .into_iter()
+            .filter_map(|item| {
+                let output = item.get("output")?.to_string();
+                (1..=6)
+                    .rev()
+                    .find(|step| output.contains(&format!("rho-e2e-step-{step}:ok")))
+            })
+            .max()
+            .unwrap_or(0);
+        if (!outputs.is_empty() && completed == 0) || tools.iter().all(|tool| tool.name != "exec") {
+            events.push(
+                json!({"type":"response.failed","response":{"id":response_id,
+                "error":{"type":"invalid_request_error","code":"invalid_request_error",
+                "message":"real-tool-rounds requires exec and a successful latest tool output"}}}),
+            );
+            return events;
+        }
+        if completed < 6 {
+            let step = completed + 1;
+            let path = format!(".rho-fake-rounds-{}", state.config.seed);
+            let init = if step == 1 {
+                format!("Path({path:?}).write_text('0')\n")
+            } else {
+                String::new()
+            };
+            let cmd = format!(
+                "test \"$(cat {path})\" = {completed} && printf {step} > {path} && printf 'rho-e2e-step-{step}:ok\\n'"
+            );
+            let source = format!("{init}await command({cmd:?})");
+            let tool = tools.iter().find(|tool| tool.name == "exec").unwrap();
+            append_tool_call(&mut events, state, request_number, 0, tool, Some(source));
+        } else {
+            append_text(&mut events, state, request_number, request, 0);
+        }
+    } else if state.config.scenario == Scenario::ReasoningCompaction {
         append_reasoning(&mut events, request_number, 0);
         append_compaction(&mut events, state, request_number, 1);
     } else if asks_compaction {
@@ -535,7 +650,7 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
             _ => state.config.distribution.parallel_tool_calls.max(1),
         };
         for offset in 0..call_count {
-            append_tool_call(&mut events, state, request_number, offset + 1, tool);
+            append_tool_call(&mut events, state, request_number, offset + 1, tool, None);
         }
     } else {
         append_reasoning(&mut events, request_number, 0);
@@ -594,6 +709,7 @@ fn append_tool_call(
     request_number: u64,
     output_index: usize,
     tool: &ProviderTool,
+    source: Option<String>,
 ) {
     let custom = tool.kind == "custom";
     let item_type = if custom {
@@ -612,17 +728,19 @@ fn append_tool_call(
         format!("fc_fake_{request_number}_{output_index}")
     };
     let call_id = format!("call_fake_{request_number}_{output_index}");
-    let arguments = tool_arguments(
-        tool,
-        state.config.distribution.large_tool_body_bytes,
-        if state.config.scenario == Scenario::HugeToolOutput {
-            output_index as u64 - 1
-        } else {
-            request_number ^ output_index as u64
-        },
-        state.config.scenario,
-        state.config.seed,
-    );
+    let arguments = source.unwrap_or_else(|| {
+        tool_arguments(
+            tool,
+            state.config.distribution.large_tool_body_bytes,
+            if state.config.scenario == Scenario::HugeToolOutput {
+                output_index as u64 - 1
+            } else {
+                request_number ^ output_index as u64
+            },
+            state.config.scenario,
+            state.config.seed,
+        )
+    });
     events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
     for chunk in chunks(&arguments, &state.config, request_number) {
         events.push(json!({"type":delta_type,"output_index":output_index,"delta":chunk}));
@@ -679,6 +797,9 @@ fn synthetic_result_bytes(scenario: Scenario, seed: u64, request_number: u64) ->
 
 fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest) -> String {
     match state.config.scenario {
+        Scenario::RealToolRounds => {
+            "Verified six sequential real shell commands and their outputs.".into()
+        }
         Scenario::ClarifyingQuestion => {
             "Could you clarify which behavior you want me to implement?".to_owned()
         }
@@ -851,19 +972,59 @@ fn openai_error_response(outcome: TerminalOutcome, request_number: u64) -> Respo
     response
 }
 
-fn begin_request(metrics: &Metrics, ordinal: &AtomicU64) -> u64 {
+fn begin_request(metrics: &Arc<Metrics>, ordinal: &AtomicU64) -> (u64, RequestGuard) {
+    let mut activity = metrics.activity.lock().unwrap();
+    let now = Instant::now();
+    activity.first.get_or_insert(now);
+    if activity.active == 0 {
+        if let Some(last) = activity.last {
+            if activity.gaps.len() == 256 {
+                activity.gaps.pop_front();
+            }
+            activity.gaps.push_back((now - last).as_micros() as u64);
+        }
+        activity.busy_since = Some(now);
+    }
+    activity.active += 1;
     metrics.requests.fetch_add(1, Ordering::Relaxed);
     let active = metrics.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
     metrics
         .peak_active_requests
         .fetch_max(active, Ordering::Relaxed);
-    ordinal.fetch_add(1, Ordering::Relaxed)
+    (
+        ordinal.fetch_add(1, Ordering::Relaxed),
+        RequestGuard {
+            metrics: metrics.clone(),
+            complete: false,
+        },
+    )
 }
 
-fn end_request(metrics: &Metrics, complete: bool) {
-    metrics.active_requests.fetch_sub(1, Ordering::Relaxed);
-    if complete {
-        metrics.completed_turns.fetch_add(1, Ordering::Relaxed);
+struct RequestGuard {
+    metrics: Arc<Metrics>,
+    complete: bool,
+}
+
+fn end_request(mut request: RequestGuard, complete: bool) {
+    request.complete = complete;
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let metrics = &self.metrics;
+        let complete = self.complete;
+        let mut activity = metrics.activity.lock().unwrap();
+        let now = Instant::now();
+        activity.active -= 1;
+        activity.last = Some(now);
+        if activity.active == 0 {
+            let start = activity.busy_since.take().unwrap();
+            activity.busy += now - start;
+        }
+        metrics.active_requests.fetch_sub(1, Ordering::Relaxed);
+        if complete {
+            metrics.completed_turns.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -915,10 +1076,10 @@ async fn anthropic_messages(
     State(state): State<AppState>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
-    let number = begin_request(&state.metrics, &state.next_request);
+    let (number, request_guard) = begin_request(&state.metrics, &state.next_request);
     let terminal = outcome(&state.config, number);
     if terminal != TerminalOutcome::Complete && terminal != TerminalOutcome::Disconnect {
-        end_request(&state.metrics, false);
+        end_request(request_guard, false);
         let (status, kind, message) = match terminal {
             TerminalOutcome::RateLimit => (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -944,7 +1105,7 @@ async fn anthropic_messages(
         return response;
     }
     if !request.stream {
-        end_request(&state.metrics, true);
+        end_request(request_guard, true);
         let text = scenario_text(&state, number, &OpenAiRequest::default());
         return Json(json!({"id":format!("msg_fake_{number}"),"type":"message","role":"assistant","model":request.model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","usage":{"input_tokens":17,"output_tokens":31}})).into_response();
     }
@@ -967,14 +1128,14 @@ async fn anthropic_messages(
             yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));
             if cut {
                 yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "seeded stream cut"));
-                end_request(&metrics, false);
+                end_request(request_guard, false);
                 return;
             }
             if terminal == TerminalOutcome::Disconnect && index >= 2 {
                 break;
             }
         }
-        end_request(&metrics, terminal == TerminalOutcome::Complete);
+        end_request(request_guard, terminal == TerminalOutcome::Complete);
     };
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(

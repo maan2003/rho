@@ -1,4 +1,5 @@
-//! Reproducible full-stack throughput and journal proof against rho-fake-model.
+//! Full-stack timing, throughput, and visible-journal checks against
+//! rho-fake-model.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -15,7 +16,7 @@ use rho_core::{AgentId, AgentRole, ContentPart, MessageDelivery};
 use rho_fake_model::Scenario;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};
-use rho_ui_proto::{ClientMessage, JoinTarget, ServerMessage, StartMode};
+use rho_ui_proto::{ClientMessage, ServerMessage, StartMode};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -53,6 +54,10 @@ struct FakeMetrics {
     completed_turns: u64,
     bytes_streamed: u64,
     max_input_tool_output_bytes: u64,
+    request_window_us: u64,
+    busy_us: u64,
+    idle_us: u64,
+    idle_gaps_us: Vec<u64>,
 }
 
 struct Children(Vec<Child>);
@@ -187,11 +192,15 @@ async fn run_async(args: Args) -> Result<()> {
     } else {
         1
     };
+    let submitted = Instant::now();
     for index in 0..agent_count {
         client
             .send(&ClientMessage::NewAgent {
                 role: AgentRole::default(),
-                start: StartMode::Join(JoinTarget::User { repo: repo.clone() }),
+                start: StartMode::NewOn {
+                    repo: repo.clone(),
+                    revset: "HEAD".into(),
+                },
                 mode: rho_ui_proto::WorksetMode::View,
                 content: Some(prompt(index, 0)),
             })
@@ -213,6 +222,7 @@ async fn run_async(args: Args) -> Result<()> {
     let mut compacted = 0u64;
     let mut clarifying = 0u64;
     let mut result_sizes = Vec::new();
+    let mut tool_durations_ms = Vec::new();
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
     let mut last_seq = Seq(0);
     let quiesce_deadline = deadline
@@ -257,7 +267,12 @@ async fn run_async(args: Args) -> Result<()> {
         };
         let message = tokio::time::timeout(event_timeout, client.recv())
             .await
-            .context("daemon journal stalled")??;
+            .with_context(|| {
+                format!(
+                    "daemon journal stalled: {}",
+                    fs::read_to_string(root.path().join("daemon.stderr.log")).unwrap_or_default()
+                )
+            })??;
         match message {
             ServerMessage::AgentCreated { agent_id } => {
                 agents.insert(agent_id);
@@ -269,21 +284,21 @@ async fn run_async(args: Args) -> Result<()> {
             ServerMessage::Log { entries } => {
                 for entry in entries {
                     ensure!(
-                        entry.seq == last_seq.next(),
-                        "global journal sequence skipped: {:?} after {:?}",
+                        entry.seq > last_seq,
+                        "global journal sequence regressed: {:?} after {:?}",
                         entry.seq,
                         last_seq
                     );
                     last_seq = entry.seq;
                     let expected = expected_pos.entry(entry.agent_id).or_insert(AgentPos::ZERO);
                     ensure!(
-                        entry.pos == *expected,
-                        "agent {:?} position skipped: {:?} expected {:?}",
+                        entry.pos >= *expected,
+                        "agent {:?} position regressed: {:?} expected {:?}",
                         entry.agent_id,
                         entry.pos,
                         expected
                     );
-                    *expected = expected.next();
+                    *expected = entry.pos.next();
                     match entry.event {
                         MirrorEvent::Created { runtime, .. } => {
                             ensure!(
@@ -293,6 +308,19 @@ async fn run_async(args: Args) -> Result<()> {
                             agents.insert(entry.agent_id);
                         }
                         MirrorEvent::Sent { results, at, .. } => {
+                            for result in &results {
+                                tool_durations_ms.push(
+                                    result
+                                        .finished_at
+                                        .saturating_duration_since(result.started_at),
+                                );
+                                if args.scenario == Scenario::RealToolRounds {
+                                    ensure!(
+                                        result.status == rho_ui_proto::mirror::ToolStatus::Success,
+                                        "real-tool-rounds tool failed"
+                                    );
+                                }
+                            }
                             sent_at.insert(entry.agent_id, at);
                             if !results.is_empty() {
                                 pending_details
@@ -389,6 +417,7 @@ async fn run_async(args: Args) -> Result<()> {
             _ => {}
         }
     }
+    let scenario_us = submitted.elapsed().as_micros() as u64;
     ensure!(
         agents.len() == agent_count,
         "created {} agents, expected {agent_count}",
@@ -399,33 +428,12 @@ async fn run_async(args: Args) -> Result<()> {
     let mut head_client = connect(&socket).await?;
     head_client.send(&ClientMessage::Subscribe).await?;
     let final_head = recv_ready(&mut head_client).await?;
-    while last_seq < final_head {
-        match client.recv().await? {
-            ServerMessage::Log { entries } => {
-                for entry in entries {
-                    ensure!(
-                        entry.seq == last_seq.next(),
-                        "global journal sequence skipped at final head"
-                    );
-                    last_seq = entry.seq;
-                    let expected = expected_pos.entry(entry.agent_id).or_insert(AgentPos::ZERO);
-                    ensure!(
-                        entry.pos == *expected,
-                        "agent {:?} position skipped at final head",
-                        entry.agent_id
-                    );
-                    *expected = expected.next();
-                }
-            }
-            ServerMessage::Error { message } => bail!("daemon journal error: {message}"),
-            _ => {}
-        }
-    }
+    // The wire projects only visible journal rows. Filtered rows advance
+    // the durable head without a Log message, so gaps are valid and the final
+    // visible row need not equal the durable head.
     ensure!(
-        last_seq == final_head,
-        "wire journal head {:?} did not match daemon {:?}",
-        last_seq,
-        final_head
+        last_seq <= final_head,
+        "visible journal advanced beyond durable head"
     );
 
     let metrics: FakeMetrics = reqwest::get(format!(
@@ -436,6 +444,19 @@ async fn run_async(args: Args) -> Result<()> {
     .error_for_status()?
     .json()
     .await?;
+    println!(
+        "MODEL_TIMING window_us={} busy_us={} idle_us={}",
+        metrics.request_window_us, metrics.busy_us, metrics.idle_us
+    );
+    println!("MODEL_IDLE_GAPS_US {:?}", metrics.idle_gaps_us);
+    println!("TOOL_DURATIONS_MS {:?}", tool_durations_ms);
+    println!(
+        "END_TO_END_US total={} model_active={} between_requests={} outside_request_window={}",
+        scenario_us,
+        metrics.busy_us,
+        metrics.idle_us,
+        scenario_us.saturating_sub(metrics.request_window_us)
+    );
     latencies.sort_unstable();
     let scenario_error = verify_scenario(
         args.scenario,
@@ -497,6 +518,7 @@ fn scenario_complete(
     latencies: &[u64],
 ) -> bool {
     match scenario {
+        Scenario::RealToolRounds => calls == 6 && results == 6 && !latencies.is_empty(),
         Scenario::Baseline => false,
         Scenario::RateLimit => failed >= 2 && !latencies.is_empty(),
         Scenario::StreamCut => failed >= 1 && !latencies.is_empty(),
@@ -521,6 +543,12 @@ struct ScenarioResults<'a> {
 
 fn verify_scenario(scenario: Scenario, results: &ScenarioResults<'_>) -> Result<()> {
     match scenario {
+        Scenario::RealToolRounds => {
+            ensure!(
+                results.calls == 6 && results.result_sizes.len() == 6 && results.failed == 0,
+                "real-tool-rounds did not complete six successful tool exchanges"
+            );
+        }
         Scenario::Baseline => {}
         Scenario::RateLimit => {
             ensure!(
@@ -643,6 +671,23 @@ fn init_workspace(path: &Path) -> Result<()> {
         .status()
         .context("run git init")?;
     ensure!(status.success(), "git init failed");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args([
+            "-c",
+            "user.name=Rho QA",
+            "-c",
+            "user.email=qa@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Synthetic QA workspace",
+        ])
+        .status()
+        .context("initialize QA repository HEAD")?;
+    ensure!(status.success(), "QA initial commit failed");
     Ok(())
 }
 
@@ -741,13 +786,46 @@ fn tree_commit() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{only_loopback, percentile};
+    use rho_fake_model::Scenario;
+
+    use super::{only_loopback, percentile, scenario_complete};
 
     #[test]
     fn network_namespace_must_contain_exactly_loopback() {
         assert!(only_loopback(["lo"]));
         assert!(!only_loopback(["eth0", "lo"]));
         assert!(!only_loopback([]));
+    }
+
+    #[test]
+    fn real_rounds_require_all_six_calls_and_results() {
+        assert!(!scenario_complete(
+            Scenario::RealToolRounds,
+            0,
+            6,
+            0,
+            0,
+            5,
+            &[1]
+        ));
+        assert!(!scenario_complete(
+            Scenario::RealToolRounds,
+            0,
+            5,
+            0,
+            0,
+            6,
+            &[1]
+        ));
+        assert!(scenario_complete(
+            Scenario::RealToolRounds,
+            0,
+            6,
+            0,
+            0,
+            6,
+            &[1]
+        ));
     }
 
     #[test]
