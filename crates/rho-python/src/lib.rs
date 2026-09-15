@@ -123,16 +123,12 @@ enum Cancellation {
 
 /// A cloneable sender, not an owner of the interpreter's lifetime.
 ///
-/// Inputs go through an unbounded outbox that one thread forwards, in
-/// order, into the interpreter's bounded inbox, waiting when that is full.
-/// The interpreter drains its inbox only between units of Python, so a cell
-/// running synchronous code while commands finish or source streams in
-/// behind it would otherwise fill the inbox, and the next thing sent, often
-/// the very cell that could relieve it, would be refused instead of queued.
+/// Inputs enter one FIFO and wake the interpreter's selector directly.
+/// Admission is unbounded so synchronous Python cannot block delivery of the
+/// completions needed to make progress. Cancellation bypasses FIFO backlog.
 #[derive(Clone)]
 pub struct Sender {
-    tx: mpsc::SyncSender<Input>,
-    outbox: mpsc::Sender<Input>,
+    tx: mpsc::Sender<Input>,
     executions: Executions,
     cancelled: Arc<Mutex<HashMap<CellId, Cancellation>>>,
     wake: Arc<OwnedFd>,
@@ -171,9 +167,11 @@ impl Sender {
         if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > MAX_MESSAGE_BYTES {
             return Err("Python input exceeds 1 MiB".into());
         }
-        self.outbox
+        self.tx
             .send(input)
-            .map_err(|_| "Python runtime disconnected".to_owned())
+            .map_err(|_| "Python runtime disconnected".to_owned())?;
+        wake(&self.wake);
+        Ok(())
     }
 
     /// The same queue as [`Sender::send`], for callers that already await.
@@ -188,7 +186,7 @@ impl Sender {
             .insert(cell, Cancellation::Pending);
         // The shared flag also interrupts a cell that is currently executing
         // Python bytecode and therefore cannot drain its inbox yet.
-        let _ = self.tx.try_send(Input::Cancel { cell });
+        let _ = self.tx.send(Input::Cancel { cell });
         wake(&self.wake);
     }
 }
@@ -205,12 +203,10 @@ impl Session {
         setup: impl FnOnce() -> Result<(), String> + Send + 'static,
         tools: Value,
     ) -> Result<Self, String> {
-        let (tx, rx) = mpsc::sync_channel(256);
-        let (outbox, outbox_rx) = mpsc::channel::<Input>();
+        let (tx, rx) = mpsc::channel();
         let executions: Executions = Default::default();
         let cancelled = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let space = Arc::new(tokio::sync::Notify::new());
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().to_string());
@@ -221,34 +217,15 @@ impl Session {
             Arc::clone(&executions),
             Arc::clone(&cancelled),
             Arc::clone(&shutdown),
-            Arc::clone(&space),
             Arc::clone(&wake),
             move || {
                 setup()?;
                 Ok(tools)
             },
         )?;
-        {
-            let tx = tx.clone();
-            let wake = Arc::clone(&wake);
-            std::thread::Builder::new()
-                .name("python-inbox".into())
-                .spawn(move || {
-                    // A blocking send here waits for the interpreter to
-                    // drain, and ends when the interpreter thread is gone.
-                    while let Ok(input) = outbox_rx.recv() {
-                        if tx.send(input).is_err() {
-                            break;
-                        }
-                        crate::wake(&wake);
-                    }
-                })
-                .map_err(|e| e.to_string())?;
-        }
         Ok(Self {
             sender: Sender {
                 tx,
-                outbox,
                 executions,
                 cancelled,
                 wake,
@@ -266,7 +243,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        let _ = self.sender.tx.try_send(Input::Shutdown);
+        let _ = self.sender.tx.send(Input::Shutdown);
         wake(&self.sender.wake);
         // Never join untrusted in-process code on an agent/Tokio thread. The
         // execution hook requests unwinding; native calls may still block.
@@ -346,25 +323,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_inbox_delays_a_cell_instead_of_refusing_it() {
+    async fn input_backlog_crosses_multiple_drain_batches_without_refusing_a_cell() {
         let (session, mut events) = test_session(|| Ok(())).unwrap();
         let sender = session.sender();
-        // Fill the interpreter's inbox behind its back, as a burst of
-        // completions or streamed source would while a cell runs.
-        let raw = session.session.sender();
-        let mut queued = 0;
-        while raw
-            .tx
-            .try_send(Input::Resolve {
-                request: u64::MAX,
-                value: Value::Null,
-                error: None,
-            })
-            .is_ok()
-        {
-            queued += 1;
+        // More than the former 256-entry staging bound and several 64-entry
+        // drain batches. No extra producer is needed to keep the tail awake.
+        for _ in 0..513 {
+            sender
+                .send(Input::Resolve {
+                    request: u64::MAX,
+                    value: Value::Null,
+                    error: None,
+                })
+                .unwrap();
         }
-        assert!(queued >= 256);
         // The cell is accepted, waits for the backlog to drain, then runs.
         sender
             .send(Input::Execute {
@@ -372,11 +344,41 @@ mod tests {
                 source: "notify('after the backlog')".into(),
             })
             .unwrap();
-        crate::wake(&raw.wake);
         loop {
             if let Event::Text { text, .. } = next(&mut events).await
                 && text.contains("after the backlog")
             {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_bypasses_backlog_with_cloned_senders_alive() {
+        let (session, mut events) = test_session(|| Ok(())).unwrap();
+        let sender = session.sender();
+        sender
+            .send(Input::Execute {
+                cell: 1,
+                source: "notify('waiting'); await asyncio.Event().wait()".into(),
+            })
+            .unwrap();
+        assert!(matches!(next(&mut events).await, Event::Text { .. }));
+        for _ in 0..513 {
+            sender
+                .send(Input::Resolve {
+                    request: u64::MAX,
+                    value: Value::Null,
+                    error: None,
+                })
+                .unwrap();
+        }
+        drop(session);
+        loop {
+            if matches!(
+                next(&mut events).await,
+                Event::Stopped { .. } | Event::Finished { .. }
+            ) {
                 break;
             }
         }
@@ -673,7 +675,7 @@ else:
     }
 
     #[tokio::test]
-    async fn worker_cannot_consume_cell_cancellation_when_inbox_is_full() {
+    async fn worker_cannot_consume_cell_cancellation_behind_input_backlog() {
         let directory = tempfile::tempdir().unwrap();
         let release = directory.path().join("release");
         let (session, mut rx) = test_session(|| Ok(())).unwrap();
@@ -701,15 +703,15 @@ await asyncio.Event().wait()
         assert!(matches!(next(&mut rx).await,
             Event::Text { text, .. } if text.contains("worker ready")));
         let sender = session.session.sender();
-        while sender
-            .tx
-            .try_send(Input::Resolve {
-                request: u64::MAX,
-                value: Value::Null,
-                error: None,
-            })
-            .is_ok()
-        {}
+        for _ in 0..513 {
+            sender
+                .send(Input::Resolve {
+                    request: u64::MAX,
+                    value: Value::Null,
+                    error: None,
+                })
+                .unwrap();
+        }
         sender.cancel(1);
         loop {
             if let Event::Text { text, .. } = next(&mut rx).await

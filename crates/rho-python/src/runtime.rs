@@ -199,7 +199,6 @@ pub(super) fn spawn(
     executions: crate::Executions,
     cancelled: Arc<Mutex<HashMap<CellId, Cancellation>>>,
     shutdown: Arc<AtomicBool>,
-    space: Arc<tokio::sync::Notify>,
     wake: Arc<OwnedFd>,
     setup: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
 ) -> Result<(), String> {
@@ -296,7 +295,6 @@ pub(super) fn spawn(
                     );
                     let inbox = Mutex::new(input);
                     let stopping = Arc::clone(&shutdown);
-                    let available = Arc::clone(&space);
                     let cancel_inbox = Arc::clone(&cancelled);
                     let fd = wake.as_raw_fd();
                     scope
@@ -318,7 +316,6 @@ pub(super) fn spawn(
                             if batch.len() == 64 {
                                 crate::wake(&wake);
                             }
-                            available.notify_waiters();
                             batch.extend(
                                 cancel_inbox
                                     .lock()
@@ -513,7 +510,6 @@ pub(super) fn spawn(
             let _ = ready_tx.send(Err(error
                 .clone()
                 .unwrap_or_else(|| "Python runtime stopped during startup".into())));
-            space.notify_waiters();
             let execs = std::mem::take(&mut *ended.lock().unwrap());
             for exec in execs.into_values() {
                 exec.event(Event::Stopped {

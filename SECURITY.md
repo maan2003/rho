@@ -807,10 +807,11 @@ own tools denied.
   retains its first 8 MiB with explicit overflow counts. At most 64 job records
   are retained, evicting oldest completed, delivered records; temporary files
   disappear with their records. Up to 32 image references are retained.
-- Notebook bridge payloads are capped at 1 MiB and the completion/input queue at 256 entries,
-  live cells at 128, and pending host requests and registered tasks at 1,024 each.
-  Reliable asynchronous completion delivery applies backpressure without blocking
-  the interpreter. Python-to-Rust callbacks commit synchronously and have no
+- Notebook bridge payloads are capped at 1 MiB, live cells at 128, and pending
+  host requests and registered tasks at 1,024 each. Input admission is unbounded:
+  one FIFO wakes the interpreter directly, which drains at most 64 messages per
+  callback and re-wakes for the remainder. Cancellation and shutdown flags bypass
+  backlog. These queue semantics do not bound total admitted bytes. Python-to-Rust callbacks commit synchronously and have no
   deferred event consumer. These bounds do not cap arbitrary Python allocations.
 - Commands and internal tool calls inside Python are independent scheduling sources. Their output remains
   attached to the originating `exec` call; command IDs identify the work, not
