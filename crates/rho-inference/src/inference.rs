@@ -1,6 +1,6 @@
 //! The daemon-wide inference runtime and the sessions created from it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::future::BoxFuture;
 use rho_core::UnixMs;
@@ -64,6 +64,7 @@ enum Backend {
 struct Inner {
     backend: Backend,
     responses_base_url: Arc<str>,
+    credentials: OnceLock<watch::Receiver<crate::CredentialSnapshot>>,
 }
 
 impl Inference {
@@ -98,6 +99,7 @@ impl Inference {
                 routes: RouteSelector::new(Some(db)),
             },
             responses_base_url: config.responses_base_url,
+            credentials: OnceLock::new(),
         }));
         if production_chatgpt {
             inference.spawn_route_prober();
@@ -113,6 +115,7 @@ impl Inference {
                 routes: RouteSelector::new(None),
             },
             responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
+            credentials: OnceLock::new(),
         }))
     }
 
@@ -125,6 +128,7 @@ impl Inference {
         Self(Arc::new(Inner {
             backend: Backend::Host(host),
             responses_base_url: config.responses_base_url,
+            credentials: OnceLock::new(),
         }))
     }
 
@@ -234,6 +238,29 @@ impl Inference {
             return host.resolve_auth(auth).await;
         }
         Ok(tokio::task::spawn_blocking(move || auth.resolve()).await??)
+    }
+
+    /// Private daemon-to-worker credential stream; never a UI/public-state DTO.
+    pub fn credential_updates(&self) -> watch::Receiver<crate::CredentialSnapshot> {
+        self.0
+            .credentials
+            .get_or_init(|| crate::credentials::subscribe(self.accounts().selection_updates()))
+            .clone()
+    }
+
+    /// Fence a policy mutation before acknowledging it to a worker. Selection
+    /// changes during resolution are followed rather than publishing stale
+    /// auth.
+    pub async fn credential_snapshot(&self) -> anyhow::Result<crate::CredentialSnapshot> {
+        let mut updates = self.credential_updates();
+        loop {
+            let wanted = self.accounts().selection_updates().borrow().clone();
+            let snapshot = updates.borrow_and_update().clone();
+            if snapshot.matches_selection(&wanted) && snapshot.current().is_some() {
+                return Ok(snapshot);
+            }
+            updates.changed().await?;
+        }
     }
 
     pub async fn select_resolved(&self) -> anyhow::Result<(SelectedAuth, crate::ResolvedAuth)> {

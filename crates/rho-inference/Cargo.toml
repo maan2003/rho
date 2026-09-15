@@ -13,6 +13,7 @@ bytes = "1"
 clap.workspace = true
 dirs.workspace = true
 fnv.workspace = true
+notify.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 rand.workspace = true

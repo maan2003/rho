@@ -86,6 +86,27 @@ impl InferenceAuth {
         self.resolve_with_refresh(openai_codex_refresh)
     }
 
+    pub(crate) fn path(&self) -> PathBuf {
+        match &self.kind {
+            InferenceAuthKind::OAuthFile(file) => file.path(),
+        }
+    }
+
+    pub(crate) fn resolve_cached(&self) -> io::Result<(ResolvedAuth, u64)> {
+        let InferenceAuthKind::OAuthFile(file) = &self.kind;
+        let credentials = file.credentials_with_refresh(openai_codex_refresh)?;
+        let refresh_at = if credentials.refresh_token.trim().is_empty() {
+            if credentials.expires_at_ms == 0 {
+                u64::MAX
+            } else {
+                credentials.expires_at_ms
+            }
+        } else {
+            oauth_refresh_at_ms(&credentials.access_token, credentials.expires_at_ms)
+        };
+        Ok((credentials.resolved()?, refresh_at))
+    }
+
     pub fn resolve_oauth(&self) -> io::Result<ResolvedOAuth> {
         self.resolve().map(|auth| ResolvedOAuth {
             bearer_token: auth.bearer_token,
@@ -180,8 +201,15 @@ impl OAuthFile {
 
     pub(crate) fn resolve_with_refresh(
         &self,
-        mut refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
+        refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
     ) -> io::Result<ResolvedAuth> {
+        self.credentials_with_refresh(refresh)?.resolved()
+    }
+
+    fn credentials_with_refresh(
+        &self,
+        mut refresh: impl FnMut(&str) -> io::Result<ResponsesOAuthCredentials>,
+    ) -> io::Result<ResponsesOAuthCredentials> {
         self.with_lock(|| {
             let Some(current) = self.load()? else {
                 return Err(io::Error::new(
@@ -192,7 +220,7 @@ impl OAuthFile {
             if !oauth_token_should_refresh(&current.access_token, current.expires_at_ms)
                 || current.refresh_token.trim().is_empty()
             {
-                return current.resolved();
+                return Ok(current);
             }
 
             let mut refreshed = refresh(&current.refresh_token)?;
@@ -201,7 +229,7 @@ impl OAuthFile {
             }
             refreshed.client_secret = current.client_secret;
             self.write(&refreshed)?;
-            refreshed.resolved()
+            Ok(refreshed)
         })
     }
 
@@ -307,15 +335,17 @@ fn generate_client_secret() -> [u8; 32] {
 }
 
 pub(crate) fn oauth_token_should_refresh(access_token: &str, expires_at_ms: u64) -> bool {
-    let now_ms = now_ms();
+    oauth_refresh_at_ms(access_token, expires_at_ms) <= now_ms()
+}
+
+fn oauth_refresh_at_ms(access_token: &str, expires_at_ms: u64) -> u64 {
+    let expiry_window = expires_at_ms.saturating_sub(duration_millis_u64(REFRESH_EXPIRY_WINDOW));
     if let Some(issued_at_ms) = jwt_issued_at_ms(access_token) {
-        let lifetime_ms = expires_at_ms.saturating_sub(issued_at_ms);
-        let refresh_at_ms = issued_at_ms.saturating_add(lifetime_ms / 2);
-        if refresh_at_ms <= now_ms {
-            return true;
-        }
+        let half_life = issued_at_ms.saturating_add(expires_at_ms.saturating_sub(issued_at_ms) / 2);
+        half_life.min(expiry_window)
+    } else {
+        expiry_window
     }
-    expires_at_ms <= now_ms.saturating_add(duration_millis_u64(REFRESH_EXPIRY_WINDOW))
 }
 
 fn parse_openai_token_response(json: &Value) -> io::Result<ResponsesOAuthCredentials> {

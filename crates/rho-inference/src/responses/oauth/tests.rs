@@ -175,3 +175,36 @@ fn parse_redirect_url_rejects_bare_query_text() {
 
     assert!(error.contains("expected full URL"));
 }
+
+#[test]
+fn cached_deadline_uses_the_same_half_life_and_expiry_window_as_refresh() {
+    let issued = 1_000_000_u64;
+    let jwt = jwt_with_claims(json!({"iat": issued / 1000}));
+    assert_eq!(
+        oauth_refresh_at_ms(&jwt, issued + 3_600_000),
+        issued + 1_800_000
+    );
+    assert_eq!(
+        oauth_refresh_at_ms(&jwt, issued + 400_000),
+        issued + 100_000
+    );
+    assert_eq!(
+        oauth_refresh_at_ms("opaque", issued + 3_600_000),
+        issued + 3_300_000
+    );
+}
+
+#[test]
+fn cached_credentials_without_refresh_tokens_still_respect_known_expiry() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = oauth_file_open_in(temp.path(), "account").unwrap();
+    let expiry = now_ms() + 60_000;
+    file.save(&ResponsesOAuthCredentials {
+        access_token: "access".into(),
+        expires_at_ms: expiry,
+        ..Default::default()
+    })
+    .unwrap();
+    let auth = InferenceAuth::oauth_file(file.path());
+    assert_eq!(auth.resolve_cached().unwrap().1, expiry);
+}

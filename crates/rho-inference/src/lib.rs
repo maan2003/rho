@@ -3,8 +3,10 @@
 mod accounts;
 pub mod auth_cli;
 pub mod config;
+mod credentials;
 pub mod exec;
 mod inference;
+pub use credentials::{CredentialSnapshot, CredentialState};
 mod responses;
 
 pub use accounts::{

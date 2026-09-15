@@ -160,6 +160,7 @@ pub(crate) struct AccountManager {
     db: RhoDb,
     inner: Mutex<AccountState>,
     public: watch::Sender<InferenceState>,
+    selection: watch::Sender<Result<SelectedAuth, String>>,
 }
 
 impl AccountManager {
@@ -197,6 +198,7 @@ impl AccountManager {
         };
         inner.reconsider();
         let public = watch::Sender::new(inner.public_state());
+        let selection = watch::Sender::new(inner.selected());
         let mut write = db.write().await;
         store_settings(&mut write, &inner);
         write.commit();
@@ -204,33 +206,16 @@ impl AccountManager {
             db,
             inner: Mutex::new(inner),
             public,
+            selection,
         }
     }
 
     pub(crate) async fn select(&self) -> anyhow::Result<SelectedAuth> {
-        let inner = self.inner.lock().await;
-        let Some(namespace) = &inner.current else {
-            let message = if inner.configured.is_empty() {
-                "no inference authentication credentials are configured"
-            } else if inner
-                .configured
-                .iter()
-                .all(|namespace| inner.disabled.contains(namespace))
-            {
-                "all inference authentication accounts are disabled"
-            } else {
-                "rate_limit_exceeded: all enabled inference accounts are exhausted"
-            };
-            anyhow::bail!(message);
-        };
-        Ok(SelectedAuth {
-            auth: InferenceAuth::named(namespace)?,
-            namespace: Some(namespace.clone()),
-            account_id: inner
-                .accounts
-                .get(namespace)
-                .and_then(|account| account.account_id.clone()),
-        })
+        self.selection.borrow().clone().map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn selection_updates(&self) -> watch::Receiver<Result<SelectedAuth, String>> {
+        self.selection.subscribe()
     }
 
     pub(crate) async fn observe_quota(&self, selected: &SelectedAuth, quota: QuotaUpdate) {
@@ -410,6 +395,14 @@ impl AccountManager {
     }
 
     fn publish(&self, inner: &AccountState) {
+        let selected = inner.selected();
+        self.selection.send_if_modified(|current| {
+            if *current == selected {
+                return false;
+            }
+            *current = selected;
+            true
+        });
         let state = inner.public_state();
         if *self.public.borrow() != state {
             self.public.send_replace(state);
@@ -418,6 +411,31 @@ impl AccountManager {
 }
 
 impl AccountState {
+    fn selected(&self) -> Result<SelectedAuth, String> {
+        let Some(namespace) = &self.current else {
+            let message = if self.configured.is_empty() {
+                "no inference authentication credentials are configured"
+            } else if self
+                .configured
+                .iter()
+                .all(|namespace| self.disabled.contains(namespace))
+            {
+                "all inference authentication accounts are disabled"
+            } else {
+                "rate_limit_exceeded: all enabled inference accounts are exhausted"
+            };
+            return Err(message.into());
+        };
+        Ok(SelectedAuth {
+            auth: InferenceAuth::named(namespace).map_err(|error| error.to_string())?,
+            namespace: Some(namespace.clone()),
+            account_id: self
+                .accounts
+                .get(namespace)
+                .and_then(|account| account.account_id.clone()),
+        })
+    }
+
     fn reconsider(&mut self) {
         let now = now_secs();
         let current_usable = self.current.as_ref().is_some_and(|namespace| {
@@ -939,6 +957,7 @@ mod tests {
         let manager = AccountManager {
             db,
             public: watch::Sender::new(inner.public_state()),
+            selection: watch::Sender::new(inner.selected()),
             inner: Mutex::new(inner),
         };
 

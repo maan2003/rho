@@ -68,7 +68,12 @@ security, resource-isolation, or rollback boundary.
   the existing choice. Ordinary retries retain that choice and only explicit
   rate-limit failover replaces it. The
   worker's `Inference::from_host` owns provider transport but obtains account and
-  route policy through IPC, without another database or policy poller. The
+  route policy through IPC, without another database or policy poller. A lazy,
+  daemon-wide credential publisher pushes revisioned pending/ready/unavailable
+  snapshots on selection changes, credential-file events, and refresh deadlines.
+  Worker request setup reads that snapshot locally; changes take effect on
+  receipt. Rate-limit acknowledgments fence replacement delivery. Reconnects
+  still resolve their pinned account through the daemon. The
   daemon projects safe settings/quota DTOs and merges Claude presentation.
   ChatGPT quota observations are attributed to that daemon-local namespace;
   `Inference` polls every enabled configured namespace and the GUI keeps each

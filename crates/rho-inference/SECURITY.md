@@ -34,8 +34,8 @@ file-backed OAuth credentials.
   deduplication. Session creation and account selection never request quota.
 - Worker-local sessions delegate account and route policy through `InferenceHost`.
   They do not open provider tables or start account/route pollers. The selected
-  credential reference and account identity can cross the trusted local worker
-  channel, but must not enter user-facing state or protocol diagnostics. Quota
+  credential reference, resolved bearer, per-session secret, and account identity
+  can cross the trusted local worker channel, but must not enter user-facing state or protocol diagnostics. Quota
   and rate-limit reports retain the selected account's identity.
 - Explicit non-production Responses endpoints suppress the ChatGPT usage
   poller, so an isolated QA daemon cannot make a live provider side request.
@@ -50,8 +50,16 @@ file-backed OAuth credentials.
   not persist remote error bodies. Direct routes retain `chatgpt.com` in the
   request URI, TLS SNI, and certificate verification; only the TCP destination
   differs.
-- The current automatic account selection is persisted privately and read at
-  request setup by sessions, web search, and realtime. Safe public state
+- The current automatic account selection is persisted privately. Worker
+  inference request setup reads a revisioned daemon-pushed credential snapshot;
+  selection and file changes take effect on receipt, not synchronously on the
+  next request. Bootstrap and refresh wait for a usable snapshot; expired or
+  disconnected snapshots cannot supply a new request. The daemon watches the
+  selected credential directory, reconciles hourly, and refreshes at the
+  existing JWT-half-life/five-minute-window deadline. Resolution errors revoke
+  the cached value without account failover. Rate-limit acknowledgments fence
+  replacement delivery; ordinary reconnects resolve their original account.
+  Web search and realtime continue to resolve through daemon policy. Safe public state
   deliberately omits it. Authentication failures fail their request without
   changing selection; only rate limits and user disablement trigger failover.
 - WebSocket pool entries are keyed by base URL, account id, and

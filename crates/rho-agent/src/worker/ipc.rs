@@ -16,7 +16,7 @@ use crate::db::{
     AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding, TurnEdge,
 };
 
-pub(super) const VERSION: u32 = 4;
+pub(super) const VERSION: u32 = 5;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -85,7 +85,6 @@ pub(super) enum Request<'a> {
         edge: TurnEdge,
     },
     SelectAccount,
-    SelectResolved,
     ResolveAuth(rho_inference::InferenceAuth),
     RateLimited(SelectedAuth),
     Quota {
@@ -115,7 +114,6 @@ pub(super) enum Reply {
     Usage(AgentUsageBucket),
     Error(String),
     Account(SelectedAuth),
-    SelectedResolved(SelectedAuth, rho_inference::ResolvedAuth),
     Auth(rho_inference::ResolvedAuth),
     RateLimited(bool),
     Done,
@@ -158,6 +156,7 @@ pub(super) enum Message<'a> {
         body: Reply,
     },
     Route(RouteSelection),
+    Credentials(rho_inference::CredentialSnapshot),
 }
 
 pub(super) fn decode(bytes: &[u8]) -> io::Result<Message<'static>> {
@@ -219,6 +218,7 @@ pub(crate) struct Host {
     next: Arc<AtomicU64>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     routes: watch::Receiver<RouteSelection>,
+    credentials: watch::Receiver<Option<rho_inference::CredentialSnapshot>>,
     closed: watch::Receiver<bool>,
     names: watch::Receiver<Option<AgentHead>>,
     publication: Arc<Publication>,
@@ -259,6 +259,8 @@ impl Host {
         let publication = Arc::new(Publication::default());
         let published = publication.clone();
         let (routes, route_updates) = watch::channel(RouteSelection::default());
+        let (credentials, credential_updates) =
+            watch::channel::<Option<rho_inference::CredentialSnapshot>>(None);
         let (closed, connection_closed) = watch::channel(false);
         let (names, name_updates) = watch::channel(None);
         tokio::spawn(async move {
@@ -285,6 +287,18 @@ impl Host {
                                 };
                                 let _ = waiter.reply.send(body);
                             }
+                        }
+                        Message::Credentials(snapshot) => {
+                            credentials.send_if_modified(|current| {
+                                if current
+                                    .as_ref()
+                                    .is_some_and(|old| snapshot.revision <= old.revision)
+                                {
+                                    return false;
+                                }
+                                *current = Some(snapshot);
+                                true
+                            });
                         }
                         Message::Route(route) => {
                             routes.send_if_modified(|current| {
@@ -362,6 +376,7 @@ impl Host {
             next,
             stop: Mutex::new(Some(stop)),
             routes: route_updates,
+            credentials: credential_updates,
             closed: connection_closed,
             names: name_updates,
             publication,
@@ -635,9 +650,22 @@ impl InferenceHost for Host {
         &self,
     ) -> BoxFuture<'_, anyhow::Result<(SelectedAuth, rho_inference::ResolvedAuth)>> {
         Box::pin(async {
-            match self.request(Request::SelectResolved).await? {
-                Reply::SelectedResolved(selected, resolved) => Ok((selected, resolved)),
-                _ => anyhow::bail!("unexpected account service reply"),
+            let mut credentials = self.credentials.clone();
+            let mut closed = self.closed.clone();
+            loop {
+                anyhow::ensure!(!*closed.borrow_and_update(), "agent connection closed");
+                if let Some(result) = credentials
+                    .borrow_and_update()
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.current())
+                {
+                    return result;
+                }
+                tokio::select! {
+                    biased;
+                    _ = closed.changed() => anyhow::bail!("agent connection closed"),
+                    change = credentials.changed() => change?,
+                }
             }
         })
     }
@@ -779,13 +807,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_selection_and_credentials_are_one_request() {
+    async fn account_selection_waits_for_push_without_an_rpc() {
         let (client, mut server) = crate::worker::testing::pair();
         let host = client.host();
         let request = tokio::spawn(async move { host.select_resolved().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), server.read())
+                .await
+                .is_err()
+        );
+        server
+            .write(&Message::Credentials(rho_inference::CredentialSnapshot {
+                revision: 1,
+                state: rho_inference::CredentialState::Unavailable {
+                    selected: None,
+                    error: "no credentials".into(),
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            request.await.unwrap().unwrap_err().to_string(),
+            "no credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_ack_installs_replacement_and_reconnect_resolves_pinned_auth() {
+        let (client, mut server) = crate::worker::testing::pair();
+        let host = client.host();
+        let auth_a = rho_inference::InferenceAuth::named("fixture-a").unwrap();
+        let auth_b = rho_inference::InferenceAuth::named("fixture-b").unwrap();
+        // SelectedAuth is opaque outside inference; construct a wire fixture.
+        #[derive(Encode)]
+        struct SelectedWire {
+            auth: rho_inference::InferenceAuth,
+            namespace: Option<String>,
+            account_id: Option<String>,
+        }
+        let selected = |auth: &rho_inference::InferenceAuth| {
+            let bytes = senax_encoder::encode(&SelectedWire {
+                auth: auth.clone(),
+                namespace: None,
+                account_id: None,
+            })
+            .unwrap();
+            senax_encoder::decode::<SelectedAuth>(&mut bytes.as_ref()).unwrap()
+        };
+        let a = selected(&auth_a);
+        let b = selected(&auth_b);
+        let resolved = |token: &str| rho_inference::ResolvedAuth {
+            bearer_token: token.into(),
+            account_id: None,
+            client_secret: [0; 32],
+        };
+        let snapshot = |revision, selected, token: &str| {
+            Message::Credentials(rho_inference::CredentialSnapshot {
+                revision,
+                state: rho_inference::CredentialState::Ready {
+                    selected,
+                    auth: resolved(token),
+                    refresh_at: u64::MAX,
+                },
+            })
+        };
+        server.write(&snapshot(1, a.clone(), "a")).await.unwrap();
+        assert_eq!(host.select_resolved().await.unwrap().1.bearer_token, "a");
+        let limit = tokio::spawn({
+            let host = host.clone();
+            let a = a.clone();
+            async move { host.mark_rate_limited(a).await }
+        });
         let Message::Request {
             id,
-            body: Request::SelectResolved,
+            body: Request::RateLimited(_),
+        } = server.read().await.unwrap()
+        else {
+            panic!()
+        };
+        server.write(&snapshot(3, b.clone(), "b")).await.unwrap();
+        server.write(&snapshot(2, a, "stale-a")).await.unwrap();
+        server
+            .write(&Message::Reply {
+                id,
+                body: Reply::RateLimited(true),
+            })
+            .await
+            .unwrap();
+        assert!(limit.await.unwrap());
+        assert_eq!(host.select_resolved().await.unwrap().1.bearer_token, "b");
+
+        let reconnect = tokio::spawn({
+            let host = host.clone();
+            let auth_a = auth_a.clone();
+            async move { host.resolve_auth(auth_a).await }
+        });
+        let Message::Request {
+            id,
+            body: Request::ResolveAuth(auth),
+        } = server.read().await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            auth, auth_a,
+            "reconnect switched to the newly selected account"
+        );
+        server
+            .write(&Message::Reply {
+                id,
+                body: Reply::Auth(resolved("refreshed-a")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            reconnect.await.unwrap().unwrap().bearer_token,
+            "refreshed-a"
+        );
+        assert_eq!(host.select_resolved().await.unwrap().1.bearer_token, "b");
+    }
+
+    #[tokio::test]
+    async fn credential_push_revision_and_reply_fence_prevent_stale_replacement() {
+        let (client, mut server) = crate::worker::testing::pair();
+        let host = client.host();
+        for (revision, error) in [(8, "replacement"), (3, "obsolete")] {
+            server
+                .write(&Message::Credentials(rho_inference::CredentialSnapshot {
+                    revision,
+                    state: rho_inference::CredentialState::Unavailable {
+                        selected: None,
+                        error: error.into(),
+                    },
+                }))
+                .await
+                .unwrap();
+        }
+        // Use a normal correlated reply to fence receipt of both pushes.
+        let call = tokio::spawn({
+            let host = host.clone();
+            async move { host.select().await }
+        });
+        let Message::Request {
+            id,
+            body: Request::SelectAccount,
         } = server.read().await.unwrap()
         else {
             panic!()
@@ -793,13 +958,27 @@ mod tests {
         server
             .write(&Message::Reply {
                 id,
-                body: Reply::Error("no credentials".into()),
+                body: Reply::Error("fenced".into()),
             })
             .await
             .unwrap();
+        assert_eq!(call.await.unwrap().unwrap_err().to_string(), "fenced");
+        for _ in 0..3 {
+            assert_eq!(
+                host.select_resolved().await.unwrap_err().to_string(),
+                "replacement"
+            );
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), server.read())
+                .await
+                .is_err()
+        );
+        drop(server);
+        host.closed().await;
         assert_eq!(
-            request.await.unwrap().unwrap_err().to_string(),
-            "no credentials"
+            host.select_resolved().await.unwrap_err().to_string(),
+            "agent connection closed"
         );
     }
 

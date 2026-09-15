@@ -13282,6 +13282,7 @@ dependencies = [
  "fnv",
  "futures",
  "futures-util",
+ "notify",
  "rand 0.8.7",
  "redb",
  "redb-derive",

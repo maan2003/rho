@@ -137,6 +137,7 @@ impl Services {
             let mut calls = JoinSet::new();
             let mut teller = crate::live::Teller::default();
             let mut routes = self.inference.route_updates();
+            let mut credentials = self.inference.credential_updates();
             let result = tokio::select! {
                 result = async {
                     loop {
@@ -229,6 +230,15 @@ impl Services {
                         let route = routes.borrow_and_update().clone();
                         outgoing.send(Message::Route(route)).await?;
                         routes.changed().await?;
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                } => result,
+                result = async {
+                    loop {
+                        let snapshot = credentials.borrow_and_update().clone();
+                        outgoing.send(Message::Credentials(snapshot)).await?;
+                        credentials.changed().await?;
                     }
                     #[allow(unreachable_code)]
                     Ok::<(), anyhow::Error>(())
@@ -444,13 +454,14 @@ impl Services {
                 Reply::Done
             }
             Request::ResolveAuth(auth) => Reply::Auth(self.inference.resolve_auth(auth).await?),
-            Request::SelectResolved => {
-                let (selected, resolved) = self.inference.select_resolved().await?;
-                Reply::SelectedResolved(selected, resolved)
-            }
             Request::SelectAccount => Reply::Account(self.inference.select().await?),
             Request::RateLimited(selected) => {
-                Reply::RateLimited(self.inference.mark_rate_limited(&selected).await)
+                let changed = self.inference.mark_rate_limited(&selected).await;
+                // Install the replacement before the retry can select again.
+                // Older background pushes are rejected by snapshot revision.
+                let snapshot = self.inference.credential_snapshot().await?;
+                outgoing.send(Message::Credentials(snapshot)).await?;
+                Reply::RateLimited(changed)
             }
             Request::Quota { selected, quota } => {
                 self.inference.observe_quota(&selected, quota).await;

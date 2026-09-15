@@ -17,10 +17,13 @@ The public surface is intentionally small:
 - `Inference::from_host` creates session transport without opening a database or
   starting pollers. Its `InferenceHost` supplies account selection, quota and
   rate-limit reporting, and route observations from the daemon. Provider
-  connections and OAuth-file resolution stay with the session.
+  connections stay with the session; credential-file reads and refresh stay
+  in the daemon. Workers read pushed credential snapshots for new requests and
+  retain the pinned-account resolution RPC for reconnects.
 - `InferenceSession` configures prompt-cache/thread behavior and owns one warm
   WebSocket. The session task snapshots the account manager's existing
-  selection when it accepts each new request and reconnects when it differs
+  selection (the latest received snapshot in workers) when it accepts each new
+  request and reconnects when it differs
   from the socket account. Ordinary retries retain that snapshot; only an
   explicit rate-limit failover replaces it.
 - `InferenceState` exposes disabled namespaces, namespace names, and quota
@@ -70,6 +73,14 @@ configuration.
   state, and both raw latency samples.
 - `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
   account id extraction, and file locking.
+- `credentials.rs` owns the daemon-wide private credential watch, created on
+  first worker subscription. Selection changes, directory events (including
+  atomic credential replacement), and the existing OAuth refresh deadline
+  invalidate it before resolution. One blocking resolution runs at a time;
+  intervening changes coalesce and stale results are discarded. Errors replace
+  usable credentials, with retry in the daemon. Hourly reconciliation bounds
+  missed file events. Revision checking rejects reordered pushes, and
+  rate-limit acknowledgments carry the replacement snapshot first.
 - `accounts.rs` is the deep account module: it owns the persisted current
   selection and disabled set, in-memory quota/rate-limit state, selection
   transitions, ChatGPT quota persistence, and safe presentation DTOs. Selection
