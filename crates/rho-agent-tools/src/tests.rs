@@ -1142,3 +1142,47 @@ async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
     assert!(!directory.path().join("wrong").exists());
     tool.shutdown().await.unwrap();
 }
+
+/// Local code submission through real Bash completion and result rendering.
+/// Uses the workset's Tokio worker count; excludes daemon/provider transport.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual release-mode awaited command latency benchmark"]
+async fn benchmark_awaited_command() {
+    tokio::spawn(async {
+        let cwd = camino::Utf8PathBuf::try_from(std::env::current_dir().unwrap()).unwrap();
+        let notebook = python(
+            ShellTools::in_directory(Duration::from_secs(30), cwd, PathOverrides::default()),
+            Vec::new(),
+        );
+        let mut samples = Vec::new();
+        for n in 0..1010 {
+            let wake = Arc::new(Notify::new());
+            let call = call(&format!("bench-{n}"), json!("await command(\"true\")"));
+            let start = std::time::Instant::now();
+            let mut cell = notebook.exec(call, SourceWaker::new(wake.clone()));
+            until(&wake, &cell, Signal::Ended).await;
+            let output = cell.first_output();
+            cell.acknowledge_output();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+            assert!(
+                output.output.contains("Process exited with code 0"),
+                "{output:?}"
+            );
+            assert!(cell.done());
+            if n >= 10 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "await command(true), 1000 warm samples: mean_ms={:.3} median_ms={:.3} p95_ms={:.3}",
+            samples.iter().sum::<f64>() / samples.len() as f64,
+            (samples[499] + samples[500]) / 2.0,
+            samples[949],
+        );
+        notebook.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
