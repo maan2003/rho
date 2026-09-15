@@ -71,6 +71,7 @@ pub struct PythonStreamProgress {
     pub completed: usize,
     pub stopped: bool,
     pub recovery: bool,
+    pub interrupted: bool,
 }
 
 struct ExecState {
@@ -978,11 +979,14 @@ impl PythonExec {
     /// Stop source admission, not the active unit or its managed commands.
     pub fn stop_stream(&self) {
         self.link.lock().unwrap().stream.stopped = true;
-        let sender = self.sender.clone();
-        let cell = self.cell;
-        self.runtime.spawn(async move {
-            let _ = sender.send_async(Input::StreamStop { cell }).await;
-        });
+        let _ = self.sender.send(Input::StreamStop { cell: self.cell });
+    }
+
+    /// Provider interruption stops source admission, not execution. The
+    /// notebook owns the explanation in its first leased contribution.
+    pub fn interrupt_stream(&self) {
+        self.link.lock().unwrap().stream.interrupted = true;
+        self.stop_stream();
     }
 
     pub fn sequence(&self) -> u64 {
@@ -1277,6 +1281,17 @@ impl PythonCell {
                 ToolOutputStatus::Success
             },
         );
+        if first && cell.stream.interrupted {
+            let execution = if result.status == ToolOutputStatus::Cancelled {
+                "Execution was cancelled."
+            } else {
+                "Execution was not cancelled."
+            };
+            result.output = Arc::new(format!(
+                "Your response was interrupted while generating this tool call. {execution} Continue from the existing state without replaying this call.\n\n{}",
+                result.output,
+            ));
+        }
         result.images = Arc::new(std::mem::take(&mut cell.images));
         Some(result)
     }

@@ -1282,3 +1282,50 @@ async fn failed_stream_unit_stops_admission_and_keeps_successful_prefix_distinct
     assert_eq!(progress.completed, 0);
     assert!(!directory.path().join("wrong").exists());
 }
+
+#[tokio::test]
+async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
+    for cancel_before_read in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let notebook = python(shell_in(&directory), Vec::new());
+        let wake = Arc::new(Notify::new());
+        let mut cell = notebook.start_stream(
+            ToolCallId::try_from("stream").unwrap(),
+            SourceWaker::new(wake.clone()),
+        );
+        cell.feed("await asyncio.Event().wait()\n".into(), false)
+            .unwrap();
+        stream_until(&wake, &cell, |p| p.ready.is_some()).await;
+        cell.admit_stream_unit().unwrap();
+        cell.interrupt_stream();
+        if cancel_before_read {
+            cell.cancel();
+            until(&wake, &cell, Signal::Ended).await;
+        }
+        let first = cell.first_output();
+        assert_eq!(
+            first
+                .output
+                .matches("Your response was interrupted")
+                .count(),
+            1
+        );
+        assert!(first.output.contains(if cancel_before_read {
+            "Execution was cancelled."
+        } else {
+            "Execution was not cancelled."
+        }));
+        assert!(first.output.contains("without replaying this call"));
+        if !cancel_before_read {
+            cell.cancel();
+            until(&wake, &cell, Signal::Ended).await;
+        }
+        // Changes after leasing cannot rewrite the pending contribution.
+        assert_eq!(cell.first_output().output, first.output);
+        assert_eq!(cell.first_output().status, first.status);
+        cell.acknowledge_output();
+        if let Some(report) = cell.more_output() {
+            assert!(!report.output.contains("Your response was interrupted"));
+        }
+    }
+}

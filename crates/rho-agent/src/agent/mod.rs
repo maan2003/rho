@@ -1458,22 +1458,7 @@ impl Agent {
             // here, nor is `done`, which is asked below.
             match tool.answer {
                 ReplyState::Owed => {
-                    let mut body = tool.session.first_output();
-                    if self
-                        .streams
-                        .get(&tool.call.id)
-                        .is_some_and(|stream| stream.interrupted)
-                    {
-                        let execution = if body.status == ToolOutputStatus::Cancelled {
-                            "Execution was cancelled."
-                        } else {
-                            "Execution was not cancelled."
-                        };
-                        body.output = Arc::new(format!(
-                            "Your response was interrupted while generating this tool call. {execution} Continue from the existing state without replaying this call.\n\n{}",
-                            body.output,
-                        ));
-                    }
+                    let body = tool.session.first_output();
                     blocks.push(rho_inference::exec::output(&rho_core::ExecOutput::Reply {
                         id: tool.call.id.clone(),
                         body,

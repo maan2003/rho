@@ -249,7 +249,7 @@ impl Process {
                 socket.write_all(&bytes).await?;
                 let (sender, mut receiver, mut writer) = transport::connect(socket);
                 let _ = connected.send(sender.clone());
-                let (policy_incoming, policy_messages) = mpsc::channel(32);
+                let (policy_incoming, policy_messages) = mpsc::channel(super::policy::MAX_REQUESTS);
                 let policy = super::policy::serve(inference, sender.clone(), policy_messages);
                 tokio::pin!(policy);
                 let result = tokio::select! {

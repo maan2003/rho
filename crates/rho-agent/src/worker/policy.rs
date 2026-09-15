@@ -13,6 +13,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{transport, workset};
 
+pub(super) const MAX_REQUESTS: usize = 32;
+
 #[derive(Encode, Decode)]
 pub(super) enum Request {
     SelectAccount,
@@ -58,22 +60,28 @@ async fn send(sender: &transport::Sender, message: Message) -> anyhow::Result<()
 #[derive(Default)]
 struct Replies {
     closed: bool,
-    calls: HashMap<u64, oneshot::Sender<Reply>>,
+    calls: HashMap<u64, (oneshot::Sender<Reply>, tokio::sync::OwnedSemaphorePermit)>,
 }
 
 struct Pending {
     id: u64,
+    published: bool,
     replies: Arc<Mutex<Replies>>,
 }
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.replies.lock().expect("poison").calls.remove(&self.id);
+        // Once published, even an abandoned request owns its credit until the
+        // daemon replies. Caller cancellation must not let bursts bypass admission.
+        if !self.published {
+            self.replies.lock().expect("poison").calls.remove(&self.id);
+        }
     }
 }
 
 pub(super) struct Host {
     sender: transport::Sender,
     next: Arc<AtomicU64>,
+    admission: Arc<tokio::sync::Semaphore>,
     replies: Arc<Mutex<Replies>>,
     routes: watch::Sender<RouteSelection>,
     credentials: watch::Sender<Option<rho_inference::CredentialSnapshot>>,
@@ -90,6 +98,7 @@ impl Host {
         Arc::new(Self {
             sender,
             next,
+            admission: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS)),
             replies: Arc::default(),
             routes: watch::Sender::new(RouteSelection::default()),
             credentials: watch::Sender::new(None),
@@ -102,7 +111,9 @@ impl Host {
     pub(super) fn receive(&self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::Reply { id, body } => {
-                if let Some(reply) = self.replies.lock().expect("poison").calls.remove(&id) {
+                if let Some((reply, _credit)) =
+                    self.replies.lock().expect("poison").calls.remove(&id)
+                {
                     let _ = reply.send(body);
                 }
             }
@@ -135,23 +146,34 @@ impl Host {
     pub(super) fn disconnect(&self) {
         let mut pending = self.replies.lock().expect("poison");
         pending.closed = true;
+        self.admission.close();
         pending.calls.clear();
         self.closed.send_replace(true);
     }
 
     async fn request(&self, body: Request) -> anyhow::Result<Reply> {
+        let credit = self
+            .admission
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("agent connection closed"))?;
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (reply, response) = oneshot::channel();
         {
             let mut pending = self.replies.lock().expect("poison");
             anyhow::ensure!(!pending.closed, "agent connection closed");
-            pending.calls.insert(id, reply);
+            pending.calls.insert(id, (reply, credit));
         }
-        let _pending = Pending {
+        let mut pending = Pending {
             id,
+            published: false,
             replies: self.replies.clone(),
         };
         send(&self.sender, Message::Request { id, body }).await?;
+        // Transport send has no suspension point after enqueueing, so a
+        // cancelled send cannot publish a request while releasing its credit.
+        pending.published = true;
         match response
             .await
             .map_err(|_| anyhow::anyhow!("agent connection closed"))?
@@ -295,7 +317,7 @@ pub(super) async fn serve(
                         let Message::Request { id, body } = message else {
                             anyhow::bail!("unexpected workset policy message");
                         };
-                        if calls.len() >= 32 {
+                        if calls.len() >= MAX_REQUESTS {
                             send(&sender, Message::Reply { id, body: Reply::Error("too many pending policy requests".into()) }).await?;
                             continue;
                         }
@@ -335,6 +357,66 @@ pub(super) async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelled_published_requests_keep_credit_until_reply_and_disconnect_wakes_waiters() {
+        let (client, mut server) = crate::worker::testing::pair();
+        let host = client.policy();
+        let mut first = tokio::task::JoinSet::new();
+        for _ in 0..MAX_REQUESTS {
+            let host = host.clone();
+            first.spawn(async move { host.request(Request::SelectAccount).await });
+        }
+        let mut ids = Vec::new();
+        for _ in 0..MAX_REQUESTS {
+            let Message::Request { id, .. } = server.read_policy().await.unwrap() else {
+                panic!("request");
+            };
+            ids.push(id);
+        }
+        let mut waiting = tokio::task::JoinSet::new();
+        for _ in 0..MAX_REQUESTS {
+            let host = host.clone();
+            waiting.spawn(async move { host.request(Request::SelectAccount).await });
+        }
+        first.abort_all();
+        while first.join_next().await.is_some() {}
+        assert_eq!(host.replies.lock().unwrap().calls.len(), MAX_REQUESTS);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), server.read_policy())
+                .await
+                .is_err()
+        );
+
+        // A late reply, not caller cancellation, allows exactly one new request.
+        server
+            .write_policy(&Message::Reply {
+                id: ids[0],
+                body: Reply::Done,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            server.read_policy().await.unwrap(),
+            Message::Request { .. }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), server.read_policy())
+                .await
+                .is_err()
+        );
+        assert_eq!(host.replies.lock().unwrap().calls.len(), MAX_REQUESTS);
+
+        drop(server);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(result) = waiting.join_next().await {
+                assert!(result.unwrap().is_err());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(host.replies.lock().unwrap().calls.is_empty());
+    }
+
     #[tokio::test]
     async fn account_selection_waits_for_push_without_an_rpc() {
         let (client, mut server) = crate::worker::testing::pair();

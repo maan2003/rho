@@ -29,6 +29,8 @@ One private Senax Unix connection multiplexes agent services and controls with
 workset control and terminal/shell traffic. Inference policy has one daemon
 subscription and one shared client per workset, not per agent. Its pushes and
 RPC replies share workset FIFO ordering; agent retirement does not close it.
+Policy admission is bounded across the workset; a published request retains
+its slot through caller cancellation until reply or disconnect.
 Bounded fragments preserve per-port
 order; routing and fair writes do not await runtime work. Completion publication
 does not await recipient acceptance, keeping reciprocal subscriptions outside
@@ -102,7 +104,8 @@ result and never replayed source. Transport handoff is not proof of consumption.
 
 One initial reply answers an exec; subsequent contributions are reports
 ([REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md)).
-The notebook supplies its own words
+The notebook supplies its own words, including the first-result annotation
+for an interrupted provider stream
 ([DECISION-the-core-never-speaks-for-a-tool](DECISION-the-core-never-speaks-for-a-tool.md)).
 Reaping waits for final contribution acknowledgment, not merely Python return.
 

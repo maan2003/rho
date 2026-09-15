@@ -13,7 +13,6 @@ pub(super) struct Stream {
     index: usize,
     source: String,
     pub canonical: bool,
-    pub interrupted: bool,
 }
 
 pub(super) fn progress_note(
@@ -120,7 +119,6 @@ impl Agent {
                 index,
                 source: incoming.source.clone(),
                 canonical: false,
-                interrupted: false,
             },
         );
         let Phase::Requesting(in_flight) = &mut self.phase else {
@@ -177,8 +175,7 @@ impl Agent {
             return Ok(false);
         };
         let stream = self.streams.get_mut(&id).unwrap();
-        stream.interrupted = true;
-        stream.exec.stop_stream();
+        stream.exec.interrupt_stream();
         let progress = stream.exec.stream_progress();
         if progress.admitted == 0 {
             self.streams.remove(&id);
@@ -234,7 +231,7 @@ impl Agent {
                 continue;
             }
             let progress = stream.exec.take_stream_report();
-            if !stream.interrupted
+            if !progress.interrupted
                 && (progress.recovery
                     || (progress.returned && progress.completed != stream.source.len()))
             {
