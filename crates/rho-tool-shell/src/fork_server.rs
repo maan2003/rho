@@ -410,6 +410,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warmed_children_refresh_identity_cwd_and_execution_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let mut command = command();
+        command.current_dir(dir.path());
+        let server = Server::start(command).await.unwrap();
+        let source = r#"printf '%s\n' "$$" "$BASHPID" "$PPID" "$PWD" "$BASH_EXECUTION_STRING" "$RANDOM:$RANDOM:$RANDOM""#;
+        let mut children = Vec::new();
+        for cwd in [dir.path(), other.as_path()] {
+            let (status, out, err) = run(&server, cwd, source).await;
+            assert!(status.success(), "{err:?}");
+            let fields = String::from_utf8(out).unwrap();
+            let fields: Vec<_> = fields.lines().map(str::to_owned).collect();
+            assert_eq!(fields[0], fields[1]);
+            assert_ne!(fields[2].parse::<u32>().unwrap(), std::process::id());
+            assert_eq!(fields[3], cwd.to_str().unwrap());
+            assert_eq!(fields[4], source);
+            children.push(fields);
+        }
+        assert_ne!(children[0][0], children[1][0]);
+        assert_eq!(children[0][2], children[1][2]);
+        assert_ne!(children[0][5], children[1][5]);
+    }
+
+    #[tokio::test]
+    async fn descriptor_passed_pty_remains_a_noninteractive_command() {
+        use std::io::Read;
+
+        use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
+
+        let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+        let master = openpt(flags).unwrap();
+        unlockpt(&master).unwrap();
+        let slave = ioctl_tiocgptpeer(&master, flags).unwrap();
+        let mut master = std::fs::File::from(master);
+        let fds = [
+            rustix::io::dup(&slave).unwrap(),
+            rustix::io::dup(&slave).unwrap(),
+            slave,
+        ];
+        let server = Server::start(command()).await.unwrap();
+        let mut job = server
+            .spawn(
+                "[[ -t 0 && -t 1 && -t 2 && $- != *i* ]] && printf pty-ok",
+                Path::new("/"),
+                &fds,
+            )
+            .await
+            .unwrap();
+        drop(fds);
+        assert!(job.wait().await.unwrap().success());
+        let mut output = [0; 6];
+        master.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"pty-ok");
+    }
+
+    #[tokio::test]
     async fn shell_time_starts_at_command_admission() {
         let dir = tempfile::tempdir().unwrap();
         let mut command = command();

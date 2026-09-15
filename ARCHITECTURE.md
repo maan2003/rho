@@ -413,8 +413,9 @@ security, resource-isolation, or rollback boundary.
   environment generations run direnv; kernel watches validate reuse, including
   environment discovery and declared inputs. A generation uses a native,
   single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
-  namespace. It forks before Bash initialization; each child performs ordinary
-  noninteractive startup, including `BASH_ENV`, with independent cwd, shell
+  namespace. It forks an initialized variable/builtin image; each child initializes
+  job control and performs ordinary noninteractive startup, including `BASH_ENV`,
+  with independent cwd, shell
   state, and stdio. The private sequenced-packet control channel carries only
   launch/lifecycle messages and passed stdio descriptors. Commands are never
   replayed after a supervisor disconnect. Interactive Brush shells are unchanged.
