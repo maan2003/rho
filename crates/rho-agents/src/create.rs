@@ -284,7 +284,10 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
             intelligence: EngineerIntelligence::Alt,
             ..
         } => "pm",
-        AgentRole::Advisor { .. } => "eng",
+        AgentRole::Advisor { .. }
+        | AgentRole::Engineer {
+            intelligence: EngineerIntelligence::LegacyGemini,
+        } => "eng",
     }
 }
 

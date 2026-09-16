@@ -1059,3 +1059,38 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
     assert_eq!(update.images.as_ref(), &[image]);
     assert_eq!(update.output.as_str(), "later");
 }
+
+#[test]
+fn retired_gemini_binding_preserves_configuration_without_a_runnable_model() {
+    #[derive(Encode)]
+    enum OldBinding {
+        AntigravityFlashLow(InferenceProfile),
+    }
+    let config = InferenceProfile::default();
+    let mut bytes = senax_encoder::encode(&OldBinding::AntigravityFlashLow(config)).unwrap();
+    let binding = senax_encoder::decode::<SessionBinding>(&mut bytes).unwrap();
+    assert_eq!(binding, SessionBinding::LegacyGemini(config));
+    assert_eq!(
+        binding.agent_role(),
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::LegacyGemini
+        }
+    );
+    assert!(binding.deep_model().is_none());
+    assert!(binding.deep_config().is_none());
+    assert!(binding.claude_model().is_none());
+    assert!(binding.claude_effort().is_none());
+    assert!(
+        binding
+            .agent_role()
+            .session_profile()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported")
+    );
+    let mut bytes = senax_encoder::encode(&binding).unwrap();
+    assert_eq!(
+        senax_encoder::decode::<SessionBinding>(&mut bytes).unwrap(),
+        binding
+    );
+}

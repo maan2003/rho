@@ -8905,6 +8905,7 @@ fn agent_role_label(config: AgentRole) -> String {
             EngineerIntelligence::HighNotes => "eng-high-notes",
             EngineerIntelligence::Ultra => "eng-ultra",
             EngineerIntelligence::Alt => "eng-alt",
+            EngineerIntelligence::LegacyGemini => "legacy Gemini (unsupported)",
         },
     }
     .to_owned()

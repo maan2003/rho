@@ -164,11 +164,14 @@ pub enum EngineerIntelligence {
     Cheap,
     /// High engineer with shared-notes context rotation.
     HighNotes,
+    /// Historical Gemini agents: readable, but no longer executable.
+    LegacyGemini,
 }
 
 /// The intelligence as rows wrote it while `eng-py` and `eng-ultra-py`
 /// existed. Every engineer has the Python notebook now, so those fold into
-/// the same model without the suffix.
+/// the same model without the suffix. Retired Gemini rows instead become
+/// an explicitly unsupported tombstone, never a replacement provider.
 #[allow(dead_code)]
 #[derive(Decode)]
 enum StoredEngineerIntelligence {
@@ -182,6 +185,8 @@ enum StoredEngineerIntelligence {
     Python,
     UltraPython,
     HighNotes,
+    Gemini,
+    LegacyGemini,
 }
 
 impl senax_encoder::Decoder for EngineerIntelligence {
@@ -196,6 +201,7 @@ impl senax_encoder::Decoder for EngineerIntelligence {
             Stored::Mini => Self::Mini,
             Stored::Alt => Self::Alt,
             Stored::Cheap => Self::Cheap,
+            Stored::Gemini | Stored::LegacyGemini => Self::LegacyGemini,
         })
     }
 }
@@ -832,6 +838,22 @@ pub fn text_content(parts: &[ContentPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_gemini_intelligence_is_a_readable_tombstone() {
+        #[derive(Encode)]
+        enum OldIntelligence {
+            Gemini,
+        }
+        let mut bytes = senax_encoder::encode(&OldIntelligence::Gemini).unwrap();
+        let role = senax_encoder::decode::<EngineerIntelligence>(&mut bytes).unwrap();
+        assert_eq!(role, EngineerIntelligence::LegacyGemini);
+        let mut bytes = senax_encoder::encode(&role).unwrap();
+        assert_eq!(
+            senax_encoder::decode::<EngineerIntelligence>(&mut bytes).unwrap(),
+            role
+        );
+    }
 
     #[test]
     fn context_rotation_is_an_append_only_window_boundary() {

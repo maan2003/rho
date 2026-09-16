@@ -461,6 +461,8 @@ pub enum SessionBinding {
     /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
     AdvisorAstra(InferenceProfile),
     ResponsesAstraNotes(InferenceProfile),
+    /// Retained historical configuration, never a runnable provider binding.
+    LegacyGemini(InferenceProfile),
 }
 
 /// `SessionBinding` as rows wrote it while the PM role existed. The
@@ -485,6 +487,8 @@ enum StoredSessionBinding {
     ResponsesSolPython(InferenceProfile),
     ClaudeFablePython { effort: ClaudeEffort },
     ResponsesAstraNotes(InferenceProfile),
+    AntigravityFlashLow(InferenceProfile),
+    LegacyGemini(InferenceProfile),
 }
 
 impl senax_encoder::Decoder for SessionBinding {
@@ -509,6 +513,9 @@ impl senax_encoder::Decoder for SessionBinding {
             Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
             Stored::ResponsesSolPython(config) => Self::ResponsesSol(config),
             Stored::ClaudeFablePython { effort } => Self::ClaudeFable { effort },
+            Stored::AntigravityFlashLow(config) | Stored::LegacyGemini(config) => {
+                Self::LegacyGemini(config)
+            }
         })
     }
 }
@@ -524,6 +531,11 @@ impl AgentRoleSessionProfile for AgentRole {
             fast_mode: false,
         };
         Ok(match self {
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::LegacyGemini,
+            } => anyhow::bail!(
+                "Legacy Gemini agents are unsupported; create an agent with a supported role"
+            ),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             } => SessionBinding::ResponsesLuna(InferenceProfile {
@@ -599,6 +611,7 @@ impl SessionBinding {
             };
         }
         let intelligence = match self {
+            Self::LegacyGemini(_) => EngineerIntelligence::LegacyGemini,
             Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
@@ -648,7 +661,10 @@ impl SessionBinding {
             | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
+            Self::ClaudeFable { .. }
+            | Self::ClaudeOpus { .. }
+            | Self::ClaudeAdvisor { .. }
+            | Self::LegacyGemini(_) => None,
         }
     }
 
@@ -661,7 +677,10 @@ impl SessionBinding {
             Self::ResponsesAstra(_) | Self::ResponsesAstraNotes(_) | Self::AdvisorAstra(_) => {
                 Some(InferenceModel::Gpt6Astra)
             }
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
+            Self::ClaudeFable { .. }
+            | Self::ClaudeOpus { .. }
+            | Self::ClaudeAdvisor { .. }
+            | Self::LegacyGemini(_) => None,
         }
     }
 
@@ -677,7 +696,8 @@ impl SessionBinding {
             | Self::ResponsesAstraNotes(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
-            | Self::AdvisorTerra(_) => None,
+            | Self::AdvisorTerra(_)
+            | Self::LegacyGemini(_) => None,
         }
     }
 
@@ -695,7 +715,8 @@ impl SessionBinding {
             | Self::ResponsesAstraNotes(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
-            | Self::AdvisorTerra(_) => None,
+            | Self::AdvisorTerra(_)
+            | Self::LegacyGemini(_) => None,
         }
     }
 }

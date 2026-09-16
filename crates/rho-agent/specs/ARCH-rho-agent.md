@@ -55,6 +55,9 @@ Unloading an agent or detaching a GUI leaves workset terminals and shells alive.
 Workset failure loses all local ephemeral execution. Normal shutdown drains
 owned work; crashes may leave descendants and external effects behind. Recovery
 reconstructs conversation, never interpreters, jobs, or automatic execution.
+Retired Gemini roles and bindings remain readable as unsupported historical
+values. They cannot create or load an executable runtime and are not silently
+reassigned to a supported model.
 
 ## Shared mechanisms, not shared runtime ownership
 

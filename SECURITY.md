@@ -918,6 +918,12 @@ observed tool calls are CLI evaluation criteria, not a security boundary.
   nested fences), inline replace-block insertion, removal when the transcript
   reference changes, and GPUI SVG rasterization.
 
+## Historical model compatibility
+
+Historical Gemini roles and bindings decode to an unsupported legacy value.
+They preserve saved configuration and history but cannot select a provider or
+start execution; migration never silently reroutes those agents to another model.
+
 ## Future review notes
 
 Future changes that add providers, credential storage, transcript persistence,

@@ -618,6 +618,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 EngineerIntelligence::HighNotes => "high-notes",
                 EngineerIntelligence::Ultra => "ultra",
                 EngineerIntelligence::Alt => "alt",
+                EngineerIntelligence::LegacyGemini => "legacy-gemini (unsupported)",
             };
             format!("engineer {intelligence}")
         }

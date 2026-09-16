@@ -578,6 +578,14 @@ impl Agent {
         view: Arc<Lazy<Arc<View>>>,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
+        anyhow::ensure!(
+            !matches!(
+                head.config.binding,
+                crate::db::SessionBinding::LegacyGemini(_)
+            ),
+            "Legacy Gemini agents are unsupported; create an agent with a supported role"
+        );
+
         let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
             anyhow::bail!("agent does not use the Rho runtime");
         };
