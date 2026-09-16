@@ -77,9 +77,10 @@
         });
         rhoBash = pkgs.bash.overrideAttrs (old: {
           pname = "rho-bash";
-          # Local fork until published; only the URL needs to change afterward.
+          # Pinned one-shot Bash spare pool, maintained in its own fork.
           src = builtins.fetchGit {
-            url = "file:///src/bash";
+            url = "https://github.com/maan2003/bash.git";
+            ref = "rho/pristine-spares";
             rev = "5235dc200be034fea114d99ef74705914920c910";
           };
           # The fork already includes GNU's patch releases.
