@@ -399,10 +399,25 @@ agents.spawn_new_advisor(
 
 ### Engineers
 
-Use an Engineer for independently specifiable parallel work or a massive bounded unit whose
-intermediate output would crowd this conversation. Do not hand off one coherent implementation
-serially or delegate routine self-review. A new phase of the current task is not itself a reason to
-create another agent.
+Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond
+the task being non-trivial.
+
+When to use an Engineer:
+- When two or more independently specifiable workstreams can run concurrently without editing the same files or depending on each other's results.
+- When one bounded unit is massive enough that its intermediate output would crowd the parent context, and you can review its result from a diff or concise evidence.
+- When the user explicitly asks you to delegate work to an agent or subagent; merely working on agent-related features does not count.
+
+When NOT to use an Engineer:
+- When the work is one coherent implementation that you can carry through yourself, even if it is complex, multi-step, cross-package, or touches many files.
+- When delegation would be a serial handoff with no meaningful parallelism or context-isolation benefit.
+- For routine review or verification of your own work; inspect the diff and run the checks yourself.
+- When reading a single file, performing an exact text search, or making one localized edit; use direct tools instead.
+- When assigning implementation before you understand what changes are needed. Investigate and do the synthesis yourself first; bounded research assignments are still appropriate.
+
+Delegate a separately owned work unit, not the whole user request merely because you already wrote
+a plan. A new phase of the current task is not itself a reason to create another agent. Continue
+with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
+single-threaded unless write targets are clearly disjoint or isolated.
 
 Start an Engineer in an existing absolute directory inside your workset. Omit workdir to inherit
 your working directory. task_name is a short kebab-case label. The child already receives project
@@ -427,10 +442,20 @@ agents.cancel(*, agent_id: str) -> Awaitable[str]
 
 ### Briefing and integrating work
 
-Brief another agent as a capable colleague who has not seen this discussion. State the goal,
-relevant evidence, scope, constraints, and how to verify completion. Preserve the user's
-requirements, distinguish observations from proposed solutions, and leave implementation choices
-open unless the task requires them. Ask for the evidence you need, since a summary may omit it.
+Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
+why it matters, what you have learned or ruled out, and where to look first. Write outcome-first
+prompts with scope, relevant files or evidence, constraints and non-goals, validation to run, and
+the expected return shape. Preserve the user's requirements, distinguish observations from
+proposed solutions, and leave implementation choices open unless the task requires them.
+
+Do the synthesis yourself before assigning implementation; don't delegate "investigate and fix
+whatever you find." Include the relevant file paths and what specifically to change or check.
+Make clear whether the assignment is coding, verification, or research.
+
+If the deliverable needs exact quotes, numbers, URLs, or file paths, require them explicitly.
+Ask for compact but complete results: outcome, requested evidence, files changed or inspected,
+validation results, and concerns or blockers. A compact summary is not a substitute for the data
+you need.
 
 Write agent instructions and messages in clear, complete sentences with ordinary punctuation and
 spacing. Be concise by removing irrelevant content, not by compressing wording. The user can read
@@ -1349,17 +1374,50 @@ papercut(*, description: str) → Awaitable[str]
     out.push_str(&team);
     match role {
         AgentRole::Engineer { .. } => out.push_str(
-            r#"Do the work yourself by default. Spawn an Engineer for independently owned parallel work, a large
-bounded task whose intermediate output would crowd your context, or explicit user-requested
-delegation. Do not hand off one coherent implementation serially or delegate routine self-review.
+            r#"Do the work yourself by default. Use an Engineer only when delegation has a concrete benefit beyond
+the task being non-trivial.
 
-Start an Engineer. task_name is a short kebab-case label; prompt must include the goal, scope,
-relevant evidence, constraints, and verification. The child already receives project guidance.
+When to use an Engineer:
+- When two or more independently specifiable workstreams can run concurrently without editing the same files or depending on each other's results.
+- When one bounded unit is massive enough that its intermediate output would crowd the parent context, and you can review its result from a diff or concise evidence.
+- When the user explicitly asks you to delegate work to an agent or subagent; merely working on agent-related features does not count.
+
+When NOT to use an Engineer:
+- When the work is one coherent implementation that you can carry through yourself, even if it is complex, multi-step, cross-package, or touches many files.
+- When delegation would be a serial handoff with no meaningful parallelism or context-isolation benefit.
+- For routine review or verification of your own work; inspect the diff and run the checks yourself.
+- When reading a single file, performing an exact text search, or making one localized edit; use direct tools instead.
+- When assigning implementation before you understand what changes are needed. Investigate and do the synthesis yourself first; bounded research assignments are still appropriate.
+
+Delegate a separately owned work unit, not the whole user request merely because you already wrote
+a plan. A new phase of the current task is not itself a reason to create another agent. Continue
+with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
+single-threaded unless write targets are clearly disjoint or isolated.
+
+Start an Engineer. task_name is a short kebab-case label. The child already receives project
+guidance and tools; do not repeat generic process instructions.
 workdir selects an existing absolute directory in your workset; omission inherits your directory.
 The call does not create a checkout. Returns an awaitable identifying the Engineer, not its findings.
 agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str | None = None) → Awaitable[str]
 
-Inspect the returned diff or evidence and run combined validation.
+Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
+why it matters, what you have learned or ruled out, and where to look first. Write outcome-first
+prompts with scope, relevant files or evidence, constraints and non-goals, validation to run, and
+the expected return shape. Preserve the user's requirements, distinguish observations from
+proposed solutions, and leave implementation choices open unless the task requires them.
+
+Do the synthesis yourself before assigning implementation; don't delegate "investigate and fix
+whatever you find." Include the relevant file paths and what specifically to change or check.
+Make clear whether the assignment is coding, verification, or research.
+
+If the deliverable needs exact quotes, numbers, URLs, or file paths, require them explicitly.
+Ask for compact but complete results: outcome, requested evidence, files changed or inspected,
+validation results, and concerns or blockers. A compact summary is not a substitute for the data
+you need.
+
+Inspect returned evidence and changes, resolve conflicts, and run relevant combined validation.
+You remain responsible for integration and the final user-facing result; summarize the findings
+yourself rather than merely acknowledging delivery.
 
 Consult an independent Advisor when the user requests one. Otherwise consult only after your own
 investigation leaves a specific unresolved question that would change a high-impact decision—not
@@ -1800,6 +1858,54 @@ mod tests {
             "Available tools:",
         ] {
             assert!(!prompt.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn engineer_delegation_requires_concrete_benefit_in_both_runtimes() {
+        for prompt in [
+            main_agent_prompt("", ""),
+            claude_prompt(None, None, AgentRole::default()),
+        ] {
+            for rule in [
+                "concrete benefit beyond",
+                "without editing the same files or depending on each other's results",
+                "one bounded unit is massive enough",
+                "merely working on agent-related features does not count",
+                "complex, multi-step, cross-package, or touches many files",
+                "serial handoff with no meaningful parallelism or context-isolation benefit",
+                "routine review or verification of your own work",
+                "reading a single file, performing an exact text search",
+                "bounded research assignments are still appropriate",
+                "not the whole user request merely because you already wrote",
+                "suitable existing Engineer",
+                "single-threaded unless write targets are clearly disjoint or isolated",
+                "whatever you find.",
+                "exact quotes, numbers, URLs, or file paths",
+                "relevant combined validation",
+            ] {
+                assert!(prompt.contains(rule), "missing {rule}");
+            }
+            for inappropriate in [
+                "Prefer parallel Tasks for verification",
+                "Never delegate understanding",
+                "can't communicate with it until it finishes",
+                "worker's intermediate work is discarded",
+            ] {
+                assert!(!prompt.contains(inappropriate), "{inappropriate}");
+            }
+        }
+        for prompt in [
+            advisor_prompt("", ""),
+            claude_prompt(
+                None,
+                None,
+                AgentRole::Advisor {
+                    intelligence: rho_core::AdvisorIntelligence::High,
+                },
+            ),
+        ] {
+            assert!(!prompt.contains("When to use an Engineer:"));
         }
     }
 
