@@ -1,6 +1,5 @@
 //! Wire types ported from Codex's `codex-api/src/search.rs`.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -56,7 +55,7 @@ pub(crate) enum MessagePhase {
     FinalAnswer,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub(crate) struct SearchCommands {
     /// Query the internet search engine for a given list of queries.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,7 +92,7 @@ pub(crate) struct SearchCommands {
     pub response_length: Option<SearchResponseLength>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SearchQuery {
     /// Search query.
     pub q: String,
@@ -105,7 +104,7 @@ pub(crate) struct SearchQuery {
     pub domains: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenOperation {
     /// Reference id or URL to open.
     pub ref_id: String,
@@ -114,7 +113,7 @@ pub(crate) struct OpenOperation {
     pub lineno: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ClickOperation {
     /// Reference id containing the numbered link.
     pub ref_id: String,
@@ -122,7 +121,7 @@ pub(crate) struct ClickOperation {
     pub id: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FindOperation {
     /// Reference id or URL to search within.
     pub ref_id: String,
@@ -130,7 +129,7 @@ pub(crate) struct FindOperation {
     pub pattern: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ScreenshotOperation {
     /// Reference id or URL to screenshot.
     pub ref_id: String,
@@ -138,7 +137,7 @@ pub(crate) struct ScreenshotOperation {
     pub pageno: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct FinanceOperation {
     /// Ticker symbol to look up.
     pub ticker: String,
@@ -149,7 +148,7 @@ pub(crate) struct FinanceOperation {
     pub market: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum FinanceAssetType {
     Equity,
@@ -158,7 +157,7 @@ pub(crate) enum FinanceAssetType {
     Index,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct WeatherOperation {
     /// Location in "Country, Area, City" format.
     pub location: String,
@@ -170,7 +169,7 @@ pub(crate) struct WeatherOperation {
     pub duration: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SportsOperation {
     /// Tool name for sports requests.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,20 +199,20 @@ pub(crate) struct SportsOperation {
     pub locale: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SportsToolName {
     Sports,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SportsFunction {
     Schedule,
     Standings,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SportsLeague {
     Nba,
@@ -227,13 +226,13 @@ pub(crate) enum SportsLeague {
     Ipl,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TimeOperation {
     /// UTC offset formatted like "+03:00".
     pub utc_offset: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SearchResponseLength {
     Short,

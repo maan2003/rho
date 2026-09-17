@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::{FutureTool, JobEnd, SourceWaker, output};
+use crate::{HostFunction, JobEnd, SourceWaker, output};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
@@ -94,7 +94,7 @@ struct Shared {
     tasks: Mutex<HostTasks>,
     next_cell: AtomicU64,
     shell: ShellTools,
-    others: HashMap<String, Arc<dyn FutureTool>>,
+    others: HashMap<String, Arc<dyn HostFunction>>,
     cells: Mutex<HashMap<u64, Arc<Mutex<ExecState>>>>,
     jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
     sequence: AtomicU64,
@@ -439,15 +439,18 @@ fn history_item(block: &ContextBlock, offset: usize) -> Result<Value, String> {
 }
 
 impl PythonNotebook {
-    pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
-        let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
+    pub fn new(shell: ShellTools, others: Vec<Arc<dyn HostFunction>>) -> Result<Self, String> {
+        let functions = others
+            .iter()
+            .map(|function| function.name().to_owned())
+            .collect();
         let shared = Arc::new(Shared {
             tasks: Mutex::new(HostTasks::default()),
             next_cell: AtomicU64::new(1),
             shell,
             others: others
                 .into_iter()
-                .map(|t| (t.spec().name.as_str().to_owned(), t))
+                .map(|function| (function.name().to_owned(), function))
                 .collect(),
             cells: Mutex::new(HashMap::new()),
             jobs: Mutex::new(BTreeMap::new()),
@@ -464,7 +467,7 @@ impl PythonNotebook {
                 unsafe { setup_runtime.block_on(shell.enter_interpreter_thread()) }
                     .map_err(|error| error.to_string())
             },
-            json!(specs),
+            functions,
             history.clone(),
         )?;
         Ok(Self {
@@ -697,7 +700,7 @@ fn register_call(
             id: request,
             name: match name.as_str() {
                 "web__run" => "web.run",
-                "spawn_engineer" => "agents.delegate_engineer",
+                "spawn_engineer" => "agents.spawn_new_engineer",
                 "ask_advisor" => "agents.spawn_new_advisor",
                 "message_agent" => "agents.message",
                 "interrupt_engineer" => "agents.cancel",
@@ -919,20 +922,13 @@ async fn host_call(
         .others
         .get(name)
         .ok_or_else(|| format!("Unknown tool: {name}"))?;
-    let spec = tool.spec();
     let call = ToolCall {
         id: format!("python-{name}")
             .try_into()
             .map_err(|_| "Invalid tool ID")?,
-        name: spec.name,
-        tool_type: spec.tool_type,
-        arguments: if spec.tool_type == ToolType::Custom {
-            args.as_str()
-                .ok_or("Custom tool takes a string")?
-                .to_owned()
-        } else {
-            args.to_string()
-        },
+        name: name.try_into().map_err(|_| "Invalid host function name")?,
+        tool_type: ToolType::Function,
+        arguments: args.to_string(),
     };
     let result = tool.call(call).await;
     if result.status != ToolOutputStatus::Success {

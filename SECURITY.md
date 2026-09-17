@@ -654,9 +654,11 @@ its queue. This is a collaboration bus inside one trusted local pool, not a
 team-isolation boundary. Self-messaging and ambiguous or mismatched handles are
 rejected. Interrupt remains role-specific and separately validated.
 
-Spawned Engineers join their parent's workset and working directory; a
-parent that wants concurrent edits makes the child a checkout of its own
-(a git worktree) first and says so in the prompt. The daemon creates no
+Spawned Engineers join their parent's workset. Optional `workdir` selects an
+existing absolute directory inside it, validated before child creation; omission
+inherits the parent's directory. A parent that wants concurrent edits makes the
+child a checkout of its own (a git worktree) first and passes its path as
+`workdir`. The daemon creates no
 checkouts for children, only the initial clone of a new agent's
 repository. Advisors intentionally join their caller's directory and
 keep shell and patch tools for read-oriented investigation and scratch

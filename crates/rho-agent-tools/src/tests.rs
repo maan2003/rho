@@ -29,7 +29,7 @@ fn shell_in(directory: &tempfile::TempDir) -> ShellTools {
     )
 }
 
-fn python(shell: ShellTools, others: Vec<Arc<dyn crate::FutureTool>>) -> Arc<PythonNotebook> {
+fn python(shell: ShellTools, others: Vec<Arc<dyn crate::HostFunction>>) -> Arc<PythonNotebook> {
     Arc::new(PythonNotebook::new(shell, others).unwrap())
 }
 
@@ -587,18 +587,20 @@ async fn python_asyncio_timeout_does_not_own_the_managed_command() {
 #[tokio::test]
 async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() {
     struct Echo;
-    impl crate::FutureTool for Echo {
-        fn spec(&self) -> rho_core::ToolSpec {
-            let mut spec = PendingTool(Default::default()).spec();
-            spec.name = ToolName::try_from("echo").unwrap();
-            spec.tool_type = ToolType::Custom;
-            spec
+    impl crate::HostFunction for Echo {
+        fn name(&self) -> &'static str {
+            "echo"
         }
         fn call(
             &self,
             call: ToolCall,
         ) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
-            Box::pin(async move { crate::output(call.arguments, ToolOutputStatus::Success) })
+            Box::pin(async move {
+                crate::output(
+                    serde_json::from_str::<String>(&call.arguments).unwrap(),
+                    ToolOutputStatus::Success,
+                )
+            })
         }
     }
     let tool = python(shell(), vec![Arc::new(Echo)]);
@@ -718,15 +720,9 @@ async fn old_execution_keeps_its_own_checkin_without_touching_new_execution() {
 }
 
 struct PendingTool(Arc<std::sync::atomic::AtomicUsize>);
-impl crate::FutureTool for PendingTool {
-    fn spec(&self) -> rho_core::ToolSpec {
-        rho_core::ToolSpec {
-            name: ToolName::try_from("pending").unwrap(),
-            tool_type: ToolType::Function,
-            description: "test".into(),
-            input_schema: json!({}),
-            format: None,
-        }
+impl crate::HostFunction for PendingTool {
+    fn name(&self) -> &'static str {
+        "pending"
     }
     fn call(&self, _: ToolCall) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
         struct Guard(Arc<std::sync::atomic::AtomicUsize>);
@@ -928,11 +924,9 @@ async fn a_silent_cell_says_nothing_when_an_older_cell_speaks_in_the_same_reply(
 #[tokio::test]
 async fn operation_output_does_not_change_exec_return_facts() {
     struct ReleasedTool(Arc<Notify>);
-    impl crate::FutureTool for ReleasedTool {
-        fn spec(&self) -> rho_core::ToolSpec {
-            let mut spec = PendingTool(Default::default()).spec();
-            spec.name = ToolName::try_from("released").unwrap();
-            spec
+    impl crate::HostFunction for ReleasedTool {
+        fn name(&self) -> &'static str {
+            "released"
         }
         fn call(&self, _: ToolCall) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
             let release = self.0.clone();
@@ -1000,10 +994,10 @@ async fn operation_output_does_not_change_exec_return_facts() {
 
 #[tokio::test]
 async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
-    struct EchoTool(rho_core::ToolSpec);
-    impl crate::FutureTool for EchoTool {
-        fn spec(&self) -> rho_core::ToolSpec {
-            self.0.clone()
+    struct EchoTool(&'static str);
+    impl crate::HostFunction for EchoTool {
+        fn name(&self) -> &'static str {
+            self.0
         }
         fn call(
             &self,
@@ -1017,7 +1011,7 @@ async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
             })
         }
     }
-    let others: Vec<Arc<dyn crate::FutureTool>> = [
+    let others: Vec<Arc<dyn crate::HostFunction>> = [
         "spawn_engineer",
         "interrupt_engineer",
         "message_agent",
@@ -1026,12 +1020,7 @@ async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
         "view_image",
     ]
     .into_iter()
-    .map(|name| {
-        let mut spec = crate::FutureTool::spec(&PendingTool(Default::default()));
-        spec.name = ToolName::try_from(name).unwrap();
-        spec.description = format!("{name} full documentation");
-        Arc::new(EchoTool(spec)) as Arc<dyn crate::FutureTool>
-    })
+    .map(|name| Arc::new(EchoTool(name)) as Arc<dyn crate::HostFunction>)
     .collect();
     let tool = PythonNotebook::new(shell(), others).unwrap();
     let wake = Arc::new(Notify::new());
@@ -1041,18 +1030,25 @@ async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
             json!(
                 r#"
 import types
+import json
 assert isinstance(agents, types.ModuleType)
-docs = display(agents.delegate_engineer)
-assert "spawn_engineer full documentation" in docs
-assert "agents.delegate_engineer(" in docs
-assert "task_name" in docs and "prompt" in docs
+assert not hasattr(agents, "delegate_engineer")
+advisor_docs = display(agents.spawn_new_advisor)
+assert "msg: str" in advisor_docs
+assert "independent Advisor consultation" in advisor_docs
+assert "Arguments:" not in advisor_docs
 assert "tools" not in globals()
 assert "spawn_engineer" not in globals()
 assert "ask_advisor" not in globals()
 assert "message_agent" not in globals()
 assert "interrupt_engineer" not in globals()
-result = await agents.delegate_engineer(task_name="test", prompt="work")
+result = await agents.spawn_new_engineer(task_name="test", prompt="work")
 assert result.startswith("spawn_engineer:")
+assert json.loads(result.split(":", 1)[1])["workdir"] is None
+result = await agents.spawn_new_engineer(task_name="test", prompt="work", workdir="/src/checkout")
+assert json.loads(result.split(":", 1)[1]) == {
+    "task_name": "test", "prompt": "work", "workdir": "/src/checkout",
+}
 assert (await agents.message(agent_id="eng-test", message="hello")).startswith("message_agent:")
 agents.cancel(engineer_id="eng-test")
 agents.spawn_new_advisor("background review")
@@ -1069,6 +1065,42 @@ assert (await view_image(path="test.png")).startswith("view_image:")
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
     assert!(output.output.contains("background review"), "{output:?}");
     assert!(output.output.contains("interrupt_engineer:"), "{output:?}");
+}
+
+#[tokio::test]
+async fn unregistered_python_callbacks_are_not_callable() {
+    let tool = python(shell(), Vec::new());
+    let wake = Arc::new(Notify::new());
+    let mut cell = tool.exec(
+        call(
+            "no-delegation",
+            json!(
+                r#"
+import agents
+assert not hasattr(agents, 'spawn_new_advisor')
+assert not hasattr(agents, 'spawn_new_engineer')
+assert not hasattr(agents, 'message')
+assert not hasattr(agents, 'cancel')
+# Bypassing the Python namespace still cannot dispatch an unregistered callback.
+try:
+    await command.__globals__['_request']('ask_advisor', {'message': 'not allowed'})
+except RuntimeError as error:
+    assert 'Unknown tool: ask_advisor' in str(error)
+else:
+    raise AssertionError('unregistered callback executed')
+print('unregistered callback rejected')
+"#
+            ),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*cell, Signal::Ended).await;
+    let output = cell.first_output();
+    cell.acknowledge_output();
+    assert!(
+        output.output.contains("unregistered callback rejected"),
+        "{output:?}"
+    );
 }
 
 #[tokio::test]

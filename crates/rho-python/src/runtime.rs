@@ -200,7 +200,7 @@ pub(super) fn spawn(
     cancelled: Arc<Mutex<HashMap<CellId, Cancellation>>>,
     shutdown: Arc<AtomicBool>,
     wake: Arc<OwnedFd>,
-    setup: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
+    setup: impl FnOnce() -> Result<Vec<String>, String> + Send + 'static,
     history: Arc<dyn History>,
 ) -> Result<(), String> {
     static TLS: OnceLock<Result<(), String>> = OnceLock::new();
@@ -234,7 +234,7 @@ pub(super) fn spawn(
                         std::io::Error::last_os_error()
                     ));
                 }
-                let tools = setup()?;
+                let functions = setup()?;
                 // Importing subprocess/signal must not replace the embedding
                 // host's Ctrl-C handler. Explicit Python signal changes remain
                 // ordinary unsandboxed operations.
@@ -472,7 +472,16 @@ pub(super) fn spawn(
                     }
                     scope
                         .globals
-                        .set_item("_tool_config", vm.ctx.new_str(tools.to_string()).into(), vm)
+                        .set_item(
+                            "_function_names",
+                            vm.ctx
+                                .new_str(
+                                    serde_json::to_string(&functions)
+                                        .expect("function names serialize"),
+                                )
+                                .into(),
+                            vm,
+                        )
                         .map_err(|e| format_exception(vm, e))?;
                     scope
                         .globals

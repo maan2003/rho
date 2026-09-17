@@ -254,8 +254,8 @@ impl Services {
                 Reply::Team(team)
             }
             Request::SharedTool(call) => {
-                use rho_agent_tools::FutureTool as _;
-                let output = if call.name == crate::papercut::PapercutTool::spec().name {
+                use rho_agent_tools::HostFunction as _;
+                let output = if call.name.as_str() == crate::papercut::PAPERCUT_TOOL_NAME {
                     crate::papercut::PapercutTool {
                         db: self.db.clone(),
                         agent_id: self.agent,
@@ -266,9 +266,8 @@ impl Services {
                     let pool = self.pool.upgrade().context("agent pool is shutting down")?;
                     let head = self.db.read().get_agent(self.agent);
                     anyhow::ensure!(
-                        crate::multi_agent_tools::agent_tool_specs(head.config.role)
-                            .iter()
-                            .any(|spec| spec.name == call.name),
+                        crate::multi_agent_tools::agent_functions(head.config.role)
+                            .contains(&call.name.as_str()),
                         "not an available daemon-owned tool"
                     );
                     let tools = crate::multi_agent_tools::MultiAgentTools::new(

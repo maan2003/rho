@@ -1,6 +1,5 @@
 //! Client-executed ChatGPT web search, compatible with Codex's `web.run` tool.
 
-mod schema;
 mod search;
 
 use std::sync::Arc;
@@ -8,12 +7,11 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use rho_core::{
-    ContentPart, ContextBlock, InferenceResponseItem, ToolCall, ToolExecutionContext, ToolName,
-    ToolOutput, ToolOutputStatus, ToolSpec, ToolType,
+    ContentPart, ContextBlock, InferenceResponseItem, ToolCall, ToolExecutionContext, ToolOutput,
+    ToolOutputStatus,
 };
 use rho_inference::Inference;
 
-use crate::schema::commands_schema;
 use crate::search::{
     AllowedCaller, ContentItem, ExternalWebAccess, MessagePhase, ResponseItem, SearchCommands,
     SearchInput, SearchRequest, SearchResponse, SearchSettings,
@@ -44,10 +42,6 @@ impl WebSearchTools {
                 .expect("static web search HTTP client configuration is valid"),
             search_url: SEARCH_URL.into(),
         }
-    }
-
-    pub fn spec(&self) -> ToolSpec {
-        web_search_spec()
     }
 
     pub fn call(
@@ -148,16 +142,6 @@ impl WebSearchTools {
             .saturating_mul(APPROX_CHARS_PER_TOKEN)
             .min(usize::MAX as u64) as usize;
         Ok(truncate_output(response.output, max_chars))
-    }
-}
-
-pub fn web_search_spec() -> ToolSpec {
-    ToolSpec {
-        name: ToolName::try_from(WEB_SEARCH_TOOL_NAME).expect("valid tool name"),
-        tool_type: ToolType::Function,
-        description: DESCRIPTION.to_owned(),
-        input_schema: commands_schema(),
-        format: None,
     }
 }
 
@@ -299,8 +283,6 @@ fn truncate_output(output: String, max_chars: usize) -> String {
     output
 }
 
-const DESCRIPTION: &str = r#"Tool for accessing the internet. Supports search_query, image_query, open, click, find, screenshot, finance, weather, sports, and time commands. Batch related operations in one call; search_query accepts at most four queries. Use returned reference IDs only in later calls to this tool. Cite final-answer sources with normal Markdown links from the returned results, not internal reference IDs."#;
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -347,36 +329,6 @@ mod tests {
         assert_eq!(text(&input[0]), "previous");
         assert!(text(&input[1]).contains("tokens truncated"));
         assert_eq!(text(&input[2]), "current");
-    }
-
-    #[test]
-    fn schema_exposes_codex_commands() {
-        let schema = commands_schema();
-        for command in [
-            "search_query",
-            "image_query",
-            "open",
-            "click",
-            "find",
-            "screenshot",
-            "finance",
-            "weather",
-            "sports",
-            "time",
-            "response_length",
-        ] {
-            assert!(
-                schema["properties"].get(command).is_some(),
-                "missing {command}"
-            );
-        }
-        assert_eq!(
-            schema["properties"]["search_query"]["items"]["properties"]["recency"],
-            json!({
-                "description": "Whether to filter by recency, as a number of recent days.",
-                "type": "integer"
-            })
-        );
     }
 
     #[test]

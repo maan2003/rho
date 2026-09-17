@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rho_core::{ImageDetail, ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
+use rho_core::{ImageDetail, ToolCall, ToolOutput, ToolOutputStatus};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::View;
 
@@ -24,31 +23,6 @@ struct ViewImageArgs {
 impl ImageTools {
     pub(crate) fn new(view: Arc<View>) -> Self {
         Self { view }
-    }
-
-    pub(crate) fn spec() -> ToolSpec {
-        ToolSpec {
-            name: ToolName::try_from(VIEW_IMAGE_TOOL_NAME).expect("static tool name"),
-            tool_type: ToolType::Function,
-            description: "Loads an image from the agent's filesystem view and returns its pixels to the model. Metadata and animation are discarded.".to_owned(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Image path, relative to the working directory or absolute."
-                    },
-                    "detail": {
-                        "type": "string",
-                        "enum": ["high", "original"],
-                        "description": "Image detail level. Defaults to `high`; use `original` to preserve exact resolution within the original-detail safety limits."
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-            format: None,
-        }
     }
 
     pub(crate) async fn call(&self, call: ToolCall) -> ToolOutput {
@@ -92,7 +66,7 @@ impl ImageTools {
 #[cfg(test)]
 mod tests {
     use image::{DynamicImage, ImageBuffer, Rgba};
-    use rho_core::ToolCallId;
+    use rho_core::{ToolCallId, ToolName, ToolType};
 
     use super::*;
 

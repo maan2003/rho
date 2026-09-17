@@ -1178,10 +1178,9 @@ impl ClaudeLoop {
             team.as_ref(),
             Some(&self.host),
         );
-        let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         let tool = rho_agent_tools::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
-        self.python = Some(python_host::PythonHost::new(tool, specs));
+        self.python = Some(python_host::PythonHost::new(tool));
         Ok(())
     }
 
@@ -1207,12 +1206,7 @@ impl ClaudeLoop {
         let target = config_home.clone().into_std_path_buf();
         options.set_env("CLAUDE_CONFIG_DIR", target.to_string_lossy());
         let team = self.host.team().await?;
-        let prompt = prompt::claude_prompt(
-            Some(view),
-            team.as_ref(),
-            self.role,
-            self.python.as_ref().map(|host| host.host_specs()),
-        );
+        let prompt = prompt::claude_prompt(Some(view), team.as_ref(), self.role);
         // Keep one source inode alive for the lifetime of the view namespace.
         // Unlinking a bind-mounted source makes the target pathname disappear
         // inside that namespace, so a rewrite has to reuse this file rather

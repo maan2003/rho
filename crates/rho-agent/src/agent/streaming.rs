@@ -339,11 +339,7 @@ pub(in crate::agent) mod tests {
             .unwrap(),
         );
         let surface = Surface {
-            prompt: PromptInputs {
-                view,
-                host: None,
-                host_specs: Vec::new(),
-            },
+            prompt: PromptInputs { view, host: None },
             notebook,
         };
         let (_control, control_rx) = mpsc::unbounded_channel();

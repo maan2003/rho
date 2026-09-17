@@ -597,17 +597,16 @@ impl AgentPool {
         .await?
     }
 
-    /// Create a child agent for `parent` in the parent's workset, in the
-    /// parent's working directory, and mail it its task. Returns once the
-    /// child has accepted that task. A parent that wants the child elsewhere
-    /// (its own git worktree, say) makes that directory first
-    /// and says so in the prompt.
+    /// Create a child in the parent's workset and mail it its task. `workdir`
+    /// selects an existing absolute directory; omission inherits the parent's
+    /// directory. Returns once the child has accepted its task.
     pub async fn spawn_child(
         self: &Arc<Self>,
         parent: AgentId,
         task_name: String,
         prompt: String,
         config: AgentRole,
+        workdir: Option<camino::Utf8PathBuf>,
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
         let (parent_place, parent_role) = {
@@ -620,6 +619,8 @@ impl AgentPool {
             mode,
             origin,
         } = parent_place;
+        let cwd = workdir.unwrap_or(cwd);
+        anyhow::ensure!(cwd.is_absolute(), "workdir must be an absolute path");
         let workset = self.worksets.open_workset(&workset).await?;
         let mode = Mode::from_workset_mode(mode);
         let view = workset.enter(mode, &cwd)?;
@@ -1002,11 +1003,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn external_handles_and_cancelled_eviction_cannot_create_overlapping_workers() {
-        use std::time::Duration;
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+    async fn test_pool(root: &std::path::Path) -> (Arc<AgentPool>, Arc<View>) {
         let worker = std::env::current_exe()
             .unwrap()
             .ancestors()
@@ -1062,6 +1059,129 @@ mod tests {
             ),
         )
         .await;
+        (pool, view)
+    }
+
+    #[tokio::test]
+    async fn child_workdir_selects_existing_directory_before_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, view) = test_pool(directory.path()).await;
+        for name in ["parent", "checkout"] {
+            let dir = view.host_cwd().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), format!("Guidance for {name}.")).unwrap();
+        }
+        let view = view.for_cwd(camino::Utf8Path::new("/src/parent")).unwrap();
+        let (parent_id, parent) = pool
+            .create(
+                AgentRole::default(),
+                Some("parent".into()),
+                StartPlace::new(view.clone(), None),
+            )
+            .await
+            .unwrap();
+
+        let tools =
+            crate::multi_agent_tools::MultiAgentTools::new(Arc::downgrade(&pool), parent_id, None);
+        let spawn = |workdir: Option<&str>| {
+            let mut args =
+                serde_json::json!({"task_name": "child", "prompt": "No work is required."});
+            if let Some(workdir) = workdir {
+                args["workdir"] = workdir.into();
+            }
+            rho_core::ToolCall {
+                id: rho_core::ToolCallId::try_from("spawn-test").unwrap(),
+                name: rho_core::ToolName::try_from("spawn_engineer").unwrap(),
+                tool_type: rho_core::ToolType::Function,
+                arguments: args.to_string(),
+            }
+        };
+        for (workdir, expected) in [
+            (Some("/src/checkout"), "/src/checkout"),
+            (None, "/src/parent"),
+        ] {
+            let before = pool.db.read().list_agent_ids();
+            let result =
+                crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(workdir)).await;
+            assert_eq!(
+                result.status,
+                rho_core::ToolOutputStatus::Success,
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains(&format!("It works in {expected}.")));
+            let read = pool.db.read();
+            let child_id = read
+                .list_agent_ids()
+                .into_iter()
+                .find(|id| !before.contains(id))
+                .unwrap();
+            let child = read.get_agent(child_id);
+            assert_eq!(child.place().cwd.as_str(), expected);
+            assert_eq!(
+                child.place().workset,
+                read.get_agent(parent_id).place().workset
+            );
+
+            // The selected directory supplies the child's guidance, immediately after
+            // workspace context; identity belongs with collaboration, not that guidance.
+            let team = crate::multi_agent_tools::MultiAgentTools::new(
+                Arc::downgrade(&pool),
+                child_id,
+                Some(parent_id),
+            )
+            .team()
+            .unwrap();
+            let child_view = view.for_cwd(camino::Utf8Path::new(expected)).unwrap();
+            let rendered = crate::prompt::prompt(&child_view, Some(&team), child.config.role);
+            let collaboration = rendered
+                .split("## Working with other agents")
+                .nth(1)
+                .unwrap()
+                .split("## Context and continuity")
+                .next()
+                .unwrap();
+            assert!(collaboration.contains(&team.agent));
+            assert!(collaboration.contains(team.parent.as_ref().unwrap()));
+            let workspace = rendered.split("## Workspace Context").nth(1).unwrap();
+            assert!(workspace.starts_with(&format!("\n\nWorking directory: {expected}\n")));
+            assert!(workspace.contains(&format!(
+                "Guidance for {}.",
+                expected.rsplit('/').next().unwrap()
+            )));
+            assert!(
+                !workspace
+                    .split("## AGENTS.md instructions")
+                    .next()
+                    .unwrap()
+                    .contains("## Skills")
+            );
+            assert!(!rendered.contains("## Team Context"));
+            assert!(!rendered.lines().any(|line| line == "## Environment"));
+        }
+
+        let count = pool.db.read().list_agent_ids().len();
+        for invalid in ["/tmp", "/src/missing", "checkout", "/src/../src/checkout"] {
+            let result =
+                crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(Some(invalid)))
+                    .await;
+            assert_eq!(
+                result.status,
+                rho_core::ToolOutputStatus::Error,
+                "{invalid}"
+            );
+            assert_eq!(pool.db.read().list_agent_ids().len(), count);
+        }
+        pool.execution(parent_id).await.unwrap().shutdown().await;
+        drop(parent);
+    }
+
+    #[tokio::test]
+    async fn external_handles_and_cancelled_eviction_cannot_create_overlapping_workers() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let (pool, view) = test_pool(root).await;
         let role = AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         };

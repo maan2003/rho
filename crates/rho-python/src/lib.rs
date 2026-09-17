@@ -219,14 +219,14 @@ impl Session {
     /// It may enter the agent's mount namespace and set the initial directory.
     pub fn new(
         setup: impl FnOnce() -> Result<(), String> + Send + 'static,
-        tools: Value,
+        functions: Vec<String>,
     ) -> Result<Self, String> {
-        Self::new_with_history(setup, tools, Arc::new(EmptyHistory))
+        Self::new_with_history(setup, functions, Arc::new(EmptyHistory))
     }
 
     pub fn new_with_history(
         setup: impl FnOnce() -> Result<(), String> + Send + 'static,
-        tools: Value,
+        functions: Vec<String>,
         history: Arc<dyn History>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
@@ -246,7 +246,7 @@ impl Session {
             Arc::clone(&wake),
             move || {
                 setup()?;
-                Ok(tools)
+                Ok(functions)
             },
             history,
         )?;
@@ -335,7 +335,7 @@ mod tests {
         let (events, receiver) = tokio::sync::mpsc::channel(256);
         Ok((
             TestSession {
-                session: Session::new(setup, serde_json::json!([]))?,
+                session: Session::new(setup, Vec::new())?,
                 events,
             },
             receiver,
@@ -370,8 +370,7 @@ mod tests {
             gets: std::sync::atomic::AtomicUsize::new(0),
         });
         let (events, mut receiver) = tokio::sync::mpsc::channel(16);
-        let session =
-            Session::new_with_history(|| Ok(()), serde_json::json!([]), history.clone()).unwrap();
+        let session = Session::new_with_history(|| Ok(()), Vec::new(), history.clone()).unwrap();
         session
             .sender()
             .execute(

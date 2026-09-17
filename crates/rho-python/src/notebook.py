@@ -475,43 +475,54 @@ _namespace = dict(__name__='__main__', command=command, write_stdin=write_stdin,
                   image=image, history=history, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
 
 
-def _configure_tools(specs):
+def _configure_functions(names):
     agents = types.ModuleType('agents')
 
-    def message(*, agent_id, message):
+    def message(*, agent_id: str, message: str):
+        """Queue a message to an existing agent; a busy agent receives it at its next boundary.
+        Use the role-prefixed agent handle, for example eng-h6u7 or adv-h6u7.
+        The return value confirms queueing, not the recipient's answer.
+        """
         return _request('message_agent', dict(agent_id=agent_id, message=message))
 
-    def cancel(*, engineer_id):
+    def cancel(*, engineer_id: str):
+        """Interrupt an Engineer's current turn. It remains available for follow-up messages."""
         return _request('interrupt_engineer', dict(engineer_id=engineer_id))
 
-    def spawn_new_advisor(msg):
+    def spawn_new_advisor(msg: str):
+        """Start an independent Advisor consultation. Its answer arrives later as agent mail.
+        State the question, relevant files, intended behavior, settled constraints, and desired
+        output. For reviews, identify the diff and the behavior it should preserve. For an
+        unsolicited consultation, explain the unresolved question and what you already checked.
+        Keep working on independent tasks while waiting; do not repeatedly message the Advisor.
+        The return value identifies the Advisor, not its eventual findings.
+        """
         return _request('ask_advisor', dict(message=msg))
 
-    def delegate_engineer(*, task_name, prompt, workdirs=None):
-        arguments = dict(task_name=task_name, prompt=prompt)
-        if workdirs is not None:
-            arguments['workdirs'] = workdirs
-        return _request('spawn_engineer', arguments)
+    def spawn_new_engineer(*, task_name: str, prompt: str, workdir: str | None = None):
+        """Start an Engineer; its final response arrives later as agent mail."""
+        return _request('spawn_engineer', dict(task_name=task_name, prompt=prompt, workdir=workdir))
+
+    def view_image(*, path: str, detail: str = 'high'):
+        return _request('view_image', dict(path=path, detail=detail))
+
+    def papercut(*, description: str):
+        return _request('papercut', dict(description=description))
 
     agent_functions = {
         'message_agent': message,
         'interrupt_engineer': cancel,
         'ask_advisor': spawn_new_advisor,
-        'spawn_engineer': delegate_engineer,
+        'spawn_engineer': spawn_new_engineer,
     }
-    for spec in specs:
-        name = spec['name']
+    local_functions = {'view_image': view_image, 'papercut': papercut}
+    for name in names:
         if name in agent_functions:
             function = agent_functions[name]
             function.__module__ = 'agents'
-            schema = spec['input_schema']
-            if name == 'ask_advisor' and 'message' in schema.get('properties', {}):
-                schema['properties']['msg'] = schema['properties'].pop('message')
-                schema['required'] = ['msg']
-            function.__doc__ = spec['description'] + '\nArguments: ' + json.dumps(schema)
             setattr(agents, function.__name__, function)
         elif name != 'web__run':
-            _namespace[name] = _host_function(name)
+            _namespace[name] = local_functions.get(name) or _host_function(name)
     _namespace['agents'] = agents
     sys.modules['agents'] = agents
 
@@ -520,7 +531,7 @@ _main = types.ModuleType('__main__')
 _main.__dict__.update(_namespace)
 _namespace = _main.__dict__
 sys.modules['__main__'] = _main
-_configure_tools(json.loads(_tool_config))
+_configure_functions(json.loads(_function_names))
 
 
 async def _evaluate(cell, source):

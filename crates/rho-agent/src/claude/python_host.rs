@@ -17,7 +17,7 @@ use rho_agent_tools::{PythonCell, PythonExec, PythonNotebook, ReplyState, Source
 use rho_claude::mcp::{reply, text_item, tool_result};
 #[cfg(test)]
 use rho_core::ToolOutputStatus;
-use rho_core::{ExecCall, ExecId, ToolOutput, ToolSpec, UnixMs};
+use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -47,7 +47,6 @@ struct Cell {
 pub(crate) struct PythonHost {
     tool: PythonNotebook,
     /// The host functions the notebook exposes, for the prompt.
-    host_specs: Vec<ToolSpec>,
     /// Woken by any cell with something new; the loop asks the boundary.
     notify: Arc<Notify>,
     cells: BTreeMap<u64, Cell>,
@@ -94,10 +93,9 @@ impl PythonHost {
         Ok(())
     }
 
-    pub(crate) fn new(tool: PythonNotebook, host_specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn new(tool: PythonNotebook) -> Self {
         Self {
             tool,
-            host_specs,
             notify: Arc::new(Notify::new()),
             cells: BTreeMap::new(),
             next_cell: 1,
@@ -107,10 +105,6 @@ impl PythonHost {
             observations: Observations::default(),
             standing: Standing::Nothing,
         }
-    }
-
-    pub(crate) fn host_specs(&self) -> &[ToolSpec] {
-        &self.host_specs
     }
 
     pub(crate) fn notify(&self) -> Arc<Notify> {
@@ -353,7 +347,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let mut host = PythonHost::new(notebook, Vec::new());
+        let mut host = PythonHost::new(notebook);
         host.cancel(UnixMs(10));
         assert!(!host.can_admit());
         assert!(

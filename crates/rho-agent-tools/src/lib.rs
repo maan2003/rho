@@ -13,20 +13,21 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 pub use python::{PythonCell, PythonExec, PythonNotebook, PythonStreamProgress};
-use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec};
+use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus};
 use rho_web_search::WebSearchTools;
 pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, ReplyState, SourceFacts, SourceWaker};
 
-/// A tool whose whole answer is one future, reachable from a cell as a host
-/// function.
-pub trait FutureTool: Send + Sync + 'static {
-    fn spec(&self) -> ToolSpec;
+/// An async Rust callback registered by name in a Python notebook.
+/// Python owns the callable signatures and documentation; this trait only
+/// dispatches calls.
+pub trait HostFunction: Send + Sync + 'static {
+    fn name(&self) -> &'static str;
     fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput>;
 }
 
-impl FutureTool for WebSearchTools {
-    fn spec(&self) -> ToolSpec {
-        WebSearchTools::spec(self)
+impl HostFunction for WebSearchTools {
+    fn name(&self) -> &'static str {
+        rho_web_search::WEB_SEARCH_TOOL_NAME
     }
 
     fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {

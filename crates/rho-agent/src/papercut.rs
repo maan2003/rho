@@ -4,14 +4,13 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use redb::TableDefinition;
-use rho_agent_tools::FutureTool;
-use rho_core::{
-    AgentId, ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs,
-};
+use rho_agent_tools::HostFunction;
+use rho_core::{AgentId, ToolCall, ToolOutput, ToolOutputStatus, UnixMs};
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 use serde::Deserialize;
-use serde_json::json;
+
+pub(crate) const PAPERCUT_TOOL_NAME: &str = "papercut";
 
 const PAPERCUTS: TableDefinition<u64, Sen<Papercut>> = TableDefinition::new("papercuts");
 const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
@@ -36,26 +35,6 @@ pub(crate) struct PapercutTool {
 }
 
 impl PapercutTool {
-    pub(crate) fn spec() -> ToolSpec {
-        ToolSpec {
-            name: ToolName::try_from("papercut").expect("static tool name"),
-            tool_type: ToolType::Function,
-            description: "Record a concrete Rho bug, confusing behavior, or workflow friction for later improvement. Describe what happened and what you expected, including reproduction details when useful. This only saves a report in the local database; it does not notify anyone or start work.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "The papercut and enough context to understand it (maximum 16 KiB)."
-                    }
-                },
-                "required": ["description"],
-                "additionalProperties": false
-            }),
-            format: None,
-        }
-    }
-
     async fn record(&self, arguments: &str) -> anyhow::Result<u64> {
         let args: Args = serde_json::from_str(arguments)?;
         anyhow::ensure!(
@@ -86,9 +65,9 @@ impl PapercutTool {
     }
 }
 
-impl FutureTool for PapercutTool {
-    fn spec(&self) -> ToolSpec {
-        Self::spec()
+impl HostFunction for PapercutTool {
+    fn name(&self) -> &'static str {
+        PAPERCUT_TOOL_NAME
     }
 
     fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
@@ -110,7 +89,8 @@ impl FutureTool for PapercutTool {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::{AgentIdDomain, ToolCallId};
+    use rho_core::{AgentIdDomain, ToolCallId, ToolType};
+    use serde_json::json;
 
     use super::*;
 
@@ -173,7 +153,7 @@ mod tests {
             let output = tool
                 .call(ToolCall {
                     id: ToolCallId::try_from("papercut-test").unwrap(),
-                    name: PapercutTool::spec().name,
+                    name: PAPERCUT_TOOL_NAME.try_into().unwrap(),
                     tool_type: ToolType::Function,
                     arguments,
                 })

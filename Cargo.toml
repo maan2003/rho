@@ -165,7 +165,6 @@ rustls = { version = "0.23", default-features = false, features = [
   "std",
   "tls12",
 ] }
-schemars = "0.8.22"
 senax-encoder = { path = "crates/senax-encoder" }
 senax-encoder-derive = { path = "crates/senax-encoder/derive" }
 serde = { version = "1", features = ["derive"] }

@@ -29,7 +29,7 @@ use rho_agent_tools::{PythonCell, ReplyState, SourceWaker};
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageDelivery, MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall,
-    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs,
+    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, UnixMs,
 };
 #[cfg(test)]
 use rho_db::RhoDb;
@@ -89,7 +89,6 @@ struct Surface {
 struct PromptInputs {
     view: Arc<View>,
     host: Option<Arc<crate::worker::Host>>,
-    host_specs: Vec<ToolSpec>,
 }
 
 struct Instructions {
@@ -102,7 +101,7 @@ impl PromptInputs {
             Some(host) => host.team().await?,
             None => None,
         };
-        let text = prompt::prompt(&self.view, team.as_ref(), role, &self.host_specs);
+        let text = prompt::prompt(&self.view, team.as_ref(), role);
         Ok(Instructions { text })
     }
 }
@@ -1874,7 +1873,6 @@ fn surface(
     host: Option<&Arc<crate::worker::Host>>,
 ) -> anyhow::Result<Surface> {
     let (shell, others) = host_tools(&view, role, agent_id, inference, team, host);
-    let host_specs = others.iter().map(|tool| tool.spec()).collect();
     let notebook = Arc::new(
         rho_agent_tools::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
@@ -1884,36 +1882,29 @@ fn surface(
         prompt: PromptInputs {
             view,
             host: host.cloned(),
-            host_specs,
         },
     })
 }
 
 /// The model-facing surface of a role, for a reader: the prompt and the tool
-/// specs a new agent of that role would get, without a pool behind them.
+/// entry point a new agent of that role would get, without constructing a
+/// notebook.
 pub fn render_agent_surface(
     view: Arc<View>,
     role: AgentRole,
 ) -> anyhow::Result<crate::RenderedAgentSurface> {
     let binding = role.session_profile()?;
     if binding.claude_model().is_some() {
-        let placeholder = AgentId::from_counter(1, &crate::db::AgentIdDomain(0))
-            .expect("counter 1 is within prefix-id capacity");
-        let (_, others) = host_tools(&view, role, placeholder, None, None, None);
-        let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         return Ok(crate::RenderedAgentSurface {
-            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role, Some(&specs)),
+            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role),
             tools: Arc::from([rho_claude::mcp::exec_spec()]),
         });
     }
     binding
         .deep_config()
         .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
-    let placeholder = AgentId::from_counter(1, &crate::db::AgentIdDomain(0))
-        .expect("counter 1 is within prefix-id capacity");
-    let surface = surface(view, role, placeholder, None, None, None)?;
     Ok(crate::RenderedAgentSurface {
-        system_prompt: prompt::prompt(&surface.prompt.view, None, role, &surface.prompt.host_specs),
+        system_prompt: prompt::prompt(&view, None, role),
         tools: Arc::from([rho_inference::exec::spec()]),
     })
 }
