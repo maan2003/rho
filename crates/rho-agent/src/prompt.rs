@@ -71,8 +71,15 @@ work outside the request.
 
 ### External research
 
-Use `web.run` for web searches and reading web pages. It is the standard
-OpenAI web tool, called through Python.
+Use `web.run` for web searches and reading web pages. The `web` object is
+preloaded in Python; call it directly inside exec with standard OpenAI web
+request fields. Results arrive automatically.
+web.run(**request) → Awaitable[str]
+
+```python
+web.run(search_query=[{"q": "search terms"}])
+web.run(open=[{"ref_id": "https://example.com"}])
+```
 
 For substantial investigation of an external codebase, prefer an existing
 local checkout or clone the upstream repository into your workset. Inspect
@@ -783,8 +790,15 @@ Follow relevant project guidance and skills. Do not turn them into extra work ou
 
 ### External research
 
-Use `web.run` for web searches and reading web pages. It is the standard
-OpenAI web tool, called through Python.
+Use `web.run` for web searches and reading web pages. The `web` object is
+preloaded in Python; call it directly inside exec with standard OpenAI web
+request fields. Results arrive automatically.
+web.run(**request) → Awaitable[str]
+
+```python
+web.run(search_query=[{"q": "search terms"}])
+web.run(open=[{"ref_id": "https://example.com"}])
+```
 
 For substantial investigation of an external codebase, prefer an existing
 local checkout or clone the upstream repository into your workset. Inspect
@@ -1312,9 +1326,13 @@ handles may be evicted. Displayed session IDs are reusable labels, not handles.
 
 ## Other Rho functions
 
-Search or read web pages using OpenAI web requests, for example
-search_query=[{"q": "search terms"}] or open=[{"ref_id": "https://example.com"}].
+The web object is preloaded in Python; call web.run directly inside exec for
+web searches and reading web pages, using standard OpenAI web request fields.
+Results arrive automatically.
 web.run(**request) → Awaitable[str]
+
+    web.run(search_query=[{"q": "search terms"}])
+    web.run(open=[{"ref_id": "https://example.com"}])
 
 Load an image from the workset. high is the default detail; original preserves resolution within
 the safety limits. The returned image must be explicitly displayed.
@@ -1800,6 +1818,10 @@ mod tests {
             ),
         ] {
             for example in [
+                "web.run(**request) → Awaitable[str]",
+                "preloaded in Python",
+                r#"web.run(search_query=[{"q": "search terms"}])"#,
+                r#"web.run(open=[{"ref_id": "https://example.com"}])"#,
                 "    command(\"git diff --stat\")\n    command(\"rg -n 'TODO' src\")",
                 "    check = await command(\"cargo check\")\n    if check[\"exit_code\"] == 0:",
                 "    write_stdin(job, \"hello\\n\")",
