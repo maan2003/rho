@@ -1,6 +1,6 @@
 use super::*;
 use crate::inference::Inference;
-use crate::responses::session::{debug_file_name, provider_debug_dir, redact_image_data};
+use crate::responses::session::{DebugRun, debug_file_name, provider_debug_dir, redact_image_data};
 
 #[test]
 fn chatgpt_codex_config_sets_endpoint_defaults() {
@@ -60,10 +60,27 @@ fn astra_uses_the_normal_context_window() {
 }
 
 #[test]
-fn provider_debug_file_name_uses_prompt_cache_key_and_sequence() {
+fn provider_debug_file_name_uses_prompt_cache_key_run_and_sequence() {
     assert_eq!(
-        debug_file_name(PromptCacheKey::from_bytes(*b"testkey1"), 7, "request"),
-        "746573746b657931-0007-request.json"
+        debug_file_name(
+            PromptCacheKey::from_bytes(*b"testkey1"),
+            DebugRun::from_parts(0x6aac_2e43, 0x1f9c),
+            7,
+            "request"
+        ),
+        "746573746b657931-6aac2e431f9c-0007-request.json"
+    );
+}
+
+/// The bug this run token exists for: the prompt cache key outlives a session
+/// task, but the sequence counter restarts with it, so two runs of one agent
+/// used to write the same path and the older run was lost.
+#[test]
+fn provider_debug_file_name_separates_runs_of_one_prompt_cache_key() {
+    let key = PromptCacheKey::from_bytes(*b"testkey1");
+    assert_ne!(
+        debug_file_name(key, DebugRun::from_parts(100, 0), 1, "request"),
+        debug_file_name(key, DebugRun::from_parts(200, 0), 1, "request")
     );
 }
 

@@ -83,6 +83,41 @@ impl PromptCacheKey {
     }
 }
 
+/// Distinguishes one session task's provider debug log from the next one's.
+///
+/// The prompt cache key is persisted with the agent and outlives any single
+/// session, while the debug sequence counter lives in the task and restarts at
+/// zero whenever the task is rebuilt — a daemon restart, a resumed agent. Those
+/// two together used to name the same file twice and silently overwrite the
+/// older run, so the run token goes in the name as well. Seconds first, so a
+/// directory listing for one agent still sorts chronologically; random tail so
+/// two tasks started in the same second stay apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DebugRun(u64, u16);
+
+impl DebugRun {
+    fn now() -> Self {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        Self(
+            secs,
+            rand::RngCore::next_u32(&mut rand::thread_rng()) as u16,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_parts(secs: u64, salt: u16) -> Self {
+        Self(secs, salt)
+    }
+}
+
+impl std::fmt::Display for DebugRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08x}{:04x}", self.0, self.1)
+    }
+}
+
 /// A turn that has been requested and is being driven by `run`.
 struct Turn {
     /// The original request, kept so a stale-`previous_response` failure can be
@@ -173,6 +208,8 @@ struct SessionTask {
     turn: Option<Turn>,
     config: SessionConfig,
     debug_counter: u64,
+    /// Names this task's debug files apart from an earlier task's.
+    debug_run: DebugRun,
     /// Where every event goes, tagged with the turn that produced it. Emitting
     /// straight into the channel is what lets one frame yield several updates
     /// without a queue in between: the channel is that queue.
@@ -447,6 +484,7 @@ impl InferenceSession {
                     turn: None,
                     config: config.clone(),
                     debug_counter: 0,
+                    debug_run: DebugRun::now(),
                     events: events_tx,
                     epoch: 0,
                 }
@@ -842,6 +880,7 @@ impl SessionTask {
         redact_image_data(&mut redacted_body);
         let metadata = serde_json::json!({
             "prompt_cache_key": self.config.prompt_cache_key.debug_file_stem(),
+            "run": self.debug_run.to_string(),
             "sequence": sequence,
             "kind": "request",
             "backend": "responses",
@@ -866,6 +905,7 @@ impl SessionTask {
     ) {
         let metadata = serde_json::json!({
             "prompt_cache_key": self.config.prompt_cache_key.debug_file_stem(),
+            "run": self.debug_run.to_string(),
             "sequence": sequence,
             "kind": "response",
             "backend": "responses",
@@ -894,6 +934,7 @@ impl SessionTask {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(debug_file_name(
             self.config.prompt_cache_key,
+            self.debug_run,
             sequence,
             kind,
         ));
@@ -1004,11 +1045,12 @@ pub(crate) fn provider_debug_dir() -> Option<PathBuf> {
 
 pub(crate) fn debug_file_name(
     prompt_cache_key: PromptCacheKey,
+    run: DebugRun,
     sequence: u64,
     kind: &str,
 ) -> String {
     format!(
-        "{}-{sequence:04}-{kind}.json",
+        "{}-{run}-{sequence:04}-{kind}.json",
         prompt_cache_key.debug_file_stem()
     )
 }
@@ -1113,6 +1155,7 @@ mod account_selection_tests {
                 prompt_cache_key: PromptCacheKey::from_bytes(*b"testkey0"),
             },
             debug_counter: 0,
+            debug_run: DebugRun::from_parts(0, 0),
             events,
             epoch: 1,
         };
