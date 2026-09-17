@@ -24,7 +24,8 @@ pub struct Process {
     clients: super::workset::Clients,
     pending: super::workset::Pending,
     pub(super) sender: transport::Sender,
-    pub(super) agents: Arc<Mutex<HashMap<rho_core::AgentId, mpsc::Sender<bytes::Bytes>>>>,
+    pub(super) agents:
+        Arc<Mutex<HashMap<rho_core::AgentId, mpsc::UnboundedSender<transport::Packet>>>>,
     pub(super) next: Arc<AtomicU64>,
     pub(crate) closed: watch::Receiver<bool>,
     pub(crate) mode: rho_fs_view::WorksetMode,
@@ -49,11 +50,14 @@ impl Process {
     }
 
     #[cfg(test)]
-    pub(crate) fn overload_agent_route(
+    pub(crate) fn pause_agent_route(
         &self,
         agent: rho_core::AgentId,
-    ) -> (mpsc::Sender<bytes::Bytes>, mpsc::Receiver<bytes::Bytes>) {
-        let (send, receive) = mpsc::channel(1);
+    ) -> (
+        mpsc::UnboundedSender<transport::Packet>,
+        mpsc::UnboundedReceiver<transport::Packet>,
+    ) {
+        let (send, receive) = mpsc::unbounded_channel();
         let previous = self
             .agents
             .lock()
@@ -64,14 +68,29 @@ impl Process {
     }
 
     #[cfg(test)]
+    pub(crate) fn restore_agent_route(
+        &self,
+        agent: rho_core::AgentId,
+        route: mpsc::UnboundedSender<transport::Packet>,
+        blocked: &mut mpsc::UnboundedReceiver<transport::Packet>,
+    ) {
+        let mut agents = self.agents.lock().expect("poison");
+        while let Ok(packet) = blocked.try_recv() {
+            route.send(packet).unwrap();
+        }
+        agents.insert(agent, route);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_shutdown_reply(&self, agent: rho_core::AgentId) {
         self.agents.lock().expect("poison")[&agent]
-            .try_send(
+            .send(transport::Packet::for_test(
+                transport::Port::Agent(agent),
                 ipc::encode(&ipc::Message::Stopped {
                     error: Some("test cleanup failed".into()),
                 })
                 .unwrap(),
-            )
+            ))
             .unwrap();
     }
 
@@ -227,8 +246,9 @@ impl Process {
         let pid = child.id().expect("spawned child");
         let (stop, stopped) = oneshot::channel();
         let (closed, closed_rx) = watch::channel(false);
-        let agents: Arc<Mutex<HashMap<rho_core::AgentId, mpsc::Sender<bytes::Bytes>>>> =
-            Arc::default();
+        let agents: Arc<
+            Mutex<HashMap<rho_core::AgentId, mpsc::UnboundedSender<transport::Packet>>>,
+        > = Arc::default();
         let clients: super::workset::Clients = Arc::default();
         let pending: super::workset::Pending = Arc::default();
         let client_routes = clients.clone();
@@ -271,8 +291,8 @@ impl Process {
                                 transport::Port::Agent(id) => {
                                     let routes = routes.lock().expect("poison");
                                     if let Some(route) = routes.get(&id) {
-                                        route.try_send(packet.bytes).map_err(|error|
-                                            anyhow::anyhow!("daemon agent route {id:?}: {error}"))?;
+                                        // Retirement can close this receiver before unregistering.
+                                        let _ = route.send(packet);
                                     }
                                 }
                                 transport::Port::Workset => {

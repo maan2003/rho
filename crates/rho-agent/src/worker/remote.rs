@@ -57,7 +57,7 @@ impl Remote {
             Arc::downgrade(pool),
             process.next.clone(),
         ));
-        let (incoming, receiver) = tokio::sync::mpsc::channel(32);
+        let (incoming, receiver) = tokio::sync::mpsc::unbounded_channel();
         anyhow::ensure!(
             process
                 .agents

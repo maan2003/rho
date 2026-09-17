@@ -146,7 +146,12 @@ pub(super) async fn run(
     use super::transport::Port;
     let (sender, mut receiver, mut writer) = super::transport::connect(socket);
     let agents: Arc<
-        std::sync::Mutex<HashMap<rho_core::AgentId, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+        std::sync::Mutex<
+            HashMap<
+                rho_core::AgentId,
+                tokio::sync::mpsc::UnboundedSender<super::transport::Packet>,
+            >,
+        >,
     > = Arc::default();
     let execution = Arc::new(super::workset::Execution {
         base: base.clone(),
@@ -269,11 +274,9 @@ pub(super) async fn run(
         {
             let agents = agents.lock().expect("poison");
             if let Some(incoming) = agents.get(&agent) {
-                if let Err(error) = incoming.try_send(packet.bytes) {
-                    break 'connection Err(anyhow::anyhow!(
-                        "worker agent route {agent:?}: {error}"
-                    ));
-                }
+                // A retiring agent may have dropped its receiver. Its late replies
+                // are no different from replies after the route is unregistered.
+                let _ = incoming.send(packet);
                 continue;
             }
         }
@@ -285,7 +288,7 @@ pub(super) async fn run(
             // The old agent has drained. Late service replies have no consumer.
             continue;
         };
-        let (incoming, messages) = tokio::sync::mpsc::channel(32);
+        let (incoming, messages) = tokio::sync::mpsc::unbounded_channel();
         agents.lock().expect("poison").insert(agent, incoming);
         let agents = agents.clone();
         let sender = sender.clone();

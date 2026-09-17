@@ -14,7 +14,7 @@ use crate::db::{
     AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding, TurnEdge,
 };
 
-pub(super) const VERSION: u32 = 6;
+pub(super) const VERSION: u32 = 7;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -228,7 +228,7 @@ impl Host {
     pub(super) fn connect(
         writer: super::transport::Sender,
         port: super::transport::Port,
-        mut incoming: mpsc::Receiver<bytes::Bytes>,
+        mut incoming: mpsc::UnboundedReceiver<super::transport::Packet>,
         next: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -243,7 +243,13 @@ impl Host {
         tokio::spawn(async move {
             let receive = async {
                 loop {
-                    let message = decode(&incoming.recv().await.ok_or(io::ErrorKind::BrokenPipe)?)?;
+                    let message = decode(
+                        &incoming
+                            .recv()
+                            .await
+                            .ok_or(io::ErrorKind::BrokenPipe)?
+                            .bytes,
+                    )?;
                     match message {
                         Message::Named(head) => {
                             names.send_replace(Some(head));

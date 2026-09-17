@@ -91,7 +91,7 @@ pub(super) mod testing {
     pub struct Endpoint {
         pub(super) sender: transport::Sender,
         pub(super) port: transport::Port,
-        pub(super) incoming: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        pub(super) incoming: tokio::sync::mpsc::UnboundedReceiver<transport::Packet>,
     }
     impl Endpoint {
         pub fn host(self) -> std::sync::Arc<Host> {
@@ -112,7 +112,7 @@ pub(super) mod testing {
             tokio::spawn(async move {
                 while let Some(bytes) = incoming.recv().await {
                     let Ok(super::workset::Message::Policy(message)) =
-                        super::workset::decode(&bytes)
+                        super::workset::decode(&bytes.bytes)
                     else {
                         break;
                     };
@@ -130,7 +130,8 @@ pub(super) mod testing {
                 .recv()
                 .await
                 .ok_or_else(|| anyhow::anyhow!("policy disconnected"))?;
-            let super::workset::Message::Policy(message) = super::workset::decode(&bytes)? else {
+            let super::workset::Message::Policy(message) = super::workset::decode(&bytes.bytes)?
+            else {
                 anyhow::bail!("not a policy message");
             };
             Ok(message)
@@ -155,7 +156,8 @@ pub(super) mod testing {
                     .incoming
                     .recv()
                     .await
-                    .ok_or(std::io::ErrorKind::UnexpectedEof)?,
+                    .ok_or(std::io::ErrorKind::UnexpectedEof)?
+                    .bytes,
             )
         }
         pub(super) async fn write(&self, message: &ipc::Message<'_>) -> std::io::Result<()> {
@@ -166,13 +168,13 @@ pub(super) mod testing {
         let (left, right) = tokio::net::UnixStream::pair().unwrap();
         fn endpoint(socket: tokio::net::UnixStream) -> Endpoint {
             let (sender, mut receiver, writer) = transport::connect(socket);
-            let (incoming, messages) = tokio::sync::mpsc::channel(32);
+            let (incoming, messages) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = incoming.closed() => {}
                     _ = async {
                         while let Ok(packet) = receiver.next().await {
-                            if incoming.send(packet.bytes).await.is_err() { break; }
+                            if incoming.send(packet).is_err() { break; }
                         }
                     } => {}
                 }

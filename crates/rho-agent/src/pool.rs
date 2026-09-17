@@ -1234,20 +1234,31 @@ mod tests {
         let (_, active, _) = pool.load(first_id).await.unwrap();
         let replacement = pool.execution(first_id).await.unwrap();
 
-        // Back up the daemon route while the real worker sends two controls.
-        let (old_route, _blocked) = replacement.overload_agent_route(first_id);
-        active.notice_carried();
-        active.tell_tail();
+        // Hold receipt credit in one agent's inbox; other workset traffic
+        // continues, and draining the route delivers the original replies.
+        let (old_route, mut blocked) = replacement.pause_agent_route(first_id);
+        for _ in 0..80 {
+            active.tell_tail();
+        }
         tokio::time::timeout(Duration::from_secs(10), async {
-            while std::path::Path::new(&format!("/proc/{}", replacement.pid)).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            while blocked.len() < 16 {
+                tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        let _ = replacement.closed.clone().wait_for(|closed| *closed).await;
+        assert!(std::path::Path::new(&format!("/proc/{}", replacement.pid)).exists());
+        assert_eq!(blocked.len(), 16, "receipt credit must bound the route");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            replacement.action(crate::WorksetAction::TerminalList),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        replacement.restore_agent_route(first_id, old_route.clone(), &mut blocked);
         drop(old_route);
-        let (_, final_agent, _) = pool.load(first_id).await.unwrap();
+        let final_agent = active.clone();
         // A failing shutdown reply consumes the join result exactly once.
         let process = pool.execution(first_id).await.unwrap();
         let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();

@@ -122,7 +122,7 @@ impl Services {
         self: Arc<Self>,
         writer: super::transport::Sender,
         port: super::transport::Port,
-        mut incoming: mpsc::Receiver<bytes::Bytes>,
+        mut incoming: mpsc::UnboundedReceiver<super::transport::Packet>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
         Box::pin(async move {
             let mut commands = self
@@ -142,7 +142,7 @@ impl Services {
                         // payload would corrupt the channel.
                         let frame = async {
                             let bytes = incoming.recv().await.context("agent port closed")?;
-                            Ok::<_, anyhow::Error>(ipc::decode(&bytes)?)
+                            Ok::<_, anyhow::Error>(ipc::decode(&bytes.bytes)?)
                         };
                         tokio::pin!(frame);
                         let message = loop {
@@ -151,7 +151,7 @@ impl Services {
                                 Some(completed) = calls.join_next(), if !calls.is_empty() => {
                                     completed.context("agent service task failed")??;
                                 }
-                                message = &mut frame => break message?,
+                                message = &mut frame, if calls.len() < 32 => break message?,
                             }
                         };
                         let (id, body) = match message {
@@ -192,10 +192,6 @@ impl Services {
                             Message::Request { id, body } => (id, body),
                             _ => anyhow::bail!("unexpected agent service message"),
                         };
-                        if calls.len() >= 32 {
-                            outgoing.send(Message::Reply { id, body: Reply::Error("too many pending agent services".into()) }).await?;
-                            continue;
-                        }
                         let service = self.clone();
                         let outgoing = outgoing.clone();
                         calls.spawn(async move {
@@ -516,6 +512,51 @@ mod tests {
         let (next, rows) = host.history().await.unwrap();
         assert_eq!(next, appended.next());
         assert_eq!((next, rows), db.read().agent_event_records(agent));
+
+        // More than the service concurrency bound must wait, never return
+        // "too many pending agent services" or lose an append.
+        let locked = db.write().await;
+        let mut pending = JoinSet::new();
+        for index in 0..80 {
+            let host = host.clone();
+            pending.spawn(async move {
+                host.append(AgentEvent::Notice {
+                    text: format!("queued-{index}").into(),
+                    at: UnixMs(4),
+                })
+                .await
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            pending.try_join_next().is_none(),
+            "a busy store rejected work"
+        );
+        drop(locked);
+        let mut positions = std::collections::BTreeSet::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(result) = pending.join_next().await {
+                positions.insert(result.unwrap().unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(positions.len(), 80);
+        let (after, rows) = host.history().await.unwrap();
+        assert_eq!(after.pos, next.pos + 80);
+        let labels = rows
+            .iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Notice { text, .. } if text.starts_with("queued-") => {
+                    Some(text.to_string())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            labels,
+            (0..80).map(|index| format!("queued-{index}")).collect()
+        );
         drop(host);
         assert!(server.await.unwrap().is_err());
 

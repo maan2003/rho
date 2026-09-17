@@ -20,7 +20,9 @@ Exactly one private Unix socketpair between daemon and workset process carries
 agent, workset, terminal, and shell traffic. Agent IDs and client ports route messages; connection-wide request IDs
 correlate replies. Bounded Senax fragments preserve logical messages and atomic
 domain operations; per-port FIFO and fair scheduling prevent bulk traffic from
-monopolizing the writer. Readers route without awaiting runtime progress.
+monopolizing the writer. Readers route without awaiting runtime progress. Agent ports retain bounded
+receipt credit through decoding, so a slow inbox backpressures its sender rather
+than terminating sibling agents. Late replies to retired routes are discarded.
 The control descriptor is close-on-exec and separated from stdin before threads
 start. Stdout and stderr remain diagnostics.
 

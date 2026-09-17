@@ -31,7 +31,10 @@ RPC replies share workset FIFO ordering; agent retirement does not close it.
 Policy admission is bounded across the workset; a published request retains
 its slot through caller cancellation until reply or disconnect.
 Bounded fragments preserve per-port
-order; routing and fair writes do not await runtime work. Completion publication
+order; routing and fair writes do not await runtime work. Agent-port receipt
+credit is returned after decoding, bounding inboxes while slow consumers
+backpressure their own senders. Retirement discards late replies, not sibling
+runtimes. Completion publication
 does not await recipient acceptance, keeping reciprocal subscriptions outside
 serialized actor-loop dependencies. Lost persistence acknowledgements stop the
 runtime; uncertain mutations are not retried. Native inference does not wait for
