@@ -481,9 +481,8 @@ def _configure_functions(names):
     agents = types.ModuleType('agents')
 
     def message(*, agent_id: str, message: str):
-        """Queue a message to an existing agent; a busy agent receives it at its next boundary.
+        """Send a message to an existing agent.
         Use the role-prefixed agent handle, for example eng-h6u7 or adv-h6u7.
-        The return value confirms queueing, not the recipient's answer.
         """
         return _request('message_agent', dict(agent_id=agent_id, message=message))
 

@@ -433,7 +433,6 @@ the next scoped request and say whether another reply is needed. Stop exchanging
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
 tasks while awaiting a reply. When blocked, use the check-in rules under Tool execution.
 
-Sending queues the message immediately; a busy recipient sees it at its next inference step.
 Child final responses arrive automatically as agent mail. Do not also send the same completion
 report through `agents.message`.
 
@@ -1000,7 +999,6 @@ the next scoped request and say whether another reply is needed. Stop exchanging
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
 tasks while awaiting a reply. When blocked, use the check-in rules under Tool execution.
 
-Sending queues the message immediately; a busy recipient sees it at its next inference step.
 Child final responses arrive automatically as agent mail. Do not also send the same completion
 report through `agents.message`.
 
@@ -1206,9 +1204,7 @@ Payload:
 <payload text>
 ```
 
-Use `{message_tool}` for bidirectional communication with any known agent. Mail \
-does not interrupt an in-flight request, but it can start or continue your next \
-request.
+Use `{message_tool}` for bidirectional communication with any known agent.
 
 "
         )
@@ -1463,8 +1459,7 @@ the next scoped request and say whether another reply is needed. Stop exchanging
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
 tasks while awaiting a reply. When blocked, use a check-in; do not repeatedly poll.
 
-Queue a message using the agent's role-prefixed handle. A busy recipient sees it at its next
-inference boundary. Returns confirmation of queueing, not the recipient's answer.
+Use the agent's role-prefixed handle.
 agents.message(*, agent_id: str, message: str) → Awaitable[str]
 
 Child final responses arrive automatically as agent mail. Do not also send the same completion
