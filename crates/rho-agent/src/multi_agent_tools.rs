@@ -256,28 +256,28 @@ async fn message_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resu
 
 #[derive(Deserialize)]
 struct InterruptArgs {
-    engineer_id: String,
+    agent_id: String,
 }
 
 async fn interrupt_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
     let args: InterruptArgs = serde_json::from_str(&call.arguments)?;
     let pool = tools.pool()?;
     let raw_agent_id = args
-        .engineer_id
+        .agent_id
         .trim()
         .strip_prefix("eng-")
-        .ok_or_else(|| anyhow::anyhow!("engineer_id must start with eng-"))?;
+        .ok_or_else(|| anyhow::anyhow!("agent_id must start with eng-"))?;
     let target = match pool.resolve_agent_id(raw_agent_id)? {
         prefix_id::PrefixResolution::Unique(agent_id)
         | prefix_id::PrefixResolution::Ambiguous {
             first: agent_id, ..
         } => agent_id,
         prefix_id::PrefixResolution::NotFound => {
-            anyhow::bail!("no agent with id {}", args.engineer_id)
+            anyhow::bail!("no agent with id {}", args.agent_id)
         }
     };
     if !pool.agent_exists(target) {
-        anyhow::bail!("no agent with id {}", args.engineer_id);
+        anyhow::bail!("no agent with id {}", args.agent_id);
     }
     anyhow::ensure!(
         pool.db().read().get_agent(target).config.role.is_engineer(),

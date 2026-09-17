@@ -1158,6 +1158,23 @@ mod tests {
             );
             assert!(!rendered.contains("## Team Context"));
             assert!(!rendered.lines().any(|line| line == "## Environment"));
+            drop(read);
+            let cancelled = crate::multi_agent_tools::call_agent_tool(
+                tools.clone(),
+                rho_core::ToolCall {
+                    id: rho_core::ToolCallId::try_from("cancel-test").unwrap(),
+                    name: rho_core::ToolName::try_from("interrupt_engineer").unwrap(),
+                    tool_type: rho_core::ToolType::Function,
+                    arguments: serde_json::json!({"agent_id": team.agent}).to_string(),
+                },
+            )
+            .await;
+            assert_eq!(
+                cancelled.status,
+                rho_core::ToolOutputStatus::Success,
+                "{}",
+                cancelled.output
+            );
         }
 
         let count = pool.db.read().list_agent_ids().len();

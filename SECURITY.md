@@ -860,7 +860,9 @@ compaction. No notes are written or preparation responses requested.
   retains prose and reasoning. Recent and live/unanswered exchanges are protected.
   Full original transcripts remain durable; role changes do not reopen evictions.
 - Python `history` is a lazy, read-only snapshot of the agent's original transcript
-  per execution. It may contain private user content, tool arguments and results,
+  per execution. Its `text` exposes bounded tool output and tool-call source
+  (`arguments` aliases the latter), not separately retained full tool output.
+  It may contain private user content, tool arguments and results,
   image data and provider reasoning metadata. It has the same trust and disclosure
   boundaries as the transcript, not privileged instruction authority. Do not send
   it to external destinations merely to search it.

@@ -190,9 +190,20 @@ Run a shell command. Starts immediately and returns a persistent command handle;
 automatically.
 command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
 
+Run independent inspections in one cell, without gather or await:
+
+    command("git diff --stat")
+    command("rg -n 'TODO' src")
+
 Await the handle when later code needs completion. Returns metadata, not stdout. Failure to start
 or cancellation can raise an exception.
 await handle → {id: int, exit_code: int | None}
+
+Await only the dependency; the next command starts without awaiting its output:
+
+    check = await command("cargo check")
+    if check["exit_code"] == 0:
+        command("cargo test")
 
 Send input and read retained output, or omit chars to read only. Registers immediately and returns
 an awaitable for this write/read operation. Awaiting waits for stdin readiness, not future output;
@@ -207,14 +218,32 @@ write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awa
     finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
 }]
 
+Send stdin without blocking the notebook:
+
+    job = command("python3 -c 'print(input())'", max_tokens=100)
+    write_stdin(job, "hello\n")
+
 Read retained output without sending input. Returns the same awaitable result shape as write_stdin.
 Explicit reads use a separate cursor starting at byte zero and can repeat automatic previews.
 Await command completion first only when Python needs a complete final read.
 display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
 
+After automatic completion, expand retained output in a later cell:
+
+    write_stdin(job, max_tokens=6000)
+
 Request cancellation immediately. Awaiting this operation waits for the cancellation request to be
 handled; await the command handle to wait for termination.
 handle.cancel() → Awaitable[None]
+
+Keep a handle for work you may want to stop:
+
+    job = command("sleep 600")
+
+In a later cell, request cancellation. Await the handle only if subsequent code needs termination:
+
+    job.cancel()
+    await job
 
 ### Python output
 
@@ -223,6 +252,18 @@ text(value: object, *, max_tokens: int = 2000) → None
 
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
+
+A monitoring cell can stay live across reporting boundaries:
+
+    progress = {"checks": 0}
+    while not Path("results.json").exists():
+        progress["checks"] += 1
+        await asyncio.sleep(5)
+    notify("Results are ready")
+
+Inspect its globals from a later cell without stopping it:
+
+    text(progress)
 
 Show and return a Python function's signature and documentation. For other non-command values,
 display behaves like text and returns None.
@@ -237,6 +278,12 @@ image(reference) → Awaitable[None]
 Set the current turn's check-in policy. The default interval is 120 seconds; omit this call unless
 changing the interval or suppressing tool wakeups. Accepted intervals are 1–3600 seconds.
 set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+
+Set a check-in alongside the work:
+
+    command("git diff --check")
+    command("cargo test")
+    set_checkin(after_seconds=300)
 
 Set the policy alongside the work, before an await that might suspend the cell past the end of the
 model turn. Follow the exec return rules above to wait; no Python sleep is needed.
@@ -368,7 +415,7 @@ agents.message(*, agent_id: str, message: str) -> Awaitable[str]
 Interrupt an agent's current turn with `agents.cancel`; the agent remains available for follow-up.
 
 ```python
-agents.cancel(*, engineer_id: str) -> Awaitable[str]
+agents.cancel(*, agent_id: str) -> Awaitable[str]
 ```
 
 ### Briefing and integrating work
@@ -391,65 +438,42 @@ delivery.
 
 ### History
 
-`history` is a lazy, read-only snapshot of the host-supplied native Rho transcript at admission of
-the current execution. It is empty when the host supplies no native transcript, including Claude
-Code's notebook. Indexing materializes one item; slicing materializes the selected items. Records
-are immutable. The types are:
+history is a lazy, read-only transcript snapshot for the current execution. Indexing loads one
+record; slicing loads the selected records. Eviction from model context does not erase history.
 
-```python
-class HistoryContent(NamedTuple):
-    kind: str
-    text: str | None = None
-    media_type: str | None = None
-    data: bytes | None = None
+item.text contains message or reasoning text, tool-call source, or bounded tool output; it may be
+None. Tool calls also expose name and call_id; arguments is an alias for their text. Results expose
+call_id and status. Use item._fields to discover other fields when needed.
 
+kind values:
+- Messages: message
+- Tool activity: tool_call, tool_result, tool_update
+- Reasoning: reasoning, encrypted_reasoning
+- Context management: compaction, compaction_trigger, context_rotation, tool_history_evicted
+- Other provider records: unknown
 
-class HistoryImage(NamedTuple):
-    media_type: str
-    data: bytes
-    detail: str | None = None
+Search backward for text, stopping after five matches:
 
+    query = "connection refused".casefold()
+    found = 0
+    for i in range(len(history) - 1, -1, -1):
+        item = history[i]
+        body = item.text or ""
+        if query in body.casefold():
+            print(i, item.kind, item.name, body[:2000])
+            found += 1
+            if found == 5:
+                break
 
-class HistoryProviderData(NamedTuple):
-    tag: str
-    data: bytes
+Searching loads each visited record; stopping early avoids scanning the whole transcript. To search
+only tool output, filter with item.kind in ("tool_result", "tool_update").
 
+Inspect a matching entry and its neighbors using the printed index:
 
-class HistoryItem(NamedTuple):
-    kind: Literal[
-        'message', 'reasoning', 'encrypted_reasoning', 'tool_call', 'tool_result',
-        'tool_update', 'compaction', 'unknown', 'compaction_trigger',
-        'context_rotation', 'tool_history_evicted',
-    ]
-    role: str | None = None
-    sender: str | None = None
-    text: str | None = None
-    display_text: str | None = None
-    content: tuple[HistoryContent, ...] = ()
-    name: str | None = None
-    arguments: str | None = None
-    call_id: str | None = None
-    summary: tuple[str, ...] = ()
-    images: tuple[HistoryImage, ...] = ()
-    provider: HistoryProviderData | None = None
-    status: str | None = None
-    phase: str | None = None
-    tool_type: str | None = None
-    started_at: int | None = None
-    finished_at: int | None = None
-    at: int | None = None
-    retain_from: int | None = None
-    call_ids: tuple[str, ...] = ()
-    response_id: str | None = None
-    metadata: object | None = None
-
-
-history: Sequence[HistoryItem]
-```
-
-`text` retains complete recorded text; `display_text` retains the bounded model-facing text.
-Timestamps are Unix milliseconds. Provider `data` is original Senax-encoded bytes (possibly opaque
-or encrypted); its representation hides the bytes. Nested metadata is read-only.
+    i = 42  # Replace with a matching index.
+    for j in range(max(0, i - 2), min(len(history), i + 3)):
+        item = history[j]
+        print(j, item.kind, (item.text or "")[:2000])
 
 ### Eviction and restart
 
@@ -801,9 +825,20 @@ Run a shell command. Starts immediately and returns a persistent command handle;
 automatically.
 command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
 
+Run independent inspections in one cell, without gather or await:
+
+    command("git diff --stat")
+    command("rg -n 'TODO' src")
+
 Await the handle when later code needs completion. Returns metadata, not stdout. Failure to start
 or cancellation can raise an exception.
 await handle → {id: int, exit_code: int | None}
+
+Await only the dependency; the next command starts without awaiting its output:
+
+    check = await command("cargo check")
+    if check["exit_code"] == 0:
+        command("cargo test")
 
 Send input and read retained output, or omit chars to read only. Registers immediately and returns
 an awaitable for this write/read operation. Awaiting waits for stdin readiness, not future output;
@@ -818,14 +853,32 @@ write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awa
     finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
 }]
 
+Send stdin without blocking the notebook:
+
+    job = command("python3 -c 'print(input())'", max_tokens=100)
+    write_stdin(job, "hello\n")
+
 Read retained output without sending input. Returns the same awaitable result shape as write_stdin.
 Explicit reads use a separate cursor starting at byte zero and can repeat automatic previews.
 Await command completion first only when Python needs a complete final read.
 display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
 
+After automatic completion, expand retained output in a later cell:
+
+    write_stdin(job, max_tokens=6000)
+
 Request cancellation immediately. Awaiting this operation waits for the cancellation request to be
 handled; await the command handle to wait for termination.
 handle.cancel() → Awaitable[None]
+
+Keep a handle for work you may want to stop:
+
+    job = command("sleep 600")
+
+In a later cell, request cancellation. Await the handle only if subsequent code needs termination:
+
+    job.cancel()
+    await job
 
 ### Python output
 
@@ -834,6 +887,18 @@ text(value: object, *, max_tokens: int = 2000) → None
 
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
+
+A monitoring cell can stay live across reporting boundaries:
+
+    progress = {"checks": 0}
+    while not Path("results.json").exists():
+        progress["checks"] += 1
+        await asyncio.sleep(5)
+    notify("Results are ready")
+
+Inspect its globals from a later cell without stopping it:
+
+    text(progress)
 
 Show and return a Python function's signature and documentation. For other non-command values,
 display behaves like text and returns None.
@@ -848,6 +913,12 @@ image(reference) → Awaitable[None]
 Set the current turn's check-in policy. The default interval is 120 seconds; omit this call unless
 changing the interval or suppressing tool wakeups. Accepted intervals are 1–3600 seconds.
 set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+
+Set a check-in alongside the work:
+
+    command("git diff --check")
+    command("cargo test")
+    set_checkin(after_seconds=300)
 
 Set the policy alongside the work, before an await that might suspend the cell past the end of the
 model turn. Follow the exec return rules above to wait; no Python sleep is needed.
@@ -890,65 +961,42 @@ agents.message(*, agent_id: str, message: str) -> Awaitable[str]
 
 ### History
 
-`history` is a lazy, read-only snapshot of the host-supplied native Rho transcript at admission of
-the current execution. It is empty when the host supplies no native transcript, including Claude
-Code's notebook. Indexing materializes one item; slicing materializes the selected items. Records
-are immutable. The types are:
+history is a lazy, read-only transcript snapshot for the current execution. Indexing loads one
+record; slicing loads the selected records. Eviction from model context does not erase history.
 
-```python
-class HistoryContent(NamedTuple):
-    kind: str
-    text: str | None = None
-    media_type: str | None = None
-    data: bytes | None = None
+item.text contains message or reasoning text, tool-call source, or bounded tool output; it may be
+None. Tool calls also expose name and call_id; arguments is an alias for their text. Results expose
+call_id and status. Use item._fields to discover other fields when needed.
 
+kind values:
+- Messages: message
+- Tool activity: tool_call, tool_result, tool_update
+- Reasoning: reasoning, encrypted_reasoning
+- Context management: compaction, compaction_trigger, context_rotation, tool_history_evicted
+- Other provider records: unknown
 
-class HistoryImage(NamedTuple):
-    media_type: str
-    data: bytes
-    detail: str | None = None
+Search backward for text, stopping after five matches:
 
+    query = "connection refused".casefold()
+    found = 0
+    for i in range(len(history) - 1, -1, -1):
+        item = history[i]
+        body = item.text or ""
+        if query in body.casefold():
+            print(i, item.kind, item.name, body[:2000])
+            found += 1
+            if found == 5:
+                break
 
-class HistoryProviderData(NamedTuple):
-    tag: str
-    data: bytes
+Searching loads each visited record; stopping early avoids scanning the whole transcript. To search
+only tool output, filter with item.kind in ("tool_result", "tool_update").
 
+Inspect a matching entry and its neighbors using the printed index:
 
-class HistoryItem(NamedTuple):
-    kind: Literal[
-        'message', 'reasoning', 'encrypted_reasoning', 'tool_call', 'tool_result',
-        'tool_update', 'compaction', 'unknown', 'compaction_trigger',
-        'context_rotation', 'tool_history_evicted',
-    ]
-    role: str | None = None
-    sender: str | None = None
-    text: str | None = None
-    display_text: str | None = None
-    content: tuple[HistoryContent, ...] = ()
-    name: str | None = None
-    arguments: str | None = None
-    call_id: str | None = None
-    summary: tuple[str, ...] = ()
-    images: tuple[HistoryImage, ...] = ()
-    provider: HistoryProviderData | None = None
-    status: str | None = None
-    phase: str | None = None
-    tool_type: str | None = None
-    started_at: int | None = None
-    finished_at: int | None = None
-    at: int | None = None
-    retain_from: int | None = None
-    call_ids: tuple[str, ...] = ()
-    response_id: str | None = None
-    metadata: object | None = None
-
-
-history: Sequence[HistoryItem]
-```
-
-`text` retains complete recorded text; `display_text` retains the bounded model-facing text.
-Timestamps are Unix milliseconds. Provider `data` is original Senax-encoded bytes (possibly opaque
-or encrypted); its representation hides the bytes. Nested metadata is read-only.
+    i = 42  # Replace with a matching index.
+    for j in range(max(0, i - 2), min(len(history), i + 3)):
+        item = history[j]
+        print(j, item.kind, (item.text or "")[:2000])
 
 ### Eviction and restart
 
@@ -1166,9 +1214,20 @@ merely to show it.
 Run a shell command. Returns a persistent handle immediately; output arrives automatically.
 command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
 
+Run independent inspections in one cell, without gather or await:
+
+    command("git diff --stat")
+    command("rg -n 'TODO' src")
+
 Wait for a command to finish. Returns completion metadata, not stdout. Failure to start or
 cancellation can raise an exception.
 await handle → {id: int, exit_code: int | None}
+
+Await only the dependency; the next command starts without awaiting its output:
+
+    check = await command("cargo check")
+    if check["exit_code"] == 0:
+        command("cargo test")
 
 Send input and read retained output, or omit chars to read only. Awaiting waits for stdin readiness,
 not future output; an empty page is valid.
@@ -1182,13 +1241,31 @@ write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awa
     finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
 }]
 
+Send stdin without blocking the notebook:
+
+    job = command("python3 -c 'print(input())'", max_tokens=100)
+    write_stdin(job, "hello\n")
+
 Read retained output without writing input. Returns the same result shape as write_stdin.
 Explicit reads use a separate cursor starting at byte zero and may repeat automatic previews.
 display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
 
+After automatic completion, expand retained output in a later cell:
+
+    write_stdin(job, max_tokens=6000)
+
 Request cancellation. Awaiting this operation waits for the request to be handled; await the
 command handle to wait for termination.
 handle.cancel() → Awaitable[None]
+
+Keep a handle for work you may want to stop:
+
+    job = command("sleep 600")
+
+In a later cell, request cancellation. Await the handle only if subsequent code needs termination:
+
+    job.cancel()
+    await job
 
 Emit ordinary output, like print. display(function) shows its signature and documentation;
 display(other_value) behaves like text.
@@ -1197,10 +1274,28 @@ text(value: object, *, max_tokens: int = 2000) → None
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
 
+A monitoring cell can stay live across reporting boundaries:
+
+    progress = {"checks": 0}
+    while not Path("results.json").exists():
+        progress["checks"] += 1
+        await asyncio.sleep(5)
+    notify("Results are ready")
+
+Inspect its globals from a later cell without stopping it:
+
+    text(progress)
+
 Set this turn's check-in policy before an await that might suspend the cell. The default interval
 is 120 seconds; accepted values are 1–3600 seconds. A check-in reports through the MCP call; do not
 sleep in Python merely to wait for reporting.
 set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+
+Set a check-in alongside the work:
+
+    command("git diff --check")
+    command("cargo test")
+    set_checkin(after_seconds=300)
 
 With wake_on_tools=False, output, completion, errors, notify, and exec completion do not wake the
 model. Only the timer, user messages, or agent mail do. Work continues; buffered output arrives on
@@ -1256,7 +1351,7 @@ Returns an awaitable identifying the Advisor, not its findings.
 agents.spawn_new_advisor(msg: str) → Awaitable[str]
 
 Interrupt an Engineer's current turn. It remains available for follow-up messages.
-agents.cancel(*, engineer_id: str) → Awaitable[str]
+agents.cancel(*, agent_id: str) → Awaitable[str]
 
 "#,
         ),
@@ -1573,7 +1668,10 @@ mod tests {
         assert!(!collaboration.contains("display(agents.spawn_new_engineer)"));
         assert!(collaboration.contains("agents.cancel("));
         assert!(collaboration.contains("agents.message("));
-        assert!(prompt.contains("history: Sequence[HistoryItem]"));
+        assert!(prompt.contains("tool-call source, or bounded tool output"));
+        assert!(prompt.contains("for i in range(len(history) - 1, -1, -1):"));
+        assert!(!prompt.contains("display_text"));
+        assert!(!prompt.contains("class HistoryItem"));
         assert!(prompt.contains("Issue at most one exec call per response"));
         assert!(prompt.contains("end the model turn"));
         assert!(prompt.contains("With False,"));
@@ -1639,7 +1737,10 @@ mod tests {
         assert!(prompt.contains("## Working with other agents\n\nTEAM_SENTINEL\n\n"));
         assert!(prompt.contains("agents.message("));
         assert!(prompt.contains("Use `web.run` for web searches and reading web pages."));
-        assert!(prompt.contains("history: Sequence[HistoryItem]"));
+        assert!(prompt.contains("tool-call source, or bounded tool output"));
+        assert!(prompt.contains("for i in range(len(history) - 1, -1, -1):"));
+        assert!(!prompt.contains("display_text"));
+        assert!(!prompt.contains("class HistoryItem"));
         for forbidden in [
             "spawn_new_advisor",
             "spawn_new_engineer",
@@ -1651,6 +1752,35 @@ mod tests {
             "Available tools:",
         ] {
             assert!(!prompt.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn execution_examples_cover_commands_and_live_cells_for_each_role() {
+        for prompt in [
+            main_agent_prompt("", ""),
+            advisor_prompt("", ""),
+            claude_prompt(None, None, AgentRole::default()),
+            claude_prompt(
+                None,
+                None,
+                AgentRole::Advisor {
+                    intelligence: rho_core::AdvisorIntelligence::High,
+                },
+            ),
+        ] {
+            for example in [
+                "    command(\"git diff --stat\")\n    command(\"rg -n 'TODO' src\")",
+                "    check = await command(\"cargo check\")\n    if check[\"exit_code\"] == 0:",
+                "    write_stdin(job, \"hello\\n\")",
+                "    write_stdin(job, max_tokens=6000)",
+                "    job.cancel()\n    await job",
+                "        await asyncio.sleep(5)",
+                "    text(progress)",
+                "    set_checkin(after_seconds=300)",
+            ] {
+                assert!(prompt.contains(example), "{example}");
+            }
         }
     }
 

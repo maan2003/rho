@@ -216,7 +216,7 @@ async fn history_preserves_tool_and_provider_transcript_fields() {
             call_id,
             tool_type: ToolType::Function,
             output: Arc::new("progress".into()),
-            full_output: None,
+            full_output: Some(Arc::new("unbounded progress".into())),
             at: UnixMs(15),
             images: Arc::new(Vec::new()),
         })),
@@ -233,11 +233,18 @@ assert (tool_call.kind, tool_call.name, tool_call.arguments, tool_call.call_id) 
     'tool_call', 'lookup', '{"needle":"x"}', 'kept-call')
 assert tool_call.provider.tag == 'test.provider'
 assert 'opaque-data' not in repr(tool_call.provider)
-assert (result.text, result.display_text, result.status) == ('complete', 'bounded', 'success')
+assert tool_call.text == tool_call.arguments == '{"needle":"x"}'
+assert (result.text, result.status) == ('bounded', 'success')
+assert result.arguments is None
+assert not hasattr(result, 'display_text')
+assert not hasattr(update, 'display_text')
 assert (result.started_at, result.finished_at) == (10, 20)
 assert result.images[0].data == b'\x09\x08'
 assert result.images[0].detail == 'original'
 assert (update.kind, update.text, update.at) == ('tool_update', 'progress', 15)
+assert [item.kind for item in history if "needle" in (item.text or "")] == ['tool_call']
+assert [item.kind for item in history if "bounded" in (item.text or "")] == ['tool_result']
+assert not any("complete" in (item.text or "") or "unbounded" in (item.text or "") for item in history)
 print(tool_call.name, result.text, update.text)
 "#
             ),
@@ -248,7 +255,7 @@ print(tool_call.name, result.text, update.text)
     let output = cell.first_output();
     cell.acknowledge_output();
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
-    assert_eq!(output.output.as_str(), "lookup complete progress\n");
+    assert_eq!(output.output.as_str(), "lookup bounded progress\n");
 }
 
 #[tokio::test]
@@ -1050,7 +1057,8 @@ assert json.loads(result.split(":", 1)[1]) == {
     "task_name": "test", "prompt": "work", "workdir": "/src/checkout",
 }
 assert (await agents.message(agent_id="eng-test", message="hello")).startswith("message_agent:")
-agents.cancel(engineer_id="eng-test")
+cancelled = await agents.cancel(agent_id="eng-test")
+assert json.loads(cancelled.split(":", 1)[1]) == {"agent_id": "eng-test"}
 agents.spawn_new_advisor("background review")
 assert (await web.run(search_query=[])).startswith("web__run:")
 assert (await view_image(path="test.png")).startswith("view_image:")

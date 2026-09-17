@@ -54,10 +54,8 @@ class HistoryItem(NamedTuple):
     role: str | None = None
     sender: str | None = None
     text: str | None = None
-    display_text: str | None = None
     content: tuple[HistoryContent, ...] = ()
     name: str | None = None
-    arguments: str | None = None
     call_id: str | None = None
     summary: tuple[str, ...] = ()
     images: tuple[HistoryImage, ...] = ()
@@ -72,6 +70,10 @@ class HistoryItem(NamedTuple):
     call_ids: tuple[str, ...] = ()
     response_id: str | None = None
     metadata: object | None = None
+
+    @property
+    def arguments(self) -> str | None:
+        return self.text if self.kind == 'tool_call' else None
 
 
 def _history_freeze(value):
@@ -485,9 +487,9 @@ def _configure_functions(names):
         """
         return _request('message_agent', dict(agent_id=agent_id, message=message))
 
-    def cancel(*, engineer_id: str):
+    def cancel(*, agent_id: str):
         """Interrupt an Engineer's current turn. It remains available for follow-up messages."""
-        return _request('interrupt_engineer', dict(engineer_id=engineer_id))
+        return _request('interrupt_engineer', dict(agent_id=agent_id))
 
     def spawn_new_advisor(msg: str):
         """Start an independent Advisor consultation. Its answer arrives later as agent mail.
