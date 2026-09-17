@@ -221,7 +221,7 @@ fn queued_block(item: QueuedItem) -> UiBlock {
     }
 }
 
-/// An in-flight item as the transcript draws it.
+/// A streamed or committed response item as the transcript draws it.
 pub fn block(item: &Item) -> UiBlock {
     match item {
         Item::Text { text, phase } => UiBlock::AssistantMessage {

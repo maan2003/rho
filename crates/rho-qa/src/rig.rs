@@ -1185,7 +1185,7 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                     let completed_reply = matches!(
                         &entry.event,
-                        MirrorEvent::Replied { calls, .. } if calls.is_empty()
+                        MirrorEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_ui_proto::mirror::Item::ToolCall { .. }))
                     );
                     if matches!(&entry.event, MirrorEvent::Replied { .. }) {
                         replies += 1;

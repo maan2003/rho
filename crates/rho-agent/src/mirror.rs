@@ -7,8 +7,8 @@ use rho_core::ContextBlock;
 use rho_core::{AgentId, InferenceResponseItem, MessageSender, UnixMs};
 use rho_db::RhoDb;
 use rho_ui_proto::mirror::{
-    AgentPos, Live, LogEntry, MirrorEvent, RuntimeKind, Seq, SpawnedBy, ToolCallLine, ToolLine,
-    ToolOutcome, ToolStatus, Usage,
+    AgentPos, Item, Live, LogEntry, MirrorEvent, RuntimeKind, Seq, SpawnedBy, ToolOutcome,
+    ToolStatus, Usage,
 };
 
 use crate::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
@@ -253,15 +253,17 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 usage: cost,
                 context_used,
             } => MirrorEvent::Replied {
-                text: text.clone(),
-                calls: calls
-                    .iter()
-                    .map(|call| ToolCallLine {
+                items: (!text.is_empty())
+                    .then(|| Item::Text {
+                        text: text.clone(),
+                        phase: None,
+                    })
+                    .into_iter()
+                    .chain(calls.iter().map(|call| Item::ToolCall {
                         id: call.id.clone(),
                         name: call.name.clone(),
-                        what: tool_line(&call.arguments),
                         arguments: call.arguments.clone(),
-                    })
+                    }))
                     .collect(),
                 compacted: false,
                 usage: cost.as_ref().map(usage),
@@ -273,8 +275,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 at: *at,
             },
             crate::TranscriptLine::Compacted { context_used } => MirrorEvent::Replied {
-                text: String::new(),
-                calls: Vec::new(),
+                items: Vec::new(),
                 compacted: true,
                 usage: None,
                 context_used: *context_used,
@@ -354,8 +355,6 @@ fn tool_outcome(result: &rho_core::ToolResult) -> ToolOutcome {
     }
 }
 
-/// One response: the visible text joined, each call as a line, whether
-/// it compacted. Reasoning and provider bookkeeping say nothing.
 /// What the model had said when its request failed.
 fn partial_text(partial: &rho_core::PendingInferenceResponse) -> String {
     use rho_core::{StreamingContextItem, StreamingContextItemState};
@@ -385,79 +384,57 @@ fn replied(
     usage: Option<Usage>,
     at: UnixMs,
 ) -> MirrorEvent {
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    let mut compacted = false;
-    for item in items {
-        match item {
-            InferenceResponseItem::AssistantMessage { content, .. } => {
-                let part = rho_core::text_content(content);
-                if !part.trim().is_empty() {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&part);
-                }
-            }
-            InferenceResponseItem::ToolCall {
-                id,
-                name,
-                arguments,
-                ..
-            } => calls.push(ToolCallLine {
-                id: id.as_str().to_owned(),
-                name: name.as_str().to_owned(),
-                what: tool_line(arguments),
-                arguments: arguments.clone(),
-            }),
-            InferenceResponseItem::Compaction { .. } => compacted = true,
-            InferenceResponseItem::EncryptedReasoning { .. }
-            | InferenceResponseItem::RawReasoning { .. }
-            | InferenceResponseItem::Unknown { .. } => {}
-        }
-    }
     MirrorEvent::Replied {
-        text,
-        calls,
-        compacted,
+        items: items.iter().filter_map(|value| item(value)).collect(),
+        compacted: items
+            .iter()
+            .any(|value| matches!(value, InferenceResponseItem::Compaction { .. })),
         usage,
         context_used,
         at,
     }
 }
 
-/// What a call shows next to its name, read out of its arguments: the
-/// first of the fields a person would recognise, whole. The arguments
-/// themselves travel beside it, so a call whose arguments no field of this
-/// can name still draws what the model sent.
-pub fn tool_line(arguments: &str) -> ToolLine {
-    let Ok(serde_json::Value::Object(fields)) =
-        serde_json::from_str::<serde_json::Value>(arguments)
-    else {
-        return ToolLine::Nothing;
-    };
-    let text = |key: &str| {
-        fields
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    if let Some(path) = text("path").or_else(|| text("file_path")) {
-        return ToolLine::Path(path.into());
-    }
-    if let Some(command) = text("command").or_else(|| text("cmd")) {
-        return ToolLine::Command(command);
-    }
-    if let Some(query) = text("query").or_else(|| text("pattern")) {
-        return ToolLine::Query(query);
-    }
-    if let Some(agent) = text("agent_id").or_else(|| text("engineer_id")) {
-        return ToolLine::Query(agent);
-    }
-    ToolLine::Nothing
+/// A durable response item uses the same display vocabulary as streaming.
+pub fn item(value: &InferenceResponseItem) -> Option<Item> {
+    Some(match value {
+        InferenceResponseItem::AssistantMessage { content, phase, .. } => Item::Text {
+            text: rho_core::text_content(content),
+            phase: phase.map(crate::live::text_phase),
+        },
+        InferenceResponseItem::RawReasoning {
+            content, summary, ..
+        } => Item::Reasoning {
+            text: if summary.is_empty() {
+                content.clone()
+            } else {
+                summary.join("\n")
+            },
+        },
+        InferenceResponseItem::EncryptedReasoning { summary, .. } => {
+            if summary.is_empty() {
+                return None;
+            }
+            Item::Reasoning {
+                text: summary.join("\n"),
+            }
+        }
+        InferenceResponseItem::ToolCall {
+            id,
+            name,
+            arguments,
+            ..
+        } => Item::ToolCall {
+            id: id.as_str().to_owned(),
+            name: name.as_str().to_owned(),
+            arguments: arguments.clone(),
+        },
+        InferenceResponseItem::Compaction { .. } | InferenceResponseItem::Unknown { .. } => {
+            return None;
+        }
+    })
 }
 
-/// The opening Claude Code gives the summary it writes after compacting.
 fn is_compaction_summary(text: &str) -> bool {
     text.trim_start()
         .starts_with("This session is being continued from a previous conversation")
@@ -471,6 +448,71 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn responses_preserve_item_order_and_message_phase() {
+        let data = || {
+            Box::new(rho_inference::OpenAiResponsesProviderData::Message {
+                item_id: "visible".try_into().unwrap(),
+            })
+        };
+        let items = vec![
+            InferenceResponseItem::AssistantMessage {
+                provider_specific: data(),
+                content: vec![ContentPart::Text {
+                    text: "before".into(),
+                }],
+                phase: Some(rho_core::MessagePhase::Commentary),
+            },
+            InferenceResponseItem::ToolCall {
+                provider_specific: data(),
+                id: "middle".try_into().unwrap(),
+                name: "exec".try_into().unwrap(),
+                tool_type: rho_core::ToolType::Custom,
+                arguments: "print(42)".into(),
+            },
+            InferenceResponseItem::AssistantMessage {
+                provider_specific: data(),
+                content: vec![ContentPart::Text {
+                    text: "after".into(),
+                }],
+                phase: Some(rho_core::MessagePhase::FinalAnswer),
+            },
+            InferenceResponseItem::Unknown {
+                provider_specific: data(),
+            },
+        ];
+        let event = replied(
+            &items.iter().collect::<Vec<_>>(),
+            Some(71),
+            None,
+            UnixMs(23),
+        );
+        assert_eq!(
+            event,
+            MirrorEvent::Replied {
+                items: vec![
+                    Item::Text {
+                        text: "before".into(),
+                        phase: Some(rho_ui_proto::mirror::TextPhase::Commentary)
+                    },
+                    Item::ToolCall {
+                        id: "middle".into(),
+                        name: "exec".into(),
+                        arguments: "print(42)".into()
+                    },
+                    Item::Text {
+                        text: "after".into(),
+                        phase: Some(rho_ui_proto::mirror::TextPhase::FinalAnswer)
+                    },
+                ],
+                compacted: false,
+                usage: None,
+                context_used: Some(71),
+                at: UnixMs(23),
+            }
+        );
+    }
 
     #[test]
     fn worker_failure_is_mirrored_without_panicking() {
@@ -609,19 +651,5 @@ mod tests {
             wake: None,
         };
         assert!(strip(&spoken).is_some());
-    }
-
-    #[test]
-    fn tool_lines_read_the_recognisable_field() {
-        assert_eq!(
-            tool_line(r#"{"command":"ls -la\nmore"}"#),
-            ToolLine::Command("ls -la\nmore".into()),
-            "the whole command, every line"
-        );
-        assert_eq!(
-            tool_line(r#"{"file_path":"/tmp/a"}"#),
-            ToolLine::Path("/tmp/a".into())
-        );
-        assert_eq!(tool_line("not json"), ToolLine::Nothing);
     }
 }

@@ -26,7 +26,6 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast
 
 pub mod debug;
 mod desk_cells;
-mod detail;
 mod realtime;
 mod secret_store;
 pub mod workspace_channel;
@@ -3272,7 +3271,7 @@ fn agent_detail(
                         _ => None,
                     })
                     .flatten()
-                    .filter_map(detail::item)
+                    .filter_map(rho_agent::mirror::item)
                     .collect(),
             ),
             NativeEvent::RequestFailed { partial, .. } => DetailBody::Response(
@@ -3284,7 +3283,7 @@ fn agent_detail(
                         | rho_core::StreamingContextItemState::Finished(item) => item
                             .to_context_item()
                             .ok()
-                            .and_then(|item| detail::item(&item)),
+                            .and_then(|item| rho_agent::mirror::item(&item)),
                         _ => None,
                     })
                     .collect(),

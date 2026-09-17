@@ -9,7 +9,6 @@
 //! This vocabulary is shared with the daemon's raw log: the runtimes write
 //! these very types, so there are no twins to keep in step.
 
-use camino::Utf8PathBuf;
 use rho_core::{AgentId, AgentRole, MessageDelivery, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -70,28 +69,6 @@ pub enum SpawnedBy {
     Engineer,
 }
 
-/// What a tool call shows: what it acted on, whole, never its output.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum ToolLine {
-    Path(Utf8PathBuf),
-    Command(String),
-    Query(String),
-    Agent(AgentId),
-    Nothing,
-}
-
-impl ToolLine {
-    /// The line as a reader sees it next to the tool's name.
-    pub fn text(&self) -> String {
-        match self {
-            Self::Path(path) => path.to_string(),
-            Self::Command(command) | Self::Query(command) => command.clone(),
-            Self::Agent(agent) => agent.encoded(),
-            Self::Nothing => String::new(),
-        }
-    }
-}
-
 /// How a turn stopped.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum TurnOutcome {
@@ -135,28 +112,6 @@ pub struct Usage {
     pub cache_write_tokens: u64,
     pub cache_write_1h_tokens: u64,
     pub output_tokens: u64,
-}
-
-/// One call a response made: enough to draw it. `what` is the argument a
-/// person recognises, for the row's label; `arguments` is what the model
-/// actually sent, whole, because that is what a reader of a transcript is
-/// reading. A code-mode `exec` call has no field a label could name — its
-/// arguments are JavaScript source, not JSON — so without this it drew as
-/// the word "exec" and the code was gone.
-///
-/// A result is still a body fetched by position. Arguments are not: they
-/// are small next to an output, they are what the reader came for, and
-/// asking for them by position would mean a transcript that cannot be read
-/// until it is asked twice.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct ToolCallLine {
-    pub id: String,
-    pub name: String,
-    pub what: ToolLine,
-    /// Empty when the row came from a daemon older than this field; the
-    /// client then draws the label alone, as it did before.
-    #[senax(default)]
-    pub arguments: String,
 }
 
 /// How one call ended. The output is a body; ask for it by position.
@@ -242,9 +197,8 @@ pub enum MirrorEvent {
     },
     /// The model answered.
     Replied {
-        /// What it said, whole. Empty when it only called tools.
-        text: String,
-        calls: Vec<ToolCallLine>,
+        /// Visible response items, in model order, just like the live tail.
+        items: Vec<Item>,
         /// The answer compacted the context.
         compacted: bool,
         usage: Option<Usage>,
@@ -371,7 +325,7 @@ pub enum QueuedItem {
     Compaction,
 }
 
-/// One item of a response, as it streams or as `Detail` hands it back.
+/// One response item, shared by the live tail, committed mirror, and `Detail`.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Item {
     Text {

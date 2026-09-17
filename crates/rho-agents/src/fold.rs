@@ -15,7 +15,7 @@ use rho_ui_proto::mirror::{
 use rho_ui_proto::{AgentUsageBucket, Place};
 
 use crate::HostId;
-use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiTool, UiToolStatus};
+use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// How much an agent wants the user, as the view decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -537,8 +537,7 @@ impl TranscriptFold {
             }
             MirrorEvent::Results { results, .. } => self.finish_calls(results),
             MirrorEvent::Replied {
-                text,
-                calls,
+                items,
                 compacted,
                 context_used,
                 at,
@@ -547,38 +546,13 @@ impl TranscriptFold {
                 if let Some(used) = context_used {
                     self.context_used = Some((pos, *used));
                 }
-                if !text.is_empty() {
-                    self.push(
-                        pos,
-                        UiBlock::AssistantMessage {
-                            text: text.clone(),
-                            phase: None,
-                        },
-                    );
-                }
-                for call in calls {
-                    self.push(
-                        pos,
-                        UiBlock::Tool(UiTool {
-                            timing: self.exec_timings.get(&call.id).copied().unwrap_or_default(),
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            // What the model sent, whole. `what` is the
-                            // label's field and reduces a call to one of
-                            // them; a reader is reading the call.
-                            arguments: call.arguments.clone(),
-                            preview: None,
-                            // Until the `Sent` that carries its result says
-                            // otherwise.
-                            status: UiToolStatus::Running,
-                            output: None,
-                            error: None,
-                            started_at: Some(*at),
-                            finished_at: None,
-                            metadata: None,
-                            // Set when the event carrying its result closes it.
-                        }),
-                    );
+                for item in items {
+                    let mut block = crate::store::block(item);
+                    if let UiBlock::Tool(tool) = &mut block {
+                        tool.timing = self.exec_timings.get(&tool.id).copied().unwrap_or_default();
+                        tool.started_at = Some(*at);
+                    }
+                    self.push(pos, block);
                 }
                 if *compacted {
                     self.push(
@@ -747,9 +721,10 @@ fn delivered(queued: UiBlock) -> UiBlock {
 #[cfg(test)]
 mod tests {
     use rho_core::MessageDelivery;
-    use rho_ui_proto::mirror::{ToolCallLine, ToolLine, ToolOutcome, Usage};
+    use rho_ui_proto::mirror::{Item, ToolOutcome, Usage};
 
     use super::*;
+    use crate::state::UiTool;
 
     pub(crate) fn test_place() -> Place {
         Place {
@@ -782,6 +757,66 @@ mod tests {
     /// A long transcript, one page appended: the reader is told where the
     /// transcript first differs, and that is the end of what it already
     /// had. Handing the state whole made a row cost every row above it.
+    #[test]
+    fn committed_items_keep_live_order_and_phase_and_rewind_together() {
+        use rho_ui_proto::mirror::{Item, TextPhase};
+        let items = vec![
+            Item::Text {
+                text: "before".into(),
+                phase: Some(TextPhase::Commentary),
+            },
+            Item::ToolCall {
+                id: "middle".into(),
+                name: "exec".into(),
+                arguments: "print(42)".into(),
+            },
+            Item::Reasoning {
+                text: "after call".into(),
+            },
+            Item::Text {
+                text: "last".into(),
+                phase: Some(TextPhase::FinalAnswer),
+            },
+        ];
+        let event = MirrorEvent::Replied {
+            items: items.clone(),
+            compacted: false,
+            usage: None,
+            context_used: Some(73),
+            at: UnixMs(19),
+        };
+        let mut fold = TranscriptFold::new(&[(AgentPos(0), user("question", 1))]);
+        fold.tell(
+            AgentPos(1),
+            &MirrorEvent::Sent {
+                results: Vec::new(),
+                compaction: false,
+                at: UnixMs(2),
+            },
+        );
+        fold.tell(AgentPos(2), &event);
+        for (index, item) in items.iter().enumerate() {
+            let expected = crate::store::block(item);
+            let actual = &*fold.blocks[index + 1];
+            match (actual, expected) {
+                (UiBlock::Tool(tool), UiBlock::Tool(expected)) => {
+                    assert_eq!(tool.id, expected.id);
+                    assert_eq!(tool.arguments, "print(42)");
+                    assert_eq!(tool.started_at, Some(UnixMs(19)));
+                }
+                (actual, expected) => assert_eq!(actual, &expected),
+            }
+        }
+        fold.tell(
+            AgentPos(3),
+            &MirrorEvent::Rewound {
+                to: AgentPos(2),
+                at: UnixMs(20),
+            },
+        );
+        assert_eq!(fold.blocks.len(), 1);
+    }
+
     #[test]
     fn a_page_for_the_open_agent_costs_its_rows() {
         let mut fold = TranscriptFold::default();
@@ -871,11 +906,9 @@ mod tests {
                 at: UnixMs(3 + nth),
             });
             events.push(MirrorEvent::Replied {
-                text: String::new(),
-                calls: vec![ToolCallLine {
+                items: vec![Item::ToolCall {
                     id: format!("call-{nth}"),
                     name: "shell".to_owned(),
-                    what: ToolLine::Command(format!("echo {nth}")),
                     arguments: format!("{{\"cmd\":\"echo {nth}\"}}"),
                 }],
                 compacted: false,
@@ -920,7 +953,7 @@ mod tests {
     }
 
     /// A code-mode `exec` call's arguments are JavaScript source, not JSON,
-    /// so no field of `ToolLine` can name them and `what` is `Nothing`. The
+    /// so the mirror must preserve the complete source. The
     /// call has to carry them itself or the transcript shows the word
     /// "exec" and the code is gone, which is what the user saw.
     #[test]
@@ -938,11 +971,9 @@ mod tests {
                 at: UnixMs(2),
             },
             MirrorEvent::Replied {
-                text: String::new(),
-                calls: vec![ToolCallLine {
+                items: vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "exec".to_owned(),
-                    what: ToolLine::Nothing,
                     arguments: code.to_owned(),
                 }],
                 compacted: false,
@@ -971,11 +1002,9 @@ mod tests {
                 at: UnixMs(2),
             },
             MirrorEvent::Replied {
-                text: String::new(),
-                calls: vec![ToolCallLine {
+                items: vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "shell_command".to_owned(),
-                    what: ToolLine::Command("cargo build".to_owned()),
                     arguments: r#"{"command":"cargo build"}"#.to_owned(),
                 }],
                 compacted: false,
@@ -1003,11 +1032,9 @@ mod tests {
                 at: UnixMs(2),
             },
             MirrorEvent::Replied {
-                text: String::new(),
-                calls: vec![ToolCallLine {
+                items: vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "Read".to_owned(),
-                    what: ToolLine::Path("/tmp/README.md".into()),
                     arguments: r#"{"file_path":"/tmp/README.md"}"#.to_owned(),
                 }],
                 compacted: false,
@@ -1030,8 +1057,10 @@ mod tests {
                 at: UnixMs(4),
             },
             MirrorEvent::Replied {
-                text: "done looking".to_owned(),
-                calls: Vec::new(),
+                items: vec![Item::Text {
+                    text: "done looking".to_owned(),
+                    phase: None,
+                }],
                 compacted: false,
                 usage: Some(Usage {
                     model: "sol".to_owned(),
@@ -1099,8 +1128,7 @@ mod tests {
 
     fn replied_with_context(used: u64, at: u64) -> MirrorEvent {
         MirrorEvent::Replied {
-            text: String::new(),
-            calls: Vec::new(),
+            items: Vec::new(),
             compacted: false,
             usage: None,
             context_used: Some(used),

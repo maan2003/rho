@@ -29,9 +29,9 @@ use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; a daemon with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v4");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v5");
 /// Which host an agent was heard from, so a host's rows can go together.
-const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v2");
+const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v3");
 /// One agent's mirror, ordered by position, agent first: a range read
 /// gives one agent's events and nothing else.
 /// The version in the name is the story's format, not redb's. A fold that
@@ -47,12 +47,13 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// v3: `Created` names one place instead of a list of workdirs.
 /// v4: canonical native entries preserve every response boundary; recurring
 /// presentation was replaced by one-shot titles. Old projections must refetch.
+/// v5: ordered response items replace flattened text and calls.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
-    TableDefinition::new("gui_mirror_events_v4");
+    TableDefinition::new("gui_mirror_events_v5");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
-    TableDefinition::new("gui_agent_digest_v2");
+    TableDefinition::new("gui_agent_digest_v3");
 /// What the user last said about an agent, so Home ranks the same way on
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
@@ -74,7 +75,11 @@ impl RecordedTypeName for VerdictName {
 }
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 11] = [
+const RETIRED_TABLES: [&str; 15] = [
+    "gui_agent_host_v2",
+    "gui_agent_digest_v2",
+    "gui_mirror_host_v4",
+    "gui_mirror_events_v4",
     "gui_agent_head_v1",
     "gui_agent_story_v1",
     "gui_agent_attention_v1",
@@ -863,13 +868,13 @@ mod tests {
     #[test]
     fn canonical_history_retires_all_old_projections_but_keeps_user_verdicts() {
         const OLD_HOSTS: TableDefinition<&str, Sen<StoredHost>> =
-            TableDefinition::new("gui_mirror_host_v3");
+            TableDefinition::new("gui_mirror_host_v4");
         const OLD_EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
-            TableDefinition::new("gui_mirror_events_v3");
+            TableDefinition::new("gui_mirror_events_v4");
         const OLD_DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
-            TableDefinition::new("gui_agent_digest_v1");
+            TableDefinition::new("gui_agent_digest_v2");
         const OLD_AGENT_HOSTS: TableDefinition<AgentId, &str> =
-            TableDefinition::new("gui_agent_host_v1");
+            TableDefinition::new("gui_agent_host_v2");
         const UNRELATED: TableDefinition<u64, &str> = TableDefinition::new("unrelated_user_data");
         let dir = tempfile::tempdir().unwrap();
         let db = RhoDb::open(dir.path().join("client.redb"));

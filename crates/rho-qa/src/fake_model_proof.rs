@@ -344,8 +344,7 @@ async fn run_async(args: Args) -> Result<()> {
                             }
                         }
                         MirrorEvent::Replied {
-                            text,
-                            calls: reply_calls,
+                            items,
                             compacted: did_compact,
                             at,
                             ..
@@ -355,17 +354,31 @@ async fn run_async(args: Args) -> Result<()> {
                                 .context("Replied without preceding Sent")?;
                             latencies.push(at.saturating_duration_since(sent));
                             replies += 1;
-                            calls += reply_calls.len();
+                            calls += items
+                                .iter()
+                                .filter(|item| {
+                                    matches!(item, rho_ui_proto::mirror::Item::ToolCall { .. })
+                                })
+                                .count();
                             compacted += u64::from(did_compact);
-                            clarifying += u64::from(text.trim_end().ends_with('?'));
+                            clarifying += u64::from(
+                                items
+                                    .iter()
+                                    .rev()
+                                    .find_map(|item| match item {
+                                        rho_ui_proto::mirror::Item::Text { text, .. } => Some(text),
+                                        _ => None,
+                                    })
+                                    .is_some_and(|text| text.trim_end().ends_with('?')),
+                            );
                             pending_details
                                 .insert((entry.agent_id, entry.pos), ExpectedDetail::Response);
                             client
                                 .send(&ClientMessage::Detail {
                                     agent_id: entry.agent_id,
                                     pos: entry.pos,
-                                    // One position per request here; the GUI
-                                    // batches a chunk's positions into one.
+                                    // Exercise detail retrieval independently of the GUI,
+                                    // which does not fetch tool output.
                                     more: Vec::new(),
                                 })
                                 .await?;
