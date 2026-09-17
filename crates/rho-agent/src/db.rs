@@ -63,19 +63,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-mod migration;
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "b4e2c7a1",
-        to: "d8f63a20",
-        migrate: migration::migrate,
-    },
-    AgentDbMigration {
-        from: "d8f63a20",
-        to: CURRENT_AGENT_DB_FORMAT,
-        migrate: migration::retire_stream_progress,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);

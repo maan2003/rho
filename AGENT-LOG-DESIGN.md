@@ -11,7 +11,7 @@ else about it is derived.
 
 Native conversation authority is `AgentEvent::Native(NativeEvent)`, not an
 independently mutated block history. Provider input, restart recovery, and GUI
-presentation are projections. Earlier block-shaped records are converted by the temporary database migration. Claude Code owns its own conversation and compaction; Rho's Claude
+presentation are projections. Earlier block-shaped records have been converted to the canonical format. Claude Code owns its own conversation and compaction; Rho's Claude
 records are observations, admission evidence, and an output outbox, not a native
 conversation imposed on the CLI.
 

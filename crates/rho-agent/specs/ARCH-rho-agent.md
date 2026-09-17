@@ -15,9 +15,8 @@ There is no in-daemon runtime fallback.
 The append-only `NativeEvent` log owns the recoverable conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
 tail while restart recovery projects only committed transactions. Requests and responses use the same canonical grouped entries consumed by
-inference. A temporary atomic database migration rewrites historical raw rows
-at their original positions, preserving response boundaries, IDs, provider data,
-and context-window offsets; normal replay does not normalize legacy events. Claude Code instead owns its session, history, and compaction; Rho
+inference. Historical rows already use this canonical format; normal replay does not
+normalize legacy events. Claude Code instead owns its session, history, and compaction; Rho
 records bounded transcript observations, execution admission, output ownership,
 and timing, and controls its worker-local MCP server.
 
