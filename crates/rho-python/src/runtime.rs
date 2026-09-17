@@ -181,11 +181,11 @@ fn execution_event(kind: &str, fields: &PyDictRef, vm: &VirtualMachine) -> PyRes
             max_tokens: field(fields, "max_tokens", vm)?,
             important: field(fields, "important", vm)?,
         },
-        "checkin" => Event::Checkin {
+        "max_wait" => Event::MaxWait {
             cell,
             seconds: field(fields, "seconds", vm)?,
-            wake_on_tools: field(fields, "wake_on_tools", vm)?,
         },
+        "suppress_tool_wakeups" => Event::SuppressToolWakeups { cell },
         "finished" => Event::Finished {
             cell,
             error: field(fields, "error", vm)?,
@@ -275,7 +275,8 @@ pub(super) fn spawn(
                                 | Event::Returned { cell, .. }
                                 | Event::Call { cell, .. }
                                 | Event::Text { cell, .. }
-                                | Event::Checkin { cell, .. }
+                                | Event::MaxWait { cell, .. }
+                                | Event::SuppressToolWakeups { cell }
                                 | Event::Finished { cell, .. } => *cell,
                                 Event::Stopped { .. } => {
                                     return Err(vm.new_value_error("invalid execution event"));

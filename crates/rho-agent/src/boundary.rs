@@ -122,14 +122,14 @@ pub(crate) const FOREGROUND_PATIENCE: Duration = Duration::from_secs(60);
 pub(crate) const FAILURE_PATIENCE: Duration = Duration::from_secs(20);
 /// How long the model is left alone with its cell when it did not say.
 ///
-/// The one number the model can overrule, through `set_checkin`. Every other
+/// The one number the model can overrule, through `set_max_wait`. Every other
 /// number is a patience — how long something worth sending waits for
 /// company. This is the opposite: it is the model asking to be woken, and it
 /// is honoured whether or not anything arrived, because an empty request is
 /// how the model finds out there is nothing to see and asks for longer next
 /// time. It is the most any event waits: a background job with nothing to
 /// hurry it is still delivered here.
-pub(crate) const DEFAULT_WAIT: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_WAIT: Duration = rho_agent_tools::PythonCheckin::DEFAULT_MAX_WAIT;
 
 /// What the model's latest turn settled: when it spoke, and whether it made a
 /// call it is waiting on.
@@ -487,7 +487,7 @@ pub(crate) fn boundary(
             _ => {}
         }
     }
-    // `wake_on_tools=False`: the model said nothing from the notebook should
+    // `suppress_tool_wakeups()`: the model said nothing from the notebook should
     // wake it. The events are still recorded, and still delivered with
     // whatever does.
     if !tools_suppressed {

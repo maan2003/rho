@@ -282,23 +282,23 @@ image(reference) → Awaitable[None]
 
 ### Waiting and wakeups
 
-Set the current turn's check-in policy. The default interval is 120 seconds; omit this call unless
-changing the interval or suppressing tool wakeups. Accepted intervals are 1–3600 seconds.
-set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
+sooner. The default is 120 seconds; accepted values are 1–3600 seconds.
+set_max_wait(seconds: int) → None
 
-Set a check-in alongside the work:
+Suppress early wakes from tool output, completion, errors, notify, and exec completion. The timer,
+user messages, and agent mail can still wake the model. Buffered output arrives on the next wake.
+suppress_tool_wakeups() → None
+
+The controls are independent. A new exec call resets both to their defaults; older cells cannot
+change the newer call's settings. Set them before an await that may suspend the cell.
 
     command("git diff --check")
     command("cargo test")
-    set_checkin(after_seconds=300)
+    set_max_wait(seconds=300)
 
-Set the policy alongside the work, before an await that might suspend the cell past the end of the
-model turn. Follow the exec return rules above to wait; no Python sleep is needed.
-
-With wake_on_tools=True, tool output or completion can wake the model before the timer. With False,
-only the timer, user messages, or agent mail wake it—not command output, host operations, errors,
-notify, or exec completion. Work continues and buffered output arrives on the next wake. Older
-cells cannot change a newer turn's policy.
+To suppress tool-triggered wakes as well, call suppress_tool_wakeups(). Neither function sleeps
+or stops running work. Follow the exec return rules above to wait; no Python sleep is needed.
 
 ### Environment and limits
 
@@ -431,7 +431,7 @@ Use `agents.message` to send findings, questions, or a scoped next action to an 
 For back-and-forth collaboration, answer the agent's question or assess its findings, then send
 the next scoped request and say whether another reply is needed. Stop exchanging messages when
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, use the check-in rules under Tool execution.
+tasks while awaiting a reply. When blocked, use the waiting rules under Tool execution.
 
 Child final responses arrive automatically as agent mail. Do not also send the same completion
 report through `agents.message`.
@@ -623,7 +623,7 @@ architectural advice, and strategic planning for software engineering tasks.
 You can exchange follow-up messages with the requesting Engineer through `agents.message`. Ask a
 focused question when missing context would materially change your recommendation and cannot be
 obtained from the workspace. Continue independent investigation while awaiting a reply; when
-blocked, use the Python check-in mechanism. Follow-up messages can refine or challenge your
+blocked, use the Python waiting controls. Follow-up messages can refine or challenge your
 findings, so build on the existing analysis rather than restarting it.
 
 Key responsibilities:
@@ -955,23 +955,23 @@ image(reference) → Awaitable[None]
 
 ### Waiting and wakeups
 
-Set the current turn's check-in policy. The default interval is 120 seconds; omit this call unless
-changing the interval or suppressing tool wakeups. Accepted intervals are 1–3600 seconds.
-set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
+sooner. The default is 120 seconds; accepted values are 1–3600 seconds.
+set_max_wait(seconds: int) → None
 
-Set a check-in alongside the work:
+Suppress early wakes from tool output, completion, errors, notify, and exec completion. The timer,
+user messages, and agent mail can still wake the model. Buffered output arrives on the next wake.
+suppress_tool_wakeups() → None
+
+The controls are independent. A new exec call resets both to their defaults; older cells cannot
+change the newer call's settings. Set them before an await that may suspend the cell.
 
     command("git diff --check")
     command("cargo test")
-    set_checkin(after_seconds=300)
+    set_max_wait(seconds=300)
 
-Set the policy alongside the work, before an await that might suspend the cell past the end of the
-model turn. Follow the exec return rules above to wait; no Python sleep is needed.
-
-With wake_on_tools=True, tool output or completion can wake the model before the timer. With False,
-only the timer, user messages, or agent mail wake it—not command output, host operations, errors,
-notify, or exec completion. Work continues and buffered output arrives on the next wake. Older
-cells cannot change a newer turn's policy.
+To suppress tool-triggered wakes as well, call suppress_tool_wakeups(). Neither function sleeps
+or stops running work. Follow the exec return rules above to wait; no Python sleep is needed.
 
 ### Environment and limits
 
@@ -997,7 +997,7 @@ registration order without waiting for earlier operations to finish.
 For back-and-forth collaboration, answer the agent's question or assess its findings, then send
 the next scoped request and say whether another reply is needed. Stop exchanging messages when
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, use the check-in rules under Tool execution.
+tasks while awaiting a reply. When blocked, use the waiting rules under Tool execution.
 
 Child final responses arrive automatically as agent mail. Do not also send the same completion
 report through `agents.message`.
@@ -1333,20 +1333,24 @@ Inspect its globals from a later cell without stopping it:
 
     text(progress)
 
-Set this turn's check-in policy before an await that might suspend the cell. The default interval
-is 120 seconds; accepted values are 1–3600 seconds. A check-in reports through the MCP call; do not
-sleep in Python merely to wait for reporting.
-set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
+sooner. The default is 120 seconds; accepted values are 1–3600 seconds.
+set_max_wait(seconds: int) → None
 
-Set a check-in alongside the work:
+Suppress early wakes from tool output, completion, errors, notify, and exec completion. The timer,
+user messages, and agent mail can still wake the model. Buffered output arrives on the next wake.
+suppress_tool_wakeups() → None
+
+The controls are independent. A new exec call resets both to their defaults; older cells cannot
+change the newer call's settings. Set them before an await that may suspend the cell.
 
     command("git diff --check")
     command("cargo test")
-    set_checkin(after_seconds=300)
+    set_max_wait(seconds=300)
 
-With wake_on_tools=False, output, completion, errors, notify, and exec completion do not wake the
-model. Only the timer, user messages, or agent mail do. Work continues; buffered output arrives on
-the next wake. Older cells cannot change a newer turn's policy.
+To suppress tool-triggered wakes as well, call suppress_tool_wakeups(). Neither function sleeps
+or stops running work. Results report through the MCP call; do not sleep in Python merely to
+wait for reporting.
 
 The standard library, PyYAML, and HTTPX are available. Python runs in-process, not in a security
 sandbox; cwd is notebook-local, other process-global APIs retain their normal effects, and native
@@ -1457,7 +1461,7 @@ push, or modify shared infrastructure. You cannot spawn or interrupt agents.
 For back-and-forth collaboration, answer the agent's question or assess its findings, then send
 the next scoped request and say whether another reply is needed. Stop exchanging messages when
 the requested work is complete; do not create acknowledgment loops. Keep working on independent
-tasks while awaiting a reply. When blocked, use a check-in; do not repeatedly poll.
+tasks while awaiting a reply. When blocked, use the waiting controls; do not repeatedly poll.
 
 Use the agent's role-prefixed handle.
 agents.message(*, agent_id: str, message: str) → Awaitable[str]
@@ -1808,7 +1812,7 @@ mod tests {
         assert!(!prompt.contains("class HistoryItem"));
         assert!(prompt.contains("Issue at most one exec call per response"));
         assert!(prompt.contains("end the model turn"));
-        assert!(prompt.contains("With False,"));
+        assert!(prompt.contains("suppress_tool_wakeups() → None"));
         assert!(prompt.contains("separate cursor starting at byte zero"));
         assert!(prompt.contains("await handle → {id: int, exit_code: int | None}"));
         assert!(prompt.contains("returns a persistent command handle"));
@@ -1986,7 +1990,11 @@ mod tests {
                 },
             ),
         ] {
+            assert!(!prompt.contains("set_checkin"));
             for example in [
+                "set_max_wait(seconds: int) → None",
+                "suppress_tool_wakeups() → None",
+                "The controls are independent. A new exec call resets both to their defaults",
                 "web.run(**request) → Awaitable[str]",
                 "preloaded in Python",
                 r#"web.run(search_query=[{"q": "search terms"}])"#,
@@ -1998,7 +2006,7 @@ mod tests {
                 "    job.cancel()\n    await job",
                 "        await asyncio.sleep(5)",
                 "    text(progress)",
-                "    set_checkin(after_seconds=300)",
+                "    set_max_wait(seconds=300)",
             ] {
                 assert!(prompt.contains(example), "{example}");
             }

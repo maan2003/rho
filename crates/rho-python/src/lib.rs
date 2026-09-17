@@ -112,10 +112,12 @@ pub enum Event {
         max_tokens: usize,
         important: bool,
     },
-    Checkin {
+    MaxWait {
         cell: CellId,
         seconds: u64,
-        wake_on_tools: bool,
+    },
+    SuppressToolWakeups {
+        cell: CellId,
     },
     Finished {
         cell: CellId,
@@ -1033,7 +1035,8 @@ def forbidden(*args, **kwargs):
     raise AssertionError('runtime event called Python JSON encoder')
 json.dumps = forbidden
 text('Ω "quoted"')
-set_checkin(after_seconds=3, wake_on_tools=False)
+set_max_wait(seconds=3)
+suppress_tool_wakeups()
 "#
                 .into(),
             })
@@ -1044,11 +1047,14 @@ set_checkin(after_seconds=3, wake_on_tools=False)
         }
         assert!(matches!(
             next(&mut rx).await,
-            Event::Checkin {
+            Event::MaxWait {
                 cell: 1,
                 seconds: 3,
-                wake_on_tools: false
             }
+        ));
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::SuppressToolWakeups { cell: 1 }
         ));
         assert!(matches!(
             next(&mut rx).await,

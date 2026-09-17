@@ -502,7 +502,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     assert!(!monitor.done());
 
     let mut idle = tool.exec(
-        call("idle", json!("set_checkin(300)")),
+        call("idle", json!("set_max_wait(300)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*idle, Signal::Ended).await;
@@ -563,7 +563,7 @@ async fn python_immediate_stdin_and_checkin_controls() {
     );
     assert!(result.output.contains("hello"), "{}", result.output);
     let mut control = tool.exec(
-        call("p2", json!("set_checkin(after_seconds=300)")),
+        call("p2", json!("set_max_wait(seconds=300)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*control, Signal::Ended).await;
@@ -702,7 +702,7 @@ async fn old_execution_keeps_its_own_checkin_without_touching_new_execution() {
     let mut old = tool.exec(
         call(
             "old",
-            json!("notify('waiting')\nawait asyncio.sleep(0.2)\nset_checkin(3600, wake_on_tools=False)"),
+            json!("notify('waiting')\nawait asyncio.sleep(0.2)\nset_max_wait(3600)\nsuppress_tool_wakeups()"),
         ),
         SourceWaker::new(wake.clone()),
     );
@@ -710,7 +710,7 @@ async fn old_execution_keeps_its_own_checkin_without_touching_new_execution() {
     old.first_output();
     old.acknowledge_output();
     let new = tool.exec(
-        call("new", json!("set_checkin(300)")),
+        call("new", json!("set_max_wait(300)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*new, Signal::Ended).await;
@@ -815,7 +815,7 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
     let tool = python(shell(), Vec::new());
     let wake = Arc::new(Notify::new());
     let source = format!(
-        "set_checkin(300)\ncommand('echo registered')\nweb.run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
+        "set_max_wait(300)\ncommand('echo registered')\nweb.run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
         marker.to_str().unwrap()
     );
     let mut cell = tool.exec(call("sync", json!(source)), SourceWaker::new(wake.clone()));
@@ -1202,6 +1202,46 @@ async fn python_announces_sources_once_in_registration_order_including_late_sour
 }
 
 #[tokio::test]
+async fn wait_controls_are_independent_and_reset_for_each_exec() {
+    let tool = PythonNotebook::new(shell(), Vec::new()).unwrap();
+    let wake = Arc::new(Notify::new());
+    for (source, expected) in [
+        (
+            "suppress_tool_wakeups()\nset_max_wait(seconds=317)",
+            Some((317, false)),
+        ),
+        (
+            "set_max_wait(seconds=219)\nsuppress_tool_wakeups()",
+            Some((219, false)),
+        ),
+        ("suppress_tool_wakeups()", Some((120, false))),
+        ("set_max_wait(seconds=1)", Some((1, true))),
+        ("set_max_wait(seconds=3600)", Some((3600, true))),
+        ("pass", None),
+    ] {
+        let mut cell = tool.exec(
+            call("wait-controls", json!(source)),
+            SourceWaker::new(wake.clone()),
+        );
+        until(&wake, &*cell, Signal::Ended).await;
+        assert_eq!(
+            cell.execution()
+                .facts()
+                .checkin
+                .map(|policy| (policy.after.as_secs(), policy.wake_on_tools)),
+            expected,
+            "{source}",
+        );
+        assert_eq!(
+            cell.first_output().status,
+            ToolOutputStatus::Success,
+            "{source}"
+        );
+        cell.acknowledge_output();
+    }
+}
+
+#[tokio::test]
 async fn checkin_policy_is_validated_and_does_not_discard_output() {
     let tool = PythonNotebook::new(shell(), Vec::new()).unwrap();
     let wake = Arc::new(Notify::new());
@@ -1211,17 +1251,19 @@ async fn checkin_policy_is_validated_and_does_not_discard_output() {
             json!(
                 r#"
 assert "set_patience" not in globals()
+assert "set_checkin" not in globals()
 for args in [
-    dict(after_seconds=True), dict(after_seconds=0), dict(after_seconds=3601),
-    dict(after_seconds=1.5), dict(wake_on_tools="false"), dict(wake_on_tools=0), dict(seconds=300),
+    dict(seconds=True), dict(seconds=0), dict(seconds=3601), dict(seconds=1.5),
+    dict(after_seconds=300), dict(seconds=300, wake_on_tools=False), {},
 ]:
     try:
-        set_checkin(**args)
+        set_max_wait(**args)
     except (TypeError, ValueError):
         pass
     else:
         raise AssertionError(args)
-set_checkin(after_seconds=300, wake_on_tools=False)
+set_max_wait(seconds=300)
+suppress_tool_wakeups()
 notify("buffered notification")
 await command("printf buffered-command")
 "#

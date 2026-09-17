@@ -133,7 +133,7 @@ including across failure, a later successful attempt, and restart.
 Once any Python unit has been admitted, a recoverable provider failure ends the
 model turn with the accepted prefix as its original `exec` call. Its cell and
 commands are ordinary sources: completion, output batching, user input, mail, and
-the cell's check-in and tool-wakeup policy determine the next request exactly as
+the cell's maximum wait and tool-wakeup policy determine the next request exactly as
 after a completed model response. A transport retry deadline must not bypass
 those sources. A pending `await` remains running, not uncertain execution.
 

@@ -56,7 +56,7 @@ use crate::{
 };
 
 /// Whether the model's turn made a call it is waiting on. Only the notebook
-/// says anything about pacing, through `set_checkin` inside the call.
+/// says anything about pacing, through `set_max_wait` inside the call.
 
 // -- what is waiting to reach the model -------------------------------------
 //

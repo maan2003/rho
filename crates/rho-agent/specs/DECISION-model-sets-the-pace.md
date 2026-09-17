@@ -23,12 +23,14 @@ nothing foreground running, everything goes at once. While it is:
 - a background success waits for the next wake, whatever causes it;
 - a `notify()` waits a second, to coalesce with the ones behind it.
 
-The model's check-in (`set_checkin`, default 120 seconds, lasting one turn) is
-the most anything waits. It shortens nobody's patience, a turn of prose asks
-for none, and `wake_on_tools=False` suppresses every notebook event for that
-turn but not the check-in, user input or mail. Patience is measured from when
-the scheduler first saw the event while able to act, never from the instant a
-tool recorded it, and the reason each request went out is recorded with it
+The model's maximum wait (`set_max_wait`, default 120 seconds) is the most
+anything waits. It shortens nobody's patience; a model response without an
+exec call requests no timed wake. `suppress_tool_wakeups()` suppresses every
+notebook event but not the timer, user input or mail. These controls are
+independent and belong to the latest exec call; a newer call resets both
+to their defaults and older cells cannot override its settings.
+Patience is measured from when the scheduler first saw the event while able
+to act, never from the instant a tool recorded it, and the reason each request went out is recorded with it
 (`WakeFacts` on `Sent` and on Claude `Transcript` rows).
 
 ## Rationale

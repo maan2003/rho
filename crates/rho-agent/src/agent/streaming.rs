@@ -1031,8 +1031,12 @@ pub(in crate::agent) mod tests {
                 let directory = tempfile::tempdir().unwrap();
                 let mut agent = agent(directory.path()).await;
                 let prefix = format!(
-                    "set_checkin(after_seconds=600, wake_on_tools={})\njob = command(\"while [ ! -e release ]; do sleep 0.01; done; printf released\")\n{}",
-                    if wake_on_tools { "True" } else { "False" },
+                    "set_max_wait(seconds=600)\n{}job = command(\"while [ ! -e release ]; do sleep 0.01; done; printf released\")\n{}",
+                    if wake_on_tools {
+                        ""
+                    } else {
+                        "suppress_tool_wakeups()\n"
+                    },
                     if await_job { "await job\n" } else { "" },
                 );
                 agent

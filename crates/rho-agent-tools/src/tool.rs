@@ -15,12 +15,25 @@ use std::sync::Arc;
 use rho_core::UnixMs;
 use tokio::sync::Notify;
 
-/// What a cell's `set_checkin` asked for: how long the model is left alone,
+/// What a cell's wait controls asked for: how long the model is left alone,
 /// and whether the notebook may wake it sooner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PythonCheckin {
     pub after: std::time::Duration,
     pub wake_on_tools: bool,
+}
+
+impl PythonCheckin {
+    pub const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+}
+
+impl Default for PythonCheckin {
+    fn default() -> Self {
+        Self {
+            after: Self::DEFAULT_MAX_WAIT,
+            wake_on_tools: true,
+        }
+    }
 }
 
 /// One cell, as the scheduler reads it. Every field is an observation the

@@ -1145,16 +1145,15 @@ impl rho_python::Execution for PythonExec {
             Event::Text {
                 text, important, ..
             } => self.link.lock().unwrap().write(&text, important),
-            Event::Checkin {
-                seconds,
-                wake_on_tools,
-                ..
-            } => {
+            Event::MaxWait { seconds, .. } => {
                 let mut state = self.link.lock().unwrap();
-                state.checkin = Some(crate::PythonCheckin {
-                    after: std::time::Duration::from_secs(seconds),
-                    wake_on_tools,
-                });
+                state.checkin.get_or_insert_default().after =
+                    std::time::Duration::from_secs(seconds);
+                state.waker.wake();
+            }
+            Event::SuppressToolWakeups { .. } => {
+                let mut state = self.link.lock().unwrap();
+                state.checkin.get_or_insert_default().wake_on_tools = false;
                 state.waker.wake();
             }
             Event::Finished { error, .. } => {
