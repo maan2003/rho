@@ -322,7 +322,7 @@ async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
             agent.start_request(UnixMs::now(), None).await.unwrap();
         }
         reply(&mut agent, vec![exec("recover-history", &format!(
-            "original = next(item for item in history if item.kind == 'tool_result' and item.call_id == 'old')\nassert original.text == 'x' * {}\nassert any(item.kind == 'tool_history_evicted' for item in history)",
+            "original = next(item for item in transcript if item.kind == 'tool_result' and item.call_id == 'old')\nassert original.text == 'x' * {}\nassert any(item.kind == 'tool_history_evicted' for item in transcript)",
             if enough { 150000 } else { 300 }
         ))], 100).await;
         cell_returned(&agent).await;

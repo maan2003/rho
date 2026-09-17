@@ -122,25 +122,27 @@ async fn history_is_a_lazy_read_only_snapshot_sequence() {
             json!(
                 r#"
 await asyncio.sleep(0.05)
-assert len(history) == 2
-assert history[-1].kind == 'tool_history_evicted'
-assert history[:1][0].text == 'before'
-assert history[0].content[1].data == b'\x01\x02\x03'
-assert history[-1].call_ids == ('old-call',)
-assert type(history[0]).__name__ == 'HistoryItem'
+assert "history" not in globals()
+assert repr(transcript) == "transcript(2 items)"
+assert len(transcript) == 2
+assert transcript[-1].kind == 'tool_history_evicted'
+assert transcript[:1][0].text == 'before'
+assert transcript[0].content[1].data == b'\x01\x02\x03'
+assert transcript[-1].call_ids == ('old-call',)
+assert type(transcript[0]).__name__ == 'HistoryItem'
 try:
-    history[0].text = 'changed'
+    transcript[0].text = 'changed'
 except AttributeError:
     pass
 else:
-    raise AssertionError('history item was mutable')
+    raise AssertionError('transcript item was mutable')
 try:
-    history[0] = None
+    transcript[0] = None
 except TypeError:
     pass
 else:
-    raise AssertionError('history sequence was mutable')
-print(history[0].text, history[-1].call_ids[0])
+    raise AssertionError('transcript sequence was mutable')
+print(transcript[0].text, transcript[-1].call_ids[0])
 "#
             ),
         ),
@@ -163,7 +165,7 @@ print(history[0].text, history[-1].call_ids[0])
     let mut next = notebook.exec(
         call(
             "history-refresh",
-            json!("assert len(history) == 1\nprint(history[0].role, history[0].text)"),
+            json!("assert len(transcript) == 1\nprint(transcript[0].role, transcript[0].text)"),
         ),
         SourceWaker::new(wake.clone()),
     );
@@ -228,7 +230,7 @@ async fn history_preserves_tool_and_provider_transcript_fields() {
             "history-fields",
             json!(
                 r#"
-tool_call, result, update = history
+tool_call, result, update = transcript
 assert (tool_call.kind, tool_call.name, tool_call.arguments, tool_call.call_id) == (
     'tool_call', 'lookup', '{"needle":"x"}', 'kept-call')
 assert tool_call.provider.tag == 'test.provider'
@@ -242,9 +244,9 @@ assert (result.started_at, result.finished_at) == (10, 20)
 assert result.images[0].data == b'\x09\x08'
 assert result.images[0].detail == 'original'
 assert (update.kind, update.text, update.at) == ('tool_update', 'progress', 15)
-assert [item.kind for item in history if "needle" in (item.text or "")] == ['tool_call']
-assert [item.kind for item in history if "bounded" in (item.text or "")] == ['tool_result']
-assert not any("complete" in (item.text or "") or "unbounded" in (item.text or "") for item in history)
+assert [item.kind for item in transcript if "needle" in (item.text or "")] == ['tool_call']
+assert [item.kind for item in transcript if "bounded" in (item.text or "")] == ['tool_result']
+assert not any("complete" in (item.text or "") or "unbounded" in (item.text or "") for item in transcript)
 print(tool_call.name, result.text, update.text)
 "#
             ),

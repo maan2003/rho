@@ -436,10 +436,10 @@ delivery.
 
 ## Context and continuity
 
-### History
+### Transcript
 
-history is a lazy, read-only transcript snapshot for the current execution. Indexing loads one
-record; slicing loads the selected records. Eviction from model context does not erase history.
+transcript is a lazy, read-only transcript snapshot for the current execution. Indexing loads one
+record; slicing loads the selected records. Eviction from model context does not erase transcript.
 
 item.text contains message or reasoning text, tool-call source, or bounded tool output; it may be
 None. Tool calls also expose name and call_id; arguments is an alias for their text. Results expose
@@ -456,8 +456,8 @@ Search backward for text, stopping after five matches:
 
     query = "connection refused".casefold()
     found = 0
-    for i in range(len(history) - 1, -1, -1):
-        item = history[i]
+    for i in range(len(transcript) - 1, -1, -1):
+        item = transcript[i]
         body = item.text or ""
         if query in body.casefold():
             print(i, item.kind, item.name, body[:2000])
@@ -471,14 +471,14 @@ only tool output, filter with item.kind in ("tool_result", "tool_update").
 Inspect a matching entry and its neighbors using the printed index:
 
     i = 42  # Replace with a matching index.
-    for j in range(max(0, i - 2), min(len(history), i + 3)):
-        item = history[j]
+    for j in range(max(0, i - 2), min(len(transcript), i + 3)):
+        item = transcript[j]
         print(j, item.kind, (item.text or "")[:2000])
 
 ### Eviction and restart
 
 The harness may remove old tool exchanges from provider context or compact that context. Eviction
-does not delete the original recorded transcript available through `history`; it does not reset
+does not delete the original recorded transcript available through transcript; it does not reset
 Python state or stop live work. Use the boundary notice to distinguish eviction from a runtime
 restart.
 
@@ -959,10 +959,10 @@ agents.message(*, agent_id: str, message: str) -> Awaitable[str]
 
 ## Context and continuity
 
-### History
+### Transcript
 
-history is a lazy, read-only transcript snapshot for the current execution. Indexing loads one
-record; slicing loads the selected records. Eviction from model context does not erase history.
+transcript is a lazy, read-only transcript snapshot for the current execution. Indexing loads one
+record; slicing loads the selected records. Eviction from model context does not erase transcript.
 
 item.text contains message or reasoning text, tool-call source, or bounded tool output; it may be
 None. Tool calls also expose name and call_id; arguments is an alias for their text. Results expose
@@ -979,8 +979,8 @@ Search backward for text, stopping after five matches:
 
     query = "connection refused".casefold()
     found = 0
-    for i in range(len(history) - 1, -1, -1):
-        item = history[i]
+    for i in range(len(transcript) - 1, -1, -1):
+        item = transcript[i]
         body = item.text or ""
         if query in body.casefold():
             print(i, item.kind, item.name, body[:2000])
@@ -994,14 +994,14 @@ only tool output, filter with item.kind in ("tool_result", "tool_update").
 Inspect a matching entry and its neighbors using the printed index:
 
     i = 42  # Replace with a matching index.
-    for j in range(max(0, i - 2), min(len(history), i + 3)):
-        item = history[j]
+    for j in range(max(0, i - 2), min(len(transcript), i + 3)):
+        item = transcript[j]
         print(j, item.kind, (item.text or "")[:2000])
 
 ### Eviction and restart
 
 The harness may remove old tool exchanges from provider context or compact that context. Eviction
-does not delete the original recorded transcript available through `history`; it does not reset
+does not delete the original recorded transcript available through transcript; it does not reset
 Python state or stop live work. Use the boundary notice to distinguish eviction from a runtime
 restart.
 
@@ -1304,7 +1304,7 @@ the next wake. Older cells cannot change a newer turn's policy.
 The standard library, PyYAML, and HTTPX are available. Python runs in-process, not in a security
 sandbox; cwd is notebook-local, other process-global APIs retain their normal effects, and native
 extensions are unsupported. A runtime restart loses globals and handles; do not automatically
-replay interrupted work. The native Rho history API is empty in Claude sessions.
+replay interrupted work. The native Rho transcript API is empty in Claude sessions.
 
 Output budgets are capped at 10000 tokens. Each command retains its first 8 MiB, with overflow
 counts. Up to 64 command handles and 32 image references are retained; old completed, delivered
@@ -1669,7 +1669,7 @@ mod tests {
         assert!(collaboration.contains("agents.cancel("));
         assert!(collaboration.contains("agents.message("));
         assert!(prompt.contains("tool-call source, or bounded tool output"));
-        assert!(prompt.contains("for i in range(len(history) - 1, -1, -1):"));
+        assert!(prompt.contains("for i in range(len(transcript) - 1, -1, -1):"));
         assert!(!prompt.contains("display_text"));
         assert!(!prompt.contains("class HistoryItem"));
         assert!(prompt.contains("Issue at most one exec call per response"));
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(prompt.contains("agents.message("));
         assert!(prompt.contains("Use `web.run` for web searches and reading web pages."));
         assert!(prompt.contains("tool-call source, or bounded tool output"));
-        assert!(prompt.contains("for i in range(len(history) - 1, -1, -1):"));
+        assert!(prompt.contains("for i in range(len(transcript) - 1, -1, -1):"));
         assert!(!prompt.contains("display_text"));
         assert!(!prompt.contains("class HistoryItem"));
         for forbidden in [
@@ -1818,7 +1818,7 @@ mod tests {
             assert!(prompt.contains("stays open until a reporting boundary"));
             assert!(!prompt.contains("Issue at most one exec call per response"));
             assert!(prompt.starts_with("# Rho integration\n"));
-            assert!(prompt.contains("history API is empty in Claude sessions"));
+            assert!(prompt.contains("transcript API is empty in Claude sessions"));
             for native_only in [
                 "You are Rho, an autonomous coding agent",
                 "You are the Advisor — an expert",

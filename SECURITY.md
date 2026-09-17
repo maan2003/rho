@@ -859,7 +859,7 @@ compaction. No notes are written or preparation responses requested.
   calls/results and their updates, invalidates pre-eviction continuations, and
   retains prose and reasoning. Recent and live/unanswered exchanges are protected.
   Full original transcripts remain durable; role changes do not reopen evictions.
-- Python `history` is a lazy, read-only snapshot of the agent's original transcript
+- Python `transcript` is a lazy, read-only snapshot of the agent's original transcript
   per execution. Its `text` exposes bounded tool output and tool-call source
   (`arguments` aliases the latter), not separately retained full tool output.
   It may contain private user content, tool arguments and results,

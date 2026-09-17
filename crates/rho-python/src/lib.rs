@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Lazy, execution-scoped data exposed through the Python `history` sequence.
-/// Implementations own snapshots and return one JSON-shaped item at a time.
+/// Lazy, execution-scoped data exposed through the Python `transcript`
+/// sequence. Implementations own snapshots and return one JSON-shaped item at a
+/// time.
 pub trait History: Send + Sync + 'static {
     fn len(&self, cell: CellId) -> Result<usize, String>;
     fn get(&self, cell: CellId, index: usize) -> Result<Value, String>;
@@ -33,7 +34,7 @@ impl History for EmptyHistory {
         Ok(0)
     }
     fn get(&self, _cell: CellId, _index: usize) -> Result<Value, String> {
-        Err("history index out of range".into())
+        Err("transcript index out of range".into())
     }
 }
 
@@ -375,7 +376,7 @@ mod tests {
             .sender()
             .execute(
                 7,
-                "assert len(history) == 3\nassert history[-1].kind == 'item_2'".into(),
+                "assert len(transcript) == 3\nassert transcript[-1].kind == 'item_2'".into(),
                 Arc::new(RecordedExecution(events)),
             )
             .unwrap();

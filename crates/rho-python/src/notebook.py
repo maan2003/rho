@@ -109,7 +109,7 @@ class _History(Sequence):
     def _cell():
         cell = _cell.get(None)
         if cell is None:
-            raise RuntimeError('history is available only while executing a cell')
+            raise RuntimeError('transcript is available only while executing a cell')
         return cell
 
     def __len__(self):
@@ -120,18 +120,18 @@ class _History(Sequence):
         if isinstance(index, slice):
             return tuple(self[i] for i in range(*index.indices(length)))
         if not isinstance(index, int):
-            raise TypeError('history indices must be integers or slices')
+            raise TypeError('transcript indices must be integers or slices')
         if index < 0:
             index += length
         if index < 0 or index >= length:
-            raise IndexError('history index out of range')
+            raise IndexError('transcript index out of range')
         return _history_item(json.loads(_history_get(self._cell(), index)))
 
     def __repr__(self):
-        return f'history({len(self)} items)'
+        return f'transcript({len(self)} items)'
 
 
-history = _History()
+transcript = _History()
 
 
 def _heartbeat():
@@ -474,7 +474,7 @@ sys.stderr = sys.__stderr__ = _Output()
 _namespace = dict(__name__='__main__', command=command, write_stdin=write_stdin,
                   display=display, text=text, notify=notify, set_checkin=set_checkin,
                   web=web,
-                  image=image, history=history, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
+                  image=image, transcript=transcript, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
 
 
 def _configure_functions(names):

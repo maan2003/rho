@@ -120,7 +120,7 @@ Instructions are code, not stored authority
 ([DECISION-instructions-are-code](DECISION-instructions-are-code.md)).
 The historical notes role evicts older completed tool exchanges before falling
 back to provider compaction, without replacing Python or jobs. Original
-transcript items remain available through lazy Python history
+transcript items remain available through the lazy Python `transcript` sequence
 ([DESIGN-context-rotation](../../../specs/DESIGN-context-rotation.md)).
 
 ## Read-only presentation
