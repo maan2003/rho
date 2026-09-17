@@ -6,12 +6,13 @@ use rho_core::{ContextBlock, InferenceResponseItem, ToolCallId};
 
 use crate::ContextChange;
 
-/// Keep a recent 40k-token suffix; reclaim enough for another such interval.
+/// Preserve a recent 40k-token suffix and aim for 40k estimated tokens
+/// remaining. Protected context can keep usage above that target.
 pub(super) const RETAIN_TOKENS: u64 = 40000;
 
 pub(super) const MANUAL_COMPACTION: &str = "Manual compaction was requested. Earlier retention and preparation notices are canceled; do not resume their preparation.";
 pub(super) const POLICY_CHANGED: &str = "The context-management role has changed. Earlier retention and preparation notices are canceled; do not resume their preparation. Existing history remains available through Python.";
-pub(super) const EVICTED: &str = "Older tool exchanges were removed to free context space. Recent exchanges, conversation, and reasoning remain. Original history is available through `history` in Python.";
+pub(super) const EVICTED: &str = "Older tool exchanges were removed to free context space. Recent exchanges, conversation, and reasoning remain. Original history is available through `transcript` in Python.";
 
 pub(super) struct Eviction {
     pub call_ids: Vec<ToolCallId>,
@@ -25,7 +26,6 @@ pub(super) fn evict_tools(
     history: &[Arc<ContextBlock>],
     active: &std::collections::BTreeSet<ToolCallId>,
     used: u64,
-    limit: u64,
 ) -> Eviction {
     use std::collections::{BTreeMap, BTreeSet};
     let start = rho_core::context_window_start(history);
@@ -105,7 +105,7 @@ pub(super) fn evict_tools(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| a.1.0.cmp(&b.1.0).then_with(|| a.0.cmp(&b.0)));
-    let needed = used.saturating_sub(limit.saturating_sub(RETAIN_TOKENS));
+    let needed = used.saturating_sub(RETAIN_TOKENS);
     let mut eviction = Eviction {
         call_ids: Vec::new(),
         freed_tokens: 0,

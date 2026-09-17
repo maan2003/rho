@@ -102,8 +102,11 @@ Required by
 
 ### Context eviction
 
-Only `eng-high-notes` evicts old completed tool exchanges before provider
-compaction. Eviction items preserve original call identities and transcript
+Only `eng-high-notes` considers old completed tool exchanges for eviction.
+At the compaction threshold, it applies an eviction plan only if the estimate
+reaches 40,000 tokens remaining; otherwise it discards the plan and requests
+provider compaction without new evictions. A request never combines these two
+actions. Eviction items preserve original call identities and transcript
 contents; replay and role changes retain the same provider exclusions. Live
 Python and jobs survive eviction and compaction; a restart never restores them.
 

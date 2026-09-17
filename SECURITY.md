@@ -853,7 +853,12 @@ own tools denied.
 
 `eng-high-notes` removes older completed tool exchanges from active context before
 falling back to provider compaction. Manual Compact always uses provider
-compaction. No notes are written or preparation responses requested.
+compaction. Eviction targets 40,000 estimated tokens remaining, while protecting
+the recent 40,000-token suffix and live/unanswered exchanges. If eligible
+exchanges cannot reclaim enough, Rho discards the eviction plan and requests
+provider compaction without evicting any exchanges. Eviction and compaction
+are mutually exclusive for a request. No notes are written or preparation
+responses requested.
 
 - Evictions are append-only typed transcript items. Inference removes paired
   calls/results and their updates, invalidates pre-eviction continuations, and

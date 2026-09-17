@@ -1430,32 +1430,36 @@ impl Agent {
 
         let mut evicted = false;
         let mut used = self.context_used;
-        if notes_rotation
+        let compacting_already =
+            pending_compaction || blocks.contains(&ContextBlock::CompactionTrigger);
+        let mut compact = false;
+        if !compacting_already
             && let Some((limit, occupancy)) = limit.zip(used)
             && occupancy >= limit
         {
-            let active = self.execs.keys().cloned().collect();
-            let eviction = context::evict_tools(history, &active, occupancy, limit);
-            if !eviction.call_ids.is_empty() {
-                used = Some(
-                    occupancy.saturating_sub(eviction.freed_tokens)
-                        + context::estimate(&ContextBlock::DeveloperMessage {
-                            text: context::EVICTED.into(),
-                        }),
-                );
-                blocks.push(ContextBlock::ToolHistoryEvicted {
-                    call_ids: eviction.call_ids,
-                });
-                blocks.push(ContextBlock::DeveloperMessage {
+            // Compaction is the default. Only a complete eviction plan that
+            // reaches the target replaces it; never persist a partial plan.
+            compact = true;
+            if notes_rotation {
+                let active = self.execs.keys().cloned().collect();
+                let notice = ContextBlock::DeveloperMessage {
                     text: context::EVICTED.into(),
-                });
-                evicted = true;
+                };
+                let notice_tokens = context::estimate(&notice);
+                let eviction =
+                    context::evict_tools(history, &active, occupancy.saturating_add(notice_tokens));
+                let remaining = occupancy.saturating_sub(eviction.freed_tokens) + notice_tokens;
+                if remaining <= context::RETAIN_TOKENS && !eviction.call_ids.is_empty() {
+                    used = Some(remaining);
+                    blocks.push(ContextBlock::ToolHistoryEvicted {
+                        call_ids: eviction.call_ids,
+                    });
+                    blocks.push(notice);
+                    evicted = true;
+                    compact = false;
+                }
             }
         }
-        let compacting_already =
-            pending_compaction || blocks.contains(&ContextBlock::CompactionTrigger);
-        let compact =
-            !compacting_already && limit.zip(used).is_some_and(|(limit, used)| used >= limit);
         if compact {
             blocks.push(ContextBlock::CompactionTrigger);
         }

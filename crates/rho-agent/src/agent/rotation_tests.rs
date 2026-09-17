@@ -223,7 +223,9 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
 
 #[tokio::test]
 async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
-    for enough in [true, false] {
+    // The middle case can get below the compaction threshold but cannot reach
+    // 40k: it must compact without committing a partial eviction.
+    for (output_bytes, enough) in [(750000, true), (150000, false), (300, false)] {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
         agent.phase = Phase::Idle {
@@ -244,7 +246,7 @@ async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
                     finished_at: UnixMs(1),
                     metadata: None,
                     body: ToolOutput {
-                        output: Arc::new("x".repeat(if enough { 150000 } else { 300 })),
+                        output: Arc::new("x".repeat(output_bytes)),
                         full_output: None,
                         images: Default::default(),
                         status: ToolOutputStatus::Success,
@@ -286,8 +288,19 @@ async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
         agent.start_request(UnixMs(2), None).await.unwrap();
         let (change, blocks) = latest_send(&agent).await;
         assert_eq!(change, None);
-        assert!(blocks.iter().any(|b| matches!(b, ContextBlock::ToolHistoryEvicted { call_ids } if call_ids == &vec![old_id.clone()])));
+        assert_eq!(blocks.iter().any(|b| matches!(b, ContextBlock::ToolHistoryEvicted { call_ids } if call_ids == &vec![old_id.clone()])), enough);
+        assert_eq!(
+            blocks.iter().any(
+                |b| matches!(b, ContextBlock::DeveloperMessage { text } if text == context::EVICTED)
+            ),
+            enough
+        );
         assert_eq!(blocks.contains(&ContextBlock::CompactionTrigger), !enough);
+        if enough {
+            assert!(agent.context_used.unwrap() <= 40000);
+        } else {
+            assert_eq!(agent.context_used, Some(limit + 1000));
+        }
         assert!(blocks.iter().any(|b| matches!(b, ContextBlock::UserMessage { content, .. } if rho_core::text_content(content) == "continue with this constraint")));
         assert!(agent.user.is_empty());
         assert!(agent.context.preparation.is_none());
@@ -297,11 +310,12 @@ async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
         );
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let replayed = replay::replay(events);
-        assert!(
+        assert_eq!(
             replayed
                 .history
                 .iter()
-                .any(|b| matches!(&**b, ContextBlock::ToolHistoryEvicted { .. }))
+                .any(|b| matches!(&**b, ContextBlock::ToolHistoryEvicted { .. })),
+            enough
         );
         assert!(replayed.user.is_empty());
         assert_eq!(&replayed.history[..history.len()], &history);
@@ -322,8 +336,8 @@ async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
             agent.start_request(UnixMs::now(), None).await.unwrap();
         }
         reply(&mut agent, vec![exec("recover-history", &format!(
-            "original = next(item for item in transcript if item.kind == 'tool_result' and item.call_id == 'old')\nassert original.text == 'x' * {}\nassert any(item.kind == 'tool_history_evicted' for item in transcript)",
-            if enough { 150000 } else { 300 }
+            "original = next(item for item in transcript if item.kind == 'tool_result' and item.call_id == 'old')\nassert original.text == 'x' * {}\nassert any(item.kind == 'tool_history_evicted' for item in transcript) == {}",
+            output_bytes, if enough { "True" } else { "False" }
         ))], 100).await;
         cell_returned(&agent).await;
         assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
@@ -392,7 +406,18 @@ fn eviction_is_oldest_first_bounded_and_preserves_live_unanswered_and_recent_cal
         result("recent", 300),
     ];
     let live = std::collections::BTreeSet::from([id("live")]);
-    let eviction = context::evict_tools(&history, &live, 100000, 100000);
+    assert!(
+        context::evict_tools(&history, &live, 40000)
+            .call_ids
+            .is_empty()
+    );
+    // "pass" costs ceil(4/3) + 8, and the result costs 150000/3 + 8:
+    // one exchange frees 50018. At 90018 it reaches exactly 40000;
+    // one token above that requires the next eligible exchange too.
+    let above = context::evict_tools(&history, &live, 90019);
+    assert_eq!(above.call_ids, vec![id("oldest"), id("next")]);
+    assert_eq!(above.freed_tokens, 100036);
+    let eviction = context::evict_tools(&history, &live, 90018);
     assert_eq!(
         eviction.call_ids,
         vec![id("oldest")],
@@ -402,13 +427,13 @@ fn eviction_is_oldest_first_bounded_and_preserves_live_unanswered_and_recent_cal
     history.push(Arc::new(ContextBlock::ToolHistoryEvicted {
         call_ids: eviction.call_ids,
     }));
-    let next = context::evict_tools(&history, &live, 100000, 100000);
+    let next = context::evict_tools(&history, &live, 90018);
     assert_eq!(next.call_ids, vec![id("next")]);
     history.push(Arc::new(ContextBlock::ToolHistoryEvicted {
         call_ids: next.call_ids,
     }));
     assert!(
-        context::evict_tools(&history, &live, 100000, 100000)
+        context::evict_tools(&history, &live, 90018)
             .call_ids
             .is_empty()
     );
@@ -466,7 +491,7 @@ fn eviction_does_not_count_summarized_tools_or_evict_a_recent_late_result() {
         at: UnixMs(10),
     })));
     assert!(
-        context::evict_tools(&history, &Default::default(), 100000, 100000)
+        context::evict_tools(&history, &Default::default(), 100000)
             .call_ids
             .is_empty()
     );
