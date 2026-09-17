@@ -419,16 +419,21 @@ a plan. A new phase of the current task is not itself a reason to create another
 with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
 single-threaded unless write targets are clearly disjoint or isolated.
 
-Start an Engineer in an existing absolute directory inside your workset. Omit workdir to inherit
-your working directory. task_name is a short kebab-case label. The child already receives project
-guidance and tools; do not repeat generic process instructions. Returns an awaitable identifying
-the Engineer; its final response arrives later as agent mail. This does not create a checkout.
-agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str | None = None) → Awaitable[str]
+Always pass workdir: an existing absolute directory inside your workset. The child loads that
+directory's applicable AGENTS.md guidance and skill catalogue; do not repeat them in its task.
+task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
+identity; its final response arrives automatically as agent mail.
+agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
 
-Use `agents.message` for follow-up with a known agent. Sending queues the message immediately; a
-busy recipient sees it at its next inference step. A child's final response is mailed to its parent
-automatically. Keep working on independent tasks while awaiting a reply. When blocked, use the
-check-in rules under Tool execution; do not create acknowledgment loops.
+Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.
+For back-and-forth collaboration, answer the agent's question or assess its findings, then send
+the next scoped request and say whether another reply is needed. Stop exchanging messages when
+the requested work is complete; do not create acknowledgment loops. Keep working on independent
+tasks while awaiting a reply. When blocked, use the check-in rules under Tool execution.
+
+Sending queues the message immediately; a busy recipient sees it at its next inference step.
+Child final responses arrive automatically as agent mail. Do not also send the same completion
+report through `agents.message`.
 
 ```python
 agents.message(*, agent_id: str, message: str) -> Awaitable[str]
@@ -987,10 +992,15 @@ registration order without waiting for earlier operations to finish.
     );
     out.push_str(team);
     out.push_str(
-        r#"Use `agents.message` for follow-up with a known agent. Sending queues the message immediately; a
-busy recipient sees it at its next inference step. A child's final response is mailed to its parent
-automatically. Keep working on independent tasks while awaiting a reply. When blocked, use the
-check-in rules under Tool execution; do not create acknowledgment loops.
+        r#"Use `agents.message` to send findings, questions, or a scoped next action to an existing agent.
+For back-and-forth collaboration, answer the agent's question or assess its findings, then send
+the next scoped request and say whether another reply is needed. Stop exchanging messages when
+the requested work is complete; do not create acknowledgment loops. Keep working on independent
+tasks while awaiting a reply. When blocked, use the check-in rules under Tool execution.
+
+Sending queues the message immediately; a busy recipient sees it at its next inference step.
+Child final responses arrive automatically as agent mail. Do not also send the same completion
+report through `agents.message`.
 
 ```python
 agents.message(*, agent_id: str, message: str) -> Awaitable[str]
@@ -1394,11 +1404,11 @@ a plan. A new phase of the current task is not itself a reason to create another
 with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
 single-threaded unless write targets are clearly disjoint or isolated.
 
-Start an Engineer. task_name is a short kebab-case label. The child already receives project
-guidance and tools; do not repeat generic process instructions.
-workdir selects an existing absolute directory in your workset; omission inherits your directory.
-The call does not create a checkout. Returns an awaitable identifying the Engineer, not its findings.
-agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str | None = None) → Awaitable[str]
+Always pass workdir: an existing absolute directory inside your workset. The child loads that
+directory's applicable AGENTS.md guidance and skill catalogue; do not repeat them in its task.
+task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
+identity; its final response arrives automatically as agent mail.
+agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
 
 Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
 why it matters, what you have learned or ruled out, and where to look first. Write outcome-first
@@ -1441,13 +1451,18 @@ push, or modify shared infrastructure. You cannot spawn or interrupt agents.
         ),
     }
     out.push_str(
-        r#"Queue a message to an existing agent using its role-prefixed handle. A busy recipient sees it at
-its next inference boundary. Returns confirmation of queueing, not the recipient's answer.
+        r#"Use agents.message to send findings, questions, or a scoped next action to an existing agent.
+For back-and-forth collaboration, answer the agent's question or assess its findings, then send
+the next scoped request and say whether another reply is needed. Stop exchanging messages when
+the requested work is complete; do not create acknowledgment loops. Keep working on independent
+tasks while awaiting a reply. When blocked, use a check-in; do not repeatedly poll.
+
+Queue a message using the agent's role-prefixed handle. A busy recipient sees it at its next
+inference boundary. Returns confirmation of queueing, not the recipient's answer.
 agents.message(*, agent_id: str, message: str) → Awaitable[str]
 
-Child final responses arrive automatically as agent mail. Keep working on independent tasks while
-waiting; use a check-in when blocked on a reply. Do not repeatedly poll or create acknowledgment
-loops.
+Child final responses arrive automatically as agent mail. Do not also send the same completion
+report through agents.message.
 
 "#,
     );
@@ -1770,7 +1785,9 @@ mod tests {
         assert!(!collaboration.contains("share a checkout"));
         assert!(collaboration.contains("agents.spawn_new_engineer(*, task_name:"));
         assert!(collaboration.contains("task_name is a short kebab-case label"));
-        assert!(collaboration.contains("The child already receives project"));
+        assert!(
+            collaboration.contains("directory's applicable AGENTS.md guidance and skill catalogue")
+        );
         assert!(!collaboration.contains("display(agents.spawn_new_engineer)"));
         assert!(collaboration.contains("agents.cancel("));
         assert!(collaboration.contains("agents.message("));
@@ -1868,6 +1885,9 @@ mod tests {
             claude_prompt(None, None, AgentRole::default()),
         ] {
             for rule in [
+                "Always pass workdir: an existing absolute directory inside your workset",
+                "directory's applicable AGENTS.md guidance and skill catalogue",
+                "agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str)",
                 "concrete benefit beyond",
                 "without editing the same files or depending on each other's results",
                 "one bounded unit is massive enough",
@@ -1906,6 +1926,34 @@ mod tests {
             ),
         ] {
             assert!(!prompt.contains("When to use an Engineer:"));
+        }
+    }
+
+    #[test]
+    fn agent_messaging_scopes_replies_and_avoids_duplicate_completion_reports() {
+        for prompt in [
+            main_agent_prompt("", ""),
+            advisor_prompt("", ""),
+            claude_prompt(None, None, AgentRole::default()),
+            claude_prompt(
+                None,
+                None,
+                AgentRole::Advisor {
+                    intelligence: rho_core::AdvisorIntelligence::High,
+                },
+            ),
+        ] {
+            let communication = prompt.split("## Working with other agents").nth(1).unwrap();
+            for rule in [
+                "send findings, questions, or a scoped next action",
+                "say whether another reply is needed",
+                "Stop exchanging messages when\nthe requested work is complete",
+                "do not create acknowledgment loops",
+                "Child final responses arrive automatically",
+                "Do not also send the same completion\nreport through",
+            ] {
+                assert!(communication.contains(rule), "missing {rule}");
+            }
         }
     }
 
