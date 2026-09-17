@@ -14,6 +14,115 @@ pub(super) const MANUAL_COMPACTION: &str = "Manual compaction was requested. Ear
 pub(super) const POLICY_CHANGED: &str = "The context-management role has changed. Earlier retention and preparation notices are canceled; do not resume their preparation. Existing history remains available through Python.";
 pub(super) const EVICTED: &str = "Older tool exchanges were removed to free context space. Recent exchanges, conversation, and reasoning remain. Original history is available through `transcript` in Python.";
 
+/// Measured result/update budgets, indexed by immutable transcript positions.
+/// Live recording and replay use the same observer; no extra persisted format.
+#[derive(Default)]
+pub(super) struct UsageCaps {
+    model: Option<crate::db::AgentUsageModel>,
+    previous: Option<(usize, u64)>,
+    outputs: std::collections::BTreeMap<(usize, usize), u64>,
+}
+
+impl UsageCaps {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn observe(&mut self, event: &crate::native::NativeEvent, history: &[Arc<ContextBlock>]) {
+        use crate::native::NativeEvent;
+        match event {
+            NativeEvent::RequestStarted { input, .. } => {
+                if input.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContextBlock::CompactionTrigger
+                            | ContextBlock::ContextRotation { .. }
+                            | ContextBlock::ToolHistoryEvicted { .. }
+                    )
+                }) {
+                    // Existing allocations remain fixed, including portions already
+                    // evicted. Never redistribute their budget to surviving exchanges.
+                    self.previous = None;
+                }
+            }
+            NativeEvent::ResponseFinished {
+                output,
+                context_used,
+                usage,
+                ..
+            } => {
+                let (Some(total), Some(usage)) = (context_used, usage) else {
+                    self.previous = None;
+                    return;
+                };
+                if usage.approximate || usage.requests != 1 {
+                    self.previous = None;
+                    return;
+                }
+                if self.model != Some(usage.model) {
+                    self.reset();
+                    self.model = Some(usage.model);
+                }
+                let Some(input) = total.checked_sub(usage.output_tokens) else {
+                    self.previous = None;
+                    return;
+                };
+                if let Some((start, previous_total)) = self.previous
+                    && let Some(budget) = input.checked_sub(previous_total)
+                {
+                    let mut costs = Vec::new();
+                    for (index, block) in history.iter().enumerate().skip(start) {
+                        match &**block {
+                            ContextBlock::ToolResults { results } => {
+                                for (part, result) in results.iter().enumerate() {
+                                    costs.push((
+                                        (index, part),
+                                        output_tokens(
+                                            &result.body.output,
+                                            result.body.images.len(),
+                                        ),
+                                    ));
+                                }
+                            }
+                            ContextBlock::ToolUpdate(update) => {
+                                costs.push((
+                                    (index, 0),
+                                    output_tokens(&update.output, update.images.len()),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    let estimated: u64 = costs.iter().map(|(_, cost)| *cost).sum();
+                    if budget < estimated {
+                        for (key, cost) in costs {
+                            // Proportional, rounded down: all outputs in the window
+                            // share one cap, even when evicted in separate passes.
+                            let capped = (u128::from(cost) * u128::from(budget)
+                                / u128::from(estimated))
+                                as u64;
+                            self.outputs.insert(key, capped);
+                        }
+                    }
+                }
+                self.previous = Some((history.len() + output.len(), *total));
+            }
+            NativeEvent::RequestFailed { .. } => self.previous = None,
+        }
+    }
+
+    fn output(&self, block: usize, part: usize, estimate: u64) -> u64 {
+        self.outputs
+            .get(&(block, part))
+            .copied()
+            .unwrap_or(estimate)
+    }
+}
+
+fn output_tokens(text: &str, images: usize) -> u64 {
+    text_tokens(text) + images as u64 * 10000 + 8
+}
+
 pub(super) struct Eviction {
     pub call_ids: Vec<ToolCallId>,
     pub freed_tokens: u64,
@@ -26,6 +135,7 @@ pub(super) fn evict_tools(
     history: &[Arc<ContextBlock>],
     active: &std::collections::BTreeSet<ToolCallId>,
     used: u64,
+    caps: &UsageCaps,
 ) -> Eviction {
     use std::collections::{BTreeMap, BTreeSet};
     let start = rho_core::context_window_start(history);
@@ -77,19 +187,21 @@ pub(super) fn evict_tools(
                 }
             }
             ContextBlock::ToolResults { results } => {
-                for result in results {
+                for (part, result) in results.iter().enumerate() {
                     let entry = calls.entry(result.call_id.clone()).or_default();
                     entry.0 = i;
-                    entry.1 += text_tokens(&result.body.output)
-                        + result.body.images.len() as u64 * 10000
-                        + 8;
+                    entry.1 += caps.output(
+                        i,
+                        part,
+                        output_tokens(&result.body.output, result.body.images.len()),
+                    );
                     entry.3 = true;
                 }
             }
             ContextBlock::ToolUpdate(update) => {
                 let entry = calls.entry(update.call_id.clone()).or_default();
                 entry.0 = i;
-                entry.1 += text_tokens(&update.output) + update.images.len() as u64 * 10000 + 8;
+                entry.1 += caps.output(i, 0, output_tokens(&update.output, update.images.len()));
             }
             _ => {}
         }

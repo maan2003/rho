@@ -189,6 +189,7 @@ impl AgentHandle {
             model,
             context: replayed.context,
             provider_history: Some(replayed.history),
+            usage_caps: replayed.usage_caps,
             session,
             // The same phase a fresh agent starts in. Being loaded from a
             // log is not its own kind of state, and coming up is never by
@@ -515,6 +516,7 @@ pub(crate) struct Agent {
     context: context::Window,
     // Live projection, including the ordered tail queued for replication.
     provider_history: Option<Vec<Arc<ContextBlock>>>,
+    usage_caps: context::UsageCaps,
 
     session: InferenceSession,
     phase: Phase,
@@ -1173,6 +1175,7 @@ impl Agent {
         let replayed = replay::replay(records.into_iter().map(|(_, event)| event).collect());
         self.context = replayed.context;
         self.provider_history = Some(replayed.history);
+        self.usage_caps = replayed.usage_caps;
         self.recovery_notes = replayed.recovery_notes;
         self.streams.clear();
         self.latest_python_exec = None;
@@ -1446,8 +1449,12 @@ impl Agent {
                     text: context::EVICTED.into(),
                 };
                 let notice_tokens = context::estimate(&notice);
-                let eviction =
-                    context::evict_tools(history, &active, occupancy.saturating_add(notice_tokens));
+                let eviction = context::evict_tools(
+                    history,
+                    &active,
+                    occupancy.saturating_add(notice_tokens),
+                    &self.usage_caps,
+                );
                 let remaining = occupancy.saturating_sub(eviction.freed_tokens) + notice_tokens;
                 if remaining <= context::RETAIN_TOKENS && !eviction.call_ids.is_empty() {
                     used = Some(remaining);
@@ -1676,8 +1683,9 @@ impl Agent {
         if self.provider_history.is_none() {
             self.flush_events().await?;
             let (_, records) = self.host.history().await?;
-            self.provider_history =
-                Some(replay::replay(records.into_iter().map(|(_, event)| event).collect()).history);
+            let replayed = replay::replay(records.into_iter().map(|(_, event)| event).collect());
+            self.provider_history = Some(replayed.history);
+            self.usage_caps = replayed.usage_caps;
         }
         Ok(self.provider_history.as_ref().unwrap().clone())
     }
@@ -1689,14 +1697,7 @@ impl Agent {
             self.pending_events.push(event);
             return Ok(());
         }
-        let blocks = event.native_event().map(|event| {
-            event
-                .blocks()
-                .iter()
-                .cloned()
-                .map(Arc::new)
-                .collect::<Vec<_>>()
-        });
+        let native = event.native_event().cloned();
         if let Some(NativeEvent::ResponseFinished { output, .. }) = event.native_event() {
             for block in output {
                 if let ContextBlock::InferenceResponse { items, .. } = block {
@@ -1712,8 +1713,9 @@ impl Agent {
         self.writer
             .append(std::mem::take(&mut self.pending_events))
             .await?;
-        if let (Some(history), Some(blocks)) = (&mut self.provider_history, blocks) {
-            history.extend(blocks);
+        if let (Some(history), Some(native)) = (&mut self.provider_history, native) {
+            self.usage_caps.observe(&native, history);
+            history.extend(native.blocks().iter().cloned().map(Arc::new));
             if let Some(surface) = self.surface.get_if_ready() {
                 surface.notebook.set_history(history.clone());
             }

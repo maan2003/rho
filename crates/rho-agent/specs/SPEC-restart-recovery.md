@@ -110,6 +110,14 @@ actions. Eviction items preserve original call identities and transcript
 contents; replay and role changes retain the same provider exclusions. Live
 Python and jobs survive eviction and compaction; a restart never restores them.
 
+Estimated savings for tool results and updates share a cap from comparable
+consecutive successful requests: next input tokens minus previous input and
+output tokens, including cached input. Negative or unavailable deltas leave
+heuristic estimates unchanged; call-source estimates remain separate.
+Allocations stay fixed across eviction passes and are reconstructed from the
+same native events on replay. Model, role, and context-window changes break
+measurement continuity.
+
 There is no dedicated preparation exchange or input holding. Historical
 preparation events remain readable, but replay abandons their unfinished
 preparation and warns against replaying effects. Old retained-window boundaries

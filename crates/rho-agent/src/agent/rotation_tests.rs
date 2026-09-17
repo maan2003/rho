@@ -407,17 +407,17 @@ fn eviction_is_oldest_first_bounded_and_preserves_live_unanswered_and_recent_cal
     ];
     let live = std::collections::BTreeSet::from([id("live")]);
     assert!(
-        context::evict_tools(&history, &live, 40000)
+        context::evict_tools(&history, &live, 40000, &Default::default())
             .call_ids
             .is_empty()
     );
     // "pass" costs ceil(4/3) + 8, and the result costs 150000/3 + 8:
     // one exchange frees 50018. At 90018 it reaches exactly 40000;
     // one token above that requires the next eligible exchange too.
-    let above = context::evict_tools(&history, &live, 90019);
+    let above = context::evict_tools(&history, &live, 90019, &Default::default());
     assert_eq!(above.call_ids, vec![id("oldest"), id("next")]);
     assert_eq!(above.freed_tokens, 100036);
-    let eviction = context::evict_tools(&history, &live, 90018);
+    let eviction = context::evict_tools(&history, &live, 90018, &Default::default());
     assert_eq!(
         eviction.call_ids,
         vec![id("oldest")],
@@ -427,13 +427,13 @@ fn eviction_is_oldest_first_bounded_and_preserves_live_unanswered_and_recent_cal
     history.push(Arc::new(ContextBlock::ToolHistoryEvicted {
         call_ids: eviction.call_ids,
     }));
-    let next = context::evict_tools(&history, &live, 90018);
+    let next = context::evict_tools(&history, &live, 90018, &Default::default());
     assert_eq!(next.call_ids, vec![id("next")]);
     history.push(Arc::new(ContextBlock::ToolHistoryEvicted {
         call_ids: next.call_ids,
     }));
     assert!(
-        context::evict_tools(&history, &live, 90018)
+        context::evict_tools(&history, &live, 90018, &Default::default())
             .call_ids
             .is_empty()
     );
@@ -491,8 +491,233 @@ fn eviction_does_not_count_summarized_tools_or_evict_a_recent_late_result() {
         at: UnixMs(10),
     })));
     assert!(
-        context::evict_tools(&history, &Default::default(), 100000)
+        context::evict_tools(&history, &Default::default(), 100000, &Default::default())
             .call_ids
             .is_empty()
+    );
+}
+
+fn measured_output_events(delta: i64) -> Vec<AgentEvent<'static>> {
+    let response = |output, total, generated| {
+        AgentEvent::Native(NativeEvent::ResponseFinished {
+            output,
+            context_used: Some(total),
+            usage: Some(crate::db::AgentUsageBucket {
+                model: crate::db::AgentUsageModel::ASTRA,
+                // Billing input excludes cache hits; the cap must use raw
+                // context_used minus generated output instead.
+                input_tokens: 2000,
+                cache_read_tokens: 8000,
+                output_tokens: generated,
+                requests: 1,
+                ..Default::default()
+            }),
+            at: UnixMs(0),
+        })
+    };
+    vec![
+        response(
+            vec![ContextBlock::InferenceResponse {
+                items: vec![exec("first", "pass"), exec("second", "pass")],
+                provider_response_id: None,
+            }],
+            11000,
+            1000,
+        ),
+        AgentEvent::Native(NativeEvent::RequestStarted {
+            input: vec![
+                ContextBlock::ToolResults {
+                    results: [("first", 2976), ("second", 5976)]
+                        .into_iter()
+                        .map(|(id, size)| rho_core::ToolResult {
+                            call_id: ToolCallId::try_from(id).unwrap(),
+                            tool_type: rho_core::ToolType::Custom,
+                            body: ToolOutput {
+                                output: Arc::new("x".repeat(size)),
+                                full_output: None,
+                                images: Default::default(),
+                                status: ToolOutputStatus::Success,
+                            },
+                            started_at: UnixMs(0),
+                            finished_at: UnixMs(1),
+                            metadata: None,
+                        })
+                        .collect(),
+                },
+                ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+                    call_id: ToolCallId::try_from("first").unwrap(),
+                    tool_type: rho_core::ToolType::Custom,
+                    output: Arc::new("y".repeat(2976)),
+                    full_output: None,
+                    images: Default::default(),
+                    status: None,
+                    at: UnixMs(1),
+                }),
+                ContextBlock::DeveloperMessage {
+                    text: "r".repeat(120000),
+                },
+            ],
+            context: None,
+            wake: None,
+            at: UnixMs(1),
+        }),
+        response(vec![], (11500i64 + delta) as u64, 500),
+    ]
+}
+
+#[test]
+fn measured_output_budget_is_shared_fixed_and_never_inflates_estimates() {
+    for (delta, expected) in [(801, 820), (0, 20), (-1, 4020), (5000, 4020)] {
+        let mut replayed = replay::replay(measured_output_events(delta));
+        let eviction = context::evict_tools(
+            &replayed.history,
+            &Default::default(),
+            100000,
+            &replayed.usage_caps,
+        );
+        // Output estimates are 1000 + 2000 + 1000. With an 801 budget
+        // they become 200 + 400 + 200, plus two uncapped 10-token calls.
+        assert_eq!(eviction.freed_tokens, expected, "delta={delta}");
+        if delta != 801 {
+            continue;
+        }
+        let first = context::evict_tools(
+            &replayed.history,
+            &Default::default(),
+            40410,
+            &replayed.usage_caps,
+        );
+        assert_eq!(
+            first.call_ids,
+            vec![ToolCallId::try_from("second").unwrap()]
+        );
+        assert_eq!(first.freed_tokens, 410);
+        let marker = NativeEvent::RequestStarted {
+            input: vec![ContextBlock::ToolHistoryEvicted {
+                call_ids: first.call_ids,
+            }],
+            context: None,
+            wake: None,
+            at: UnixMs(2),
+        };
+        replayed.usage_caps.observe(&marker, &replayed.history);
+        replayed
+            .history
+            .extend(marker.blocks().iter().cloned().map(Arc::new));
+        let remaining = context::evict_tools(
+            &replayed.history,
+            &Default::default(),
+            100000,
+            &replayed.usage_caps,
+        );
+        assert_eq!(
+            remaining.freed_tokens, 410,
+            "do not reallocate the evicted share"
+        );
+    }
+}
+
+#[test]
+fn measured_output_budget_requires_comparable_successful_samples() {
+    for boundary in ["model", "approximate", "missing", "failure", "compaction"] {
+        let mut events = measured_output_events(0);
+        match boundary {
+            "failure" => events.insert(
+                1,
+                AgentEvent::Native(NativeEvent::RequestFailed {
+                    partial: Default::default(),
+                    error: "failed".into(),
+                    retrying: false,
+                    at: UnixMs(1),
+                }),
+            ),
+            "compaction" => {
+                let AgentEvent::Native(NativeEvent::RequestStarted { input, .. }) = &mut events[1]
+                else {
+                    unreachable!()
+                };
+                input.insert(0, ContextBlock::CompactionTrigger);
+            }
+            _ => {
+                let AgentEvent::Native(NativeEvent::ResponseFinished { usage, .. }) =
+                    &mut events[2]
+                else {
+                    unreachable!()
+                };
+                match boundary {
+                    "model" => usage.as_mut().unwrap().model = crate::db::AgentUsageModel::LUNA,
+                    "approximate" => usage.as_mut().unwrap().approximate = true,
+                    "missing" => *usage = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let replayed = replay::replay(events);
+        assert_eq!(
+            context::evict_tools(
+                &replayed.history,
+                &Default::default(),
+                100000,
+                &replayed.usage_caps,
+            )
+            .freed_tokens,
+            4020,
+            "{boundary}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn live_and_replayed_output_caps_agree() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = agent(directory.path()).await;
+    agent.provider_history = Some(Vec::new());
+    for event in measured_output_events(801) {
+        agent.persist(event).await.unwrap();
+    }
+    let live = context::evict_tools(
+        &agent.provider_input().await.unwrap(),
+        &Default::default(),
+        100000,
+        &agent.usage_caps,
+    );
+    assert_eq!(live.freed_tokens, 820);
+    agent.provider_history = None;
+    let reloaded = context::evict_tools(
+        &agent.provider_input().await.unwrap(),
+        &Default::default(),
+        100000,
+        &agent.usage_caps,
+    );
+    assert_eq!(reloaded.freed_tokens, 820);
+    assert_eq!(live.call_ids, reloaded.call_ids);
+
+    // Without the measured cap this output looks large enough to reach 40k.
+    // The live request must instead compact, with no partial eviction.
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = self::agent(directory.path()).await;
+    agent.provider_history = Some(Vec::new());
+    for mut event in measured_output_events(801) {
+        if let AgentEvent::Native(NativeEvent::RequestStarted { input, .. }) = &mut event {
+            if let ContextBlock::ToolResults { results } = &mut input[0] {
+                for result in results {
+                    result.body.output = Arc::new(result.body.output.repeat(100));
+                }
+            }
+        }
+        agent.persist(event).await.unwrap();
+    }
+    let used = agent.session.auto_compact_token_limit().unwrap() + 1000;
+    let history = agent.provider_input().await.unwrap();
+    let naive = context::evict_tools(&history, &Default::default(), used, &Default::default());
+    assert!(used.saturating_sub(naive.freed_tokens) <= 40000);
+    agent.context_used = Some(used);
+    agent.start_request(UnixMs(2), None).await.unwrap();
+    let (_, blocks) = latest_send(&agent).await;
+    assert!(blocks.contains(&ContextBlock::CompactionTrigger));
+    assert!(
+        !blocks
+            .iter()
+            .any(|b| matches!(b, ContextBlock::ToolHistoryEvicted { .. }))
     );
 }

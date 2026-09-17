@@ -358,6 +358,7 @@ pub(in crate::agent) mod tests {
                 pending_events: Vec::new(),
                 admitted: Default::default(),
                 provider_history: None,
+                usage_caps: Default::default(),
                 name_updates: host.names(),
                 host,
                 surface: Arc::new(Lazy::ready(surface)),

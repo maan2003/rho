@@ -11,6 +11,7 @@ use crate::{AgentEvent, InputKind, QueuedInput};
 #[derive(Default)]
 pub(crate) struct Replayed {
     pub history: Vec<Arc<ContextBlock>>,
+    pub(super) usage_caps: super::context::UsageCaps,
     pub(super) context: super::context::Window,
     pub recovery_notes: Vec<String>,
     /// Calls history left hanging: every one of them gets a placeholder
@@ -39,6 +40,7 @@ pub(crate) fn recover(events: Vec<AgentEvent<'static>>) -> Replayed {
 pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let mut history: Vec<Arc<ContextBlock>> = Vec::new();
     let mut context_used = None;
+    let mut usage_caps = super::context::UsageCaps::default();
     let mut context = super::context::Window::default();
     let mut recovery_notes = Vec::new();
     let mut user = Vec::new();
@@ -47,6 +49,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let mut notes_rotation = false;
     for event in events {
         if let Some(native) = event.native_event() {
+            usage_caps.observe(native, &history);
             use crate::native::NativeEvent;
             match native {
                 NativeEvent::RequestStarted {
@@ -98,6 +101,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             }
             AgentEvent::Created { role, .. } => notes_rotation = role.uses_notes_rotation(),
             AgentEvent::RoleChanged { role, .. } => {
+                usage_caps.reset();
                 let enabled = role.uses_notes_rotation();
                 if enabled != notes_rotation {
                     context.rotated();
@@ -138,6 +142,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let owed = owed_calls(&history);
     Replayed {
         history,
+        usage_caps,
         context,
         recovery_notes,
         owed,
