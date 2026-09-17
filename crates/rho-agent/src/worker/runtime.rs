@@ -269,8 +269,10 @@ pub(super) async fn run(
         {
             let agents = agents.lock().expect("poison");
             if let Some(incoming) = agents.get(&agent) {
-                if incoming.try_send(packet.bytes).is_err() {
-                    break 'connection Err(anyhow::anyhow!("agent route closed or overloaded"));
+                if let Err(error) = incoming.try_send(packet.bytes) {
+                    break 'connection Err(anyhow::anyhow!(
+                        "worker agent route {agent:?}: {error}"
+                    ));
                 }
                 continue;
             }

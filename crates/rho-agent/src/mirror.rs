@@ -221,7 +221,18 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             InputKind::Message { content } => message(source, content, *delivery, *at),
             InputKind::Compaction => MirrorEvent::CompactionRequested { at: *at },
         },
-        AgentEvent::Native(_) | AgentEvent::Failed { .. } => unreachable!("normalized above"),
+        AgentEvent::Native(_) => unreachable!("normalized above"),
+        AgentEvent::Failed {
+            partial,
+            error,
+            retrying,
+            at,
+        } => MirrorEvent::Failed {
+            text: partial_text(partial),
+            error: error.to_string(),
+            retrying: *retrying,
+            at: *at,
+        },
         AgentEvent::Cleared { at } => MirrorEvent::QueueCleared { at: *at },
         AgentEvent::RuntimeRebound { .. }
         | AgentEvent::ClaudeExecAdmitted { .. }
@@ -460,6 +471,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn worker_failure_is_mirrored_without_panicking() {
+        let event = AgentEvent::Failed {
+            partial: Default::default(),
+            error: "agent service connection closed".into(),
+            retrying: false,
+            at: UnixMs(17),
+        };
+        assert_eq!(
+            strip(&event),
+            Some(MirrorEvent::Failed {
+                text: String::new(),
+                error: "agent service connection closed".into(),
+                retrying: false,
+                at: UnixMs(17),
+            })
+        );
+    }
 
     #[test]
     fn a_sent_keeps_statuses_and_leaves_output_behind() {

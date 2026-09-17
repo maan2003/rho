@@ -270,8 +270,9 @@ impl Process {
                             match packet.port {
                                 transport::Port::Agent(id) => {
                                     let routes = routes.lock().expect("poison");
-                                    if routes.get(&id).is_some_and(|route| route.try_send(packet.bytes).is_err()) {
-                                        anyhow::bail!("agent route closed or overloaded");
+                                    if let Some(route) = routes.get(&id) {
+                                        route.try_send(packet.bytes).map_err(|error|
+                                            anyhow::anyhow!("daemon agent route {id:?}: {error}"))?;
                                     }
                                 }
                                 transport::Port::Workset => {
@@ -309,7 +310,12 @@ impl Process {
             let service_done = tokio::select! {
                 _ = stopped => false,
                 _ = child.wait() => false,
-                _ = &mut service => true,
+                result = &mut service => {
+                    if !matches!(&result, Ok(Ok(()))) {
+                        eprintln!("rho-agent: workset service ended: {result:?}");
+                    }
+                    true
+                },
             };
             let _ = disconnect.shutdown(std::net::Shutdown::Both);
             if !service_done {

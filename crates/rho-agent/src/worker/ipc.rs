@@ -313,8 +313,16 @@ impl Host {
             };
             tokio::select! {
                 _ = stopped => {}
-                _ = receive => {}
-                _ = send => {}
+                result = receive => {
+                    if let Err(error) = result {
+                        eprintln!("rho-agent: {port:?} service receive failed: {error}");
+                    }
+                }
+                result = send => {
+                    if let Err(error) = result {
+                        eprintln!("rho-agent: {port:?} service send failed: {error}");
+                    }
+                }
             }
             // All outstanding calls fail before the worker's owner is told to
             // stop. The executor stays alive to perform normal job cleanup.
