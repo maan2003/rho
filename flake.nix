@@ -374,8 +374,6 @@
               postInstall = ''
                 mkdir -p $out/share/rho/skills
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
-                cp -r ${./.agents/skills/delegate-engineering} \
-                  $out/share/rho/skills/delegate-engineering
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
                 chmod -R u+w $out/share/rho/skills

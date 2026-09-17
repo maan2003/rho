@@ -519,13 +519,11 @@ pending descriptor reconstructs that view on load and rotates away from any
 partial destination transcript before retrying.
 
 Collaboration creation is role-specific while communication is shared.
-`spawn_engineer` puts the child in the parent's workset and working
-directory. A parent that wants concurrent edits makes the child a checkout
-of its own first (a git worktree in the workset) and says
-so in the prompt; the daemon creates no workspaces, only initial clones.
-Advisors join the asker's directory. Detailed delegation and integration guidance lives in the
-`delegate-engineering` skill rather than every Engineer prompt. Engineers can
-use `ask_advisor` to create an advisory session. `message_agent` is
+`agents.spawn_new_engineer` creates a child in the parent's workset. Optional
+`workdir` selects an existing directory; omission inherits the parent's working
+directory. The daemon creates no checkouts for children. Delegation guidance is
+part of the Engineer prompt. `agents.spawn_new_advisor` creates an advisory
+session in the asker's directory. `agents.message` is
 an unrestricted bidirectional
 mail bus for any known role-prefixed handle, including Advisor context requests;
 an agent waits for mail with `set_checkin` inside its notebook. Each agent record

@@ -3,16 +3,8 @@ use std::sync::Arc;
 use crate::db::{AgentRole, AgentSpawnedBy};
 use crate::multi_agent_tools::Team;
 
-/// Native inference yields the turn; Claude's MCP call waits for a reporting
-/// boundary.
-#[derive(Clone, Copy)]
-enum ExecReturn {
-    AtTurnEnd,
-    Blocking,
-}
-
 /// Render the complete Engineer instructions in the order an agent uses them.
-fn main_agent_prompt(execution: ExecReturn, team: &str, context: &str) -> Arc<str> {
+fn main_agent_prompt(team: &str, context: &str) -> Arc<str> {
     let mut out = String::new();
     out.push_str(
         r#"You are Rho, an autonomous coding agent. You and the user share one workspace.
@@ -179,19 +171,11 @@ reviewable. While approval is pending, end the turn and wait.
     );
 
     out.push_str("## Tool execution\n\n");
-    match execution {
-            ExecReturn::AtTurnEnd => out.push_str(r#"exec is your only top-level tool. Issue at most one exec call per response. To wait for the next
+    out.push_str(r#"exec is your only top-level tool. Issue at most one exec call per response. To wait for the next
 check-in or event, end the model turn; no separate exec is needed. This does not sleep or block
 Python.
 
-"#),
-            ExecReturn::Blocking => out.push_str(r#"Claude Code's built-in tools are disabled. Your only tool is mcp__py__exec, with one source
-string argument. Make one call at a time. It stays open until a reporting boundary (output,
-completion, check-in, or incoming input), then returns output so far. Cells can keep running
-afterward; later output appears in a subsequent result or message.
-
-"#),
-        }
+"#);
     out.push_str(
         r#"### Calling tools through exec
 
@@ -387,11 +371,6 @@ Interrupt an agent's current turn with `agents.cancel`; the agent remains availa
 agents.cancel(*, engineer_id: str) -> Awaitable[str]
 ```
 
-Agents in the same workset can see each other's edits; give concurrent workers disjoint write
-targets or create a separate checkout and pass its path as workdir. A new checkout does not
-automatically contain uncommitted changes, running services, or test setup. Keep implementation, review, fixes, and verification with the checkout
-containing the work. Inspect a returned outcome before treating completion as success.
-
 ### Briefing and integrating work
 
 Brief another agent as a capable colleague who has not seen this discussion. State the goal,
@@ -573,7 +552,7 @@ commit page, for example [`abc1234`](https://github.com/org/repo/commit/abc1234)
 
 /// Render the complete Advisor instructions independently of the Engineer
 /// policy.
-fn advisor_prompt(execution: ExecReturn, team: &str, context: &str) -> Arc<str> {
+fn advisor_prompt(team: &str, context: &str) -> Arc<str> {
     let mut out = String::new();
     out.push_str(r#"You are the Advisor — an expert engineering advisor called when the requesting Engineer needs deeper
 reasoning than it can provide itself. You give high-quality technical guidance, code reviews,
@@ -803,19 +782,11 @@ image((await view_image(path='/absolute/path/to/capture.png'))['content'][0])
         );
 
     out.push_str("## Tool execution\n\n");
-    match execution {
-            ExecReturn::AtTurnEnd => out.push_str(r#"exec is your only top-level tool. Issue at most one exec call per response. To wait for the next
+    out.push_str(r#"exec is your only top-level tool. Issue at most one exec call per response. To wait for the next
 check-in or event, end the model turn; no separate exec is needed. This does not sleep or block
 Python.
 
-"#),
-            ExecReturn::Blocking => out.push_str(r#"Claude Code's built-in tools are disabled. Your only tool is mcp__py__exec, with one source
-string argument. Make one call at a time. It stays open until a reporting boundary (output,
-completion, check-in, or incoming input), then returns output so far. Cells can keep running
-afterward; later output appears in a subsequent result or message.
-
-"#),
-        }
+"#);
     out.push_str(
         r#"### Calling tools through exec
 
@@ -1079,13 +1050,9 @@ commit page, for example [`abc1234`](https://github.com/org/repo/commit/abc1234)
 /// Render an agent's role, project guidance, team, and environment.
 /// Main agents and Advisors each have a fixed Python interface.
 pub fn prompt(view: &crate::View, multi_agent: Option<&Team>, role: AgentRole) -> Arc<str> {
-    let place = WorksetPrompt::of(view, multi_agent);
+    let place = WorksetPrompt::of(view);
     let (agents_md, skills) = {
         let (agents_files, skills) = discovered_context(view);
-        let skills = skills
-            .into_iter()
-            .filter(|skill| role.is_engineer() || skill.name != "delegate-engineering")
-            .collect::<Vec<_>>();
         (
             render_agents_md_prompt(&agents_files).unwrap_or_default(),
             render_skills_prompt(&skills).unwrap_or_default(),
@@ -1150,10 +1117,8 @@ request.
     let workspace = render_workspace_prompt(&place);
     let context = format!("{workspace}{agents_md}{skills}");
     match role {
-        AgentRole::Engineer { .. } => {
-            main_agent_prompt(ExecReturn::AtTurnEnd, &team_context, &context)
-        }
-        AgentRole::Advisor { .. } => advisor_prompt(ExecReturn::AtTurnEnd, &team_context, &context),
+        AgentRole::Engineer { .. } => main_agent_prompt(&team_context, &context),
+        AgentRole::Advisor { .. } => advisor_prompt(&team_context, &context),
     }
 }
 
@@ -1179,12 +1144,144 @@ pub fn claude_prompt(
         format!("{identity}\n\n")
     });
     let workspace = view
-        .map(|view| render_workspace_prompt(&WorksetPrompt::of(view, multi_agent)))
+        .map(|view| render_workspace_prompt(&WorksetPrompt::of(view)))
         .unwrap_or_default();
+    // This is a CLAUDE.md supplement to Claude Code's own system instructions,
+    // not a variant of either native agent's complete system prompt.
+    let mut out = String::from(
+        r#"# Rho integration
+
+## Python execution
+
+Rho exposes its tools through mcp__py__exec, with one source string argument. Claude Code's built-in
+tools are disabled in this session. Make one call at a time. It stays open until a reporting boundary:
+output, completion, check-in, or incoming input. It then returns output so far. Cells may
+continue running afterward; later output appears in a subsequent result or message.
+
+The notebook supports top-level await and persistent globals. Host calls start immediately, even
+without assignment or await. Start independent work in one cell; await only when later Python code
+needs completion or a returned value. Output arrives automatically; do not await or reprint it
+merely to show it.
+
+Run a shell command. Returns a persistent handle immediately; output arrives automatically.
+command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
+
+Wait for a command to finish. Returns completion metadata, not stdout. Failure to start or
+cancellation can raise an exception.
+await handle → {id: int, exit_code: int | None}
+
+Send input and read retained output, or omit chars to read only. Awaiting waits for stdin readiness,
+not future output; an empty page is valid.
+write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awaitable[{
+    id: int,
+    output: str,
+    offset: int,
+    next_offset: int,
+    retained_bytes: int,
+    dropped_bytes: int,
+    finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
+}]
+
+Read retained output without writing input. Returns the same result shape as write_stdin.
+Explicit reads use a separate cursor starting at byte zero and may repeat automatic previews.
+display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
+
+Request cancellation. Awaiting this operation waits for the request to be handled; await the
+command handle to wait for termination.
+handle.cancel() → Awaitable[None]
+
+Emit ordinary output, like print. display(function) shows its signature and documentation;
+display(other_value) behaves like text.
+text(value: object, *, max_tokens: int = 2000) → None
+
+Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
+notify(value: object, *, max_tokens: int = 2000) → None
+
+Set this turn's check-in policy before an await that might suspend the cell. The default interval
+is 120 seconds; accepted values are 1–3600 seconds. A check-in reports through the MCP call; do not
+sleep in Python merely to wait for reporting.
+set_checkin(after_seconds: int = 300, *, wake_on_tools: bool = True) → None
+
+With wake_on_tools=False, output, completion, errors, notify, and exec completion do not wake the
+model. Only the timer, user messages, or agent mail do. Work continues; buffered output arrives on
+the next wake. Older cells cannot change a newer turn's policy.
+
+The standard library, PyYAML, and HTTPX are available. Python runs in-process, not in a security
+sandbox; cwd is notebook-local, other process-global APIs retain their normal effects, and native
+extensions are unsupported. A runtime restart loses globals and handles; do not automatically
+replay interrupted work. The native Rho history API is empty in Claude sessions.
+
+Output budgets are capped at 10000 tokens. Each command retains its first 8 MiB, with overflow
+counts. Up to 64 command handles and 32 image references are retained; old completed, delivered
+handles may be evicted. Displayed session IDs are reusable labels, not handles.
+
+## Other Rho functions
+
+Search or read web pages using OpenAI web requests, for example
+search_query=[{"q": "search terms"}] or open=[{"ref_id": "https://example.com"}].
+web.run(**request) → Awaitable[str]
+
+Load an image from the workset. high is the default detail; original preserves resolution within
+the safety limits. The returned image must be explicitly displayed.
+view_image(*, path: str, detail: Literal['high', 'original'] = 'high') → Awaitable[dict]
+image((await view_image(path='/src/capture.png'))['content'][0]) → Awaitable[None]
+
+Record a concrete Rho bug or workflow friction locally. It does not notify anyone or start work.
+papercut(*, description: str) → Awaitable[str]
+
+## Working with other agents
+
+"#,
+    );
+    out.push_str(&team);
     match role {
-        AgentRole::Engineer { .. } => main_agent_prompt(ExecReturn::Blocking, &team, &workspace),
-        AgentRole::Advisor { .. } => advisor_prompt(ExecReturn::Blocking, &team, &workspace),
+        AgentRole::Engineer { .. } => out.push_str(
+            r#"Do the work yourself by default. Spawn an Engineer for independently owned parallel work, a large
+bounded task whose intermediate output would crowd your context, or explicit user-requested
+delegation. Do not hand off one coherent implementation serially or delegate routine self-review.
+
+Start an Engineer. task_name is a short kebab-case label; prompt must include the goal, scope,
+relevant evidence, constraints, and verification. The child already receives project guidance.
+workdir selects an existing absolute directory in your workset; omission inherits your directory.
+The call does not create a checkout. Returns an awaitable identifying the Engineer, not its findings.
+agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str | None = None) → Awaitable[str]
+
+Inspect the returned diff or evidence and run combined validation.
+
+Consult an independent Advisor when the user requests one. Otherwise consult only after your own
+investigation leaves a specific unresolved question that would change a high-impact decision—not
+for routine review, reassurance, or merely complex work. State the question or requested review
+scope, relevant files, intended behavior, what you checked, settled constraints, and desired output.
+Returns an awaitable identifying the Advisor, not its findings.
+agents.spawn_new_advisor(msg: str) → Awaitable[str]
+
+Interrupt an Engineer's current turn. It remains available for follow-up messages.
+agents.cancel(*, engineer_id: str) → Awaitable[str]
+
+"#,
+        ),
+        AgentRole::Advisor { .. } => out.push_str(
+            r#"You are serving as an Advisor. Complete the requesting Engineer's analysis or review and return
+your findings through your final response. Investigate rather than implement: inspect files and
+run focused checks or scratch experiments when needed, but do not make product changes, commit,
+push, or modify shared infrastructure. You cannot spawn or interrupt agents.
+
+"#,
+        ),
     }
+    out.push_str(
+        r#"Queue a message to an existing agent using its role-prefixed handle. A busy recipient sees it at
+its next inference boundary. Returns confirmation of queueing, not the recipient's answer.
+agents.message(*, agent_id: str, message: str) → Awaitable[str]
+
+Child final responses arrive automatically as agent mail. Keep working on independent tasks while
+waiting; use a check-in when blocked on a reply. Do not repeatedly poll or create acknowledgment
+loops.
+
+"#,
+    );
+    out.push_str(&workspace);
+    out.into()
 }
 
 /// An agent's place as the prompt renders it.
@@ -1197,13 +1294,10 @@ struct WorksetPrompt {
     git: bool,
     /// Whether the filesystem outside the workset is a disposable view.
     view: bool,
-    /// Whether another agent started this one, and so may share its
-    /// directory.
-    spawned: bool,
 }
 
 impl WorksetPrompt {
-    fn of(view: &crate::View, multi_agent: Option<&Team>) -> Self {
+    fn of(view: &crate::View) -> Self {
         let git = view
             .context_roots()
             .map(|(_, host_root)| host_root.join(".git").exists())
@@ -1213,7 +1307,6 @@ impl WorksetPrompt {
             cwd: view.cwd().to_string(),
             git,
             view: matches!(view.mode(), rho_fs_view::Mode::View { .. }),
-            spawned: multi_agent.is_some_and(|tools| tools.parent.as_ref().is_some()),
         }
     }
 }
@@ -1333,17 +1426,7 @@ behind you; what is there when you start is the starting state you were given.
         );
     }
     if place.git {
-        out.push_str(
-            "This repository is a git checkout; `origin` is the real remote. Other checkouts \
-             of it in the workset have their own branches: leave commits you did not create \
-             alone unless the task is to work on them.\n\n",
-        );
-    }
-    if place.spawned {
-        out.push_str(
-            "The agent that started you may share this directory with you, so your edits are \
-             visible to it immediately and its edits to you.\n\n",
-        );
+        out.push_str("This repository is a git checkout; `origin` is the real remote.\n\n");
     }
     out
 }
@@ -1391,19 +1474,18 @@ mod tests {
         assert!(prompt.contains("follow them unless they conflict"));
     }
 
-    fn place(git: bool, view: bool, spawned: bool) -> WorksetPrompt {
+    fn place(git: bool, view: bool) -> WorksetPrompt {
         WorksetPrompt {
             root: "/src".to_owned(),
             cwd: "/src/repo".to_owned(),
             git,
             view,
-            spawned,
         }
     }
 
     #[test]
     fn workspace_prompt_is_informational() {
-        let prompt = render_workspace_prompt(&place(true, true, false));
+        let prompt = render_workspace_prompt(&place(true, true));
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("Your workset is the directory /src"));
         assert!(prompt.contains("Working directory: /src/repo"));
@@ -1412,7 +1494,8 @@ mod tests {
         assert!(prompt.contains("git worktree add"));
         assert!(prompt.contains("This repository is a git checkout"));
         assert!(prompt.contains("starting state you were given"));
-        assert!(prompt.contains("leave commits you did not create alone"));
+        assert!(!prompt.contains("Other checkouts"));
+        assert!(!prompt.contains("share"));
         assert!(prompt.contains("disposable environment"));
         assert!(!prompt.contains("agent that started you"));
         assert!(!prompt.contains("do not create"));
@@ -1420,19 +1503,15 @@ mod tests {
 
     #[test]
     fn workspace_prompt_omits_git_and_view_sections_when_absent() {
-        let prompt = render_workspace_prompt(&place(false, false, true));
+        let prompt = render_workspace_prompt(&place(false, false));
         assert!(!prompt.contains("This repository is a git checkout"));
         assert!(!prompt.contains("disposable environment"));
-        assert!(prompt.contains("agent that started you"));
+        assert!(!prompt.contains("agent that started you"));
     }
 
     #[test]
     fn engineer_prompt_integrates_capabilities_in_story_order() {
-        let prompt = main_agent_prompt(
-            ExecReturn::AtTurnEnd,
-            "TEAM_SENTINEL\n\n",
-            "WORKSPACE_SENTINEL",
-        );
+        let prompt = main_agent_prompt("TEAM_SENTINEL\n\n", "WORKSPACE_SENTINEL");
         let headings = prompt
             .lines()
             .filter(|line| line.starts_with("## "))
@@ -1487,6 +1566,7 @@ mod tests {
         assert!(collaboration.contains("agents.spawn_new_advisor(msg: str)"));
         assert!(collaboration.starts_with("\n\nTEAM_SENTINEL\n\n"));
         assert!(collaboration.contains("### Engineers"));
+        assert!(!collaboration.contains("share a checkout"));
         assert!(collaboration.contains("agents.spawn_new_engineer(*, task_name:"));
         assert!(collaboration.contains("task_name is a short kebab-case label"));
         assert!(collaboration.contains("The child already receives project"));
@@ -1535,7 +1615,7 @@ mod tests {
 
     #[test]
     fn advisor_prompt_has_its_own_policy_and_only_its_capabilities() {
-        let prompt = advisor_prompt(ExecReturn::AtTurnEnd, "TEAM_SENTINEL\n\n", "");
+        let prompt = advisor_prompt("TEAM_SENTINEL\n\n", "");
         for section in [
             "## Read before you advise",
             "## Work quickly",
@@ -1575,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_prompt_uses_blocking_exec_for_both_roles() {
+    fn claude_prompt_is_an_independent_integration_supplement_for_both_roles() {
         for role in [
             AgentRole::default(),
             AgentRole::Advisor {
@@ -1607,7 +1687,25 @@ mod tests {
             assert!(prompt.contains("Make one call at a time"));
             assert!(prompt.contains("stays open until a reporting boundary"));
             assert!(!prompt.contains("Issue at most one exec call per response"));
-            assert!(prompt.contains("history: Sequence[HistoryItem]"));
+            assert!(prompt.starts_with("# Rho integration\n"));
+            assert!(prompt.contains("history API is empty in Claude sessions"));
+            for native_only in [
+                "You are Rho, an autonomous coding agent",
+                "You are the Advisor — an expert",
+                "## Autonomy And Persistence",
+                "## Engineering And Scope",
+                "## Working with the user",
+                "history: Sequence[HistoryItem]",
+                "end the model turn",
+            ] {
+                assert!(!prompt.contains(native_only), "{native_only}");
+            }
+            assert!(!collaboration.contains("share a checkout"));
+            assert_eq!(
+                prompt.contains("agents.spawn_new_engineer(*"),
+                role.is_engineer()
+            );
+            assert_eq!(prompt.contains("agents.cancel(*"), role.is_engineer());
             assert_eq!(
                 prompt.contains("agents.spawn_new_advisor(msg:"),
                 role.is_engineer()

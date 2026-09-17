@@ -622,8 +622,9 @@ Rho follows symlinks with cycle detection for `AGENTS.md` files and does not
 load legacy `~/.agents`, `.agents.local`, or `AGENTS.*.md` variants.
 
 Claude-runtime agents keep Claude Code's `CLAUDE.md` discovery enabled. In
-managed workspaces, Rho provides the rendered Rho prompt through a
-generated temporary file that is file-bind-mounted over `~/.claude/CLAUDE.md`
+managed workspaces, Rho provides a separately authored Claude integration
+supplement covering the notebook interface, agent coordination, and workspace
+context—not either native role's full system prompt—through a generated temporary file that is file-bind-mounted over `~/.claude/CLAUDE.md`
 inside the Claude process's private workspace mount namespace. If the bind
 target does not exist, Rho creates an empty `~/.claude/CLAUDE.md` file first.
 Rho does not write the generated prompt into the origin checkout or workspace
