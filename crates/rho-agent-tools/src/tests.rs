@@ -261,8 +261,10 @@ async fn python_tool_entries_use_the_callable_namespace() {
     assert!(description.contains("handle.cancel() requests cancellation"));
     assert!(description.contains("job.cancel()"));
     assert!(description.contains("await job"));
-    assert!(description.contains("`history` is a lazy, read-only sequence"));
-    assert!(description.contains("HistoryProviderData(tag, data)"));
+    assert!(description.contains("`history` is a lazy, read-only snapshot"));
+    assert!(description.contains("class HistoryProviderData(NamedTuple):"));
+    assert!(description.contains("provider: HistoryProviderData | None = None"));
+    assert!(description.contains("history: Sequence[HistoryItem]"));
     assert!(!description.contains("for item in history"));
 }
 

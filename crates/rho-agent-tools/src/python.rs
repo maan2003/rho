@@ -287,24 +287,67 @@ to manipulate their data.
 The Python standard library, PyYAML (`yaml`), and HTTPX (`httpx`) are available through ordinary \
 imports.
 
-`history` is a lazy, read-only sequence containing the native Rho transcript supplied by the host,
-snapshotted when the current execution was admitted; it is empty when the host supplies no
-transcript. Indexing returns immutable `HistoryItem` values; iteration and slicing use
-ordinary sequence semantics. Fields are `kind`, `role`, `sender`, `text`, `display_text`, `content`,
-`name`, `arguments`, `call_id`, `summary`, `images`, `provider`, `status`, `phase`, `tool_type`,
-`started_at`, `finished_at`, `at`, `retain_from`, `call_ids`, `response_id`, and `metadata`; fields
-that do not apply are `None` or empty tuples. `content` contains immutable `HistoryContent` values
-(`kind`, `text`, `media_type`, `data`) and `images` contains immutable `HistoryImage` values
-(`media_type`, `data`, `detail`). Binary image data is `bytes`. `provider` preserves raw
-provider-specific transcript metadata as `HistoryProviderData(tag, data)`, where `data` is the
-original Senax-encoded `bytes`; it may be opaque or encrypted and its representation does not print
-the bytes. Item kinds include `message`, `reasoning`, `encrypted_reasoning`, `tool_call`,
-`tool_result`, `tool_update`, `compaction`, `unknown`, `compaction_trigger`, `context_rotation`,
-and `tool_history_evicted`.
-Messages use `text`/`content`; tool calls use `name`/`arguments`/`call_id`; results and updates use
-`call_id`, complete recorded `text`, and the original bounded `display_text`. Timestamps are Unix
-milliseconds; `status` is `success`, `error`, or `cancelled` when known. Slices materialize their
-selected items; ordinary indexing materializes only that item.
+`history` is a lazy, read-only snapshot of the host-supplied native Rho transcript at execution
+admission (empty if none is supplied). Indexing materializes one item; slices materialize their
+selected items. Records are immutable. Types:
+
+```python
+from collections.abc import Sequence
+from typing import Literal, NamedTuple
+
+class HistoryContent(NamedTuple):
+    kind: str
+    text: str | None = None
+    media_type: str | None = None
+    data: bytes | None = None
+
+
+class HistoryImage(NamedTuple):
+    media_type: str
+    data: bytes
+    detail: str | None = None
+
+
+class HistoryProviderData(NamedTuple):
+    tag: str
+    data: bytes
+
+
+class HistoryItem(NamedTuple):
+    kind: Literal[
+        'message', 'reasoning', 'encrypted_reasoning', 'tool_call', 'tool_result',
+        'tool_update', 'compaction', 'unknown', 'compaction_trigger',
+        'context_rotation', 'tool_history_evicted',
+    ]
+    role: str | None = None
+    sender: str | None = None
+    text: str | None = None
+    display_text: str | None = None
+    content: tuple[HistoryContent, ...] = ()
+    name: str | None = None
+    arguments: str | None = None
+    call_id: str | None = None
+    summary: tuple[str, ...] = ()
+    images: tuple[HistoryImage, ...] = ()
+    provider: HistoryProviderData | None = None
+    status: str | None = None
+    phase: str | None = None
+    tool_type: str | None = None
+    started_at: int | None = None
+    finished_at: int | None = None
+    at: int | None = None
+    retain_from: int | None = None
+    call_ids: tuple[str, ...] = ()
+    response_id: str | None = None
+    metadata: object | None = None
+
+
+history: Sequence[HistoryItem]
+```
+
+`text` retains complete recorded text; `display_text` retains the bounded model-facing text.
+Timestamps are Unix milliseconds. Provider `data` is original Senax-encoded bytes (possibly opaque
+or encrypted); its representation hides the bytes. Nested metadata is read-only.
 
 Work registers immediately; output arrives automatically. Put independent calls in the same cell \
 to run them concurrently; await only when later Python statements depend on completion.
