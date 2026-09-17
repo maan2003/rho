@@ -205,8 +205,9 @@ pub struct ClaudeOutputBatch {
     pub at: UnixMs,
 }
 
-/// Durable context transitions; indices refer to the complete block history,
-/// never to the shortened provider projection.
+/// Historical notes-preparation transitions, retained for transcript decoding.
+/// New eviction boundaries are `ContextBlock::ToolHistoryEvicted` items.
+/// Indices refer to full history, never to the provider projection.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum ContextChange {
     Marked { retain_from: u64 },

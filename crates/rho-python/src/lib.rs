@@ -19,6 +19,24 @@ use std::sync::{Arc, Mutex, mpsc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Lazy, execution-scoped data exposed through the Python `history` sequence.
+/// Implementations own snapshots and return one JSON-shaped item at a time.
+pub trait History: Send + Sync + 'static {
+    fn len(&self, cell: CellId) -> Result<usize, String>;
+    fn get(&self, cell: CellId, index: usize) -> Result<Value, String>;
+}
+
+#[derive(Default)]
+struct EmptyHistory;
+impl History for EmptyHistory {
+    fn len(&self, _cell: CellId) -> Result<usize, String> {
+        Ok(0)
+    }
+    fn get(&self, _cell: CellId, _index: usize) -> Result<Value, String> {
+        Err("history index out of range".into())
+    }
+}
+
 pub type CellId = u64;
 pub type RequestId = u64;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -203,6 +221,14 @@ impl Session {
         setup: impl FnOnce() -> Result<(), String> + Send + 'static,
         tools: Value,
     ) -> Result<Self, String> {
+        Self::new_with_history(setup, tools, Arc::new(EmptyHistory))
+    }
+
+    pub fn new_with_history(
+        setup: impl FnOnce() -> Result<(), String> + Send + 'static,
+        tools: Value,
+        history: Arc<dyn History>,
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let executions: Executions = Default::default();
         let cancelled = Arc::new(Mutex::new(HashMap::new()));
@@ -222,6 +248,7 @@ impl Session {
                 setup()?;
                 Ok(tools)
             },
+            history,
         )?;
         Ok(Self {
             sender: Sender {
@@ -320,6 +347,50 @@ mod tests {
             .await
             .expect("runtime timed out")
             .expect("runtime stopped")
+    }
+
+    struct CountingHistory {
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl History for CountingHistory {
+        fn len(&self, _cell: CellId) -> Result<usize, String> {
+            Ok(3)
+        }
+
+        fn get(&self, _cell: CellId, index: usize) -> Result<Value, String> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(serde_json::json!({"kind": format!("item_{index}")}))
+        }
+    }
+
+    #[tokio::test]
+    async fn history_only_materializes_indexed_items() {
+        let history = Arc::new(CountingHistory {
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (events, mut receiver) = tokio::sync::mpsc::channel(16);
+        let session =
+            Session::new_with_history(|| Ok(()), serde_json::json!([]), history.clone()).unwrap();
+        session
+            .sender()
+            .execute(
+                7,
+                "assert len(history) == 3\nassert history[-1].kind == 'item_2'".into(),
+                Arc::new(RecordedExecution(events)),
+            )
+            .unwrap();
+
+        loop {
+            if matches!(next(&mut receiver).await, Event::Finished { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            history.gets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "len and untouched items must not materialize payloads"
+        );
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use rustpython_vm::builtins::PyDictRef;
 use rustpython_vm::function::{ArgIntoFloat, OptionalArg};
 use rustpython_vm::{AsObject, Interpreter, PyObjectRef, PyResult, TryFromObject, VirtualMachine};
 
-use crate::{Cancellation, CellId, Event, Input, MAX_MESSAGE_BYTES};
+use crate::{Cancellation, CellId, Event, History, Input, MAX_MESSAGE_BYTES};
 
 /// Account for cell-owned work after an ordinary asyncio iteration. Python
 /// objects remain on the interpreter thread; scheduling and I/O stay in
@@ -201,6 +201,7 @@ pub(super) fn spawn(
     shutdown: Arc<AtomicBool>,
     wake: Arc<OwnedFd>,
     setup: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
+    history: Arc<dyn History>,
 ) -> Result<(), String> {
     static TLS: OnceLock<Result<(), String>> = OnceLock::new();
     TLS.get_or_init(|| {
@@ -423,6 +424,34 @@ pub(super) fn spawn(
                             }
                         },
                     );
+                    let history_len = {
+                        let history = Arc::clone(&history);
+                        vm.new_function(
+                            "_history_len",
+                            move |cell: u64, vm: &VirtualMachine| -> PyResult<usize> {
+                                history
+                                    .len(cell)
+                                    .map_err(|error| vm.new_runtime_error(error))
+                            },
+                        )
+                    };
+                    let history_get = {
+                        let history = Arc::clone(&history);
+                        vm.new_function(
+                            "_history_get",
+                            move |cell: u64,
+                                  index: usize,
+                                  vm: &VirtualMachine|
+                                  -> PyResult<String> {
+                                history
+                                    .get(cell, index)
+                                    .and_then(|value| {
+                                        serde_json::to_string(&value).map_err(|e| e.to_string())
+                                    })
+                                    .map_err(|error| vm.new_runtime_error(error))
+                            },
+                        )
+                    };
                     for (name, function) in [
                         ("_emit", emit),
                         (
@@ -433,6 +462,8 @@ pub(super) fn spawn(
                         ("_receive", receive),
                         ("_cancel_requested", checkpoint),
                         ("_sync_watchdog", watchdog),
+                        ("_history_len", history_len),
+                        ("_history_get", history_get),
                     ] {
                         scope
                             .globals

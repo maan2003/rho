@@ -97,9 +97,6 @@ pub(crate) enum SourceKind {
     /// A command or host call a cell registered. It outlives its cell and is
     /// reported until its end has been delivered.
     Job { facts: JobFacts },
-    /// A dedicated preparation exchange. Other sources stay queued until its
-    /// model response and submitted Python cell have both returned.
-    Preparation { replied: bool, returned: bool },
 }
 
 /// How long a person's message waits for the machines around it to settle.
@@ -251,16 +248,12 @@ pub(crate) fn boundary(
     // with those the precedence lived in the order they were written.
     let standing = match available {
         None => {
-            let preparing = sources
-                .iter()
-                .any(|source| matches!(source, SourceKind::Preparation { .. }));
-            let interrupt = !preparing
-                && sources.iter().any(|source| match source {
-                    SourceKind::User { interrupt, .. } => *interrupt,
-                    // However loud a peer or a job is, the model finishes what it
-                    // is saying.
-                    _ => false,
-                });
+            let interrupt = sources.iter().any(|source| match source {
+                SourceKind::User { interrupt, .. } => *interrupt,
+                // However loud a peer or a job is, the model finishes what it
+                // is saying.
+                _ => false,
+            });
             return match interrupt {
                 true => Boundary::AbortAndResend,
                 false => NEVER,
@@ -273,28 +266,6 @@ pub(crate) fn boundary(
         // `owed` is never read here: only `standing` is.
         Some(standing) => standing,
     };
-
-    if !matches!(standing, Standing::Retry { .. })
-        && let Some((replied, returned)) = sources.iter().find_map(|source| match source {
-            SourceKind::Preparation { replied, returned } => Some((*replied, *returned)),
-            _ => None,
-        })
-    {
-        return if replied && returned {
-            Boundary::Now {
-                wake: WakeFacts {
-                    trigger: WakeTrigger::ContextRotation,
-                    events: Vec::new(),
-                    foreground_running: 0,
-                    background_running: 0,
-                    tools_suppressed: false,
-                    checkin_at: None,
-                },
-            }
-        } else {
-            NEVER
-        };
-    }
 
     // -- the room: what is running, and where the foreground is ---------------
 
@@ -392,10 +363,7 @@ pub(crate) fn boundary(
                     pending.push((facts.cell, facts.registered_at.0, kind, end.at));
                 }
             }
-            SourceKind::Delivery
-            | SourceKind::User { .. }
-            | SourceKind::Mail { .. }
-            | SourceKind::Preparation { .. } => {}
+            SourceKind::Delivery | SourceKind::User { .. } | SourceKind::Mail { .. } => {}
         }
     }
     // Start each event's clock the first time it is seen from here, and stop

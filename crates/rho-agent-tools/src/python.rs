@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rho_core::{
-    ExecCall, ExecId, ToolCall, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs,
+    ContentPart, ContextBlock, ExecCall, ExecId, InferenceResponseItem, MessageSender, ToolCall,
+    ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs,
 };
-use rho_python::{Event, Input, Sender, Session};
+use rho_python::{Event, History, Input, Sender, Session};
 use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools, decode_output_lossy};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -22,8 +23,73 @@ const JOB_LIMIT: usize = 64;
 pub struct PythonNotebook {
     session: Session,
     shared: Arc<Shared>,
+    history: Arc<HistoryStore>,
     runtime: tokio::runtime::Handle,
 }
+
+#[derive(Default)]
+struct HistorySnapshot {
+    blocks: Arc<[Arc<ContextBlock>]>,
+    locations: Vec<(usize, usize)>,
+}
+
+impl HistorySnapshot {
+    fn new(blocks: Vec<Arc<ContextBlock>>) -> Self {
+        let locations = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(block, value)| {
+                (0..history_block_len(value)).map(move |offset| (block, offset))
+            })
+            .collect();
+        Self {
+            blocks: blocks.into(),
+            locations,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HistoryStore {
+    current: Mutex<Arc<HistorySnapshot>>,
+    executions: Mutex<HashMap<u64, Arc<HistorySnapshot>>>,
+}
+
+impl HistoryStore {
+    fn admit(&self, cell: u64) {
+        let snapshot = Arc::clone(&self.current.lock().unwrap());
+        self.executions.lock().unwrap().insert(cell, snapshot);
+    }
+
+    fn forget(&self, cell: u64) {
+        self.executions.lock().unwrap().remove(&cell);
+    }
+
+    fn snapshot(&self, cell: u64) -> Result<Arc<HistorySnapshot>, String> {
+        self.executions
+            .lock()
+            .unwrap()
+            .get(&cell)
+            .cloned()
+            .ok_or_else(|| "history is unavailable for this execution".into())
+    }
+}
+
+impl History for HistoryStore {
+    fn len(&self, cell: u64) -> Result<usize, String> {
+        Ok(self.snapshot(cell)?.locations.len())
+    }
+
+    fn get(&self, cell: u64, index: usize) -> Result<Value, String> {
+        let snapshot = self.snapshot(cell)?;
+        let &(block, offset) = snapshot
+            .locations
+            .get(index)
+            .ok_or_else(|| "history index out of range".to_owned())?;
+        history_item(&snapshot.blocks[block], offset)
+    }
+}
+
 struct Shared {
     tasks: Mutex<HostTasks>,
     next_cell: AtomicU64,
@@ -221,6 +287,25 @@ to manipulate their data.
 The Python standard library, PyYAML (`yaml`), and HTTPX (`httpx`) are available through ordinary \
 imports.
 
+`history` is a lazy, read-only sequence containing the native Rho transcript supplied by the host,
+snapshotted when the current execution was admitted; it is empty when the host supplies no
+transcript. Indexing returns immutable `HistoryItem` values; iteration and slicing use
+ordinary sequence semantics. Fields are `kind`, `role`, `sender`, `text`, `display_text`, `content`,
+`name`, `arguments`, `call_id`, `summary`, `images`, `provider`, `status`, `phase`, `tool_type`,
+`started_at`, `finished_at`, `at`, `retain_from`, `call_ids`, `response_id`, and `metadata`; fields
+that do not apply are `None` or empty tuples. `content` contains immutable `HistoryContent` values
+(`kind`, `text`, `media_type`, `data`) and `images` contains immutable `HistoryImage` values
+(`media_type`, `data`, `detail`). Binary image data is `bytes`. `provider` preserves raw
+provider-specific transcript metadata as `HistoryProviderData(tag, data)`, where `data` is the
+original Senax-encoded `bytes`; it may be opaque or encrypted and its representation does not print
+the bytes. Item kinds include `message`, `reasoning`, `encrypted_reasoning`, `tool_call`,
+`tool_result`, `tool_update`, `compaction`, `unknown`, `compaction_trigger`, `context_rotation`,
+and `tool_history_evicted`.
+Messages use `text`/`content`; tool calls use `name`/`arguments`/`call_id`; results and updates use
+`call_id`, complete recorded `text`, and the original bounded `display_text`. Timestamps are Unix
+milliseconds; `status` is `success`, `error`, or `cancelled` when known. Slices materialize their
+selected items; ordinary indexing materializes only that item.
+
 Work registers immediately; output arrives automatically. Put independent calls in the same cell \
 to run them concurrently; await only when later Python statements depend on completion.
 - command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are \
@@ -386,6 +471,197 @@ Available tools:
     description
 }
 
+fn history_block_len(block: &ContextBlock) -> usize {
+    match block {
+        ContextBlock::ToolResults { results } => results.len(),
+        ContextBlock::InferenceResponse { items, .. } => items.len(),
+        _ => 1,
+    }
+}
+
+fn history_content(content: &[ContentPart]) -> Value {
+    Value::Array(
+        content
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => json!({"kind": "text", "text": text}),
+                ContentPart::Image { media_type, data } => {
+                    json!({"kind": "image", "media_type": media_type, "data": data})
+                }
+            })
+            .collect(),
+    )
+}
+
+fn history_images(images: &[rho_core::ImageContent]) -> Value {
+    Value::Array(
+        images
+            .iter()
+            .map(|image| {
+                json!({
+                    "media_type": image.media_type,
+                    "data": image.data,
+                    "detail": match image.detail {
+                        rho_core::ImageDetail::High => "high",
+                        rho_core::ImageDetail::Original => "original",
+                    },
+                })
+            })
+            .collect(),
+    )
+}
+
+fn provider_data(provider: &dyn rho_core::ProviderSpecificData) -> Result<Value, String> {
+    let encoded =
+        senax_encoder::encode(&provider.clone_box()).map_err(|error| error.to_string())?;
+    Ok(json!({"tag": provider.tag(), "data": encoded.as_ref()}))
+}
+
+fn tool_type(value: ToolType) -> &'static str {
+    match value {
+        ToolType::Function => "function",
+        ToolType::Custom => "custom",
+    }
+}
+
+fn output_status(value: ToolOutputStatus) -> &'static str {
+    match value {
+        ToolOutputStatus::Success => "success",
+        ToolOutputStatus::Error => "error",
+        ToolOutputStatus::Cancelled => "cancelled",
+    }
+}
+
+fn history_item(block: &ContextBlock, offset: usize) -> Result<Value, String> {
+    let value = match block {
+        ContextBlock::UserMessage { sender, content } => {
+            let (role, sender) = match sender {
+                MessageSender::User => ("user", None),
+                MessageSender::Agent { id } => ("agent", Some(id.encoded())),
+            };
+            json!({
+                "kind": "message",
+                "role": role,
+                "sender": sender,
+                "text": content.iter().filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::Image { .. } => None,
+                }).collect::<Vec<_>>().join(""),
+                "content": history_content(content),
+            })
+        }
+        ContextBlock::DeveloperMessage { text } => {
+            json!({"kind": "message", "role": "developer", "text": text})
+        }
+        ContextBlock::ToolResults { results } => {
+            let result = &results[offset];
+            json!({
+                "kind": "tool_result",
+                "call_id": result.call_id.as_str(),
+                "tool_type": tool_type(result.tool_type),
+                "text": result.body.recorded_output(),
+                "display_text": result.body.output.as_str(),
+                "images": history_images(&result.body.images),
+                "status": output_status(result.body.status),
+                "started_at": result.started_at.0,
+                "finished_at": result.finished_at.0,
+                "metadata": result.metadata,
+            })
+        }
+        ContextBlock::ToolUpdate(update) => json!({
+            "kind": "tool_update",
+            "call_id": update.call_id.as_str(),
+            "tool_type": tool_type(update.tool_type),
+            "text": update.recorded_output(),
+            "display_text": update.output.as_str(),
+            "images": history_images(&update.images),
+            "status": update.status.map(output_status),
+            "at": update.at.0,
+        }),
+        ContextBlock::InferenceResponse {
+            items,
+            provider_response_id,
+        } => {
+            let response_id = provider_response_id.as_ref().map(|id| id.as_str());
+            match &items[offset] {
+                InferenceResponseItem::AssistantMessage {
+                    provider_specific,
+                    content,
+                    phase,
+                } => json!({
+                    "kind": "message",
+                    "role": "assistant",
+                    "text": content.iter().filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        ContentPart::Image { .. } => None,
+                    }).collect::<Vec<_>>().join(""),
+                    "content": history_content(content),
+                    "phase": phase.map(|phase| match phase {
+                        rho_core::MessagePhase::Commentary => "commentary",
+                        rho_core::MessagePhase::FinalAnswer => "final_answer",
+                    }),
+                    "provider": provider_data(provider_specific.as_ref())?,
+                    "response_id": response_id,
+                }),
+                InferenceResponseItem::ToolCall {
+                    provider_specific,
+                    id,
+                    name,
+                    tool_type: kind,
+                    arguments,
+                } => json!({
+                    "kind": "tool_call",
+                    "name": name.as_str(),
+                    "arguments": arguments,
+                    "call_id": id.as_str(),
+                    "tool_type": tool_type(*kind),
+                    "provider": provider_data(provider_specific.as_ref())?,
+                    "response_id": response_id,
+                }),
+                InferenceResponseItem::EncryptedReasoning {
+                    provider_specific,
+                    summary,
+                } => json!({
+                    "kind": "encrypted_reasoning",
+                    "summary": summary,
+                    "provider": provider_data(provider_specific.as_ref())?,
+                    "response_id": response_id,
+                }),
+                InferenceResponseItem::RawReasoning {
+                    provider_specific,
+                    content,
+                    summary,
+                } => json!({
+                    "kind": "reasoning",
+                    "text": content,
+                    "summary": summary,
+                    "provider": provider_data(provider_specific.as_ref())?,
+                    "response_id": response_id,
+                }),
+                InferenceResponseItem::Compaction { provider_specific } => json!({
+                    "kind": "compaction",
+                    "provider": provider_data(provider_specific.as_ref())?,
+                    "response_id": response_id,
+                }),
+                InferenceResponseItem::Unknown { provider_specific } => json!({
+                    "kind": "unknown",
+                    "provider": provider_data(provider_specific.as_ref())?,
+                    "response_id": response_id,
+                }),
+            }
+        }
+        ContextBlock::CompactionTrigger => json!({"kind": "compaction_trigger"}),
+        ContextBlock::ContextRotation { retain_from } => {
+            json!({"kind": "context_rotation", "retain_from": retain_from})
+        }
+        ContextBlock::ToolHistoryEvicted { call_ids } => json!({
+            "kind": "tool_history_evicted",
+            "call_ids": call_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        }),
+    };
+    Ok(value)
+}
+
 impl PythonNotebook {
     pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
         let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
@@ -403,19 +679,22 @@ impl PythonNotebook {
             images: Mutex::new(BTreeMap::new()),
             foreground_cell: AtomicU64::new(0),
         });
+        let history = Arc::new(HistoryStore::default());
         let shell = shared.shell.clone();
         let runtime = tokio::runtime::Handle::current();
         let setup_runtime = runtime.clone();
-        let session = Session::new(
+        let session = Session::new_with_history(
             move || {
                 unsafe { setup_runtime.block_on(shell.enter_interpreter_thread()) }
                     .map_err(|error| error.to_string())
             },
             json!(specs),
+            history.clone(),
         )?;
         Ok(Self {
             session,
             shared,
+            history,
             runtime,
         })
     }
@@ -426,6 +705,12 @@ impl Drop for PythonNotebook {
     }
 }
 impl PythonNotebook {
+    /// Replace the transcript used for subsequently admitted executions.
+    /// Running executions retain their existing cheap `Arc` snapshot.
+    pub fn set_history(&self, history: Vec<Arc<ContextBlock>>) {
+        *self.history.current.lock().unwrap() = Arc::new(HistorySnapshot::new(history));
+    }
+
     fn stop(&self) {
         self.shared.tasks.lock().unwrap().closed = true;
         for cell in self.shared.cells.lock().unwrap().values() {
@@ -501,10 +786,12 @@ impl PythonNotebook {
             cell,
             link,
             shared: Arc::clone(&self.shared),
+            history: Arc::clone(&self.history),
             sender: self.session.sender(),
             runtime: self.runtime.clone(),
         });
         let sender = self.session.sender();
+        self.history.admit(cell);
         let result = if tasks.closed {
             Err("Python notebook closed".into())
         } else {
@@ -514,6 +801,7 @@ impl PythonNotebook {
             }
         };
         if let Err(error) = result {
+            self.history.forget(cell);
             let mut state = exec.link.lock().unwrap();
             state.fail(&error);
             state.returned = Some(UnixMs::now());
@@ -905,6 +1193,7 @@ pub struct PythonExec {
     cell: u64,
     link: Arc<Mutex<ExecState>>,
     shared: Arc<Shared>,
+    history: Arc<HistoryStore>,
     sender: Sender,
     runtime: tokio::runtime::Handle,
 }
@@ -1117,6 +1406,8 @@ impl rho_python::Execution for PythonExec {
                     state.returned = state.finished;
                 }
                 state.waker.wake();
+                drop(state);
+                self.history.forget(self.cell);
             }
             Event::Stopped { error } => {
                 let mut state = self.link.lock().unwrap();
@@ -1125,6 +1416,8 @@ impl rho_python::Execution for PythonExec {
                 state.returned = state.finished;
                 state.cancelled.send_replace(true);
                 state.waker.wake();
+                drop(state);
+                self.history.forget(self.cell);
             }
         }
     }

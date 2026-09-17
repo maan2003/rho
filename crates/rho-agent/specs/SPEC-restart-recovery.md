@@ -100,19 +100,17 @@ takes.
 Required by
 [REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md).
 
-### Context rotation
+### Context eviction
 
-Only `eng-high-notes` schedules rotation. Role transitions reset unfinished
-rotation state and append the same cancellation notice live and during replay;
-committed retention boundaries remain authoritative regardless of current role.
+Only `eng-high-notes` evicts old completed tool exchanges before provider
+compaction. Eviction items preserve original call identities and transcript
+contents; replay and role changes retain the same provider exclusions. Live
+Python and jobs survive eviction and compaction; a restart never restores them.
 
-A live rotation preserves Python and jobs; a restart never does. Replay retains
-the last committed active-window boundary but abandons an unfinished preparation
-exchange. The next independently triggered request explains that note writes may
-already have happened; it must not automatically replay them. Preparing sends do
-not acknowledge held input or unrelated live output. A committed rotation
-clears old occupancy along with advancing the window. Notes are ordinary external
-filesystem effects and are not rewound with conversation.
+There is no dedicated preparation exchange or input holding. Historical
+preparation events remain readable, but replay abandons their unfinished
+preparation and warns against replaying effects. Old retained-window boundaries
+remain authoritative. Files written by earlier versions remain external effects.
 
 ### Live stream failure
 

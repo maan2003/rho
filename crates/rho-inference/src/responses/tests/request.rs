@@ -466,7 +466,7 @@ fn compaction_trigger_is_the_last_provider_input_item() {
 }
 
 #[test]
-fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffix() {
+fn tool_eviction_mode_allows_explicit_compaction_fallback() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = test_inference_service_with(
         auth,
@@ -474,8 +474,8 @@ fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffi
         PromptCacheKey::from_bytes(*b"noteskey"),
         Some(42_000),
     );
-    // The adapter distinguishes automatic rotation from an explicit manual
-    // override.
+    // Automatic server compaction is disabled, but explicit fallback remains
+    // available.
     let request = inference_request(vec![
         user_block("discarded"),
         user_block("retained"),
@@ -487,7 +487,7 @@ fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffi
     let body = ResponsesRequest::from_inference_request(&session.config, &request, None);
     let json = serde_json::to_value(body).unwrap();
     assert!(json.get("context_management").is_none());
-    assert!(!json["input"].to_string().contains("compaction_trigger"));
+    assert!(json["input"].to_string().contains("compaction_trigger"));
     assert!(!json["input"].to_string().contains("discarded"));
     assert!(json["input"].to_string().contains("retained"));
 
@@ -1130,4 +1130,112 @@ fn incremental_results_resolve_both_old_and_recent_call_metadata() {
         assert_eq!(result["call_id"], format!("call-{index}"));
         assert_eq!(result["name"], format!("tool-{index}"));
     }
+}
+
+#[test]
+fn eviction_removes_only_selected_tool_exchanges_and_invalidates_old_continuations() {
+    let session = test_inference_service("gpt-test");
+    let call = |id: &str| InferenceResponseItem::ToolCall {
+        provider_specific: provider_specific(
+            "function_call",
+            json!({
+                "type": "function_call", "id": format!("fc_{id}"), "call_id": id,
+                "name": "shell_run", "arguments": "pwd",
+            }),
+        ),
+        id: tool_call_id(id),
+        name: tool_name("shell_run"),
+        tool_type: ToolType::Function,
+        arguments: "pwd".into(),
+    };
+    let reasoning = InferenceResponseItem::EncryptedReasoning {
+        provider_specific: provider_specific(
+            "reasoning",
+            json!({
+                "type": "reasoning", "id": "reason", "encrypted_content": "opaque",
+                "summary": [{"type":"summary_text","text":"keep this reasoning"}],
+            }),
+        ),
+        summary: vec!["keep this reasoning".into()],
+    };
+    let mut request = inference_request(vec![
+        user_block("keep original request"),
+        inference_response(
+            Some("before-eviction"),
+            vec![
+                reasoning,
+                assistant_message("keep prose"),
+                call("old"),
+                call("recent"),
+            ],
+        ),
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![
+                tool_result_success(tool_call_id("old"), "old-result"),
+                tool_result_success(tool_call_id("recent"), "recent-result"),
+            ],
+        }),
+        Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+            call_id: tool_call_id("old"),
+            tool_type: ToolType::Function,
+            output: Arc::new("old-late-output".into()),
+            full_output: None,
+            status: Some(rho_core::ToolOutputStatus::Success),
+            at: rho_core::UnixMs(1),
+            images: Default::default(),
+        })),
+        Arc::new(ContextBlock::ToolHistoryEvicted {
+            call_ids: vec![tool_call_id("old")],
+        }),
+        Arc::new(ContextBlock::DeveloperMessage {
+            text: "history available".into(),
+        }),
+    ]);
+    let output = ResponsesRequest::from_inference_request(
+        &session.config,
+        &request,
+        Some("before-eviction"),
+    );
+    assert!(output.previous_response_id.is_none());
+    let wire = serde_json::to_value(&output).unwrap()["input"].clone();
+    let wire_text = wire.to_string();
+    for retained in [
+        "keep original request",
+        "keep prose",
+        "keep this reasoning",
+        "opaque",
+        "recent-result",
+    ] {
+        assert!(wire_text.contains(retained), "{retained}");
+    }
+    assert!(!wire_text.contains("old-result"));
+    assert!(!wire_text.contains("old-late-output"));
+    assert!(
+        !wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["call_id"] == "old")
+    );
+    assert!(
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["call_id"] == "recent" && item["type"] == "function_call")
+    );
+    request.input.push(inference_response(
+        Some("after-eviction"),
+        vec![assistant_message("new")],
+    ));
+    request.input.push(user_block("continue"));
+    let warm =
+        ResponsesRequest::from_inference_request(&session.config, &request, Some("after-eviction"));
+    assert_eq!(warm.previous_response_id.as_deref(), Some("after-eviction"));
+    assert_eq!(warm.input.len(), 1);
+    assert_eq!(warm.input[0]["content"][0]["text"], "continue");
+    assert_eq!(
+        request.input.len(),
+        8,
+        "projection must not mutate original history"
+    );
 }

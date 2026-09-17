@@ -215,9 +215,12 @@ impl ResponsesRequest {
         let mut previous_response = None;
         if let Some(cached_response_id) = cached_response_id {
             for (index, block) in request.input.iter().enumerate().skip(context_start).rev() {
-                if matches!(&**block, ContextBlock::ContextRotation { .. }) {
-                    // Even retained preparation responses still contain the
-                    // old server context. Only post-activation chains are safe.
+                if matches!(
+                    &**block,
+                    ContextBlock::ContextRotation { .. } | ContextBlock::ToolHistoryEvicted { .. }
+                ) {
+                    // Earlier server continuations still contain discarded
+                    // history. Only post-activation chains are safe.
                     break;
                 }
                 let ContextBlock::InferenceResponse {
@@ -260,6 +263,15 @@ impl ResponsesRequest {
         context_start: usize,
         previous_response: Option<(String, usize)>,
     ) -> Self {
+        let evicted: std::collections::HashSet<_> = request
+            .input
+            .iter()
+            .filter_map(|block| match &**block {
+                ContextBlock::ToolHistoryEvicted { call_ids } => Some(call_ids),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         let input_blocks = if let Some((_, next_block_index)) = previous_response.as_ref() {
             &request.input[*next_block_index..]
         } else {
@@ -335,7 +347,7 @@ impl ResponsesRequest {
         let mut compaction_requested = false;
         for (index, block) in input_blocks.iter().enumerate().skip(first_block) {
             match &**block {
-                ContextBlock::ContextRotation { .. } => {}
+                ContextBlock::ContextRotation { .. } | ContextBlock::ToolHistoryEvicted { .. } => {}
                 ContextBlock::DeveloperMessage { text } => input.push(json!({
                     "type": "message", "role": "developer",
                     "content": [{"type": "input_text", "text": text}],
@@ -357,6 +369,9 @@ impl ResponsesRequest {
                 ContextBlock::CompactionTrigger => compaction_requested = true,
                 ContextBlock::ToolResults { results } => {
                     for result in results {
+                        if evicted.contains(&result.call_id) {
+                            continue;
+                        }
                         let mut output =
                             convert_tool_result(result.clone(), tool_calls.get(&result.call_id));
                         if context_start > 0 && !retained_calls.contains(&result.call_id) {
@@ -370,20 +385,28 @@ impl ResponsesRequest {
                         input.push(output);
                     }
                 }
-                ContextBlock::ToolUpdate(update) => input.push(convert_tool_update(
-                    update,
-                    tool_calls.get(&update.call_id).map(|(name, _)| name),
-                )),
+                ContextBlock::ToolUpdate(update) => {
+                    if !evicted.contains(&update.call_id) {
+                        input.push(convert_tool_update(
+                            update,
+                            tool_calls.get(&update.call_id).map(|(name, _)| name),
+                        ));
+                    }
+                }
                 ContextBlock::InferenceResponse { items, .. } => {
                     let skip = if index == first_block { first_item } else { 0 };
                     for item in items.iter().skip(skip) {
+                        if matches!(item, InferenceResponseItem::ToolCall { id, .. } if evicted.contains(id))
+                        {
+                            continue;
+                        }
                         convert_response_item(item.clone(), &mut input);
                     }
                 }
             }
         }
         // The API requires one manual trigger at the tail.
-        if !session.responses_config.context_rotation && compaction_requested {
+        if compaction_requested {
             input.push(json!({ "type": "compaction_trigger" }));
         }
 

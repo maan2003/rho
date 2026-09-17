@@ -7,9 +7,12 @@ import json
 import pathlib
 import sys
 import types
+from types import MappingProxyType
 import inspect
 import threading
 import concurrent.futures
+from collections.abc import Sequence
+from typing import NamedTuple
 
 sys.path.insert(0, _site_packages)
 sys.path.insert(0, '')
@@ -23,6 +26,110 @@ _notebook_thread = threading.current_thread()
 _SYNC_TIMEOUT = 120
 _HEARTBEAT_INTERVAL = 10
 _task_dispatch = False
+
+
+class HistoryContent(NamedTuple):
+    kind: str
+    text: str | None = None
+    media_type: str | None = None
+    data: bytes | None = None
+
+
+class HistoryImage(NamedTuple):
+    media_type: str
+    data: bytes
+    detail: str | None = None
+
+
+class HistoryProviderData(NamedTuple):
+    tag: str
+    data: bytes
+
+    def __repr__(self):
+        return f'HistoryProviderData(tag={self.tag!r}, data=<{len(self.data)} bytes>)'
+
+
+class HistoryItem(NamedTuple):
+    kind: str
+    role: str | None = None
+    sender: str | None = None
+    text: str | None = None
+    display_text: str | None = None
+    content: tuple[HistoryContent, ...] = ()
+    name: str | None = None
+    arguments: str | None = None
+    call_id: str | None = None
+    summary: tuple[str, ...] = ()
+    images: tuple[HistoryImage, ...] = ()
+    provider: HistoryProviderData | None = None
+    status: str | None = None
+    phase: str | None = None
+    tool_type: str | None = None
+    started_at: int | None = None
+    finished_at: int | None = None
+    at: int | None = None
+    retain_from: int | None = None
+    call_ids: tuple[str, ...] = ()
+    response_id: str | None = None
+    metadata: object | None = None
+
+
+def _history_freeze(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key: _history_freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_history_freeze(item) for item in value)
+    return value
+
+
+def _history_item(value):
+    content = tuple(HistoryContent(
+        part['kind'], part.get('text'), part.get('media_type'),
+        bytes(part['data']) if part.get('data') is not None else None)
+        for part in value.get('content', ()))
+    images = tuple(HistoryImage(
+        item['media_type'], bytes(item['data']), item.get('detail'))
+        for item in value.get('images', ()))
+    raw = value.get('provider')
+    provider = None if raw is None else HistoryProviderData(raw['tag'], bytes(raw['data']))
+    fields = dict(value)
+    fields.update(content=content, images=images, provider=provider,
+                  summary=tuple(value.get('summary', ())),
+                  call_ids=tuple(value.get('call_ids', ())),
+                  metadata=_history_freeze(value.get('metadata')))
+    return HistoryItem(**fields)
+
+
+class _History(Sequence):
+    __slots__ = ()
+
+    @staticmethod
+    def _cell():
+        cell = _cell.get(None)
+        if cell is None:
+            raise RuntimeError('history is available only while executing a cell')
+        return cell
+
+    def __len__(self):
+        return _history_len(self._cell())
+
+    def __getitem__(self, index):
+        length = len(self)
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(length)))
+        if not isinstance(index, int):
+            raise TypeError('history indices must be integers or slices')
+        if index < 0:
+            index += length
+        if index < 0 or index >= length:
+            raise IndexError('history index out of range')
+        return _history_item(json.loads(_history_get(self._cell(), index)))
+
+    def __repr__(self):
+        return f'history({len(self)} items)'
+
+
+history = _History()
 
 
 def _heartbeat():
@@ -365,7 +472,7 @@ sys.stderr = sys.__stderr__ = _Output()
 _namespace = dict(__name__='__main__', command=command, write_stdin=write_stdin,
                   display=display, text=text, notify=notify, set_checkin=set_checkin,
                   web=web,
-                  image=image, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
+                  image=image, history=history, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
 
 
 def _configure_tools(specs):

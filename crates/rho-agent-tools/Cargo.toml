@@ -16,10 +16,11 @@ rho-tool-shell.workspace = true
 rho-web-search.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+senax-encoder.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-senax-encoder.workspace = true
+bytes.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 camino.workspace = true
 rho-fs-view.workspace = true

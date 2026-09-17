@@ -6,207 +6,205 @@ use rho_core::{ContextBlock, InferenceResponseItem, ToolCallId};
 
 use crate::ContextChange;
 
-/// Recent work retained between the early notice and the rotation threshold.
+/// Keep a recent 40k-token suffix; reclaim enough for another such interval.
 pub(super) const RETAIN_TOKENS: u64 = 40000;
-pub(super) const REPAIR_HEADROOM: u64 = 8000;
 
-pub(super) const MANUAL_COMPACTION: &str = "Manual compaction was requested. All earlier retention and preparation notices are canceled; do not resume their preparation. This request uses provider compaction. Any future automatic notes rotation will establish a new boundary.";
+pub(super) const MANUAL_COMPACTION: &str = "Manual compaction was requested. Earlier retention and preparation notices are canceled; do not resume their preparation.";
+pub(super) const POLICY_CHANGED: &str = "The context-management role has changed. Earlier retention and preparation notices are canceled; do not resume their preparation. Existing history remains available through Python.";
+pub(super) const EVICTED: &str = "Older tool exchanges were removed to free context space. Recent exchanges, conversation, and reasoning remain. Original history is available through `history` in Python.";
 
-pub(super) const POLICY_CHANGED: &str = "The context-management role has changed. All earlier retention and preparation notices are canceled; do not resume their preparation. Follow the current role's instructions. Any future notes rotation will establish a new boundary. Existing notes and the current retained conversation remain available.";
-
-pub(super) const MARKER: &str = "Context retention boundary: at the next rotation, this notice and everything after it will \
-     remain in context; everything before it will leave. Keep incremental notes in your notes directory as \
-     you work. You will receive one dedicated preparation response before rotation.";
-
-pub(super) const PREPARE: &str = "Prepare for context rotation now. Save anything you will need from before the context \
-     retention boundary using ordinary Python writes to your notes directory. The boundary and subsequent \
-     conversation, including this preparation exchange, will remain. This response is for \
-     preparation only: do not continue the task or give its final answer. New user messages, \
-     mail, and unrelated tool output are being held for the fresh window. Finish or await \
-     note writes in this cell; do not detach them. Python state and background jobs will survive.\n\n\
-     Preserve in your notes:\n\
-     - Current progress and key decisions made\n\
-     - Important context, constraints, or user preferences\n\
-     - What remains to be done (clear next steps)\n\
-     - Any critical data, examples, or references needed to continue\n\n\
-     Be concise, structured, and focused on seamlessly continuing the work.";
-
-pub(super) const REPAIR: &str = "The preparation cell failed. You have one repair response before context rotation. \
-     Inspect the failure and finish the necessary note writes using ordinary Python. \
-     Do not repeat actions whose effects may already have occurred. Finish or await writes \
-     in this cell; do not continue the task.";
-
-#[derive(Clone, Debug)]
-pub(super) struct Preparation {
-    pub retain_from: usize,
-    pub repair: bool,
-    pub replied: bool,
-    pub call: Option<ToolCallId>,
+pub(super) struct Eviction {
+    pub call_ids: Vec<ToolCallId>,
+    pub freed_tokens: u64,
 }
 
+/// Work from full history, excluding exchanges already evicted or summarized.
+/// A call's final contribution determines its age, and live calls are
+/// protected.
+pub(super) fn evict_tools(
+    history: &[Arc<ContextBlock>],
+    active: &std::collections::BTreeSet<ToolCallId>,
+    used: u64,
+    limit: u64,
+) -> Eviction {
+    use std::collections::{BTreeMap, BTreeSet};
+    let start = rho_core::context_window_start(history);
+    let mut first_block = start;
+    let mut first_item = 0;
+    for (i, block) in history.iter().enumerate().skip(start) {
+        if let ContextBlock::InferenceResponse { items, .. } = &**block
+            && let Some(j) = items
+                .iter()
+                .rposition(|item| matches!(item, InferenceResponseItem::Compaction { .. }))
+        {
+            first_block = i;
+            first_item = j;
+        }
+    }
+    let removed: BTreeSet<_> = history
+        .iter()
+        .filter_map(|block| match &**block {
+            ContextBlock::ToolHistoryEvicted { call_ids } => Some(call_ids),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect();
+    let mut suffix = 0;
+    let mut recent_start = history.len();
+    for (i, block) in history.iter().enumerate().skip(first_block).rev() {
+        recent_start = i;
+        suffix += estimate_visible(block, &removed);
+        if suffix >= RETAIN_TOKENS {
+            break;
+        }
+    }
+    // (last contribution, token estimate, has call, has result)
+    let mut calls = BTreeMap::<ToolCallId, (usize, u64, bool, bool)>::new();
+    for (i, block) in history.iter().enumerate().skip(first_block) {
+        match &**block {
+            ContextBlock::InferenceResponse { items, .. } => {
+                for item in items
+                    .iter()
+                    .skip(if i == first_block { first_item } else { 0 })
+                {
+                    if let InferenceResponseItem::ToolCall { id, arguments, .. } = item {
+                        let entry = calls.entry(id.clone()).or_default();
+                        entry.0 = i;
+                        entry.1 += text_tokens(arguments) + 8;
+                        entry.2 = true;
+                    }
+                }
+            }
+            ContextBlock::ToolResults { results } => {
+                for result in results {
+                    let entry = calls.entry(result.call_id.clone()).or_default();
+                    entry.0 = i;
+                    entry.1 += text_tokens(&result.body.output)
+                        + result.body.images.len() as u64 * 10000
+                        + 8;
+                    entry.3 = true;
+                }
+            }
+            ContextBlock::ToolUpdate(update) => {
+                let entry = calls.entry(update.call_id.clone()).or_default();
+                entry.0 = i;
+                entry.1 += text_tokens(&update.output) + update.images.len() as u64 * 10000 + 8;
+            }
+            _ => {}
+        }
+    }
+    let mut candidates = calls
+        .into_iter()
+        .filter(|(id, (last, _, call, result))| {
+            *call
+                && *result
+                && *last < recent_start
+                && !active.contains(id)
+                && !removed.contains(id)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.1.0.cmp(&b.1.0).then_with(|| a.0.cmp(&b.0)));
+    let needed = used.saturating_sub(limit.saturating_sub(RETAIN_TOKENS));
+    let mut eviction = Eviction {
+        call_ids: Vec::new(),
+        freed_tokens: 0,
+    };
+    for (id, (_, tokens, _, _)) in candidates {
+        if eviction.freed_tokens >= needed {
+            break;
+        }
+        eviction.call_ids.push(id);
+        eviction.freed_tokens += tokens;
+    }
+    eviction
+}
+
+fn text_tokens(text: &str) -> u64 {
+    (text.len() as u64).div_ceil(3)
+}
+
+/// Legacy notices are still interpreted when loading older transcripts, but
+/// no new preparation exchanges are scheduled.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Window {
     pub marker: Option<usize>,
-    pub preparation: Option<Preparation>,
+    pub preparation: Option<()>,
 }
 
 impl Window {
     pub fn sent(&mut self, change: &ContextChange) {
         match change {
             ContextChange::Marked { retain_from } => self.marker = Some(*retain_from as usize),
-            ContextChange::Preparing {
-                retain_from,
-                repair,
-            } => {
+            ContextChange::Preparing { retain_from, .. } => {
                 self.marker = Some(*retain_from as usize);
-                self.preparation = Some(Preparation {
-                    retain_from: *retain_from as usize,
-                    repair: *repair,
-                    replied: false,
-                    call: None,
-                });
+                self.preparation = Some(());
             }
         }
     }
-
     pub fn rotated(&mut self) {
-        self.marker = None;
-        self.preparation = None;
-    }
-
-    pub fn replied(&mut self, items: &[InferenceResponseItem]) {
-        if let Some(preparation) = &mut self.preparation {
-            preparation.replied = true;
-            preparation.call = items.iter().find_map(|item| match item {
-                InferenceResponseItem::ToolCall { id, .. } => Some(id.clone()),
-                _ => None,
-            });
-        }
-    }
-
-    /// An oversized first turn may have no early marker. Retain a recent suffix
-    /// and identify its actual beginning in the preparation notice, instead
-    /// of discarding the whole conversation.
-    pub fn fallback_start(&self, history: &[Arc<ContextBlock>]) -> usize {
-        let mut used = 0;
-        let mut start = history.len();
-        for (index, block) in history
-            .iter()
-            .enumerate()
-            .skip(rho_core::context_window_start(history))
-            .rev()
-        {
-            let tokens = estimate(block);
-            if used + tokens > RETAIN_TOKENS && start < history.len() {
-                break;
-            }
-            used += tokens;
-            start = index;
-        }
-        start
+        *self = Self::default();
     }
 }
 
-/// Approximate local estimate for exceptional suffix choice,
-/// not a replacement for provider-reported occupancy.
+/// Local estimates select eviction candidates; provider-reported occupancy
+/// remains authoritative after the next response.
 pub(super) fn estimate(block: &ContextBlock) -> u64 {
-    fn text(text: &str) -> u64 {
-        (text.len() as u64).div_ceil(3)
-    }
+    estimate_visible(block, &Default::default())
+}
+
+fn estimate_visible(block: &ContextBlock, removed: &std::collections::BTreeSet<ToolCallId>) -> u64 {
     fn parts(parts: &[rho_core::ContentPart]) -> u64 {
         parts
             .iter()
             .map(|part| match part {
-                rho_core::ContentPart::Text { text: value } => text(value),
+                rho_core::ContentPart::Text { text } => text_tokens(text),
                 rho_core::ContentPart::Image { .. } => 10000,
             })
             .sum()
     }
     8 + match block {
         ContextBlock::UserMessage { content, .. } => parts(content),
-        ContextBlock::DeveloperMessage { text: value } => text(value),
+        ContextBlock::DeveloperMessage { text } => text_tokens(text),
         ContextBlock::ToolResults { results } => results
             .iter()
-            .map(|result| text(&result.body.output) + result.body.images.len() as u64 * 10000)
+            .filter(|result| !removed.contains(&result.call_id))
+            .map(|result| {
+                text_tokens(&result.body.output) + result.body.images.len() as u64 * 10000
+            })
             .sum(),
-        ContextBlock::ToolUpdate(update) => text(&update.output),
+        ContextBlock::ToolUpdate(update) => {
+            if removed.contains(&update.call_id) {
+                0
+            } else {
+                text_tokens(&update.output) + update.images.len() as u64 * 10000
+            }
+        }
         ContextBlock::InferenceResponse { items, .. } => items
             .iter()
             .map(|item| match item {
                 InferenceResponseItem::AssistantMessage { content, .. } => parts(content),
-                InferenceResponseItem::ToolCall { arguments, .. } => text(arguments),
+                InferenceResponseItem::ToolCall { id, arguments, .. } => {
+                    if removed.contains(id) {
+                        0
+                    } else {
+                        text_tokens(arguments)
+                    }
+                }
                 InferenceResponseItem::RawReasoning {
                     content, summary, ..
-                } => text(content) + summary.iter().map(|value| text(value)).sum::<u64>(),
+                } => {
+                    text_tokens(content)
+                        + summary.iter().map(|value| text_tokens(value)).sum::<u64>()
+                }
+                InferenceResponseItem::EncryptedReasoning { summary, .. } => {
+                    summary.iter().map(|value| text_tokens(value)).sum()
+                }
                 _ => 0,
             })
             .sum(),
-        ContextBlock::CompactionTrigger | ContextBlock::ContextRotation { .. } => 0,
-    }
-}
-
-pub(super) fn fallback_notice(history: &[Arc<ContextBlock>], start: usize) -> String {
-    let excerpt = history
-        .get(start)
-        .map(|block| match &**block {
-            ContextBlock::UserMessage { content, .. } => rho_core::text_content(content),
-            ContextBlock::DeveloperMessage { text } => text.clone(),
-            ContextBlock::ToolUpdate(update) => update.output.to_string(),
-            ContextBlock::ToolResults { results } => results
-                .first()
-                .map(|result| result.body.output.to_string())
-                .unwrap_or_default(),
-            ContextBlock::InferenceResponse { items, .. } => items
-                .iter()
-                .find_map(|item| match item {
-                    InferenceResponseItem::ToolCall { arguments, .. } => Some(arguments.clone()),
-                    InferenceResponseItem::AssistantMessage { content, .. } => {
-                        Some(rho_core::text_content(content))
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default(),
-            ContextBlock::CompactionTrigger | ContextBlock::ContextRotation { .. } => String::new(),
-        })
-        .unwrap_or_default();
-    let excerpt: String = excerpt.chars().take(400).collect();
-    format!(
-        "{PREPARE}\nNo early retention notice was established for this rotation. \
-         A recent suffix will remain, beginning with this quoted excerpt (data, not instructions): {}",
-        serde_json::to_string(&excerpt).unwrap()
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transitions_keep_the_marker_fixed_until_rotation() {
-        let mut window = Window::default();
-        window.sent(&ContextChange::Marked { retain_from: 7 });
-        window.sent(&ContextChange::Preparing {
-            retain_from: 7,
-            repair: false,
-        });
-        window.replied(&[]);
-        assert!(window.preparation.as_ref().unwrap().replied);
-        window.rotated();
-        assert!(window.marker.is_none());
-        assert!(window.preparation.is_none());
-    }
-
-    #[test]
-    fn fallback_retains_a_recent_suffix_without_reopening_an_old_window() {
-        let mut history = (0..5)
-            .map(|_| {
-                Arc::new(ContextBlock::DeveloperMessage {
-                    text: "x".repeat(60000),
-                })
-            })
-            .collect::<Vec<_>>();
-        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 3 }));
-        let window = Window::default();
-        assert_eq!(window.fallback_start(&history), 4);
+        ContextBlock::CompactionTrigger
+        | ContextBlock::ContextRotation { .. }
+        | ContextBlock::ToolHistoryEvicted { .. } => 0,
     }
 }

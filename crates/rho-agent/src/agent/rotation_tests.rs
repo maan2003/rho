@@ -2,7 +2,6 @@ use rho_core::MessagePhase;
 
 use super::streaming::tests::agent as standard_agent;
 use super::*;
-use crate::{ContextChange, WakeTrigger};
 
 async fn agent(directory: &std::path::Path) -> super::streaming::tests::TestAgent {
     let agent = standard_agent(directory).await;
@@ -104,418 +103,6 @@ async fn latest_send(
 }
 
 #[tokio::test]
-async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Asked,
-    };
-    let limit = agent.session.auto_compact_token_limit().unwrap();
-    agent.context_used = Some(limit - context::RETAIN_TOKENS);
-    agent
-        .handle_control(Control::User(input("original task", 1), None), UnixMs(1))
-        .await
-        .unwrap();
-    agent.start_request(UnixMs(2), None).await.unwrap();
-    let (change, _) = latest_send(&agent).await;
-    assert_eq!(change, Some(ContextChange::Marked { retain_from: 1 }));
-    let marker = agent.context.marker.unwrap();
-    reply(&mut agent, vec![message("working")], limit).await;
-
-    agent
-        .handle_control(
-            Control::User(input("new task held during preparation", 3), None),
-            UnixMs(3),
-        )
-        .await
-        .unwrap();
-    agent.start_request(UnixMs(4), None).await.unwrap();
-    let (change, blocks) = latest_send(&agent).await;
-    assert_eq!(
-        change,
-        Some(ContextChange::Preparing {
-            retain_from: marker as u64,
-            repair: false
-        })
-    );
-    assert!(
-        blocks
-            .iter()
-            .all(|block| matches!(block, ContextBlock::DeveloperMessage { .. }))
-    );
-    assert_eq!(agent.user.len(), 1);
-    assert_eq!(
-        rho_core::context_window_start(&agent.provider_input().await.unwrap()),
-        0,
-        "preparation still sees the old context"
-    );
-    let (_, events) = agent.db.read().agent_events(agent.agent_id);
-    let replayed = replay::replay(events);
-    assert_eq!(
-        replayed.user, agent.user,
-        "preparation must not acknowledge queued input"
-    );
-    assert!(
-        replayed.context.preparation.is_none(),
-        "restart must not replay preparation"
-    );
-    assert_eq!(replayed.context.marker, Some(marker));
-
-    reply(&mut agent, vec![message("notes are ready")], limit).await;
-    assert!(
-        matches!(agent.decide(UnixMs::now()), Boundary::Now { wake } if wake.trigger == WakeTrigger::ContextRotation)
-    );
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    assert_eq!(
-        rho_core::context_window_start(&agent.provider_input().await.unwrap()),
-        marker
-    );
-    assert!(agent.context.marker.is_none());
-    assert!(agent.user.is_empty());
-    assert_eq!(agent.context_used, None);
-    assert!(
-        latest_send(&agent)
-            .await
-            .1
-            .iter()
-            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-    );
-    assert!(
-        matches!(
-            &*agent.provider_input().await.unwrap()[0],
-            ContextBlock::UserMessage { .. }
-        ),
-        "full history is untouched"
-    );
-    let (_, events) = agent.db.read().agent_events(agent.agent_id);
-    let replayed = replay::replay(events);
-    assert_eq!(rho_core::context_window_start(&replayed.history), marker);
-    assert_eq!(replayed.history, agent.provider_input().await.unwrap());
-    assert_eq!(replayed.context_used, None);
-    assert!(replayed.user.is_empty());
-}
-
-#[tokio::test]
-async fn preparation_waits_for_python_and_allows_only_one_repair() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Asked,
-    };
-    let limit = agent.session.auto_compact_token_limit().unwrap();
-    agent.context_used = Some(limit);
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    reply(
-        &mut agent,
-        vec![exec(
-            "prepare",
-            "import asyncio\nawait asyncio.sleep(0.1)\nraise ValueError('write failed')",
-        )],
-        limit,
-    )
-    .await;
-    agent
-        .handle_control(
-            Control::User(
-                QueuedInput {
-                    delivery: MessageDelivery::Immediate,
-                    ..input("queued", 5)
-                },
-                None,
-            ),
-            UnixMs(5),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(agent.decide(UnixMs::now()), Boundary::No { .. }));
-    cell_returned(&agent).await;
-    assert!(matches!(agent.decide(UnixMs::now()), Boundary::Now { .. }));
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    assert!(matches!(
-        latest_send(&agent).await.0,
-        Some(ContextChange::Preparing { repair: true, .. })
-    ));
-    assert_eq!(agent.user.len(), 1);
-    assert!(latest_send(&agent).await.1.iter().any(|block| matches!(block,
-        ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("write failed")))));
-
-    reply(
-        &mut agent,
-        vec![exec("repair", "raise ValueError('failed again')")],
-        limit,
-    )
-    .await;
-    cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    assert!(
-        latest_send(&agent)
-            .await
-            .1
-            .iter()
-            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-    );
-    assert!(agent.user.is_empty());
-}
-
-#[tokio::test]
-async fn preparation_preserves_python_state_and_does_not_wait_for_old_jobs() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    let limit = agent.session.auto_compact_token_limit().unwrap();
-    reply(
-        &mut agent,
-        vec![exec(
-            "old",
-            "remembered = 41\njob = command('sleep 0.3; echo old-output')",
-        )],
-        100,
-    )
-    .await;
-    cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    reply(&mut agent, vec![message("continue")], limit).await;
-    agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    reply(
-        &mut agent,
-        vec![exec("prepare", "assert remembered == 41\nremembered += 1")],
-        limit,
-    )
-    .await;
-    cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    assert!(
-        latest_send(&agent)
-            .await
-            .1
-            .iter()
-            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-    );
-    reply(
-        &mut agent,
-        vec![exec(
-            "after",
-            "assert remembered == 42\nprint('state survived')",
-        )],
-        100,
-    )
-    .await;
-    cell_returned(&agent).await;
-    assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
-}
-
-#[tokio::test]
-async fn cancellation_stops_preparation_even_with_buffered_input() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    let limit = agent.session.auto_compact_token_limit().unwrap();
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Asked,
-    };
-    agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    reply(
-        &mut agent,
-        vec![exec("prepare", "import asyncio\nawait asyncio.sleep(60)")],
-        limit,
-    )
-    .await;
-    agent
-        .handle_control(Control::User(input("held", 0), None), UnixMs(0))
-        .await
-        .unwrap();
-    agent
-        .handle_control(Control::Cancel, UnixMs::now())
-        .await
-        .unwrap();
-    assert!(agent.context.preparation.is_none());
-    assert!(agent.user.is_empty());
-    assert!(matches!(
-        agent.decide(UnixMs::now()),
-        Boundary::No { recheck: None }
-    ));
-}
-
-#[test]
-fn preparation_mirror_does_not_drain_the_ui_queue() {
-    let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
-        context: Some(ContextChange::Preparing {
-            retain_from: 0,
-            repair: false,
-        }),
-        input: Vec::from(Vec::new()),
-        at: UnixMs(5),
-        wake: None,
-    });
-    assert_eq!(
-        crate::mirror::strip(&event),
-        Some(rho_ui_proto::mirror::MirrorEvent::Results {
-            results: Vec::new(),
-            at: UnixMs(5),
-        })
-    );
-}
-
-#[tokio::test]
-async fn terminal_preparation_failure_allows_fresh_input_and_explicit_retry() {
-    for retry in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut agent = agent(directory.path()).await;
-        agent.phase = Phase::Idle {
-            owed: Vec::new(),
-            standing: Standing::Asked,
-        };
-        agent.context_used = agent.session.auto_compact_token_limit();
-        agent.start_request(UnixMs::now(), None).await.unwrap();
-        agent
-            .fail(
-                UnixMs(10),
-                PendingInferenceResponse::default(),
-                "terminal error".into(),
-            )
-            .await
-            .unwrap();
-        assert!(agent.context.preparation.is_none());
-        assert!(matches!(
-            agent.decide(UnixMs(11)),
-            Boundary::No { recheck: None }
-        ));
-        if retry {
-            agent
-                .handle_control(Control::Retry, UnixMs(12))
-                .await
-                .unwrap();
-        } else {
-            agent
-                .handle_control(Control::User(input("try again", 12), None), UnixMs(12))
-                .await
-                .unwrap();
-        }
-        assert!(matches!(agent.decide(UnixMs(13)), Boundary::Now { .. }));
-        agent.start_request(UnixMs(13), None).await.unwrap();
-        assert!(matches!(
-            latest_send(&agent).await.0,
-            Some(ContextChange::Preparing { repair: false, .. })
-        ));
-    }
-}
-
-#[tokio::test]
-async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
-    for preparing in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut agent = agent(directory.path()).await;
-        agent.phase = Phase::Idle {
-            owed: Vec::new(),
-            standing: Standing::Asked,
-        };
-        let change = if preparing {
-            ContextChange::Preparing {
-                retain_from: 0,
-                repair: false,
-            }
-        } else {
-            ContextChange::Marked { retain_from: 0 }
-        };
-        agent
-            .persist(AgentEvent::Native(
-                crate::native::NativeEvent::RequestStarted {
-                    input: Vec::from(vec![]),
-                    context: Some(change.clone()),
-                    at: UnixMs(1),
-                    wake: None,
-                },
-            ))
-            .await
-            .unwrap();
-        agent.context.sent(&change);
-        agent.context_used = agent.session.auto_compact_token_limit();
-        agent
-            .handle_control(
-                Control::User(
-                    QueuedInput {
-                        kind: InputKind::Compaction,
-                        ..input("", 2)
-                    },
-                    None,
-                ),
-                UnixMs(2),
-            )
-            .await
-            .unwrap();
-        agent.start_request(UnixMs(3), None).await.unwrap();
-        let (change, blocks) = latest_send(&agent).await;
-        assert!(change.is_none());
-        assert!(matches!(
-            blocks.last(),
-            Some(ContextBlock::CompactionTrigger)
-        ));
-        assert!(blocks.iter().any(|block| matches!(block,
-            ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION)));
-        assert!(agent.context.marker.is_none());
-        assert!(agent.context.preparation.is_none());
-        assert!(agent.user.is_empty());
-        let (_, events) = agent.db.read().agent_events(agent.agent_id);
-        let restored = replay::replay(events);
-        assert!(restored.context.marker.is_none());
-        assert!(restored.context.preparation.is_none());
-        assert!(
-            matches!(&agent.phase, Phase::Requesting(request) if !request.compaction_owes_reply)
-        );
-        agent.session.abort();
-    }
-}
-
-#[tokio::test]
-async fn failed_preparation_without_headroom_rotates_without_repair() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Asked,
-    };
-    agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    let used = agent.session.context_window().unwrap() - context::REPAIR_HEADROOM + 1;
-    reply(
-        &mut agent,
-        vec![exec("prepare", "raise ValueError('failed write')")],
-        used,
-    )
-    .await;
-    cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    assert!(
-        latest_send(&agent)
-            .await
-            .1
-            .iter()
-            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-    );
-}
-
-#[tokio::test]
-async fn ordinary_python_writes_notes_without_a_prebound_variable() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    let notes_path = directory.path().join("notes");
-    std::fs::create_dir(&notes_path).unwrap();
-    let source = format!(
-        "assert 'notes' not in globals()\nfrom pathlib import Path\nPath({}).joinpath('progress.md').write_text('goal\\nnext step')",
-        serde_json::to_string(&notes_path.to_string_lossy()).unwrap()
-    );
-    reply(&mut agent, vec![exec("write-notes", &source)], 100).await;
-    cell_returned(&agent).await;
-    assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
-    let inventory = notes::inventory(&notes_path);
-    assert!(inventory.contains("\"progress.md\" (2 lines, 14 bytes)"));
-    assert!(!inventory.contains("next step"));
-}
-
-#[tokio::test]
 async fn ordinary_roles_keep_standard_manual_and_automatic_compaction() {
     for manual in [false, true] {
         let directory = tempfile::tempdir().unwrap();
@@ -613,11 +200,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
             .render(role)
             .await
             .unwrap();
-        assert_eq!(instructions.notes.is_some(), role.uses_notes_rotation());
-        assert_eq!(
-            instructions.text.contains("# Notes and context rotation"),
-            role.uses_notes_rotation()
-        );
+        assert!(!instructions.text.contains("# Notes and context rotation"));
         assert_eq!(
             agent.model,
             role.session_profile().unwrap().deep_model().unwrap()
@@ -639,122 +222,252 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
 }
 
 #[tokio::test]
-async fn role_switches_cancel_pending_rotation_durably() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = standard_agent(directory.path()).await;
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Nothing,
-    };
-    let notes_role = AgentRole::Engineer {
-        intelligence: EngineerIntelligence::HighNotes,
-    };
-    agent.change_role(notes_role).await.unwrap();
-    assert_eq!(agent.model, InferenceModel::Gpt6Astra);
-
-    // Model the marker and an interrupted preparation.
-    let change = ContextChange::Preparing {
-        retain_from: agent.provider_input().await.unwrap().len() as u64,
-        repair: false,
-    };
-    let blocks = vec![ContextBlock::DeveloperMessage {
-        text: context::MARKER.into(),
-    }];
-    agent
-        .persist(AgentEvent::Native(
-            crate::native::NativeEvent::RequestStarted {
-                input: blocks.clone(),
-                context: Some(change.clone()),
-                at: UnixMs::now(),
-                wake: None,
-            },
-        ))
-        .await
-        .unwrap();
-    agent.context.sent(&change);
-    agent
-        .change_role(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-        })
-        .await
-        .unwrap();
-    assert!(agent.context.marker.is_none());
-    assert!(agent.context.preparation.is_none());
-
-    let (_, events) = agent.db.read().agent_events(agent.agent_id);
-    let restored = replay::replay(events);
-    assert_eq!(
-        restored.history.len(),
-        agent.provider_input().await.unwrap().len()
-    );
-    assert!(restored.context.marker.is_none());
-    assert!(restored.context.preparation.is_none());
-    assert!(restored.recovery_notes.is_empty());
-    assert!(matches!(&**restored.history.last().unwrap(),
-        ContextBlock::DeveloperMessage { text } if text == context::POLICY_CHANGED));
-    agent.change_role(notes_role).await.unwrap();
-    assert!(agent.context.marker.is_none());
-    assert!(agent.context.preparation.is_none());
+async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
+    for enough in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        agent.phase = Phase::Idle {
+            owed: Vec::new(),
+            standing: Standing::Asked,
+        };
+        let old_id = ToolCallId::try_from("old").unwrap();
+        let history = vec![
+            Arc::new(ContextBlock::InferenceResponse {
+                items: vec![exec("old", "print('old')")],
+                provider_response_id: None,
+            }),
+            Arc::new(ContextBlock::ToolResults {
+                results: vec![rho_core::ToolResult {
+                    call_id: old_id.clone(),
+                    tool_type: rho_core::ToolType::Custom,
+                    started_at: UnixMs(0),
+                    finished_at: UnixMs(1),
+                    metadata: None,
+                    body: ToolOutput {
+                        output: Arc::new("x".repeat(if enough { 150000 } else { 300 })),
+                        full_output: None,
+                        images: Default::default(),
+                        status: ToolOutputStatus::Success,
+                    },
+                }],
+            }),
+            Arc::new(ContextBlock::DeveloperMessage {
+                text: "recent".repeat(25000),
+            }),
+        ];
+        agent.provider_history = Some(Vec::new());
+        for block in &history {
+            let event = if matches!(&**block, ContextBlock::InferenceResponse { .. }) {
+                NativeEvent::ResponseFinished {
+                    output: vec![(**block).clone()],
+                    context_used: None,
+                    usage: None,
+                    at: UnixMs(0),
+                }
+            } else {
+                NativeEvent::RequestStarted {
+                    input: vec![(**block).clone()],
+                    context: None,
+                    wake: None,
+                    at: UnixMs(0),
+                }
+            };
+            agent.persist(AgentEvent::Native(event)).await.unwrap();
+        }
+        let limit = agent.session.auto_compact_token_limit().unwrap();
+        agent.context_used = Some(limit + 1000);
+        agent
+            .handle_control(
+                Control::User(input("continue with this constraint", 1), None),
+                UnixMs(1),
+            )
+            .await
+            .unwrap();
+        agent.start_request(UnixMs(2), None).await.unwrap();
+        let (change, blocks) = latest_send(&agent).await;
+        assert_eq!(change, None);
+        assert!(blocks.iter().any(|b| matches!(b, ContextBlock::ToolHistoryEvicted { call_ids } if call_ids == &vec![old_id.clone()])));
+        assert_eq!(blocks.contains(&ContextBlock::CompactionTrigger), !enough);
+        assert!(blocks.iter().any(|b| matches!(b, ContextBlock::UserMessage { content, .. } if rho_core::text_content(content) == "continue with this constraint")));
+        assert!(agent.user.is_empty());
+        assert!(agent.context.preparation.is_none());
+        assert_eq!(
+            &agent.provider_input().await.unwrap()[..history.len()],
+            &history
+        );
+        let (_, events) = agent.db.read().agent_events(agent.agent_id);
+        let replayed = replay::replay(events);
+        assert!(
+            replayed
+                .history
+                .iter()
+                .any(|b| matches!(&**b, ContextBlock::ToolHistoryEvicted { .. }))
+        );
+        assert!(replayed.user.is_empty());
+        assert_eq!(&replayed.history[..history.len()], &history);
+        if !enough {
+            reply(
+                &mut agent,
+                vec![InferenceResponseItem::Compaction {
+                    provider_specific: Box::new(
+                        rho_inference::OpenAiResponsesProviderData::Compaction {
+                            item_id: rho_core::ProviderResponseItemId::try_from("compact").unwrap(),
+                            encrypted_content: "summary".into(),
+                        },
+                    ),
+                }],
+                100,
+            )
+            .await;
+            agent.start_request(UnixMs::now(), None).await.unwrap();
+        }
+        reply(&mut agent, vec![exec("recover-history", &format!(
+            "original = next(item for item in history if item.kind == 'tool_result' and item.call_id == 'old')\nassert original.text == 'x' * {}\nassert any(item.kind == 'tool_history_evicted' for item in history)",
+            if enough { 150000 } else { 300 }
+        ))], 100).await;
+        cell_returned(&agent).await;
+        assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
+    }
 }
 
 #[tokio::test]
-async fn compaction_retries_preserve_task_obligations_and_manual_override() {
-    for manual in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut agent = if manual {
-            agent(directory.path()).await
-        } else {
-            standard_agent(directory.path()).await
-        };
-        agent.context_used = agent.session.auto_compact_token_limit();
-        if manual {
-            agent.user.push(QueuedInput {
-                kind: InputKind::Compaction,
-                ..input("", 1)
-            });
-        }
-        agent.start_request(UnixMs::now(), None).await.unwrap();
-        agent
-            .handle(Event::Inference(InferenceEvent::TemporaryFailure {
-                error: Arc::new(anyhow::anyhow!("disconnected")),
-                retrying_at: std::time::Instant::now(),
-            }))
-            .await
-            .unwrap();
-        agent.start_request(UnixMs::now(), None).await.unwrap();
-        assert!(agent.context.preparation.is_none());
-        assert!(
-            matches!(&agent.phase, Phase::Requesting(request) if request.compaction_owes_reply == !manual)
-        );
-        agent.session.abort();
-        reply(
-            &mut agent,
-            vec![InferenceResponseItem::Compaction {
+async fn notes_role_without_evictable_tools_compacts_without_preparing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = agent(directory.path()).await;
+    agent.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Asked,
+    };
+    agent.context_used = agent.session.auto_compact_token_limit();
+    agent.start_request(UnixMs::now(), None).await.unwrap();
+    let (change, blocks) = latest_send(&agent).await;
+    assert_eq!(change, None);
+    assert!(blocks.contains(&ContextBlock::CompactionTrigger));
+    assert!(agent.context.preparation.is_none());
+}
+
+#[test]
+fn eviction_is_oldest_first_bounded_and_preserves_live_unanswered_and_recent_calls() {
+    let tool = |id: &str| {
+        Arc::new(ContextBlock::InferenceResponse {
+            items: vec![exec(id, "pass")],
+            provider_response_id: None,
+        })
+    };
+    let result = |id: &str, count: usize| {
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![rho_core::ToolResult {
+                call_id: ToolCallId::try_from(id).unwrap(),
+                tool_type: rho_core::ToolType::Custom,
+                body: ToolOutput {
+                    output: Arc::new("x".repeat(count)),
+                    full_output: None,
+                    images: Default::default(),
+                    status: ToolOutputStatus::Success,
+                },
+                started_at: UnixMs(0),
+                finished_at: UnixMs(1),
+                metadata: None,
+            }],
+        })
+    };
+    let id = |v: &str| ToolCallId::try_from(v).unwrap();
+    let mut history = vec![
+        tool("already"),
+        result("already", 150000),
+        tool("oldest"),
+        result("oldest", 150000),
+        tool("live"),
+        result("live", 150000),
+        tool("next"),
+        result("next", 150000),
+        tool("unanswered"),
+        Arc::new(ContextBlock::ToolHistoryEvicted {
+            call_ids: vec![id("already")],
+        }),
+        Arc::new(ContextBlock::DeveloperMessage {
+            text: "r".repeat(120000),
+        }),
+        tool("recent"),
+        result("recent", 300),
+    ];
+    let live = std::collections::BTreeSet::from([id("live")]);
+    let eviction = context::evict_tools(&history, &live, 100000, 100000);
+    assert_eq!(
+        eviction.call_ids,
+        vec![id("oldest")],
+        "stop once enough space has been freed"
+    );
+    assert_eq!(eviction.freed_tokens, 50018);
+    history.push(Arc::new(ContextBlock::ToolHistoryEvicted {
+        call_ids: eviction.call_ids,
+    }));
+    let next = context::evict_tools(&history, &live, 100000, 100000);
+    assert_eq!(next.call_ids, vec![id("next")]);
+    history.push(Arc::new(ContextBlock::ToolHistoryEvicted {
+        call_ids: next.call_ids,
+    }));
+    assert!(
+        context::evict_tools(&history, &live, 100000, 100000)
+            .call_ids
+            .is_empty()
+    );
+}
+
+#[test]
+fn eviction_does_not_count_summarized_tools_or_evict_a_recent_late_result() {
+    let mut history = vec![Arc::new(ContextBlock::InferenceResponse {
+        items: vec![
+            exec("summarized", "old"),
+            InferenceResponseItem::Compaction {
                 provider_specific: Box::new(
                     rho_inference::OpenAiResponsesProviderData::Compaction {
-                        item_id: "compaction".try_into().unwrap(),
+                        item_id: rho_core::ProviderResponseItemId::try_from("compact").unwrap(),
                         encrypted_content: "summary".into(),
                     },
                 ),
-            }],
-            100,
-        )
-        .await;
-        assert!(
-            matches!(
-                &agent.phase,
-                Phase::Idle {
-                    standing: Standing::Asked,
-                    ..
-                }
-            ) == !manual
-        );
-        if manual {
-            // The fulfilled manual override must not disable future automatic rotation.
-            agent.context_used = agent.session.auto_compact_token_limit();
-            agent.start_request(UnixMs::now(), None).await.unwrap();
-            assert!(agent.context.preparation.is_some());
-            agent.session.abort();
+            },
+        ],
+        provider_response_id: None,
+    })];
+    for id in ["summarized", "late"] {
+        if id == "late" {
+            history.push(Arc::new(ContextBlock::InferenceResponse {
+                items: vec![exec(id, "pass")],
+                provider_response_id: None,
+            }));
         }
+        history.push(Arc::new(ContextBlock::ToolResults {
+            results: vec![rho_core::ToolResult {
+                call_id: ToolCallId::try_from(id).unwrap(),
+                tool_type: rho_core::ToolType::Custom,
+                body: ToolOutput {
+                    output: Arc::new("x".repeat(150000)),
+                    full_output: None,
+                    images: Default::default(),
+                    status: ToolOutputStatus::Success,
+                },
+                started_at: UnixMs(0),
+                finished_at: UnixMs(1),
+                metadata: None,
+            }],
+        }));
     }
+    history.push(Arc::new(ContextBlock::DeveloperMessage {
+        text: "r".repeat(120000),
+    }));
+    history.push(Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+        call_id: ToolCallId::try_from("late").unwrap(),
+        tool_type: rho_core::ToolType::Custom,
+        output: Arc::new("finished only recently".into()),
+        full_output: None,
+        status: Some(ToolOutputStatus::Success),
+        images: Default::default(),
+        at: UnixMs(10),
+    })));
+    assert!(
+        context::evict_tools(&history, &Default::default(), 100000, 100000)
+            .call_ids
+            .is_empty()
+    );
 }

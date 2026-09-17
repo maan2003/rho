@@ -186,7 +186,6 @@ impl Agent {
         let mut item = stream.item.clone();
         set_source(&mut item, stream.source[..progress.admitted].to_owned());
         stream.canonical = true;
-        self.context.replied(std::slice::from_ref(&item));
         // Give the admitted, syntactically complete prefix its one place in
         // history before the normal boundary drains its result.
         self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
@@ -344,7 +343,6 @@ pub(in crate::agent) mod tests {
                 view,
                 host: None,
                 host_specs: Vec::new(),
-                notes: Some(Lazy::ready(directory.join("notes"))),
             },
             notebook,
         };

@@ -1,7 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_core::{ExecCall, ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
+use rho_core::{
+    ContentPart, ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem,
+    ToolCall, ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate,
+    UnixMs,
+};
 use rho_fs_view::PathOverrides;
 use rho_tool_shell::ShellTools;
 use serde_json::json;
@@ -91,6 +95,163 @@ fn jobs(session: &PythonCell) -> Vec<JobFacts> {
 }
 
 #[tokio::test]
+async fn history_is_a_lazy_read_only_snapshot_sequence() {
+    let notebook = python(shell(), Vec::new());
+    notebook.set_history(vec![
+        Arc::new(ContextBlock::UserMessage {
+            sender: rho_core::MessageSender::User,
+            content: vec![
+                ContentPart::Text {
+                    text: "before".into(),
+                },
+                ContentPart::Image {
+                    media_type: "image/png".into(),
+                    data: vec![1, 2, 3],
+                },
+            ],
+        }),
+        Arc::new(ContextBlock::ToolHistoryEvicted {
+            call_ids: vec![ToolCallId::try_from("old-call").unwrap()],
+        }),
+    ]);
+
+    let wake = Arc::new(Notify::new());
+    let mut cell = notebook.exec(
+        call(
+            "history-sequence",
+            json!(
+                r#"
+await asyncio.sleep(0.05)
+assert len(history) == 2
+assert history[-1].kind == 'tool_history_evicted'
+assert history[:1][0].text == 'before'
+assert history[0].content[1].data == b'\x01\x02\x03'
+assert history[-1].call_ids == ('old-call',)
+assert type(history[0]).__name__ == 'HistoryItem'
+try:
+    history[0].text = 'changed'
+except AttributeError:
+    pass
+else:
+    raise AssertionError('history item was mutable')
+try:
+    history[0] = None
+except TypeError:
+    pass
+else:
+    raise AssertionError('history sequence was mutable')
+print(history[0].text, history[-1].call_ids[0])
+"#
+            ),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+
+    // Refreshing the notebook while this execution sleeps must not alter its
+    // admission snapshot.
+    notebook.set_history(vec![Arc::new(ContextBlock::DeveloperMessage {
+        text: "after".into(),
+    })]);
+
+    until(&wake, &cell, Signal::Ended).await;
+    let output = cell.first_output();
+    cell.acknowledge_output();
+    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+    assert_eq!(output.output.as_str(), "before old-call\n");
+
+    let wake = Arc::new(Notify::new());
+    let mut next = notebook.exec(
+        call(
+            "history-refresh",
+            json!("assert len(history) == 1\nprint(history[0].role, history[0].text)"),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &next, Signal::Ended).await;
+    let output = next.first_output();
+    next.acknowledge_output();
+    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+    assert_eq!(output.output.as_str(), "developer after\n");
+}
+
+#[tokio::test]
+async fn history_preserves_tool_and_provider_transcript_fields() {
+    let call_id = ToolCallId::try_from("kept-call").unwrap();
+    let notebook = python(shell(), Vec::new());
+    notebook.set_history(vec![
+        Arc::new(ContextBlock::InferenceResponse {
+            items: vec![InferenceResponseItem::ToolCall {
+                provider_specific: Box::new(rho_core::UnknownProviderSpecificData {
+                    tag: "test.provider".into(),
+                    body: bytes::Bytes::from_static(b"opaque-data"),
+                }),
+                id: call_id.clone(),
+                name: ToolName::try_from("lookup").unwrap(),
+                tool_type: ToolType::Function,
+                arguments: r#"{"needle":"x"}"#.into(),
+            }],
+            provider_response_id: None,
+        }),
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![ToolResult {
+                call_id: call_id.clone(),
+                tool_type: ToolType::Function,
+                body: ToolOutput {
+                    output: Arc::new("bounded".into()),
+                    full_output: Some(Arc::new("complete".into())),
+                    images: Arc::new(vec![ImageContent {
+                        media_type: "image/png".into(),
+                        data: vec![9, 8],
+                        detail: ImageDetail::Original,
+                    }]),
+                    status: ToolOutputStatus::Success,
+                },
+                started_at: UnixMs(10),
+                finished_at: UnixMs(20),
+                metadata: None,
+            }],
+        }),
+        Arc::new(ContextBlock::ToolUpdate(ToolUpdate {
+            status: Some(ToolOutputStatus::Success),
+            call_id,
+            tool_type: ToolType::Function,
+            output: Arc::new("progress".into()),
+            full_output: None,
+            at: UnixMs(15),
+            images: Arc::new(Vec::new()),
+        })),
+    ]);
+
+    let wake = Arc::new(Notify::new());
+    let mut cell = notebook.exec(
+        call(
+            "history-fields",
+            json!(
+                r#"
+tool_call, result, update = history
+assert (tool_call.kind, tool_call.name, tool_call.arguments, tool_call.call_id) == (
+    'tool_call', 'lookup', '{"needle":"x"}', 'kept-call')
+assert tool_call.provider.tag == 'test.provider'
+assert 'opaque-data' not in repr(tool_call.provider)
+assert (result.text, result.display_text, result.status) == ('complete', 'bounded', 'success')
+assert (result.started_at, result.finished_at) == (10, 20)
+assert result.images[0].data == b'\x09\x08'
+assert result.images[0].detail == 'original'
+assert (update.kind, update.text, update.at) == ('tool_update', 'progress', 15)
+print(tool_call.name, result.text, update.text)
+"#
+            ),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &cell, Signal::Ended).await;
+    let output = cell.first_output();
+    cell.acknowledge_output();
+    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+    assert_eq!(output.output.as_str(), "lookup complete progress\n");
+}
+
+#[tokio::test]
 async fn python_tool_entries_use_the_callable_namespace() {
     let description = crate::python_instructions(&[]);
     assert!(!description.contains("apply_patch"));
@@ -100,6 +261,9 @@ async fn python_tool_entries_use_the_callable_namespace() {
     assert!(description.contains("handle.cancel() requests cancellation"));
     assert!(description.contains("job.cancel()"));
     assert!(description.contains("await job"));
+    assert!(description.contains("`history` is a lazy, read-only sequence"));
+    assert!(description.contains("HistoryProviderData(tag, data)"));
+    assert!(!description.contains("for item in history"));
 }
 
 #[tokio::test]

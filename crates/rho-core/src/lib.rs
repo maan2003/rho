@@ -293,6 +293,12 @@ pub enum ContextBlock {
     DeveloperMessage {
         text: String,
     },
+    /// Remove completed tool exchanges from provider replay only. Original
+    /// blocks remain available in transcript history. Invalidates continuations
+    /// established before this item.
+    ToolHistoryEvicted {
+        call_ids: Vec<ToolCallId>,
+    },
 }
 
 /// Interpret harness-authored rotation items in complete, append-only history.

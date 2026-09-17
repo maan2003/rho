@@ -118,8 +118,9 @@ Loading alone starts no requests
 ([DECISION-a-restart-does-not-resume-by-itself](DECISION-a-restart-does-not-resume-by-itself.md)).
 Instructions are code, not stored authority
 ([DECISION-instructions-are-code](DECISION-instructions-are-code.md)).
-The notes role rotates the active provider window without replacing Python or
-jobs; notes remain external effects
+The historical notes role evicts older completed tool exchanges before falling
+back to provider compaction, without replacing Python or jobs. Original
+transcript items remain available through lazy Python history
 ([DESIGN-context-rotation](../../../specs/DESIGN-context-rotation.md)).
 
 ## Read-only presentation

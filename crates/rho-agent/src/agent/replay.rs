@@ -62,28 +62,27 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                     if let Some(change) = change {
                         context.sent(change);
                     } else {
-                        if blocks.contains(&ContextBlock::CompactionTrigger) {
+                        if blocks.contains(&ContextBlock::CompactionTrigger)
+                            || blocks.iter().any(|block| matches!(block, ContextBlock::DeveloperMessage { text } if text == super::context::POLICY_CHANGED))
+                        {
                             context.rotated();
                         }
-                        if blocks
-                            .iter()
-                            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-                        {
+                        if blocks.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContextBlock::ContextRotation { .. }
+                                    | ContextBlock::ToolHistoryEvicted { .. }
+                            )
+                        }) {
                             context.rotated();
                             context_used = None;
                         }
                     }
                 }
                 NativeEvent::ResponseFinished {
-                    output,
                     context_used: replied,
                     ..
                 } => {
-                    for block in output {
-                        if let ContextBlock::InferenceResponse { items, .. } = block {
-                            context.replied(items);
-                        }
-                    }
                     context_used = *replied;
                 }
                 NativeEvent::RequestFailed { .. } => {}
@@ -184,7 +183,8 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_core::ExecId>
             | ContextBlock::ToolUpdate(_)
             | ContextBlock::CompactionTrigger
             | ContextBlock::DeveloperMessage { .. }
-            | ContextBlock::ContextRotation { .. } => {}
+            | ContextBlock::ContextRotation { .. }
+            | ContextBlock::ToolHistoryEvicted { .. } => {}
         }
     }
     unanswered

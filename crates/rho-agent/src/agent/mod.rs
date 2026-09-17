@@ -12,7 +12,6 @@
 //! `specs/ARCH-rho-agent.md` has the shape and the invariants.
 
 mod context;
-mod notes;
 mod persistence;
 pub(crate) mod replay;
 #[cfg(test)]
@@ -91,12 +90,10 @@ struct PromptInputs {
     view: Arc<View>,
     host: Option<Arc<crate::worker::Host>>,
     host_specs: Vec<ToolSpec>,
-    notes: Option<Lazy<std::path::PathBuf>>,
 }
 
 struct Instructions {
     text: Arc<str>,
-    notes: Option<std::path::PathBuf>,
 }
 
 impl PromptInputs {
@@ -106,15 +103,7 @@ impl PromptInputs {
             None => None,
         };
         let text = prompt::prompt(&self.view, team.as_ref(), role, &self.host_specs);
-        let notes = match &self.notes {
-            Some(notes) if role.uses_notes_rotation() => Some(notes.get().await?.clone()),
-            _ => None,
-        };
-        let text = match &notes {
-            Some(path) => Arc::from(format!("{}{}", text, notes::instructions(path))),
-            None => text,
-        };
-        Ok(Instructions { text, notes })
+        Ok(Instructions { text })
     }
 }
 
@@ -786,31 +775,6 @@ impl Agent {
                 latest: true,
             });
         }
-        if self
-            .head
-            .read()
-            .expect("poison")
-            .config
-            .role
-            .uses_notes_rotation()
-            && let Some(preparation) = &self.context.preparation
-        {
-            let returned = preparation.call.as_ref().is_none_or(|id| {
-                self.execs.get(id).is_none_or(|tool| {
-                    tool.session
-                        .sources()
-                        .iter()
-                        .all(|(_, source)| match source {
-                            rho_agent_tools::SourceFacts::Cell(facts) => facts.returned.is_some(),
-                            rho_agent_tools::SourceFacts::Job(_) => true,
-                        })
-                })
-            });
-            sources.push(SourceKind::Preparation {
-                replied: preparation.replied,
-                returned,
-            });
-        }
         sources
     }
 
@@ -1078,9 +1042,6 @@ impl Agent {
         error: String,
     ) -> anyhow::Result<()> {
         self.abandon_stream(now).await?;
-        // A terminal failure must not leave an unreplied preparation gate
-        // blocking fresh input or an explicit retry.
-        self.context.preparation = None;
         self.persist(AgentEvent::Native(NativeEvent::RequestFailed {
             partial,
             error: error.clone(),
@@ -1275,16 +1236,7 @@ impl Agent {
             }
         };
         let notes_rotation = role.uses_notes_rotation();
-        let instructions = if !notes_rotation && self.context.marker.is_some() {
-            // Older experimental builds emitted rotation notices for ordinary roles.
-            Arc::from(format!(
-                "{}\n\nThis role uses standard provider compaction, not notes rotation. Earlier retention and preparation notices are canceled; continue the user's task.",
-                prompt.text
-            ))
-        } else {
-            Arc::clone(&prompt.text)
-        };
-        let notes_path = prompt.notes;
+        let instructions = Arc::clone(&prompt.text);
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
         let previous_failure = match &self.phase {
@@ -1325,16 +1277,15 @@ impl Agent {
                 .user
                 .iter()
                 .any(|input| matches!(input.kind, InputKind::Compaction));
-        let cancel_rotation = manual && self.context.marker.is_some();
-        if manual {
+        let cancel_rotation = self.context.marker.is_some();
+        if manual || cancel_rotation {
             self.context.rotated();
         }
         // Explicit compaction always uses the provider, including transport retries.
         let notes_rotation = notes_rotation && !manual;
+        // Tool eviction is a first pass; provider compaction remains the fallback.
         self.session.set_context_rotation(notes_rotation);
-        if !notes_rotation {
-            self.context.preparation = None;
-        }
+        self.context.preparation = None;
         let retry_owes_reply = matches!(
             &self.phase,
             Phase::Idle {
@@ -1345,77 +1296,25 @@ impl Agent {
                 ..
             }
         );
-        let prior_preparation = self.context.preparation.clone();
         let limit = self.session.auto_compact_token_limit();
-        let mut rotate = None;
-        let mut change = if !notes_rotation {
-            None
-        } else if let Some(preparation) = &prior_preparation {
-            if !preparation.replied {
-                Some(crate::ContextChange::Preparing {
-                    retain_from: preparation.retain_from as u64,
-                    repair: preparation.repair,
-                })
-            } else {
-                let failed = preparation.call.as_ref().is_some_and(|id| {
-                    self.execs.get(id).is_some_and(|tool| {
-                        tool.session.sources().iter().any(|(_, source)| {
-                        matches!(source, rho_agent_tools::SourceFacts::Cell(facts) if facts.failed)
-                    })
-                    })
-                });
-                let headroom = self
-                    .session
-                    .context_window()
-                    .zip(self.context_used)
-                    .is_some_and(|(window, used)| {
-                        window.saturating_sub(used) >= context::REPAIR_HEADROOM
-                    });
-                if failed && !preparation.repair && headroom {
-                    Some(crate::ContextChange::Preparing {
-                        retain_from: preparation.retain_from as u64,
-                        repair: true,
-                    })
-                } else {
-                    rotate = Some(preparation.retain_from);
-                    None
-                }
-            }
-        } else if limit
-            .zip(self.context_used)
-            .is_some_and(|(limit, used)| used >= limit)
-        {
-            Some(crate::ContextChange::Preparing {
-                retain_from: self
-                    .context
-                    .marker
-                    .unwrap_or_else(|| self.context.fallback_start(history))
-                    as u64,
-                repair: false,
-            })
-        } else {
-            None
-        };
-        let preparing = matches!(change, Some(crate::ContextChange::Preparing { .. }));
-        let preparation_call = prior_preparation
-            .as_ref()
-            .and_then(|preparation| preparation.call.as_ref());
         let owed = match &mut self.phase {
             Phase::Idle { owed, .. } => std::mem::take(owed),
             Phase::Requesting(_) => Vec::new(),
         };
         let delivered = self
             .execs
-            .iter()
-            .filter(|(id, tool)| {
-                !preparing || tool.answer == ReplyState::Owed || preparation_call == Some(*id)
-            })
-            .map(|(id, _)| id.clone())
+            .keys()
+            .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let mut blocks: Vec<ContextBlock> = Vec::new();
         if cancel_rotation {
             blocks.push(ContextBlock::DeveloperMessage {
-                text: context::MANUAL_COMPACTION.into(),
+                text: if manual {
+                    context::MANUAL_COMPACTION
+                } else {
+                    context::POLICY_CHANGED
+                }
+                .into(),
             });
         }
         self.collect_stream_notes(Some(&delivered));
@@ -1488,7 +1387,7 @@ impl Agent {
         // Everything pending went into this request; the next event's clock
         // starts fresh.
         self.observations.clear();
-        if !preparing {
+        {
             // One block per sender: several messages from the same peer collapse,
             // so a chatty one costs the model one block rather than five.
             let mut by_sender: BTreeMap<AgentId, Vec<ContentPart>> = BTreeMap::new();
@@ -1505,16 +1404,14 @@ impl Agent {
                 }
             }));
 
-            // Ordinary input enters only outside the dedicated preparation exchange.
             let mut inputs = std::mem::take(&mut self.user);
             inputs.sort_by_key(|input| matches!(input.kind, InputKind::Compaction));
-            blocks.extend(inputs.into_iter().filter_map(|input| match input.kind {
-                InputKind::Message { content } => Some(ContextBlock::UserMessage {
+            blocks.extend(inputs.into_iter().map(|input| match input.kind {
+                InputKind::Message { content } => ContextBlock::UserMessage {
                     sender: MessageSender::User,
                     content,
-                }),
-                InputKind::Compaction if notes_rotation => None,
-                InputKind::Compaction => Some(ContextBlock::CompactionTrigger),
+                },
+                InputKind::Compaction => ContextBlock::CompactionTrigger,
             }));
         }
 
@@ -1532,71 +1429,42 @@ impl Agent {
             );
         }
 
-        if let Some(crate::ContextChange::Preparing {
-            retain_from,
-            repair,
-        }) = &change
+        let mut evicted = false;
+        let mut used = self.context_used;
+        if notes_rotation
+            && let Some((limit, occupancy)) = limit.zip(used)
+            && occupancy >= limit
         {
-            let text = if *repair {
-                context::REPAIR.to_owned()
-            } else if self.context.marker.is_some() {
-                context::PREPARE.to_owned()
-            } else {
-                context::fallback_notice(history, *retain_from as usize)
-            };
-            blocks.push(ContextBlock::DeveloperMessage { text });
-        } else if let Some(retain_from) = rotate {
-            blocks.push(ContextBlock::ContextRotation {
-                retain_from: retain_from as u64,
-            });
-            let inventory = if let Some(path) = notes_path {
-                tokio::task::spawn_blocking(move || notes::inventory(&path))
-                    .await
-                    .unwrap_or_else(|_| "Notes inventory unavailable.".into())
-            } else {
-                "Notes inventory unavailable.".into()
-            };
-            blocks.push(ContextBlock::DeveloperMessage {
-                text: format!(
-                    "Context has rotated. Older conversation before the announced boundary is no \
-                     longer in context; the retained conversation and preparation exchange remain. \
-                     The earlier retention and preparation notices are now fulfilled; wait for a new \
-                     notice before preparing for another rotation. Python state and running jobs were \
-                     preserved. Read relevant notes and use the retained conversation and tool state \
-                     to build on the work already done and avoid duplicating work. Continue the user's task.\n\n{inventory}"
-                ),
-            });
-        } else if notes_rotation
-            && self.context.marker.is_none()
-            && limit
-                .zip(self.context_used)
-                .is_some_and(|(limit, used)| used >= limit.saturating_sub(context::RETAIN_TOKENS))
-        {
-            change = Some(crate::ContextChange::Marked {
-                retain_from: (history.len() + blocks.len()) as u64,
-            });
-            blocks.push(ContextBlock::DeveloperMessage {
-                text: context::MARKER.to_owned(),
-            });
+            let active = self.execs.keys().cloned().collect();
+            let eviction = context::evict_tools(history, &active, occupancy, limit);
+            if !eviction.call_ids.is_empty() {
+                used = Some(
+                    occupancy.saturating_sub(eviction.freed_tokens)
+                        + context::estimate(&ContextBlock::DeveloperMessage {
+                            text: context::EVICTED.into(),
+                        }),
+                );
+                blocks.push(ContextBlock::ToolHistoryEvicted {
+                    call_ids: eviction.call_ids,
+                });
+                blocks.push(ContextBlock::DeveloperMessage {
+                    text: context::EVICTED.into(),
+                });
+                evicted = true;
+            }
         }
-
-        // Standard roles retain the existing explicit provider-compaction path.
         let compacting_already =
             pending_compaction || blocks.contains(&ContextBlock::CompactionTrigger);
-        let compact = !notes_rotation
-            && !compacting_already
-            && limit
-                .zip(self.context_used)
-                .is_some_and(|(limit, used)| used >= limit);
+        let compact =
+            !compacting_already && limit.zip(used).is_some_and(|(limit, used)| used >= limit);
         if compact {
             blocks.push(ContextBlock::CompactionTrigger);
         }
-        let compaction_owes_reply = !preparing
-            && (retry_owes_reply || compact
+        let compaction_owes_reply = retry_owes_reply || compact
                 || blocks
                     .iter()
                     .any(|block| !matches!(block, ContextBlock::CompactionTrigger)
-                        && !matches!(block, ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION)));
+                        && !matches!(block, ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION));
 
         let handoff = blocks
             .iter()
@@ -1621,17 +1489,14 @@ impl Agent {
         // into and a queue nobody emptied.
         self.persist(AgentEvent::Native(NativeEvent::RequestStarted {
             input: blocks,
-            context: change.clone(),
+            context: None,
             wake,
             at: now,
         }))
         .await?;
-        if let Some(change) = &change {
-            self.context.sent(change);
-        }
-        if rotate.is_some() {
+        if evicted {
             self.context.rotated();
-            self.context_used = None;
+            self.context_used = used;
             self.session.abort();
         }
         for (id, exec) in &mut self.execs {
@@ -1643,6 +1508,11 @@ impl Agent {
             .retain(|id, exec| !delivered.contains(id) || !exec.session.done());
         self.acknowledge_streams(&delivered);
         let input = self.provider_input().await?;
+        self.surface
+            .get_if_ready()
+            .expect("surface initialized")
+            .notebook
+            .set_history(input.clone());
         self.session.request(InferenceRequest {
             instructions,
             input,
@@ -1696,8 +1566,6 @@ impl Agent {
         };
         let final_text = call.is_none().then(|| final_answer_text(&items));
 
-        let preparing = self.context.preparation.is_some();
-        self.context.replied(&items);
         // What the response cost rides on the reply itself, so a reader
         // can price the transcript from the log alone.
         let turn_usage = usage.as_ref().map(|usage| AgentUsageBucket {
@@ -1770,7 +1638,6 @@ impl Agent {
         // classifies it.
         if let Some(final_text) = final_text
             && !compacted
-            && !preparing
         {
             self.flush_events().await?;
             self.host.completed(final_text).await?;
@@ -1844,6 +1711,9 @@ impl Agent {
             .await?;
         if let (Some(history), Some(blocks)) = (&mut self.provider_history, blocks) {
             history.extend(blocks);
+            if let Some(surface) = self.surface.get_if_ready() {
+                surface.notebook.set_history(history.clone());
+            }
         }
         Ok(())
     }
@@ -1900,7 +1770,6 @@ impl Agent {
                     .execs
                     .values()
                     .any(|tool| tool.answer == ReplyState::Owed)
-                    || self.context.preparation.is_some()
                     || deadline.is_some() =>
             {
                 AgentStateKind::ToolCalling {
@@ -2006,13 +1875,6 @@ fn surface(
 ) -> anyhow::Result<Surface> {
     let (shell, others) = host_tools(&view, role, agent_id, inference, team, host);
     let host_specs = others.iter().map(|tool| tool.spec()).collect();
-    let notes = inference.map(|_| {
-        let view = Arc::clone(&view);
-        Lazy::new(move || {
-            let view = Arc::clone(&view);
-            async move { notes::directory(&view) }
-        })
-    });
     let notebook = Arc::new(
         rho_agent_tools::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
@@ -2023,7 +1885,6 @@ fn surface(
             view,
             host: host.cloned(),
             host_specs,
-            notes,
         },
     })
 }
