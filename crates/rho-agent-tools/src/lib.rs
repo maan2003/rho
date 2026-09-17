@@ -12,10 +12,7 @@ mod tool;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-pub use python::{
-    ExecReturn, PythonCell, PythonExec, PythonNotebook, PythonStreamProgress, python_instructions,
-    python_instructions_for,
-};
+pub use python::{PythonCell, PythonExec, PythonNotebook, PythonStreamProgress};
 use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec};
 use rho_web_search::WebSearchTools;
 pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, ReplyState, SourceFacts, SourceWaker};

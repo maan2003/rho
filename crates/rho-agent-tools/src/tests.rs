@@ -252,23 +252,6 @@ print(tool_call.name, result.text, update.text)
 }
 
 #[tokio::test]
-async fn python_tool_entries_use_the_callable_namespace() {
-    let description = crate::python_instructions(&[]);
-    assert!(!description.contains("apply_patch"));
-    assert!(description.contains("session IDs from 1000 through 9999"));
-    assert!(description.contains("web.run(search_query="));
-    assert!(description.contains("same cell to run them concurrently"));
-    assert!(description.contains("handle.cancel() requests cancellation"));
-    assert!(description.contains("job.cancel()"));
-    assert!(description.contains("await job"));
-    assert!(description.contains("`history` is a lazy, read-only snapshot"));
-    assert!(description.contains("class HistoryProviderData(NamedTuple):"));
-    assert!(description.contains("provider: HistoryProviderData | None = None"));
-    assert!(description.contains("history: Sequence[HistoryItem]"));
-    assert!(!description.contains("for item in history"));
-}
-
-#[tokio::test]
 async fn python_independent_commands_in_one_cell_run_concurrently() {
     let directory = tempfile::tempdir().unwrap();
     let tool = python(shell_in(&directory), Vec::new());
@@ -1050,16 +1033,7 @@ async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
         Arc::new(EchoTool(spec)) as Arc<dyn crate::FutureTool>
     })
     .collect();
-    let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
     let tool = PythonNotebook::new(shell(), others).unwrap();
-    let description = crate::python_instructions(&specs);
-    assert!(description.contains("display(agents.delegate_engineer)"));
-    assert!(description.contains("agents.spawn_new_advisor: ask_advisor full documentation"));
-    assert!(!description.contains("tools.ask_advisor"));
-    assert!(!description.contains("spawn_engineer full documentation"));
-    assert!(!description.contains("encoding="));
-    assert!(description.contains("web.run: standard OpenAI web run"));
-    assert!(!description.contains("web__run full documentation"));
     let wake = Arc::new(Notify::new());
     let mut cell = tool.exec(
         call(
@@ -1188,7 +1162,6 @@ async fn python_announces_sources_once_in_registration_order_including_late_sour
 #[tokio::test]
 async fn checkin_policy_is_validated_and_does_not_discard_output() {
     let tool = PythonNotebook::new(shell(), Vec::new()).unwrap();
-    assert!(crate::python_instructions(&[]).contains("wake_on_tools=False"));
     let wake = Arc::new(Notify::new());
     let mut cell = tool.exec(
         call(
