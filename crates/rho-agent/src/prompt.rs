@@ -419,8 +419,7 @@ a plan. A new phase of the current task is not itself a reason to create another
 with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
 single-threaded unless write targets are clearly disjoint or isolated.
 
-Always pass workdir: an existing absolute directory inside your workset. The child loads that
-directory's applicable AGENTS.md guidance and skill catalogue; do not repeat them in its task.
+The child loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
 task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
 identity; its final response arrives automatically as agent mail.
 agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
@@ -1404,8 +1403,7 @@ a plan. A new phase of the current task is not itself a reason to create another
 with a suitable existing Engineer rather than spawning a replacement. Keep code-writing
 single-threaded unless write targets are clearly disjoint or isolated.
 
-Always pass workdir: an existing absolute directory inside your workset. The child loads that
-directory's applicable AGENTS.md guidance and skill catalogue; do not repeat them in its task.
+The child loads applicable AGENTS.md guidance and the skill catalogue; do not repeat them in its task.
 task_name is a short kebab-case label. Spawning creates no checkout and returns the Engineer's
 identity; its final response arrives automatically as agent mail.
 agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
@@ -1786,7 +1784,7 @@ mod tests {
         assert!(collaboration.contains("agents.spawn_new_engineer(*, task_name:"));
         assert!(collaboration.contains("task_name is a short kebab-case label"));
         assert!(
-            collaboration.contains("directory's applicable AGENTS.md guidance and skill catalogue")
+            collaboration.contains("loads applicable AGENTS.md guidance and the skill catalogue")
         );
         assert!(!collaboration.contains("display(agents.spawn_new_engineer)"));
         assert!(collaboration.contains("agents.cancel("));
@@ -1885,8 +1883,7 @@ mod tests {
             claude_prompt(None, None, AgentRole::default()),
         ] {
             for rule in [
-                "Always pass workdir: an existing absolute directory inside your workset",
-                "directory's applicable AGENTS.md guidance and skill catalogue",
+                "loads applicable AGENTS.md guidance and the skill catalogue",
                 "agents.spawn_new_engineer(*, task_name: str, prompt: str, workdir: str)",
                 "concrete benefit beyond",
                 "without editing the same files or depending on each other's results",
