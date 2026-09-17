@@ -1070,6 +1070,9 @@ mod tests {
             let dir = view.host_cwd().join(name);
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(dir.join("AGENTS.md"), format!("Guidance for {name}.")).unwrap();
+            let skill_dir = dir.join(".agents/skills/catalogue-fixture");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), "---\nname: catalogue-fixture\ndescription: Directory-specific skill.\n---\nPrivate skill body.\n").unwrap();
         }
         let view = view.for_cwd(camino::Utf8Path::new("/src/parent")).unwrap();
         let (parent_id, parent) = pool
@@ -1158,6 +1161,25 @@ mod tests {
             );
             assert!(!rendered.contains("## Team Context"));
             assert!(!rendered.lines().any(|line| line == "## Environment"));
+            for role in [
+                AgentRole::default(),
+                AgentRole::Advisor {
+                    intelligence: crate::db::AdvisorIntelligence::High,
+                },
+            ] {
+                let native = crate::prompt::prompt(&child_view, Some(&team), role);
+                let claude = crate::prompt::claude_prompt(Some(&child_view), Some(&team), role);
+                let native_catalogue = native.split("## Skills\n").nth(1).unwrap();
+                let claude_catalogue = claude.split("## Skills\n").nth(1).unwrap();
+                assert_eq!(native_catalogue, claude_catalogue);
+                assert!(
+                    native_catalogue
+                        .contains("- catalogue-fixture: Directory-specific skill. (file: r")
+                );
+                assert!(native_catalogue.contains(&format!("`{expected}/.agents/skills`")));
+                assert!(!native_catalogue.contains("### How to use skills"));
+                assert!(!native_catalogue.contains("Private skill body."));
+            }
             drop(read);
             let cancelled = crate::multi_agent_tools::call_agent_tool(
                 tools.clone(),

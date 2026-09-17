@@ -1376,6 +1376,12 @@ loops.
 "#,
     );
     out.push_str(&workspace);
+    if let Some(view) = view {
+        let (_, skills) = discovered_context(view);
+        if let Some(catalogue) = render_skills_prompt(&skills) {
+            out.push_str(&catalogue);
+        }
+    }
     out.into()
 }
 
@@ -1462,35 +1468,41 @@ fn render_skills_prompt(skills: &[rho_context_config::Skill]) -> Option<String> 
         return None;
     }
 
-    let mut out = String::new();
-    out.push_str("## Skills\n");
-    out.push_str("In your workspace you have skills the user created. A **skill** is a guide for proven techniques, patterns, or tools. If a skill exists for a task, you must do it. The following skills provide specialized instructions for specific tasks.\n");
-    out.push_str("### Available skills\n");
+    let mut roots = Vec::new();
+    let mut entries = String::new();
     for skill in skills {
-        out.push_str("- ");
-        out.push_str(&skill.name);
-        out.push_str(": ");
-        out.push_str(&skill.description);
-        out.push_str(" (file: ");
-        out.push_str(skill.file_path.as_str());
-        out.push_str(")\n");
+        let path = if let Some(root) = skill.file_path.parent().and_then(|dir| dir.parent()) {
+            let index = roots
+                .iter()
+                .position(|existing| *existing == root)
+                .unwrap_or_else(|| {
+                    roots.push(root);
+                    roots.len() - 1
+                });
+            format!(
+                "r{index}/{}",
+                skill.file_path.strip_prefix(root).expect("ancestor root")
+            )
+        } else {
+            skill.file_path.to_string()
+        };
+        entries.push_str(&format!(
+            "- {}: {} (file: {path})\n",
+            skill.name, skill.description
+        ));
     }
-    out.push_str("\n### How to use skills\n");
-    out.push_str("- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths. Read the listed file path before using a skill; do not assume the description is enough.\n");
-    out.push_str("- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n");
-    out.push_str("- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.\n");
-    out.push_str("- How to use a skill (progressive disclosure):\n");
-    out.push_str("  1) After deciding to use a skill, open and read its SKILL.md file before taking task actions.\n");
-    out.push_str("  2) When `SKILL.md` references relative paths (e.g., `scripts/foo.py`), resolve them relative to the skill directory listed above first.\n");
-    out.push_str("  3) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.\n");
-    out.push_str("  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.\n");
-    out.push_str(
-        "  5) If `assets/` or templates exist, reuse them instead of recreating from scratch.\n",
+    let mut out = String::from(
+        "## Skills\n\nA skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a path. Short paths can be expanded into absolute paths using the skill roots table.\n\n",
     );
-    out.push_str("- Context hygiene:\n");
-    out.push_str("  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.\n");
-    out.push_str("  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.\n");
-    out.push_str("- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue.\n");
+    if !roots.is_empty() {
+        out.push_str("### Skill roots\n\n");
+        for (index, root) in roots.iter().enumerate() {
+            out.push_str(&format!("- `r{index}` = `{root}`\n"));
+        }
+        out.push('\n');
+    }
+    out.push_str("### Available skills\n\n");
+    out.push_str(&entries);
     out.push('\n');
     Some(out)
 }
@@ -1549,12 +1561,30 @@ mod tests {
     }
 
     #[test]
-    fn renders_big_skill_guidance_with_file_paths() {
-        let prompt = render_skills_prompt(&[skill("demo", "Demo skill")]).unwrap();
-        assert!(prompt.contains("## Skills"));
-        assert!(prompt.contains("If a skill exists for a task, you must do it"));
-        assert!(prompt.contains("- demo: Demo skill (file: /repo/.agents/skills/demo/SKILL.md)"));
-        assert!(prompt.contains("open and read its SKILL.md file"));
+    fn renders_skill_catalogue_with_stable_root_aliases() {
+        let mut external = skill("beta", "Other skill");
+        external.file_path = "/opt/shared/skills/beta/SKILL.md".into();
+        let prompt = render_skills_prompt(&[
+            skill("zeta", "Last skill"),
+            external,
+            skill("alpha", "First skill"),
+        ])
+        .unwrap();
+        assert_eq!(
+            prompt,
+            concat!(
+                "## Skills\n\n",
+                "A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a path. Short paths can be expanded into absolute paths using the skill roots table.\n\n",
+                "### Skill roots\n\n",
+                "- `r0` = `/repo/.agents/skills`\n",
+                "- `r1` = `/opt/shared/skills`\n\n",
+                "### Available skills\n\n",
+                "- alpha: First skill (file: r0/alpha/SKILL.md)\n",
+                "- beta: Other skill (file: r1/beta/SKILL.md)\n",
+                "- zeta: Last skill (file: r0/zeta/SKILL.md)\n\n",
+            )
+        );
+        assert!(render_skills_prompt(&[]).is_none());
     }
 
     #[test]
