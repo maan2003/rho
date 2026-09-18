@@ -270,9 +270,6 @@ Inspect its globals from a later cell without stopping it:
 
     print(progress)
 
-Show a function's signature and documentation, and return the same text.
-help(function) → str
-
 ### Waiting and wakeups
 
 Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
@@ -936,9 +933,6 @@ Inspect its globals from a later cell without stopping it:
 
     print(progress)
 
-Show a function's signature and documentation, and return the same text.
-help(function) → str
-
 ### Waiting and wakeups
 
 Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
@@ -1300,7 +1294,7 @@ In a later cell, request cancellation. Await the handle only if subsequent code 
     await job
 
 The built-in print, with a cap on how much of one call is kept. Library output on stdout and
-stderr is captured the same way. help(function) shows a signature and documentation.
+stderr is captured the same way.
 print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens: int = 2000) → None
 
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
@@ -1789,7 +1783,6 @@ mod tests {
         assert!(
             collaboration.contains("loads applicable AGENTS.md guidance and the skill catalogue")
         );
-        assert!(!collaboration.contains("help(agents.spawn_new_engineer)"));
         assert!(collaboration.contains("agents.cancel("));
         assert!(collaboration.contains("agents.message("));
         assert!(prompt.contains("tool-call source, or bounded tool output"));
@@ -1813,7 +1806,6 @@ mod tests {
         assert!(!execution.contains('`'));
         assert!(!execution.contains("CommandResult"));
 
-        assert!(!prompt.contains("help(agents.spawn_new_advisor)"));
         assert!(
             collaboration.contains("Without an explicit request, do NOT consult the Advisor for:")
         );
@@ -1823,8 +1815,6 @@ mod tests {
         for legacy in [
             "Python Code Mode",
             "Available tools:",
-            "help(web.run)",
-            "help(view_image)",
             "Arguments: ",
             "### Rho agents",
             "class agents:",
@@ -1870,8 +1860,6 @@ mod tests {
             "spawn_new_engineer",
             "agents.cancel(*",
             "Autonomy And Persistence",
-            "help(web.run)",
-            "help(view_image)",
             "Python Code Mode",
             "Available tools:",
         ] {

@@ -1130,10 +1130,6 @@ import types
 import json
 assert isinstance(agents, types.ModuleType)
 assert not hasattr(agents, "delegate_engineer")
-advisor_docs = help(agents.spawn_new_advisor)
-assert "msg: str" in advisor_docs
-assert "independent Advisor consultation" in advisor_docs
-assert "Arguments:" not in advisor_docs
 assert "tools" not in globals()
 assert "spawn_engineer" not in globals()
 assert "ask_advisor" not in globals()

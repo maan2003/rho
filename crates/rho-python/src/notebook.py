@@ -9,7 +9,6 @@ import pathlib
 import sys
 import types
 from types import MappingProxyType
-import inspect
 import threading
 import concurrent.futures
 from collections.abc import Sequence
@@ -376,9 +375,6 @@ class Command:
 
     @staticmethod
     def from_session_id(session_id):
-        """The handle for a live command, found by the session ID its reports carry.
-        For a command whose handle was never kept. Usable at once, like command().
-        """
         return Command(_request('find_command', dict(session_id=int(session_id))), completes=False)
 
     def __await__(self):
@@ -389,7 +385,6 @@ class Command:
         return asyncio.shield(self._result).__await__()
 
     def more_output(self, *, max_tokens=2000):
-        """Show the next page of output, carrying on from the last report."""
         return _request('more_output', dict(id=self.id, max_tokens=_budget(max_tokens)))
 
     def cancel(self):
@@ -409,23 +404,6 @@ def write_stdin(handle, chars):
     return _request('write_stdin', dict(id=handle.id, chars=chars))
 
 
-def help(value):
-    """Show a function's signature and documentation."""
-    try:
-        signature = inspect.signature(value)
-    except (TypeError, ValueError):
-        raise TypeError('help takes a function; print a value instead') from None
-    # Host functions carry no module, and a bare `None.` in front of the name
-    # reads like part of the signature.
-    name = getattr(value, '__qualname__', None) or getattr(value, '__name__', None) or repr(value)
-    module = getattr(value, '__module__', None)
-    docs = inspect.getdoc(value)
-    title = f'{module}.{name}{signature}' if module else f'{name}{signature}'
-    shown = f'{title}\n\n{docs}' if docs else title
-    print(shown)
-    return shown
-
-
 def _render(value, budget):
     value = str(value)
     limit = _budget(budget) * 4
@@ -435,7 +413,6 @@ def _render(value, budget):
 
 
 def print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens=2000):
-    """Like the built-in print, with a cap on how much of one call is kept."""
     if file is not None:
         return builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
     max_tokens = _budget(max_tokens)
@@ -498,7 +475,7 @@ sys.stdout = sys.__stdout__ = _Output()
 sys.stderr = sys.__stderr__ = _Output()
 
 _namespace = dict(__name__='__main__', command=command, Command=Command,
-                  write_stdin=write_stdin, print=print, help=help,
+                  write_stdin=write_stdin, print=print,
                   notify=notify, set_max_wait=set_max_wait,
                   suppress_tool_wakeups=suppress_tool_wakeups,
                   web=web,
@@ -509,31 +486,18 @@ def _configure_functions(names):
     agents = types.ModuleType('agents')
 
     def message(*, agent_id: str, message: str):
-        """Send a message to an existing agent.
-        Use the role-prefixed agent handle, for example eng-h6u7 or adv-h6u7.
-        """
         return _request('message_agent', dict(agent_id=agent_id, message=message))
 
     def cancel(*, agent_id: str):
-        """Interrupt an Engineer's current turn. It remains available for follow-up messages."""
         return _request('interrupt_engineer', dict(agent_id=agent_id))
 
     def spawn_new_advisor(msg: str):
-        """Start an independent Advisor consultation. Its answer arrives later as agent mail.
-        State the question, relevant files, intended behavior, settled constraints, and desired
-        output. For reviews, identify the diff and the behavior it should preserve. For an
-        unsolicited consultation, explain the unresolved question and what you already checked.
-        Keep working on independent tasks while waiting; do not repeatedly message the Advisor.
-        The return value identifies the Advisor, not its eventual findings.
-        """
         return _request('ask_advisor', dict(message=msg))
 
     def spawn_new_engineer(*, task_name: str, prompt: str, workdir: str | None = None):
-        """Start an Engineer; its final response arrives later as agent mail."""
         return _request('spawn_engineer', dict(task_name=task_name, prompt=prompt, workdir=workdir))
 
     def view_image(path: str, *, detail: str = 'high'):
-        """Show an image from the workset in this cell. Nothing to await."""
         shown = _request('view_image', dict(path=path, detail=detail))
         # Nobody will await it, so take the outcome here to keep asyncio quiet.
         # A host call that fails is the cell's news on its own.
