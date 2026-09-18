@@ -1,5 +1,6 @@
 """Host-driven notebook scheduler. No Python objects cross the host boundary."""
 import ast
+import builtins
 import asyncio
 import _asyncio
 import contextvars
@@ -367,12 +368,29 @@ def _request(name, arguments):
     return result
 
 class Command:
-    def __init__(self, result):
-        self._result = result
+    def __init__(self, result, *, completes=True):
         self.id = result.id
+        # A recovered handle's request answers with the command it found, not
+        # with the command's own ending, so it is not what awaiting waits on.
+        self._result = result if completes else None
+
+    @staticmethod
+    def from_session_id(session_id):
+        """The handle for a live command, found by the session ID its reports carry.
+        For a command whose handle was never kept. Usable at once, like command().
+        """
+        return Command(_request('find_command', dict(session_id=int(session_id))), completes=False)
 
     def __await__(self):
+        # A recovered handle has no request of its own to wait on, so it asks
+        # the host to tell it when the command ends.
+        if self._result is None:
+            self._result = _request('wait_command', {'id': self.id})
         return asyncio.shield(self._result).__await__()
+
+    def more_output(self, *, max_tokens=2000):
+        """Show the next page of output, carrying on from the last report."""
+        return _request('more_output', dict(id=self.id, max_tokens=_budget(max_tokens)))
 
     def cancel(self):
         return _request('cancel_command', {'id': self.id})
@@ -387,20 +405,25 @@ def command(cmd, *, workdir=None, max_tokens=2000):
     return Command(_request('command', dict(cmd=cmd, workdir=workdir, max_tokens=_budget(max_tokens))))
 
 
-def write_stdin(handle, chars='', *, max_tokens=2000):
-    return _request('write_stdin', dict(id=handle.id, chars=chars, max_tokens=_budget(max_tokens)))
+def write_stdin(handle, chars):
+    return _request('write_stdin', dict(id=handle.id, chars=chars))
 
 
-def display(value, *, max_tokens=2000):
-    if isinstance(value, Command):
-        return _request('display', dict(id=value.id, max_tokens=_budget(max_tokens)))
-    if inspect.isfunction(value):
-        docs = f'{value.__module__}.{value.__name__}{inspect.signature(value)}\n\n{inspect.getdoc(value) or ""}'
-    else:
-        text(value, max_tokens=max_tokens)
-        return
-    text(docs, max_tokens=max_tokens)
-    return docs
+def help(value):
+    """Show a function's signature and documentation."""
+    try:
+        signature = inspect.signature(value)
+    except (TypeError, ValueError):
+        raise TypeError('help takes a function; print a value instead') from None
+    # Host functions carry no module, and a bare `None.` in front of the name
+    # reads like part of the signature.
+    name = getattr(value, '__qualname__', None) or getattr(value, '__name__', None) or repr(value)
+    module = getattr(value, '__module__', None)
+    docs = inspect.getdoc(value)
+    title = f'{module}.{name}{signature}' if module else f'{name}{signature}'
+    shown = f'{title}\n\n{docs}' if docs else title
+    print(shown)
+    return shown
 
 
 def _render(value, budget):
@@ -411,9 +434,13 @@ def _render(value, budget):
     return value
 
 
-def text(value, *, max_tokens=2000):
+def print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens=2000):
+    """Like the built-in print, with a cap on how much of one call is kept."""
+    if file is not None:
+        return builtins.print(*values, sep=sep, end=end, file=file, flush=flush)
     max_tokens = _budget(max_tokens)
-    _send('text', cell=_cell.get(), text=_render(value, max_tokens) + '\n', max_tokens=max_tokens, important=False)
+    written = sep.join(str(value) for value in values) + end
+    _send('text', cell=_cell.get(), text=_render(written, max_tokens), max_tokens=max_tokens, important=False)
 
 
 def notify(value, *, max_tokens=2000):
@@ -429,10 +456,6 @@ def set_max_wait(seconds):
 
 def suppress_tool_wakeups():
     _send('suppress_tool_wakeups', cell=_cell.get())
-
-
-def image(reference):
-    return _request('image', reference)
 
 
 def _host_function(name):
@@ -474,11 +497,12 @@ class _Output:
 sys.stdout = sys.__stdout__ = _Output()
 sys.stderr = sys.__stderr__ = _Output()
 
-_namespace = dict(__name__='__main__', command=command, write_stdin=write_stdin,
-                  display=display, text=text, notify=notify, set_max_wait=set_max_wait,
+_namespace = dict(__name__='__main__', command=command, Command=Command,
+                  write_stdin=write_stdin, print=print, help=help,
+                  notify=notify, set_max_wait=set_max_wait,
                   suppress_tool_wakeups=suppress_tool_wakeups,
                   web=web,
-                  image=image, transcript=transcript, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
+                  transcript=transcript, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
 
 
 def _configure_functions(names):
@@ -508,8 +532,12 @@ def _configure_functions(names):
         """Start an Engineer; its final response arrives later as agent mail."""
         return _request('spawn_engineer', dict(task_name=task_name, prompt=prompt, workdir=workdir))
 
-    def view_image(*, path: str, detail: str = 'high'):
-        return _request('view_image', dict(path=path, detail=detail))
+    def view_image(path: str, *, detail: str = 'high'):
+        """Show an image from the workset in this cell. Nothing to await."""
+        shown = _request('view_image', dict(path=path, detail=detail))
+        # Nobody will await it, so take the outcome here to keep asyncio quiet.
+        # A host call that fails is the cell's news on its own.
+        shown.add_done_callback(lambda done: done.cancelled() or done.exception())
 
     def papercut(*, description: str):
         return _request('papercut', dict(description=description))

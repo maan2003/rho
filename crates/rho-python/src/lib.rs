@@ -1049,7 +1049,7 @@ with tempfile.TemporaryDirectory() as directory:
             .sender()
             .send(Input::Execute {
                 cell: 2,
-                source: "values.append(2)\ntext(values)".into(),
+                source: "values.append(2)\nprint(values)".into(),
             })
             .unwrap();
         let mut finished = 0;
@@ -1082,7 +1082,7 @@ import json
 def forbidden(*args, **kwargs):
     raise AssertionError('runtime event called Python JSON encoder')
 json.dumps = forbidden
-text('Ω "quoted"')
+print('Ω "quoted"')
 set_max_wait(seconds=3)
 suppress_tool_wakeups()
 "#
@@ -1121,7 +1121,7 @@ suppress_tool_wakeups()
             .send(Input::Execute {
                 cell: 1,
                 source: r#"
-send = text.__globals__['_send']
+send = print.__globals__['_send']
 request = command.__globals__['_request']
 try:
     send('text', cell=1, text='x' * (1024 * 1024), max_tokens=1, important=False)
@@ -1203,7 +1203,7 @@ await request('echo', {'nested': [None, True, 3.5, {'Ω': 'quoted"\\\n'}], 'tupl
             .sender()
             .send(Input::Execute {
                 cell: 2,
-                source: "text(await job)".into(),
+                source: "print(await job)".into(),
             })
             .unwrap();
         session
@@ -1343,7 +1343,7 @@ class SlowString:
         while time.monotonic() < until:
             pass
         return 'formatting survived'
-text(SlowString())
+print(SlowString())
 "#
                 .into(),
             })
@@ -1465,11 +1465,11 @@ await asyncio.sleep(30)
             .send(Input::Execute {
                 cell: 2,
                 source: r#"
-while not text.__globals__['_cells'][1]['cancelled']:
+while not print.__globals__['_cells'][1]['cancelled']:
     await asyncio.sleep(0)
 release.set()
 await asyncio.to_thread(stopped.wait)
-text('worker stopped')
+print('worker stopped')
 "#
                 .into(),
             })
@@ -1513,7 +1513,7 @@ text('worker stopped')
             .sender()
             .send(Input::Execute {
                 cell: 2,
-                source: "import sys\nassert sys.gettrace() is None\ntext(survives)".into(),
+                source: "import sys\nassert sys.gettrace() is None\nprint(survives)".into(),
             })
             .unwrap();
         assert!(matches!(next(&mut rx).await, Event::Text{text,..} if text.trim() == "42"));
@@ -1665,7 +1665,7 @@ assert process.returncode == 0
             .sender()
             .send(Input::Execute {
                 cell: 2,
-                source: "text('must not run')".into(),
+                source: "print('must not run')".into(),
             })
             .unwrap();
         let event = next(&mut rx).await;
@@ -1685,7 +1685,7 @@ assert process.returncode == 0
             .sender()
             .send(Input::Execute {
                 cell: 3,
-                source: "text('alive')".into(),
+                source: "print('alive')".into(),
             })
             .unwrap();
         assert!(matches!(next(&mut rx).await, Event::Text { cell: 3, .. }));
@@ -1737,7 +1737,7 @@ assert process.returncode == 0
                 error: None
             }
         ));
-        session.sender().send(Input::Execute {cell: 2, source: "asyncio.get_running_loop().call_later(3600, notify, 'too late')\ntext('scheduled')".into()}).unwrap();
+        session.sender().send(Input::Execute {cell: 2, source: "asyncio.get_running_loop().call_later(3600, notify, 'too late')\nprint('scheduled')".into()}).unwrap();
         assert!(matches!(next(&mut rx).await, Event::Text { cell: 2, .. }));
         session.sender().cancel(2);
         assert!(matches!(
@@ -1766,7 +1766,7 @@ def ready():
     reader.close()
     raise ValueError('reader failure')
 loop.add_reader(reader, ready)
-text('watching')
+print('watching')
 "#
                 .into(),
             })
@@ -1813,7 +1813,8 @@ text('watching')
             .sender()
             .send(Input::Execute {
                 cell: 1,
-                source: "text('hello', max_tokens=12000)\ncommand('true', max_tokens=12000)".into(),
+                source: "print('hello', max_tokens=12000)\ncommand('true', max_tokens=12000)"
+                    .into(),
             })
             .unwrap();
         assert!(matches!(

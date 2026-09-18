@@ -376,7 +376,7 @@ async fn only_notify_marks_a_cell_notified() {
     let mut plain = tool.exec(
         call(
             "plain",
-            json!("text('just output')\nawait asyncio.sleep(0.3)"),
+            json!("print('just output')\nawait asyncio.sleep(0.3)"),
         ),
         SourceWaker::new(wake.clone()),
     );
@@ -409,7 +409,7 @@ async fn the_foreground_moves_only_when_a_cell_registers_work() {
     worker.first_output();
     worker.acknowledge_output();
     let looker = tool.exec(
-        call("looker", json!("text(1)")),
+        call("looker", json!("print(1)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*looker, Signal::Ended).await;
@@ -462,7 +462,7 @@ async fn python_commands_outlive_cells_and_retain_truncated_output() {
     assert!(cell.done());
     drop(cell);
     let mut read = tool.exec(
-        call("p2", json!("write_stdin(job, max_tokens=100)")),
+        call("p2", json!("job.more_output(max_tokens=100)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*read, Signal::Ended).await;
@@ -480,7 +480,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     let tool = python(shell_in(&directory), Vec::new());
     let wake = Arc::new(Notify::new());
     let mut monitor = tool.exec(call("monitor", json!(
-        "progress = {'checks': 0}\ntext('monitor started')\nwhile not Path('results.json').exists():\n    progress['checks'] += 1\n    await asyncio.sleep(0.01)\nnotify(Path('results.json').read_text())"
+        "progress = {'checks': 0}\nprint('monitor started')\nwhile not Path('results.json').exists():\n    progress['checks'] += 1\n    await asyncio.sleep(0.01)\nnotify(Path('results.json').read_text())"
     )), SourceWaker::new(wake.clone()));
     until(&wake, &*monitor, Signal::Output).await;
     assert_eq!(monitor.first_output().output.trim(), "monitor started");
@@ -490,7 +490,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     let mut inspect = tool.exec(
         call(
             "inspect",
-            json!("assert progress['checks'] > 0\ntext(progress)"),
+            json!("assert progress['checks'] > 0\nprint(progress)"),
         ),
         SourceWaker::new(wake.clone()),
     );
@@ -679,7 +679,7 @@ async fn python_registration_cancels_an_unawaited_command_and_blocked_stdin_toge
     let mut cell = tool.exec(
         call(
             "blocked",
-            json!("job = command('sleep 60')\nwrite_stdin(job, 'x' * 262144)\ntext('registered')"),
+            json!("job = command('sleep 60')\nwrite_stdin(job, 'x' * 262144)\nprint('registered')"),
         ),
         SourceWaker::new(wake.clone()),
     );
@@ -793,10 +793,92 @@ async fn python_cancellation_owns_pending_host_calls() {
 }
 
 #[tokio::test]
+async fn python_session_id_recovers_a_handle_whose_python_name_was_lost() {
+    let tool = python(shell(), Vec::new());
+    let wake = Arc::new(Notify::new());
+    let mut cell = tool.exec(
+        call("p1", json!("command('sleep 60')\nprint('started')")),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*cell, Signal::Output).await;
+    let announced = cell.first_output();
+    cell.acknowledge_output();
+    let label: u32 = announced
+        .output
+        .split("session ID ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the announcement names a session ID")
+        .parse()
+        .expect("a numeric session ID");
+    drop(cell);
+    // The handle was never assigned, so the label in the report is the only
+    // way back to the command. The handle it gives back is usable at once.
+    let mut second = tool.exec(
+        call(
+            "p2",
+            json!(format!(
+                "job = Command.from_session_id({label})\njob.cancel()\nprint('recovered', job.id > 0)"
+            )),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*second, Signal::Ended).await;
+    let result = second.first_output();
+    assert_eq!(
+        result.status,
+        ToolOutputStatus::Success,
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("recovered True"),
+        "{}",
+        result.output
+    );
+    second.acknowledge_output();
+}
+
+#[tokio::test]
+async fn python_display_pages_on_from_the_automatic_report() {
+    let tool = python(shell(), Vec::new());
+    let wake = Arc::new(Notify::new());
+    let mut cell = tool.exec(
+        call("p1", json!("job = command(\"printf alpha\")\nawait job")),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*cell, Signal::Ended).await;
+    let reported = cell.first_output();
+    cell.acknowledge_output();
+    assert!(reported.output.contains("alpha"), "{}", reported.output);
+    assert!(cell.done());
+    drop(cell);
+    // The report already showed everything, so a later read has nothing to
+    // add rather than saying it a second time.
+    let mut read = tool.exec(
+        call("p2", json!("await job.more_output()")),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*read, Signal::Ended).await;
+    let page = read.first_output();
+    assert!(!page.output.contains("alpha"), "{}", page.output);
+    assert!(page.output.contains("No more output."), "{}", page.output);
+    read.acknowledge_output();
+}
+
+#[tokio::test]
 async fn python_retained_pages_do_not_split_unicode_characters() {
     let tool = python(shell(), Vec::new());
     let wake = Arc::new(Notify::new());
-    let mut cell = tool.exec(call("p1", json!("job = command(\"printf '☃☃'\")\nawait job\na = await write_stdin(job, max_tokens=1)\nb = await write_stdin(job, max_tokens=1)\nassert a['output'] + b['output'] == '☃☃'")), SourceWaker::new(wake.clone()));
+    let mut cell = tool.exec(
+        call(
+            "p1",
+            json!(
+                "job = command(\"printf '☃☃'\")\nawait job\nawait job.more_output(max_tokens=1)\nawait job.more_output(max_tokens=1)"
+            ),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
     until(&wake, &*cell, Signal::Ended).await;
     let result = cell.first_output();
     cell.acknowledge_output();
@@ -806,6 +888,12 @@ async fn python_retained_pages_do_not_split_unicode_characters() {
         "{}",
         result.output
     );
+    // Each page is a whole character, so no page boundary leaves a
+    // replacement character behind, and the first page says what is left.
+    assert!(!result.output.contains('\u{fffd}'), "{}", result.output);
+    assert!(result.output.contains("[3 more bytes"), "{}", result.output);
+    // The pages replace the automatic report rather than being repeated by it.
+    assert_eq!(result.output.matches('☃').count(), 2, "{}", result.output);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1042,7 +1130,7 @@ import types
 import json
 assert isinstance(agents, types.ModuleType)
 assert not hasattr(agents, "delegate_engineer")
-advisor_docs = display(agents.spawn_new_advisor)
+advisor_docs = help(agents.spawn_new_advisor)
 assert "msg: str" in advisor_docs
 assert "independent Advisor consultation" in advisor_docs
 assert "Arguments:" not in advisor_docs
@@ -1063,7 +1151,7 @@ cancelled = await agents.cancel(agent_id="eng-test")
 assert json.loads(cancelled.split(":", 1)[1]) == {"agent_id": "eng-test"}
 agents.spawn_new_advisor("background review")
 assert (await web.run(search_query=[])).startswith("web__run:")
-assert (await view_image(path="test.png")).startswith("view_image:")
+assert view_image("test.png") is None
 "#
             ),
         ),

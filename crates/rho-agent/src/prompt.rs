@@ -133,13 +133,13 @@ present a visual as proof of behavior you did not exercise.
 
 ### Inspecting rendered output
 
-`view_image` loads an existing image; it does not create a screenshot. Capture the rendered UI using
-the relevant browser or GUI workflow, then inspect the returned image explicitly:
+`view_image` shows an existing image; it does not create a screenshot. Capture the rendered UI using
+the relevant browser or GUI workflow, then look at it:
 
 ```python
-def view_image(*, path: str, detail: Literal['high', 'original'] = 'high') -> Awaitable[Any]: ...
+def view_image(path: str, *, detail: Literal['high', 'original'] = 'high') -> None: ...
 
-image((await view_image(path='/absolute/path/to/capture.png'))['content'][0])
+view_image('/absolute/path/to/capture.png')
 ```
 
 ## Actions Requiring Explicit Approval
@@ -212,32 +212,29 @@ Await only the dependency; the next command starts without awaiting its output:
     if check["exit_code"] == 0:
         command("cargo test")
 
-Send input and read retained output, or omit chars to read only. Registers immediately and returns
-an awaitable for this write/read operation. Awaiting waits for stdin readiness, not future output;
-an empty page is valid.
-write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awaitable[{
-    id: int,
-    output: str,
-    offset: int,
-    next_offset: int,
-    retained_bytes: int,
-    dropped_bytes: int,
-    finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
-}]
+Send input to a running command. Registers immediately and returns an awaitable for the write.
+Awaiting waits for stdin readiness, not for output. It never reads; more_output does that.
+write_stdin(handle: Command, chars: str) → Awaitable[None]
 
 Send stdin without blocking the notebook:
 
     job = command("python3 -c 'print(input())'", max_tokens=100)
     write_stdin(job, "hello\n")
 
-Read retained output without sending input. Returns the same awaitable result shape as write_stdin.
-Explicit reads use a separate cursor starting at byte zero and can repeat automatic previews.
-Await command completion first only when Python needs a complete final read.
-display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
+Show the next page of a command's output, in the same form the command reports itself. A page
+starts where the last report or page stopped, so it never repeats what you have already seen, and
+it says how many bytes are left when more remain. The page is the output; nothing is returned.
+handle.more_output(*, max_tokens: int = 2000) → Awaitable[None]
 
-After automatic completion, expand retained output in a later cell:
+A command's output reaches you on its own. Ask for more only when a report says it truncated:
 
-    write_stdin(job, max_tokens=6000)
+    job.more_output(max_tokens=6000)
+
+The handle for a live command whose handle was not kept, found by the session ID in its reports.
+Usable at once, like command().
+Command.from_session_id(session_id: int) → Command
+
+    job = Command.from_session_id(3835)
 
 Request cancellation immediately. Awaiting this operation waits for the cancellation request to be
 handled; await the command handle to wait for termination.
@@ -254,8 +251,9 @@ In a later cell, request cancellation. Await the handle only if subsequent code 
 
 ### Python output
 
-Emit ordinary output, like print.
-text(value: object, *, max_tokens: int = 2000) → None
+The built-in print, with a cap on how much of one call is kept. Library output on stdout and
+stderr is captured the same way.
+print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens: int = 2000) → None
 
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
@@ -270,15 +268,10 @@ A monitoring cell can stay live across reporting boundaries:
 
 Inspect its globals from a later cell without stopping it:
 
-    text(progress)
+    print(progress)
 
-Show and return a Python function's signature and documentation. For other non-command values,
-display behaves like text and returns None.
-display(function, *, max_tokens: int = 2000) → str
-
-Add an image returned by a host function to the model-visible output. Nested image results are not
-displayed automatically.
-image(reference) → Awaitable[None]
+Show a function's signature and documentation, and return the same text.
+help(function) → str
 
 ### Waiting and wakeups
 
@@ -838,13 +831,13 @@ Web discovery is optional when the repository is already known.
 
 ### Inspecting rendered output
 
-`view_image` loads an existing image; it does not create a screenshot. Use it to inspect supplied
-screenshots or local images relevant to the question, then display the returned image explicitly:
+`view_image` shows an existing image; it does not create a screenshot. Use it to inspect supplied
+screenshots or local images relevant to the question:
 
 ```python
-def view_image(*, path: str, detail: Literal['high', 'original'] = 'high') -> Awaitable[Any]: ...
+def view_image(path: str, *, detail: Literal['high', 'original'] = 'high') -> None: ...
 
-image((await view_image(path='/absolute/path/to/capture.png'))['content'][0])
+view_image('/absolute/path/to/capture.png')
 ```
 
 "#,
@@ -885,32 +878,29 @@ Await only the dependency; the next command starts without awaiting its output:
     if check["exit_code"] == 0:
         command("cargo test")
 
-Send input and read retained output, or omit chars to read only. Registers immediately and returns
-an awaitable for this write/read operation. Awaiting waits for stdin readiness, not future output;
-an empty page is valid.
-write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awaitable[{
-    id: int,
-    output: str,
-    offset: int,
-    next_offset: int,
-    retained_bytes: int,
-    dropped_bytes: int,
-    finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
-}]
+Send input to a running command. Registers immediately and returns an awaitable for the write.
+Awaiting waits for stdin readiness, not for output. It never reads; more_output does that.
+write_stdin(handle: Command, chars: str) → Awaitable[None]
 
 Send stdin without blocking the notebook:
 
     job = command("python3 -c 'print(input())'", max_tokens=100)
     write_stdin(job, "hello\n")
 
-Read retained output without sending input. Returns the same awaitable result shape as write_stdin.
-Explicit reads use a separate cursor starting at byte zero and can repeat automatic previews.
-Await command completion first only when Python needs a complete final read.
-display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
+Show the next page of a command's output, in the same form the command reports itself. A page
+starts where the last report or page stopped, so it never repeats what you have already seen, and
+it says how many bytes are left when more remain. The page is the output; nothing is returned.
+handle.more_output(*, max_tokens: int = 2000) → Awaitable[None]
 
-After automatic completion, expand retained output in a later cell:
+A command's output reaches you on its own. Ask for more only when a report says it truncated:
 
-    write_stdin(job, max_tokens=6000)
+    job.more_output(max_tokens=6000)
+
+The handle for a live command whose handle was not kept, found by the session ID in its reports.
+Usable at once, like command().
+Command.from_session_id(session_id: int) → Command
+
+    job = Command.from_session_id(3835)
 
 Request cancellation immediately. Awaiting this operation waits for the cancellation request to be
 handled; await the command handle to wait for termination.
@@ -927,8 +917,9 @@ In a later cell, request cancellation. Await the handle only if subsequent code 
 
 ### Python output
 
-Emit ordinary output, like print.
-text(value: object, *, max_tokens: int = 2000) → None
+The built-in print, with a cap on how much of one call is kept. Library output on stdout and
+stderr is captured the same way.
+print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens: int = 2000) → None
 
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
@@ -943,15 +934,10 @@ A monitoring cell can stay live across reporting boundaries:
 
 Inspect its globals from a later cell without stopping it:
 
-    text(progress)
+    print(progress)
 
-Show and return a Python function's signature and documentation. For other non-command values,
-display behaves like text and returns None.
-display(function, *, max_tokens: int = 2000) → str
-
-Add an image returned by a host function to the model-visible output. Nested image results are not
-displayed automatically.
-image(reference) → Awaitable[None]
+Show a function's signature and documentation, and return the same text.
+help(function) → str
 
 ### Waiting and wakeups
 
@@ -1276,30 +1262,29 @@ Await only the dependency; the next command starts without awaiting its output:
     if check["exit_code"] == 0:
         command("cargo test")
 
-Send input and read retained output, or omit chars to read only. Awaiting waits for stdin readiness,
-not future output; an empty page is valid.
-write_stdin(handle: Command, chars: str = '', *, max_tokens: int = 2000) → Awaitable[{
-    id: int,
-    output: str,
-    offset: int,
-    next_offset: int,
-    retained_bytes: int,
-    dropped_bytes: int,
-    finished: {id: int, exit_code: int | None} | {id: int, error: str} | None,
-}]
+Send input to a running command. Registers immediately and returns an awaitable for the write.
+Awaiting waits for stdin readiness, not for output. It never reads; more_output does that.
+write_stdin(handle: Command, chars: str) → Awaitable[None]
 
 Send stdin without blocking the notebook:
 
     job = command("python3 -c 'print(input())'", max_tokens=100)
     write_stdin(job, "hello\n")
 
-Read retained output without writing input. Returns the same result shape as write_stdin.
-Explicit reads use a separate cursor starting at byte zero and may repeat automatic previews.
-display(handle: Command, *, max_tokens: int = 2000) → same result as write_stdin
+Show the next page of a command's output, in the same form the command reports itself. A page
+starts where the last report or page stopped, so it never repeats what you have already seen, and
+it says how many bytes are left when more remain. The page is the output; nothing is returned.
+handle.more_output(*, max_tokens: int = 2000) → Awaitable[None]
 
-After automatic completion, expand retained output in a later cell:
+A command's output reaches you on its own. Ask for more only when a report says it truncated:
 
-    write_stdin(job, max_tokens=6000)
+    job.more_output(max_tokens=6000)
+
+The handle for a live command whose handle was not kept, found by the session ID in its reports.
+Usable at once, like command().
+Command.from_session_id(session_id: int) → Command
+
+    job = Command.from_session_id(3835)
 
 Request cancellation. Awaiting this operation waits for the request to be handled; await the
 command handle to wait for termination.
@@ -1314,9 +1299,9 @@ In a later cell, request cancellation. Await the handle only if subsequent code 
     job.cancel()
     await job
 
-Emit ordinary output, like print. display(function) shows its signature and documentation;
-display(other_value) behaves like text.
-text(value: object, *, max_tokens: int = 2000) → None
+The built-in print, with a cap on how much of one call is kept. Library output on stdout and
+stderr is captured the same way. help(function) shows a signature and documentation.
+print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens: int = 2000) → None
 
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
@@ -1331,7 +1316,7 @@ A monitoring cell can stay live across reporting boundaries:
 
 Inspect its globals from a later cell without stopping it:
 
-    text(progress)
+    print(progress)
 
 Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
 sooner. The default is 120 seconds; accepted values are 1–3600 seconds.
@@ -1371,10 +1356,11 @@ web.run(**request) → Awaitable[str]
     web.run(search_query=[{"q": "search terms"}])
     web.run(open=[{"ref_id": "https://example.com"}])
 
-Load an image from the workset. high is the default detail; original preserves resolution within
-the safety limits. The returned image must be explicitly displayed.
-view_image(*, path: str, detail: Literal['high', 'original'] = 'high') → Awaitable[dict]
-image((await view_image(path='/src/capture.png'))['content'][0]) → Awaitable[None]
+Show an image from the workset. high is the default detail; original preserves resolution within
+the safety limits. The image appears in this cell; there is nothing to await.
+view_image(path: str, *, detail: Literal['high', 'original'] = 'high') → None
+
+    view_image('/src/capture.png')
 
 Record a concrete Rho bug or workflow friction locally. It does not notify anyone or start work.
 papercut(*, description: str) → Awaitable[str]
@@ -1803,7 +1789,7 @@ mod tests {
         assert!(
             collaboration.contains("loads applicable AGENTS.md guidance and the skill catalogue")
         );
-        assert!(!collaboration.contains("display(agents.spawn_new_engineer)"));
+        assert!(!collaboration.contains("help(agents.spawn_new_engineer)"));
         assert!(collaboration.contains("agents.cancel("));
         assert!(collaboration.contains("agents.message("));
         assert!(prompt.contains("tool-call source, or bounded tool output"));
@@ -1813,7 +1799,7 @@ mod tests {
         assert!(prompt.contains("Issue at most one exec call per response"));
         assert!(prompt.contains("end the model turn"));
         assert!(prompt.contains("suppress_tool_wakeups() → None"));
-        assert!(prompt.contains("separate cursor starting at byte zero"));
+        assert!(prompt.contains("never repeats what you have already seen"));
         assert!(prompt.contains("await handle → {id: int, exit_code: int | None}"));
         assert!(prompt.contains("returns a persistent command handle"));
         let execution = prompt
@@ -1827,7 +1813,7 @@ mod tests {
         assert!(!execution.contains('`'));
         assert!(!execution.contains("CommandResult"));
 
-        assert!(!prompt.contains("display(agents.spawn_new_advisor)"));
+        assert!(!prompt.contains("help(agents.spawn_new_advisor)"));
         assert!(
             collaboration.contains("Without an explicit request, do NOT consult the Advisor for:")
         );
@@ -1837,8 +1823,8 @@ mod tests {
         for legacy in [
             "Python Code Mode",
             "Available tools:",
-            "display(web.run)",
-            "display(view_image)",
+            "help(web.run)",
+            "help(view_image)",
             "Arguments: ",
             "### Rho agents",
             "class agents:",
@@ -1884,8 +1870,8 @@ mod tests {
             "spawn_new_engineer",
             "agents.cancel(*",
             "Autonomy And Persistence",
-            "display(web.run)",
-            "display(view_image)",
+            "help(web.run)",
+            "help(view_image)",
             "Python Code Mode",
             "Available tools:",
         ] {
@@ -2002,10 +1988,10 @@ mod tests {
                 "    command(\"git diff --stat\")\n    command(\"rg -n 'TODO' src\")",
                 "    check = await command(\"cargo check\")\n    if check[\"exit_code\"] == 0:",
                 "    write_stdin(job, \"hello\\n\")",
-                "    write_stdin(job, max_tokens=6000)",
+                "    job.more_output(max_tokens=6000)",
                 "    job.cancel()\n    await job",
                 "        await asyncio.sleep(5)",
-                "    text(progress)",
+                "    print(progress)",
                 "    set_max_wait(seconds=300)",
             ] {
                 assert!(prompt.contains(example), "{example}");

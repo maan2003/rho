@@ -875,6 +875,12 @@ impl BoundedOutput {
         self.total_bytes == 0
     }
 
+    /// Whether the middle has been dropped, so the kept bytes are a sample of
+    /// what was pushed rather than all of it.
+    pub fn is_truncated(&self) -> bool {
+        self.total_bytes as usize > self.head_limit + self.tail_limit
+    }
+
     /// The kept bytes, with a marker where the middle was dropped.
     pub fn into_bytes(self) -> Vec<u8> {
         self.finish().bytes

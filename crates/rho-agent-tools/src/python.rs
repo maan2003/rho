@@ -97,8 +97,6 @@ struct Shared {
     others: HashMap<String, Arc<dyn HostFunction>>,
     cells: Mutex<HashMap<u64, Arc<Mutex<ExecState>>>>,
     jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
-    sequence: AtomicU64,
-    images: Mutex<BTreeMap<u64, rho_core::ImageContent>>,
     /// The newest cell that registered a job: where the foreground begins.
     /// Advanced by registration, never by a cell that only looks or waits.
     foreground_cell: AtomicU64,
@@ -230,6 +228,9 @@ struct Job {
     cancel: Notify,
     budget: usize,
     ready: tokio::sync::watch::Sender<bool>,
+    /// Flipped when the job ends, so a handle recovered from a session ID can
+    /// wait for it without holding the request that started it.
+    done: tokio::sync::watch::Sender<bool>,
 }
 struct JobState {
     file: std::fs::File,
@@ -452,8 +453,6 @@ impl PythonNotebook {
                 .collect(),
             cells: Mutex::new(HashMap::new()),
             jobs: Mutex::new(BTreeMap::new()),
-            sequence: AtomicU64::new(1),
-            images: Mutex::new(BTreeMap::new()),
             foreground_cell: AtomicU64::new(0),
         });
         let history = Arc::new(HistoryStore::default());
@@ -685,12 +684,28 @@ fn register_call(
                 cancel: Notify::new(),
                 budget,
                 ready: tokio::sync::watch::channel(false).0,
+                done: tokio::sync::watch::channel(false).0,
             });
             jobs.insert(request, Arc::clone(&job));
             Ok(job)
         })()
         .map(Some)
     } else {
+        // The same synchronous publication for a handle recovered from a
+        // session ID: the existing job is filed under this request too, so the
+        // Command that comes back works at once, with nothing to await.
+        if name == "find_command"
+            && let Some(label) = args["session_id"].as_u64()
+        {
+            let mut jobs = shared.jobs.lock().unwrap();
+            let found = jobs
+                .iter()
+                .find(|(id, _)| session_id(**id) == label as u32)
+                .map(|(_, job)| Arc::clone(job));
+            if let Some(job) = found {
+                jobs.insert(request, job);
+            }
+        }
         Ok(None)
     };
     let operation = (name != "command").then(|| {
@@ -753,6 +768,7 @@ fn register_call(
             };
             let mut state = job.state.lock().unwrap();
             state.finished = Some((UnixMs::now(), summary));
+            let _ = job.done.send(true);
             state.failed = failed;
         } else if let Err(error) = &result {
             let mut operation = operation.as_ref().unwrap().lock().unwrap();
@@ -838,24 +854,31 @@ async fn host_call(
     link: &Arc<Mutex<ExecState>>,
     operation: &Arc<Mutex<Operation>>,
 ) -> Result<Value, String> {
-    if name == "image" {
-        let id = args["id"].as_u64().ok_or("Expected an image reference")?;
-        let image = shared
-            .images
+    // A session ID is a label the reports show, not a handle, and labels come
+    // round again every 9,000 requests. Only live jobs are searched, and two
+    // live jobs wearing one label is an error rather than a guess.
+    if name == "find_command" {
+        let label = args["session_id"].as_u64().ok_or("Expected a session ID")? as u32;
+        let found: Vec<u64> = shared
+            .jobs
             .lock()
             .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or("Image expired or unknown")?;
-        let mut cell = link.lock().unwrap();
-        if cell.images.len() >= 20 {
-            return Err("Cell image limit reached".into());
-        }
-        cell.images.push(image);
-        operation.lock().unwrap().output.push(b"Image displayed");
-        return Ok(Value::Null);
+            .keys()
+            .copied()
+            .filter(|id| session_id(*id) == label)
+            .collect();
+        return match found.as_slice() {
+            [id] => Ok(json!(id)),
+            [] => Err(format!("No live command has session ID {label}")),
+            _ => Err(format!(
+                "Session ID {label} names more than one live command; keep the handle command() returned"
+            )),
+        };
     }
-    if matches!(name, "write_stdin" | "display" | "cancel_command") {
+    if matches!(
+        name,
+        "write_stdin" | "more_output" | "wait_command" | "cancel_command"
+    ) {
         let id = args["id"].as_u64().ok_or("Expected command handle")?;
         let job = shared
             .jobs
@@ -868,6 +891,18 @@ async fn host_call(
             job.cancel.notify_one();
             return Ok(Value::Null);
         }
+        if name == "wait_command" {
+            let mut done = job.done.subscribe();
+            loop {
+                let finished = job.state.lock().unwrap().finished.clone();
+                if let Some((_, summary)) = finished {
+                    return Ok(summary);
+                }
+                done.changed().await.map_err(|e| e.to_string())?;
+            }
+        }
+        // `write_stdin` only writes. Reading output is `display`'s job, so
+        // that one function owns the cursor and nobody reads by accident.
         if name == "write_stdin" {
             let chars = args["chars"].as_str().ok_or("chars must be a string")?;
             if !chars.is_empty() {
@@ -884,6 +919,7 @@ async fn host_call(
                     .map_err(|e| e.to_string())?;
                 stdin.flush().await.map_err(|e| e.to_string())?;
             }
+            return Ok(Value::Null);
         }
         let mut state = job.state.lock().unwrap();
         let start = state.cursor;
@@ -907,14 +943,47 @@ async fn host_call(
             bytes.truncate(error.valid_up_to());
         }
         state.cursor += bytes.len();
-        let result = json!({"id":id,"output":String::from_utf8_lossy(&bytes),"offset":start,"next_offset":state.cursor,"retained_bytes":state.len,"dropped_bytes":state.dropped,"finished":state.finished.as_ref().map(|(_,v)|v)});
+        // Reading by hand takes over from the automatic report: whatever was
+        // waiting to be reported is dropped, so the next reply does not say
+        // again what this page just showed. The rest is paged the same way.
+        state.unsent = BoundedOutput::for_tokens(Some(job.budget));
+        state.since = None;
+        let page = String::from_utf8_lossy(&bytes).into_owned();
+        let remaining = state.len - state.cursor;
+        let finished = state.finished.is_some();
+        let dropped = state.dropped;
         drop(state);
+        // The same shape a command's own output arrives in, so a page reads
+        // like the report it continues.
+        let mut parts = vec![format!("Session ID: {}", session_id(id))];
+        if page.is_empty() {
+            parts.push(
+                if finished {
+                    "No more output."
+                } else {
+                    "No more output yet. Output and completion arrive automatically."
+                }
+                .to_owned(),
+            );
+        } else {
+            parts.push(format!("Output:\n{page}"));
+        }
+        if remaining > 0 {
+            parts.push(format!(
+                "[{remaining} more bytes; call more_output() again for the next page]"
+            ));
+        }
+        if dropped > 0 {
+            parts.push(format!(
+                "[{dropped} bytes never reached the log: the command outran its limit]"
+            ));
+        }
         operation
             .lock()
             .unwrap()
             .output
-            .push(result.to_string().as_bytes());
-        return Ok(result);
+            .push(parts.join("\n").as_bytes());
+        return Ok(Value::Null);
     }
     let tool = shared
         .others
@@ -932,16 +1001,18 @@ async fn host_call(
     if result.status != ToolOutputStatus::Success {
         return Err((*result.output).clone());
     }
-    let mut content = Vec::new();
+    // A tool that answers with pictures shows them here and now. Handing back
+    // a reference to display in a second call only ever meant the same thing
+    // one step later, and a reference could expire before it was used.
+    let mut dropped = 0;
     if !result.images.is_empty() {
-        let mut images = shared.images.lock().unwrap();
+        let mut cell = link.lock().unwrap();
         for image in result.images.iter() {
-            while images.len() >= 32 {
-                images.pop_first();
+            if cell.images.len() >= 20 {
+                dropped += 1;
+                continue;
             }
-            let id = shared.sequence.fetch_add(1, Ordering::Relaxed);
-            images.insert(id, image.clone());
-            content.push(json!({"id":id}));
+            cell.images.push(image.clone());
         }
     }
     if !result.output.is_empty() {
@@ -951,12 +1022,14 @@ async fn host_call(
             .output
             .push(result.output.as_bytes());
     }
-    if !content.is_empty() {
-        Ok(json!({"output":*result.output,"content":content}))
-    } else {
-        Ok(serde_json::from_str(&result.output)
-            .unwrap_or_else(|_| Value::String((*result.output).clone())))
+    if dropped > 0 {
+        operation.lock().unwrap().output.push(
+            format!("[{dropped} more images not shown: this cell is at its limit of 20]")
+                .as_bytes(),
+        );
     }
+    Ok(serde_json::from_str(&result.output)
+        .unwrap_or_else(|_| Value::String((*result.output).clone())))
 }
 pub struct PythonExec {
     id: ExecId,
@@ -1289,6 +1362,12 @@ impl PythonCell {
                 parts.push(format!("Command: {}", job.name));
             }
             if has_output {
+                // A reply and an explicit `more_output` share one cursor, so a read
+                // after an automatic report carries on from where the report
+                // stopped instead of repeating it. A report that dropped its
+                // own middle showed only a sample, so it leaves the cursor
+                // alone and `display` can still page the whole span.
+                let complete = !state.unsent.is_truncated();
                 let output = decode_output_lossy(
                     std::mem::replace(
                         &mut state.unsent,
@@ -1296,6 +1375,9 @@ impl PythonCell {
                     )
                     .into_bytes(),
                 );
+                if complete {
+                    state.cursor = state.len;
+                }
                 parts.push(format!("Output:\n{output}"));
             }
             state.since = None;
