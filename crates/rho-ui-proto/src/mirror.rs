@@ -339,7 +339,27 @@ pub enum Item {
         id: String,
         name: String,
         arguments: String,
+        /// How to read `arguments`.
+        format: ArgumentsFormat,
     },
+}
+
+/// What a call's `arguments` string holds. A function tool is given a JSON
+/// object, which is only whole once the call is; a custom tool is given the
+/// text the model wrote, which is never JSON and must not be parsed as it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum ArgumentsFormat {
+    Json,
+    Text,
+}
+
+impl From<rho_core::ToolType> for ArgumentsFormat {
+    fn from(tool_type: rho_core::ToolType) -> Self {
+        match tool_type {
+            rho_core::ToolType::Function => Self::Json,
+            rho_core::ToolType::Custom => Self::Text,
+        }
+    }
 }
 
 /// Whether a text item is the model thinking aloud or its answer.

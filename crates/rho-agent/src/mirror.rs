@@ -263,6 +263,9 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
+                        // A transcript call is Claude's, and Claude's tools
+                        // are all schema'd: its arguments are always JSON.
+                        format: rho_ui_proto::mirror::ArgumentsFormat::Json,
                     }))
                     .collect(),
                 compacted: false,
@@ -423,11 +426,13 @@ pub fn item(value: &InferenceResponseItem) -> Option<Item> {
             id,
             name,
             arguments,
+            tool_type,
             ..
         } => Item::ToolCall {
             id: id.as_str().to_owned(),
             name: name.as_str().to_owned(),
             arguments: arguments.clone(),
+            format: (*tool_type).into(),
         },
         InferenceResponseItem::Compaction { .. } | InferenceResponseItem::Unknown { .. } => {
             return None;
@@ -499,7 +504,8 @@ mod tests {
                     Item::ToolCall {
                         id: "middle".into(),
                         name: "exec".into(),
-                        arguments: "print(42)".into()
+                        arguments: "print(42)".into(),
+                        format: rho_ui_proto::mirror::ArgumentsFormat::Text,
                     },
                     Item::Text {
                         text: "after".into(),

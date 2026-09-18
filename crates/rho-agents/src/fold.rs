@@ -721,7 +721,7 @@ fn delivered(queued: UiBlock) -> UiBlock {
 #[cfg(test)]
 mod tests {
     use rho_core::MessageDelivery;
-    use rho_ui_proto::mirror::{Item, ToolOutcome, Usage};
+    use rho_ui_proto::mirror::{ArgumentsFormat, Item, ToolOutcome, Usage};
 
     use super::*;
     use crate::state::UiTool;
@@ -759,7 +759,7 @@ mod tests {
     /// had. Handing the state whole made a row cost every row above it.
     #[test]
     fn committed_items_keep_live_order_and_phase_and_rewind_together() {
-        use rho_ui_proto::mirror::{Item, TextPhase};
+        use rho_ui_proto::mirror::{ArgumentsFormat, Item, TextPhase};
         let items = vec![
             Item::Text {
                 text: "before".into(),
@@ -769,6 +769,7 @@ mod tests {
                 id: "middle".into(),
                 name: "exec".into(),
                 arguments: "print(42)".into(),
+                format: ArgumentsFormat::Text,
             },
             Item::Reasoning {
                 text: "after call".into(),
@@ -910,6 +911,7 @@ mod tests {
                     id: format!("call-{nth}"),
                     name: "shell".to_owned(),
                     arguments: format!("{{\"cmd\":\"echo {nth}\"}}"),
+                    format: ArgumentsFormat::Json,
                 }],
                 compacted: false,
                 usage: None,
@@ -975,6 +977,7 @@ mod tests {
                     id: "call-1".to_owned(),
                     name: "exec".to_owned(),
                     arguments: code.to_owned(),
+                    format: ArgumentsFormat::Text,
                 }],
                 compacted: false,
                 usage: None,
@@ -1006,6 +1009,7 @@ mod tests {
                     id: "call-1".to_owned(),
                     name: "shell_command".to_owned(),
                     arguments: r#"{"command":"cargo build"}"#.to_owned(),
+                    format: ArgumentsFormat::Json,
                 }],
                 compacted: false,
                 usage: None,
@@ -1014,7 +1018,7 @@ mod tests {
             },
         ]);
         let tool = only_tool(&state);
-        let (label, _) = crate::render::tool_label(&tool.name, &tool.arguments);
+        let (label, _) = crate::render::tool_label(&tool.name, &tool.arguments, tool.format);
         assert_eq!(label, "$ cargo build");
     }
 
@@ -1036,6 +1040,7 @@ mod tests {
                     id: "call-1".to_owned(),
                     name: "Read".to_owned(),
                     arguments: r#"{"file_path":"/tmp/README.md"}"#.to_owned(),
+                    format: ArgumentsFormat::Json,
                 }],
                 compacted: false,
                 usage: Some(Usage {

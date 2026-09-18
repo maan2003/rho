@@ -233,11 +233,13 @@ pub fn block(item: &Item) -> UiBlock {
             id,
             name,
             arguments,
+            format,
         } => UiBlock::Tool(UiTool {
             timing: Default::default(),
             id: id.clone(),
             name: name.clone(),
             arguments: arguments.clone(),
+            format: *format,
             preview: None,
             status: UiToolStatus::Running,
             output: None,
@@ -439,6 +441,7 @@ mod tests {
                     id: "exec-1".into(),
                     name: "exec".into(),
                     arguments: "print(1)".into(),
+                    format: rho_ui_proto::mirror::ArgumentsFormat::Text,
                 },
             },
         );

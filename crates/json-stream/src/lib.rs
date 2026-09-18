@@ -1,64 +1,90 @@
 use serde_json::{Value, json};
 
-fn ends_with_odd_backslashes(s: &str) -> bool {
-    s.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
-}
-
 fn decode_json_string(raw: &str) -> Result<String, String> {
     serde_json::from_str::<String>(&format!("\"{raw}\"")).map_err(|e| e.to_string())
 }
 
-fn decode_json_string_partial(raw: &[char]) -> String {
-    let mut out = String::new();
-    let mut chars = raw.iter().copied();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
+#[derive(Clone, Debug, Default)]
+struct RawString {
+    raw: Vec<char>,
+    /// How much of `raw` is already folded into the target string.
+    consumed: usize,
+    /// Trailing bytes of the target that are a half-arrived escape shown as
+    /// itself. They are rewritten once the rest of the escape lands.
+    tail: usize,
+}
 
-        let Some(escaped) = chars.next() else {
-            out.push('\\');
-            break;
-        };
+impl RawString {
+    fn push(&mut self, character: char) {
+        self.raw.push(character);
+    }
 
-        match escaped {
-            '"' => out.push('"'),
-            '\\' => out.push('\\'),
-            '/' => out.push('/'),
-            'b' => out.push('\u{0008}'),
-            'f' => out.push('\u{000c}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'u' => {
-                let mut hex = String::new();
-                for _ in 0..4 {
-                    let Some(digit) = chars.next() else {
-                        out.push_str("\\u");
-                        out.push_str(&hex);
-                        return out;
-                    };
-                    hex.push(digit);
-                }
-                match u16::from_str_radix(&hex, 16)
-                    .ok()
-                    .and_then(|code| char::from_u32(code.into()))
-                {
-                    Some(ch) => out.push(ch),
-                    None => {
-                        out.push_str("\\u");
-                        out.push_str(&hex);
-                    }
-                }
+    fn ends_with_odd_backslashes(&self) -> bool {
+        self.raw.iter().rev().take_while(|&&c| c == '\\').count() % 2 == 1
+    }
+
+    fn to_raw_string(&self) -> String {
+        self.raw.iter().collect()
+    }
+
+    /// Bring `out` up to date with everything pushed since the last call.
+    fn decode_into(&mut self, out: &mut String) {
+        out.truncate(out.len() - self.tail);
+        self.tail = 0;
+        while self.consumed < self.raw.len() {
+            let character = self.raw[self.consumed];
+            if character != '\\' {
+                out.push(character);
+                self.consumed += 1;
+                continue;
             }
-            other => {
+            let Some(&escaped) = self.raw.get(self.consumed + 1) else {
                 out.push('\\');
-                out.push(other);
+                self.tail = 1;
+                return;
+            };
+            let simple = match escaped {
+                '"' => Some('"'),
+                '\\' => Some('\\'),
+                '/' => Some('/'),
+                'b' => Some('\u{0008}'),
+                'f' => Some('\u{000c}'),
+                'n' => Some('\n'),
+                'r' => Some('\r'),
+                't' => Some('\t'),
+                _ => None,
+            };
+            if let Some(decoded) = simple {
+                out.push(decoded);
+                self.consumed += 2;
+                continue;
             }
+            if escaped != 'u' {
+                out.push('\\');
+                out.push(escaped);
+                self.consumed += 2;
+                continue;
+            }
+            let hex: String = self.raw[self.consumed + 2..].iter().take(4).collect();
+            if hex.chars().count() < 4 {
+                out.push_str("\\u");
+                out.push_str(&hex);
+                self.tail = 2 + hex.len();
+                return;
+            }
+            match u16::from_str_radix(&hex, 16)
+                .ok()
+                .and_then(|code| char::from_u32(code.into()))
+            {
+                Some(decoded) => out.push(decoded),
+                None => {
+                    out.push_str("\\u");
+                    out.push_str(&hex);
+                }
+            }
+            self.consumed += 6;
         }
     }
-    out
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +93,7 @@ enum ObjectStatus {
     Ready,
     // We are in the beginning of a string, likely because we just received an opening quote.
     StringQuoteOpen {
-        raw_so_far: Vec<char>,
+        raw_so_far: RawString,
     },
     // We just finished a string, likely because we just received a closing quote.
     StringQuoteClose,
@@ -83,7 +109,7 @@ enum ObjectStatus {
     // We are in the beginning of an array string value.
     ArrayValueQuoteOpen {
         index: usize,
-        raw_so_far: Vec<char>,
+        raw_so_far: RawString,
     },
     // We just closed an array string value.
     ArrayValueQuoteClose,
@@ -114,7 +140,7 @@ enum ObjectStatus {
     // We are in the beginning of a value, likely because we just received a quote.
     ValueQuoteOpen {
         key: Vec<char>,
-        raw_so_far: Vec<char>,
+        raw_so_far: RawString,
         // We don't need to store the valueSoFar because we can add the value to the object
         // immediately.
     },
@@ -149,7 +175,7 @@ fn process_char(
         (val @ Value::Null, sts @ ObjectStatus::Ready, '"') => {
             *val = json!("");
             *sts = ObjectStatus::StringQuoteOpen {
-                raw_so_far: Vec::new(),
+                raw_so_far: RawString::default(),
             };
         }
         (val @ Value::Null, sts @ ObjectStatus::Ready, '{') => {
@@ -282,7 +308,7 @@ fn process_char(
             arr.push(json!(""));
             *sts = ObjectStatus::ArrayValueQuoteOpen {
                 index: arr.len() - 1,
-                raw_so_far: Vec::new(),
+                raw_so_far: RawString::default(),
             };
         }
         (Value::Array(arr), sts @ ObjectStatus::StartArray, char) => {
@@ -298,20 +324,19 @@ fn process_char(
                 _ => unreachable!(),
             };
             if let Some(Value::String(s)) = arr.get_mut(index) {
-                let raw = raw_so_far.iter().collect::<String>();
-                if ends_with_odd_backslashes(&raw) {
+                if raw_so_far.ends_with_odd_backslashes() {
                     raw_so_far.push('"');
-                    *s = decode_json_string_partial(raw_so_far);
+                    raw_so_far.decode_into(s);
                     return Ok(());
                 }
-                *s = decode_json_string(&raw)?;
+                *s = decode_json_string(&raw_so_far.to_raw_string())?;
             }
             *sts = ObjectStatus::ArrayValueQuoteClose;
         }
         (Value::Array(arr), ObjectStatus::ArrayValueQuoteOpen { index, raw_so_far }, char) => {
             raw_so_far.push(char);
             if let Some(Value::String(s)) = arr.get_mut(*index) {
-                *s = decode_json_string_partial(raw_so_far);
+                raw_so_far.decode_into(s);
             } else {
                 return Err("Invalid string value in array".to_string());
             }
@@ -364,18 +389,17 @@ fn process_char(
                 ObjectStatus::StringQuoteOpen { raw_so_far } => raw_so_far,
                 _ => unreachable!(),
             };
-            let raw = raw_so_far.iter().collect::<String>();
-            if ends_with_odd_backslashes(&raw) {
+            if raw_so_far.ends_with_odd_backslashes() {
                 raw_so_far.push('"');
-                *s = decode_json_string_partial(raw_so_far);
+                raw_so_far.decode_into(s);
             } else {
-                *s = decode_json_string(&raw)?;
+                *s = decode_json_string(&raw_so_far.to_raw_string())?;
                 *sts = ObjectStatus::StringQuoteClose;
             }
         }
         (Value::String(str), ObjectStatus::StringQuoteOpen { raw_so_far }, char) => {
             raw_so_far.push(char);
-            *str = decode_json_string_partial(raw_so_far);
+            raw_so_far.decode_into(str);
         }
         (Value::Object(_obj), sts @ ObjectStatus::StartProperty, '"') => {
             *sts = ObjectStatus::KeyQuoteOpen { key_so_far: vec![] };
@@ -404,7 +428,7 @@ fn process_char(
             if let ObjectStatus::Colon { key } = sts.clone() {
                 *sts = ObjectStatus::ValueQuoteOpen {
                     key: key.clone(),
-                    raw_so_far: Vec::new(),
+                    raw_so_far: RawString::default(),
                 };
                 // create an empty string for the value
                 obj.insert(key.iter().collect::<String>().clone(), json!(""));
@@ -418,13 +442,12 @@ fn process_char(
             };
             let key_string = key_vec.iter().collect::<String>();
             if let Some(Value::String(value)) = obj.get_mut(&key_string) {
-                let raw = raw_so_far.iter().collect::<String>();
-                if ends_with_odd_backslashes(&raw) {
+                if raw_so_far.ends_with_odd_backslashes() {
                     raw_so_far.push('"');
-                    *value = decode_json_string_partial(raw_so_far);
+                    raw_so_far.decode_into(value);
                     return Ok(());
                 }
-                *value = decode_json_string(&raw)?;
+                *value = decode_json_string(&raw_so_far.to_raw_string())?;
             }
             *sts = ObjectStatus::ValueQuoteClose;
         }
@@ -436,7 +459,7 @@ fn process_char(
             match value {
                 Value::String(value) => {
                     raw_so_far.push(char);
-                    *value = decode_json_string_partial(raw_so_far);
+                    raw_so_far.decode_into(value);
                 }
                 _ => {
                     return Err(format!("Invalid value type for key {key_string}"));
@@ -1038,5 +1061,101 @@ mod string_escape_tests {
         }
 
         assert_eq!(parser.get_result()["command"].as_str(), Some("printf hi\\"));
+    }
+}
+
+#[cfg(test)]
+mod incremental_decode {
+    use super::JsonStreamParser;
+
+    /// Re-decode a whole raw string the way the parser did before the decode
+    /// was grown in place. The incremental decode must agree with it at every
+    /// prefix, escapes and half-escapes included.
+    fn reference(raw: &[char]) -> String {
+        let mut out = String::new();
+        let mut chars = raw.iter().copied();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            let Some(escaped) = chars.next() else {
+                out.push('\\');
+                break;
+            };
+            match escaped {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{0008}'),
+                'f' => out.push('\u{000c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        let Some(digit) = chars.next() else {
+                            out.push_str("\\u");
+                            out.push_str(&hex);
+                            return out;
+                        };
+                        hex.push(digit);
+                    }
+                    match u16::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(|code| char::from_u32(code.into()))
+                    {
+                        Some(ch) => out.push(ch),
+                        None => {
+                            out.push_str("\\u");
+                            out.push_str(&hex);
+                        }
+                    }
+                }
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_prefix_matches_a_full_re_decode() {
+        let body = r#"a\nb\tc\\d\"eéf\q\u12"#;
+        let raw: Vec<char> = body.chars().collect();
+        for upto in 0..=raw.len() {
+            let mut parser = JsonStreamParser::new();
+            parser.add_char('"').unwrap();
+            for c in &raw[..upto] {
+                parser.add_char(*c).unwrap();
+            }
+            assert_eq!(
+                parser.get_result().as_str().unwrap(),
+                reference(&raw[..upto]),
+                "prefix of {upto} characters"
+            );
+        }
+    }
+
+    /// The decode used to be rebuilt per character, so a long argument cost
+    /// its length squared. A hundred thousand characters is a normal tool
+    /// call and must stay quick; quadratic would take hours.
+    #[test]
+    fn a_long_string_is_not_quadratic() {
+        let body: String = "abcdefghij".repeat(10_000);
+        let started = std::time::Instant::now();
+        let mut parser = JsonStreamParser::new();
+        for c in format!("{{\"source\":\"{body}\"").chars() {
+            parser.add_char(c).unwrap();
+        }
+        assert_eq!(parser.get_result()["source"].as_str().unwrap(), body);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

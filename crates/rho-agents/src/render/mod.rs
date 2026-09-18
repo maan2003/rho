@@ -10,6 +10,7 @@ pub mod elision;
 use std::ops::Range;
 use std::time::Duration;
 
+use rho_ui_proto::mirror::ArgumentsFormat;
 use rho_ui_proto::{AgentId, MessageDelivery};
 use rho_window::style::StyleClass;
 
@@ -501,7 +502,7 @@ fn next_tab_stop(column: usize) -> usize {
 /// timestamp get an empty position span instead: the live duration renders
 /// as an inlay there, so per-second ticks never edit the buffer.
 fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<InlaySpec> {
-    let (label, class) = tool_label(&tool.name, &tool.arguments);
+    let (label, class) = tool_label(&tool.name, &tool.arguments, tool.format);
     spans.push(Span::new(label, class));
     spans.push(Span::new(" ", StyleClass::ToolDetail));
     let status = tool_status_label(tool.status);
@@ -620,10 +621,14 @@ pub fn format_running_duration(started_at_ms: u64, now_ms: u64) -> String {
 /// Claude's file tools render as `read/write/edit path` so the transcript
 /// shows the touched file instead of raw JSON arguments. Argument extraction
 /// tolerates the partial JSON seen while arguments stream.
-pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
+pub(crate) fn tool_label(
+    name: &str,
+    arguments: &str,
+    format: ArgumentsFormat,
+) -> (String, StyleClass) {
     match name {
         "shell" | "shell_command" | "Bash" => {
-            let command = shell_command_argument_label(arguments);
+            let command = shell_command_argument_label(arguments, format);
             let label = if command.is_empty() {
                 "$".to_owned()
             } else {
@@ -631,10 +636,10 @@ pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
             };
             (label, StyleClass::ToolShell)
         }
-        "exec" | "mcp__py__exec" => (exec_source_label(arguments), StyleClass::ToolShell),
+        "exec" | "mcp__py__exec" => (exec_source_label(arguments, format), StyleClass::ToolShell),
         "Read" | "Write" | "Edit" => {
             let verb = name.to_ascii_lowercase();
-            let label = match streaming_json_text_field(arguments, "file_path") {
+            let label = match json_text_field(arguments, "file_path", format) {
                 Some(path) if !path.is_empty() => format!("{verb} {path}"),
                 _ => verb,
             };
@@ -649,20 +654,28 @@ pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
 /// as its whole argument string; Claude Code's `mcp__py__exec` wraps it as
 /// `{"source": ...}`. Trailing blank lines are dropped so the status marker
 /// lands after the last line of code rather than on a line of its own.
-fn exec_source_label(arguments: &str) -> String {
-    let source = streaming_json_text_field(arguments, "source")
-        .or_else(|| (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned()))
-        .unwrap_or_default();
+fn exec_source_label(arguments: &str, format: ArgumentsFormat) -> String {
+    let source = match format {
+        ArgumentsFormat::Text => arguments.to_owned(),
+        ArgumentsFormat::Json => json_text_field(arguments, "source", format).unwrap_or_default(),
+    };
     source.trim_end().to_owned()
 }
 
-fn shell_command_argument_label(arguments: &str) -> String {
-    streaming_json_text_field(arguments, "command")
-        .or_else(|| (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned()))
-        .unwrap_or_default()
+fn shell_command_argument_label(arguments: &str, format: ArgumentsFormat) -> String {
+    match format {
+        ArgumentsFormat::Text => arguments.to_owned(),
+        ArgumentsFormat::Json => json_text_field(arguments, "command", format).unwrap_or_default(),
+    }
 }
 
-fn streaming_json_text_field(arguments: &str, key: &str) -> Option<String> {
+fn json_text_field(arguments: &str, key: &str, format: ArgumentsFormat) -> Option<String> {
+    // Text arguments are what the model wrote, not an object with fields in
+    // it. Parsing them would be wrong as well as wasted.
+    if format == ArgumentsFormat::Text || !arguments.trim_start().starts_with('{') {
+        return None;
+    }
+
     // Completed historical calls should be parsed in one pass. The streaming
     // parser repairs its partial result after every character, which is useful
     // for live arguments but quadratic for a large completed command.
@@ -695,6 +708,7 @@ mod tests {
             id: "tool-1".to_owned(),
             name: "shell_command".to_owned(),
             arguments: "echo ok".to_owned(),
+            format: ArgumentsFormat::Text,
             preview: None,
             status,
             output: None,
@@ -798,9 +812,38 @@ mod tests {
 
     #[test]
     fn shell_command_argument_label_extracts_streaming_json() {
-        assert_eq!(shell_command_argument_label(r#"{"command":"echo"#), "echo");
-        assert_eq!(shell_command_argument_label(r#"{"comm"#), "");
-        assert_eq!(shell_command_argument_label("echo ok"), "echo ok");
+        let json = ArgumentsFormat::Json;
+        assert_eq!(
+            shell_command_argument_label(r#"{"command":"echo"#, json),
+            "echo"
+        );
+        assert_eq!(shell_command_argument_label(r#"{"comm"#, json), "");
+        // Raw text is what `Text` is for; a `Json` tool with no object in it
+        // has no command to show.
+        assert_eq!(shell_command_argument_label("echo ok", json), "");
+        assert_eq!(
+            shell_command_argument_label("echo ok", ArgumentsFormat::Text),
+            "echo ok"
+        );
+    }
+
+    /// The point of the format: a text tool's arguments are never offered to
+    /// the JSON parser, so source that merely looks like an object is shown
+    /// as the code it is instead of being read for fields it does not have.
+    #[test]
+    fn a_text_tool_is_never_parsed_as_json() {
+        let source = "{\"source\": 1}\nprint(2)\n";
+        assert_eq!(
+            tool_label("exec", source, ArgumentsFormat::Text),
+            (
+                "{\"source\": 1}\nprint(2)".to_owned(),
+                StyleClass::ToolShell
+            )
+        );
+        assert_eq!(
+            shell_command_argument_label("{ echo ok; }", ArgumentsFormat::Text),
+            "{ echo ok; }"
+        );
     }
 
     #[test]
@@ -808,17 +851,18 @@ mod tests {
         assert_eq!(
             tool_label(
                 "Bash",
-                r#"{"command":"cargo test","description":"Run tests"}"#
+                r#"{"command":"cargo test","description":"Run tests"}"#,
+                ArgumentsFormat::Json,
             ),
             ("$ cargo test".to_owned(), StyleClass::ToolShell)
         );
         // Streaming partial JSON still resolves the command field.
         assert_eq!(
-            tool_label("Bash", r#"{"command":"cargo te"#),
+            tool_label("Bash", r#"{"command":"cargo te"#, ArgumentsFormat::Json),
             ("$ cargo te".to_owned(), StyleClass::ToolShell)
         );
         assert_eq!(
-            tool_label("Bash", r#"{"desc"#),
+            tool_label("Bash", r#"{"desc"#, ArgumentsFormat::Json),
             ("$".to_owned(), StyleClass::ToolShell)
         );
     }
@@ -827,11 +871,11 @@ mod tests {
     fn native_exec_renders_its_source_without_the_tool_name() {
         let code = "x = 1\nprint(x)\n";
         assert_eq!(
-            tool_label("exec", code),
+            tool_label("exec", code, ArgumentsFormat::Text),
             ("x = 1\nprint(x)".to_owned(), StyleClass::ToolShell)
         );
         assert_eq!(
-            tool_label("exec", ""),
+            tool_label("exec", "", ArgumentsFormat::Text),
             (String::new(), StyleClass::ToolShell)
         );
     }
@@ -839,16 +883,20 @@ mod tests {
     #[test]
     fn claude_code_py_exec_renders_its_source_without_the_tool_name() {
         assert_eq!(
-            tool_label("mcp__py__exec", r#"{"source":"print(1)\n"}"#),
+            tool_label(
+                "mcp__py__exec",
+                r#"{"source":"print(1)\n"}"#,
+                ArgumentsFormat::Json
+            ),
             ("print(1)".to_owned(), StyleClass::ToolShell)
         );
         // Streaming partial JSON still resolves the source field.
         assert_eq!(
-            tool_label("mcp__py__exec", r#"{"source":"comm"#),
+            tool_label("mcp__py__exec", r#"{"source":"comm"#, ArgumentsFormat::Json),
             ("comm".to_owned(), StyleClass::ToolShell)
         );
         assert_eq!(
-            tool_label("mcp__py__exec", r#"{"sou"#),
+            tool_label("mcp__py__exec", r#"{"sou"#, ArgumentsFormat::Json),
             (String::new(), StyleClass::ToolShell)
         );
     }
@@ -856,18 +904,23 @@ mod tests {
     #[test]
     fn claude_file_tools_render_verb_and_path() {
         assert_eq!(
-            tool_label("Read", r#"{"file_path":"/tmp/a.rs","limit":40}"#),
+            tool_label(
+                "Read",
+                r#"{"file_path":"/tmp/a.rs","limit":40}"#,
+                ArgumentsFormat::Json
+            ),
             ("read /tmp/a.rs".to_owned(), StyleClass::ToolName)
         );
         assert_eq!(
             tool_label(
                 "Edit",
-                r#"{"file_path":"/tmp/a.rs","old_string":"a","new_string":"b"}"#
+                r#"{"file_path":"/tmp/a.rs","old_string":"a","new_string":"b"}"#,
+                ArgumentsFormat::Json,
             ),
             ("edit /tmp/a.rs".to_owned(), StyleClass::ToolName)
         );
         assert_eq!(
-            tool_label("Write", r#"{"file_p"#),
+            tool_label("Write", r#"{"file_p"#, ArgumentsFormat::Json),
             ("write".to_owned(), StyleClass::ToolName)
         );
     }

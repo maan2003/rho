@@ -3303,6 +3303,7 @@ fn agent_detail(
                                 id: call.id,
                                 name: call.name,
                                 arguments: call.arguments,
+                                format: rho_ui_proto::mirror::ArgumentsFormat::Json,
                             }),
                     )
                     .collect(),

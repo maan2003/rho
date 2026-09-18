@@ -18,6 +18,7 @@ fn ran(command: &str) -> UiBlock {
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: serde_json::json!({ "command": command }).to_string(),
+        format: rho_ui_proto::mirror::ArgumentsFormat::Json,
         preview: None,
         status: UiToolStatus::Success,
         output: None,

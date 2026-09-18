@@ -160,6 +160,8 @@ fn block_is_working(block: &UiBlock) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rho_ui_proto::mirror::ArgumentsFormat;
+
     use super::*;
     use crate::state::{UiMessagePhase, UiTool, UiToolStatus};
 
@@ -197,6 +199,7 @@ mod tests {
             id: id.to_owned(),
             name: "shell".to_owned(),
             arguments: String::new(),
+            format: ArgumentsFormat::Json,
             preview: None,
             status: UiToolStatus::Success,
             output: None,

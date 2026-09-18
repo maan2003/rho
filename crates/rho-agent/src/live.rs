@@ -161,11 +161,13 @@ pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
             id,
             name,
             arguments,
+            tool_type,
             ..
         } => Item::ToolCall {
             id: id.as_str().to_owned(),
             name: name.as_str().to_owned(),
             arguments: arguments.to_string(),
+            format: (*tool_type).into(),
         },
         StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
             return None;

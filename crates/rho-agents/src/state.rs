@@ -3,7 +3,7 @@
 
 use rho_core::{MessagePhase, ToolOutputStatus, UnixMs};
 use rho_ui_proto::MessageDelivery;
-use rho_ui_proto::mirror::TextPhase;
+use rho_ui_proto::mirror::{ArgumentsFormat, TextPhase};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// One agent's transcript as a client draws it: a flat block list plus a
@@ -127,6 +127,9 @@ pub struct UiTool {
     pub metadata: Option<UiToolMetadata>,
     #[senax(default)]
     pub timing: rho_core::ExecTiming,
+    /// Whether `arguments` is JSON or the raw text the model wrote. A text
+    /// tool's arguments are shown as they are and never parsed.
+    pub format: ArgumentsFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
