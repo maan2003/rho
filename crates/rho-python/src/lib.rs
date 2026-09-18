@@ -368,6 +368,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_loads_constant_sets_and_preserves_notebook_state() {
+        let (session, mut events) = test_session(|| Ok(())).unwrap();
+        let sender = session.sender();
+        for (cell, source) in [
+            (
+                1,
+                "names = {'fedimint-core', 'fedimint-api-client', 'fedimint-wallet-client'}",
+            ),
+            (
+                2,
+                r#"
+assert sorted(names) == ['fedimint-api-client', 'fedimint-core', 'fedimint-wallet-client']
+names.add('extra')
+assert len(names) == 4
+def nested(value):
+    return value in {'fedimint-core', 'fedimint-api-client', 'fedimint-wallet-client'}
+assert nested('fedimint-core')
+assert not nested('extra')
+assert eval("{'a', 'b', 'c'}") == set(['a', 'b', 'c'])
+"#,
+            ),
+        ] {
+            sender.send(Input::BeginStream { cell }).unwrap();
+            sender
+                .send(Input::StreamFeed {
+                    cell,
+                    source: source.into(),
+                    eof: true,
+                })
+                .unwrap();
+            loop {
+                match next(&mut events).await {
+                    Event::UnitReady { cell, end } => {
+                        sender.send(Input::StreamPermit { cell, end }).unwrap();
+                    }
+                    Event::UnitSettled { error, .. } => assert!(error.is_none(), "{error:?}"),
+                    Event::Finished { error, .. } => {
+                        assert!(error.is_none(), "{error:?}");
+                        break;
+                    }
+                    Event::Stopped { error } => panic!("interpreter stopped: {error:?}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn history_only_materializes_indexed_items() {
         let history = Arc::new(CountingHistory {
             gets: std::sync::atomic::AtomicUsize::new(0),

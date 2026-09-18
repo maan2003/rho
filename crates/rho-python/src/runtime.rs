@@ -418,7 +418,11 @@ pub(super) fn spawn(
                                     .ctx
                                     .new_tuple(vec![
                                         vm.ctx.new_int(compiler.compiled_bytes()).into(),
-                                        vm.ctx.new_code(code).into(),
+                                        // Constant sets need the VM for element hashing.
+                                        rustpython_vm::builtins::PyCode::new_ref_from_bytecode(
+                                            vm, code,
+                                        )
+                                        .into(),
                                     ])
                                     .into()),
                                 None => Ok(vm.ctx.none()),
