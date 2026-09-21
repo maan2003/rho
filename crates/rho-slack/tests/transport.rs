@@ -2017,6 +2017,13 @@ async fn multiple_files_message_actions_and_thread_broadcast_round_trip() {
         .unwrap();
     assert_eq!(fake.calls("files.getUploadURLExternal"), 2);
     assert_eq!(fake.calls("files.completeUploadExternal"), 1);
+    let files = client.search_files("two", 1).await.unwrap();
+    assert_eq!(
+        files.files.len(),
+        1,
+        "the second uploaded attachment is indexed"
+    );
+    assert_eq!(files.files[0].title, "two.png");
 
     client
         .post_message_with_options(
@@ -2212,4 +2219,23 @@ async fn a_partial_multi_file_upload_can_be_retried_as_the_same_message() {
     assert_eq!(page.messages.len(), 1);
     assert_eq!(page.messages[0].files.len(), 2);
     assert_eq!(page.messages[0].text, "caption");
+}
+
+#[tokio::test]
+async fn file_search_indexes_seeded_attachments_and_deduplicates_shared_ids() {
+    let fake = Fake::start().await.unwrap();
+    let file =
+        json!({"id":"FSEED","name":"review.pdf","title":"review.pdf","mimetype":"application/pdf"});
+    fake.add_message(
+        "C1",
+        json!({"ts":"100.0","text":"first share","files":[file.clone()]}),
+    );
+    fake.add_message(
+        "C2",
+        json!({"ts":"200.0","text":"second share","files":[file]}),
+    );
+    let page = client(&fake).search_files("review", 1).await.unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.files[0].id, "FSEED");
+    assert_eq!(page.files[0].title, "review.pdf");
 }

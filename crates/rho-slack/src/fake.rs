@@ -874,7 +874,6 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             if kind == "reply" {
                 message["thread_ts"] = json!(field("thread_ts"));
             }
-            state.files.push(message["files"][0].clone());
             state
                 .history
                 .entry(channel.clone())
@@ -1693,9 +1692,22 @@ fn handle(
         }
         "search.files" => {
             let query = search_query(&field("query"));
-            let mut matches = state
+            // Standalone and message-attached files share Slack's file index.
+            // A shared file may appear in several messages; return it only once.
+            let files = state
                 .files
                 .iter()
+                .chain(
+                    state
+                        .history
+                        .values()
+                        .flatten()
+                        .flat_map(|message| message["files"].as_array().into_iter().flatten()),
+                )
+                .filter_map(|file| file["id"].as_str().map(|id| (id, file)))
+                .collect::<BTreeMap<_, _>>();
+            let mut matches = files
+                .into_values()
                 .filter(|file| {
                     let title = file["title"]
                         .as_str()
@@ -1928,7 +1940,6 @@ fn handle(
             if let Some(thread_ts) = &thread_ts {
                 message["thread_ts"] = json!(thread_ts);
             }
-            state.files.push(message["files"][0].clone());
             state
                 .history
                 .entry(channel.clone())
@@ -2140,7 +2151,6 @@ fn handle(
             if let Some(thread_ts) = &thread_ts {
                 message["thread_ts"] = json!(thread_ts);
             }
-            state.files.push(message["files"][0].clone());
             state
                 .history
                 .entry(channel.clone())
