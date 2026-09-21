@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use rho_db::RhoDb;
 use rho_slack::api::Client;
 use rho_slack::config::Credentials;
 use rho_slack::fake::Fake;
@@ -558,4 +559,21 @@ fn exact_message_lookup_does_not_drift_to_later_chatter() {
             .map(|message| message.text),
         Some("<@ME> actual mention".to_owned()),
     );
+}
+
+/// Production embeds Slack tables in the client's shared rho.redb. Reads on
+/// a database that predates a table must be empty, never a redb
+/// TableDoesNotExist panic.
+#[test]
+fn shared_database_open_initializes_saved_before_its_first_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(dir.path().join("rho.redb"));
+
+    let mirror = Mirror::open_on(db.clone()).unwrap();
+    assert!(mirror.saved("acme").is_empty());
+
+    // Reopening the same shared database exercises the ordinary production
+    // start after the table has been added.
+    let reopened = Mirror::open_on(db).unwrap();
+    assert!(reopened.saved("acme").is_empty());
 }
