@@ -511,7 +511,10 @@ impl Workspace {
     /// buffer in the frame.
     pub(crate) fn slack_hooks() -> rho_slack::ui::Hooks {
         rho_slack::ui::Hooks {
-            configure_editor: rho_window::editor_config::configure,
+            configure_editor: |editor, window, cx| {
+                rho_window::editor_config::configure(editor, window, cx);
+                editor.set_mouse_click_selection_enabled(true, cx);
+            },
             configure_markdown: rho_window::markdown::configure_buffer,
             gutter_colour: rho_window::style::user_prompt_gutter_color,
         }
