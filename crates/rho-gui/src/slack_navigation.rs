@@ -345,6 +345,16 @@ impl Workspace {
             )
             .child(
                 div()
+                    .id("slack-drafts")
+                    .p_1()
+                    .cursor_pointer()
+                    .child("Drafts")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_slack_drafts(window, cx)),
+                    ),
+            )
+            .child(
+                div()
                     .id("slack-new-dm")
                     .p_1()
                     .cursor_pointer()
@@ -559,6 +569,21 @@ impl Workspace {
                                     });
                                 }
                                 cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("slack-message-actions")
+                            .cursor_pointer()
+                            .child("Message actions")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if !this.prompt_slack_message_actions(window, cx) {
+                                    this.echo(
+                                        "Select a message first",
+                                        rho_window::style::StyleClass::SystemInfo,
+                                        cx,
+                                    );
+                                }
                             })),
                     )
                     .child(

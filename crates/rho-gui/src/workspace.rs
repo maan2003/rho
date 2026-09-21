@@ -6913,6 +6913,8 @@ impl Workspace {
             Command::SlackMessageCopyLink(ts) => self.slack_copy_message_link(ts, cx),
             Command::SlackMessageForward(ts) => self.prompt_slack_forward_message(ts, window, cx),
             Command::SlackMarkReadBefore => self.prompt_slack_mark_read_before(window, cx),
+            Command::SlackMarkUnread => self.slack_mark_unread(window, cx),
+            Command::SlackSaveForLater => self.slack_save_for_later(window, cx),
             Command::SlackRegister => self.prompt_slack_register(window, cx),
             Command::HostsList => self.cmd_hosts(cx),
             Command::HostAttach => self.prompt_host_attach(window, cx),

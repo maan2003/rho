@@ -87,6 +87,8 @@ pub(crate) enum Command {
     SlackConversations,
     SlackAttach,
     SlackMarkReadBefore,
+    SlackMarkUnread,
+    SlackSaveForLater,
     SlackRegister,
     SlackMessageEdit(rho_slack::types::Ts),
     SlackMessageDelete(rho_slack::types::Ts),
@@ -386,6 +388,8 @@ pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageA
         );
     }
     menu
+        .item("u", "mark unread", MenuAction::Command(Command::SlackMarkUnread))
+        .item("s", "save / unsave for later (local)", MenuAction::Command(Command::SlackSaveForLater))
 }
 
 pub(crate) fn slack_menu() -> Menu {
