@@ -12,7 +12,14 @@ fn a_gap_anchor_follows_its_source_row_through_a_prepend(cx: &mut TestAppContext
         editor.set_text("first\nsecond\nthird", window, cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let anchor = snapshot.anchor_after(language::Point::new(1, 6));
-        editor.set_row_spacing(vec![(anchor, 0.5)], cx);
+        editor.set_row_spacing(
+            vec![editor::display_map::RowSpacing {
+                range: anchor..anchor,
+                minimum_height: 0.,
+                gap_after: 0.5,
+            }],
+            cx,
+        );
         editor
     });
 
@@ -55,7 +62,14 @@ fn a_gap_follows_the_last_visual_row_after_soft_wrap(cx: &mut TestAppContext) {
             0,
             snapshot.line_len(multi_buffer::MultiBufferRow(0)),
         ));
-        editor.set_row_spacing(vec![(anchor, 0.5)], cx);
+        editor.set_row_spacing(
+            vec![editor::display_map::RowSpacing {
+                range: anchor..anchor,
+                minimum_height: 0.,
+                gap_after: 0.5,
+            }],
+            cx,
+        );
         editor
     });
     cx.simulate_window_resize(*editor, size(px(220.), px(400.)));
@@ -107,7 +121,21 @@ fn a_fold_end_row_keeps_its_gap_while_hidden_rows_do_not_pile_onto_it(cx: &mut T
                 )],
                 cx,
             );
-            map.set_row_spacing(vec![(hidden, 0.75), (body, 0.5)], cx);
+            map.set_row_spacing(
+                vec![
+                    editor::display_map::RowSpacing {
+                        range: hidden..hidden,
+                        minimum_height: 0.,
+                        gap_after: 0.75,
+                    },
+                    editor::display_map::RowSpacing {
+                        range: body..body,
+                        minimum_height: 0.,
+                        gap_after: 0.5,
+                    },
+                ],
+                cx,
+            );
         });
         editor
     });
@@ -154,7 +182,14 @@ fn trailing_spacing_stays_after_attachment_blocks(cx: &mut TestAppContext) {
                 None,
                 cx,
             );
-            editor.set_row_spacing(vec![(anchor, 0.5)], cx);
+            editor.set_row_spacing(
+                vec![editor::display_map::RowSpacing {
+                    range: anchor..anchor,
+                    minimum_height: 0.,
+                    gap_after: 0.5,
+                }],
+                cx,
+            );
             let snapshot = editor.display_snapshot(cx);
             assert_eq!(snapshot.row_y(1.), 1., "no gap between caption and image");
             assert_eq!(snapshot.row_y(2.), 2., "no gap inside the image");
@@ -167,6 +202,54 @@ fn trailing_spacing_stays_after_attachment_blocks(cx: &mut TestAppContext) {
             assert_eq!(editor.display_snapshot(cx).row_y(1.), 1.5);
             editor.set_row_spacing(vec![], cx);
             assert_eq!(editor.display_snapshot(cx).row_y(1.), 1.);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn avatar_minimum_height_does_not_add_a_blank_row_to_multiline_messages(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text("short\nlong\nbody\nnext", window, cx);
+        let source = editor.buffer().read(cx).snapshot(cx);
+        let at = |row, col| source.anchor_after(language::Point::new(row, col));
+        editor.set_row_spacing(
+            vec![
+                editor::display_map::RowSpacing {
+                    range: at(0, 0)..at(0, 5),
+                    minimum_height: 1.5,
+                    gap_after: 0.5,
+                },
+                editor::display_map::RowSpacing {
+                    range: at(1, 0)..at(2, 4),
+                    minimum_height: 1.5,
+                    gap_after: 0.5,
+                },
+            ],
+            cx,
+        );
+        editor
+    });
+    editor
+        .update(cx, |editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            assert_eq!(
+                snapshot.row_y(1.),
+                2.,
+                "one-line body reserves 1.5 avatar + 0.5 gap"
+            );
+            assert_eq!(
+                snapshot.row_y(2.),
+                3.,
+                "internal body lines remain consecutive"
+            );
+            assert_eq!(
+                snapshot.row_y(3.),
+                4.5,
+                "multiline body adds only the half-line gap"
+            );
+            assert_eq!(snapshot.text(), "short\nlong\nbody\nnext");
         })
         .unwrap();
 }

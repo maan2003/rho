@@ -559,10 +559,10 @@ transcript renders through, and owns none of its own. Concretely:
   markups are told apart; `block.rs` resolves the ids, links and lists the
   same way for both.
 - A message is one block of the document, keyed by its `ts`. Subtly rounded
-  profile images occupy a dedicated gutter: one line high for a single visual
-  line, 1.5 lines for longer messages. They replace author headers
-  visually. Names remain in the buffer for copy and search, and remain visible
-  if an avatar cannot load. Nearby messages
+  profile images occupy a dedicated gutter at a consistent 1.5-line size.
+  The gutter width and author slots are reserved before downloads start;
+  initials occupy unavailable images without changing layout. Author headers
+  are concealed from the first populated frame, retaining names for copy/search. Nearby messages
   from the same author share an avatar (within five minutes and the same day).
 - The composer uses the agent prompt's draft style. Its display-only hint is
   `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
@@ -570,8 +570,9 @@ transcript renders through, and owns none of its own. Concretely:
   are no buttons or permanent instruction rows.
 - Day breaks are source headings centered by an anchored editor row-alignment
   primitive. They never replace body rows. The unread line stays left-aligned.
-  Message boundaries add half a line of display-only trailing space through the
-  editor's shared vertical geometry, including scrolling, selection and hit testing.
+  Message boundaries add half a line of display-only trailing space after the
+  larger of the body height and its 1.5-line avatar slot. The editor's shared
+  geometry owns wrapping, scrolling, selection and hit testing.
   Per-message and last-reply timestamps are hidden; date separators remain.
 - Attachments, previews, reactions, and thread summaries follow the body.
   The sidebar distinguishes unread conversations by text color rather than

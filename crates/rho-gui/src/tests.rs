@@ -85,8 +85,26 @@ fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &m
                 .snapshot(cx)
                 .anchor_before(editor::MultiBufferOffset(0));
             let before = editor.display_snapshot(cx).text();
+            editor.set_reserve_image_gutter(true, cx);
+            let reserved = editor
+                .snapshot(window, cx)
+                .gutter_dimensions(font_id, font_size, &style, window, cx)
+                .width;
+            assert_eq!(
+                reserved,
+                line_height * 1.5 + font_size * 0.5,
+                "reserve the final width before there are any images"
+            );
+
             let image = std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::new()));
-            editor.set_gutter_image(anchor, Some((anchor, image)), cx);
+            editor.set_gutter_image(
+                anchor,
+                Some(editor::GutterImage {
+                    image: Some(image),
+                    initials: "AB".into(),
+                }),
+                cx,
+            );
             let dimensions = editor
                 .snapshot(window, cx)
                 .gutter_dimensions(font_id, font_size, &style, window, cx);
@@ -97,6 +115,15 @@ fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &m
                 "avatars consume no text columns or rows"
             );
             editor.set_gutter_image(anchor, None, cx);
+            assert_eq!(
+                editor
+                    .snapshot(window, cx)
+                    .gutter_dimensions(font_id, font_size, &style, window, cx)
+                    .width,
+                reserved
+            );
+            editor.set_reserve_image_gutter(false, cx);
+
             let dimensions = editor
                 .snapshot(window, cx)
                 .gutter_dimensions(font_id, font_size, &style, window, cx);
@@ -124,7 +151,21 @@ fn centered_rows_and_fractional_gaps_share_paint_and_hit_geometry(cx: &mut TestA
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let anchor = |row| snapshot.anchor_after(language::Point::new(row, 0));
         editor.set_centered_rows(vec![anchor(0), anchor(4)], cx);
-        editor.set_row_spacing(vec![(anchor(1), 0.5), (anchor(3), 0.25)], cx);
+        editor.set_row_spacing(
+            vec![
+                editor::display_map::RowSpacing {
+                    range: anchor(1)..anchor(1),
+                    minimum_height: 0.,
+                    gap_after: 0.5,
+                },
+                editor::display_map::RowSpacing {
+                    range: anchor(3)..anchor(3),
+                    minimum_height: 0.,
+                    gap_after: 0.25,
+                },
+            ],
+            cx,
+        );
         editor
     });
     for width in [740., 430.] {

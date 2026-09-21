@@ -5894,11 +5894,11 @@ impl EditorElement {
             .read(cx)
             .gutter_images
             .iter()
-            .filter_map(|(anchor, (end, image))| {
+            .filter_map(|(anchor, image)| {
                 let row = anchor.to_display_point(snapshot).row();
                 (row.0 + 2 > layout.visible_display_row_range.start.0
                     && row < layout.visible_display_row_range.end)
-                    .then(|| (row, end.to_display_point(snapshot).row(), image.clone()))
+                    .then(|| (row, image.clone()))
             })
             .collect::<Vec<_>>();
         window.with_content_mask(
@@ -5906,8 +5906,8 @@ impl EditorElement {
                 bounds: layout.gutter_hitbox.bounds,
             }),
             |window| {
-                for (row, end, image) in images {
-                    let side = line_height * if row == end { 1.0 } else { 1.5 };
+                for (row, avatar) in images {
+                    let side = line_height * 1.5;
                     let y = layout.gutter_hitbox.top()
                         + Pixels::from(
                             snapshot.row_y(row.as_f64()) * ScrollPixelOffset::from(line_height)
@@ -5920,9 +5920,37 @@ impl EditorElement {
                         ),
                         size(side, side),
                     );
-                    window
-                        .paint_image(bounds, bounds, Corners::all(side * 0.12), image, 0, false)
+                    let corners = Corners::all(side * 0.12);
+                    // The fallback is also painted beneath a pending GPU upload.
+                    window.paint_quad(
+                        fill(bounds, cx.theme().colors().element_background).corner_radii(corners),
+                    );
+                    let label = window.text_system().shape_line(
+                        avatar.initials.clone(),
+                        line_height * 0.6,
+                        &[TextRun {
+                            len: avatar.initials.len(),
+                            font: self.style.text.font(),
+                            color: cx.theme().colors().text_muted.into(),
+                            ..Default::default()
+                        }],
+                        None,
+                    );
+                    label
+                        .paint(
+                            bounds.origin + point((side - label.width) / 2., px(0.)),
+                            side,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
                         .log_err();
+                    if let Some(image) = avatar.image {
+                        window
+                            .paint_image(bounds, bounds, corners, image, 0, false)
+                            .log_err();
+                    }
                 }
             },
         );

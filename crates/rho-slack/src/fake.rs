@@ -79,6 +79,7 @@ struct State {
     /// a QA run has to be able to look at what the reader sees while a
     /// picture is still coming.
     file_delay_ms: u64,
+    avatars_paused: bool,
     /// How long a send takes to be accepted, and whether it is accepted at
     /// all. Both are what a QA run needs to see the states a real network
     /// puts the composer in: a message on its way, and one refused.
@@ -208,6 +209,12 @@ impl Fake {
             },
             "avatar_hash": hash,
         }));
+    }
+
+    /// Hold avatar bytes until a test releases them, without blocking other API
+    /// calls.
+    pub fn pause_avatars(&self, paused: bool) {
+        self.state.lock().unwrap().avatars_paused = paused;
     }
 
     pub fn set_user_profile(&self, id: &str, profile: Value) {
@@ -694,6 +701,9 @@ async fn serve_api(
             state.lock().unwrap().avatar_credentials_seen = true;
         }
         if let Some(bytes) = binary_route(&path, &state) {
+            while path.starts_with("/avatars/") && state.lock().unwrap().avatars_paused {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             let delay = match path.starts_with("/files/") {
                 true => state.lock().unwrap().file_delay_ms,
                 false => 0,
@@ -955,6 +965,10 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
         // list the next connect reads and the live frame move together.
         // How slowly a picture arrives, so a QA run can look at the box
         // while it is still on its way.
+        "pause_avatars" => {
+            state.avatars_paused = request["paused"].as_bool().unwrap_or(false);
+            json!({"ok": true})
+        }
         "file_delay" => {
             state.file_delay_ms = request["ms"].as_u64().unwrap_or_default();
             json!({"ok": true})

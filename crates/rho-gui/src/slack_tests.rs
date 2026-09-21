@@ -52,6 +52,126 @@ async fn wait_for_rows(
     panic!("the fake's conversations never reached the listing");
 }
 
+/// Avatar downloads change pixels, never author rows, wrapping or gutter width.
+#[gpui::test]
+async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::{ChannelId, UserId};
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.pause_avatars(true);
+    fake.set_user_profile("UD", serde_json::json!({}));
+    for (ts, user, text) in [
+        ("99.0", "UA", "short"),
+        ("100.0", "UD", "a longer message\nwith two lines"),
+    ] {
+        fake.add_message("C1", serde_json::json!({"ts":ts,"user":user,"text":text}));
+    }
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+    let window = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            Source::Conversation(ChannelId("C1".into())),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+    // Observe the very first populated state while avatar bytes cannot arrive.
+    let mut before = None;
+    for _ in 0..300 {
+        cx.run_until_parked();
+        before = window
+            .update(cx, |view, window, cx| {
+                let display = view.display_text_for_test(cx);
+                if !display.contains("short") {
+                    return None;
+                }
+                assert_eq!(view.avatar_count_for_test(), 2);
+                assert!(
+                    !display.contains("ada") && !display.contains("dana"),
+                    "{display}"
+                );
+                view.editor().update(cx, |editor, cx| {
+                    let snapshot = editor.snapshot(window, cx);
+                    let style = editor.style(cx).clone();
+                    let font_size = style.text.font_size.to_pixels(window.rem_size());
+                    let font_id = window.text_system().resolve_font(&style.text.font());
+                    Some((
+                        display,
+                        snapshot.row_y(snapshot.max_point().row().0 as f64),
+                        snapshot
+                            .gutter_dimensions(font_id, font_size, &style, window, cx)
+                            .width,
+                    ))
+                })
+            })
+            .unwrap();
+        if before.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let before = before.expect("history arrived while avatar bytes are paused");
+    assert!(cx.update(|cx| session.read(cx).avatar_loading(&UserId("UA".into()))));
+    fake.pause_avatars(false);
+    let mut ready = false;
+    for _ in 0..300 {
+        cx.run_until_parked();
+        ready = cx.update(|cx| {
+            session
+                .read(cx)
+                .cached_avatar(&UserId("UA".into()))
+                .is_some()
+        });
+        if ready {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(ready, "the paused avatar eventually arrives");
+    cx.run_until_parked();
+    window
+        .update(cx, |view, window, cx| {
+            let display = view.display_text_for_test(cx);
+            view.editor().update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let style = editor.style(cx).clone();
+                let font_size = style.text.font_size.to_pixels(window.rem_size());
+                let font_id = window.text_system().resolve_font(&style.text.font());
+                assert_eq!(
+                    (
+                        display,
+                        snapshot.row_y(snapshot.max_point().row().0 as f64),
+                        snapshot
+                            .gutter_dimensions(font_id, font_size, &style, window, cx)
+                            .width
+                    ),
+                    before
+                );
+            });
+            assert!(view.transcript_text_for_test(cx).contains("ada"));
+        })
+        .unwrap();
+}
+
 /// Custom emoji travel through the real API, bounded cache, decoder, fold,
 /// and editor-inlay path. The buffer remains the Slack source of truth.
 #[gpui::test]

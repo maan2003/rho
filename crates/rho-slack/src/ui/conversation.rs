@@ -443,6 +443,7 @@ impl ConversationView {
                 cx,
             );
             (hooks.configure_editor)(&mut editor, window, cx);
+            editor.set_reserve_image_gutter(true, cx);
             editor.disable_header_for_buffer(transcript.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
             // Completion is the composer's, not the transcript's: the
@@ -1845,10 +1846,17 @@ impl ConversationView {
                 // Anchor the final content byte, not the next item's first row.
                 let end = text::ToOffset::to_offset(&range.end, &buffer);
                 let start = text::ToOffset::to_offset(&range.start, &buffer);
-                (end > start)
-                    .then(|| buffer.anchor_before(end - 1))
-                    .and_then(|anchor| snapshot.anchor_in_excerpt(anchor))
-                    .map(|anchor| (anchor, 0.5))
+                (end > start).then_some(())?;
+                Some(editor::display_map::RowSpacing {
+                    range: snapshot.anchor_in_excerpt(range.start)?
+                        ..snapshot.anchor_in_excerpt(buffer.anchor_before(end - 1))?,
+                    minimum_height: if self.avatar_authors.contains_key(row) {
+                        1.5
+                    } else {
+                        0.
+                    },
+                    gap_after: 0.5,
+                })
             })
             .collect();
         self.editor.update(cx, |editor, cx| {
@@ -2089,53 +2097,57 @@ impl ConversationView {
                     .read(cx)
                     .cached_avatar(&user)
                     .map(std::path::Path::to_path_buf);
-                if let Some(path) = path {
-                    if let Some(image) = self.decoded_image(&path, cx) {
-                        let mut header_end = text.find('\n').map_or(0, |offset| offset + 1);
-                        // The opening fence has no visible text. Hide that row
-                        // with the author header so code starts beside the avatar.
-                        let body = &text[header_end..];
-                        if (body.starts_with("```") || body.starts_with("~~~"))
-                            && let Some(end) = body.find('\n')
-                        {
-                            header_end += end + 1;
-                        }
-                        let (start, end) = {
-                            let buffer = self.transcript.buffer().read(cx);
-                            (
-                                buffer.anchor_before(base),
-                                buffer.anchor_after(base + header_end),
-                            )
-                        };
-                        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-                        let content_end = self
-                            .transcript
-                            .buffer()
-                            .read(cx)
-                            .anchor_before(base + text.trim_end_matches('\n').len());
-                        if let (Some(start), Some(end), Some(content_end)) = (
-                            snapshot.anchor_in_excerpt(start),
-                            snapshot.anchor_in_excerpt(end),
-                            snapshot.anchor_in_excerpt(content_end),
-                        ) {
-                            let range = start..end;
-                            self.editor.update(cx, |editor, cx| {
-                                editor.set_gutter_image(start, Some((content_end, image)), cx);
-                                editor.fold_creases(
-                                    vec![Crease::simple(
-                                        range.clone(),
-                                        FoldPlaceholder::concealed(TypeId::of::<AvatarFold>()),
-                                    )],
-                                    false,
-                                    window,
-                                    cx,
-                                );
-                            });
-                            self.avatar_folds.insert(row.clone(), range);
-                        }
-                    }
-                } else {
-                    pending |= self.session.read(cx).avatar_loading(&user);
+                let image = path.as_ref().and_then(|path| self.decoded_image(path, cx));
+                pending |= self.session.read(cx).avatar_loading(&user);
+                // Author identity and row geometry never depend on the download.
+                // The source still retains the name for copy/search.
+                let header = text.lines().next().unwrap_or_default();
+                let initials = header
+                    .split_whitespace()
+                    .filter_map(|word| word.chars().next())
+                    .flat_map(char::to_uppercase)
+                    .take(2)
+                    .collect::<String>();
+                let mut header_end = text.find('\n').map_or(0, |offset| offset + 1);
+                let body = &text[header_end..];
+                if (body.starts_with("```") || body.starts_with("~~~"))
+                    && let Some(end) = body.find('\n')
+                {
+                    header_end += end + 1;
+                }
+                let (start, end) = {
+                    let buffer = self.transcript.buffer().read(cx);
+                    (
+                        buffer.anchor_before(base),
+                        buffer.anchor_after(base + header_end),
+                    )
+                };
+                let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+                if let (Some(start), Some(end)) = (
+                    snapshot.anchor_in_excerpt(start),
+                    snapshot.anchor_in_excerpt(end),
+                ) {
+                    let range = start..end;
+                    self.editor.update(cx, |editor, cx| {
+                        editor.set_gutter_image(
+                            start,
+                            Some(editor::GutterImage {
+                                image,
+                                initials: initials.into(),
+                            }),
+                            cx,
+                        );
+                        editor.fold_creases(
+                            vec![Crease::simple(
+                                range.clone(),
+                                FoldPlaceholder::concealed(TypeId::of::<AvatarFold>()),
+                            )],
+                            false,
+                            window,
+                            cx,
+                        );
+                    });
+                    self.avatar_folds.insert(row.clone(), range);
                 }
             }
             if pending {

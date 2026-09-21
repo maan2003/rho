@@ -1111,8 +1111,9 @@ pub struct Editor {
     syntax_concealments_dirty: bool,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
-    gutter_images: HashMap<Anchor, (Anchor, Arc<gpui::RenderImage>)>,
+    gutter_images: HashMap<Anchor, GutterImage>,
     centered_rows: Arc<[Anchor]>,
+    reserve_image_gutter: bool,
     allow_git_diff_scrollbar_markers: bool,
     scrollbar_marker_state: ScrollbarMarkerState,
     active_indent_guides_state: ActiveIndentGuidesState,
@@ -1406,6 +1407,13 @@ pub struct NavigationOverlayLabel {
     pub text_color: Hsla,
     pub x_offset: Pixels,
     pub scale_factor: f32,
+}
+
+/// A fixed-size gutter avatar, with initials while its image is unavailable.
+#[derive(Clone)]
+pub struct GutterImage {
+    pub image: Option<Arc<gpui::RenderImage>>,
+    pub initials: SharedString,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -2577,6 +2585,7 @@ impl Editor {
             gutter_highlights: Default::default(),
             gutter_images: HashMap::default(),
             centered_rows: Arc::default(),
+            reserve_image_gutter: false,
             allow_git_diff_scrollbar_markers: false,
             scrollbar_marker_state: ScrollbarMarkerState::default(),
             active_indent_guides_state: ActiveIndentGuidesState::default(),
@@ -3374,7 +3383,7 @@ impl Editor {
 
         EditorSnapshot {
             mode: self.mode.clone(),
-            has_gutter_images: !self.gutter_images.is_empty(),
+            has_gutter_images: self.reserve_image_gutter || !self.gutter_images.is_empty(),
             centered_rows: self.centered_rows.clone(),
             show_gutter: self.show_gutter,
             show_compact_gutter: self.show_compact_gutter,
@@ -9902,14 +9911,13 @@ impl Editor {
         Some(text_highlights)
     }
 
-    /// Sets an image beside an anchored content range. Single-display-line
-    /// content uses a one-line image; taller content uses 1.5 lines. This
-    /// decoration never inserts buffer text or rows.
-    /// Removing the last image releases the gutter width.
+    /// Sets a 1.5-line gutter avatar without changing text or row geometry.
+    /// Callers reserve its content height using `RowSpacing`.
+    /// Removing the last image releases the gutter width unless explicitly reserved.
     pub fn set_gutter_image(
         &mut self,
         anchor: Anchor,
-        image: Option<(Anchor, Arc<gpui::RenderImage>)>,
+        image: Option<GutterImage>,
         cx: &mut Context<Self>,
     ) {
         match image {
@@ -9923,6 +9931,12 @@ impl Editor {
         cx.notify();
     }
 
+    /// Reserves avatar width even before any messages or images arrive.
+    pub fn set_reserve_image_gutter(&mut self, reserve: bool, cx: &mut Context<Self>) {
+        self.reserve_image_gutter = reserve;
+        cx.notify();
+    }
+
     /// Centers the source rows at these anchors without replacing their text
     /// or changing the display map. Painting, selections and hit testing share
     /// the same line alignment.
@@ -9933,7 +9947,7 @@ impl Editor {
 
     /// Adds display-only trailing space to anchored source rows, in line-height
     /// units. Source text and logical cursor rows are unchanged.
-    pub fn set_row_spacing(&mut self, spacing: Vec<(Anchor, f32)>, cx: &mut Context<Self>) {
+    pub fn set_row_spacing(&mut self, spacing: Vec<RowSpacing>, cx: &mut Context<Self>) {
         self.display_map
             .update(cx, |map, cx| map.set_row_spacing(spacing, cx));
         cx.notify();

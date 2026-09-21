@@ -228,6 +228,17 @@ pub struct CompanionExcerptPatch {
     pub target_excerpt_range: Range<MultiBufferPoint>,
 }
 
+/// Display-only spacing for an anchored content range, measured in line heights.
+#[derive(Clone, Debug)]
+pub struct RowSpacing {
+    /// Anchors in the first and last source rows of the content.
+    pub range: Range<Anchor>,
+    /// The minimum space reserved for content, including any attached blocks.
+    pub minimum_height: f32,
+    /// Space following the larger of the content height and its minimum height.
+    pub gap_after: f32,
+}
+
 /// Decides how text in a [`MultiBuffer`] should be displayed in a buffer, handling inlay hints,
 /// folding, hard tabs, soft wrapping, custom blocks (like diagnostics), and highlighting.
 ///
@@ -259,7 +270,7 @@ pub struct DisplayMap {
     /// so they follow the text they cover. See [`Self::set_row_scales`].
     row_scales: row_scale_map::RowScaleSnapshot,
     /// Display-only trailing gaps, kept as anchors so they follow source edits.
-    row_spacing: Vec<(Anchor, f32)>,
+    row_spacing: Vec<RowSpacing>,
     pub(crate) fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
     pub(crate) masked: bool,
@@ -640,7 +651,7 @@ impl DisplayMap {
 
     /// Sets display-only gaps following anchored source rows, in line-height units.
     /// Anchors are resolved into sparse physical geometry for each snapshot.
-    pub fn set_row_spacing(&mut self, row_spacing: Vec<(Anchor, f32)>, cx: &mut Context<Self>) {
+    pub fn set_row_spacing(&mut self, row_spacing: Vec<RowSpacing>, cx: &mut Context<Self>) {
         self.row_spacing = row_spacing;
         cx.notify();
     }
@@ -1938,15 +1949,21 @@ impl DisplaySnapshot {
         !self.row_geometry.is_empty()
     }
 
-    fn resolve_row_geometry(&self, spacing: &[(Anchor, f32)]) -> row_geometry::RowGeometry {
+    fn resolve_row_geometry(&self, spacing: &[RowSpacing]) -> row_geometry::RowGeometry {
         if spacing.is_empty() {
             return row_geometry::RowGeometry::default();
         }
         let buffer = self.buffer_snapshot();
         let max_buffer_row = buffer.max_point().row;
         let mut gaps = Vec::with_capacity(spacing.len());
-        for &(anchor, gap) in spacing {
-            if !gap.is_finite() || gap <= 0.0 || !anchor.is_valid(buffer) {
+        for spacing in spacing {
+            let anchor = spacing.range.end;
+            let gap = spacing.gap_after;
+            if !gap.is_finite()
+                || gap < 0.0
+                || !anchor.is_valid(buffer)
+                || !spacing.range.start.is_valid(buffer)
+            {
                 continue;
             }
             let point = anchor.to_point(buffer);
@@ -1967,7 +1984,12 @@ impl DisplaySnapshot {
                 self.max_point().row()
             };
             if boundary >= last_text_row {
-                gaps.push((boundary.0, gap));
+                let first = spacing.range.start.to_display_point(self).row();
+                let content_height = boundary.0.saturating_sub(first.0) as f32 + 1.;
+                gaps.push((
+                    boundary.0,
+                    gap + (spacing.minimum_height - content_height).max(0.),
+                ));
             }
         }
         row_geometry::RowGeometry::new(gaps)

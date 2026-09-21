@@ -18,11 +18,13 @@ claims are not evidence that a workflow is complete.
 - Rho OKSolar P3 body text measures 6.509:1 against its editor background.
   Sidebar unread/mention state uses color, not bold weight; the conversation
   has a 4px inset and an avatar gutter.
-- Lightly rounded avatars are one line high for single-line messages and
-  1.5 lines for longer messages. Slack's 192px images are preferred for HiDPI.
-  Half-line display-only gaps separate messages without blank source rows.
+- Lightly rounded avatars are consistently 1.5 lines high. Slack's 192px
+  images are preferred for HiDPI. Initials fill pending or unavailable avatars;
+  the gutter and folded author rows do not wait for the image download.
+  Message slots reserve at least 1.5 lines for avatars, then a half-line gap,
+  without blank source rows. Same-author follow-ups need no avatar minimum.
   Wrapped paragraphs, leading code, and image attachments retain a common text margin.
-  Names remain available for copy/search and as an avatar-load fallback.
+  Names remain available for copy/search; initials remain on avatar failure.
   Message and last-reply timestamps are hidden.
 - Date headings are centered by anchored editor row alignment, not replacement
   blocks. Text, selection and mouse hits use the same alignment.
@@ -37,7 +39,7 @@ claims are not evidence that a workflow is complete.
   including supported joined emoji. Custom images and aliases stay on the
   bounded Slack asset path.
 - Verification: `cargo test -p rho-slack --features ui,fake`: 232 passed.
-  `cargo test -p rho-gui --lib`: 366 passed, 4 ignored, including the
+  `cargo test -p rho-gui --lib`: 368 passed, 4 ignored, including the
   bundled-font, 6.5:1-theme, and Slack rendering regressions.
   `cargo test -p rho-transcript --lib`: 11 passed, 2 ignored.
   After hiding timestamps and disabling popups:
@@ -60,6 +62,11 @@ claims are not evidence that a workflow is complete.
   and `spacing-backlog.png`.
 - Row-spaced editors omit minimaps, whose separate display map cannot mirror gaps.
   Ordinary editor layouts are unchanged.
+- Cold-load QA holds avatar responses at the fake server, then releases them.
+  The first populated frame already conceals names and reserves gutter width.
+  The regression asserts unchanged display text, height and gutter width after
+  release, including another author with no avatar. Inspected both states:
+  `/src/slack-qa/screens/avatar-loading.png` and `avatar-loaded.png`.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 
