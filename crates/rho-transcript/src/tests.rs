@@ -531,7 +531,7 @@ fn replacement_cost(
         match block_every {
             Some(every) if index.is_multiple_of(every) => {
                 shown.with_blocks(vec![crate::BlockSpec {
-                    placement: editor::display_map::BlockPlacement::Below(0),
+                    line: 0,
                     height: 4,
                     render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
                     priority: 0,
@@ -614,7 +614,7 @@ fn a_block_survives_an_edit_that_is_not_its_own(cx: &mut TestAppContext) {
     let (buffer, editor) = on_screen(cx);
     let mut sheet = Sheet::new(buffer.clone());
     let with_picture = item("a", "alice hello\n").with_blocks(vec![crate::BlockSpec {
-        placement: editor::display_map::BlockPlacement::Below(0),
+        line: 0,
         height: 4,
         render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
         priority: 0,
@@ -643,73 +643,6 @@ fn a_block_survives_an_edit_that_is_not_its_own(cx: &mut TestAppContext) {
     );
 }
 
-#[gpui::test]
-fn a_replacement_block_keeps_source_text_and_one_display_row(cx: &mut TestAppContext) {
-    init_editor(cx);
-    let (buffer, editor) = on_screen(cx);
-    let mut sheet = Sheet::new(buffer.clone());
-    let day = item("day", "date label\n").with_blocks(vec![crate::BlockSpec {
-        placement: editor::display_map::BlockPlacement::Replace(0..=0),
-        height: 1,
-        render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
-        priority: 0,
-    }]);
-    cx.update(|cx| {
-        sheet.insert_before(None, vec![day, item("message", "body\n")], cx);
-        sheet.attach(&editor, cx);
-    });
-    let placed = sheet.block_ids(&"day".to_owned());
-    assert_eq!(placed.len(), 1);
-    editor.update(cx, |editor, cx| {
-        let snapshot = editor.display_snapshot(cx);
-        assert_eq!(
-            snapshot.max_point().row().0,
-            2,
-            "replacement does not add a row"
-        );
-        assert_eq!(
-            snapshot
-                .blocks_in_range(
-                    editor::display_map::DisplayRow(0)..editor::display_map::DisplayRow(3)
-                )
-                .map(|(row, _)| row.0)
-                .collect::<Vec<_>>(),
-            vec![0]
-        );
-    });
-    assert_eq!(
-        cx.update(|cx| buffer.read(cx).text()),
-        "date label\nbody\n",
-        "copy/search keep the date"
-    );
-
-    cx.update(|cx| {
-        sheet.insert_before(Some(&"day".to_owned()), vec![item("older", "older\n")], cx)
-    });
-    assert_eq!(sheet.block_ids(&"day".to_owned()), placed);
-    editor.update(cx, |editor, cx| {
-        let snapshot = editor.display_snapshot(cx);
-        assert_eq!(snapshot.max_point().row().0, 3);
-        assert_eq!(
-            snapshot
-                .blocks_in_range(
-                    editor::display_map::DisplayRow(0)..editor::display_map::DisplayRow(4)
-                )
-                .map(|(row, _)| row.0)
-                .collect::<Vec<_>>(),
-            vec![1],
-            "the replacement follows its source anchor"
-        );
-    });
-    cx.update(|cx| sheet.remove(&"day".to_owned(), cx));
-    assert!(sheet.block_ids(&"day".to_owned()).is_empty());
-    let displayed = editor.update(cx, |editor, cx| editor.display_snapshot(cx).text());
-    assert_eq!(
-        displayed, "older\nbody\n",
-        "removing a day also removes its centered block"
-    );
-}
-
 /// Every block the sheet says it placed is one the editor is holding,
 /// after every splice and not only the first.
 ///
@@ -734,7 +667,7 @@ fn every_block_the_sheet_records_is_one_the_editor_is_holding(cx: &mut TestAppCo
 
     let with_picture = |key: &str, text: &str, line: u32| {
         item(key, text).with_blocks(vec![crate::BlockSpec {
-            placement: editor::display_map::BlockPlacement::Below(line),
+            line,
             height: 4,
             render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
             priority: 0,

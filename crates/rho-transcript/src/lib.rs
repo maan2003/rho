@@ -2,7 +2,7 @@
 //!
 //! Items sit in display order, each keyed by the caller (Slack: conversation
 //! plus timestamp) and each owning an anchored range in the buffer, its
-//! styles, its anchored blocks and its per-line metadata. Every operation
+//! styles, its below-line blocks and its per-line metadata. Every operation
 //! (insert a run before or after a key, replace one item, remove one) edits
 //! only the range it names, so anchors outside it — the cursor, the scroll
 //! anchor, other items' highlights and blocks — survive untouched. Nothing
@@ -47,11 +47,11 @@ pub trait Style: Copy + Eq + Hash + 'static {
     }
 }
 
-/// A rendered block positioned relative to an item's source lines.
+/// Something drawn under a line of an item: an image, an unfurl.
 #[derive(Clone)]
 pub struct BlockSpec {
-    /// Placement uses line numbers relative to the item's own text.
-    pub placement: BlockPlacement<u32>,
+    /// Which line of the item's own text the block sits under.
+    pub line: u32,
     pub height: u32,
     pub render: RenderBlock,
     pub priority: usize,
@@ -59,7 +59,7 @@ pub struct BlockSpec {
 
 impl BlockSpec {
     fn same(&self, other: &Self) -> bool {
-        self.placement == other.placement
+        self.line == other.line
             && self.height == other.height
             && self.priority == other.priority
             && Arc::ptr_eq(&self.render, &other.render)
@@ -726,18 +726,12 @@ where
         for item in self.items.get(inserted).into_iter().flatten() {
             let start = item.range.start.to_point(&snapshot).row;
             for block in &item.blocks {
-                let anchor = |line: u32, end: bool| {
-                    let row = (start + line).min(snapshot.max_point().row);
-                    let column = if end { snapshot.line_len(row) } else { 0 };
-                    snapshot.anchor_after(Point::new(row, column))
-                };
-                let placement = match block.placement.clone() {
-                    BlockPlacement::Replace(range) => BlockPlacement::Replace(
-                        anchor(*range.start(), false)..=anchor(*range.end(), true),
-                    ),
-                    placement => placement.map(|line| anchor(line, false)),
-                };
-                placements.push((item.key.clone(), block.clone(), placement));
+                let point = Point::new((start + block.line).min(snapshot.max_point().row), 0);
+                placements.push((
+                    item.key.clone(),
+                    block.clone(),
+                    snapshot.anchor_after(point),
+                ));
             }
         }
         drop(snapshot);
@@ -767,19 +761,11 @@ where
             let mut owners = Vec::new();
             let properties = placements
                 .iter()
-                .filter_map(|(key, block, placement)| {
-                    let anchor = |position| snapshot.anchor_in_excerpt(position);
-                    let placement = match placement {
-                        BlockPlacement::Above(at) => BlockPlacement::Above(anchor(*at)?),
-                        BlockPlacement::Below(at) => BlockPlacement::Below(anchor(*at)?),
-                        BlockPlacement::Near(at) => BlockPlacement::Near(anchor(*at)?),
-                        BlockPlacement::Replace(range) => {
-                            BlockPlacement::Replace(anchor(*range.start())?..=anchor(*range.end())?)
-                        }
-                    };
+                .filter_map(|(key, block, anchor)| {
+                    let anchor = snapshot.anchor_in_excerpt(*anchor)?;
                     owners.push(key.clone());
                     Some(BlockProperties {
-                        placement,
+                        placement: BlockPlacement::Below(anchor),
                         height: Some(block.height),
                         style: BlockStyle::Fixed,
                         render: block.render.clone(),

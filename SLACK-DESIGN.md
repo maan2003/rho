@@ -570,8 +570,8 @@ transcript renders through, and owns none of its own. Concretely:
   `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
   typing removes it. The gutter contains avatars, not editing chrome; there
   are no buttons or permanent instruction rows.
-- Day labels are centered single-row replacement blocks; the date remains in
-  the source for copy/search. The unread line remains a document heading.
+- Day breaks and the unread line are left-aligned document headings, whose
+  markers the parse hides. Dates stay in the source, not replacement blocks.
 - Attachments, previews, reactions, and thread summaries follow the body.
   The sidebar distinguishes unread conversations by text color rather than
   weight, with a separate accent for mentions.

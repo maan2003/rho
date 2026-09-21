@@ -3104,7 +3104,7 @@ fn image_block(
 ) -> BlockSpec {
     let rows = file.image_rows();
     BlockSpec {
-        placement: editor::display_map::BlockPlacement::Below(line),
+        line,
         height: rows,
         render: std::sync::Arc::new(move |cx| {
             let (file, view) = (file.clone(), view.clone());
@@ -3482,25 +3482,6 @@ fn day_rule(label: String) -> Rendered {
         format!("## {label}\n"),
         Class::Muted,
     )
-    .with_blocks(vec![BlockSpec {
-        placement: editor::display_map::BlockPlacement::Replace(0..=0),
-        height: 1,
-        priority: 0,
-        render: Arc::new(move |cx| {
-            let style = &cx.editor_style.text;
-            div()
-                .w(cx.max_width)
-                .h(cx.line_height)
-                .flex()
-                .justify_center()
-                .items_center()
-                .font_family(style.font_family.clone())
-                .text_size(style.font_size)
-                .text_color(cx.theme().colors().text_muted)
-                .child(label.clone())
-                .into_any_element()
-        }),
-    }])
 }
 
 fn muted_item(key: Row, text: impl Into<String>, class: Class) -> Rendered {
@@ -4227,6 +4208,19 @@ mod tests {
             }],
             "a whole page arrives as one run, under the day rule already there"
         );
+    }
+
+    #[test]
+    fn day_separators_are_source_rows_not_replacement_blocks() {
+        for label in ["Tue 18 Aug", "Thu 3 Sep", "Wed 16 Sep"] {
+            let separator = day_rule(label.to_owned());
+            assert_eq!(separator.text, format!("## {label}\n"));
+            assert_eq!(separator.lines.len(), 1);
+            assert!(
+                separator.blocks.is_empty(),
+                "date chrome must not replace message rows as history changes"
+            );
+        }
     }
 
     #[test]

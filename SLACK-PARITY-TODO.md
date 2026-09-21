@@ -20,7 +20,7 @@ claims are not evidence that a workflow is complete.
   has a 4px inset and an avatar gutter.
 - 1.5-line-high, lightly rounded avatars in the gutter replace visible names once loaded.
   Slack's 192px profile images are preferred for HiDPI clarity, with smaller
-  image sizes as fallbacks. Day labels are centered without adding rows.
+  image sizes as fallbacks. Day labels are left-aligned source headings.
   Short messages reserve enough height to keep adjacent avatars from overlapping;
   wrapped paragraphs, leading code blocks, and image attachments align at the same text margin.
   Names remain available for copy/search and as a failed-avatar fallback. Times follow messages,
@@ -33,18 +33,20 @@ claims are not evidence that a workflow is complete.
   `::skin-tone-2` through `::skin-tone-6` sequences render their variants,
   including supported joined emoji. Custom images and aliases stay on the
   bounded Slack asset path.
-- Verification: `cargo test -p rho-slack --features ui,fake`: 231 passed.
+- Verification: `cargo test -p rho-slack --features ui,fake`: 232 passed.
   `cargo test -p rho-gui --lib`: 362 passed, 4 ignored, including the
   bundled-font, 6.5:1-theme, and Slack rendering regressions.
-  `cargo test -p rho-transcript --lib`: 12 passed, 2 ignored, including
-  date replacement height, prepend anchoring, removal, and source preservation. The two atlas upload
+  `cargo test -p rho-transcript --lib`: 11 passed, 2 ignored.
+  Date repair: `cargo test -p rho-gui --lib slack_tests`: 43 passed, 1 ignored. The two atlas upload
   helper tests pass in an isolated Rust harness; the vendored graphics test
   workspace itself is blocked by its existing SQLite dependency conflict.
 - Inspected native captures of compact messages, empty and typed composers,
   standard/skin-tone/joined emoji, custom emoji, and corrected image colors:
   `/src/slack-qa/screens/gutter-emoji-final.png` and `gutter-emoji-draft.png`.
-- Inspected the smaller rounded avatars, multiple centered dates, and attachments
-  aligned outside the gutter: `/src/slack-qa/screens/avatar-date-images-final.png`.
+- The centered-date replacement blocks were broken: dates could duplicate inside
+  message bodies. Removed that approach and restored source headings. The prior
+  screenshot check missed the defect. Inspected the repaired multi-day view:
+  `/src/slack-qa/screens/date-repair-initial.png`.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 
