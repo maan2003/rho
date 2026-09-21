@@ -255,6 +255,7 @@ impl Workspace {
             };
             entries.push((Some(row.id), format!("{}{badge}", row.label), row.unread));
         }
+        let health = session.health_reason().map(str::to_owned);
         let entries = Rc::new(entries);
         let selected = match &self.active_surface().view {
             SurfaceView::SlackConversation(view) => Some(view.read(cx).source().channel().clone()),
@@ -280,6 +281,14 @@ impl Workspace {
                     .font_weight(gpui::FontWeight::BOLD)
                     .child(model.workspace().0.clone()),
             )
+            .when_some(health, |sidebar, reason| {
+                sidebar.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().status().error)
+                        .child(format!("Slack: {reason}")),
+                )
+            })
             .child(
                 div()
                     .id("slack-jump")
