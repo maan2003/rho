@@ -9,15 +9,15 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, Window, div};
+use gpui::{Context, Entity, EventEmitter, MouseButton, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::ToPoint as _;
 use text::Anchor;
 use theme::ActiveTheme as _;
 
-use crate::api::SearchHit;
+use crate::api::{FileSearchPage, SearchHit, SearchPage};
 use crate::session::{ActivityEntry, SearchRefused, Session, Source};
-use crate::types::{ThreadKey, Ts};
+use crate::types::{FileSummary, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
 
 /// A place the reader chose: which conversation, and which message in it.
@@ -26,6 +26,26 @@ pub struct Place {
     pub source: Source,
     pub ts: Ts,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Message(Place),
+    File(FileSummary),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKind {
+    Messages,
+    Files,
+}
+
+#[derive(Clone, Debug)]
+pub enum Event {
+    Open(Place),
+    OpenFile(FileSummary),
+}
+
+impl EventEmitter<Event> for ResultsView {}
 
 pub struct ResultsView {
     session: Entity<Session>,
@@ -39,12 +59,12 @@ pub struct ResultsView {
     page: u32,
     pages: u32,
     loading: bool,
+    kind: SearchKind,
 }
 
 struct DrawnLine {
-    /// The place this line opens, or `None` for a line that opens nothing:
-    /// the heading, the failure, the second line of a hit.
-    place: Option<Place>,
+    /// The target this line opens, or `None` for a heading or failure line.
+    target: Option<Target>,
     text: String,
     styles: Vec<(Class, Range<usize>)>,
 }
@@ -98,6 +118,7 @@ impl ResultsView {
             page: 0,
             pages: 0,
             loading: false,
+            kind: SearchKind::Messages,
         }
     }
 
@@ -108,8 +129,15 @@ impl ResultsView {
     /// The one line shown while the query is out. A search is a request over
     /// a network and the reader is owed the difference between "still
     /// asking" and "nothing".
-    pub fn asking(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn asking(
+        &mut self,
+        query: &str,
+        kind: SearchKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.query = query.to_owned();
+        self.kind = kind;
         self.page = 0;
         self.pages = 0;
         self.loading = true;
@@ -129,7 +157,7 @@ impl ResultsView {
     pub fn found(
         &mut self,
         query: &str,
-        page: &crate::api::SearchPage,
+        page: &SearchPage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -137,6 +165,7 @@ impl ResultsView {
         self.page = page.page;
         self.pages = page.pages;
         self.loading = false;
+        self.kind = SearchKind::Messages;
         let hits = &page.hits;
         let mut lines = vec![(None, heading(query, hits.len(), page.total))];
         if hits.is_empty() {
@@ -165,7 +194,7 @@ impl ResultsView {
                 ts: hit.message.ts.clone(),
             };
             lines.push((
-                Some(place.clone()),
+                Some(Target::Message(place.clone())),
                 vec![
                     Span::styled(
                         author,
@@ -184,7 +213,7 @@ impl ResultsView {
             // read as one hit. The same place, so the reader landing on
             // either line opens the same message.
             lines.push((
-                Some(place),
+                Some(Target::Message(place)),
                 vec![Span::plain(format!(
                     "  {}",
                     session
@@ -195,41 +224,44 @@ impl ResultsView {
                 ))],
             ));
         }
-        if page.pages > 1 {
-            let mut navigation = Vec::new();
-            if page.page > 1 {
-                navigation.push("[ previous");
-            }
-            if page.page < page.pages {
-                navigation.push("] next");
-            }
+        append_navigation(&mut lines, page.page, page.pages);
+        self.draw(lines, window, cx);
+    }
+
+    /// Draws standalone file matches from Slack's file index.
+    pub fn found_files(
+        &mut self,
+        query: &str,
+        page: &FileSearchPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.query = query.to_owned();
+        self.page = page.page;
+        self.pages = page.pages;
+        self.loading = false;
+        self.kind = SearchKind::Files;
+        let mut lines = vec![(None, heading(query, page.files.len(), page.total))];
+        if page.files.is_empty() {
+            lines.push((None, vec![Span::styled("no files matched", Class::Muted)]));
+        }
+        for file in &page.files {
             lines.push((
-                None,
-                vec![Span::styled(
-                    format!(
-                        "page {} of {}{}",
-                        page.page,
-                        page.pages,
-                        if navigation.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {}", navigation.join(" · "))
-                        }
-                    ),
-                    Class::Muted,
-                )],
+                Some(Target::File(file.clone())),
+                vec![Span::styled(file.line(), Class::Conversation)],
             ));
         }
+        append_navigation(&mut lines, page.page, page.pages);
         self.draw(lines, window, cx);
     }
 
     /// The adjacent page to request, if one exists and no request is in flight.
-    pub fn adjacent_page(
+    fn adjacent_page(
         &mut self,
         offset: i32,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(String, u32)> {
+    ) -> Option<(String, u32, SearchKind)> {
         if self.loading || self.page == 0 {
             return None;
         }
@@ -250,7 +282,23 @@ impl ResultsView {
             window,
             cx,
         );
-        Some((self.query.clone(), page))
+        Some((self.query.clone(), page, self.kind))
+    }
+
+    pub fn request_adjacent(
+        &mut self,
+        offset: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((query, page, kind)) = self.adjacent_page(offset, window, cx) else {
+            return false;
+        };
+        self.session.update(cx, |session, cx| match kind {
+            SearchKind::Messages => session.search(&query, page, cx),
+            SearchKind::Files => session.search_files(&query, page, cx),
+        });
+        true
     }
 
     /// Draws a durable Slack inventory. Unlike search results these rows
@@ -282,10 +330,10 @@ impl ResultsView {
                 head.push(Span::plain("  "));
                 head.push(Span::styled("unread", Class::Unread));
             }
-            lines.push((Some(place.clone()), head));
+            lines.push((Some(Target::Message(place.clone())), head));
             if !entry.summary.is_empty() {
                 lines.push((
-                    Some(place),
+                    Some(Target::Message(place)),
                     vec![Span::plain(format!(
                         "  {}",
                         entry.summary.replace('\n', " ")
@@ -323,12 +371,27 @@ impl ResultsView {
     }
 
     /// The place the cursor is on: what `enter` opens.
-    pub fn cursor_place(&self, cx: &mut Context<Self>) -> Option<Place> {
+    pub fn cursor_target(&self, cx: &mut Context<Self>) -> Option<Target> {
         // A buffer position, not a display one: see `ListView::cursor_row`.
         let head = self.editor.read(cx).selections.newest_anchor().head();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let row = head.to_point(&snapshot).row as usize;
-        self.drawn.get(row).and_then(|line| line.place.clone())
+        self.drawn.get(row).and_then(|line| line.target.clone())
+    }
+
+    fn open_clicked(&mut self, cx: &mut Context<Self>) {
+        let empty = self.editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .is_empty()
+        });
+        if empty && let Some(target) = self.cursor_target(cx) {
+            match target {
+                Target::Message(place) => cx.emit(Event::Open(place)),
+                Target::File(file) => cx.emit(Event::OpenFile(file)),
+            }
+        }
     }
 
     /// The lines as the reader reads them, for a test outside this crate.
@@ -342,16 +405,16 @@ impl ResultsView {
     /// next answer, so there is nothing an incremental edit would save.
     fn draw(
         &mut self,
-        lines: Vec<(Option<Place>, Vec<Span>)>,
+        lines: Vec<(Option<Target>, Vec<Span>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.drawn = lines
             .into_iter()
-            .map(|(place, spans)| {
+            .map(|(target, spans)| {
                 let (text, styles) = lay_out(&spans);
                 DrawnLine {
-                    place,
+                    target,
                     text,
                     styles,
                 }
@@ -370,7 +433,7 @@ impl ResultsView {
         let first = self
             .drawn
             .iter()
-            .position(|line| line.place.is_some())
+            .position(|line| line.target.is_some())
             .unwrap_or_default();
         self.place_cursor(first, window, cx);
         cx.notify();
@@ -417,6 +480,33 @@ impl ResultsView {
     }
 }
 
+fn append_navigation(lines: &mut Vec<(Option<Target>, Vec<Span>)>, page: u32, pages: u32) {
+    if pages <= 1 {
+        return;
+    }
+    let mut navigation = Vec::new();
+    if page > 1 {
+        navigation.push("[ previous");
+    }
+    if page < pages {
+        navigation.push("] next");
+    }
+    lines.push((
+        None,
+        vec![Span::styled(
+            format!(
+                "page {page} of {pages}{}",
+                if navigation.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", navigation.join(" · "))
+                }
+            ),
+            Class::Muted,
+        )],
+    ));
+}
+
 /// What the surface says it is showing. The count is Slack's, so a page of
 /// forty out of three hundred says so rather than implying that is all there
 /// was.
@@ -447,10 +537,52 @@ fn now_seconds() -> i64 {
 
 impl gpui::Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let previous = (self.page > 1 && !self.loading).then(|| {
+            div()
+                .id("slack-search-previous")
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .bg(colors.element_background)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.request_adjacent(-1, window, cx);
+                }))
+                .child("← Previous")
+        });
+        let next = (self.page < self.pages && !self.loading).then(|| {
+            div()
+                .id("slack-search-next")
+                .cursor_pointer()
+                .px_2()
+                .py_1()
+                .bg(colors.element_background)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.request_adjacent(1, window, cx);
+                }))
+                .child("Next →")
+        });
         div()
             .key_context("RhoSlackResults")
             .size_full()
-            .bg(cx.theme().colors().editor_background)
-            .child(self.editor.clone())
+            .flex()
+            .flex_col()
+            .bg(colors.editor_background)
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.open_clicked(cx)),
+            )
+            .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .text_color(colors.text_muted)
+                    .children(previous)
+                    .child(div().flex_1())
+                    .children(next),
+            )
     }
 }

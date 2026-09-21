@@ -1609,7 +1609,7 @@ async fn a_conversation_search_is_scoped_without_hiding_slack_operators(cx: &mut
 
     assert_eq!(
         lines.first().map(String::as_str),
-        Some("1 for asymmetric in:dev-ops")
+        Some("1 for asymmetric in:#dev-ops")
     );
     assert!(
         lines.iter().any(|line| line.contains("#dev-ops"))
@@ -1618,7 +1618,74 @@ async fn a_conversation_search_is_scoped_without_hiding_slack_operators(cx: &mut
     );
     assert_eq!(
         fake.last_field("search.messages", "query").as_deref(),
-        Some("asymmetric in:dev-ops")
+        Some("asymmetric in:#dev-ops")
+    );
+}
+
+/// The explicit all-workspace entry point does not inherit the active
+/// conversation's scope. This is what sidebar search calls.
+#[gpui::test]
+async fn sidebar_message_search_stays_workspace_wide(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "810.0", "user": "UA", "text": "workspace-wide marker"}),
+    );
+    fake.add_message(
+        "C3",
+        serde_json::json!({"ts": "710.0", "user": "UD", "text": "workspace-wide marker"}),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId(
+                    "C3".to_owned(),
+                )),
+                window,
+                cx,
+            );
+            workspace.prompt_slack_find_all(window, cx);
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "w o r k s p a c e - w i d e enter");
+    let lines = wait_for_results(cx, &workspace).await;
+
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("2 for workspace-wide")
+    );
+    assert_eq!(
+        fake.last_field("search.messages", "query").as_deref(),
+        Some("workspace-wide")
+    );
+}
+
+/// File search uses Slack's standalone file index rather than requiring a
+/// matching message attachment.
+#[gpui::test]
+async fn standalone_file_search_has_its_own_result_choice(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_file("FSTANDALONE", "incident-retrospective.pdf");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.prompt_slack_find_files(window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "r e t r o s p e c t i v e enter");
+    let lines = wait_for_results(cx, &workspace).await;
+
+    assert_eq!(
+        lines,
+        vec![
+            "1 for retrospective".to_owned(),
+            "incident-retrospective.pdf · 128 B".to_owned(),
+        ]
+    );
+    assert_eq!(
+        fake.last_field("search.files", "query").as_deref(),
+        Some("retrospective")
     );
 }
 
@@ -3051,4 +3118,30 @@ async fn new_message_picker_opens_a_group_and_sends(cx: &mut TestAppContext) {
             .await;
     }
     assert_eq!(fake.posted().last().unwrap().text, "hello");
+}
+
+#[test]
+fn slack_query_operators_are_explained_as_completions() {
+    let candidates = crate::slack::slack_filter_candidates("");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["from:", "in:", "before:", "after:", "has:", "is:"]
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| !candidate.description.is_empty()),
+        "an operator name alone does not tell the reader what value it accepts"
+    );
+    assert_eq!(
+        crate::slack::slack_filter_candidates("rollback bef")
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect::<Vec<_>>(),
+        vec!["before:"],
+        "completion follows the query's current token"
+    );
 }

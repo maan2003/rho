@@ -584,6 +584,25 @@ impl Model {
         self.conversations.get(channel)
     }
 
+    /// Slack search's stable `in:` value for a conversation.
+    ///
+    /// Legacy search accepts channel names and user handles, not channel IDs.
+    /// Use the raw API names here: rendered labels can contain display names,
+    /// emoji, spaces, or a group DM's comma-separated member list.
+    pub fn search_scope(&self, channel: &ChannelId) -> Option<String> {
+        let conversation = self.conversations.get(channel)?;
+        match conversation.kind {
+            ConversationKind::DirectMessage => {
+                let user = conversation.user.as_ref()?;
+                let handle = &self.users.get(user)?.handle;
+                Some(format!("@{handle}"))
+            }
+            ConversationKind::Channel | ConversationKind::Group => {
+                Some(format!("#{}", conversation.name))
+            }
+        }
+    }
+
     /// Every conversation rho knows of, for a caller that has to visit them
     /// all: seeding the read cursors off the mirror at startup is the case.
     pub fn conversations(&self) -> Vec<ChannelId> {
@@ -4103,5 +4122,37 @@ mod tests {
         assert_eq!(model.decode(&model.encode(typed)), typed);
         let wire = "<@U1> <#C1|design> <!here> <!channel> <https://x.example|docs>";
         assert_eq!(model.encode(&model.decode(wire)), wire);
+    }
+    #[test]
+    fn search_scope_uses_raw_names_instead_of_rendered_labels_or_ids() {
+        let mut model = model();
+        model.add_users([User {
+            id: UserId("U1".into()),
+            name: "Ada Lovelace".to_owned(),
+            handle: "ada".to_owned(),
+        }]);
+        model.add_conversations([Conversation {
+            id: ChannelId("G1".into()),
+            kind: ConversationKind::Group,
+            name: "mpdm-ada--manmeet-1".to_owned(),
+            user: None,
+            members: vec![UserId("U1".into()), UserId("ME".into())],
+        }]);
+
+        assert_eq!(
+            model.search_scope(&ChannelId("D1".into())).as_deref(),
+            Some("@ada"),
+            "a display name with spaces is not Slack's DM search identifier"
+        );
+        assert_eq!(
+            model.search_scope(&ChannelId("G1".into())).as_deref(),
+            Some("#mpdm-ada--manmeet-1"),
+            "a rendered member list is not Slack's group search identifier"
+        );
+        assert_eq!(
+            model.search_scope(&ChannelId("C1".into())).as_deref(),
+            Some("#design"),
+            "legacy Slack search accepts the channel name, not its C-id"
+        );
     }
 }

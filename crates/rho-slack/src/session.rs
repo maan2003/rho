@@ -15,7 +15,7 @@ use futures::channel::mpsc;
 use gpui::{AppContext as _, Context, EventEmitter, Task};
 use tokio::sync::Notify;
 
-use crate::api::{Client, SearchPage};
+use crate::api::{Client, FileSearchPage, SearchPage};
 use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
@@ -103,7 +103,13 @@ pub enum SessionEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub query: String,
-    pub page: Result<SearchPage, SearchRefused>,
+    pub page: Result<FoundPage, SearchRefused>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FoundPage {
+    Messages(SearchPage),
+    Files(FileSearchPage),
 }
 
 /// One row in Activity or Saved. It is a place, not a dealer verdict.
@@ -1097,10 +1103,42 @@ impl Session {
                     return;
                 }
                 let page = match answer {
-                    Ok(Ok(page)) => Ok(page),
+                    Ok(Ok(page)) => Ok(FoundPage::Messages(page)),
                     // The refusal rho can name is the one the reader can act
                     // on: Slack answers a session that may not search with
                     // one of these two, and every other failure is a failure.
+                    Ok(Err(error)) => match refused_search(&format!("{error}")) {
+                        true => Err(SearchRefused::NotAllowed),
+                        false => Err(SearchRefused::Failed),
+                    },
+                    Err(_) => Err(SearchRefused::Failed),
+                };
+                cx.emit(SessionEvent::Found(Found { query, page }));
+            });
+        }));
+    }
+
+    /// Searches Slack's standalone file index. This is separate from
+    /// `search.messages`: a file need not have a matching message.
+    pub fn search_files(&mut self, query: &str, page: u32, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.asked += 1;
+        let asked = self.asked;
+        let query = query.to_owned();
+        let task = gpui_tokio::Tokio::spawn(cx, {
+            let query = query.clone();
+            async move { client.search_files(&query, page).await }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            let _ = this.update(cx, |session, cx| {
+                if session.asked != asked {
+                    return;
+                }
+                let page = match answer {
+                    Ok(Ok(page)) => Ok(FoundPage::Files(page)),
                     Ok(Err(error)) => match refused_search(&format!("{error}")) {
                         true => Err(SearchRefused::NotAllowed),
                         false => Err(SearchRefused::Failed),

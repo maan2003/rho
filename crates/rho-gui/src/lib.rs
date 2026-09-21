@@ -116,6 +116,7 @@ actions!(
         SlackCompose,
         SlackSearch,
         SlackFindMessage,
+        SlackFindFile,
         SlackOpenFound,
         SlackSearchPreviousPage,
         SlackSearchNextPage,
@@ -420,6 +421,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             SlackFindMessage,
             Some("RhoSlackResults > Editor"),
         ),
+        KeyBinding::new(
+            "ctrl-shift-s",
+            SlackFindFile,
+            Some("RhoSlackResults > Editor"),
+        ),
         KeyBinding::new("enter", SlackOpenRow, Some("RhoSlackList > Editor")),
         KeyBinding::new("enter", HomeOpenRow, Some("RhoHome > Editor")),
         KeyBinding::new(
@@ -453,6 +459,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             // people said. Two different questions, and the second one is
             // a request over a network rather than an index in memory.
             KeyBinding::new("shift-s", SlackFindMessage, Some(context)),
+            KeyBinding::new("ctrl-shift-s", SlackFindFile, Some(context)),
             // The next conversation with something in it. `shift-n` and
             // not `n`, because `n` in a transcript is the search the reader
             // just ran.

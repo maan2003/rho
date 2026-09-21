@@ -140,6 +140,16 @@ pub struct SearchPage {
     pub total: u32,
 }
 
+/// One page of standalone file search results.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileSearchPage {
+    pub files: Vec<FileSummary>,
+    /// One-based, as Slack counts.
+    pub page: u32,
+    pub pages: u32,
+    pub total: u32,
+}
+
 /// One thread Slack follows for the user, from `subscriptions.thread.getView`.
 /// Which threads are the user's is Slack's answer, not rho's memory of what
 /// it happened to watch: a reply sent from the phone follows the thread just
@@ -367,6 +377,40 @@ impl Client {
         let paging = &messages["paging"];
         Ok(SearchPage {
             hits,
+            page: number(&paging["page"]).unwrap_or(1),
+            pages: number(&paging["pages"]).unwrap_or(1),
+            total: number(&paging["total"]).unwrap_or_default(),
+        })
+    }
+
+    /// Standalone files matching a query, newest first, one page at a time.
+    ///
+    /// This is Slack's `search.files` result set, which includes files that
+    /// are not attached to a message returned by `search.messages`.
+    pub async fn search_files(&self, query: &str, page: u32) -> anyhow::Result<FileSearchPage> {
+        let body = self
+            .post_form(
+                "search.files",
+                &[
+                    ("query", query.to_owned()),
+                    ("count", SEARCH_PAGE.to_string()),
+                    ("page", page.max(1).to_string()),
+                    ("sort", "timestamp".to_owned()),
+                    ("sort_dir", "desc".to_owned()),
+                ],
+            )
+            .await?;
+        let files = &body["files"];
+        let matches = files["matches"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(parse_file)
+            .collect();
+        let paging = &files["paging"];
+        Ok(FileSearchPage {
+            files: matches,
             page: number(&paging["page"]).unwrap_or(1),
             pages: number(&paging["pages"]).unwrap_or(1),
             total: number(&paging["total"]).unwrap_or_default(),
@@ -1246,25 +1290,27 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
             .map(Vec::as_slice)
             .unwrap_or_default()
             .iter()
-            .filter_map(|file| {
-                Some(FileSummary {
-                    id: string(&file["id"]).unwrap_or_default(),
-                    title: string(&file["name"])
-                        .or_else(|| string(&file["title"]))
-                        .filter(|title| !title.is_empty())?,
-                    filetype: string(&file["filetype"]).unwrap_or_default(),
-                    size: file["size"].as_u64().unwrap_or(0),
-                    url: string(&file["url_private"]).unwrap_or_default(),
-                    original_w: file["original_w"].as_u64().unwrap_or(0) as u32,
-                    original_h: file["original_h"].as_u64().unwrap_or(0) as u32,
-                    // The smallest Slack offers: it is a placeholder, so the
-                    // fewest bytes that carry the picture's colours win.
-                    thumb_url: string(&file["thumb_64"])
-                        .or_else(|| string(&file["thumb_80"]))
-                        .unwrap_or_default(),
-                })
-            })
+            .filter_map(parse_file)
             .collect(),
+    })
+}
+
+fn parse_file(file: &Value) -> Option<FileSummary> {
+    Some(FileSummary {
+        id: string(&file["id"]).unwrap_or_default(),
+        title: string(&file["name"])
+            .or_else(|| string(&file["title"]))
+            .filter(|title| !title.is_empty())?,
+        filetype: string(&file["filetype"]).unwrap_or_default(),
+        size: file["size"].as_u64().unwrap_or(0),
+        url: string(&file["url_private"]).unwrap_or_default(),
+        original_w: file["original_w"].as_u64().unwrap_or(0) as u32,
+        original_h: file["original_h"].as_u64().unwrap_or(0) as u32,
+        // The smallest Slack offers: it is a placeholder, so the fewest
+        // bytes that carry the picture's colours win.
+        thumb_url: string(&file["thumb_64"])
+            .or_else(|| string(&file["thumb_80"]))
+            .unwrap_or_default(),
     })
 }
 

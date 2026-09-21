@@ -97,7 +97,7 @@ use crate::{
     MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
     MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat, SearchRepeatReverse, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
-    SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread,
+    SlackEditLast, SlackEditMessage, SlackFindFile, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread,
     SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch,
     SlackSearchNextPage, SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose,
     TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
@@ -8993,7 +8993,17 @@ impl Render for Workspace {
                 this.prompt_slack_search(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SlackFindMessage, window, cx| {
-                this.prompt_slack_find(window, cx);
+                if matches!(
+                    &this.active_surface().view,
+                    SurfaceView::SlackConversation(_)
+                ) {
+                    this.prompt_slack_find(window, cx);
+                } else {
+                    this.prompt_slack_find_all(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SlackFindFile, window, cx| {
+                this.prompt_slack_find_files(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SlackOpenFound, window, cx| {
                 // Not on a hit: the line opens nothing, so `enter` is the

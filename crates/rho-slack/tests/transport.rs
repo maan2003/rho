@@ -2066,3 +2066,28 @@ async fn refused_message_actions_are_reported() {
             .is_err()
     );
 }
+
+/// File search has its own Slack result set: a standalone file with no
+/// history message still has to be findable.
+#[tokio::test]
+async fn standalone_files_are_found_through_search_files() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_file("F1", "incident-retrospective.pdf");
+    let client = client(&fake);
+
+    let found = client.search_files("retrospective", 1).await.unwrap();
+
+    assert_eq!(
+        found
+            .files
+            .iter()
+            .map(|file| file.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["incident-retrospective.pdf"]
+    );
+    assert_eq!((found.page, found.pages, found.total), (1, 1, 1));
+    assert_eq!(
+        fake.last_field("search.files", "query").as_deref(),
+        Some("retrospective")
+    );
+}

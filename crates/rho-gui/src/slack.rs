@@ -32,6 +32,25 @@ use crate::minibuffer::Candidate;
 use crate::pane::SurfaceKey;
 use crate::workspace::{ContextId, SurfaceView, Workspace};
 
+pub(crate) fn slack_filter_candidates(typed: &str) -> Vec<crate::minibuffer::Candidate> {
+    let token = typed.split_whitespace().last().unwrap_or_default();
+    [
+        ("from:", "messages or files from a person"),
+        ("in:", "search one channel or direct message"),
+        ("before:", "before a date, for example before:2025-01-31"),
+        ("after:", "after a date, for example after:2025-01-01"),
+        ("has:", "with a file, link, reaction, pin, or star"),
+        ("is:", "saved items or thread replies"),
+    ]
+    .into_iter()
+    .filter(|(operator, _)| token.is_empty() || operator.starts_with(token))
+    .map(|(value, description)| crate::minibuffer::Candidate {
+        value: value.to_owned(),
+        description: description.to_owned(),
+    })
+    .collect()
+}
+
 impl Workspace {
     /// Registers a workspace by hand: name, then token, then cookie. Three
     /// prompts rather than one line because the token and cookie are long
@@ -889,6 +908,40 @@ impl Workspace {
         .detach();
     }
 
+    fn open_slack_file_image(
+        &mut self,
+        file: rho_slack::types::FileSummary,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack.session() else {
+            return;
+        };
+        let path = session.update(cx, |session, cx| session.file_path(&file, cx));
+        let title = file.title.clone();
+        cx.spawn(async move |this, cx| {
+            let path = path.await;
+            let _ = this.update_in(cx, |this, window, cx| match path {
+                Ok(path) => match camino::Utf8PathBuf::from_path_buf(path) {
+                    Ok(path) => this.open_image(path, title, window, cx),
+                    Err(path) => {
+                        tracing::warn!(path = %path.display(), "slack image path is not utf-8");
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "slack file search image fetch failed");
+                    this.notice_on(
+                        None,
+                        &format!("slack: {error:#}"),
+                        rho_window::style::StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Shows a cached picture full-window. Opened from a conversation, so
     /// `ctrl-k` walks back to it and `q` closes.
     pub(crate) fn open_image(
@@ -1615,44 +1668,84 @@ impl Workspace {
     /// match, and this is only the reminder of what is being reached for.
     const SLACK_MATCHES_OFFERED: usize = 64;
 
-    /// `shift-s`: find a message. The prompt offers nothing while the
-    /// reader types and reads nothing until they submit -- searching is a
-    /// request over a network against a history rho does not hold, which is
-    /// the whole reason it is not the finder.
+    /// Opens workspace-wide message search. Sidebar search uses this even
+    /// when a conversation happens to be the active surface.
+    pub(crate) fn prompt_slack_find_all(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.prompt_slack_find_with(None, rho_slack::ui::SearchKind::Messages, window, cx);
+    }
+
+    /// `shift-s` in a conversation: find a message in that conversation.
     pub(crate) fn prompt_slack_find(
         &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let channel = view.read(cx).source().channel().clone();
+        let Some(session) = self.slack_session(window, cx) else {
+            return;
+        };
+        let model = session.read(cx).model();
+        let Some(scope) = model.search_scope(&channel) else {
+            return;
+        };
+        let label = model.label(&channel);
+        self.prompt_slack_find_with(
+            Some((scope, label)),
+            rho_slack::ui::SearchKind::Messages,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens Slack's standalone file search. It is separate from message
+    /// search because a file can match without an associated message match.
+    pub(crate) fn prompt_slack_find_files(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.prompt_slack_find_with(None, rho_slack::ui::SearchKind::Files, window, cx);
+    }
+
+    fn prompt_slack_find_with(
+        &mut self,
+        scope: Option<(String, String)>,
+        kind: rho_slack::ui::SearchKind,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
         if self.slack_session(window, cx).is_none() {
             return;
         }
-        let scope = match &self.active_surface().view {
-            SurfaceView::SlackConversation(view) => {
-                let source = view.read(cx).source();
-                let label = self
-                    .slack
-                    .session()
-                    .map(|session| session.read(cx).model().label(source.channel()))
-                    .unwrap_or_default();
-                Some(label.trim_start_matches(['#', '@']).to_owned())
-            }
-            _ => None,
+        let noun = match kind {
+            rho_slack::ui::SearchKind::Messages => "messages",
+            rho_slack::ui::SearchKind::Files => "files",
         };
         let prompt = match &scope {
-            Some(label) => format!("slack find in {label} (from: before: after: has: is:):"),
-            None => "slack find (from: in: before: after: has: is:):".to_owned(),
+            Some((_, label)) => {
+                format!("slack {noun} in {label} (from: before: after: has: is:):")
+            }
+            None => format!("slack {noun} (from: in: before: after: has: is:):"),
         };
         self.open_prompt(
             prompt,
-            std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new()),
+            std::rc::Rc::new(|_: &Workspace, typed: &str, _: &gpui::App| {
+                slack_filter_candidates(typed)
+            }),
             std::rc::Rc::new(move |workspace: &mut Workspace, input, window, cx| {
                 let query = match (input.trim(), &scope) {
                     ("", _) => String::new(),
-                    (input, Some(label)) => format!("{input} in:{label}"),
+                    (input, Some((scope, _))) => format!("{input} in:{scope}"),
                     (_, None) => input,
                 };
-                workspace.slack_find(&query, window, cx);
+                workspace.slack_find(&query, kind, window, cx);
             }),
             window,
             cx,
@@ -1663,7 +1756,13 @@ impl Workspace {
     /// surface is opened now rather than when the answer lands: the reader
     /// asked, and a screen saying so is the honest thing to show them while
     /// Slack is thinking.
-    fn slack_find(&mut self, query: &str, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
+    fn slack_find(
+        &mut self,
+        query: &str,
+        kind: rho_slack::ui::SearchKind,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let query = query.trim().to_owned();
         if query.is_empty() {
             return;
@@ -1681,6 +1780,21 @@ impl Workspace {
                 let hooks = Self::slack_hooks();
                 let view = cx
                     .new(|cx| rho_slack::ui::ResultsView::new(session.clone(), hooks, window, cx));
+                self._slack_view_subscriptions.push(cx.subscribe_in(
+                    &view,
+                    window,
+                    |workspace, _, event: &rho_slack::ui::results::Event, window, cx| {
+                        let target = match event {
+                            rho_slack::ui::results::Event::Open(place) => {
+                                rho_slack::ui::Target::Message(place.clone())
+                            }
+                            rho_slack::ui::results::Event::OpenFile(file) => {
+                                rho_slack::ui::Target::File(file.clone())
+                            }
+                        };
+                        workspace.open_slack_search_target(target, window, cx);
+                    },
+                ));
                 Self::wrap_surface(key, SurfaceView::SlackResults(view))
             }
         };
@@ -1688,14 +1802,17 @@ impl Workspace {
         self.focus_active_surface(window, cx);
         if let SurfaceView::SlackResults(view) = &self.active_surface().view {
             view.clone()
-                .update(cx, |view, cx| view.asking(&query, window, cx));
+                .update(cx, |view, cx| view.asking(&query, kind, window, cx));
         }
-        session.update(cx, |session, cx| session.search(&query, 1, cx));
+        session.update(cx, |session, cx| match kind {
+            rho_slack::ui::SearchKind::Messages => session.search(&query, 1, cx),
+            rho_slack::ui::SearchKind::Files => session.search_files(&query, 1, cx),
+        });
         cx.notify();
     }
 
-    /// Requests the adjacent numbered search page. Slack's message search
-    /// uses page numbers rather than cursors.
+    /// Requests the adjacent numbered search page. Slack's search endpoints
+    /// use page numbers rather than cursors.
     pub(crate) fn slack_search_page(
         &mut self,
         offset: i32,
@@ -1705,17 +1822,8 @@ impl Workspace {
         let SurfaceView::SlackResults(view) = &self.active_surface().view else {
             return false;
         };
-        let Some((query, page)) = view
-            .clone()
-            .update(cx, |view, cx| view.adjacent_page(offset, window, cx))
-        else {
-            return false;
-        };
-        let Some(session) = self.slack.session() else {
-            return false;
-        };
-        session.update(cx, |session, cx| session.search(&query, page, cx));
-        true
+        view.clone()
+            .update(cx, |view, cx| view.request_adjacent(offset, window, cx))
     }
 
     /// `enter` on a hit: the conversation, opened at that message. The
@@ -1729,15 +1837,35 @@ impl Workspace {
         let SurfaceView::SlackResults(view) = &self.active_surface().view else {
             return false;
         };
-        let Some(place) = view.clone().update(cx, |view, cx| view.cursor_place(cx)) else {
+        let Some(target) = view.clone().update(cx, |view, cx| view.cursor_target(cx)) else {
             return false;
         };
-        self.open_slack_source(place.source, window, cx);
-        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
-            return false;
-        };
-        view.clone()
-            .update(cx, |view, cx| view.reveal_found(place.ts, window, cx));
+        self.open_slack_search_target(target, window, cx)
+    }
+
+    fn open_slack_search_target(
+        &mut self,
+        target: rho_slack::ui::Target,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        match target {
+            rho_slack::ui::Target::Message(place) => {
+                self.open_slack_source(place.source, window, cx);
+                let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+                    return false;
+                };
+                view.clone()
+                    .update(cx, |view, cx| view.reveal_found(place.ts, window, cx));
+            }
+            rho_slack::ui::Target::File(file) => {
+                if file.is_image() {
+                    self.open_slack_file_image(file, window, cx);
+                } else if let Some(session) = self.slack.session() {
+                    session.update(cx, |session, cx| session.open_file(&file, cx));
+                }
+            }
+        }
         true
     }
 
@@ -1761,7 +1889,12 @@ impl Workspace {
         };
         let found = found.clone();
         view.update(cx, |view, cx| match &found.page {
-            Ok(page) => view.found(&found.query, page, window, cx),
+            Ok(rho_slack::session::FoundPage::Messages(page)) => {
+                view.found(&found.query, page, window, cx)
+            }
+            Ok(rho_slack::session::FoundPage::Files(page)) => {
+                view.found_files(&found.query, page, window, cx)
+            }
             Err(why) => view.refused(&found.query, why, window, cx),
         });
         cx.notify();

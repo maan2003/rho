@@ -51,6 +51,7 @@ struct State {
     counts: Vec<Value>,
     feed: Vec<Value>,
     history: BTreeMap<String, Vec<Value>>,
+    files: Vec<Value>,
     posted: Vec<Posted>,
     marked: Vec<(String, String)>,
     /// Custom workspace emoji, as `emoji.list` returns them.
@@ -317,6 +318,22 @@ impl Fake {
             .entry(channel.to_owned())
             .or_default()
             .push(message);
+    }
+
+    /// Adds a standalone file to Slack's file index. It need not have a
+    /// message in conversation history, which is the distinction
+    /// `search.files` exists to preserve.
+    pub fn add_file(&self, id: &str, title: &str) {
+        let base = self.api_base.trim_end_matches("/api");
+        self.state.lock().unwrap().files.push(json!({
+            "id": id,
+            "name": title,
+            "title": title,
+            "filetype": title.rsplit_once('.').map(|(_, extension)| extension).unwrap_or(""),
+            "size": 128,
+            "url_private": format!("{base}/files/{id}/{title}"),
+            "timestamp": 1000,
+        }));
     }
 
     /// Slack follows a thread for the user when they post in it or are
@@ -843,6 +860,7 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             if kind == "reply" {
                 message["thread_ts"] = json!(field("thread_ts"));
             }
+            state.files.push(message["files"][0].clone());
             state
                 .history
                 .entry(channel.clone())
@@ -1659,6 +1677,52 @@ fn handle(
                 },
             })
         }
+        "search.files" => {
+            let query = search_query(&field("query"));
+            let mut matches = state
+                .files
+                .iter()
+                .filter(|file| {
+                    let title = file["title"]
+                        .as_str()
+                        .or_else(|| file["name"].as_str())
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    query.terms.iter().all(|term| title.contains(term))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            matches.sort_by(|left, right| {
+                let timestamp = |file: &Value| {
+                    file["timestamp"]
+                        .as_f64()
+                        .or_else(|| file["timestamp"].as_u64().map(|value| value as f64))
+                        .unwrap_or(0.0)
+                };
+                timestamp(right).total_cmp(&timestamp(left))
+            });
+            let total = matches.len();
+            let count = field("count").parse::<usize>().unwrap_or(20).max(1);
+            let page = field("page").parse::<usize>().unwrap_or(1).max(1);
+            let pages = total.div_ceil(count).max(1);
+            let start = (page - 1) * count;
+            let end = (start + count).min(total);
+            let shown = matches.get(start..end).unwrap_or_default().to_vec();
+            json!({
+                "ok": true,
+                "query": field("query"),
+                "files": {
+                    "total": total,
+                    "matches": shown,
+                    "paging": {
+                        "count": count,
+                        "total": total,
+                        "page": page,
+                        "pages": pages,
+                    },
+                },
+            })
+        }
         "conversations.history" => {
             let channel = field("channel");
             let mut messages = state.history.get(&channel).cloned().unwrap_or_default();
@@ -1850,6 +1914,7 @@ fn handle(
             if let Some(thread_ts) = &thread_ts {
                 message["thread_ts"] = json!(thread_ts);
             }
+            state.files.push(message["files"][0].clone());
             state
                 .history
                 .entry(channel.clone())
@@ -1952,6 +2017,7 @@ fn handle(
             if let Some(thread_ts) = &thread_ts {
                 message["thread_ts"] = json!(thread_ts);
             }
+            state.files.push(message["files"][0].clone());
             state
                 .history
                 .entry(channel.clone())
