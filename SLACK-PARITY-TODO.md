@@ -10,8 +10,8 @@ Record checks and remaining limitations below. Existing historical checklist
 claims are not evidence that a workflow is complete.
 
 ## Navigation and discovery
-- [ ] Persistent channel/DM sidebar, unread badges, favorites, quick switcher, back/forward.
-- [ ] Find people, start a DM, create group DMs, browse and join channels.
+- [x] Persistent channel/DM sidebar, unread badges, favorites, quick switcher, back/forward.
+- [x] Find people, start a DM, create group DMs, browse and join channels.
 
 ## Finding things
 - [ ] Workspace and conversation search, useful filters, pagination, correct thread/context landing.
@@ -51,3 +51,14 @@ Implementation in progress; acceptance remains open until combined QA.
 - Favorites reopen test confirms persistence, removal, and scope isolation.
 - Saved-for-later is Rho-local: Slack has no supported current Later API. This must be labeled rather than implying cross-client synchronization.
 - Combined screenshots and final test totals will replace intermediate evidence on completion.
+
+### Integrated navigation QA
+- `cargo test -p rho-gui --lib slack_tests`: 29 passed, 1 performance benchmark ignored.
+- `cargo test -p rho-slack`: 211 passed across unit/config/mirror/transport suites at first integration.
+- Inspected `/src/slack-qa/screens/header6.png`, `thread6.png`, `thread-followed6.png`,
+  `starred6.png`, `back6.png`, and `forward6.png`: mouse selection opens the selected
+  message's thread, parent/replies remain an editor buffer, favorite moves into Starred,
+  muted room is subdued, back/forward restores the correct conversation.
+- Fake `subscriptions.thread.getView` returned C1 / 1789809000.000000 after clicking
+  Follow and an empty list after Unfollow. Both UI states were inspected.
+- Remaining acceptance stays open for integrated search, composer, emoji and app followups.
