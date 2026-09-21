@@ -18,13 +18,16 @@ claims are not evidence that a workflow is complete.
 - Rho OKSolar P3 body text measures 6.509:1 against its editor background.
   Sidebar unread/mention state uses color, not bold weight; the conversation
   has a 4px inset and an avatar gutter.
-- 1.5-line-high, lightly rounded avatars in the gutter replace visible names once loaded.
-  Slack's 192px profile images are preferred for HiDPI clarity, with smaller
-  image sizes as fallbacks. Day labels are left-aligned source headings.
-  Short messages reserve enough height to keep adjacent avatars from overlapping;
-  wrapped paragraphs, leading code blocks, and image attachments align at the same text margin.
-  Names remain available for copy/search and as a failed-avatar fallback. Times follow messages,
-  with a separate footer after fenced code.
+- Lightly rounded avatars are one line high for single-line messages and
+  1.5 lines for longer messages. Slack's 192px images are preferred for HiDPI.
+  Half-line display-only gaps separate messages without blank source rows.
+  Wrapped paragraphs, leading code, and image attachments retain a common text margin.
+  Names remain available for copy/search and as an avatar-load fallback.
+  Message and last-reply timestamps are hidden.
+- Date headings are centered by anchored editor row alignment, not replacement
+  blocks. Text, selection and mouse hits use the same alignment.
+- Desktop Slack notifications are disabled. Mentions, DMs and followed-thread
+  replies still update in-app cards, unread state and the activity lamp.
 - Fixed the shared WGPU BGRA/RGBA upload conversion; avatars, custom emoji,
   and other images retain their source colors.
 - Standard color emoji are bundled in Rho via Noto Color Emoji. Slack alias
@@ -34,19 +37,29 @@ claims are not evidence that a workflow is complete.
   including supported joined emoji. Custom images and aliases stay on the
   bounded Slack asset path.
 - Verification: `cargo test -p rho-slack --features ui,fake`: 232 passed.
-  `cargo test -p rho-gui --lib`: 362 passed, 4 ignored, including the
+  `cargo test -p rho-gui --lib`: 366 passed, 4 ignored, including the
   bundled-font, 6.5:1-theme, and Slack rendering regressions.
   `cargo test -p rho-transcript --lib`: 11 passed, 2 ignored.
-  Date repair: `cargo test -p rho-gui --lib slack_tests`: 43 passed, 1 ignored. The two atlas upload
+  After hiding timestamps and disabling popups:
+  `cargo test -p rho-gui --lib slack_tests`: 43 passed, 1 ignored.
+  The live-event card regression sets a desktop app identity and asserts no
+  system notifications for incoming mentions, DMs and followed-thread replies.
+  A rendered geometry test checks half-line and quarter-line gaps, centered-row
+  mouse hits, unchanged text, and two viewport widths. The pure geometry suite
+  passes 4 tests. Root spacing regressions
+  also cover prepends, actual soft wraps, hidden fold rows, and attachment blocks. The two atlas upload
   helper tests pass in an isolated Rust harness; the vendored graphics test
   workspace itself is blocked by its existing SQLite dependency conflict.
 - Inspected native captures of compact messages, empty and typed composers,
   standard/skin-tone/joined emoji, custom emoji, and corrected image colors:
   `/src/slack-qa/screens/gutter-emoji-final.png` and `gutter-emoji-draft.png`.
-- The centered-date replacement blocks were broken: dates could duplicate inside
-  message bodies. Removed that approach and restored source headings. The prior
-  screenshot check missed the defect. Inspected the repaired multi-day view:
-  `/src/slack-qa/screens/date-repair-initial.png`.
+- The former centered-date replacement blocks were broken; the original screenshot
+  check missed the defect. They remain removed. Inspected anchored centering,
+  mixed short/long messages, attachments, and the compact backlog:
+  `/src/slack-qa/screens/spacing-mixed-final.png`, `spacing-short-long-final.png`,
+  and `spacing-backlog.png`.
+- Row-spaced editors omit minimaps, whose separate display map cannot mirror gaps.
+  Ordinary editor layouts are unchanged.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 
@@ -68,7 +81,7 @@ claims are not evidence that a workflow is complete.
 - [x] Edit/delete, reactions, copy link, forward, mark unread, save for later.
 
 ## Awareness and content
-- [x] Mentions and thread activity, notifications, clear connection failures.
+- [x] Mentions and thread activity in-app, clear connection failures; no desktop notifications.
 - [x] Files, previews, inline custom emoji, interactive app messages.
 
 ## QA acceptance
@@ -137,9 +150,7 @@ product parity. Multi-workspace is excluded by the user.
   current Later API. It does not imply cross-client synchronization.
 - File+thread-broadcast is explicitly refused rather than silently dropping the
   broadcast flag. Text replies support also-send-to-channel.
-- OS notification delivery could not be verified: the headless session has no
-  notification daemon. Deduplication and focused-conversation suppression pass
-  tests before delivery.
+- Desktop Slack notification delivery is intentionally disabled.
 - External document opening could not be verified because `xdg-open` is absent.
   File download, cache, search, and inline image rendering were verified.
 - Some standard Unicode emoji glyphs are absent in the QA font environment.

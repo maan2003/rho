@@ -174,8 +174,8 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         "author names remain in copy/search text: {text}"
     );
     assert!(
-        display.lines().any(|line| line.contains("2  00:01")),
-        "the reaction row carries the trailing time: {display}"
+        !display.contains("00:01"),
+        "message and reaction rows do not show timestamps: {display}"
     );
     assert!(
         display.contains("Thu 1 Jan\nlet answer = 42;"),
@@ -2425,6 +2425,7 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
 
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
+    cx.update(|cx| cx.set_app_identity("com.rho.slack-test", "Rho Slack test"));
     cx.executor().allow_parking();
     let fake = cx
         .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
@@ -2537,6 +2538,10 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
     assert_eq!(asking.get("@ada"), Some(&Attention::DirectMessage));
     assert_eq!(asking.get("#dev-ops"), Some(&Attention::FollowedThread));
     assert_eq!(asking.get("#ops-alerts"), Some(&Attention::ChannelTraffic));
+    assert!(
+        cx.shown_system_notifications().is_empty(),
+        "mentions, DMs and followed threads update in-app cards without desktop popups"
+    );
 
     // And every one of them ranks above the floor the dealer drops cards at.
     let now = chrono::Local::now().fixed_offset();

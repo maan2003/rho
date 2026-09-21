@@ -1111,7 +1111,8 @@ pub struct Editor {
     syntax_concealments_dirty: bool,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
-    gutter_images: HashMap<Anchor, Arc<gpui::RenderImage>>,
+    gutter_images: HashMap<Anchor, (Anchor, Arc<gpui::RenderImage>)>,
+    centered_rows: Arc<[Anchor]>,
     allow_git_diff_scrollbar_markers: bool,
     scrollbar_marker_state: ScrollbarMarkerState,
     active_indent_guides_state: ActiveIndentGuidesState,
@@ -1371,6 +1372,7 @@ impl NextScrollCursorCenterTopBottom {
 pub struct EditorSnapshot {
     pub mode: EditorMode,
     has_gutter_images: bool,
+    centered_rows: Arc<[Anchor]>,
     show_gutter: bool,
     show_compact_gutter: bool,
     offset_content: bool,
@@ -2574,6 +2576,7 @@ impl Editor {
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
             gutter_images: HashMap::default(),
+            centered_rows: Arc::default(),
             allow_git_diff_scrollbar_markers: false,
             scrollbar_marker_state: ScrollbarMarkerState::default(),
             active_indent_guides_state: ActiveIndentGuidesState::default(),
@@ -3372,6 +3375,7 @@ impl Editor {
         EditorSnapshot {
             mode: self.mode.clone(),
             has_gutter_images: !self.gutter_images.is_empty(),
+            centered_rows: self.centered_rows.clone(),
             show_gutter: self.show_gutter,
             show_compact_gutter: self.show_compact_gutter,
             offset_content: self.offset_content,
@@ -9898,13 +9902,14 @@ impl Editor {
         Some(text_highlights)
     }
 
-    /// Sets a 1.5-line-high square image outside the text layout. The caller
-    /// reserves those rows; this decoration never inserts buffer text or rows.
+    /// Sets an image beside an anchored content range. Single-display-line
+    /// content uses a one-line image; taller content uses 1.5 lines. This
+    /// decoration never inserts buffer text or rows.
     /// Removing the last image releases the gutter width.
     pub fn set_gutter_image(
         &mut self,
         anchor: Anchor,
-        image: Option<Arc<gpui::RenderImage>>,
+        image: Option<(Anchor, Arc<gpui::RenderImage>)>,
         cx: &mut Context<Self>,
     ) {
         match image {
@@ -9915,6 +9920,22 @@ impl Editor {
                 self.gutter_images.remove(&anchor);
             }
         }
+        cx.notify();
+    }
+
+    /// Centers the source rows at these anchors without replacing their text
+    /// or changing the display map. Painting, selections and hit testing share
+    /// the same line alignment.
+    pub fn set_centered_rows(&mut self, anchors: Vec<Anchor>, cx: &mut Context<Self>) {
+        self.centered_rows = anchors.into();
+        cx.notify();
+    }
+
+    /// Adds display-only trailing space to anchored source rows, in line-height
+    /// units. Source text and logical cursor rows are unchanged.
+    pub fn set_row_spacing(&mut self, spacing: Vec<(Anchor, f32)>, cx: &mut Context<Self>) {
+        self.display_map
+            .update(cx, |map, cx| map.set_row_spacing(spacing, cx));
         cx.notify();
     }
 
@@ -11652,15 +11673,38 @@ impl Editor {
             .scroll_position(editor_snapshot)
             .y;
         if !line_height.is_zero() {
-            scroll_top =
-                window.pixel_snap_f64(scroll_top * f64::from(line_height)) / f64::from(line_height);
+            scroll_top = editor_snapshot.row_at_y(
+                window.pixel_snap_f64(editor_snapshot.row_y(scroll_top) * f64::from(line_height))
+                    / f64::from(line_height),
+            );
         }
 
         if source.row().as_f64() < scroll_top.floor() {
             return None;
         }
-        let source_x = editor_snapshot.x_for_display_point(source, &text_layout_details);
-        let source_y = line_height * (source.row().as_f64() - scroll_top) as f32;
+        let mut source_x = editor_snapshot.x_for_display_point(source, &text_layout_details);
+        if editor_snapshot
+            .centered_rows
+            .iter()
+            .any(|anchor| anchor.to_display_point(editor_snapshot).row() == source.row())
+            && let Some(content_width) =
+                self.last_position_map.as_ref().map(|map| map.content_width)
+        {
+            let line = element::layout_line(
+                source.row(),
+                editor_snapshot,
+                &self.style(cx),
+                content_width,
+                |_| false,
+                window,
+                cx,
+            );
+            source_x = line.x_for_index(source.column() as usize)
+                + line.alignment_offset(gpui::TextAlign::Center, content_width);
+        }
+        let source_y = line_height
+            * (editor_snapshot.row_y(source.row().as_f64()) - editor_snapshot.row_y(scroll_top))
+                as f32;
         Some(gpui::Point::new(source_x, source_y))
     }
 

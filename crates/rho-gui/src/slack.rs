@@ -200,10 +200,6 @@ pub(crate) struct Slack {
     session: Option<gpui::Entity<Session>>,
     pub(crate) list: Option<gpui::Entity<rho_slack::ui::ListView>>,
     degraded: Option<String>,
-    /// Newest inbound message considered for a desktop notification per
-    /// Slack unit. Focused messages are recorded too, so leaving the
-    /// conversation cannot make the same arrival alert later.
-    notified: std::collections::BTreeMap<Unit, Ts>,
 }
 
 impl Slack {
@@ -237,27 +233,6 @@ impl Slack {
     pub(crate) fn caught_up(&mut self) {
         self.degraded = None;
     }
-}
-
-fn source_is_unit(source: &Source, unit: &Unit) -> bool {
-    source.channel() == &unit.channel
-        && match (source, &unit.thread) {
-            (Source::Conversation(_), None) => true,
-            (Source::Thread(key), Some(root)) => key.thread_ts == *root,
-            _ => false,
-        }
-}
-
-/// New timestamps alert only away from the conversation. Equality and older
-/// timestamps are reconnect/replay evidence and never alert again.
-fn should_notify_slack(
-    previous: Option<&Ts>,
-    focused: Option<&Source>,
-    unit: &Unit,
-    newest: &Ts,
-) -> bool {
-    let new = previous.is_none_or(|previous| newest.is_newer_than(previous));
-    new && focused.is_none_or(|source| !source_is_unit(source, unit))
 }
 
 impl Workspace {
@@ -3054,61 +3029,6 @@ impl Workspace {
             }
             SessionEvent::Changed(changes) => {
                 for change in changes {
-                    if let Change::Raised(unit) | Change::Updated(unit) = change
-                        && let Some(card) = session
-                            .read(cx)
-                            .model()
-                            .card(unit, chrono::Local::now().timestamp_millis())
-                        && !matches!(
-                            card.attention,
-                            Some(rho_slack::model::Attention::ChannelTraffic) | None
-                        )
-                    {
-                        let focused = match &self.active_surface().key {
-                            SurfaceKey::SlackConversation(source) => Some(source),
-                            _ => None,
-                        };
-                        let alert = should_notify_slack(
-                            self.slack.notified.get(unit),
-                            focused,
-                            unit,
-                            &card.newest,
-                        );
-                        let remember = self
-                            .slack
-                            .notified
-                            .get(unit)
-                            .is_none_or(|previous| card.newest.is_newer_than(previous));
-                        if remember {
-                            self.slack
-                                .notified
-                                .insert(unit.clone(), card.newest.clone());
-                        }
-                        if alert {
-                            let thread = unit.thread.as_ref().map(Ts::as_str).unwrap_or("");
-                            cx.show_system_notification(gpui::SystemNotification {
-                                tag: format!(
-                                    "rho-slack-{}-{}-{thread}",
-                                    session.read(cx).model().workspace().0,
-                                    unit.channel.0,
-                                )
-                                .into(),
-                                title: card.conversation.clone().into(),
-                                body: {
-                                    let summary = session.read(cx).unit_summary(unit);
-                                    match (summary.is_empty(), card.attention) {
-                                        (true, Some(reason)) => rho_slack::model::reason_text(
-                                            reason,
-                                            &card.conversation,
-                                        ),
-                                        _ => summary,
-                                    }
-                                }
-                                .into(),
-                                actions: Vec::new(),
-                            });
-                        }
-                    }
                     // A thread that starts to matter needs nothing written:
                     // it is addressable as its unit, and the view shows it
                     // because the mirror says it is open.
@@ -3767,30 +3687,5 @@ mod tests {
         };
         assert_eq!(key.channel.0, "C1");
         assert_eq!(key.thread_ts.0, "500.0");
-    }
-}
-
-#[cfg(test)]
-mod awareness_tests {
-    use rho_slack::model::Unit;
-    use rho_slack::types::{ChannelId, Ts};
-
-    use super::{Source, should_notify_slack};
-
-    #[test]
-    fn desktop_notification_requires_a_new_timestamp_away_from_its_conversation() {
-        let channel = ChannelId("C1".into());
-        let unit = Unit::conversation(&channel);
-        let old = Ts("100.0".into());
-        let new = Ts("200.0".into());
-        assert!(should_notify_slack(Some(&old), None, &unit, &new));
-        assert!(!should_notify_slack(Some(&new), None, &unit, &new));
-        assert!(!should_notify_slack(Some(&new), None, &unit, &old));
-        assert!(!should_notify_slack(
-            Some(&old),
-            Some(&Source::Conversation(channel)),
-            &unit,
-            &new,
-        ));
     }
 }

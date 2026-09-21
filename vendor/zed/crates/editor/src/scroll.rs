@@ -36,6 +36,8 @@ pub type ScrollOffset = f64;
 pub type ScrollPixelOffset = f64;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollAnchor {
+    /// Horizontal columns and physical line-height units below the anchor.
+    /// Unlike public scroll positions, `offset.y` includes display-only gaps.
     pub offset: gpui::Point<ScrollOffset>,
     pub anchor: Anchor,
 }
@@ -50,12 +52,15 @@ impl ScrollAnchor {
 
     pub fn scroll_position(&self, snapshot: &DisplaySnapshot) -> gpui::Point<ScrollOffset> {
         self.offset.apply_along(Axis::Vertical, |offset| {
-            if self.anchor == Anchor::Min {
-                0.
-            } else {
-                let scroll_top = self.anchor.to_display_point(snapshot).row().as_f64();
-                (offset + scroll_top).max(0.)
+            if self.anchor == Anchor::Min && !snapshot.has_row_spacing() {
+                return 0.;
             }
+            // A top inside row zero still anchors to `Anchor::Min`; with row
+            // spacing its physical offset is needed to represent that position.
+            let anchor_row = self.anchor.to_display_point(snapshot).row().as_f64();
+            snapshot
+                .row_at_y(snapshot.row_y(anchor_row) + offset)
+                .max(0.)
         })
     }
 
@@ -186,8 +191,9 @@ fn autoscroll_target_is_visible(
     let Some(visible_line_count) = visible_line_count else {
         return true;
     };
-    let target_top = anchor.to_display_point(display_map).row().as_f64();
-    let target_bottom = target_top + 1.;
+    let target_top = display_map.row_y(anchor.to_display_point(display_map).row().as_f64());
+    let target_bottom = display_map.row_y(anchor.to_display_point(display_map).row().as_f64() + 1.);
+    let scroll_top = display_map.row_y(scroll_top);
     target_top >= scroll_top && target_bottom <= scroll_top + visible_line_count
 }
 impl ScrollManager {
@@ -350,29 +356,30 @@ impl ScrollManager {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> WasScrolled {
-        let scroll_top = scroll_position.y.max(0.);
-        let scroll_top = match scroll_beyond_last_line {
-            ScrollBeyondLastLine::OnePage => scroll_top,
+        let mut scroll_top_y = map.row_y(scroll_position.y.max(0.));
+        scroll_top_y = match scroll_beyond_last_line {
+            ScrollBeyondLastLine::OnePage => scroll_top_y,
             ScrollBeyondLastLine::Off => {
                 if let Some(height_in_lines) = self.visible_line_count {
-                    let max_row = map.max_point().row().as_f64();
-                    scroll_top.min(max_row - height_in_lines + 1.).max(0.)
+                    let document_end = map.row_y(map.max_point().row().next_row().as_f64());
+                    scroll_top_y.min(document_end - height_in_lines).max(0.)
                 } else {
-                    scroll_top
+                    scroll_top_y
                 }
             }
             ScrollBeyondLastLine::VerticalScrollMargin => {
                 if let Some(height_in_lines) = self.visible_line_count {
-                    let max_row = map.max_point().row().as_f64();
-                    scroll_top
-                        .min(max_row - height_in_lines + 1. + self.vertical_scroll_margin)
+                    let document_end = map.row_y(map.max_point().row().next_row().as_f64());
+                    scroll_top_y
+                        .min(document_end - height_in_lines + self.vertical_scroll_margin)
                         .max(0.)
                 } else {
-                    scroll_top
+                    scroll_top_y
                 }
             }
         };
-        let scroll_top_row = DisplayRow(scroll_top as u32);
+        let scroll_top = map.row_at_y(scroll_top_y);
+        let scroll_top_row = DisplayRow(scroll_top.floor() as u32);
         let scroll_top_buffer_point = map
             .clip_point(
                 DisplayPoint::new(scroll_top_row, scroll_position.x as u32),
@@ -386,7 +393,7 @@ impl ScrollManager {
                 anchor: top_anchor,
                 offset: point(
                     scroll_position.x.max(0.),
-                    scroll_top - top_anchor.to_display_point(map).row().as_f64(),
+                    scroll_top_y - map.row_y(top_anchor.to_display_point(map).row().as_f64()),
                 ),
             },
             map,
@@ -729,7 +736,9 @@ impl Editor {
             delta.y = 0.0;
         }
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-        let position = self.scroll_manager.scroll_position(&display_map, cx) + delta.map(f64::from);
+        let mut position = self.scroll_manager.scroll_position(&display_map, cx);
+        position.x += f64::from(delta.x);
+        position.y = display_map.row_at_y(display_map.row_y(position.y) + f64::from(delta.y));
         self.set_scroll_position_taking_display_map(position, true, false, display_map, window, cx);
     }
 
@@ -884,7 +893,7 @@ impl Editor {
         // view jumps by however many rows the old anchor stood for.
         let row = anchor.to_display_point(&display_map).row().as_f64();
         let mut offset = current.offset;
-        offset.y = position.y - row;
+        offset.y = display_map.row_y(position.y) - display_map.row_y(row);
         self.set_scroll_anchor(ScrollAnchor { anchor, offset }, window, cx);
     }
 
@@ -967,11 +976,13 @@ impl Editor {
             current_position.x +=
                 f64::from(self.gutter_dimensions.margin / last_position_map.em_advance);
         }
-        let new_position = current_position
-            + point(
-                amount.columns(visible_column_count),
-                amount.lines(visible_line_count),
-            );
+        let display_snapshot = self.display_snapshot(cx);
+        let new_position = point(
+            current_position.x + amount.columns(visible_column_count),
+            display_snapshot.row_at_y(
+                display_snapshot.row_y(current_position.y) + amount.lines(visible_line_count),
+            ),
+        );
         self.set_scroll_position(new_position, window, cx);
     }
 
@@ -987,24 +998,31 @@ impl Editor {
             return;
         };
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-        let top = self
-            .scroll_manager
-            .scroll_top_display_point(&display_snapshot, cx);
+        let scroll_top = self.scroll_manager.scroll_position(&display_snapshot, cx).y;
+        let top_y = display_snapshot.row_y(scroll_top);
         let vertical_scroll_margin =
-            (self.vertical_scroll_margin() as u32).min(visible_line_count as u32 / 2);
+            (self.vertical_scroll_margin() as f64).min(visible_line_count / 2.0);
 
         let max_point = display_snapshot.max_point();
-        let min_row = if top.row().0 == 0 {
+        let min_row = if scroll_top.floor() == 0.0 {
             DisplayRow(0)
         } else {
-            DisplayRow(top.row().0 + vertical_scroll_margin)
+            DisplayRow(
+                display_snapshot
+                    .row_at_y((top_y + vertical_scroll_margin).max(0.0))
+                    .ceil() as u32,
+            )
         };
-        let max_row = if top.row().0 + visible_line_count as u32 >= max_point.row().0 {
+        let visible_bottom = display_snapshot.row_at_y(top_y + visible_line_count);
+        let max_row = if visible_bottom >= max_point.row().as_f64() {
             max_point.row()
         } else {
             DisplayRow(
-                (top.row().0 + visible_line_count as u32)
-                    .saturating_sub(1 + vertical_scroll_margin),
+                display_snapshot
+                    .row_at_y((top_y + visible_line_count - vertical_scroll_margin).max(top_y))
+                    .ceil()
+                    .max(1.0) as u32
+                    - 1,
             )
         };
 
@@ -1043,16 +1061,17 @@ impl Editor {
             .newest_anchor()
             .head()
             .to_display_point(&snapshot);
-        let screen_top = self.scroll_manager.scroll_top_display_point(&snapshot, cx);
+        let screen_top = self.scroll_manager.scroll_position(&snapshot, cx);
 
-        if screen_top > newest_head {
+        if screen_top.y > newest_head.row().as_f64() {
             return Ordering::Less;
         }
 
         if let (Some(visible_lines), Some(visible_columns)) =
             (self.visible_line_count(), self.visible_column_count())
-            && newest_head.row() <= DisplayRow(screen_top.row().0 + visible_lines as u32)
-            && newest_head.column() <= screen_top.column() + visible_columns as u32
+            && snapshot.row_y(newest_head.row().next_row().as_f64())
+                <= snapshot.row_y(screen_top.y) + visible_lines
+            && newest_head.column() <= screen_top.x as u32 + visible_columns as u32
         {
             return Ordering::Equal;
         }

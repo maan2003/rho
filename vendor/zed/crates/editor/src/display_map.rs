@@ -79,6 +79,7 @@ mod custom_highlights;
 mod fold_map;
 mod inlay_map;
 mod invisibles;
+mod row_geometry;
 mod row_scale_map;
 mod tab_map;
 mod wrap_map;
@@ -257,6 +258,8 @@ pub struct DisplayMap {
     /// Rows that render at a multiple of the editor's font size, as anchors
     /// so they follow the text they cover. See [`Self::set_row_scales`].
     row_scales: row_scale_map::RowScaleSnapshot,
+    /// Display-only trailing gaps, kept as anchors so they follow source edits.
+    row_spacing: Vec<(Anchor, f32)>,
     pub(crate) fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
     pub(crate) masked: bool,
@@ -481,6 +484,7 @@ impl DisplayMap {
             block_map,
             crease_map,
             row_scales,
+            row_spacing: Vec::new(),
             fold_placeholder,
             diagnostics_max_severity,
             text_highlights: Default::default(),
@@ -634,6 +638,13 @@ impl DisplayMap {
         self.companion.as_ref().map(|(_, c)| c)
     }
 
+    /// Sets display-only gaps following anchored source rows, in line-height units.
+    /// Anchors are resolved into sparse physical geometry for each snapshot.
+    pub fn set_row_spacing(&mut self, row_spacing: Vec<(Anchor, f32)>, cx: &mut Context<Self>) {
+        self.row_spacing = row_spacing;
+        cx.notify();
+    }
+
     /// Renders the given ranges of rows at a multiple of the editor's font
     /// size, leaving row height alone - so the editor's leading has to cover
     /// the largest scale in use, or tall rows will collide with their
@@ -768,7 +779,7 @@ impl DisplayMap {
                 .ok()
         });
 
-        DisplaySnapshot {
+        let mut snapshot = DisplaySnapshot {
             display_map_id: self.entity_id,
             companion_display_snapshot,
             block_snapshot,
@@ -780,9 +791,12 @@ impl DisplayMap {
             clip_at_line_ends: self.clip_at_line_ends,
             masked: self.masked,
             row_scales: self.row_scales.clone(),
+            row_geometry: Default::default(),
             use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty(),
             fold_placeholder: self.fold_placeholder.clone(),
-        }
+        };
+        snapshot.row_geometry = snapshot.resolve_row_geometry(&self.row_spacing);
+        snapshot
     }
 
     fn snapshot_simple(&mut self, cx: &mut Context<Self>) -> DisplaySnapshot {
@@ -793,7 +807,7 @@ impl DisplayMap {
             .read(wrap_snapshot, wrap_edits, None)
             .snapshot;
 
-        DisplaySnapshot {
+        let mut snapshot = DisplaySnapshot {
             display_map_id: self.entity_id,
             companion_display_snapshot: None,
             block_snapshot,
@@ -805,9 +819,12 @@ impl DisplayMap {
             clip_at_line_ends: self.clip_at_line_ends,
             masked: self.masked,
             row_scales: self.row_scales.clone(),
+            row_geometry: Default::default(),
             use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty(),
             fold_placeholder: self.fold_placeholder.clone(),
-        }
+        };
+        snapshot.row_geometry = snapshot.resolve_row_geometry(&self.row_spacing);
+        snapshot
     }
 
     pub fn crease_snapshot(&self) -> CreaseSnapshot {
@@ -1895,6 +1912,7 @@ pub struct DisplaySnapshot {
     /// Anchored source ranges that render at a multiple of the editor's font
     /// size. Only the range near a painted row is resolved.
     row_scales: row_scale_map::RowScaleSnapshot,
+    row_geometry: row_geometry::RowGeometry,
     pub(crate) fold_placeholder: FoldPlaceholder,
     /// When true, LSP folding ranges are used via the crease map and the
     /// indent-based fallback in `crease_for_buffer_row` is skipped.
@@ -1904,6 +1922,55 @@ pub struct DisplaySnapshot {
 impl DisplaySnapshot {
     pub fn companion_snapshot(&self) -> Option<&DisplaySnapshot> {
         self.companion_display_snapshot.as_deref()
+    }
+
+    /// Converts a logical display-row coordinate to physical line-height units.
+    pub fn row_y(&self, row: f64) -> f64 {
+        self.row_geometry.row_y(row)
+    }
+
+    /// Converts physical line-height units to a logical display-row coordinate.
+    pub fn row_at_y(&self, y: f64) -> f64 {
+        self.row_geometry.row_at_y(y)
+    }
+
+    pub(crate) fn has_row_spacing(&self) -> bool {
+        !self.row_geometry.is_empty()
+    }
+
+    fn resolve_row_geometry(&self, spacing: &[(Anchor, f32)]) -> row_geometry::RowGeometry {
+        if spacing.is_empty() {
+            return row_geometry::RowGeometry::default();
+        }
+        let buffer = self.buffer_snapshot();
+        let max_buffer_row = buffer.max_point().row;
+        let mut gaps = Vec::with_capacity(spacing.len());
+        for &(anchor, gap) in spacing {
+            if !gap.is_finite() || gap <= 0.0 || !anchor.is_valid(buffer) {
+                continue;
+            }
+            let point = anchor.to_point(buffer);
+            let row_start = MultiBufferPoint::new(point.row, 0);
+            let display_start = self.point_to_display_point(row_start, Bias::Right);
+            if self.display_point_to_point(display_start, Bias::Right).row != point.row {
+                continue;
+            }
+            let line_end =
+                MultiBufferPoint::new(point.row, buffer.line_len(MultiBufferRow(point.row)));
+            let last_text_row = self.point_to_display_point(line_end, Bias::Left).row();
+            let boundary = if point.row < max_buffer_row {
+                let next_row = self
+                    .point_to_display_point(MultiBufferPoint::new(point.row + 1, 0), Bias::Left)
+                    .row();
+                DisplayRow(next_row.0.saturating_sub(1))
+            } else {
+                self.max_point().row()
+            };
+            if boundary >= last_text_row {
+                gaps.push((boundary.0, gap));
+            }
+        }
+        row_geometry::RowGeometry::new(gaps)
     }
 
     pub fn wrap_snapshot(&self) -> &WrapSnapshot {

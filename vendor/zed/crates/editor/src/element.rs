@@ -1201,7 +1201,8 @@ impl EditorElement {
                     }
 
                     let x = cursor_character_x - scroll_pixel_position.x.into();
-                    let y = ((cursor_position.row().as_f64() - scroll_position.y)
+                    let y = ((snapshot.row_y(cursor_position.row().as_f64())
+                        - snapshot.row_y(scroll_position.y))
                         * ScrollPixelOffset::from(line_height))
                     .into();
                     if selection.is_newest {
@@ -1212,7 +1213,9 @@ impl EditorElement {
 
                         if autoscroll_containing_element {
                             let top = text_hitbox.origin.y
-                                + ((cursor_position.row().as_f64() - scroll_position.y - 3.)
+                                + ((snapshot.row_y(cursor_position.row().as_f64())
+                                    - snapshot.row_y(scroll_position.y)
+                                    - 3.)
                                     .max(0.)
                                     * ScrollPixelOffset::from(line_height))
                                 .into();
@@ -1225,7 +1228,9 @@ impl EditorElement {
                                 .into();
 
                             let bottom = text_hitbox.origin.y
-                                + ((cursor_position.row().as_f64() - scroll_position.y + 4.)
+                                + ((snapshot.row_y(cursor_position.row().as_f64())
+                                    - snapshot.row_y(scroll_position.y)
+                                    + 4.)
                                     * ScrollPixelOffset::from(line_height))
                                 .into();
                             let right = text_hitbox.origin.x
@@ -1347,7 +1352,8 @@ impl EditorElement {
             + row_layout.alignment_offset(context.text_align, context.content_width)
             - context.scroll_pixel_position.x.into()
             + label.x_offset;
-        let label_y = ((label_row.as_f64() - context.scroll_position.y)
+        let label_y = ((context.display_snapshot.row_y(label_row.as_f64())
+            - context.display_snapshot.row_y(context.scroll_position.y))
             * ScrollPixelOffset::from(context.line_height))
         .into();
         let label_text_size = (context.editor_font_size * label.scale_factor.max(0.0)).max(px(1.0));
@@ -1449,7 +1455,7 @@ impl EditorElement {
             },
             scrollbar_layout_information,
             content_offset,
-            scroll_position,
+            point(scroll_position.x, snapshot.row_y(scroll_position.y)),
             self.style.scrollbar_width,
             right_margin,
             editor_width,
@@ -1469,6 +1475,11 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<MinimapLayout> {
+        // A minimap has its own display map and cannot mirror view-local gaps.
+        // Do not show a misleading compressed overview for decorated transcripts.
+        if snapshot.has_row_spacing() {
+            return None;
+        }
         let minimap_editor = self.editor.read(cx).minimap().cloned()?;
 
         let minimap_settings = EditorSettings::get_global(cx).minimap;
@@ -1643,6 +1654,7 @@ impl EditorElement {
 
     fn prepaint_crease_toggles(
         &self,
+        snapshot: &EditorSnapshot,
         crease_toggles: &mut [Option<AnyElement>],
         line_height: Pixels,
         gutter_dimensions: &GutterDimensions,
@@ -1665,7 +1677,9 @@ impl EditorElement {
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
                     gutter_dimensions.width - gutter_dimensions.right_padding,
-                    line_height * (display_row.as_f64() - scroll_position.y) as f32,
+                    line_height
+                        * (snapshot.row_y(display_row.as_f64()) - snapshot.row_y(scroll_position.y))
+                            as f32,
                 );
                 let centering_offset = point(
                     (gutter_dimensions.fold_area_width() - crease_toggle_size.width) / 2.,
@@ -1692,6 +1706,7 @@ impl EditorElement {
 
     fn prepaint_crease_trailers(
         &self,
+        snapshot: &EditorSnapshot,
         trailers: Vec<Option<AnyElement>>,
         lines: &[LineWithInvisibles],
         line_height: Pixels,
@@ -1723,7 +1738,8 @@ impl EditorElement {
                 let position = point(
                     Pixels::from(scroll_pixel_position.x) + line.width + padding,
                     line_height
-                        * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32,
+                        * (snapshot.row_y(DisplayRow(start_row.0 + ix as u32).as_f64())
+                            - snapshot.row_y(scroll_position.y)) as f32,
                 );
                 let centering_offset = point(px(0.), (line_height - size.height) / 2.);
                 let origin = content_origin + position + centering_offset;
@@ -1778,6 +1794,7 @@ impl EditorElement {
 
     fn layout_inline_diagnostics(
         &self,
+        snapshot: &EditorSnapshot,
         line_layouts: &[LineWithInvisibles],
         crease_trailers: &[Option<CreaseTrailerLayout>],
         row_block_types: &HashMap<DisplayRow, bool>,
@@ -1879,7 +1896,9 @@ impl EditorElement {
                 continue;
             };
 
-            let pos_y = content_origin.y + line_height * (row.0 as f64 - scroll_position.y) as f32;
+            let pos_y = content_origin.y
+                + line_height
+                    * (snapshot.row_y(row.as_f64()) - snapshot.row_y(scroll_position.y)) as f32;
 
             let window_ix = row.0.saturating_sub(start_row.0) as usize;
             let pos_x = {
@@ -2082,7 +2101,9 @@ impl EditorElement {
             .row();
 
         let start_y = content_origin.y
-            + (((new_display_row.as_f64() - scroll_position.y) as f32) * line_height)
+            + ((snapshot.row_y(new_display_row.as_f64()) - snapshot.row_y(scroll_position.y))
+                as f32
+                * line_height)
             + (line_height / 2.0)
             - (icon_size.square(window, cx) / 2.);
         let start_x = (ScrollPixelOffset::from(content_origin.x) - scroll_pixel_position.x
@@ -2143,8 +2164,9 @@ impl EditorElement {
                 ScrollPixelOffset::from(content_origin.x + line_layout.width)
                     - scroll_pixel_position.x,
             ) + em_width;
-            let start_y =
-                content_origin.y + line_height * ((row.as_f64() - scroll_position.y) as f32);
+            let start_y = content_origin.y
+                + line_height
+                    * (snapshot.row_y(row.as_f64()) - snapshot.row_y(scroll_position.y)) as f32;
             let mut element = renderer(window, cx);
             // The renderer's element is laid out at its intrinsic
             // height, which is typically shorter than the editor line;
@@ -2164,6 +2186,7 @@ impl EditorElement {
     #[cfg(feature = "native")]
     fn layout_inline_blame(
         &self,
+        snapshot: &EditorSnapshot,
         display_row: DisplayRow,
         row_info: &RowInfo,
         line_layout: &LineWithInvisibles,
@@ -2210,8 +2233,9 @@ impl EditorElement {
 
         let mut element = render_inline_blame_entry(entry.clone(), &self.style, cx)?;
 
-        let start_y =
-            content_origin.y + line_height * ((display_row.as_f64() - scroll_position.y) as f32);
+        let start_y = content_origin.y
+            + line_height
+                * (snapshot.row_y(display_row.as_f64()) - snapshot.row_y(scroll_position.y)) as f32;
 
         let start_x = {
             let line_end = if let Some(crease_trailer) = crease_trailer {
@@ -2315,8 +2339,10 @@ impl EditorElement {
             return None;
         }
 
-        let y =
-            content_origin.y + line_height * ((display_row.as_f64() - scroll_position.y) as f32);
+        let y = content_origin.y
+            + line_height
+                * ((editor_snapshot.row_y(display_row.as_f64())
+                    - editor_snapshot.row_y(scroll_position.y)) as f32);
         Some(RightPromptLayout {
             line,
             origin: point(prompt_x, y),
@@ -2428,6 +2454,7 @@ impl EditorElement {
 
     fn layout_blame_entries(
         &self,
+        snapshot: &EditorSnapshot,
         buffer_rows: &[RowInfo],
         em_width: Pixels,
         scroll_position: gpui::Point<ScrollOffset>,
@@ -2481,7 +2508,8 @@ impl EditorElement {
                 )?;
 
                 let start_y = line_height
-                    * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32;
+                    * (snapshot.row_y(DisplayRow(start_row.0 + ix as u32).as_f64())
+                        - snapshot.row_y(scroll_position.y)) as f32;
                 let absolute_offset = gutter_hitbox.origin + point(start_x, start_y);
 
                 element.prepaint_as_root(
@@ -2678,6 +2706,10 @@ impl EditorElement {
             row_range = row_range.start..cons_line;
         }
 
+        let start = offset_y / f64::from(line_height);
+        let end = start + f64::from(length / line_height);
+        offset_y = snapshot.row_y(start) * f64::from(line_height);
+        length = (snapshot.row_y(end) - snapshot.row_y(start)) as f32 * line_height;
         (offset_y, length, row_range)
     }
 
@@ -2883,6 +2915,7 @@ impl EditorElement {
 
     fn layout_expand_toggles(
         &self,
+        snapshot: &EditorSnapshot,
         gutter_hitbox: &Hitbox,
         gutter_dimensions: GutterDimensions,
         em_width: Pixels,
@@ -2962,7 +2995,8 @@ impl EditorElement {
                 let position = point(
                     git_gutter_width + px(1.),
                     line_height
-                        * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32
+                        * (snapshot.row_y(DisplayRow(start_row.0 + ix as u32).as_f64())
+                            - snapshot.row_y(scroll_position.y)) as f32
                         + px(1.),
                 );
                 let origin = gutter_hitbox.origin + position;
@@ -3039,17 +3073,18 @@ impl EditorElement {
 
                 let shaped_line =
                     self.shape_line_number(SharedString::from(&line_number), color, window);
-                let scroll_top =
-                    gutter.scroll_position.y * ScrollPixelOffset::from(gutter.line_height);
+                let scroll_top = gutter.snapshot.row_y(gutter.scroll_position.y)
+                    * ScrollPixelOffset::from(gutter.line_height);
                 let line_origin = gutter.hitbox.origin
                     + point(
                         gutter.hitbox.size.width
                             - shaped_line.width
                             - gutter.dimensions.right_padding,
-                        ix as f32 * gutter.line_height
-                            - Pixels::from(
-                                scroll_top % ScrollPixelOffset::from(gutter.line_height),
-                            ),
+                        Pixels::from(
+                            gutter.snapshot.row_y(display_row.as_f64())
+                                * ScrollPixelOffset::from(gutter.line_height)
+                                - scroll_top,
+                        ),
                     );
 
                 #[cfg(not(test))]
@@ -3346,6 +3381,7 @@ impl EditorElement {
                         fragments: smallvec![LineFragment::Text(line)],
                         invisibles: Vec::new(),
                         font_size,
+                        centered: false,
                     }
                 })
                 .collect()
@@ -3363,7 +3399,7 @@ impl EditorElement {
             let mut guard = gpui::profiler::EditorTimingGuard::new(
                 gpui::profiler::EditorTimingKind::HighlightedChunks,
             );
-            let lines = LineWithInvisibles::from_chunks(
+            let mut lines = LineWithInvisibles::from_chunks(
                 chunks,
                 style,
                 MAX_LINE_LEN,
@@ -3376,6 +3412,12 @@ impl EditorElement {
                 window,
                 cx,
             );
+            for anchor in snapshot.centered_rows.iter() {
+                let row = anchor.to_display_point(snapshot).row();
+                if row >= rows.start && row < rows.end {
+                    lines[(row.0 - rows.start.0) as usize].centered = true;
+                }
+            }
             let (nanos, count) = CHUNK_WORK.get();
             guard.touched_rows(rows.len() as u64);
             guard.walked_items(count);
@@ -3386,6 +3428,8 @@ impl EditorElement {
 
     fn prepaint_lines(
         &self,
+        snapshot: &EditorSnapshot,
+        content_width: Pixels,
         start_row: DisplayRow,
         line_layouts: &mut [LineWithInvisibles],
         line_height: Pixels,
@@ -3398,12 +3442,20 @@ impl EditorElement {
         let mut line_elements = SmallVec::new();
         for (ix, line) in line_layouts.iter_mut().enumerate() {
             let row = start_row + DisplayRow(ix as u32);
-            line.prepaint(
+            line.prepaint_with_custom_offset(
                 line_height,
-                scroll_position,
                 scroll_pixel_position,
-                row,
-                content_origin,
+                content_origin
+                    + point(
+                        if line.centered {
+                            line.alignment_offset(TextAlign::Center, content_width)
+                        } else {
+                            px(0.)
+                        },
+                        px(0.),
+                    ),
+                line_height
+                    * (snapshot.row_y(row.as_f64()) - snapshot.row_y(scroll_position.y)) as f32,
                 &mut line_elements,
                 window,
                 cx,
@@ -4021,6 +4073,7 @@ impl EditorElement {
 
     fn layout_blocks(
         &self,
+        snapshot: &EditorSnapshot,
         blocks: &mut Vec<BlockLayout>,
         hitbox: &Hitbox,
         gutter_hitbox: &Hitbox,
@@ -4037,7 +4090,7 @@ impl EditorElement {
                     + point(
                         block.x_offset,
                         Pixels::from(
-                            (row.as_f64() - scroll_position.y)
+                            (snapshot.row_y(row.as_f64()) - snapshot.row_y(scroll_position.y))
                                 * ScrollPixelOffset::from(line_height),
                         ),
                     )
@@ -4077,6 +4130,7 @@ impl EditorElement {
 
     fn layout_cursor_popovers(
         &self,
+        snapshot: &EditorSnapshot,
         line_height: Pixels,
         text_hitbox: &Hitbox,
         content_origin: gpui::Point<Pixels>,
@@ -4146,7 +4200,8 @@ impl EditorElement {
                 y: cmp::max(
                     px(0.),
                     Pixels::from(
-                        cursor.row().next_row().as_f64() * ScrollPixelOffset::from(line_height)
+                        snapshot.row_y(cursor.row().next_row().as_f64())
+                            * ScrollPixelOffset::from(line_height)
                             - scroll_pixel_position.y,
                     ),
                 ),
@@ -4296,6 +4351,7 @@ impl EditorElement {
 
     fn layout_gutter_menu(
         &self,
+        snapshot: &EditorSnapshot,
         line_height: Pixels,
         text_hitbox: &Hitbox,
         content_origin: gpui::Point<Pixels>,
@@ -4320,7 +4376,8 @@ impl EditorElement {
             + gpui::Point {
                 x: -gutter_overshoot,
                 y: Pixels::from(
-                    gutter_row.next_row().as_f64() * ScrollPixelOffset::from(line_height)
+                    snapshot.row_y(gutter_row.next_row().as_f64())
+                        * ScrollPixelOffset::from(line_height)
                         - scroll_pixel_position.y,
                 ),
             };
@@ -4673,7 +4730,7 @@ impl EditorElement {
         let x = hovered_row_layout.x_for_index(popover_position.column() as usize)
             - Pixels::from(scroll_pixel_position.x);
         let y = Pixels::from(
-            popover_position.row().as_f64() * ScrollPixelOffset::from(line_height)
+            snapshot.row_y(popover_position.row().as_f64()) * ScrollPixelOffset::from(line_height)
                 - scroll_pixel_position.y,
         );
         let hovered_point = content_origin + point(x, y);
@@ -4950,6 +5007,7 @@ impl EditorElement {
 
     fn layout_diff_hunk_controls(
         &self,
+        snapshot: &EditorSnapshot,
         row_range: Range<DisplayRow>,
         row_infos: &[RowInfo],
         text_hitbox: &Hitbox,
@@ -5019,7 +5077,7 @@ impl EditorElement {
                     .iter()
                     .any(|row| row.is_some_and(|row| display_row_range.contains(&row)))
                 {
-                    let hunk_start_y: Pixels = (display_row_range.start.as_f64()
+                    let hunk_start_y: Pixels = (snapshot.row_y(display_row_range.start.as_f64())
                         * ScrollPixelOffset::from(line_height)
                         + ScrollPixelOffset::from(text_hitbox.bounds.top())
                         - scroll_pixel_position.y)
@@ -5029,7 +5087,8 @@ impl EditorElement {
                         hunk_start_y
                     } else {
                         let hunk_end_y: Pixels = hunk_start_y
-                            + (display_row_range.len() as f64
+                            + ((snapshot.row_y(display_row_range.end.as_f64())
+                                - snapshot.row_y(display_row_range.start.as_f64()))
                                 * ScrollPixelOffset::from(line_height))
                             .into();
                         let max_y = hunk_end_y - line_height;
@@ -5073,6 +5132,7 @@ impl EditorElement {
 
     fn layout_signature_help(
         &self,
+        snapshot: &EditorSnapshot,
         hitbox: &Hitbox,
         content_origin: gpui::Point<Pixels>,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
@@ -5124,7 +5184,8 @@ impl EditorElement {
         let target_x = cursor_row_layout.x_for_index(newest_selection_head.column() as usize)
             - Pixels::from(scroll_pixel_position.x);
         let target_y = Pixels::from(
-            selection_row.as_f64() * ScrollPixelOffset::from(line_height) - scroll_pixel_position.y,
+            snapshot.row_y(selection_row.as_f64()) * ScrollPixelOffset::from(line_height)
+                - scroll_pixel_position.y,
         );
         let target_point = content_origin + point(target_x, target_y);
 
@@ -5269,7 +5330,11 @@ impl EditorElement {
                                     range.start,
                                     layout.hitbox.origin.y
                                         + Pixels::from(
-                                            (start_row.as_f64() - scroll_top)
+                                            (layout
+                                                .position_map
+                                                .snapshot
+                                                .row_y(start_row.as_f64())
+                                                - layout.position_map.snapshot.row_y(scroll_top))
                                                 * ScrollPixelOffset::from(
                                                     layout.position_map.line_height,
                                                 ),
@@ -5278,7 +5343,12 @@ impl EditorElement {
                                 size: size(
                                     range.end - range.start,
                                     layout.position_map.line_height
-                                        * (end_row - start_row.0 + 1) as f32,
+                                        * (layout.position_map.snapshot.row_y(end_row as f64 + 1.)
+                                            - layout
+                                                .position_map
+                                                .snapshot
+                                                .row_y(start_row.as_f64()))
+                                            as f32,
                                 ),
                             };
                             window.paint_quad(fill(bounds, active_line_bg));
@@ -5301,14 +5371,26 @@ impl EditorElement {
                         origin_x,
                         layout.hitbox.origin.y
                             + Pixels::from(
-                                (highlight_row_start.as_f64() - scroll_top)
+                                (layout
+                                    .position_map
+                                    .snapshot
+                                    .row_y(highlight_row_start.as_f64())
+                                    - layout.position_map.snapshot.row_y(scroll_top))
                                     * ScrollPixelOffset::from(layout.position_map.line_height),
                             ),
                     );
                     let size = size(
                         width,
                         layout.position_map.line_height
-                            * highlight_row_end.next_row().minus(highlight_row_start) as f32,
+                            * (layout
+                                .position_map
+                                .snapshot
+                                .row_y(highlight_row_end.next_row().as_f64())
+                                - layout
+                                    .position_map
+                                    .snapshot
+                                    .row_y(highlight_row_start.as_f64()))
+                                as f32,
                     );
                     let mut quad = fill(Bounds { origin, size }, highlight.background);
                     if let Some(border_color) = highlight.border {
@@ -5650,12 +5732,13 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         cx: &App,
     ) -> Bounds<Pixels> {
-        let scroll_top = scroll_position.y * ScrollPixelOffset::from(line_height);
+        let scroll_top = snapshot.row_y(scroll_position.y) * ScrollPixelOffset::from(line_height);
         let gutter_strip_width = Self::gutter_strip_width(line_height, cx);
 
         match hunk {
             DisplayDiffHunk::Folded { display_row, .. } => {
-                let start_y = (display_row.as_f64() * ScrollPixelOffset::from(line_height)
+                let start_y = (snapshot.row_y(display_row.as_f64())
+                    * ScrollPixelOffset::from(line_height)
                     - scroll_top)
                     .into();
                 let end_y = start_y + line_height;
@@ -5672,9 +5755,11 @@ impl EditorElement {
                     let row = display_row_range.start;
 
                     let offset = ScrollPixelOffset::from(line_height / 2.);
-                    let start_y =
-                        (row.as_f64() * ScrollPixelOffset::from(line_height) - offset - scroll_top)
-                            .into();
+                    let start_y = (snapshot.row_y(row.as_f64())
+                        * ScrollPixelOffset::from(line_height)
+                        - offset
+                        - scroll_top)
+                        .into();
                     let end_y = start_y + line_height;
 
                     let width = match EditorSettings::get_global(cx).gutter.git_gutter_width {
@@ -5707,11 +5792,13 @@ impl EditorElement {
                         })
                         .unwrap_or(end_row);
 
-                    let start_y = (start_row.as_f64() * ScrollPixelOffset::from(line_height)
+                    let start_y = (snapshot.row_y(start_row.as_f64())
+                        * ScrollPixelOffset::from(line_height)
                         - scroll_top)
                         .into();
                     let end_y = Pixels::from(
-                        end_row_in_current_excerpt.as_f64() * ScrollPixelOffset::from(line_height)
+                        snapshot.row_y(end_row_in_current_excerpt.as_f64())
+                            * ScrollPixelOffset::from(line_height)
                             - scroll_top,
                     );
 
@@ -5802,17 +5889,16 @@ impl EditorElement {
 
         let snapshot = &layout.position_map.snapshot.display_snapshot;
         let line_height = layout.position_map.line_height;
-        let side = line_height * 1.5;
         let images = self
             .editor
             .read(cx)
             .gutter_images
             .iter()
-            .filter_map(|(anchor, image)| {
+            .filter_map(|(anchor, (end, image))| {
                 let row = anchor.to_display_point(snapshot).row();
                 (row.0 + 2 > layout.visible_display_row_range.start.0
                     && row < layout.visible_display_row_range.end)
-                    .then(|| (row, image.clone()))
+                    .then(|| (row, end.to_display_point(snapshot).row(), image.clone()))
             })
             .collect::<Vec<_>>();
         window.with_content_mask(
@@ -5820,14 +5906,20 @@ impl EditorElement {
                 bounds: layout.gutter_hitbox.bounds,
             }),
             |window| {
-                for (row, image) in images {
+                for (row, end, image) in images {
+                    let side = line_height * if row == end { 1.0 } else { 1.5 };
                     let y = layout.gutter_hitbox.top()
                         + Pixels::from(
-                            row.0 as f64 * ScrollPixelOffset::from(line_height)
+                            snapshot.row_y(row.as_f64()) * ScrollPixelOffset::from(line_height)
                                 - layout.position_map.scroll_pixel_position.y,
                         );
-                    let bounds =
-                        Bounds::new(point(layout.gutter_hitbox.left(), y), size(side, side));
+                    let bounds = Bounds::new(
+                        point(
+                            layout.gutter_hitbox.left() + (line_height * 1.5 - side) / 2.,
+                            y,
+                        ),
+                        size(side, side),
+                    );
                     window
                         .paint_image(bounds, bounds, Corners::all(side * 0.12), image, 0, false)
                         .log_err();
@@ -5857,13 +5949,16 @@ impl EditorElement {
 
                 let start_y = layout.gutter_hitbox.top()
                     + Pixels::from(
-                        start_row.0 as f64
+                        layout.position_map.snapshot.row_y(start_row.as_f64())
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - layout.position_map.scroll_pixel_position.y,
                     );
                 let end_y = layout.gutter_hitbox.top()
                     + Pixels::from(
-                        (end_row.0 + 1) as f64
+                        layout
+                            .position_map
+                            .snapshot
+                            .row_y(end_row.next_row().as_f64())
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - layout.position_map.scroll_pixel_position.y,
                     );
@@ -6268,11 +6363,17 @@ impl EditorElement {
                         if (hitbox.origin.along(axis)..hitbox.bottom_right().along(axis))
                             .contains(&old_position)
                         {
+                            let snapshot = editor.display_snapshot(cx);
                             let position = editor.scroll_position(cx).apply_along(axis, |p| {
-                                (p + ScrollOffset::from(
+                                let delta = ScrollOffset::from(
                                     (new_position - old_position) / *text_unit_size,
-                                ))
-                                .max(0.)
+                                );
+                                match axis {
+                                    ScrollbarAxis::Vertical => {
+                                        snapshot.row_at_y((snapshot.row_y(p) + delta).max(0.))
+                                    }
+                                    ScrollbarAxis::Horizontal => (p + delta).max(0.),
+                                }
                             });
                             editor.set_scroll_position(position, window, cx);
                         }
@@ -6363,9 +6464,16 @@ impl EditorElement {
                                 (visible_range.end - visible_range.start) as u32 / 2,
                             );
 
-                            let position = editor
-                                .scroll_position(cx)
-                                .apply_along(axis, |_| start_position as ScrollOffset);
+                            let snapshot = editor.display_snapshot(cx);
+                            let position =
+                                editor
+                                    .scroll_position(cx)
+                                    .apply_along(axis, |_| match axis {
+                                        ScrollbarAxis::Vertical => {
+                                            snapshot.row_at_y(start_position as ScrollOffset)
+                                        }
+                                        ScrollbarAxis::Horizontal => start_position as ScrollOffset,
+                                    });
 
                             editor.set_scroll_position(position, window, cx);
                         } else {
@@ -6624,7 +6732,11 @@ impl EditorElement {
                 corner_radius,
                 start_y: layout.content_origin.y
                     + Pixels::from(
-                        (row_range.start.as_f64() - layout.position_map.scroll_position.y)
+                        (layout.position_map.snapshot.row_y(row_range.start.as_f64())
+                            - layout
+                                .position_map
+                                .snapshot
+                                .row_y(layout.position_map.scroll_position.y))
                             * ScrollOffset::from(layout.position_map.line_height),
                     ),
                 lines: row_range
@@ -6670,7 +6782,30 @@ impl EditorElement {
                     .collect(),
             };
 
-            highlighted_range.paint(fill, layout.position_map.text_hitbox.bounds, window);
+            let snapshot = &layout.position_map.snapshot;
+            let first = row_range.start.as_f64();
+            let last = row_range.end.as_f64();
+            if snapshot.row_y(last) - snapshot.row_y(first) != last - first {
+                // Selection contains source text, not the decorative gaps.
+                for (ix, line) in highlighted_range.lines.into_iter().enumerate() {
+                    HighlightedRange {
+                        start_y: layout.content_origin.y
+                            + layout.position_map.line_height
+                                * (snapshot.row_y(first + ix as f64)
+                                    - snapshot.row_y(layout.position_map.scroll_position.y))
+                                    as f32,
+                        lines: vec![line],
+                        ..highlighted_range
+                    }
+                    .paint(
+                        fill,
+                        layout.position_map.text_hitbox.bounds,
+                        window,
+                    );
+                }
+            } else {
+                highlighted_range.paint(fill, layout.position_map.text_hitbox.bounds, window);
+            }
         }
     }
 
@@ -7172,7 +7307,8 @@ impl Gutter<'_> {
         let x = git_gutter_width + px(2.);
 
         let mut y = Pixels::from(
-            (row.as_f64() - self.scroll_position.y) * ScrollPixelOffset::from(self.line_height),
+            (self.snapshot.row_y(row.as_f64()) - self.snapshot.row_y(self.scroll_position.y))
+                * ScrollPixelOffset::from(self.line_height),
         );
         y += (self.line_height - indicator_size.height) / 2.;
 
@@ -7496,6 +7632,7 @@ pub(crate) struct LineWithInvisibles {
     len: usize,
     pub(crate) width: Pixels,
     font_size: Pixels,
+    centered: bool,
 }
 
 enum LineFragment {
@@ -7705,6 +7842,7 @@ impl LineWithInvisibles {
                             fragments: mem::take(&mut fragments),
                             invisibles: std::mem::take(&mut invisibles),
                             font_size,
+                            centered: false,
                         });
 
                         line.clear();
@@ -7868,29 +8006,6 @@ impl LineWithInvisibles {
         output_runs
     }
 
-    fn prepaint(
-        &mut self,
-        line_height: Pixels,
-        scroll_position: gpui::Point<ScrollOffset>,
-        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
-        row: DisplayRow,
-        content_origin: gpui::Point<Pixels>,
-        line_elements: &mut SmallVec<[AnyElement; 1]>,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let line_y = f32::from(line_height) * Pixels::from(row.as_f64() - scroll_position.y);
-        self.prepaint_with_custom_offset(
-            line_height,
-            scroll_pixel_position,
-            content_origin,
-            line_y,
-            line_elements,
-            window,
-            cx,
-        );
-    }
-
     fn prepaint_with_custom_offset(
         &mut self,
         line_height: Pixels,
@@ -7940,7 +8055,11 @@ impl LineWithInvisibles {
             row,
             content_origin,
             layout.position_map.line_height
-                * (row.as_f64() - layout.position_map.scroll_position.y) as f32,
+                * (layout.position_map.snapshot.row_y(row.as_f64())
+                    - layout
+                        .position_map
+                        .snapshot
+                        .row_y(layout.position_map.scroll_position.y)) as f32,
             whitespace_setting,
             selection_ranges,
             window,
@@ -7962,7 +8081,8 @@ impl LineWithInvisibles {
         let line_height = layout.position_map.line_height;
         let mut fragment_origin = content_origin
             + gpui::point(
-                Pixels::from(-layout.position_map.scroll_pixel_position.x),
+                Pixels::from(-layout.position_map.scroll_pixel_position.x)
+                    + self.alignment_offset(layout.text_align, layout.content_width),
                 line_y,
             );
 
@@ -7976,8 +8096,8 @@ impl LineWithInvisibles {
                         ),
                         fragment_origin,
                         line_height,
-                        layout.text_align,
-                        Some(layout.content_width),
+                        TextAlign::Left,
+                        None,
                         window,
                         cx,
                     )
@@ -8012,11 +8132,17 @@ impl LineWithInvisibles {
         cx: &mut App,
     ) {
         let line_height = layout.position_map.line_height;
-        let line_y = line_height * (row.as_f64() - layout.position_map.scroll_position.y) as f32;
+        let line_y = line_height
+            * (layout.position_map.snapshot.row_y(row.as_f64())
+                - layout
+                    .position_map
+                    .snapshot
+                    .row_y(layout.position_map.scroll_position.y)) as f32;
 
         let mut fragment_origin = content_origin
             + gpui::point(
-                Pixels::from(-layout.position_map.scroll_pixel_position.x),
+                Pixels::from(-layout.position_map.scroll_pixel_position.x)
+                    + self.alignment_offset(layout.text_align, layout.content_width),
                 line_y,
             );
 
@@ -8026,8 +8152,8 @@ impl LineWithInvisibles {
                     line.paint_background(
                         fragment_origin,
                         line_height,
-                        layout.text_align,
-                        Some(layout.content_width),
+                        TextAlign::Left,
+                        None,
                         window,
                         cx,
                     )
@@ -8277,7 +8403,11 @@ impl LineWithInvisibles {
 
     pub fn alignment_offset(&self, text_align: TextAlign, content_width: Pixels) -> Pixels {
         let line_width = self.width;
-        match text_align {
+        match if self.centered {
+            TextAlign::Center
+        } else {
+            text_align
+        } {
             TextAlign::Left => px(0.0),
             TextAlign::Center => (content_width - line_width) / 2.0,
             TextAlign::Right => content_width - line_width,
@@ -8659,8 +8789,10 @@ impl Element for EditorElement {
                             let snapshot = editor.snapshot(window, cx);
                             let line_height =
                                 self.style.text.line_height_in_pixels(window.rem_size());
-                            let scroll_height =
-                                (snapshot.max_point().row().next_row().0 as f32) * line_height;
+                            let scroll_height = snapshot
+                                .row_y(snapshot.max_point().row().next_row().as_f64())
+                                as f32
+                                * line_height;
                             style.size.height = scroll_height.into();
                         } else {
                             style.size.height = relative(1.).into();
@@ -8820,7 +8952,7 @@ impl Element for EditorElement {
                     let content_origin = text_hitbox.origin + content_offset;
 
                     let height_in_lines = f64::from(bounds.size.height / line_height);
-                    let max_row = snapshot.max_point().row().as_f64();
+                    let max_row = snapshot.row_y(snapshot.max_point().row().as_f64());
 
                     // Calculate how much of the editor is clipped by parent containers (e.g., List).
                     // This allows us to only render lines that are actually visible, which is
@@ -8835,7 +8967,7 @@ impl Element for EditorElement {
 
                     // The max scroll position for the top of the window
                     let scroll_beyond_last_line = self.editor.read(cx).scroll_beyond_last_line(cx);
-                    let max_scroll_top = match scroll_beyond_last_line {
+                    let max_scroll_top = snapshot.row_at_y(match scroll_beyond_last_line {
                         ScrollBeyondLastLine::OnePage => max_row,
                         ScrollBeyondLastLine::Off => (max_row - height_in_lines + 1.).max(0.),
                         ScrollBeyondLastLine::VerticalScrollMargin => {
@@ -8843,7 +8975,7 @@ impl Element for EditorElement {
                             (max_row - height_in_lines + 1. + settings.vertical_scroll_margin)
                                 .max(0.)
                         }
-                    };
+                    });
 
                     let (
                         autoscroll_request,
@@ -8876,9 +9008,11 @@ impl Element for EditorElement {
 
                     let mut scroll_position = snapshot.scroll_position();
                     if !line_height.is_zero() {
-                        scroll_position.y = window
-                            .pixel_snap_f64(scroll_position.y * f64::from(line_height))
-                            / f64::from(line_height);
+                        scroll_position.y = snapshot.row_at_y(
+                            window.pixel_snap_f64(
+                                snapshot.row_y(scroll_position.y) * f64::from(line_height),
+                            ) / f64::from(line_height),
+                        );
                     }
                     // The scroll position is a fractional point, the whole number of which represents
                     // the top of the window in terms of display rows.
@@ -8886,12 +9020,21 @@ impl Element for EditorElement {
                     // but we don't modify scroll_position itself since the parent handles positioning.
                     let max_row = snapshot.max_point().row();
                     let start_row = cmp::min(
-                        DisplayRow((scroll_position.y + clipped_top_in_lines).floor() as u32),
+                        DisplayRow(
+                            snapshot
+                                .row_at_y(snapshot.row_y(scroll_position.y) + clipped_top_in_lines)
+                                .floor() as u32,
+                        ),
                         max_row,
                     );
                     let end_row = cmp::min(
-                        (scroll_position.y + clipped_top_in_lines + visible_height_in_lines).ceil()
-                            as u32,
+                        snapshot
+                            .row_at_y(
+                                snapshot.row_y(scroll_position.y)
+                                    + clipped_top_in_lines
+                                    + visible_height_in_lines,
+                            )
+                            .ceil() as u32,
                         max_row.next_row().0,
                     );
                     let end_row = DisplayRow(end_row);
@@ -9232,6 +9375,7 @@ impl Element for EditorElement {
                     let mut expand_toggles =
                         window.with_element_namespace("expand_toggles", |window| {
                             self.layout_expand_toggles(
+                                &snapshot,
                                 &gutter_hitbox,
                                 gutter_dimensions,
                                 em_width,
@@ -9431,7 +9575,7 @@ impl Element for EditorElement {
                         glyph_grid_cell,
                         size(
                             longest_line_width,
-                            Pixels::from(max_row.as_f64() * f64::from(line_height)),
+                            Pixels::from(snapshot.row_y(max_row.as_f64()) * f64::from(line_height)),
                         ),
                         longest_line_blame_width,
                         EditorSettings::get_global(cx),
@@ -9455,7 +9599,7 @@ impl Element for EditorElement {
 
                     let preliminary_scroll_pixel_position = point(
                         scroll_position.x * f64::from(em_layout_width),
-                        scroll_position.y * f64::from(line_height),
+                        snapshot.row_y(scroll_position.y) * f64::from(line_height),
                     );
                     let indent_guides = self.layout_indent_guides(
                         content_origin,
@@ -9587,7 +9731,7 @@ impl Element for EditorElement {
 
                     let scroll_pixel_position = point(
                         scroll_position.x * f64::from(em_layout_width),
-                        scroll_position.y * f64::from(line_height),
+                        snapshot.row_y(scroll_position.y) * f64::from(line_height),
                     );
                     #[cfg(feature = "native")]
                     let sticky_headers = if !is_minimap
@@ -9632,6 +9776,7 @@ impl Element for EditorElement {
                     let crease_trailers =
                         window.with_element_namespace("crease_trailers", |window| {
                             self.prepaint_crease_trailers(
+                                &snapshot,
                                 crease_trailers,
                                 &line_layouts,
                                 line_height,
@@ -9656,7 +9801,8 @@ impl Element for EditorElement {
                                 &snapshot,
                                 start_row..end_row,
                                 scroll_position.y,
-                                scroll_position.y + height_in_lines,
+                                snapshot
+                                    .row_at_y(snapshot.row_y(scroll_position.y) + height_in_lines),
                                 &line_layouts,
                                 line_height,
                                 scroll_position,
@@ -9672,6 +9818,7 @@ impl Element for EditorElement {
 
                     #[cfg(feature = "native")]
                     let mut inline_diagnostics = self.layout_inline_diagnostics(
+                        &snapshot,
                         &line_layouts,
                         &crease_trailers,
                         &row_block_types,
@@ -9747,6 +9894,7 @@ impl Element for EditorElement {
                             ) {
                                 let crease_trailer_layout = crease_trailer.as_ref();
                                 if let Some(layout) = self.layout_inline_blame(
+                                    &snapshot,
                                     display_row,
                                     row_info,
                                     line_layout,
@@ -9779,6 +9927,7 @@ impl Element for EditorElement {
 
                     #[cfg(feature = "native")]
                     let blamed_display_rows = self.layout_blame_entries(
+                        &snapshot,
                         &row_infos,
                         em_width,
                         scroll_position,
@@ -9792,6 +9941,8 @@ impl Element for EditorElement {
 
                     passes.mark("prepaint/blocks");
                     let line_elements = self.prepaint_lines(
+                        &snapshot,
+                        text_hitbox.size.width,
                         start_row,
                         &mut line_layouts,
                         line_height,
@@ -9805,6 +9956,7 @@ impl Element for EditorElement {
 
                     window.with_element_namespace("blocks", |window| {
                         self.layout_blocks(
+                            &snapshot,
                             &mut blocks,
                             &hitbox,
                             &gutter_hitbox,
@@ -9816,6 +9968,7 @@ impl Element for EditorElement {
                             cx,
                         );
                         self.layout_blocks(
+                            &snapshot,
                             &mut spacer_blocks,
                             &hitbox,
                             &gutter_hitbox,
@@ -9888,6 +10041,7 @@ impl Element for EditorElement {
                                 newest_selection_head.to_point(&snapshot.display_snapshot);
                             if (start_row..end_row).contains(&newest_selection_head.row()) {
                                 self.layout_cursor_popovers(
+                                    &snapshot,
                                     line_height,
                                     &text_hitbox,
                                     content_origin,
@@ -9910,6 +10064,7 @@ impl Element for EditorElement {
 
                     #[cfg(feature = "native")]
                     self.layout_gutter_menu(
+                        &snapshot,
                         line_height,
                         &text_hitbox,
                         content_origin,
@@ -10041,6 +10196,7 @@ impl Element for EditorElement {
 
                     #[cfg(feature = "native")]
                     self.layout_signature_help(
+                        &snapshot,
                         &hitbox,
                         content_origin,
                         scroll_pixel_position,
@@ -10084,6 +10240,7 @@ impl Element for EditorElement {
 
                     window.with_element_namespace("crease_toggles", |window| {
                         self.prepaint_crease_toggles(
+                            &snapshot,
                             &mut crease_toggles,
                             line_height,
                             &gutter_dimensions,
@@ -10183,7 +10340,9 @@ impl Element for EditorElement {
                         let offset = match display_row {
                             Some(display_row) => {
                                 let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
-                                let offset = (scroll_position.y - max_row as f64).max(0.0);
+                                let offset = (snapshot.row_y(scroll_position.y)
+                                    - snapshot.row_y(max_row as f64))
+                                .max(0.0);
                                 let slide_up =
                                     Pixels::from(offset * ScrollPixelOffset::from(line_height));
 
@@ -10204,6 +10363,7 @@ impl Element for EditorElement {
                             (vec![], vec![])
                         } else {
                             self.layout_diff_hunk_controls(
+                                &snapshot,
                                 start_row..end_row,
                                 &row_infos,
                                 &text_hitbox,
@@ -11100,7 +11260,10 @@ impl PositionMap {
         let position = position - text_bounds.origin;
         let y = position.y.max(px(0.)).min(self.size.height);
         let x = position.x + (scroll_position.x as f32 * self.em_layout_width);
-        let row = ((y / self.line_height) as f64 + scroll_position.y) as u32;
+        let row = self
+            .snapshot
+            .row_at_y((y / self.line_height) as f64 + self.snapshot.row_y(scroll_position.y))
+            .floor() as u32;
 
         let (column, x_overshoot_after_line_end) = if let Some(line_index) =
             row.checked_sub(self.visible_row_range.start.0)
@@ -11217,7 +11380,7 @@ pub fn layout_line(
         diagnostics: true,
     };
     let chunks = snapshot.highlighted_chunks(row..row + DisplayRow(1), language_aware, style);
-    LineWithInvisibles::from_chunks(
+    let mut line = LineWithInvisibles::from_chunks(
         chunks,
         style,
         MAX_LINE_LEN,
@@ -11231,7 +11394,12 @@ pub fn layout_line(
         cx,
     )
     .pop()
-    .unwrap()
+    .unwrap();
+    line.centered = snapshot
+        .centered_rows
+        .iter()
+        .any(|anchor| anchor.to_display_point(snapshot).row() == row);
+    line
 }
 
 #[derive(Debug, Clone)]
@@ -11632,7 +11800,8 @@ fn compute_auto_height_layout(
         snapshot = editor.snapshot(window, cx);
     }
 
-    let scroll_height = (snapshot.max_point().row().next_row().0 as f32) * line_height;
+    let scroll_height =
+        snapshot.row_y(snapshot.max_point().row().next_row().as_f64()) as f32 * line_height;
 
     let min_height = line_height * min_lines as f32;
     let content_height = scroll_height.max(min_height);

@@ -40,6 +40,7 @@ mod minibuffer;
 mod prose_buffers;
 mod record_anchors;
 mod removing_a_turn_after_growth;
+mod row_spacing;
 mod running_turn_elapsed;
 mod scene_walk;
 pub(super) mod story;
@@ -85,7 +86,7 @@ fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &m
                 .anchor_before(editor::MultiBufferOffset(0));
             let before = editor.display_snapshot(cx).text();
             let image = std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::new()));
-            editor.set_gutter_image(anchor, Some(image), cx);
+            editor.set_gutter_image(anchor, Some((anchor, image)), cx);
             let dimensions = editor
                 .snapshot(window, cx)
                 .gutter_dimensions(font_id, font_size, &style, window, cx);
@@ -106,6 +107,77 @@ fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &m
             );
         })
         .unwrap();
+}
+
+#[gpui::test]
+fn centered_rows_and_fractional_gaps_share_paint_and_hit_geometry(cx: &mut TestAppContext) {
+    use text::Bias;
+    cx.update(init_test_app);
+    let window = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        rho_window::editor_config::configure(&mut editor, window, cx);
+        editor.set_text(
+            "Mon 1 Jun\nshort\nlonger body\nlast\nTue 2 Jun\ntail",
+            window,
+            cx,
+        );
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = |row| snapshot.anchor_after(language::Point::new(row, 0));
+        editor.set_centered_rows(vec![anchor(0), anchor(4)], cx);
+        editor.set_row_spacing(vec![(anchor(1), 0.5), (anchor(3), 0.25)], cx);
+        editor
+    });
+    for width in [740., 430.] {
+        cx.simulate_window_resize(*window, size(px(width), px(600.)));
+        cx.run_until_parked();
+        cx.draw_window(*window);
+        window
+            .update(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let line_height = editor
+                    .style(cx)
+                    .text
+                    .line_height_in_pixels(window.rem_size());
+                let position =
+                    |editor: &mut Editor, row, column, window: &mut gpui::Window, cx: &mut App| {
+                        editor
+                            .window_position_for_display_point(
+                                DisplayPoint::new(DisplayRow(row), column),
+                                &snapshot,
+                                window,
+                                cx,
+                            )
+                            .unwrap()
+                    };
+                let origin = position(editor, 1, 0, window, cx);
+                let next = position(editor, 2, 0, window, cx);
+                assert!((f32::from(next.y - origin.y) - f32::from(line_height) * 1.5).abs() < 0.1);
+                let date = position(editor, 4, 0, window, cx);
+                let first_date = position(editor, 0, 0, window, cx);
+                assert!(
+                    (f32::from(date.y - first_date.y) - f32::from(line_height) * 4.75).abs() < 0.1
+                );
+                assert!(date.x > origin.x + px(80.), "dates center; body stays left");
+                for (row, offset) in [(0, 0), (1, 10), (2, 16), (3, 28), (4, 33), (5, 43)] {
+                    let pos =
+                        position(editor, row, 0, window, cx) + point(px(1.), line_height * 0.5);
+                    let (_, _, hit) = editor
+                        .buffer_location_for_window_position(pos, Bias::Left)
+                        .unwrap();
+                    assert_eq!(hit, offset, "row {row}, viewport width {width}");
+                }
+                let gap = origin + point(px(1.), line_height * 1.25);
+                let (_, _, hit) = editor
+                    .buffer_location_for_window_position(gap, Bias::Left)
+                    .unwrap();
+                assert_eq!(hit, 10, "gap clicks map to the preceding text row");
+                assert_eq!(
+                    snapshot.text(),
+                    "Mon 1 Jun\nshort\nlonger body\nlast\nTue 2 Jun\ntail"
+                );
+            })
+            .unwrap();
+    }
 }
 
 #[gpui::test]
