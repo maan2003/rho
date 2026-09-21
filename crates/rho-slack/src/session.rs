@@ -19,10 +19,10 @@ use crate::api::{Client, SearchPage};
 use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
-use crate::mirror::{Mirror, Scope};
+use crate::mirror::{Mirror, Saved, Scope};
 use crate::model::{Change, ConversationRow, Model, Unit, UnitCard};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
-use crate::types::{ChannelId, Message, Reaction, ThreadKey, Ts, UserId};
+use crate::types::{ChannelId, Message, Reaction, Reason, ThreadKey, Ts, UserId};
 
 /// How often health is re-examined. An outage produces no events at all, so
 /// something has to look at the clock.
@@ -92,6 +92,16 @@ pub enum SessionEvent {
 pub struct Found {
     pub query: String,
     pub page: Result<SearchPage, SearchRefused>,
+}
+
+/// One row in Activity or Saved. It is a place, not a dealer verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityEntry {
+    pub source: Source,
+    pub ts: Ts,
+    pub conversation: String,
+    pub summary: String,
+    pub unread: bool,
 }
 
 /// Why a search did not answer, in the terms the reader is told it in.
@@ -1183,6 +1193,42 @@ impl Session {
         true
     }
 
+    /// Moves Slack's read cursor to immediately before `ts`, and clears
+    /// rho's handled cursor to the same point. This is Slack's real
+    /// mark-unread operation (`conversations.mark` or
+    /// `subscriptions.thread.mark`), not a local badge.
+    pub fn mark_unread_from(&mut self, source: &Source, ts: &Ts, cx: &mut Context<Self>) {
+        let unit = match source {
+            Source::Conversation(channel) => Unit::conversation(channel),
+            Source::Thread(key) => Unit::thread(&key.channel, &key.thread_ts),
+        };
+        let before = self
+            .loaded
+            .get(source)
+            .and_then(|loaded| {
+                loaded
+                    .messages
+                    .iter()
+                    .take_while(|message| message.ts != *ts)
+                    .last()
+                    .map(|message| message.ts.clone())
+            })
+            .unwrap_or_else(|| {
+                let micros = (ts.epoch_seconds() * 1_000_000.0) as i64 - 1;
+                Ts(format!(
+                    "{}.{:06}",
+                    micros.div_euclid(1_000_000),
+                    micros.rem_euclid(1_000_000)
+                ))
+            });
+        self.model.undo_handled(&unit, Some(before.clone()));
+        self.model.undo_read(&unit, Some(before.clone()));
+        self.write_handled();
+        self.outbox.insert(unit, before);
+        self.drain_outbox(cx);
+        cx.notify();
+    }
+
     /// A cursor the store already held, put where cursors live now. Not
     /// pushed: it is a record of verdicts made before rho ever pushed a
     /// read mark, and a start is not the moment to mark a hundred
@@ -1427,6 +1473,101 @@ impl Session {
         match self.mirror.as_deref() {
             Some(mirror) => unit_summary(&self.model, mirror, unit),
             None => String::new(),
+        }
+    }
+
+    /// Mentions, direct messages, and followed threads rho knows about,
+    /// including read items. This is deliberately a superset of the dealer.
+    pub fn activity(&self) -> Vec<ActivityEntry> {
+        let mut rows = self
+            .model
+            .tracked()
+            .into_iter()
+            .filter(|unit| {
+                self.model.unit(unit).is_some_and(|facts| {
+                    matches!(
+                        facts.reason,
+                        Reason::Mention | Reason::DirectMessage | Reason::Thread
+                    )
+                })
+            })
+            .filter_map(|unit| {
+                let facts = self.model.unit(&unit)?;
+                let source = match &unit.thread {
+                    Some(root) => Source::Thread(self.model.key(&unit.channel, root)),
+                    None => Source::Conversation(unit.channel.clone()),
+                };
+                Some(ActivityEntry {
+                    source,
+                    ts: facts.newest.clone(),
+                    conversation: self.model.label(&unit.channel),
+                    summary: self.unit_summary(&unit),
+                    unread: self.model.attention(&unit).is_some(),
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| right.ts.epoch_seconds().total_cmp(&left.ts.epoch_seconds()));
+        rows
+    }
+
+    /// The local Later inventory. Slack has no supported API for its current
+    /// Later list, so these are exactly the messages saved in rho.
+    pub fn saved(&self) -> Vec<ActivityEntry> {
+        let Some(mirror) = self.mirror.as_ref() else {
+            return Vec::new();
+        };
+        mirror
+            .saved(&self.model.workspace().0)
+            .into_iter()
+            .map(|saved| {
+                let source = match saved.thread {
+                    Some(root) => Source::Thread(self.model.key(&saved.channel, &root)),
+                    None => Source::Conversation(saved.channel.clone()),
+                };
+                ActivityEntry {
+                    conversation: self.model.label(&saved.channel),
+                    summary: String::new(),
+                    source,
+                    ts: saved.ts,
+                    unread: false,
+                }
+            })
+            .collect()
+    }
+
+    pub fn is_saved_for_later(&self, source: &Source, ts: &Ts) -> bool {
+        self.mirror.as_ref().is_some_and(|mirror| {
+            mirror.saved(&self.model.workspace().0).iter().any(|saved| {
+                saved.channel == *source.channel()
+                    && saved.thread.as_ref() == source.thread_ts()
+                    && saved.ts == *ts
+            })
+        })
+    }
+
+    pub fn save_for_later(&self, source: &Source, ts: &Ts) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.save(
+                &self.model.workspace().0,
+                &Saved {
+                    channel: source.channel().clone(),
+                    thread: source.thread_ts().cloned(),
+                    ts: ts.clone(),
+                },
+            );
+        }
+    }
+
+    pub fn remove_from_later(&self, source: &Source, ts: &Ts) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.unsave(
+                &self.model.workspace().0,
+                &Saved {
+                    channel: source.channel().clone(),
+                    thread: source.thread_ts().cloned(),
+                    ts: ts.clone(),
+                },
+            );
         }
     }
 

@@ -16,7 +16,7 @@ use text::Anchor;
 use theme::ActiveTheme as _;
 
 use crate::api::SearchHit;
-use crate::session::{SearchRefused, Session, Source};
+use crate::session::{ActivityEntry, SearchRefused, Session, Source};
 use crate::types::{ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
 
@@ -251,6 +251,49 @@ impl ResultsView {
             cx,
         );
         Some((self.query.clone(), page))
+    }
+
+    /// Draws a durable Slack inventory. Unlike search results these rows
+    /// come from the mirror and remain available while Slack is offline.
+    pub fn inventory(
+        &mut self,
+        heading: &str,
+        entries: &[ActivityEntry],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut lines = vec![(None, vec![Span::styled(heading.to_owned(), Class::Muted)])];
+        if let Some(reason) = self.session.read(cx).health_reason() {
+            lines.push((None, vec![Span::styled(reason.to_owned(), Class::Error)]));
+        }
+        if entries.is_empty() {
+            lines.push((None, vec![Span::styled("nothing here", Class::Muted)]));
+        }
+        for entry in entries {
+            let place = Place {
+                source: entry.source.clone(),
+                ts: entry.ts.clone(),
+            };
+            let mut head = vec![Span::styled(
+                entry.conversation.clone(),
+                Class::Conversation,
+            )];
+            if entry.unread {
+                head.push(Span::plain("  "));
+                head.push(Span::styled("unread", Class::Unread));
+            }
+            lines.push((Some(place.clone()), head));
+            if !entry.summary.is_empty() {
+                lines.push((
+                    Some(place),
+                    vec![Span::plain(format!(
+                        "  {}",
+                        entry.summary.replace('\n', " ")
+                    ))],
+                ));
+            }
+        }
+        self.draw(lines, window, cx);
     }
 
     /// What the reader is told when the search did not answer. One line,

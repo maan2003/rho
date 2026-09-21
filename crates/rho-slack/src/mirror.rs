@@ -55,6 +55,10 @@ const CURSORS: TableDefinition<&str, Sen<StoredCursor>> =
 /// this table is first opened or when a rebuild is asked for; after that
 /// they are written on the event that moves them and read back whole.
 const UNITS: TableDefinition<&str, Sen<StoredUnit>> = TableDefinition::new("rho_slack_units_v1");
+/// Messages the reader explicitly saved for later in rho. Slack does not
+/// expose its current Later list through a supported API, so this is honest
+/// client-local state in the same durable mirror as the message it names.
+const SAVED: TableDefinition<&str, Sen<StoredSaved>> = TableDefinition::new("rho_slack_saved_v1");
 /// The channels the reader opted into. Its own table rather than a flag in
 /// `CURSORS`, because the question asked of it is "which ones", and that is
 /// a range scan over a workspace rather than a lookup per channel.
@@ -64,6 +68,15 @@ const UNITS: TableDefinition<&str, Sen<StoredUnit>> = TableDefinition::new("rho_
 /// forgets what the reader always uses is a picker they stop using.
 const REACTED_WITH: TableDefinition<&str, Sen<StoredReactedWith>> =
     TableDefinition::new("rho_slack_reacted_with_v1");
+
+/// One locally saved message. Its source is retained so opening a saved
+/// thread reply returns to the thread rather than the channel timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saved {
+    pub channel: ChannelId,
+    pub thread: Option<Ts>,
+    pub ts: Ts,
+}
 
 /// One run of history: a conversation, or one thread inside it. A thread is
 /// its own run because Slack pages it separately.
@@ -756,6 +769,58 @@ impl Mirror {
         );
     }
 
+    /// Saves one message idempotently. The key is Slack's message identity,
+    /// so pressing save twice cannot duplicate an inventory row.
+    pub fn save(&self, workspace: &str, saved: &Saved) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(SAVED);
+            table.insert(
+                saved_key(workspace, saved).as_str(),
+                SenValue::owned(StoredSaved {
+                    channel: saved.channel.0.clone(),
+                    thread: saved.thread.as_ref().map(|ts| ts.0.clone()),
+                    ts: saved.ts.0.clone(),
+                }),
+            );
+        }
+        txn.commit();
+    }
+
+    pub fn unsave(&self, workspace: &str, saved: &Saved) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(SAVED);
+            table.remove(saved_key(workspace, saved).as_str());
+        }
+        txn.commit();
+    }
+
+    /// Newest first, as a Later inventory is read.
+    pub fn saved(&self, workspace: &str) -> Vec<Saved> {
+        let txn = self.db.read();
+        let table = txn.open_table(SAVED);
+        let prefix = format!("{workspace}{SEPARATOR}");
+        let end = format!(
+            "{workspace}{}",
+            char::from_u32(SEPARATOR as u32 + 1).unwrap()
+        );
+        let mut saved = table
+            .range(prefix.as_str()..end.as_str())
+            .map(|(_, value)| {
+                let value = value.value();
+                let value = value.as_ref();
+                Saved {
+                    channel: ChannelId(value.channel.clone()),
+                    thread: value.thread.as_ref().map(|ts| Ts(ts.clone())),
+                    ts: Ts(value.ts.clone()),
+                }
+            })
+            .collect::<Vec<_>>();
+        saved.sort_by(|left, right| right.ts.epoch_seconds().total_cmp(&left.ts.epoch_seconds()));
+        saved
+    }
+
     /// Every write goes through one lock; the mirror is small and the GUI is
     /// the only writer, so blocking on it is cheaper than threading async
     /// through every surface.
@@ -862,6 +927,21 @@ fn unit_key(workspace: &str, unit: &Unit) -> String {
     format!(
         "{workspace}{SEPARATOR}{}{SEPARATOR}{thread}",
         unit.channel.as_str()
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredSaved {
+    channel: String,
+    thread: Option<String>,
+    ts: String,
+}
+
+fn saved_key(workspace: &str, saved: &Saved) -> String {
+    format!(
+        "{workspace}{SEPARATOR}{}{SEPARATOR}{}",
+        saved.channel.as_str(),
+        saved.ts.as_str()
     )
 }
 

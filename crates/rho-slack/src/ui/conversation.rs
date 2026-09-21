@@ -746,7 +746,7 @@ impl ConversationView {
     }
 
     /// The message the cursor is on, if the transcript has one there.
-    fn cursor_message(&self, cx: &mut Context<Self>) -> Option<Message> {
+    pub fn cursor_message(&self, cx: &mut Context<Self>) -> Option<Message> {
         let ts = self.cursor_message_ts(cx)?;
         self.shown_messages(cx)
             .into_iter()

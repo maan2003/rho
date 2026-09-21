@@ -234,6 +234,104 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens every mention, DM, and followed thread known to the mirror,
+    /// including read items; this is navigation, not the dealer queue.
+    pub(crate) fn open_slack_activity(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack_session(window, cx) else {
+            return;
+        };
+        let rows = session.read(cx).activity();
+        self.open_slack_inventory("activity", rows, session, window, cx);
+    }
+
+    /// Opens messages explicitly saved in rho's local Later inventory.
+    pub(crate) fn open_slack_saved(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack_session(window, cx) else {
+            return;
+        };
+        let rows = session.read(cx).saved();
+        self.open_slack_inventory("saved for later", rows, session, window, cx);
+    }
+
+    /// Saves the message under the cursor for the local Later inventory.
+    pub(crate) fn slack_save_for_later(&mut self, cx: &mut gpui::Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let view = view.clone();
+        let source = view.read(cx).source().clone();
+        let Some(message) = view.update(cx, |view, cx| view.cursor_message(cx)) else {
+            return;
+        };
+        if let Some(session) = self.slack.session() {
+            let saved = session.read(cx).is_saved_for_later(&source, &message.ts);
+            if saved {
+                session.read(cx).remove_from_later(&source, &message.ts);
+                self.echo("slack: removed from saved", StyleClass::SystemInfo, cx);
+            } else {
+                session.read(cx).save_for_later(&source, &message.ts);
+                self.echo("slack: saved for later", StyleClass::SystemInfo, cx);
+            }
+        }
+    }
+
+    /// Marks the message under the cursor and everything after it unread in
+    /// Slack, while making the same cursor move in rho immediately.
+    pub(crate) fn slack_mark_unread(&mut self, cx: &mut gpui::Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let view = view.clone();
+        let source = view.read(cx).source().clone();
+        let Some(message) = view.update(cx, |view, cx| view.cursor_message(cx)) else {
+            return;
+        };
+        if let Some(session) = self.slack.session() {
+            session.update(cx, |session, cx| {
+                session.mark_unread_from(&source, &message.ts, cx)
+            });
+            self.echo("slack: marked unread", StyleClass::SystemInfo, cx);
+        }
+    }
+
+    fn open_slack_inventory(
+        &mut self,
+        title: &str,
+        rows: Vec<rho_slack::session::ActivityEntry>,
+        session: gpui::Entity<Session>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.active_context = ContextId::Slack;
+        let key = SurfaceKey::SlackResults {
+            query: title.to_owned(),
+        };
+        let surface = match self.find_surface(|surface| surface.key == key).cloned() {
+            Some(surface) => surface,
+            None => {
+                let hooks = Self::slack_hooks();
+                let view = cx.new(|cx| rho_slack::ui::ResultsView::new(session, hooks, window, cx));
+                Self::wrap_surface(key, SurfaceView::SlackResults(view))
+            }
+        };
+        let SurfaceView::SlackResults(view) = &surface.view else {
+            return;
+        };
+        view.clone()
+            .update(cx, |view, cx| view.inventory(title, &rows, window, cx));
+        self.show_slack_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
     /// The live session, started from the first registered workspace. A
     /// session is per workspace; the prompt registers several, and the first
     /// is the one rho lives in.
@@ -1583,6 +1681,38 @@ impl Workspace {
             }
             SessionEvent::Changed(changes) => {
                 for change in changes {
+                    if let Change::Raised(unit) | Change::Updated(unit) = change
+                        && let Some(card) = session
+                            .read(cx)
+                            .model()
+                            .card(unit, chrono::Local::now().timestamp_millis())
+                        && !matches!(
+                            card.attention,
+                            Some(rho_slack::model::Attention::ChannelTraffic) | None
+                        )
+                    {
+                        let thread = unit.thread.as_ref().map(Ts::as_str).unwrap_or("");
+                        cx.show_system_notification(gpui::SystemNotification {
+                            tag: format!(
+                                "rho-slack-{}-{}-{thread}",
+                                session.read(cx).model().workspace().0,
+                                unit.channel.0,
+                            )
+                            .into(),
+                            title: card.conversation.clone().into(),
+                            body: {
+                                let summary = session.read(cx).unit_summary(unit);
+                                match (summary.is_empty(), card.attention) {
+                                    (true, Some(reason)) => {
+                                        rho_slack::model::reason_text(reason, &card.conversation)
+                                    }
+                                    _ => summary,
+                                }
+                            }
+                            .into(),
+                            actions: Vec::new(),
+                        });
+                    }
                     // A thread that starts to matter needs nothing written:
                     // it is addressable as its unit, and the view shows it
                     // because the mirror says it is open.

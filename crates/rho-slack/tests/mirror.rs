@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rho_slack::api::Client;
 use rho_slack::config::Credentials;
 use rho_slack::fake::Fake;
-use rho_slack::mirror::{Mirror, Scope};
+use rho_slack::mirror::{Mirror, Saved, Scope};
 use rho_slack::types::{ChannelId, Message, Ts};
 use serde_json::json;
 
@@ -448,4 +448,27 @@ fn favorite_survives_reopening_without_leaking_to_another_room() {
     assert!(!mirror.favorite("other", &c1));
     mirror.set_favorite("acme", &c1, false);
     assert!(!mirror.favorite("acme", &c1));
+}
+
+#[test]
+fn saved_messages_survive_reopen_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slack.redb");
+    let saved = Saved {
+        channel: ChannelId::from("C1"),
+        thread: Some(Ts::from("100.000000")),
+        ts: Ts::from("200.000000"),
+    };
+    {
+        let mirror = Mirror::open(&path).unwrap();
+        mirror.save("acme", &saved);
+        mirror.save("acme", &saved);
+        assert_eq!(mirror.saved("acme"), vec![saved.clone()]);
+    }
+    {
+        let mirror = Mirror::open(&path).unwrap();
+        assert_eq!(mirror.saved("acme"), vec![saved.clone()]);
+        mirror.unsave("acme", &saved);
+    }
+    assert!(Mirror::open(path).unwrap().saved("acme").is_empty());
 }

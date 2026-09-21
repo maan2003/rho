@@ -394,3 +394,56 @@ async fn an_answer_to_a_query_the_reader_has_replaced_is_never_raised(cx: &mut T
         "the reader is shown the last thing they typed, and only that"
     );
 }
+
+/// Mark unread is a backward Slack cursor move, not a local-only badge.
+#[gpui::test]
+async fn mark_unread_round_trips_to_slack_and_uses_the_previous_message(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "400.0", "user": "UA", "text": "before"}),
+    );
+    rig.session
+        .update(cx, |session, cx| session.open(&design(), cx));
+
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let loaded = rig.session.read_with(cx, |session, _| {
+            session.loaded(&design()).is_some_and(|loaded| {
+                loaded
+                    .messages
+                    .iter()
+                    .any(|message| message.ts == Ts("500.0".into()))
+                    && loaded
+                        .messages
+                        .iter()
+                        .any(|message| message.ts == Ts("400.0".into()))
+            })
+        });
+        if loaded {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    rig.session.update(cx, |session, cx| {
+        session.mark_unread_from(&design(), &Ts("500.0".into()), cx)
+    });
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if rig
+            .fake
+            .marked()
+            .iter()
+            .any(|(channel, ts)| channel == "C1" && ts == "400.0")
+        {
+            return;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    panic!("the backward conversations.mark never reached Slack");
+}

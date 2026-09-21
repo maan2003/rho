@@ -120,6 +120,8 @@ actions!(
         SlackSearchPreviousPage,
         SlackSearchNextPage,
         SlackMarkReadBefore,
+        SlackMarkUnread,
+        SlackSaveForLater,
         SlackNextUnread,
         SlackEditMessage,
         SlackReactTo,
@@ -481,6 +483,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             // `r` on a message opens what to react with. On a line that is
             // not a message it gives the key back, the way `e` does.
             KeyBinding::new("r", SlackReactTo, Some(context)),
+            KeyBinding::new("m", SlackMarkUnread, Some(context)),
+            KeyBinding::new("b", SlackSaveForLater, Some(context)),
         ]);
     }
     // Marking the old backlog is a list-wide verb, so it lives on the list

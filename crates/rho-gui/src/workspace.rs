@@ -97,8 +97,8 @@ use crate::{
     MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
     MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat, SearchRepeatReverse, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
-    SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackNextUnread,
-    SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch, SlackSearchNextPage,
+    SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread, SlackNextUnread,
+    SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch, SlackSearchNextPage,
     SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
     UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
 };
@@ -9049,6 +9049,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
                 this.prompt_slack_mark_read_before(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackMarkUnread, _window, cx| {
+                this.slack_mark_unread(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackSaveForLater, _window, cx| {
+                this.slack_save_for_later(cx);
             }))
             .on_action(cx.listener(|this, _: &TranscriptTop, window, cx| {
                 // Only a transcript composes its way to the top; anywhere
