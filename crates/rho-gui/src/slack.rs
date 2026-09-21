@@ -330,6 +330,7 @@ impl Workspace {
             window,
             cx,
         );
+        self.set_prompt_complete_whole_input();
     }
 
     /// Opens the conversation list, starting the session on first entry.

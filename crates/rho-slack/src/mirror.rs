@@ -74,6 +74,8 @@ const REACTED_WITH: TableDefinition<&str, Sen<StoredReactedWith>> =
 const DRAFT_TEXT: TableDefinition<&str, &str> = TableDefinition::new("rho_slack_draft_text_v1");
 const DRAFT_FILES: TableDefinition<&str, Sen<StoredDraftFiles>> =
     TableDefinition::new("rho_slack_draft_files_v1");
+const PENDING_DRAFTS: TableDefinition<&str, Sen<StoredPendingDraft>> =
+    TableDefinition::new("rho_slack_pending_drafts_v1");
 
 /// One locally saved message. Its source is retained so opening a saved
 /// thread reply returns to the thread rather than the channel timeline.
@@ -212,6 +214,7 @@ impl Mirror {
             write.open_table(UNITS);
             write.open_table(DRAFT_TEXT);
             write.open_table(DRAFT_FILES);
+            write.open_table(PENDING_DRAFTS);
             write.commit();
         });
         Ok(Self { db })
@@ -889,6 +892,28 @@ impl Mirror {
             })
             .unwrap_or_default();
         let draft = Draft { text, files };
+        let pending = txn
+            .open_table(PENDING_DRAFTS)
+            .get(key.as_str())
+            .map(|value| {
+                let value = value.value();
+                let value = value.as_ref();
+                Draft {
+                    text: value.text.clone(),
+                    files: value
+                        .files
+                        .iter()
+                        .map(|file| DraftFile {
+                            name: file.name.clone(),
+                            bytes: file.bytes.clone(),
+                        })
+                        .collect(),
+                }
+            });
+        let draft = match pending {
+            Some(pending) => merge_drafts(pending, draft),
+            None => draft,
+        };
         (!draft.is_empty()).then_some(draft)
     }
 
@@ -966,6 +991,79 @@ impl Mirror {
         txn.commit();
     }
 
+    /// Persists the immutable snapshot currently being sent. A restart
+    /// exposes it as part of the draft inventory but never sends it.
+    pub fn put_pending_draft(&self, scope: &Scope, draft: &Draft) {
+        let mut txn = self.write();
+        {
+            txn.open_table(PENDING_DRAFTS).insert(
+                scope.prefix().as_str(),
+                SenValue::owned(StoredPendingDraft::from(draft)),
+            );
+        }
+        txn.commit();
+    }
+
+    /// Resolves the pending snapshot and the next composer in one transaction.
+    /// Success keeps only `next`; failure restores pending before it.
+    pub fn finish_pending_draft(&self, scope: &Scope, next: &Draft, sent: bool) -> Draft {
+        let key = scope.prefix();
+        let mut txn = self.write();
+        let pending = txn
+            .open_table(PENDING_DRAFTS)
+            .get(key.as_str())
+            .map(|value| {
+                let value = value.value();
+                let value = value.as_ref();
+                Draft {
+                    text: value.text.clone(),
+                    files: value
+                        .files
+                        .iter()
+                        .map(|file| DraftFile {
+                            name: file.name.clone(),
+                            bytes: file.bytes.clone(),
+                        })
+                        .collect(),
+                }
+            });
+        let resolved = match (sent, pending) {
+            (false, Some(pending)) => merge_drafts(pending, next.clone()),
+            _ => next.clone(),
+        };
+        {
+            let mut text = txn.open_table(DRAFT_TEXT);
+            if resolved.text.is_empty() {
+                text.remove(key.as_str());
+            } else {
+                text.insert(key.as_str(), resolved.text.as_str());
+            }
+        }
+        {
+            let mut files = txn.open_table(DRAFT_FILES);
+            if resolved.files.is_empty() {
+                files.remove(key.as_str());
+            } else {
+                files.insert(
+                    key.as_str(),
+                    SenValue::owned(StoredDraftFiles {
+                        files: resolved
+                            .files
+                            .iter()
+                            .map(|file| StoredDraftFile {
+                                name: file.name.clone(),
+                                bytes: file.bytes.clone(),
+                            })
+                            .collect(),
+                    }),
+                );
+            }
+        }
+        txn.open_table(PENDING_DRAFTS).remove(key.as_str());
+        txn.commit();
+        resolved
+    }
+
     /// Every resumable draft in a workspace.
     pub fn drafts(&self, workspace: &str) -> Vec<(Scope, Draft)> {
         let txn = self.db.read();
@@ -995,6 +1093,26 @@ impl Mirror {
                     bytes: file.bytes.clone(),
                 })
                 .collect();
+        }
+        for (key, value) in txn
+            .open_table(PENDING_DRAFTS)
+            .range(prefix.as_str()..end.as_str())
+        {
+            let value = value.value();
+            let value = value.as_ref();
+            let pending = Draft {
+                text: value.text.clone(),
+                files: value
+                    .files
+                    .iter()
+                    .map(|file| DraftFile {
+                        name: file.name.clone(),
+                        bytes: file.bytes.clone(),
+                    })
+                    .collect(),
+            };
+            let next = drafts.remove(key.value()).unwrap_or_default();
+            drafts.insert(key.value().to_owned(), merge_drafts(pending, next));
         }
         drafts
             .into_iter()
@@ -1155,6 +1273,38 @@ struct StoredDraftFiles {
 struct StoredDraftFile {
     name: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredPendingDraft {
+    text: String,
+    files: Vec<StoredDraftFile>,
+}
+
+impl From<&Draft> for StoredPendingDraft {
+    fn from(draft: &Draft) -> Self {
+        Self {
+            text: draft.text.clone(),
+            files: draft
+                .files
+                .iter()
+                .map(|file| StoredDraftFile {
+                    name: file.name.clone(),
+                    bytes: file.bytes.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn merge_drafts(pending: Draft, next: Draft) -> Draft {
+    let text = match (pending.text.is_empty(), next.text.is_empty()) {
+        (true, _) => next.text,
+        (_, true) => pending.text,
+        (false, false) => format!("{}\n\n{}", pending.text, next.text),
+    };
+    let files = pending.files.into_iter().chain(next.files).collect();
+    Draft { text, files }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

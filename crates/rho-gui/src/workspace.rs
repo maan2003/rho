@@ -6547,6 +6547,12 @@ impl Workspace {
         self.open_prompt_watching(prompt, complete, None, on_submit, window, cx);
     }
 
+    pub(crate) fn set_prompt_complete_whole_input(&mut self) {
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_complete_whole_input();
+        }
+    }
+
     /// [`Self::open_prompt`] with a handler that runs after each edit, for a
     /// prompt that narrows what is behind it as the reader types rather than
     /// only on submit.

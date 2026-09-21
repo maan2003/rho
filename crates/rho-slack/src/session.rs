@@ -2955,6 +2955,21 @@ impl Session {
         }
     }
 
+    pub fn save_pending_draft(&self, source: &Source, draft: &Draft) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.put_pending_draft(&source.scope(&self.model.workspace().0), draft);
+        }
+    }
+
+    pub fn finish_pending_draft(&self, source: &Source, next: &Draft, sent: bool) -> Draft {
+        self.mirror
+            .as_ref()
+            .map(|mirror| {
+                mirror.finish_pending_draft(&source.scope(&self.model.workspace().0), next, sent)
+            })
+            .unwrap_or_else(|| next.clone())
+    }
+
     pub fn send(
         &mut self,
         source: &Source,

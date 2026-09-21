@@ -752,6 +752,13 @@ impl ConversationView {
             .detach();
             return watch(cx, told);
         }
+        self.session.read(cx).save_pending_draft(
+            &source,
+            &Draft {
+                text: text.clone(),
+                files: Vec::new(),
+            },
+        );
         self.send_state = SendState::Sending;
         self.set_compose(String::new(), cx);
         self.refresh_chip(cx);
@@ -765,7 +772,23 @@ impl ConversationView {
                 Ok(()) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Ready;
-                        this.persist_draft(cx);
+                        let next = Draft {
+                            text: this.draft_text(cx),
+                            files: this.draft_files(),
+                        };
+                        let resolved =
+                            this.session
+                                .read(cx)
+                                .finish_pending_draft(&this.source, &next, true);
+                        this.set_compose(resolved.text, cx);
+                        this.attached = resolved
+                            .files
+                            .into_iter()
+                            .map(|file| Attached {
+                                name: file.name,
+                                bytes: std::sync::Arc::new(file.bytes),
+                            })
+                            .collect();
                         this.refresh_chip(cx);
                         cx.notify();
                     });
@@ -774,8 +797,23 @@ impl ConversationView {
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Failed;
-                        this.restore_compose(text, cx);
-                        this.persist_draft(cx);
+                        let next = Draft {
+                            text: this.draft_text(cx),
+                            files: this.draft_files(),
+                        };
+                        let resolved =
+                            this.session
+                                .read(cx)
+                                .finish_pending_draft(&this.source, &next, false);
+                        this.set_compose(resolved.text, cx);
+                        this.attached = resolved
+                            .files
+                            .into_iter()
+                            .map(|file| Attached {
+                                name: file.name,
+                                bytes: std::sync::Arc::new(file.bytes),
+                            })
+                            .collect();
                         this.refresh_chip(cx);
                         cx.notify();
                     });
@@ -1124,9 +1162,6 @@ impl ConversationView {
         if self.editing_message.is_some() {
             return Attaching::NotWhileEditing;
         }
-        if self.send_state == SendState::Sending {
-            return Attaching::Sending;
-        }
         if self.attached.len() >= MAX_ATTACHMENTS {
             return Attaching::TooMany;
         }
@@ -1205,7 +1240,7 @@ impl ConversationView {
 
     /// Removes one attachment chip by its displayed index.
     pub fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        if self.send_state == SendState::Sending || index >= self.attached.len() {
+        if index >= self.attached.len() {
             return false;
         }
         self.attached.remove(index);
@@ -1217,9 +1252,6 @@ impl ConversationView {
 
     /// Drops the attachment without sending it.
     pub fn clear_attachment(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.send_state == SendState::Sending {
-            return false;
-        }
         let had = !self.attached.is_empty();
         self.attached.clear();
         if had {
@@ -1263,8 +1295,23 @@ impl ConversationView {
         text: String,
         cx: &mut Context<Self>,
     ) -> Task<Submitted> {
+        self.session.read(cx).save_pending_draft(
+            &self.source,
+            &Draft {
+                text: text.clone(),
+                files: files
+                    .iter()
+                    .map(|file| DraftFile {
+                        name: file.name.clone(),
+                        bytes: file.bytes.as_ref().clone(),
+                    })
+                    .collect(),
+            },
+        );
         self.send_state = SendState::Sending;
+        self.attached.clear();
         self.set_compose(String::new(), cx);
+        self.persist_draft_files(cx);
         self.refresh_chip(cx);
         cx.notify();
         let source = self.source.clone();
@@ -1282,10 +1329,23 @@ impl ConversationView {
                 Ok(()) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Ready;
-                        if this.attached == files {
-                            this.attached.clear();
-                        }
-                        this.persist_draft(cx);
+                        let next = Draft {
+                            text: this.draft_text(cx),
+                            files: this.draft_files(),
+                        };
+                        let resolved =
+                            this.session
+                                .read(cx)
+                                .finish_pending_draft(&this.source, &next, true);
+                        this.set_compose(resolved.text, cx);
+                        this.attached = resolved
+                            .files
+                            .into_iter()
+                            .map(|file| Attached {
+                                name: file.name,
+                                bytes: std::sync::Arc::new(file.bytes),
+                            })
+                            .collect();
                         this.refresh_chip(cx);
                         cx.notify();
                     });
@@ -1294,8 +1354,23 @@ impl ConversationView {
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Failed;
-                        this.restore_compose(text, cx);
-                        this.persist_draft(cx);
+                        let next = Draft {
+                            text: this.draft_text(cx),
+                            files: this.draft_files(),
+                        };
+                        let resolved =
+                            this.session
+                                .read(cx)
+                                .finish_pending_draft(&this.source, &next, false);
+                        this.set_compose(resolved.text, cx);
+                        this.attached = resolved
+                            .files
+                            .into_iter()
+                            .map(|file| Attached {
+                                name: file.name,
+                                bytes: std::sync::Arc::new(file.bytes),
+                            })
+                            .collect();
                         this.refresh_chip(cx);
                         cx.notify();
                     });
@@ -1356,27 +1431,15 @@ impl ConversationView {
     }
 
     fn persist_draft_text(&self, cx: &App) {
-        if self.send_state != SendState::Sending {
-            self.session
-                .read(cx)
-                .save_draft_text(&self.source, &self.draft_text(cx));
-        }
+        self.session
+            .read(cx)
+            .save_draft_text(&self.source, &self.draft_text(cx));
     }
 
     fn persist_draft_files(&self, cx: &App) {
         self.session
             .read(cx)
             .save_draft_files(&self.source, &self.draft_files());
-    }
-
-    fn persist_draft(&self, cx: &App) {
-        self.session.read(cx).save_draft(
-            &self.source,
-            &Draft {
-                text: self.draft_text(cx),
-                files: self.draft_files(),
-            },
-        );
     }
 
     fn set_compose(&mut self, text: String, cx: &mut Context<Self>) {
@@ -3597,6 +3660,7 @@ impl gpui::Render for ConversationView {
             .py_1()
             .border_t_1()
             .border_color(cx.theme().colors().border)
+            .text_color(cx.theme().colors().text)
             .children(attachments.into_iter().enumerate().map(|(index, file)| {
                 div()
                     .id(("slack-remove-attachment", index))

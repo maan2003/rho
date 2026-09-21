@@ -3331,7 +3331,7 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
         .unwrap()
         .unwrap();
     seed_workspace(&fake);
-    fake.live(serde_json::json!({"kind": "send_delay", "ms": 150}));
+    fake.fail_next("files.completeUploadExternal", 1);
     let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
     let client = std::sync::Arc::new(
         rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
@@ -3373,16 +3373,25 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
             .unwrap(),
         ""
     );
+    window
+        .update(cx, |view, _, cx| {
+            view.set_compose_for_test("next thought".into(), cx);
+            assert_eq!(
+                view.attach("next.png".into(), vec![2; 8], cx),
+                Attaching::Attached
+            );
+        })
+        .unwrap();
     let durable = session.read_with(cx, |session, _| session.draft(&source).unwrap());
-    assert_eq!(durable.text, "send exactly once");
+    assert_eq!(durable.text, "send exactly once\n\nnext thought");
     assert_eq!(
         durable.files.len(),
-        2,
-        "same-name identical files remain distinct"
+        3,
+        "pending and next files remain distinct"
     );
 
-    // Reopening during the request restores the retry snapshot rather than
-    // an empty composer.
+    // Reopening during the request restores both the retry snapshot and the
+    // next draft; neither is automatically sent.
     let reopened = cx.add_window(|window, cx| {
         rho_slack::ui::ConversationView::new(
             session.clone(),
@@ -3396,41 +3405,33 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
         reopened
             .update(cx, |view, _, cx| view.compose_text_for_test(cx))
             .unwrap(),
-        "send exactly once"
+        "send exactly once\n\nnext thought"
     );
     assert_eq!(
         reopened
             .update(cx, |view, _, _| view.attachments().len())
             .unwrap(),
-        2
+        3
     );
 
-    window
-        .update(cx, |view, _, cx| {
-            view.set_compose_for_test("next thought".into(), cx)
-        })
-        .unwrap();
-    assert_eq!(sending.await, Submitted::FileSent(16));
+    assert_eq!(sending.await, Submitted::Refused);
+    assert_eq!(
+        window.update(cx, |view, _, _| view.send_state()).unwrap(),
+        SendState::Failed
+    );
     assert_eq!(
         window
             .update(cx, |view, _, cx| view.compose_text_for_test(cx))
             .unwrap(),
-        "next thought"
+        "send exactly once\n\nnext thought"
     );
-    assert!(
+    assert_eq!(
         window
-            .update(cx, |view, _, _| view.attachments().is_empty())
-            .unwrap()
+            .update(cx, |view, _, _| view.attachments().len())
+            .unwrap(),
+        3
     );
     let remaining = session.read_with(cx, |session, _| session.draft(&source).unwrap());
-    assert_eq!(remaining.text, "next thought");
-    assert!(remaining.files.is_empty());
-    assert_eq!(
-        fake.posted()
-            .iter()
-            .filter(|post| post.text == "send exactly once")
-            .count(),
-        0,
-        "file messages are completed through the upload API, not chat.postMessage"
-    );
+    assert_eq!(remaining.text, "send exactly once\n\nnext thought");
+    assert_eq!(remaining.files.len(), 3);
 }
