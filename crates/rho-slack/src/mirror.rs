@@ -202,6 +202,7 @@ impl Mirror {
         futures::executor::block_on(async {
             let mut write = db.write().await;
             write.open_table(FAVORITES);
+            write.open_table(SAVED);
             write.open_table(MESSAGES);
             write.open_table(GAPS);
             write.open_table(USERS);
