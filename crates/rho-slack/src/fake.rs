@@ -41,6 +41,7 @@ pub struct Posted {
     pub channel: String,
     pub thread_ts: Option<String>,
     pub text: String,
+    pub also_sent_to_channel: bool,
 }
 
 #[derive(Default)]
@@ -1813,27 +1814,18 @@ fn handle(
                 empty if empty.is_empty() => None,
                 thread_ts => Some(thread_ts),
             };
-            let files: Value = serde_json::from_str(&field("files")).unwrap_or(Value::Null);
-            let id = files[0]["id"].as_str().unwrap_or_default().to_owned();
-            let title = files[0]["title"].as_str().unwrap_or("file").to_owned();
-            let bytes = state.uploads.get(&id).cloned().unwrap_or_default();
-            if bytes.is_empty() {
-                return json!({"ok": false, "error": "upload_not_found"});
-            }
-            let (width, height) = png_size(&bytes);
+            let requested: Value = serde_json::from_str(&field("files")).unwrap_or(Value::Null);
             let base = state.api_base.trim_end_matches("/api").to_owned();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_secs())
-                .unwrap_or_default();
-            let ts = next_ts(&state, &channel, now);
-            let mut message = json!({
-                "type": "message",
-                "ts": ts,
-                "user": "ME",
-                "channel": channel,
-                "text": field("initial_comment"),
-                "files": [{
+            let mut completed = Vec::new();
+            for file in requested.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let id = file["id"].as_str().unwrap_or_default().to_owned();
+                let title = file["title"].as_str().unwrap_or("file").to_owned();
+                let bytes = state.uploads.get(&id).cloned().unwrap_or_default();
+                if bytes.is_empty() {
+                    return json!({"ok": false, "error": "upload_not_found"});
+                }
+                let (width, height) = png_size(&bytes);
+                completed.push(json!({
                     "id": id,
                     "name": title,
                     "title": title,
@@ -1844,7 +1836,16 @@ fn handle(
                     "original_w": width,
                     "original_h": height,
                     "thumb_64": format!("{base}/thumbs/{id}.png"),
-                }],
+                }));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default();
+            let ts = next_ts(&state, &channel, now);
+            let mut message = json!({
+                "type": "message", "ts": ts, "user": "ME", "channel": channel,
+                "text": field("initial_comment"), "files": completed,
             });
             if let Some(thread_ts) = &thread_ts {
                 message["thread_ts"] = json!(thread_ts);
@@ -1855,7 +1856,40 @@ fn handle(
                 .or_default()
                 .push(message.clone());
             let _ = frames.send(Frame::Text(message.to_string().into()));
-            json!({"ok": true, "files": [{"id": id, "title": title}]})
+            json!({"ok": true, "files": message["files"].clone()})
+        }
+        "chat.getPermalink" => {
+            let channel = field("channel");
+            let ts = field("message_ts");
+            if message_mut(&mut state, &channel, &ts).is_none() {
+                json!({"ok": false, "error": "message_not_found"})
+            } else {
+                json!({"ok": true, "permalink": format!(
+                    "https://acme.slack.com/archives/{channel}/p{}", ts.replace('.', "")
+                )})
+            }
+        }
+        "chat.delete" => {
+            let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let channel = payload["channel"].as_str().unwrap_or_default().to_owned();
+            let ts = payload["ts"].as_str().unwrap_or_default().to_owned();
+            let Some(messages) = state.history.get_mut(&channel) else {
+                return json!({"ok": false, "error": "channel_not_found"});
+            };
+            let before = messages.len();
+            messages.retain(|message| message["ts"] != json!(ts));
+            if messages.len() == before {
+                return json!({"ok": false, "error": "message_not_found"});
+            }
+            let _ = frames.send(Frame::Text(
+                json!({
+                    "type": "message", "subtype": "message_deleted",
+                    "channel": channel, "deleted_ts": ts,
+                })
+                .to_string()
+                .into(),
+            ));
+            json!({"ok": true, "channel": channel, "ts": ts})
         }
         // An edit is `chat.update` plus the socket event every other client
         // sees, so the round trip a reader makes here is the live one.
@@ -1949,6 +1983,7 @@ fn handle(
                 channel,
                 thread_ts,
                 text,
+                also_sent_to_channel: payload["reply_broadcast"].as_bool().unwrap_or(false),
             });
             // Slack echoes the sender's own message back down the socket;
             // rho has to survive seeing it twice, and a client that only

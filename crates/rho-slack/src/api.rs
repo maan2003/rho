@@ -954,9 +954,23 @@ impl Client {
         thread_ts: Option<&Ts>,
         text: &str,
     ) -> anyhow::Result<Ts> {
+        self.post_message_with_options(channel, thread_ts, text, false)
+            .await
+    }
+
+    pub async fn post_message_with_options(
+        &self,
+        channel: &ChannelId,
+        thread_ts: Option<&Ts>,
+        text: &str,
+        also_send_to_channel: bool,
+    ) -> anyhow::Result<Ts> {
         let mut body = json!({"channel": channel.0, "text": text});
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = json!(thread_ts.0);
+            if also_send_to_channel {
+                body["reply_broadcast"] = json!(true);
+            }
         }
         let response = self.post_json("chat.postMessage", body).await?;
         Ok(Ts(string(&response["ts"]).unwrap_or_default()))
@@ -974,31 +988,48 @@ impl Client {
         bytes: Vec<u8>,
         comment: &str,
     ) -> anyhow::Result<()> {
-        let reserved = self
-            .post_form(
-                "files.getUploadURLExternal",
-                &[
-                    ("filename", name.to_owned()),
-                    ("length", bytes.len().to_string()),
-                ],
-            )
-            .await?;
-        let url = string(&reserved["upload_url"]).unwrap_or_default();
-        let file_id = string(&reserved["file_id"]).unwrap_or_default();
-        if url.is_empty() || file_id.is_empty() {
-            anyhow::bail!("slack gave no upload url");
-        }
-        let response = self
-            .authorize(self.http.post(url))
-            .body(bytes)
-            .send()
+        self.upload_files(channel, thread_ts, vec![(name.to_owned(), bytes)], comment)
             .await
-            .context("uploading file bytes")?;
-        if !response.status().is_success() {
-            anyhow::bail!("upload refused: {}", response.status());
+    }
+
+    pub async fn upload_files(
+        &self,
+        channel: &ChannelId,
+        thread_ts: Option<&Ts>,
+        files: Vec<(String, Vec<u8>)>,
+        comment: &str,
+    ) -> anyhow::Result<()> {
+        let mut completed = Vec::with_capacity(files.len());
+        for (name, bytes) in files {
+            let reserved = self
+                .post_form(
+                    "files.getUploadURLExternal",
+                    &[
+                        ("filename", name.clone()),
+                        ("length", bytes.len().to_string()),
+                    ],
+                )
+                .await?;
+            let url = string(&reserved["upload_url"]).unwrap_or_default();
+            let file_id = string(&reserved["file_id"]).unwrap_or_default();
+            if url.is_empty() || file_id.is_empty() {
+                anyhow::bail!("slack gave no upload url");
+            }
+            let response = self
+                .authorize(self.http.post(url))
+                .body(bytes)
+                .send()
+                .await
+                .context("uploading file bytes")?;
+            if !response.status().is_success() {
+                anyhow::bail!("upload refused: {}", response.status());
+            }
+            completed.push(json!({"id": file_id, "title": name}));
         }
-        let files = json!([{"id": file_id, "title": name}]).to_string();
-        let mut fields = vec![("files", files), ("channel_id", channel.0.clone())];
+        let mut fields = vec![
+            ("files", Value::Array(completed).to_string()),
+            ("channel_id", channel.0.clone()),
+        ];
         if !comment.is_empty() {
             fields.push(("initial_comment", comment.to_owned()));
         }
@@ -1008,6 +1039,24 @@ impl Client {
         self.post_form("files.completeUploadExternal", &fields)
             .await?;
         Ok(())
+    }
+
+    pub async fn delete_message(&self, channel: &ChannelId, ts: &Ts) -> anyhow::Result<()> {
+        self.post_json("chat.delete", json!({"channel": channel.0, "ts": ts.0}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn message_link(&self, channel: &ChannelId, ts: &Ts) -> anyhow::Result<String> {
+        let body = self
+            .post_form(
+                "chat.getPermalink",
+                &[("channel", channel.0.clone()), ("message_ts", ts.0.clone())],
+            )
+            .await?;
+        string(&body["permalink"])
+            .filter(|link| !link.is_empty())
+            .context("chat.getPermalink returned no permalink")
     }
 
     /// Rewrites a message the reader already sent. Slack answers with the

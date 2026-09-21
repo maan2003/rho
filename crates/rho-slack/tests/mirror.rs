@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rho_slack::api::Client;
 use rho_slack::config::Credentials;
 use rho_slack::fake::Fake;
-use rho_slack::mirror::{Mirror, Saved, Scope};
+use rho_slack::mirror::{Draft, DraftFile, Mirror, Saved, Scope};
 use rho_slack::types::{ChannelId, Message, Ts};
 use serde_json::json;
 
@@ -472,4 +472,52 @@ fn saved_messages_survive_reopen_without_duplicates() {
         mirror.unsave("acme", &saved);
     }
     assert!(Mirror::open(path).unwrap().saved("acme").is_empty());
+}
+
+#[test]
+fn drafts_round_trip_per_source_and_empty_removes_them() {
+    let (dir, mirror) = mirror();
+    let channel = scope();
+    let thread = Scope::thread("acme", &ChannelId::from("C1"), &Ts::from("500.0"));
+    let channel_draft = Draft {
+        text: "channel words".into(),
+        files: vec![
+            DraftFile {
+                name: "a.png".into(),
+                bytes: vec![1, 2],
+            },
+            DraftFile {
+                name: "b.png".into(),
+                bytes: vec![3, 4, 5],
+            },
+        ],
+    };
+    mirror.put_draft(&channel, &channel_draft);
+    mirror.put_draft(
+        &thread,
+        &Draft {
+            text: "thread words".into(),
+            files: Vec::new(),
+        },
+    );
+    drop(mirror);
+
+    let reopened = Mirror::open(dir.path().join("slack.redb")).unwrap();
+    assert_eq!(reopened.draft(&channel), Some(channel_draft.clone()));
+    let inventory = reopened.drafts("acme");
+    assert_eq!(inventory.len(), 2);
+    assert!(
+        inventory
+            .iter()
+            .any(|(scope, draft)| scope == &channel && draft == &channel_draft)
+    );
+    assert!(
+        inventory
+            .iter()
+            .any(|(scope, draft)| scope == &thread && draft.text == "thread words")
+    );
+
+    reopened.put_draft(&channel, &Draft::default());
+    assert_eq!(reopened.draft(&channel), None);
+    assert_eq!(reopened.drafts("acme").len(), 1);
 }

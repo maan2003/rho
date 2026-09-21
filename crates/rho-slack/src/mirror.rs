@@ -68,6 +68,10 @@ const SAVED: TableDefinition<&str, Sen<StoredSaved>> = TableDefinition::new("rho
 /// forgets what the reader always uses is a picker they stop using.
 const REACTED_WITH: TableDefinition<&str, Sen<StoredReactedWith>> =
     TableDefinition::new("rho_slack_reacted_with_v1");
+/// Unsent composer contents, one row per conversation or thread. This is a
+/// new table rather than a changed record shape, so existing mirrors open
+/// without a format migration.
+const DRAFTS: TableDefinition<&str, Sen<StoredDraft>> = TableDefinition::new("rho_slack_drafts_v1");
 
 /// One locally saved message. Its source is retained so opening a saved
 /// thread reply returns to the thread rather than the channel timeline.
@@ -140,6 +144,25 @@ struct StoredGap {
     page_before: String,
 }
 
+/// An unsent composer, including every file waiting with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub files: Vec<DraftFile>,
+}
+
+impl Draft {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.files.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
 pub struct Mirror {
     db: RhoDb,
 }
@@ -181,6 +204,7 @@ impl Mirror {
             write.open_table(CURSORS);
             write.open_table(REACTED_WITH);
             write.open_table(UNITS);
+            write.open_table(DRAFTS);
             write.commit();
         });
         Ok(Self { db })
@@ -821,6 +845,64 @@ impl Mirror {
         saved
     }
 
+    /// Reads the draft for one source.
+    pub fn draft(&self, scope: &Scope) -> Option<Draft> {
+        let txn = self.db.read();
+        let table = txn.open_table(DRAFTS);
+        table
+            .get(scope.prefix().as_str())
+            .map(|value| value.value().as_ref().into())
+    }
+
+    /// Replaces one draft atomically. Empty drafts are removed so inventory
+    /// contains only work the reader can resume.
+    pub fn put_draft(&self, scope: &Scope, draft: &Draft) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(DRAFTS);
+            if draft.is_empty() {
+                table.remove(scope.prefix().as_str());
+            } else {
+                table.insert(
+                    scope.prefix().as_str(),
+                    SenValue::owned(StoredDraft::from(draft)),
+                );
+            }
+        }
+        txn.commit();
+    }
+
+    /// Every resumable draft in a workspace.
+    pub fn drafts(&self, workspace: &str) -> Vec<(Scope, Draft)> {
+        let txn = self.db.read();
+        let table = txn.open_table(DRAFTS);
+        let prefix = format!("{workspace}{SEPARATOR}");
+        let end = format!(
+            "{workspace}{}",
+            char::from_u32(SEPARATOR as u32 + 1).unwrap()
+        );
+        table
+            .range(prefix.as_str()..end.as_str())
+            .filter_map(|(key, value)| {
+                let mut parts = key.value().split(SEPARATOR);
+                let workspace = parts.next()?.to_owned();
+                let channel = ChannelId(parts.next()?.to_owned());
+                let thread = parts
+                    .next()
+                    .filter(|it| !it.is_empty())
+                    .map(|it| Ts(it.to_owned()));
+                Some((
+                    Scope {
+                        workspace,
+                        channel,
+                        thread,
+                    },
+                    value.value().as_ref().into(),
+                ))
+            })
+            .collect()
+    }
+
     /// Every write goes through one lock; the mirror is small and the GUI is
     /// the only writer, so blocking on it is cheaper than threading async
     /// through every surface.
@@ -947,6 +1029,51 @@ fn saved_key(workspace: &str, saved: &Saved) -> String {
 
 /// The reader's own reaction history: shortcodes without colons, most
 /// recent first, capped where the picker stops showing them.
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredDraft {
+    text: String,
+    files: Vec<StoredDraftFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredDraftFile {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl From<&Draft> for StoredDraft {
+    fn from(draft: &Draft) -> Self {
+        Self {
+            text: draft.text.clone(),
+            files: draft
+                .files
+                .iter()
+                .map(|file| StoredDraftFile {
+                    name: file.name.clone(),
+                    bytes: file.bytes.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&StoredDraft> for Draft {
+    fn from(draft: &StoredDraft) -> Self {
+        Self {
+            text: draft.text.clone(),
+            files: draft
+                .files
+                .iter()
+                .map(|file| DraftFile {
+                    name: file.name.clone(),
+                    bytes: file.bytes.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct StoredReactedWith {
     names: Vec<String>,

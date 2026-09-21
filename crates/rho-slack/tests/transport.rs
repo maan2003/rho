@@ -1990,3 +1990,79 @@ async fn search_query_operators_filter_asymmetrically_and_are_not_rewritten() {
         "Slack, rather than rho, owns the query grammar"
     );
 }
+
+#[tokio::test]
+async fn multiple_files_message_actions_and_thread_broadcast_round_trip() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "random");
+    fake.add_message("C1", json!({"ts": "500.0", "user": "ME", "text": "source"}));
+    let client = client(&fake);
+
+    client
+        .upload_files(
+            &ChannelId("C1".into()),
+            None,
+            vec![
+                ("one.png".into(), vec![1, 2, 3]),
+                ("two.png".into(), vec![4, 5, 6]),
+            ],
+            "two files",
+        )
+        .await
+        .unwrap();
+    assert_eq!(fake.calls("files.getUploadURLExternal"), 2);
+    assert_eq!(fake.calls("files.completeUploadExternal"), 1);
+
+    client
+        .post_message_with_options(
+            &ChannelId("C1".into()),
+            Some(&Ts("500.0".into())),
+            "reply",
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(fake.posted().last().unwrap().also_sent_to_channel);
+
+    let link = client
+        .message_link(&ChannelId("C1".into()), &Ts("500.0".into()))
+        .await
+        .unwrap();
+    assert!(link.contains("/archives/C1/"));
+    client
+        .post_message(&ChannelId("C2".into()), None, &link)
+        .await
+        .unwrap();
+    assert_eq!(fake.posted().last().unwrap().channel, "C2");
+
+    client
+        .delete_message(&ChannelId("C1".into()), &Ts("500.0".into()))
+        .await
+        .unwrap();
+    assert!(
+        client
+            .message_link(&ChannelId("C1".into()), &Ts("500.0".into()))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn refused_message_actions_are_reported() {
+    let fake = Fake::start().await.unwrap();
+    let client = client(&fake);
+    let missing = Ts("missing".into());
+    assert!(
+        client
+            .message_link(&ChannelId("C1".into()), &missing)
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .delete_message(&ChannelId("C1".into()), &missing)
+            .await
+            .is_err()
+    );
+}

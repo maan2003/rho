@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     seed_reference_group(&fake, &at);
     seed_design(&fake, &at);
+    seed_composing_actions(&fake, &at);
     let backlog_ping = seed_random_backlog(&fake, midnight);
 
     fake.add_message(
@@ -341,6 +342,41 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
 
 /// The channel that shows thread isolation: replies are interleaved today,
 /// so 1.6 has a before and an after in the same buffer.
+/// Own messages and a multi-file post for composer/action QA.
+fn seed_composing_actions(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
+    let base = fake.api_base().trim_end_matches("/api");
+    fake.add_message(
+        "C1",
+        json!({
+            "ts": at(0, 8, 20),
+            "user": "ME",
+            "text": "my message — edit, copy link, forward, or delete me",
+        }),
+    );
+    fake.add_message(
+        "C1",
+        json!({
+            "ts": at(0, 8, 21),
+            "user": "ME",
+            "text": "two files in one message",
+            "files": [
+                {
+                    "id": "FCOMPOSE1", "name": "first.png", "title": "first.png",
+                    "mimetype": "image/png", "filetype": "png", "size": 225_280,
+                    "url_private": format!("{base}/files/image.png"),
+                    "original_w": 320, "original_h": 200,
+                },
+                {
+                    "id": "FCOMPOSE2", "name": "second.png", "title": "second.png",
+                    "mimetype": "image/png", "filetype": "png", "size": 196_608,
+                    "url_private": format!("{base}/files/tall.png"),
+                    "original_w": 400, "original_h": 1000,
+                },
+            ],
+        }),
+    );
+}
+
 fn seed_design(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
     fake.add_message(
         "C1",

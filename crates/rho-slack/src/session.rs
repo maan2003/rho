@@ -19,7 +19,7 @@ use crate::api::{Client, SearchPage};
 use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
-use crate::mirror::{Mirror, Saved, Scope};
+use crate::mirror::{Draft, Mirror, Saved, Scope};
 use crate::model::{Change, ConversationRow, Model, Unit, UnitCard};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
 use crate::types::{ChannelId, Message, Reaction, Reason, ThreadKey, Ts, UserId};
@@ -50,6 +50,13 @@ impl Source {
         match self {
             Self::Conversation(_) => None,
             Self::Thread(key) => Some(&key.thread_ts),
+        }
+    }
+
+    pub fn scope(&self, workspace: &str) -> Scope {
+        match self {
+            Self::Conversation(channel) => Scope::conversation(workspace, channel),
+            Self::Thread(key) => Scope::thread(workspace, &key.channel, &key.thread_ts),
         }
     }
 }
@@ -2697,10 +2704,57 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// The saved composer for one source.
+    pub fn draft(&self, source: &Source) -> Option<Draft> {
+        let workspace = self.model.workspace().0.as_str();
+        self.mirror.as_ref()?.draft(&source.scope(workspace))
+    }
+
+    /// Every non-empty saved composer, for a draft inventory.
+    pub fn drafts(&self) -> Vec<(Source, Draft)> {
+        let workspace = self.model.workspace().0.as_str();
+        self.mirror
+            .as_ref()
+            .map(|mirror| {
+                mirror
+                    .drafts(workspace)
+                    .into_iter()
+                    .map(|(scope, draft)| {
+                        let source = match scope.thread {
+                            Some(thread_ts) => Source::Thread(ThreadKey {
+                                workspace: self.model.workspace().clone(),
+                                channel: scope.channel,
+                                thread_ts,
+                            }),
+                            None => Source::Conversation(scope.channel),
+                        };
+                        (source, draft)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn save_draft(&self, source: &Source, draft: &Draft) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.put_draft(&source.scope(&self.model.workspace().0), draft);
+        }
+    }
+
     pub fn send(
         &mut self,
         source: &Source,
         text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.send_with_options(source, text, false, cx)
+    }
+
+    pub fn send_with_options(
+        &mut self,
+        source: &Source,
+        text: String,
+        also_send_to_channel: bool,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let Some(client) = self.client.clone() else {
@@ -2722,7 +2776,12 @@ impl Session {
         let local = self.hold_local(&source, &text, cx);
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
-                .post_message(&channel, thread_ts.as_ref(), &body)
+                .post_message_with_options(
+                    &channel,
+                    thread_ts.as_ref(),
+                    &body,
+                    also_send_to_channel,
+                )
                 .await
         });
         cx.spawn(async move |this, cx| {
@@ -2818,6 +2877,16 @@ impl Session {
         text: String,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        self.send_files(source, vec![(name, bytes)], text, cx)
+    }
+
+    pub fn send_files(
+        &mut self,
+        source: &Source,
+        files: Vec<(String, Vec<u8>)>,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
         let Some(client) = self.client.clone() else {
             return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
         };
@@ -2828,7 +2897,7 @@ impl Session {
         let text = self.model.encode(&text);
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
-                .upload_file(&channel, thread_ts.as_ref(), &name, bytes, &text)
+                .upload_files(&channel, thread_ts.as_ref(), files, &text)
                 .await
         });
         cx.spawn(async move |this, cx| {
@@ -2857,6 +2926,80 @@ impl Session {
     /// The answer says whether it went, the same as `send`, so the surface
     /// can put a refused rewrite back in the reader's hands rather than
     /// drop it.
+    pub fn delete_message(
+        &mut self,
+        source: &Source,
+        ts: Ts,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let is_own = self
+            .loaded
+            .get(source)
+            .and_then(|loaded| loaded.held(&ts))
+            .is_some_and(|message| message.user.as_ref() == Some(self.model.self_id()));
+        if !is_own {
+            return Task::ready(Err(anyhow::anyhow!(
+                "only your own messages can be deleted"
+            )));
+        }
+        let Some(client) = self.client.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
+        };
+        let channel = source.channel().clone();
+        let task =
+            gpui_tokio::Tokio::spawn(
+                cx,
+                async move { client.delete_message(&channel, &ts).await },
+            );
+        cx.spawn(async move |_, _| {
+            task.await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")))
+        })
+    }
+
+    pub fn message_link(
+        &mut self,
+        source: &Source,
+        ts: Ts,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<String>> {
+        let Some(client) = self.client.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
+        };
+        let channel = source.channel().clone();
+        let task =
+            gpui_tokio::Tokio::spawn(cx, async move { client.message_link(&channel, &ts).await });
+        cx.spawn(async move |_, _| {
+            task.await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")))
+        })
+    }
+
+    /// Forwards by posting Slack's canonical permalink. This preserves the
+    /// original as the source of truth and works across public channels,
+    /// private conversations, and DMs the reader can access.
+    pub fn forward_message(
+        &mut self,
+        source: &Source,
+        ts: Ts,
+        destination: ChannelId,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let Some(client) = self.client.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
+        };
+        let channel = source.channel().clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let link = client.message_link(&channel, &ts).await?;
+            client.post_message(&destination, None, &link).await?;
+            Ok(())
+        });
+        cx.spawn(async move |_, _| {
+            task.await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")))
+        })
+    }
+
     pub fn edit_message(
         &mut self,
         source: &Source,

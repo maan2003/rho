@@ -985,7 +985,7 @@ impl Workspace {
                 conversation,
                 bytes,
             }),
-            Submitted::Sent | Submitted::Refused | Submitted::Nothing => {}
+            Submitted::Sent | Submitted::Refused | Submitted::Nothing | Submitted::Sending => {}
         }
     }
 
@@ -1175,6 +1175,143 @@ impl Workspace {
                         cx,
                     );
                 }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens an explicit confirmation prompt before deleting an own message.
+    /// Header and context-menu mouse actions call this with their target.
+    pub(crate) fn confirm_slack_delete_message(
+        &mut self,
+        ts: Ts,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_prompt(
+            "delete message? type delete:",
+            std::rc::Rc::new(|_, typed, _| {
+                vec![Candidate {
+                    value: "delete".to_owned(),
+                    description: if typed.trim() == "delete" {
+                        "Enter permanently deletes your message".to_owned()
+                    } else {
+                        "confirmation required".to_owned()
+                    },
+                }]
+            }),
+            std::rc::Rc::new(move |workspace: &mut Workspace, input, _window, cx| {
+                if input.trim() != "delete" {
+                    workspace.echo("slack: message not deleted", StyleClass::SystemInfo, cx);
+                    return;
+                }
+                let SurfaceView::SlackConversation(view) = &workspace.active_surface().view else {
+                    return;
+                };
+                let deleting = view
+                    .clone()
+                    .update(cx, |view, cx| view.delete_message(ts.clone(), cx));
+                cx.spawn(async move |this, cx| {
+                    let deleted = deleting.await;
+                    let _ = this.update(cx, |this, cx| match deleted {
+                        Ok(()) => this.echo("slack: message deleted", StyleClass::SystemInfo, cx),
+                        Err(error) => this.echo(
+                            &format!("slack: {error:#}"),
+                            StyleClass::SystemImportant,
+                            cx,
+                        ),
+                    });
+                })
+                .detach();
+            }),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn slack_copy_message_link(&mut self, ts: Ts, cx: &mut gpui::Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let linking = view
+            .clone()
+            .update(cx, |view, cx| view.message_link(ts, cx));
+        cx.spawn(async move |this, cx| {
+            let linked = linking.await;
+            let _ = this.update(cx, |this, cx| match linked {
+                Ok(link) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+                    this.echo("slack: message link copied", StyleClass::SystemInfo, cx);
+                }
+                Err(error) => this.echo(
+                    &format!("slack: {error:#}"),
+                    StyleClass::SystemImportant,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn prompt_slack_forward_message(
+        &mut self,
+        ts: Ts,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_prompt(
+            "forward to:",
+            std::rc::Rc::new(|workspace: &Workspace, needle: &str, cx: &gpui::App| {
+                let Some(session) = workspace.slack.session() else {
+                    return Vec::new();
+                };
+                let needle = needle.to_lowercase();
+                session
+                    .read(cx)
+                    .model()
+                    .conversation_rows()
+                    .into_iter()
+                    .filter(|row| row.label.to_lowercase().contains(&needle))
+                    .map(|row| Candidate {
+                        value: row.label,
+                        description: row.id.0,
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(move |workspace: &mut Workspace, input, _window, cx| {
+                let Some(session) = workspace.slack.session() else {
+                    return;
+                };
+                let destination = session
+                    .read(cx)
+                    .model()
+                    .conversation_rows()
+                    .into_iter()
+                    .find(|row| row.label == input.trim() || row.id.0 == input.trim())
+                    .map(|row| row.id);
+                let Some(destination) = destination else {
+                    workspace.echo("slack: choose a conversation", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                let SurfaceView::SlackConversation(view) = &workspace.active_surface().view else {
+                    return;
+                };
+                let forwarding = view.clone().update(cx, |view, cx| {
+                    view.forward_message(ts.clone(), destination, cx)
+                });
+                cx.spawn(async move |this, cx| {
+                    let forwarded = forwarding.await;
+                    let _ = this.update(cx, |this, cx| match forwarded {
+                        Ok(()) => this.echo("slack: message forwarded", StyleClass::SystemInfo, cx),
+                        Err(error) => this.echo(
+                            &format!("slack: {error:#}"),
+                            StyleClass::SystemImportant,
+                            cx,
+                        ),
+                    });
+                })
+                .detach();
             }),
             window,
             cx,

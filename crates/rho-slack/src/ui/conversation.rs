@@ -27,6 +27,7 @@ use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
 use theme::ActiveTheme as _;
 
+use crate::mirror::{Draft, DraftFile};
 use crate::model::Model;
 use crate::session::{Session, Source, Update};
 use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
@@ -108,10 +109,9 @@ pub struct ConversationView {
     /// further up. The status line says how many; reaching the end again
     /// clears it, because then they have been seen.
     unseen: usize,
-    /// The picture the next message carries, if the reader attached one.
-    /// One at a time: a second attachment replaces it, which is what the
-    /// chip shows.
-    attached: Option<Attached>,
+    /// Files carried by the next message, in attachment order.
+    attached: Vec<Attached>,
+    send_state: SendState,
     /// The message being rewritten, if `e` is open on one: tinted, and what
     /// `enter` updates instead of sending. The composer's own text is held
     /// beside it so `escape` gives the reader back what they were writing.
@@ -157,6 +157,8 @@ pub enum Event {
 pub enum Submitted {
     /// Nothing to send: an empty composer with no picture waiting.
     Nothing,
+    /// The same draft is already being sent.
+    Sending,
     /// A new message went out.
     Sent,
     /// The rewrite of this message was accepted.
@@ -171,21 +173,34 @@ pub enum Submitted {
 /// for each, so this is the answer rather than a bare yes and no.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attaching {
-    /// The chip is now showing this picture, and there was none before.
+    /// The file was added to the waiting set.
     Attached,
-    /// It took the place of one already waiting, which the reader is told
-    /// so they do not send the wrong file.
+    /// Kept for source compatibility; multiple attachments no longer replace.
     Replaced,
     /// An edit is open, and a rewrite cannot carry a picture.
     NotWhileEditing,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SendState {
+    #[default]
+    Ready,
+    Sending,
+    Failed,
+}
+
 /// A picture waiting to go with the next message: what the chip shows and
 /// what `enter` uploads.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Attached {
     pub name: String,
     pub bytes: std::sync::Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentSummary {
+    pub name: String,
+    pub bytes: u64,
 }
 
 impl Attached {
@@ -231,6 +246,14 @@ pub enum EditStart {
     Started(Ts),
     NotYours,
     Nothing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageActions {
+    pub ts: Ts,
+    pub can_delete: bool,
+    pub can_forward: bool,
+    pub can_copy_link: bool,
 }
 
 impl EventEmitter<Event> for ConversationView {}
@@ -347,6 +370,15 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let saved = session.read(cx).draft(&source).unwrap_or_default();
+        let saved_files = saved
+            .files
+            .iter()
+            .map(|file| Attached {
+                name: file.name.clone(),
+                bytes: std::sync::Arc::new(file.bytes.clone()),
+            })
+            .collect::<Vec<_>>();
         // The conversation is a document of Markdown blocks, one to a
         // message, read by the same pipeline the agent transcript uses: it
         // parses the markup, conceals the markers and styles what is left,
@@ -357,7 +389,7 @@ impl ConversationView {
             (hooks.configure_markdown)(&mut buffer, cx);
             buffer
         });
-        let input = cx.new(|cx| Buffer::local("", cx));
+        let input = cx.new(|cx| Buffer::local(saved.text.clone(), cx));
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
             multi_buffer.set_excerpts_for_path(
@@ -410,6 +442,7 @@ impl ConversationView {
         subscriptions.push(cx.subscribe(&input, |this, _, event: &BufferEvent, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
                 this.apply_compose_chrome(cx);
+                this.persist_draft(cx);
             }
         }));
         // History fills as the reader scrolls, and there is no other way to
@@ -484,7 +517,8 @@ impl ConversationView {
             unseen: 0,
             editing_message: None,
             held_compose: None,
-            attached: None,
+            attached: saved_files,
+            send_state: SendState::Ready,
             awaiting_images: Vec::new(),
             awaiting_names: Vec::new(),
             emoji_decorations: Vec::new(),
@@ -617,14 +651,26 @@ impl ConversationView {
     /// here and the returned task only watches for the outcome, so a caller
     /// with no use for the answer can drop it without cancelling a message.
     pub fn submit(&mut self, cx: &mut Context<Self>) -> Task<Submitted> {
+        self.submit_with_options(false, cx)
+    }
+
+    /// Sends a thread reply and optionally broadcasts it to the channel.
+    pub fn submit_with_options(
+        &mut self,
+        also_send_to_channel: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Submitted> {
         let text = self.input.read(cx).text();
-        // A picture is a message on its own; words are not required.
-        if text.trim().is_empty() && self.attached.is_none() {
+        if self.send_state == SendState::Sending {
+            return Task::ready(Submitted::Sending);
+        }
+        // A file is a message on its own; words are not required.
+        if text.trim().is_empty() && self.attached.is_empty() {
             return Task::ready(Submitted::Nothing);
         }
         let source = self.source.clone();
-        if let Some(file) = self.attached.take() {
-            return self.send_attached(file, text, cx);
+        if !self.attached.is_empty() {
+            return self.send_attached(self.attached.clone(), text, cx);
         }
         if let Some(ts) = self.editing_message.take() {
             // The composer goes back to whatever the reader had put aside to
@@ -650,16 +696,37 @@ impl ConversationView {
             .detach();
             return watch(cx, told);
         }
-        self.set_compose(String::new(), cx);
-        let sending = self
-            .session
-            .update(cx, |session, cx| session.send(&source, text.clone(), cx));
+        self.send_state = SendState::Sending;
+        self.refresh_chip(cx);
+        cx.notify();
+        let sending = self.session.update(cx, |session, cx| {
+            session.send_with_options(&source, text.clone(), also_send_to_channel, cx)
+        });
         let (tell, told) = futures::channel::oneshot::channel();
         cx.spawn(async move |this, cx| {
             let outcome = match sending.await {
-                Ok(()) => Submitted::Sent,
+                Ok(()) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.send_state = SendState::Ready;
+                        let current = this.input.read(cx).text();
+                        if current == text {
+                            this.set_compose(String::new(), cx);
+                        } else if let Some(after) = current.strip_prefix(&text) {
+                            this.set_compose(after.to_owned(), cx);
+                        }
+                        this.persist_draft(cx);
+                        this.refresh_chip(cx);
+                        cx.notify();
+                    });
+                    Submitted::Sent
+                }
                 Err(_) => {
-                    let _ = this.update(cx, |this, cx| this.restore_compose(text, cx));
+                    let _ = this.update(cx, |this, cx| {
+                        this.send_state = SendState::Failed;
+                        this.persist_draft(cx);
+                        this.refresh_chip(cx);
+                        cx.notify();
+                    });
                     Submitted::Refused
                 }
             };
@@ -854,6 +921,42 @@ impl ConversationView {
         });
     }
 
+    /// Actions available for the message under the cursor. The host uses
+    /// this for either a context menu or header menu.
+    pub fn message_actions(&self, cx: &mut Context<Self>) -> Option<MessageActions> {
+        let message = self.cursor_message(cx)?;
+        Some(MessageActions {
+            ts: message.ts,
+            can_delete: message.user.as_ref() == Some(self.session.read(cx).model().self_id()),
+            can_forward: true,
+            can_copy_link: true,
+        })
+    }
+
+    pub fn delete_message(&mut self, ts: Ts, cx: &mut Context<Self>) -> Task<anyhow::Result<()>> {
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.delete_message(&source, ts, cx))
+    }
+
+    pub fn message_link(&mut self, ts: Ts, cx: &mut Context<Self>) -> Task<anyhow::Result<String>> {
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.message_link(&source, ts, cx))
+    }
+
+    pub fn forward_message(
+        &mut self,
+        ts: Ts,
+        destination: crate::types::ChannelId,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let source = self.source.clone();
+        self.session.update(cx, |session, cx| {
+            session.forward_message(&source, ts, destination, cx)
+        })
+    }
+
     /// `e`: rewrite the message under the cursor. Only the reader's own can
     /// be rewritten, and saying so is the host's job, so a refusal is
     /// reported rather than swallowed.
@@ -931,17 +1034,14 @@ impl ConversationView {
         if self.editing_message.is_some() {
             return Attaching::NotWhileEditing;
         }
-        let replaced = self.attached.is_some();
-        self.attached = Some(Attached {
+        self.attached.push(Attached {
             name,
             bytes: std::sync::Arc::new(bytes),
         });
+        self.persist_draft(cx);
         self.refresh_chip(cx);
         cx.notify();
-        match replaced {
-            true => Attaching::Replaced,
-            false => Attaching::Attached,
-        }
+        Attaching::Attached
     }
 
     /// Reads a file from disk and attaches it: the path a drop or a prompt
@@ -965,10 +1065,34 @@ impl ConversationView {
         Ok(self.attach(name, bytes, cx))
     }
 
+    pub fn attachments(&self) -> Vec<AttachmentSummary> {
+        self.attached
+            .iter()
+            .map(|file| AttachmentSummary {
+                name: file.name.clone(),
+                bytes: file.bytes.len() as u64,
+            })
+            .collect()
+    }
+
+    /// Removes one attachment chip by its displayed index.
+    pub fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if index >= self.attached.len() {
+            return false;
+        }
+        self.attached.remove(index);
+        self.persist_draft(cx);
+        self.refresh_chip(cx);
+        cx.notify();
+        true
+    }
+
     /// Drops the attachment without sending it.
     pub fn clear_attachment(&mut self, cx: &mut Context<Self>) -> bool {
-        let had = self.attached.take().is_some();
+        let had = !self.attached.is_empty();
+        self.attached.clear();
         if had {
+            self.persist_draft(cx);
             self.refresh_chip(cx);
             cx.notify();
         }
@@ -977,7 +1101,16 @@ impl ConversationView {
 
     /// How big the waiting picture is, for the host's journal.
     pub fn attached_size(&self) -> Option<u64> {
-        self.attached.as_ref().map(|file| file.bytes.len() as u64)
+        (!self.attached.is_empty()).then(|| {
+            self.attached
+                .iter()
+                .map(|file| file.bytes.len() as u64)
+                .sum()
+        })
+    }
+
+    pub fn send_state(&self) -> SendState {
+        self.send_state
     }
 
     /// Uploads the picture with the message. Nothing is drawn from the
@@ -986,32 +1119,49 @@ impl ConversationView {
     /// again without retyping.
     fn send_attached(
         &mut self,
-        file: Attached,
+        files: Vec<Attached>,
         text: String,
         cx: &mut Context<Self>,
     ) -> Task<Submitted> {
-        self.set_compose(String::new(), cx);
+        self.send_state = SendState::Sending;
         self.refresh_chip(cx);
+        cx.notify();
         let source = self.source.clone();
-        let bytes = file.bytes.len() as u64;
+        let bytes = files.iter().map(|file| file.bytes.len() as u64).sum();
+        let upload = files
+            .iter()
+            .map(|file| (file.name.clone(), file.bytes.as_ref().clone()))
+            .collect();
         let sending = self.session.update(cx, |session, cx| {
-            session.send_file(
-                &source,
-                file.name.clone(),
-                file.bytes.as_ref().clone(),
-                text.clone(),
-                cx,
-            )
+            session.send_files(&source, upload, text.clone(), cx)
         });
         let (tell, told) = futures::channel::oneshot::channel();
         cx.spawn(async move |this, cx| {
             let outcome = match sending.await {
-                Ok(()) => Submitted::FileSent(bytes),
+                Ok(()) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.send_state = SendState::Ready;
+                        let current = this.input.read(cx).text();
+                        if current == text {
+                            this.set_compose(String::new(), cx);
+                        } else if let Some(after) = current.strip_prefix(&text) {
+                            this.set_compose(after.to_owned(), cx);
+                        }
+                        if this.attached == files {
+                            this.attached.clear();
+                        }
+                        this.persist_draft(cx);
+                        this.refresh_chip(cx);
+                        cx.notify();
+                    });
+                    Submitted::FileSent(bytes)
+                }
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.attached = Some(file);
-                        this.restore_compose(text, cx);
+                        this.send_state = SendState::Failed;
+                        this.persist_draft(cx);
                         this.refresh_chip(cx);
+                        cx.notify();
                     });
                     Submitted::Refused
                 }
@@ -1026,11 +1176,17 @@ impl ConversationView {
     /// composer, and a message arriving appends itself after whatever is
     /// at the end.
     fn refresh_chip(&mut self, cx: &mut Context<Self>) {
-        let Some(file) = self.attached.clone() else {
+        if self.attached.is_empty() && self.send_state == SendState::Ready {
             self.transcript.remove(&Row::Chip, cx);
             return;
-        };
-        let item = muted_item(Row::Chip, format!("{}\n", file.line()), Class::Muted);
+        }
+        let mut lines = self.attached.iter().map(Attached::line).collect::<Vec<_>>();
+        match self.send_state {
+            SendState::Ready => {}
+            SendState::Sending => lines.push("sending…".to_owned()),
+            SendState::Failed => lines.push("send failed · Enter retries".to_owned()),
+        }
+        let item = muted_item(Row::Chip, format!("{}\n", lines.join("\n")), Class::Muted);
         let last = self.transcript.keys().last().cloned();
         if last.as_ref() == Some(&Row::Chip) {
             self.transcript.replace(&Row::Chip, item, cx);
@@ -1043,6 +1199,27 @@ impl ConversationView {
     /// Which message an open edit is about, for the host's journal.
     pub fn editing_message(&self) -> Option<&Ts> {
         self.editing_message.as_ref()
+    }
+
+    fn persist_draft(&self, cx: &App) {
+        let text = self
+            .held_compose
+            .as_ref()
+            .filter(|_| self.editing_message.is_some())
+            .cloned()
+            .unwrap_or_else(|| self.input.read(cx).text());
+        let draft = Draft {
+            text,
+            files: self
+                .attached
+                .iter()
+                .map(|file| DraftFile {
+                    name: file.name.clone(),
+                    bytes: file.bytes.as_ref().clone(),
+                })
+                .collect(),
+        };
+        self.session.read(cx).save_draft(&self.source, &draft);
     }
 
     fn set_compose(&mut self, text: String, cx: &mut Context<Self>) {
@@ -2706,10 +2883,11 @@ fn width(spans: &[Span]) -> usize {
 /// its own words, because a reply landing in the channel instead is the
 /// mistake this line exists to prevent.
 fn compose_placeholder(label: &str, thread: bool) -> String {
-    match thread {
+    let target = match thread {
         false => format!("message {label}"),
         true => format!("reply in {label}"),
-    }
+    };
+    format!("{target} · Enter sends · Shift-Enter newline · Markdown supported")
 }
 
 /// Waits for the outcome of a write that is already on its way. The write
@@ -4201,10 +4379,16 @@ mod tests {
 
     #[test]
     fn the_empty_composer_says_where_the_message_is_going() {
-        assert_eq!(compose_placeholder("#design", false), "message #design");
+        assert_eq!(
+            compose_placeholder("#design", false),
+            "message #design · Enter sends · Shift-Enter newline · Markdown supported"
+        );
         // A thread's composer is the one place the reader can be wrong about
         // where the words land, so it says the thread out loud.
-        assert_eq!(compose_placeholder("#design", true), "reply in #design");
+        assert_eq!(
+            compose_placeholder("#design", true),
+            "reply in #design · Enter sends · Shift-Enter newline · Markdown supported"
+        );
     }
 
     #[test]
