@@ -51,6 +51,12 @@ pub fn message(channel: &str, message: &Message) -> Value {
         "text": message.text,
     });
     let object = value.as_object_mut().expect("a message is an object");
+    if !message.blocks.is_empty() {
+        object.insert("blocks".to_owned(), json!(message.blocks));
+    }
+    if let Some(bot_id) = &message.bot_id {
+        object.insert("bot_id".to_owned(), json!(bot_id));
+    }
     if let Some(thread_ts) = message.thread_ts {
         object.insert("thread_ts".to_owned(), json!(thread_ts.to_string()));
     }

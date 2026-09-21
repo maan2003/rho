@@ -186,6 +186,14 @@ impl Wire {
 
 /// What `rtm.connect` hands back: where the socket is, who the caller is,
 /// and what the workspace is called.
+pub fn dialog_opened(dialog_id: &str, client_token: &str) -> Frame {
+    Frame::plain(json!({
+        "type": "dialog_opened",
+        "dialog_id": dialog_id,
+        "client_token": client_token,
+    }))
+}
+
 pub fn rtm(url: &str, self_id: &UserId, self_name: &str) -> Value {
     json!({
         "ok": true,

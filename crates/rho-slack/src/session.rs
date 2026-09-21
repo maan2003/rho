@@ -81,6 +81,11 @@ pub enum SessionEvent {
     /// an answer to a query they have already replaced is dropped before
     /// this is emitted.
     Found(Found),
+    /// A legacy app dialog fetched after Slack announced it on the socket.
+    Dialog {
+        dialog_id: String,
+        dialog: serde_json::Value,
+    },
 }
 
 /// What came back from a search, ready to be drawn.
@@ -2515,6 +2520,71 @@ impl Session {
         }));
     }
 
+    /// Dispatches one supported Block Kit message control.
+    pub fn run_interaction(
+        &mut self,
+        message: Message,
+        action: crate::block::Interaction,
+        selected: Option<crate::block::InteractionOption>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            cx.emit(SessionEvent::Notice("slack: not connected".to_owned()));
+            return;
+        };
+        let mut payload = action.payload;
+        if let Some(selected) = selected {
+            payload["selected_option"] = serde_json::json!({
+                "text": {"type": "plain_text", "text": selected.label},
+                "value": selected.value,
+            });
+        }
+        let service_id = message.bot_id.unwrap_or_else(|| "B01".to_owned());
+        let channel = message.channel;
+        let ts = message.ts;
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client
+                .block_action(&service_id, payload, &channel, &ts)
+                .await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let notice = match task.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("slack: {error:#}")),
+                Err(error) => Some(format!("slack: {error}")),
+            };
+            if let Some(notice) = notice {
+                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Notice(notice)));
+            }
+        }));
+    }
+
+    /// Submits the values collected by the host for a legacy app dialog.
+    pub fn submit_dialog(
+        &mut self,
+        dialog_id: String,
+        submission: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            cx.emit(SessionEvent::Notice("slack: not connected".to_owned()));
+            return;
+        };
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client.submit_dialog(&dialog_id, submission).await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let notice = match task.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("slack: {error:#}")),
+                Err(error) => Some(format!("slack: {error}")),
+            };
+            if let Some(notice) = notice {
+                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Notice(notice)));
+            }
+        }));
+    }
+
     /// Sends `text` where the surface points: into the thread from a thread
     /// surface, into the conversation otherwise.
     /// Posts the message. The words appear at once, muted, under a local
@@ -2703,6 +2773,7 @@ impl Session {
             channel: source.channel().clone(),
             user: Some(self.model.self_id().clone()),
             bot_name: None,
+            bot_id: None,
             blocks: Vec::new(),
             text: text.to_owned(),
             attachments: Vec::new(),
@@ -2847,6 +2918,7 @@ impl Session {
             channel: source.channel().clone(),
             user: Some(self.model.self_id().clone()),
             bot_name: None,
+            bot_id: None,
             blocks: Vec::new(),
             text,
             attachments: Vec::new(),

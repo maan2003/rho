@@ -807,3 +807,124 @@ async fn the_control_surface_takes_the_same_action_the_handle_takes() {
         reader.abort();
     }
 }
+
+#[tokio::test]
+async fn block_actions_and_the_dialog_round_trip_through_the_real_client_api() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let client = connected(&slack);
+    let mut socket = socket(&slack, &client).await;
+    assert_eq!(frame(&mut socket).await.expect("hello")["type"], "hello");
+
+    let channel = client
+        .conversations()
+        .await
+        .expect("conversations")
+        .into_iter()
+        .find(|channel| channel.id.0.ends_with("00000"))
+        .expect("representative room")
+        .id;
+    let card = client
+        .conversations_history(&channel, None)
+        .await
+        .expect("history")
+        .messages
+        .into_iter()
+        .find(|message| !message.blocks.is_empty())
+        .expect("representative app card");
+
+    client
+        .block_action(
+            card.bot_id.as_deref().expect("service id"),
+            serde_json::json!({
+                "type": "button",
+                "action_id": "approve",
+                "block_id": "deploy",
+                "value": "yes",
+                "text": {"type": "plain_text", "text": "Approve"}
+            }),
+            &channel,
+            &card.ts,
+        )
+        .await
+        .expect("button accepted");
+
+    client
+        .block_action(
+            card.bot_id.as_deref().expect("service id"),
+            serde_json::json!({
+                "type": "static_select",
+                "action_id": "target",
+                "block_id": "deploy",
+                "placeholder": {"type": "plain_text", "text": "Choose target"},
+                "selected_option": {
+                    "text": {"type": "plain_text", "text": "Production"},
+                    "value": "production"
+                }
+            }),
+            &channel,
+            &card.ts,
+        )
+        .await
+        .expect("selection accepted");
+
+    client
+        .block_action(
+            card.bot_id.as_deref().expect("service id"),
+            serde_json::json!({
+                "type": "button",
+                "action_id": "open_details",
+                "block_id": "deploy",
+                "text": {"type": "plain_text", "text": "Add details"}
+            }),
+            &channel,
+            &card.ts,
+        )
+        .await
+        .expect("modal button accepted");
+    let opened = frame(&mut socket).await.expect("dialog_opened");
+    assert_eq!(
+        rho_slack::events::parse(&opened),
+        rho_slack::events::WsEvent::DialogOpened {
+            dialog_id: "DIALOG1".to_owned(),
+            client_token: "RhoSlack-acme".to_owned(),
+        }
+    );
+
+    let dialog = client.dialog("DIALOG1").await.expect("dialog");
+    assert_eq!(dialog["title"], "Deployment details");
+    client
+        .submit_dialog(
+            "DIALOG1",
+            serde_json::json!({"note": "ship it", "urgency": "normal"}),
+        )
+        .await
+        .expect("dialog submission");
+
+    assert_eq!(slack.served_method(Method::BlocksActions), 3);
+    assert_eq!(slack.served_method(Method::DialogGet), 1);
+    assert_eq!(slack.served_method(Method::DialogSubmit), 1);
+}
+
+#[tokio::test]
+async fn malformed_block_actions_are_refused_instead_of_teaching_a_fake_dialect() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let answer: serde_json::Value = client()
+        .post(format!("{}/blocks.actions", slack.api_base()))
+        .bearer_auth("xoxc-fake")
+        .json(&serde_json::json!({
+            "actions": [{"type": "button", "action_id": "approve"}],
+            "service_id": "BAPP",
+            "container": {"type": "message"},
+            "client_token": "made-up"
+        }))
+        .send()
+        .await
+        .expect("call")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        answer,
+        serde_json::json!({"ok": false, "error": "invalid_arguments"})
+    );
+}

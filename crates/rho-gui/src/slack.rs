@@ -744,6 +744,40 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // An app control is more specific than the thread around its message.
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
+            let view = view.clone();
+            if let Some(interaction) = view.update(cx, |view, cx| view.cursor_interaction(cx)) {
+                if interaction.action.requires_confirmation {
+                    self.echo(
+                        "slack: this app action requires a confirmation dialog, which rho does not support yet",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                }
+                match interaction.action.element_type.as_str() {
+                    "button" => {
+                        if let Some(url) = interaction.action.payload["url"].as_str() {
+                            self.create_browser_page(url.to_owned(), None, window, cx);
+                        } else {
+                            view.update(cx, |view, cx| view.run_interaction(interaction, None, cx));
+                        }
+                    }
+                    "static_select" => {
+                        self.prompt_slack_select(view, interaction, window, cx);
+                    }
+                    kind => {
+                        self.echo(
+                            &format!("slack: {kind} app controls are not supported yet"),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                }
+                return;
+            }
+        }
         // A file line is a file: the reader who put the cursor there asked
         // for the attachment, not for the thread it hangs under.
         if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
@@ -781,6 +815,42 @@ impl Workspace {
         if let Some(source) = source {
             self.open_slack_source(source, window, cx);
         }
+    }
+
+    fn prompt_slack_select(
+        &mut self,
+        view: gpui::Entity<rho_slack::ui::ConversationView>,
+        interaction: rho_slack::ui::conversation::MessageInteraction,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let options = interaction.action.options.clone();
+        let choices = options.clone();
+        self.open_prompt(
+            format!("{}:", interaction.action.label),
+            std::rc::Rc::new(move |_, needle, _| {
+                let needle = needle.to_lowercase();
+                choices
+                    .iter()
+                    .filter(|option| option.label.to_lowercase().contains(&needle))
+                    .map(|option| Candidate {
+                        value: option.label.clone(),
+                        description: option.value.clone(),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(move |_, input, _window, cx| {
+                let Some(option) = options.iter().find(|option| option.label == input).cloned()
+                else {
+                    return;
+                };
+                view.update(cx, |view, cx| {
+                    view.run_interaction(interaction.clone(), Some(option), cx)
+                });
+            }),
+            window,
+            cx,
+        );
     }
 
     /// A picture opens in rho, not in the desktop's viewer: the bytes are
@@ -1646,6 +1716,110 @@ impl Workspace {
         self.slack_narrow(&before, window, cx);
     }
 
+    fn prompt_slack_dialog(
+        &mut self,
+        dialog_id: String,
+        dialog: serde_json::Value,
+        index: usize,
+        submission: serde_json::Map<String, serde_json::Value>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let elements = dialog["elements"].as_array().cloned().unwrap_or_default();
+        let Some(element) = elements.get(index).cloned() else {
+            if let Some(session) = self.slack.session() {
+                session.update(cx, |session, cx| {
+                    session.submit_dialog(dialog_id, serde_json::Value::Object(submission), cx)
+                });
+            }
+            return;
+        };
+        let kind = element["type"].as_str().unwrap_or_default();
+        let name = element["name"].as_str().unwrap_or_default().to_owned();
+        let label = element["label"].as_str().unwrap_or(&name).to_owned();
+        if name.is_empty() {
+            self.echo(
+                "slack: app dialog field has no name",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        match kind {
+            "text" | "textarea" => {
+                let next_dialog = dialog.clone();
+                self.open_prompt(
+                    format!("{label}:"),
+                    std::rc::Rc::new(|_, _, _| Vec::new()),
+                    std::rc::Rc::new(move |workspace, input, window, cx| {
+                        let mut submission = submission.clone();
+                        submission.insert(name.clone(), serde_json::json!(input));
+                        workspace.prompt_slack_dialog(
+                            dialog_id.clone(),
+                            next_dialog.clone(),
+                            index + 1,
+                            submission,
+                            window,
+                            cx,
+                        );
+                    }),
+                    window,
+                    cx,
+                );
+            }
+            "select" if element["data_source"].as_str() == Some("static") => {
+                let options = element["options"].as_array().cloned().unwrap_or_default();
+                let choices = options.clone();
+                let next_dialog = dialog.clone();
+                self.open_prompt(
+                    format!("{label}:"),
+                    std::rc::Rc::new(move |_, needle, _| {
+                        let needle = needle.to_lowercase();
+                        choices
+                            .iter()
+                            .filter_map(|option| {
+                                let label = option["label"].as_str()?;
+                                label.to_lowercase().contains(&needle).then(|| Candidate {
+                                    value: label.to_owned(),
+                                    description: option["value"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                })
+                            })
+                            .collect()
+                    }),
+                    std::rc::Rc::new(move |workspace, input, window, cx| {
+                        let Some(value) = options.iter().find_map(|option| {
+                            (option["label"].as_str() == Some(&input))
+                                .then(|| option["value"].as_str().map(str::to_owned))
+                                .flatten()
+                        }) else {
+                            return;
+                        };
+                        let mut submission = submission.clone();
+                        submission.insert(name.clone(), serde_json::json!(value));
+                        workspace.prompt_slack_dialog(
+                            dialog_id.clone(),
+                            next_dialog.clone(),
+                            index + 1,
+                            submission,
+                            window,
+                            cx,
+                        );
+                    }),
+                    window,
+                    cx,
+                );
+            }
+            _ => self.echo(
+                &format!("slack: {kind} app dialog fields are not supported yet"),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+        }
+    }
+
     fn on_slack_event(
         &mut self,
         session: gpui::Entity<Session>,
@@ -1671,6 +1845,16 @@ impl Workspace {
             }
             SessionEvent::Found(found) => {
                 self.slack_found(found, window, cx);
+            }
+            SessionEvent::Dialog { dialog_id, dialog } => {
+                self.prompt_slack_dialog(
+                    dialog_id.clone(),
+                    dialog.clone(),
+                    0,
+                    serde_json::Map::new(),
+                    window,
+                    cx,
+                );
             }
             SessionEvent::Connected => {
                 rho_journal::record(rho_journal::Event::SlackConnected {

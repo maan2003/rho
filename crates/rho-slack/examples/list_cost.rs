@@ -335,6 +335,7 @@ fn message(channel: &str, seconds: i64) -> Message {
         channel: ChannelId(channel.to_owned()),
         user: Some(UserId("U1".to_owned())),
         bot_name: None,
+        bot_id: None,
         blocks: Vec::new(),
         text: "traffic".to_owned(),
         attachments: Vec::new(),

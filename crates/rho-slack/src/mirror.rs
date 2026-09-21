@@ -1020,6 +1020,8 @@ struct StoredMessage {
     channel: String,
     user: Option<String>,
     bot_name: Option<String>,
+    #[senax(default)]
+    bot_id: Option<String>,
     blocks: Vec<String>,
     text: String,
     attachments: Vec<StoredAttachment>,
@@ -1075,6 +1077,7 @@ impl From<&Message> for StoredMessage {
             channel: message.channel.0.clone(),
             user: message.user.as_ref().map(|user| user.0.clone()),
             bot_name: message.bot_name.clone(),
+            bot_id: message.bot_id.clone(),
             blocks: message
                 .blocks
                 .iter()
@@ -1134,6 +1137,7 @@ impl From<&StoredMessage> for Message {
             channel: ChannelId(stored.channel.clone()),
             user: stored.user.clone().map(UserId),
             bot_name: stored.bot_name.clone(),
+            bot_id: stored.bot_id.clone(),
             blocks: stored
                 .blocks
                 .iter()

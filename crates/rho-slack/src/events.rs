@@ -71,6 +71,11 @@ pub enum WsEvent {
     /// Slack refused the session on an accepted socket, which is what an
     /// `invalid_auth` handshake failure looks like from the inside.
     Failed(String),
+    /// Slack opened a legacy app dialog after an interactive action.
+    DialogOpened {
+        dialog_id: String,
+        client_token: String,
+    },
     Ignored,
 }
 
@@ -80,6 +85,15 @@ pub fn parse(frame: &Value) -> WsEvent {
         "pong" => WsEvent::Pong,
         "reconnect_url" => match frame["url"].as_str() {
             Some(url) if !url.is_empty() => WsEvent::ReconnectUrl(url.to_owned()),
+            _ => WsEvent::Ignored,
+        },
+        "dialog_opened" => match (frame["dialog_id"].as_str(), frame["client_token"].as_str()) {
+            (Some(dialog_id), Some(client_token)) if !dialog_id.is_empty() => {
+                WsEvent::DialogOpened {
+                    dialog_id: dialog_id.to_owned(),
+                    client_token: client_token.to_owned(),
+                }
+            }
             _ => WsEvent::Ignored,
         },
         "error" => {

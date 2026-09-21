@@ -143,6 +143,8 @@ pub struct Message {
     pub user: Option<UserId>,
     /// A bot or app post has no user id; its name arrives inline.
     pub bot_name: Option<String>,
+    /// The app service receiving Block Kit interactions.
+    pub bot_id: Option<String>,
     /// Block Kit as received, kept unrendered so names can be resolved later
     /// when a user or channel first becomes known.
     pub blocks: Vec<serde_json::Value>,

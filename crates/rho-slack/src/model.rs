@@ -2595,6 +2595,7 @@ mod tests {
             channel: ChannelId(channel.into()),
             user: Some(UserId(user.into())),
             bot_name: None,
+            bot_id: None,
             blocks: Vec::new(),
             text: text.into(),
             attachments: Vec::new(),

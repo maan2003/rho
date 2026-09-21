@@ -190,6 +190,135 @@ pub struct Link {
     pub url: String,
 }
 
+/// An interactive Block Kit control retained beside the rendered message text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Interaction {
+    pub label: String,
+    pub element_type: String,
+    pub block_id: String,
+    pub action_id: String,
+    pub value: Option<String>,
+    pub options: Vec<InteractionOption>,
+    pub requires_confirmation: bool,
+    /// Slack's original element payload, with the containing block id attached.
+    pub payload: Value,
+}
+
+/// One choice in a `static_select` control.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InteractionOption {
+    pub label: String,
+    pub value: String,
+}
+
+/// Interactive controls in display order. Buttons and static selects can be
+/// dispatched; every other control is still returned so the UI can explain
+/// that it is unsupported rather than silently eating `enter`.
+pub fn interactions(blocks: &[Value], names: &dyn Names) -> Vec<Interaction> {
+    let mut found = Vec::new();
+    for block in blocks {
+        let block_id = string(block, "block_id");
+        match string(block, "type") {
+            "actions" => {
+                for element in array(block, "elements") {
+                    push_interaction(element, block_id, names, &mut found);
+                }
+            }
+            "section" => {
+                if let Some(accessory) = block.get("accessory") {
+                    push_interaction(accessory, block_id, names, &mut found);
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+fn push_interaction(
+    element: &Value,
+    block_id: &str,
+    names: &dyn Names,
+    found: &mut Vec<Interaction>,
+) {
+    let element_type = string(element, "type").to_owned();
+    let action_id = string(element, "action_id").to_owned();
+    if element_type.is_empty() || action_id.is_empty() {
+        return;
+    }
+    let label = interaction_label(element, names);
+    let options = array(element, "options")
+        .iter()
+        .filter_map(|option| {
+            let value = string(option, "value").to_owned();
+            if value.is_empty() {
+                return None;
+            }
+            Some(InteractionOption {
+                label: render_text_object(Flavour::Mrkdwn, option.get("text"), names),
+                value,
+            })
+        })
+        .collect();
+    let mut payload = element.clone();
+    if let Some(payload) = payload.as_object_mut() {
+        payload.insert("block_id".to_owned(), Value::String(block_id.to_owned()));
+        payload.remove("options");
+        payload.remove("option_groups");
+        payload.remove("initial_option");
+        payload.remove("confirm");
+    }
+    found.push(Interaction {
+        label,
+        element_type,
+        block_id: block_id.to_owned(),
+        action_id,
+        value: element
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        options,
+        requires_confirmation: element.get("confirm").is_some(),
+        payload,
+    });
+}
+
+fn interaction_label(element: &Value, names: &dyn Names) -> String {
+    let direct = render_text_object(Flavour::Mrkdwn, element.get("text"), names);
+    if !direct.is_empty() {
+        return direct;
+    }
+    let initial = element
+        .get("initial_option")
+        .and_then(|option| option.get("text"));
+    let initial = render_text_object(Flavour::Mrkdwn, initial, names);
+    if !initial.is_empty() {
+        return initial;
+    }
+    let placeholder = render_text_object(Flavour::Mrkdwn, element.get("placeholder"), names);
+    if !placeholder.is_empty() {
+        return placeholder;
+    }
+    match string(element, "type") {
+        "overflow" => "more…".to_owned(),
+        kind if !kind.is_empty() => kind.replace('_', " "),
+        _ => "action".to_owned(),
+    }
+}
+
+fn render_interaction(element: &Value, names: &dyn Names) -> String {
+    let label = interaction_label(element, names);
+    match string(element, "type") {
+        "static_select"
+        | "external_select"
+        | "users_select"
+        | "conversations_select"
+        | "channels_select"
+        | "overflow" => format!("[{label} ▾]"),
+        _ => format!("[{label}]"),
+    }
+}
+
 /// Every link in a message, in the order the renderer prints them. Walked
 /// from the source rather than from the rendered text, because the rendered
 /// text no longer carries the URL.
@@ -390,6 +519,12 @@ pub fn render_block_as(flavour: Flavour, block: &Value, names: &dyn Names) -> St
             if !fields.is_empty() {
                 parts.push(fields.join("\n"));
             }
+            if let Some(accessory) = block.get("accessory") {
+                let action = render_interaction(accessory, names);
+                if !action.is_empty() {
+                    parts.push(action);
+                }
+            }
             parts.join("\n")
         }
         "header" => {
@@ -424,21 +559,12 @@ pub fn render_block_as(flavour: Flavour, block: &Value, names: &dyn Names) -> St
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(" "),
-        // Nothing is interactive in this version, so an action row renders
-        // as the labels it offers — enough to know the message wanted a
-        // click, without pretending rho can deliver one.
         "actions" => array(block, "elements")
             .iter()
-            .map(|element| {
-                let label = render_text_object(flavour, element.get("text"), names);
-                match label.is_empty() {
-                    true => String::new(),
-                    false => format!("[{label}]"),
-                }
-            })
+            .map(|element| render_interaction(element, names))
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
-            .join(" "),
+            .join("\n"),
         // An unknown block renders as nothing rather than as a debug dump:
         // Slack adds block types constantly and none of them are worth
         // showing a reader raw JSON over.
@@ -988,6 +1114,56 @@ mod tests {
         assert_eq!(
             rendered,
             "ping @grace\n\u{258e} Build #12 failed\ntrace.txt · text · 2 KB"
+        );
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn actions_render_one_per_line_and_keep_the_wire_identity() {
+        let blocks = vec![json!({
+            "type": "actions",
+            "block_id": "deploy",
+            "elements": [
+                {"type": "button", "action_id": "approve", "value": "yes",
+                 "text": {"type": "plain_text", "text": "Approve"}},
+                {"type": "static_select", "action_id": "target",
+                 "placeholder": {"type": "plain_text", "text": "Choose target"},
+                 "options": [
+                     {"text": {"type": "plain_text", "text": "Staging"}, "value": "staging"},
+                     {"text": {"type": "plain_text", "text": "Production"}, "value": "production"}
+                 ]}
+            ]
+        })];
+        assert_eq!(
+            render_message(&blocks, "", &[], &[], &NoNames),
+            "[Approve]\n[Choose target ▾]"
+        );
+        let actions = interactions(&blocks, &NoNames);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].payload["block_id"], "deploy");
+        assert_eq!(actions[0].payload["value"], "yes");
+        assert_eq!(
+            actions[1].options,
+            vec![
+                InteractionOption {
+                    label: "Staging".to_owned(),
+                    value: "staging".to_owned(),
+                },
+                InteractionOption {
+                    label: "Production".to_owned(),
+                    value: "production".to_owned(),
+                },
+            ]
+        );
+        assert!(
+            actions[1].payload.get("options").is_none(),
+            "the dispatched action carries the selection, not the entire menu"
         );
     }
 }

@@ -32,6 +32,7 @@ fn message(ts: &str, text: &str) -> Message {
         channel: ChannelId::from("C1"),
         user: Some(rho_slack::types::UserId::from("UD")),
         bot_name: None,
+        bot_id: None,
         blocks: Vec::new(),
         text: text.to_owned(),
         attachments: Vec::new(),

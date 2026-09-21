@@ -97,6 +97,9 @@ pub struct Message {
     pub thread_ts: Option<Ts>,
     pub user: UserId,
     pub text: String,
+    /// Optional Block Kit payload for representative app messages.
+    pub blocks: Vec<serde_json::Value>,
+    pub bot_id: Option<String>,
     pub edited: bool,
     pub reply_count: u32,
     pub latest_reply: Option<Ts>,

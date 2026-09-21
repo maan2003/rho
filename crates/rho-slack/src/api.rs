@@ -849,6 +849,55 @@ impl Client {
     /// keys on. Slack answers `already_reacted` if it is already there,
     /// which the caller treats as done rather than as a failure: two
     /// clients racing to agree is not an error.
+    /// Dispatches a Block Kit action exactly as Slack's desktop client does.
+    pub async fn block_action(
+        &self,
+        service_id: &str,
+        action: Value,
+        channel: &ChannelId,
+        message_ts: &Ts,
+    ) -> anyhow::Result<()> {
+        self.post_json(
+            "blocks.actions",
+            json!({
+                "actions": [action],
+                "service_id": service_id,
+                "container": {
+                    "type": "message",
+                    "message_ts": message_ts.0,
+                    "channel_id": channel.0,
+                    "is_ephemeral": false,
+                },
+                "client_token": format!("RhoSlack-{}", self.credentials.workspace.0),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Fetches a dialog announced by Slack's `dialog_opened` socket event.
+    pub async fn dialog(&self, dialog_id: &str) -> anyhow::Result<Value> {
+        let body = self
+            .post_form("dialog.get", &[("dialog_id", dialog_id.to_owned())])
+            .await?;
+        body.get("dialog")
+            .cloned()
+            .context("dialog.get returned no dialog")
+    }
+
+    /// Submits the fields of a legacy Slack dialog.
+    pub async fn submit_dialog(&self, dialog_id: &str, submission: Value) -> anyhow::Result<()> {
+        self.post_form(
+            "dialog.submit",
+            &[
+                ("dialog_id", dialog_id.to_owned()),
+                ("submission", submission.to_string()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn add_reaction(
         &self,
         channel: &ChannelId,
@@ -1089,6 +1138,7 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
         bot_name: string(&value["username"])
             .or_else(|| string(&value["bot_profile"]["name"]))
             .filter(|name| !name.is_empty()),
+        bot_id: string(&value["bot_id"]).filter(|id| !id.is_empty()),
         blocks: value["blocks"].as_array().cloned().unwrap_or_default(),
         text: string(&value["text"]).unwrap_or_default(),
         attachments: value["attachments"]

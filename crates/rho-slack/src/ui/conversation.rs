@@ -322,6 +322,8 @@ struct LineMeta {
     /// The URL the line stands for. The text shows a link's label alone, so
     /// this is the only place the address survives for `enter` to open.
     link: Option<String>,
+    /// The app control this rendered line offers.
+    interaction: Option<crate::block::Interaction>,
     /// The pictures that hang under this line. A picture has no line of its
     /// own — it is the whole of what it has to say — so the message's last
     /// line before its reactions carries them.
@@ -329,6 +331,13 @@ struct LineMeta {
 }
 
 type Rendered = Item<Row, Class, LineMeta>;
+
+/// An app control under the cursor and the message container Slack needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageInteraction {
+    pub action: crate::block::Interaction,
+    pub message: Message,
+}
 
 impl ConversationView {
     pub fn new(
@@ -515,6 +524,29 @@ impl ConversationView {
 
     pub fn source(&self) -> &Source {
         &self.source
+    }
+
+    /// The app control on the cursor's line, if that line is interactive.
+    pub fn cursor_interaction(&self, cx: &mut Context<Self>) -> Option<MessageInteraction> {
+        let row = self.cursor_row(cx) as u32;
+        let action = self.transcript.line_meta(row, cx)?.interaction.clone()?;
+        Some(MessageInteraction {
+            message: self.cursor_message(cx)?,
+            action,
+        })
+    }
+
+    /// Dispatches a button or selected static option. Larger controls are
+    /// deliberately refused by the host before this is called.
+    pub fn run_interaction(
+        &mut self,
+        interaction: MessageInteraction,
+        selected: Option<crate::block::InteractionOption>,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.update(cx, |session, cx| {
+            session.run_interaction(interaction.message, interaction.action, selected, cx);
+        });
     }
 
     /// The file on the cursor's line, if the line is one. A file is opened
@@ -2514,6 +2546,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread,
             file: None,
             link: None,
+            interaction: None,
             images: Vec::new(),
         });
         return item(Row::Message(message.ts.clone()), spans, lines);
@@ -2540,6 +2573,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
     let (said, chrome) = model.markdown_parts(message);
     let said = said.trim_end().to_owned();
     let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
+    let interactions = crate::block::interactions(&message.blocks, model);
     // A file's line is the one that reads as the file: `enter` there opens
     // it rather than the thread.
     let meta = |line: &str| LineMeta {
@@ -2550,6 +2584,13 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             .find(|file| line.trim() == file.line())
             .cloned(),
         link: link_on(line, &links),
+        interaction: interactions
+            .iter()
+            .find(|action| {
+                line.trim() == format!("[{}]", action.label)
+                    || line.trim() == format!("[{} ▾]", action.label)
+            })
+            .cloned(),
         images: Vec::new(),
     };
 
@@ -2575,6 +2616,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread: thread.clone(),
             file: None,
             link: None,
+            interaction: None,
             images: Vec::new(),
         });
         push_body(&mut spans, &said, model, &message.files);
@@ -2613,6 +2655,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread: thread.clone(),
             file: None,
             link: None,
+            interaction: None,
             images: Vec::new(),
         });
     }
@@ -2627,6 +2670,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread: thread.clone(),
             file: None,
             link: None,
+            interaction: None,
             images: Vec::new(),
         });
     }
@@ -2641,6 +2685,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread,
             file: None,
             link: None,
+            interaction: None,
             images: Vec::new(),
         });
     }

@@ -179,6 +179,8 @@ fn history(
             thread_ts: None,
             user,
             text: line(random, mentions_self),
+            blocks: Vec::new(),
+            bot_id: None,
             edited: random.below(80) == 0,
             reply_count: 0,
             latest_reply: None,
@@ -196,6 +198,8 @@ fn history(
                     thread_ts: Some(ts),
                     user: members[random.below(members.len() as u64) as usize].clone(),
                     text: line(random, false),
+                    blocks: Vec::new(),
+                    bot_id: None,
                     edited: false,
                     reply_count: 0,
                     latest_reply: None,
@@ -210,6 +214,38 @@ fn history(
             threads.push((ts, replies));
         }
         messages.push(message);
+    }
+    // The first room carries one representative app card for isolated UI QA.
+    if at == 0
+        && let Some(message) = messages.last_mut()
+    {
+        message.user = UserId("UAPP".to_owned());
+        message.bot_id = Some("BAPP".to_owned());
+        message.text = "Deployment approval".to_owned();
+        message.blocks = vec![
+            serde_json::json!({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Deploy checkout?*\nChoose the target and approve."}
+            }),
+            serde_json::json!({
+                "type": "actions",
+                "block_id": "deploy",
+                "elements": [
+                    {"type": "button", "action_id": "approve", "value": "yes",
+                     "text": {"type": "plain_text", "text": "Approve"}},
+                    {"type": "static_select", "action_id": "target",
+                     "placeholder": {"type": "plain_text", "text": "Choose target"},
+                     "options": [
+                         {"text": {"type": "plain_text", "text": "Staging"}, "value": "staging"},
+                         {"text": {"type": "plain_text", "text": "Production"}, "value": "production"}
+                     ]},
+                    {"type": "button", "action_id": "open_details",
+                     "text": {"type": "plain_text", "text": "Add details"}},
+                    {"type": "datepicker", "action_id": "schedule",
+                     "placeholder": {"type": "plain_text", "text": "Schedule"}}
+                ]
+            }),
+        ];
     }
     (messages, threads)
 }

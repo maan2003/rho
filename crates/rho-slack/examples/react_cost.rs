@@ -133,6 +133,7 @@ fn message(channel: &ChannelId, seconds: i64) -> Message {
         channel: channel.clone(),
         user: Some(UserId("UD".to_owned())),
         bot_name: None,
+        bot_id: None,
         blocks: Vec::new(),
         text: "shipping it".to_owned(),
         attachments: Vec::new(),

@@ -151,6 +151,7 @@ fn message(channel: &ChannelId, seconds: i64) -> Message {
         channel: channel.clone(),
         user: Some(UserId("U1".to_owned())),
         bot_name: None,
+        bot_id: None,
         blocks: Vec::new(),
         text: "the quick brown fox jumps over the lazy dog again today".to_owned(),
         attachments: Vec::new(),

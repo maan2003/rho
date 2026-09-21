@@ -50,6 +50,12 @@ pub enum Method {
     ChatPostMessage,
     #[serde(rename = "chat.update")]
     ChatUpdate,
+    #[serde(rename = "blocks.actions")]
+    BlocksActions,
+    #[serde(rename = "dialog.get")]
+    DialogGet,
+    #[serde(rename = "dialog.submit")]
+    DialogSubmit,
     #[serde(rename = "reactions.add")]
     ReactionsAdd,
     #[serde(rename = "reactions.remove")]
@@ -81,6 +87,9 @@ impl Method {
             "rtm.connect" => Self::RtmConnect,
             "chat.postMessage" => Self::ChatPostMessage,
             "chat.update" => Self::ChatUpdate,
+            "blocks.actions" => Self::BlocksActions,
+            "dialog.get" => Self::DialogGet,
+            "dialog.submit" => Self::DialogSubmit,
             "reactions.add" => Self::ReactionsAdd,
             "reactions.remove" => Self::ReactionsRemove,
             "conversations.mark" => Self::ConversationsMark,
@@ -100,6 +109,8 @@ impl Method {
             self,
             Self::ChatPostMessage
                 | Self::ChatUpdate
+                | Self::BlocksActions
+                | Self::DialogSubmit
                 | Self::ReactionsAdd
                 | Self::ReactionsRemove
                 | Self::ConversationsMark
@@ -122,6 +133,7 @@ pub enum Refusal {
     NotInChannel,
     AlreadyReacted,
     NoReaction,
+    InvalidArguments,
     UnknownMethod,
     #[serde(rename = "ratelimited")]
     RateLimited {
@@ -139,6 +151,7 @@ impl Refusal {
             Self::NotInChannel => "not_in_channel",
             Self::AlreadyReacted => "already_reacted",
             Self::NoReaction => "no_reaction",
+            Self::InvalidArguments => "invalid_arguments",
             Self::UnknownMethod => "unknown_method",
             Self::RateLimited { .. } => "ratelimited",
         }
@@ -341,6 +354,8 @@ fn apply(
                 thread_ts,
                 user: self_id,
                 text,
+                blocks: Vec::new(),
+                bot_id: None,
                 edited: false,
                 reply_count: 0,
                 latest_reply: None,
@@ -389,6 +404,71 @@ fn apply(
             server
                 .live
                 .publish(socket::reaction(added, &channel, ts, &user, &name));
+            Ok(json!({"ok": true}))
+        }
+        Method::BlocksActions => {
+            let actions: Value =
+                serde_json::from_str(form.get("actions").ok_or(Refusal::InvalidArguments)?)
+                    .map_err(|_| Refusal::InvalidArguments)?;
+            let action = actions
+                .as_array()
+                .and_then(|actions| actions.first())
+                .and_then(Value::as_object)
+                .ok_or(Refusal::InvalidArguments)?;
+            let container: Value =
+                serde_json::from_str(form.get("container").ok_or(Refusal::InvalidArguments)?)
+                    .map_err(|_| Refusal::InvalidArguments)?;
+            let channel = container["channel_id"]
+                .as_str()
+                .map(|channel| ChannelId(channel.to_owned()));
+            let ts = container["message_ts"].as_str().and_then(Ts::parse);
+            let valid_container = container["type"] == "message"
+                && channel
+                    .as_ref()
+                    .zip(ts)
+                    .and_then(|(channel, ts)| store.message(channel, ts))
+                    .is_some_and(|(_, message)| message.bot_id.as_deref() == Some("BAPP"));
+            let valid_common = form.get("service_id").map(String::as_str) == Some("BAPP")
+                && form.get("client_token").map(String::as_str) == Some("RhoSlack-acme")
+                && action.get("block_id").and_then(Value::as_str) == Some("deploy");
+            if !valid_container || !valid_common {
+                return Err(Refusal::InvalidArguments);
+            }
+            match (
+                action.get("type").and_then(Value::as_str),
+                action.get("action_id").and_then(Value::as_str),
+            ) {
+                (Some("button"), Some("approve"))
+                    if action.get("value").and_then(Value::as_str) == Some("yes") => {}
+                (Some("button"), Some("open_details")) => {
+                    server.live.publish(socket::dialog_opened(
+                        "DIALOG1",
+                        form.get("client_token").expect("validated"),
+                    ));
+                }
+                (Some("static_select"), Some("target"))
+                    if action
+                        .get("selected_option")
+                        .and_then(|option| option.get("value"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| matches!(value, "staging" | "production")) => {}
+                _ => return Err(Refusal::InvalidArguments),
+            }
+            Ok(json!({"ok": true}))
+        }
+        Method::DialogSubmit => {
+            let dialog_id = field(form, "dialog_id").map_err(|_| Refusal::InvalidArguments)?;
+            let submission: Value =
+                serde_json::from_str(form.get("submission").ok_or(Refusal::InvalidArguments)?)
+                    .map_err(|_| Refusal::InvalidArguments)?;
+            if dialog_id != "DIALOG1"
+                || submission["note"].as_str().is_none_or(str::is_empty)
+                || !submission["urgency"]
+                    .as_str()
+                    .is_some_and(|value| matches!(value, "normal" | "urgent"))
+            {
+                return Err(Refusal::InvalidArguments);
+            }
             Ok(json!({"ok": true}))
         }
         Method::ConversationsMark => {
@@ -613,6 +693,28 @@ fn answer(
                 .collect();
             Ok(wire::page(json!({ "items": items }), None))
         }
+        Method::DialogGet => {
+            if field(form, "dialog_id").map_err(|_| Refusal::InvalidArguments)? != "DIALOG1" {
+                return Err(Refusal::InvalidArguments);
+            }
+            Ok(json!({
+                "ok": true,
+                "dialog": {
+                    "title": "Deployment details",
+                    "submit_label": "Send",
+                    "elements": [
+                        {"type": "text", "name": "note", "label": "Note",
+                         "placeholder": "Why is this needed?"},
+                        {"type": "select", "name": "urgency", "label": "Urgency",
+                         "data_source": "static",
+                         "options": [
+                             {"label": "Normal", "value": "normal"},
+                             {"label": "Urgent", "value": "urgent"}
+                         ]}
+                    ]
+                }
+            }))
+        }
         Method::EmojiList => {
             let emoji: serde_json::Map<String, Value> = store
                 .emoji()
@@ -623,6 +725,8 @@ fn answer(
         // Every writing method went to `apply` before this was called.
         Method::ChatPostMessage
         | Method::ChatUpdate
+        | Method::BlocksActions
+        | Method::DialogSubmit
         | Method::ReactionsAdd
         | Method::ReactionsRemove
         | Method::ConversationsMark

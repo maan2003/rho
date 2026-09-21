@@ -267,6 +267,8 @@ impl Schedule {
             thread_ts,
             user: user.clone(),
             text,
+            blocks: Vec::new(),
+            bot_id: None,
             edited: false,
             reply_count: 0,
             latest_reply: None,
