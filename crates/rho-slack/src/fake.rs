@@ -101,10 +101,16 @@ impl Fake {
     /// Starts the fake on two ephemeral ports and returns once both are
     /// accepting, so a test can connect immediately.
     pub async fn start() -> anyhow::Result<Self> {
+        Self::start_on(0).await
+    }
+
+    /// A stable API port lets an accumulating QA mirror keep its attachment
+    /// URLs valid across fake-server restarts. Tests use ephemeral port zero.
+    pub async fn start_on(port: u16) -> anyhow::Result<Self> {
         let state = Arc::new(Mutex::new(State::default()));
         let (frames, _) = broadcast::channel(64);
 
-        let api = TcpListener::bind("127.0.0.1:0").await?;
+        let api = TcpListener::bind(("127.0.0.1", port)).await?;
         let api_base = format!("http://{}/api", api.local_addr()?);
         state.lock().unwrap().api_base = api_base.clone();
         let sockets = TcpListener::bind("127.0.0.1:0").await?;

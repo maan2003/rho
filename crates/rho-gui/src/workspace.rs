@@ -97,10 +97,10 @@ use crate::{
     MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
     MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat, SearchRepeatReverse, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
-    SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread, SlackNextUnread,
-    SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch, SlackSearchNextPage,
-    SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
-    UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
+    SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackMarkUnread,
+    SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSaveForLater, SlackSearch,
+    SlackSearchNextPage, SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose,
+    TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);

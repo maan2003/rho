@@ -18,7 +18,12 @@ const GROUP_NAME: &str = "mpdm-david--manmeet--keith-1";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let fake = Fake::start().await?;
+    let port = std::env::args()
+        .find_map(|argument| argument.strip_prefix("--port=").map(str::to_owned))
+        .map(|port| port.parse::<u16>())
+        .transpose()?
+        .unwrap_or(0);
+    let fake = Fake::start_on(port).await?;
     // Seeded relative to today, so the transcript's day breaks and clock
     // times read the way they would in a live workspace.
     let midnight = {
