@@ -302,6 +302,24 @@ impl Workspace {
             )
             .child(
                 div()
+                    .id("slack-activity")
+                    .p_1()
+                    .cursor_pointer()
+                    .child("Activity")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_slack_activity(window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("slack-saved")
+                    .p_1()
+                    .cursor_pointer()
+                    .child("Saved for later")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_slack_saved(window, cx))),
+            )
+            .child(
+                div()
                     .id("slack-new-dm")
                     .p_1()
                     .cursor_pointer()
@@ -334,6 +352,7 @@ impl Workspace {
                                     let (channel, label, unread) = &entries[index];
                                     let mut row = div()
                                         .id(("slack-room", index))
+                                        .w_full()
                                         .h(px(28.))
                                         .px_2()
                                         .flex()

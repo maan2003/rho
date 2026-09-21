@@ -43,4 +43,11 @@ workflow checklist agreed above. Do not present this milestone as full Slack
 product parity. Multi-workspace is excluded by the user.
 
 ## Evidence and remaining work
-Implementation in progress. No acceptance item is closed yet.
+Implementation in progress; acceptance remains open until combined QA.
+- Navigation: `cargo test -p rho-slack`: 200 passed; `cargo test -p rho-gui --lib slack_tests`: 25 passed, 1 benchmark ignored (before other feature integration).
+- Fake transport proves new DM reuse, group membership, unjoined-channel discovery/join, and send destination.
+- Fake-backed GUI test exercises multi-recipient completion and sends `hello` to the resulting group.
+- Inspected initial sidebar, channel, group composer, and channel-directory captures. Fixed missing text color and delayed insert-mode activation found in QA.
+- Favorites reopen test confirms persistence, removal, and scope isolation.
+- Saved-for-later is Rho-local: Slack has no supported current Later API. This must be labeled rather than implying cross-client synchronization.
+- Combined screenshots and final test totals will replace intermediate evidence on completion.
