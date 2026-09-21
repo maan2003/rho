@@ -26,7 +26,7 @@
 //! next key needs) stays. Nothing else stays.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, Keystroke, TextStyle, div};
+use gpui::{AnyElement, App, Div, Keystroke, TextStyle, div};
 use theme::ActiveTheme as _;
 
 /// How tall a column of the grid is. Magit's number, and the reason the
@@ -239,27 +239,45 @@ impl<A> Transient<A> {
     /// Cost: per frame O(rows in the menu), and a menu is a screenful of keys
     /// at the most.
     pub fn render(&self, text_style: &TextStyle, cx: &App) -> AnyElement {
-        let rows: Vec<(String, String, Option<String>)> = self
+        self.render_rows(text_style, cx, |_, row| row.into_any_element())
+    }
+
+    /// The same menu with a caller-supplied wrapper for each row.
+    ///
+    /// The callback receives the item's stable index and the fully styled
+    /// row. A host can make that row clickable without teaching this generic
+    /// primitive what the action means; keyboard presses and pointer clicks
+    /// still resolve through the caller's one action path.
+    pub fn render_rows(
+        &self,
+        text_style: &TextStyle,
+        cx: &App,
+        decorate: impl Fn(usize, Div) -> AnyElement,
+    ) -> AnyElement {
+        let rows: Vec<(usize, String, String, Option<String>)> = self
             .items
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(index, item)| {
                 (
+                    index,
                     display_key(&item.key),
                     item.description.clone(),
                     item.value.clone(),
                 )
             })
             .collect();
-        render(&self.title, self.count, &rows, text_style, cx).into_any_element()
+        render(&self.title, self.count, &rows, text_style, cx, decorate).into_any_element()
     }
 }
 
 fn render(
     title: &str,
     count: Option<u32>,
-    rows: &[(String, String, Option<String>)],
+    rows: &[(usize, String, String, Option<String>)],
     text_style: &TextStyle,
     cx: &App,
+    decorate: impl Fn(usize, Div) -> AnyElement,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
     let accent = colors.text_accent;
@@ -270,40 +288,42 @@ fn render(
     // then left to right, wrapping across the width. A menu of
     // twenty-eight items down one column is the whole screen; the same
     // twenty-eight in sevens is one glance.
-    let columns = rows.chunks(COLUMN_ROWS).map(|chunk| {
-        div()
-            .flex()
-            .flex_col()
-            .children(chunk.iter().map(|(key, description, value)| {
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    // The keys line up down the column, so the eye runs
-                    // down them rather than down ragged descriptions.
-                    .child(
-                        div()
-                            .w_8()
-                            .text_align(gpui::TextAlign::Right)
-                            .pr_2()
-                            .text_color(accent)
-                            .child(key.clone()),
-                    )
-                    .child(div().child(description.clone()));
-                if let Some(value) = value {
-                    row = row
-                        .child(div().pl_1().text_color(muted).child("("))
+    let columns = rows
+        .chunks(COLUMN_ROWS)
+        .map(|chunk| {
+            div().flex().flex_col().children(chunk.iter().map(
+                |(index, key, description, value)| {
+                    let mut row = div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        // The keys line up down the column, so the eye runs
+                        // down them rather than down ragged descriptions.
                         .child(
                             div()
-                                .text_color(value_color)
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child(value.clone()),
+                                .w_8()
+                                .text_align(gpui::TextAlign::Right)
+                                .pr_2()
+                                .text_color(accent)
+                                .child(key.clone()),
                         )
-                        .child(div().text_color(muted).child(")"));
-                }
-                row
-            }))
-    });
+                        .child(div().child(description.clone()));
+                    if let Some(value) = value {
+                        row = row
+                            .child(div().pl_1().text_color(muted).child("("))
+                            .child(
+                                div()
+                                    .text_color(value_color)
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child(value.clone()),
+                            )
+                            .child(div().text_color(muted).child(")"));
+                    }
+                    decorate(*index, row)
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
 
     let heading = match count {
         Some(count) => format!("{title} {count}"),

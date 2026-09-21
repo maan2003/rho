@@ -585,6 +585,7 @@ pub struct Workspace {
     voice: crate::voice::Voice,
     _event_task: Task<()>,
     _keystroke_subscription: gpui::Subscription,
+    _transient_keystroke_interceptor: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
     phone: phone::PhoneUi,
 }
@@ -958,6 +959,17 @@ impl Workspace {
         .detach();
 
         let dashboard = crate::dashboard::Dashboard::new(window, cx);
+        // A menu owns its focused keys before GPUI resolves keybindings. In particular,
+        // Vim binds `g` as the prefix of several multi-stroke commands, so an ordinary
+        // `on_key_down` handler would not see a menu's one-stroke `g` until another key
+        // arrived (or the prefix timer expired).
+        let transient_keystroke_listener =
+            cx.listener(|this, event: &gpui::KeystrokeEvent, window, cx| {
+                if this.menu_buffer.is_some() && this.transient_focus.is_focused(window) {
+                    this.menu_keystroke(&event.keystroke, window, cx);
+                }
+            });
+        let transient_keystroke_interceptor = cx.intercept_keystrokes(transient_keystroke_listener);
         let keystroke_subscription = cx.observe_keystrokes(|this, event, _window, _cx| {
             if this.desk_semantic_paste_target.is_some()
                 && !event.keystroke.key.eq_ignore_ascii_case("p")
@@ -1061,6 +1073,7 @@ impl Workspace {
             voice: crate::voice::Voice::default(),
             _event_task: event_task,
             _keystroke_subscription: keystroke_subscription,
+            _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
         };
@@ -6776,10 +6789,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.menu_keystroke(&event.keystroke, window, cx);
+    }
+
+    fn menu_keystroke(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Bare modifiers arrive as key events too; holding shift for an
         // uppercase key must not dismiss the menu.
         if matches!(
-            event.keystroke.key.as_str(),
+            keystroke.key.as_str(),
             "shift" | "control" | "alt" | "platform" | "function"
         ) {
             return;
@@ -6787,7 +6809,7 @@ impl Workspace {
         let Some(open) = self.menu_buffer.as_mut() else {
             return;
         };
-        let press = open.menu.press(&event.keystroke);
+        let press = open.menu.press(keystroke);
         let carried = open.carried_count;
         match press {
             rho_window::transient::Press::Count(_) => {
@@ -9401,7 +9423,19 @@ impl Render for Workspace {
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .child(bottom_strip(&text_style, cx).child(open.menu.render(&text_style, cx)))
+                    .child(bottom_strip(&text_style, cx).child(open.menu.render_rows(
+                        &text_style,
+                        cx,
+                        |index, row| {
+                            row.id(("desktop-transient-row", index))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_menu_at(index, window, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .into_any_element()
+                        },
+                    )))
                     .into_any_element()
             }))
             .children(

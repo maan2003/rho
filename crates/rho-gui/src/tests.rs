@@ -4703,6 +4703,48 @@ fn the_phone_sheet_is_drawn_where_a_thumb_can_reach_it(cx: &mut TestAppContext) 
         .unwrap();
 }
 
+/// Desktop rows are the same commands as their keys, rather than labels
+/// that can only be read.
+#[gpui::test]
+fn a_desktop_transient_row_dispatches_when_clicked(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(800.), gpui::px(600.)));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::phone_root_menu(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The three-row transient is pinned to the bottom. Its middle row is
+    // Agents, whose keyboard equivalent is `a`.
+    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
+    visual.simulate_click(
+        gpui::point(gpui::px(50.), gpui::px(568.)),
+        gpui::Modifiers::none(),
+    );
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.menu_title_for_test(),
+                Some("agent"),
+                "clicking the rendered Agents row ran its menu action"
+            );
+        })
+        .unwrap();
+}
+
 /// Escape out of the snooze units goes back to the verdicts, not out of the
 /// menu: back returns, here as everywhere.
 #[gpui::test]

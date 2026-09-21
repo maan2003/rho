@@ -1480,6 +1480,83 @@ async fn a_rewrite_whose_message_is_deleted_closes_and_keeps_the_words(cx: &mut 
     );
 }
 
+/// A reaction key is a complete transient command even when Vim also uses it
+/// as a multi-stroke prefix.
+#[gpui::test]
+async fn reaction_g_runs_without_waiting_for_another_key(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "910.0", "user": "UD", "text": "react here"}),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId("C1".into())),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    let mut transcript = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        transcript = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.slack_transcript_for_test(cx)
+            })
+            .unwrap();
+        if transcript.iter().any(|line| line.contains("react here")) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        transcript.iter().any(|line| line.contains("react here")),
+        "the message reached the conversation: {transcript:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "r");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| {
+                workspace.menu_title_for_test().map(str::to_owned)
+            })
+            .unwrap()
+            .as_deref(),
+        Some("react")
+    );
+
+    // `g` is heart in the default reaction menu. Do not send a following
+    // key: that would conceal GPUI retaining `g` as a Vim prefix.
+    cx.simulate_keystrokes(*workspace, "g");
+    for _ in 0..50 {
+        cx.run_until_parked();
+        if fake
+            .reactions("C1", "910.0")
+            .iter()
+            .any(|(name, users)| name == "heart" && users.iter().any(|user| user == fake.self_id()))
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        fake.reactions("C1", "910.0")
+            .iter()
+            .any(|(name, users)| name == "heart"
+                && users.iter().any(|user| user == fake.self_id())),
+        "one `g` immediately put heart on the server: {:?}",
+        fake.reactions("C1", "910.0")
+    );
+}
+
 /// A workspace with Slack over the fake server, seeded and drawn.
 ///
 /// The workspace comes first: `test_workspace` initialises the app, and
