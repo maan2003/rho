@@ -8,6 +8,21 @@ use camino::Utf8PathBuf;
 use rho_agents::HostId;
 use rho_ui_proto::AgentId;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SlackInventoryKind {
+    Activity,
+    Saved,
+}
+
+impl SlackInventoryKind {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Activity => "activity",
+            Self::Saved => "saved for later",
+        }
+    }
+}
+
 /// Stable identity of a surface, independent of its live view entity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceKey {
@@ -46,6 +61,9 @@ pub enum SurfaceKey {
     SlackResults {
         query: String,
     },
+    /// Activity and Saved reuse the results editor, but are durable
+    /// inventories with identities that cannot collide with literal searches.
+    SlackInventory(SlackInventoryKind),
     /// One Slack conversation. The source is the identity: two threads in
     /// the same channel are two surfaces, and their labels are not unique.
     SlackConversation(rho_slack::session::Source),

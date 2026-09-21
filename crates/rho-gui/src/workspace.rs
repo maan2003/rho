@@ -534,6 +534,7 @@ pub struct Workspace {
     /// knows that its narrowing is a state of the list behind it.
     pub(crate) slack_search_before: Option<String>,
     pub(crate) _slack_subscription: Option<gpui::Subscription>,
+    pub(crate) _slack_observer: Option<gpui::Subscription>,
     /// One per open conversation surface, for what a conversation asks the
     /// frame to show: a picture full-window, so far.
     pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
@@ -1041,6 +1042,7 @@ impl Workspace {
             slack_reacting: None,
             slack_search_before: None,
             _slack_subscription: None,
+            _slack_observer: None,
             _slack_view_subscriptions: Vec::new(),
             _draft_subscription: draft_subscription,
             agent_model_subscriptions: Vec::new(),
@@ -4364,6 +4366,7 @@ impl Workspace {
             SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::SlackList => "slack".to_owned(),
             SurfaceKey::SlackResults { query } => query.clone(),
+            SurfaceKey::SlackInventory(kind) => kind.title().to_owned(),
             SurfaceKey::SlackConversation(source) => self
                 .slack_labels
                 .get(source)
@@ -4388,6 +4391,7 @@ impl Workspace {
             SurfaceKey::Browser(_) => "browser",
             SurfaceKey::SlackList => "slack list",
             SurfaceKey::SlackResults { .. } => "slack search",
+            SurfaceKey::SlackInventory(_) => "slack inventory",
             SurfaceKey::SlackConversation(_) => "slack",
             SurfaceKey::Image { .. } => "image",
         }
@@ -4508,6 +4512,9 @@ impl Workspace {
             SurfaceKey::SlackList => SurfaceIdentity::SlackList,
             SurfaceKey::SlackResults { query } => SurfaceIdentity::SlackSearch {
                 query: query.clone(),
+            },
+            SurfaceKey::SlackInventory(kind) => SurfaceIdentity::SlackInventory {
+                name: kind.title().to_owned(),
             },
             SurfaceKey::SlackConversation(source) => SurfaceIdentity::SlackConversation {
                 thread: crate::slack::journal_thread(source),
@@ -6265,6 +6272,7 @@ impl Workspace {
             | SurfaceKey::DeskNode { .. } => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
+            | SurfaceKey::SlackInventory(_)
             | SurfaceKey::SlackConversation(_) => None,
             SurfaceKey::Image { .. } => None,
             SurfaceKey::Browser(_) => None,
@@ -6363,6 +6371,9 @@ impl Workspace {
             SurfaceKey::SlackResults { .. } => {
                 unreachable!("results surfaces are created by open_slack_results")
             }
+            SurfaceKey::SlackInventory(_) => {
+                unreachable!("inventory surfaces are created by open_slack_inventory")
+            }
             SurfaceKey::SlackConversation(_) => {
                 unreachable!("slack conversations are created by open_slack_source")
             }
@@ -6406,6 +6417,7 @@ impl Workspace {
             | SurfaceKey::File { .. } => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
+            | SurfaceKey::SlackInventory(_)
             | SurfaceKey::SlackConversation(_) => None,
             SurfaceKey::Image { .. } => None,
         };
@@ -9060,11 +9072,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
                 this.prompt_slack_mark_read_before(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SlackMarkUnread, _window, cx| {
-                this.slack_mark_unread(cx);
+            .on_action(cx.listener(|this, _: &SlackMarkUnread, window, cx| {
+                this.slack_mark_unread(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &SlackSaveForLater, _window, cx| {
-                this.slack_save_for_later(cx);
+            .on_action(cx.listener(|this, _: &SlackSaveForLater, window, cx| {
+                this.slack_save_for_later(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TranscriptTop, window, cx| {
                 // Only a transcript composes its way to the top; anywhere

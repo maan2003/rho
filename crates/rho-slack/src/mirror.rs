@@ -80,6 +80,9 @@ pub struct Saved {
     pub channel: ChannelId,
     pub thread: Option<Ts>,
     pub ts: Ts,
+    /// A human-readable snapshot retained if the mirrored message is later
+    /// deleted or its cached run is collected.
+    pub summary: String,
 }
 
 /// One run of history: a conversation, or one thread inside it. A thread is
@@ -390,6 +393,15 @@ impl Mirror {
             .range(scope.prefix().as_str()..scope.end().as_str())
             .map(|(_, value)| value.value().as_ref().into())
             .collect()
+    }
+
+    /// One exact Slack message identity, when its cached bytes still exist.
+    pub fn message(&self, scope: &Scope, ts: &Ts) -> Option<Message> {
+        let txn = self.db.read();
+        let table = txn.open_table(MESSAGES);
+        table
+            .get(scope.key(ts).as_str())
+            .map(|value| value.value().as_ref().into())
     }
 
     /// Whether a particular message is already on disk. A ping for something
@@ -805,6 +817,7 @@ impl Mirror {
                     channel: saved.channel.0.clone(),
                     thread: saved.thread.as_ref().map(|ts| ts.0.clone()),
                     ts: saved.ts.0.clone(),
+                    summary: saved.summary.clone(),
                 }),
             );
         }
@@ -838,6 +851,7 @@ impl Mirror {
                     channel: ChannelId(value.channel.clone()),
                     thread: value.thread.as_ref().map(|ts| Ts(ts.clone())),
                     ts: Ts(value.ts.clone()),
+                    summary: value.summary.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1017,6 +1031,7 @@ struct StoredSaved {
     channel: String,
     thread: Option<String>,
     ts: String,
+    summary: String,
 }
 
 fn saved_key(workspace: &str, saved: &Saved) -> String {

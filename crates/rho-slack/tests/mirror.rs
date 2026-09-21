@@ -459,6 +459,7 @@ fn saved_messages_survive_reopen_without_duplicates() {
         channel: ChannelId::from("C1"),
         thread: Some(Ts::from("100.000000")),
         ts: Ts::from("200.000000"),
+        summary: "David — follow up".to_owned(),
     };
     {
         let mirror = Mirror::open(&path).unwrap();
@@ -520,4 +521,22 @@ fn drafts_round_trip_per_source_and_empty_removes_them() {
     reopened.put_draft(&channel, &Draft::default());
     assert_eq!(reopened.draft(&channel), None);
     assert_eq!(reopened.drafts("acme").len(), 1);
+}
+
+#[test]
+fn exact_message_lookup_does_not_drift_to_later_chatter() {
+    let (_dir, mirror) = mirror();
+    mirror.insert_messages(
+        &scope(),
+        &[
+            message("200.000000", "<@ME> actual mention"),
+            message("300.000000", "ordinary later chatter"),
+        ],
+    );
+    assert_eq!(
+        mirror
+            .message(&scope(), &Ts::from("200.000000"))
+            .map(|message| message.text),
+        Some("<@ME> actual mention".to_owned()),
+    );
 }

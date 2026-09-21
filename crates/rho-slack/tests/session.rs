@@ -429,8 +429,19 @@ async fn mark_unread_round_trips_to_slack_and_uses_the_previous_message(cx: &mut
     }
 
     rig.session.update(cx, |session, cx| {
-        session.mark_unread_from(&design(), &Ts("500.0".into()), cx)
+        session.mark_unread_from(&design(), &Ts("500.0".into()), cx);
+        // Navigating away must not turn the deliberate backward cursor into
+        // a read-to-end operation.
+        session.open(&Source::Conversation(ChannelId("C2".into())), cx);
     });
+    assert_eq!(
+        rig.session.read_with(cx, |session, _| session
+            .model()
+            .last_read(&ChannelId("C1".into()))
+            .cloned()),
+        Some(Ts("400.0".into())),
+        "leaving the conversation preserves mark unread",
+    );
     for _ in 0..200 {
         cx.run_until_parked();
         if rig

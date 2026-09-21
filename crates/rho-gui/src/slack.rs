@@ -29,7 +29,7 @@ const REWRITE_LOST: &str = "slack: that message was deleted; your rewrite is in 
 
 use crate::dashboard::SlackFacts;
 use crate::minibuffer::Candidate;
-use crate::pane::SurfaceKey;
+use crate::pane::{SlackInventoryKind, SurfaceKey};
 use crate::workspace::{ContextId, SurfaceView, Workspace};
 
 pub(crate) fn slack_filter_candidates(typed: &str) -> Vec<crate::minibuffer::Candidate> {
@@ -199,6 +199,10 @@ impl Workspace {
 pub(crate) struct Slack {
     session: Option<gpui::Entity<Session>>,
     degraded: Option<String>,
+    /// Newest inbound message considered for a desktop notification per
+    /// Slack unit. Focused messages are recorded too, so leaving the
+    /// conversation cannot make the same arrival alert later.
+    notified: std::collections::BTreeMap<Unit, Ts>,
 }
 
 impl Slack {
@@ -233,6 +237,27 @@ impl Slack {
     }
 }
 
+fn source_is_unit(source: &Source, unit: &Unit) -> bool {
+    source.channel() == &unit.channel
+        && match (source, &unit.thread) {
+            (Source::Conversation(_), None) => true,
+            (Source::Thread(key), Some(root)) => key.thread_ts == *root,
+            _ => false,
+        }
+}
+
+/// New timestamps alert only away from the conversation. Equality and older
+/// timestamps are reconnect/replay evidence and never alert again.
+fn should_notify_slack(
+    previous: Option<&Ts>,
+    focused: Option<&Source>,
+    unit: &Unit,
+    newest: &Ts,
+) -> bool {
+    let new = previous.is_none_or(|previous| newest.is_newer_than(previous));
+    new && focused.is_none_or(|source| !source_is_unit(source, unit))
+}
+
 impl Workspace {
     /// Opens the conversation list, starting the session on first entry.
     /// This is the way in: everything else is reached from a row.
@@ -264,7 +289,7 @@ impl Workspace {
             return;
         };
         let rows = session.read(cx).activity();
-        self.open_slack_inventory("activity", rows, session, window, cx);
+        self.open_slack_inventory(SlackInventoryKind::Activity, rows, session, window, cx);
     }
 
     /// Opens messages explicitly saved in rho's local Later inventory.
@@ -277,11 +302,15 @@ impl Workspace {
             return;
         };
         let rows = session.read(cx).saved();
-        self.open_slack_inventory("saved for later", rows, session, window, cx);
+        self.open_slack_inventory(SlackInventoryKind::Saved, rows, session, window, cx);
     }
 
     /// Saves the message under the cursor for the local Later inventory.
-    pub(crate) fn slack_save_for_later(&mut self, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn slack_save_for_later(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return;
         };
@@ -296,15 +325,20 @@ impl Workspace {
                 session.read(cx).remove_from_later(&source, &message.ts);
                 self.echo("slack: removed from saved", StyleClass::SystemInfo, cx);
             } else {
-                session.read(cx).save_for_later(&source, &message.ts);
+                session.read(cx).save_for_later(&source, &message);
                 self.echo("slack: saved for later", StyleClass::SystemInfo, cx);
             }
+            self.refresh_slack_inventories(window, cx);
         }
     }
 
     /// Marks the message under the cursor and everything after it unread in
     /// Slack, while making the same cursor move in rho immediately.
-    pub(crate) fn slack_mark_unread(&mut self, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn slack_mark_unread(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return;
         };
@@ -318,21 +352,21 @@ impl Workspace {
                 session.mark_unread_from(&source, &message.ts, cx)
             });
             self.echo("slack: marked unread", StyleClass::SystemInfo, cx);
+            self.refresh_slack_inventories(window, cx);
         }
     }
 
     fn open_slack_inventory(
         &mut self,
-        title: &str,
+        kind: SlackInventoryKind,
         rows: Vec<rho_slack::session::ActivityEntry>,
         session: gpui::Entity<Session>,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
         self.active_context = ContextId::Slack;
-        let key = SurfaceKey::SlackResults {
-            query: title.to_owned(),
-        };
+        let title = kind.title();
+        let key = SurfaceKey::SlackInventory(kind);
         let surface = match self.find_surface(|surface| surface.key == key).cloned() {
             Some(surface) => surface,
             None => {
@@ -349,6 +383,32 @@ impl Workspace {
         self.show_slack_surface(surface, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
+    }
+
+    fn refresh_slack_inventories(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack.session() else {
+            return;
+        };
+        for kind in [SlackInventoryKind::Activity, SlackInventoryKind::Saved] {
+            let view = self
+                .find_surface(|surface| surface.key == SurfaceKey::SlackInventory(kind))
+                .and_then(|surface| match &surface.view {
+                    SurfaceView::SlackResults(view) => Some(view.clone()),
+                    _ => None,
+                });
+            let Some(view) = view else { continue };
+            let rows = match kind {
+                SlackInventoryKind::Activity => session.read(cx).activity(),
+                SlackInventoryKind::Saved => session.read(cx).saved(),
+            };
+            view.update(cx, |view, cx| {
+                view.inventory(kind.title(), &rows, window, cx)
+            });
+        }
     }
 
     /// The live session, started from the first registered workspace. A
@@ -375,6 +435,9 @@ impl Workspace {
                     workspace.on_slack_event(session.clone(), event, window, cx);
                 }),
             );
+        self._slack_observer = Some(cx.observe_in(&session, window, |workspace, _, window, cx| {
+            workspace.refresh_slack_inventories(window, cx)
+        }));
         self.slack.start(session.clone());
         Some(session)
     }
@@ -519,6 +582,9 @@ impl Workspace {
                     workspace.on_slack_event(session.clone(), event, window, cx);
                 }),
             );
+        self._slack_observer = Some(cx.observe_in(&session, window, |workspace, _, window, cx| {
+            workspace.refresh_slack_inventories(window, cx)
+        }));
         self.slack.start(session);
         // The session is the other half of the seed. Whichever half arrives
         // second runs it; the marker in the mirror is what makes it once.
@@ -2152,27 +2218,50 @@ impl Workspace {
                             Some(rho_slack::model::Attention::ChannelTraffic) | None
                         )
                     {
-                        let thread = unit.thread.as_ref().map(Ts::as_str).unwrap_or("");
-                        cx.show_system_notification(gpui::SystemNotification {
-                            tag: format!(
-                                "rho-slack-{}-{}-{thread}",
-                                session.read(cx).model().workspace().0,
-                                unit.channel.0,
-                            )
-                            .into(),
-                            title: card.conversation.clone().into(),
-                            body: {
-                                let summary = session.read(cx).unit_summary(unit);
-                                match (summary.is_empty(), card.attention) {
-                                    (true, Some(reason)) => {
-                                        rho_slack::model::reason_text(reason, &card.conversation)
+                        let focused = match &self.active_surface().key {
+                            SurfaceKey::SlackConversation(source) => Some(source),
+                            _ => None,
+                        };
+                        let alert = should_notify_slack(
+                            self.slack.notified.get(unit),
+                            focused,
+                            unit,
+                            &card.newest,
+                        );
+                        let remember = self
+                            .slack
+                            .notified
+                            .get(unit)
+                            .is_none_or(|previous| card.newest.is_newer_than(previous));
+                        if remember {
+                            self.slack
+                                .notified
+                                .insert(unit.clone(), card.newest.clone());
+                        }
+                        if alert {
+                            let thread = unit.thread.as_ref().map(Ts::as_str).unwrap_or("");
+                            cx.show_system_notification(gpui::SystemNotification {
+                                tag: format!(
+                                    "rho-slack-{}-{}-{thread}",
+                                    session.read(cx).model().workspace().0,
+                                    unit.channel.0,
+                                )
+                                .into(),
+                                title: card.conversation.clone().into(),
+                                body: {
+                                    let summary = session.read(cx).unit_summary(unit);
+                                    match (summary.is_empty(), card.attention) {
+                                        (true, Some(reason)) => rho_slack::model::reason_text(
+                                            reason,
+                                            &card.conversation,
+                                        ),
+                                        _ => summary,
                                     }
-                                    _ => summary,
                                 }
-                            }
-                            .into(),
-                            actions: Vec::new(),
-                        });
+                                .into(),
+                                actions: Vec::new(),
+                            });
+                        }
                     }
                     // A thread that starts to matter needs nothing written:
                     // it is addressable as its unit, and the view shows it
@@ -2576,5 +2665,30 @@ mod tests {
         };
         assert_eq!(key.channel.0, "C1");
         assert_eq!(key.thread_ts.0, "500.0");
+    }
+}
+
+#[cfg(test)]
+mod awareness_tests {
+    use rho_slack::model::Unit;
+    use rho_slack::types::{ChannelId, Ts};
+
+    use super::{Source, should_notify_slack};
+
+    #[test]
+    fn desktop_notification_requires_a_new_timestamp_away_from_its_conversation() {
+        let channel = ChannelId("C1".into());
+        let unit = Unit::conversation(&channel);
+        let old = Ts("100.0".into());
+        let new = Ts("200.0".into());
+        assert!(should_notify_slack(Some(&old), None, &unit, &new));
+        assert!(!should_notify_slack(Some(&new), None, &unit, &new));
+        assert!(!should_notify_slack(Some(&new), None, &unit, &old));
+        assert!(!should_notify_slack(
+            Some(&old),
+            Some(&Source::Conversation(channel)),
+            &unit,
+            &new,
+        ));
     }
 }

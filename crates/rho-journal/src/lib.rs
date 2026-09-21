@@ -302,6 +302,9 @@ pub enum SurfaceIdentity {
     SlackSearch {
         query: String,
     },
+    SlackInventory {
+        name: String,
+    },
 }
 
 /// Who ignored the thread: this rho, or Slack telling rho that another

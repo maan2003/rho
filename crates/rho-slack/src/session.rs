@@ -1273,6 +1273,9 @@ impl Session {
             });
         self.model.undo_handled(&unit, Some(before.clone()));
         self.model.undo_read(&unit, Some(before.clone()));
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.set_last_read(&self.scope(source), &before);
+        }
         self.write_handled();
         self.outbox.insert(unit, before);
         self.drain_outbox(cx);
@@ -1576,7 +1579,11 @@ impl Session {
                 };
                 ActivityEntry {
                     conversation: self.model.label(&saved.channel),
-                    summary: String::new(),
+                    summary: if saved.summary.is_empty() {
+                        "saved message (content unavailable)".to_owned()
+                    } else {
+                        saved.summary
+                    },
                     source,
                     ts: saved.ts,
                     unread: false,
@@ -1595,14 +1602,22 @@ impl Session {
         })
     }
 
-    pub fn save_for_later(&self, source: &Source, ts: &Ts) {
+    pub fn save_for_later(&self, source: &Source, message: &Message) {
         if let Some(mirror) = self.mirror.as_ref() {
             mirror.save(
                 &self.model.workspace().0,
                 &Saved {
                     channel: source.channel().clone(),
                     thread: source.thread_ts().cloned(),
-                    ts: ts.clone(),
+                    ts: message.ts.clone(),
+                    summary: {
+                        let author = self.model.author(message);
+                        let body = self.model.render_parts(message).0.replace('\n', " ");
+                        match body.trim().is_empty() {
+                            true => author,
+                            false => format!("{author} — {body}"),
+                        }
+                    },
                 },
             );
         }
@@ -1616,6 +1631,7 @@ impl Session {
                     channel: source.channel().clone(),
                     thread: source.thread_ts().cloned(),
                     ts: ts.clone(),
+                    summary: String::new(),
                 },
             );
         }
@@ -3368,8 +3384,7 @@ pub fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
     let message = model
         .unit(unit)
         .map(|facts| facts.newest.clone())
-        .and_then(|ts| mirror.chunk_containing(&scope, &ts, 1).pop())
-        .or_else(|| mirror.newest_chunk(&scope, 1).pop());
+        .and_then(|ts| mirror.message(&scope, &ts));
     message
         .map(|message| model.render(&message))
         .as_deref()
@@ -3706,6 +3721,28 @@ mod tests {
             unit_summary(&model, &mirror, &unit),
             "@ada can you look?",
             "the same message, re-rendered with what is known now"
+        );
+    }
+
+    #[test]
+    fn a_mention_summary_stays_on_the_mention_not_later_room_chatter() {
+        let (_dir, mirror, mut model) = seeded();
+        let scope = Scope::conversation("T1", &ChannelId("C1".into()));
+        let mention = mentioning("100.0", "U1", "hey <@ME> actual mention");
+        let chatter = mentioning("200.0", "U1", "ordinary later chatter");
+        mirror.insert_messages(&scope, &[mention.clone(), chatter.clone()]);
+        model.note_message(&mention, 0);
+        model.note_message(&chatter, 0);
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+
+        assert_eq!(
+            model.unit(&unit).map(|facts| facts.newest.clone()),
+            Some(Ts("100.0".into())),
+            "ordinary traffic does not replace the trigger timestamp",
+        );
+        assert_eq!(
+            unit_summary(&model, &mirror, &unit),
+            "hey @someone actual mention",
         );
     }
 
