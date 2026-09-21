@@ -184,10 +184,10 @@ impl Class {
         let (color, weight) = match self {
             Self::Sender | Self::You => (colors.text, FontWeight::BOLD),
             Self::Time => (colors.text_muted, FontWeight::NORMAL),
-            Self::Conversation => (colors.text, FontWeight::NORMAL),
+            Self::Conversation => (colors.text_muted, FontWeight::NORMAL),
             Self::Topic => (colors.text, FontWeight::NORMAL),
-            Self::Unread => (colors.text, FontWeight::BOLD),
-            Self::Mention => (colors.text_accent, FontWeight::BOLD),
+            Self::Unread => (colors.text, FontWeight::NORMAL),
+            Self::Mention => (colors.text_accent, FontWeight::NORMAL),
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
             Self::Dealt | Self::Found => (colors.text, FontWeight::NORMAL),

@@ -1097,7 +1097,7 @@ mod tests {
         assert_eq!(
             lines[0][0].class,
             Some(Class::Unread),
-            "the unread name is bold"
+            "the unread name uses the brighter text color"
         );
         assert_eq!(
             lines[0][2].class,
@@ -1112,7 +1112,7 @@ mod tests {
         assert_eq!(
             lines[0][6].class,
             Some(Class::Unread),
-            "the unread count is bold"
+            "the unread count uses the brighter text color"
         );
     }
 

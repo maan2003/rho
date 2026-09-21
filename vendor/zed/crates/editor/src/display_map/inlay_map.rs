@@ -433,11 +433,20 @@ impl<'a> Iterator for InlayChunks<'a> {
                             let image = image.clone();
                             renderer = Some(ChunkRenderer {
                                 id: ChunkRendererId::Inlay(inlay.id),
-                                render: Arc::new(move |_| {
+                                render: Arc::new(move |cx| {
+                                    // Keep the bitmap square inside the text row rather than
+                                    // letting a cell-wide image extend into the row's clip.
+                                    let side = cx
+                                        .window
+                                        .text_style()
+                                        .font_size
+                                        .to_pixels(cx.window.rem_size());
                                     div()
                                         .size_full()
+                                        .flex()
+                                        .items_center()
                                         .overflow_hidden()
-                                        .child(gpui::img(image.clone()).size_full())
+                                        .child(gpui::img(image.clone()).size(side))
                                         .into_any_element()
                                 }),
                                 constrain_width: true,

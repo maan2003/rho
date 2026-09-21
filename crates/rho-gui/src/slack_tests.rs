@@ -166,6 +166,22 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         .update(cx, |view, _, cx| view.display_text_for_test(cx))
         .unwrap();
     assert!(
+        !display.contains("ada") && !display.contains("dana"),
+        "loaded avatars replace visible author names: {display}"
+    );
+    assert!(
+        text.contains("ada") && text.contains("dana"),
+        "author names remain in copy/search text: {text}"
+    );
+    assert!(
+        display.lines().any(|line| line.contains("2  00:01")),
+        "the reaction row carries the trailing time: {display}"
+    );
+    assert!(
+        display.contains("let answer = 42;\n  00:01"),
+        "a fenced block keeps its time outside the code: {display}"
+    );
+    assert!(
         !display.contains(":party:"),
         "the active fold conceals the body shortcode: {display}"
     );
@@ -1137,10 +1153,7 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
         let drawn = window
             .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
             .unwrap();
-        if drawn
-            .iter()
-            .any(|line| line.trim_start().starts_with("ada  "))
-        {
+        if drawn.iter().any(|line| line.trim() == "ada") {
             break;
         }
         cx.executor()
@@ -1157,10 +1170,7 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
         drawn = window
             .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
             .unwrap();
-        if drawn
-            .iter()
-            .any(|line| line.trim_start().starts_with("zed  "))
-        {
+        if drawn.iter().any(|line| line.trim() == "zed") {
             break;
         }
         cx.executor()
@@ -1168,15 +1178,11 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
             .await;
     }
     assert!(
-        drawn
-            .iter()
-            .any(|line| line.trim_start().starts_with("zed  ")),
+        drawn.iter().any(|line| line.trim() == "zed"),
         "the row the newcomer's message drew says who they are: {drawn:?}"
     );
     assert!(
-        !drawn
-            .iter()
-            .any(|line| line.trim_start().starts_with("someone  ")),
+        !drawn.iter().any(|line| line.trim() == "someone"),
         "and no row is left saying someone: {drawn:?}"
     );
 }
@@ -4170,6 +4176,18 @@ async fn slack_message_grouping_restores_a_header_after_its_first_message_is_del
     use rho_slack::session::Source;
     use rho_slack::types::ChannelId;
     cx.update(init_test_app);
+    cx.update(|cx| {
+        use rho_slack::ui::Class;
+        let read = Class::Conversation.resolve(cx);
+        let unread = Class::Unread.resolve(cx);
+        let mention = Class::Mention.resolve(cx);
+        assert_ne!(read.color, unread.color, "unread is distinguished by color");
+        assert_ne!(mention.color, unread.color, "mentions retain their accent");
+        for style in [read, unread, mention] {
+            assert_eq!(style.font_weight, Some(gpui::FontWeight::NORMAL));
+        }
+    });
+
     cx.executor().allow_parking();
     let fake = cx
         .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
@@ -4216,7 +4234,11 @@ async fn slack_message_grouping_restores_a_header_after_its_first_message_is_del
             .await;
     }
     assert_eq!(text.matches("ada").count(), 1, "{text}");
-    assert!(text.contains("first\n\nsecond\n"), "{text}");
+    assert!(
+        text.lines().position(|line| line == "first").unwrap()
+            < text.lines().position(|line| line == "second").unwrap(),
+        "{text}"
+    );
     fake.live(serde_json::json!({"kind":"delete", "channel":"C1", "ts":"100.0"}));
     for _ in 0..200 {
         cx.run_until_parked();

@@ -386,8 +386,9 @@ impl WgpuAtlasTexture {
 }
 
 fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
+    // GPUI rasterizers supply color pixels in BGRA order.
     match format {
-        wgpu::TextureFormat::Bgra8Unorm => {
+        wgpu::TextureFormat::Rgba8Unorm => {
             let mut data = bytes.to_vec();
             for pixel in data.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
@@ -509,20 +510,20 @@ mod tests {
     }
 
     #[test]
-    fn swizzle_upload_data_converts_rgba_to_bgra() {
-        let input = vec![0x10, 0x20, 0x30, 0x40];
+    fn swizzle_upload_data_preserves_bgra_uploads() {
+        let input = vec![0xF8, 0xBD, 0x38, 0xFF, 0x17, 0x63, 0xC4, 0x80];
         assert_eq!(
             swizzle_upload_data(&input, wgpu::TextureFormat::Bgra8Unorm),
-            vec![0x30, 0x20, 0x10, 0x40]
+            input
         );
     }
 
     #[test]
-    fn swizzle_upload_data_preserves_rgba_uploads() {
-        let input = vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD];
+    fn swizzle_upload_data_converts_bgra_to_rgba() {
+        let input = vec![0xF8, 0xBD, 0x38, 0xFF, 0x17, 0x63, 0xC4, 0x80];
         assert_eq!(
             swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
-            input
+            vec![0x38, 0xBD, 0xF8, 0xFF, 0xC4, 0x63, 0x17, 0x80]
         );
     }
 }

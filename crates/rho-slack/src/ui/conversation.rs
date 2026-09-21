@@ -54,6 +54,8 @@ pub struct ChromeGutter;
 /// Marks folds owned by custom emoji rendering. The shortcode stays in the
 /// buffer while the display conceals it behind an image inlay.
 struct CustomEmojiFold;
+struct AvatarFold;
+struct MessageTimeFold;
 
 struct EmojiDecoration {
     inlay: InlayId,
@@ -149,7 +151,8 @@ pub struct ConversationView {
     emoji_image_bytes: usize,
     emoji_revision: u64,
     avatar_authors: HashMap<Row, crate::types::UserId>,
-    avatar_inlays: HashMap<Row, InlayId>,
+    avatar_inlays: HashMap<Row, EmojiDecoration>,
+    time_folds: HashMap<Row, Range<MultiBufferAnchor>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -562,6 +565,7 @@ impl ConversationView {
             emoji_revision: 0,
             avatar_authors: HashMap::new(),
             avatar_inlays: HashMap::new(),
+            time_folds: HashMap::new(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -1887,9 +1891,21 @@ impl ConversationView {
     }
 
     fn remove_emoji_row(&mut self, row: &Row, cx: &mut Context<Self>) {
-        if let Some(inlay) = self.avatar_inlays.remove(row) {
-            self.editor
-                .update(cx, |editor, cx| editor.remove_image_inlay(inlay, cx));
+        if let Some(range) = self.time_folds.remove(row) {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_folds_with_type(&[range], TypeId::of::<MessageTimeFold>(), false, cx);
+            });
+        }
+        if let Some(decoration) = self.avatar_inlays.remove(row) {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_image_inlay(decoration.inlay, cx);
+                editor.remove_folds_with_type(
+                    std::slice::from_ref(&decoration.range),
+                    TypeId::of::<AvatarFold>(),
+                    false,
+                    cx,
+                );
+            });
         }
         let Some(decorations) = self.emoji_decorations.remove(row) else {
             return;
@@ -1912,6 +1928,7 @@ impl ConversationView {
             .emoji_decorations
             .keys()
             .chain(self.avatar_inlays.keys())
+            .chain(self.time_folds.keys())
             .cloned()
             .collect::<Vec<_>>();
         for row in rows {
@@ -1988,6 +2005,39 @@ impl ConversationView {
                 let end = text::ToOffset::to_offset(&anchored.end, &snapshot);
                 (base, snapshot.text_for_range(base..end).collect::<String>())
             };
+            // Join the metadata footer visually, without putting its time inside
+            // a Markdown fence, table, link, or attachment in the source.
+            if let Some(offset) = text.trim_end_matches('\n').rfind('\n')
+                && text[offset + 1..].starts_with("  ")
+                && text.as_bytes().get(offset + 5) == Some(&b':')
+            {
+                let (start, end) = {
+                    let buffer = self.transcript.buffer().read(cx);
+                    (
+                        buffer.anchor_before(base + offset),
+                        buffer.anchor_after(base + offset + 1),
+                    )
+                };
+                let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+                if let (Some(start), Some(end)) = (
+                    snapshot.anchor_in_excerpt(start),
+                    snapshot.anchor_in_excerpt(end),
+                ) {
+                    let range = start..end;
+                    self.editor.update(cx, |editor, cx| {
+                        editor.fold_creases(
+                            vec![Crease::simple(
+                                range.clone(),
+                                FoldPlaceholder::concealed(TypeId::of::<MessageTimeFold>()),
+                            )],
+                            false,
+                            window,
+                            cx,
+                        );
+                    });
+                    self.time_folds.insert(row.clone(), range);
+                }
+            }
             let names = {
                 let model = self.session.read(cx).model();
                 custom_emoji_ranges(&text, model)
@@ -2059,17 +2109,34 @@ impl ConversationView {
                     .map(std::path::Path::to_path_buf);
                 if let Some(path) = path {
                     if let Some(image) = self.decoded_image(&path, cx) {
-                        let anchor = self.transcript.buffer().read(cx).anchor_before(base);
-                        if let Some(anchor) = self
-                            .multi_buffer
-                            .read(cx)
-                            .snapshot(cx)
-                            .anchor_in_excerpt(anchor)
-                        {
-                            if let Some(inlay) = self.editor.update(cx, |editor, cx| {
-                                editor.add_image_inlay(anchor, image, 3, cx)
+                        let header_end = text.find('\n').map_or(0, |offset| offset + 1);
+                        let (start, end) = {
+                            let buffer = self.transcript.buffer().read(cx);
+                            (
+                                buffer.anchor_before(base),
+                                buffer.anchor_after(base + header_end),
+                            )
+                        };
+                        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+                        if let (Some(start), Some(end)) = (
+                            snapshot.anchor_in_excerpt(start),
+                            snapshot.anchor_in_excerpt(end),
+                        ) {
+                            if let Some(decoration) = self.editor.update(cx, |editor, cx| {
+                                let inlay = editor.add_image_inlay(start, image, 3, cx)?;
+                                let range = start..end;
+                                editor.fold_creases(
+                                    vec![Crease::simple(
+                                        range.clone(),
+                                        FoldPlaceholder::concealed(TypeId::of::<AvatarFold>()),
+                                    )],
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                                Some(EmojiDecoration { inlay, range })
                             }) {
-                                self.avatar_inlays.insert(row.clone(), inlay);
+                                self.avatar_inlays.insert(row.clone(), decoration);
                             }
                         }
                     }
@@ -3179,8 +3246,8 @@ fn message_item_with_header(
             false => Class::Sender,
         },
     );
-    // Metadata stays in the header rather than interrupting the words or
-    // looking like part of an attachment's label.
+    // Time occupies the message's trailing separator, outside Markdown and
+    // attachment labels, so code fences and tables keep their syntax.
     let time = Span::styled(format!("  {}", clock_time(at)), Class::Time);
     // The reader is told what they are looking at is not what was sent.
     let edited = message
@@ -3215,8 +3282,6 @@ fn message_item_with_header(
         // A text-cell gap separates the profile inlay from the author name.
         spans.push(Span::plain(" "));
         spans.push(name);
-        spans.push(time);
-        spans.extend(edited);
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread: thread.clone(),
@@ -3295,6 +3360,8 @@ fn message_item_with_header(
             images: Vec::new(),
         });
     }
+    spans.push(time);
+    spans.extend(edited);
     spans.push(Span::plain("\n"));
     lines.push(LineMeta {
         thread: Some(message.thread_root()),
@@ -3798,8 +3865,7 @@ impl gpui::Render for ConversationView {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .px(gpui::px(16.))
-                    .py(gpui::px(8.))
+                    .px(gpui::px(4.))
                     .on_mouse_up(
                         gpui::MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
@@ -4232,10 +4298,10 @@ mod tests {
         );
         let lines_text = text.lines().collect::<Vec<_>>();
         let hello = lines_text.iter().position(|line| *line == "hello").unwrap();
-        assert!(lines_text[hello - 1].trim_start().starts_with("ada  "));
-        assert_eq!(lines_text[hello + 1], "");
+        assert!(lines_text[hello - 1].trim() == "ada");
+        assert_eq!(lines_text[hello + 1].trim(), clock_time(1_700_000_000));
         let over = lines_text.iter().position(|line| *line == "over").unwrap();
-        assert!(lines_text[over - 1].trim_start().starts_with("ada  "));
+        assert!(lines_text[over - 1].trim() == "ada");
         assert_eq!(lines_text[over + 1], "two lines");
         assert_eq!(classed(&text, &styles, Class::Time).len(), 2);
         assert_eq!(lines.len(), text.matches('\n').count());
@@ -4256,7 +4322,10 @@ mod tests {
         next.edited = true;
         assert!(!continues_author(&first, &next, &model));
         let rendered = message_item_with_header(&next, &model, false, false);
-        assert_eq!(rendered.text, "two\n\n");
+        assert_eq!(
+            rendered.text,
+            format!("two\n  {} (edited)\n", clock_time(1_700_000_060))
+        );
     }
 
     #[test]
@@ -4407,7 +4476,13 @@ mod tests {
             "edited": {"user": "U1", "ts": "1700000100.0"},
         }));
         let (text, styles, lines) = render_messages(&[message], &model(), false);
-        assert!(text.contains(" (edited)\nfriday it is\n"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "friday it is\n  {} (edited)\n",
+                clock_time(1_700_000_000)
+            )),
+            "{text}"
+        );
         assert!(
             classed(&text, &styles, Class::Muted).contains(&" (edited)".to_owned()),
             "{text}"
@@ -4520,7 +4595,7 @@ mod tests {
     }
 
     #[test]
-    fn the_time_stays_in_the_header_not_the_body_or_attachment() {
+    fn the_time_follows_the_message_without_changing_attachment_text() {
         let with_file = parsed(json!({
             "ts": "1700000000.0",
             "user": "U1",
@@ -4541,8 +4616,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(timed.len(), 1, "one time, on one line: {text}");
         assert!(
-            timed[0].trim_start().starts_with("ada  ") && !timed[0].contains("here is the deck"),
-            "the time belongs to the author header: {text}"
+            timed[0].trim() == clock_time(1_700_000_000),
+            "the time is a quiet footer: {text}"
         );
         assert!(
             text.lines().any(|line| line.trim() == "deck.pdf · 220 KB"),

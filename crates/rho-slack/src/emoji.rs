@@ -12,17 +12,41 @@ use std::ops::Range;
 pub fn render(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    for (range, literal) in scan(text) {
+    let mut tokens = scan(text).into_iter().peekable();
+    while let Some((range, literal)) = tokens.next() {
         out.push_str(&text[cursor..range.start]);
         let name = &text[range.start + 1..range.end - 1];
-        match (literal, emojis::get_by_shortcode(name)) {
-            (false, Some(emoji)) => out.push_str(emoji.as_str()),
-            _ => out.push_str(&text[range.clone()]),
-        }
         cursor = range.end;
+        match (literal, emojis::get_by_shortcode(name)) {
+            (false, Some(mut emoji)) => {
+                if let Some((tone_range, false)) = tokens.peek()
+                    && tone_range.start == cursor
+                    && let Some(tone) = skin_tone(&text[tone_range.start + 1..tone_range.end - 1])
+                    && let Some(toned) = emoji.with_skin_tone(tone)
+                {
+                    emoji = toned;
+                    cursor = tone_range.end;
+                    tokens.next();
+                }
+                out.push_str(emoji.as_str());
+            }
+            _ => out.push_str(&text[range]),
+        }
     }
     out.push_str(&text[cursor..]);
     out
+}
+
+fn skin_tone(name: &str) -> Option<emojis::SkinTone> {
+    use emojis::SkinTone;
+    match name {
+        "skin-tone-2" => Some(SkinTone::Light),
+        "skin-tone-3" => Some(SkinTone::MediumLight),
+        "skin-tone-4" => Some(SkinTone::Medium),
+        "skin-tone-5" => Some(SkinTone::MediumDark),
+        "skin-tone-6" => Some(SkinTone::Dark),
+        _ => None,
+    }
 }
 
 /// The `:name:` tokens still standing in rendered text: the custom emoji a
@@ -89,6 +113,26 @@ mod tests {
             "a workspace emoji has no glyph outside Slack"
         );
         assert_eq!(render("a 10:30 start"), "a 10:30 start");
+    }
+
+    #[test]
+    fn slack_skin_tones_modify_the_whole_emoji_sequence() {
+        assert_eq!(
+            render(
+                ":thumbsup::skin-tone-2: :wave::skin-tone-3: :thumbsup::skin-tone-4: :wave::skin-tone-5: :thumbsup::skin-tone-6:"
+            ),
+            "👍🏻 👋🏼 👍🏽 👋🏾 👍🏿"
+        );
+        assert_eq!(render(":woman_technologist::skin-tone-4:"), "👩🏽‍💻");
+        assert_eq!(render("👩🏽‍💻 👍🏿"), "👩🏽‍💻 👍🏿");
+        assert_eq!(
+            render("`:thumbsup::skin-tone-4:`"),
+            "`:thumbsup::skin-tone-4:`"
+        );
+        assert_eq!(render(":wave: :skin-tone-4:"), "👋 :skin-tone-4:");
+        assert_eq!(render(":heart::skin-tone-4:"), "❤️:skin-tone-4:");
+        assert_eq!(render(":custom::skin-tone-4:"), ":custom::skin-tone-4:");
+        assert_eq!(render(":thumbsup::skin-tone-7:"), "👍:skin-tone-7:");
     }
 
     #[test]

@@ -558,20 +558,21 @@ transcript renders through, and owns none of its own. Concretely:
   conversion is `rho-slack`'s `markdown` module and the one place the two
   markups are told apart; `block.rs` resolves the ids, links and lists the
   same way for both.
-- A message is one block of the document, keyed by its `ts`. A neutral,
-  bold author name and muted time head the body, with a small profile-image
-  inlay beside the name. Nearby messages from the same author share a header
-  (within five minutes and the same day); separate messages retain spacing.
-  Message bodies always start at the margin on their own line.
-- The composer uses the agent prompt's draft style and gutter. Its display-only
-  hint is `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
-  typing removes it. No buttons or permanent instruction row are added.
+- A message is one block of the document, keyed by its `ts`. Square profile
+  inlays replace author headers visually; names remain in the buffer for copy
+  and search, and remain visible if an avatar cannot load. Nearby messages
+  from the same author share an avatar (within five minutes and the same day).
+  Muted times sit at message ends: a concealed newline keeps them outside
+  Markdown syntax in the source. A closing code fence retains its own footer
+  row so the time cannot be mistaken for code.
+- The composer uses the agent prompt's draft style. Its display-only hint is
+  `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
+  typing removes it. Slack has no gutter, buttons, or permanent instruction row.
 - The day break and the unread line are the document's own headings, whose
   markers the parse hides.
-- What came with a message rather than being it — an attachment's card, a
-  link preview, a file — is marked with the gutter bar the transcript puts
-  beside the user's own message, and starts at the margin like everything
-  else. No bar is drawn into the text and no tint is painted behind it.
+- Attachments, previews, reactions, and thread summaries follow the body.
+  The sidebar distinguishes unread conversations by text color rather than
+  weight, with a separate accent for mentions.
 - What the surface still paints for itself is only what the parse cannot
   know: who is speaking, when, a file's caption, the reader's own mention,
   and the tint on the message a card or a search sent them to.

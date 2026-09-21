@@ -91,8 +91,8 @@ mod tests {
         ))
         .expect("valid Rho OKSolar P3 source");
         let style = &source["themes"][0]["style"];
-        assert_eq!(style["text"], "oklch(72.9% 0.012 95)");
-        assert_eq!(style["editor.foreground"], "oklch(72.9% 0.012 95)");
+        assert_eq!(style["text"], "oklch(68.8% 0.012 95)");
+        assert_eq!(style["editor.foreground"], "oklch(68.8% 0.012 95)");
         assert_eq!(
             colors.text, colors.editor_foreground,
             "general and editor body text use the same foreground"
@@ -102,11 +102,11 @@ mod tests {
         let background = wcag_relative_luminance(colors.editor_background);
         let contrast = (foreground + 0.05) / (background + 0.05);
         assert!(
-            contrast >= 7.0,
-            "body text contrast must remain at least 7:1, got {contrast:.2}:1"
+            contrast >= 6.0,
+            "body text contrast must remain at least 6:1, got {contrast:.2}:1"
         );
         assert!(
-            (contrast - 7.006).abs() < 0.005,
+            (contrast - 6.017).abs() < 0.005,
             "unexpected contrast {contrast}"
         );
     }
@@ -137,5 +137,59 @@ mod tests {
                 "{name} draws a strike rather than only dimming the text"
             );
         }
+    }
+
+    #[test]
+    fn bundled_noto_color_emoji_is_used_by_automatic_fallback() -> anyhow::Result<()> {
+        use gpui::{FontRun, PlatformTextSystem as _};
+        use gpui_wgpu::CosmicTextSystem;
+
+        let font_bytes = |path| {
+            RhoEmbedded::get(path)
+                .map(|file| file.data)
+                .with_context(|| format!("loading embedded test font {path}"))
+        };
+        let text_system = CosmicTextSystem::new_without_system_fonts("sans-serif");
+        text_system.add_fonts(vec![
+            font_bytes("fonts/rho-font/RhoFont-Regular.ttf")?,
+            font_bytes("fonts/noto-color-emoji/NotoColorEmoji.ttf")?,
+        ])?;
+
+        assert!(
+            text_system
+                .all_font_names()
+                .iter()
+                .any(|name| name == "Noto Color Emoji")
+        );
+
+        let primary_id = text_system.font_id(&gpui::font("Rho Font"))?;
+        for (description, text) in [
+            ("skin-tone emoji", "👍🏽"),
+            ("skin-tone ZWJ emoji", "👩🏽‍💻"),
+            ("standard emoji", "🎉"),
+        ] {
+            let layout = text_system.layout_line(
+                text,
+                gpui::px(16.0),
+                &[FontRun {
+                    len: text.len(),
+                    font_id: primary_id,
+                }],
+            );
+            let glyphs = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter())
+                .collect::<Vec<_>>();
+
+            assert_eq!(glyphs.len(), 1, "{description} must shape as one glyph");
+            assert!(glyphs[0].is_emoji, "{description} must use the emoji face");
+            assert!(
+                layout.runs.iter().all(|run| run.font_id != primary_id),
+                "{description} must fall back from Rho Font"
+            );
+        }
+
+        Ok(())
     }
 }

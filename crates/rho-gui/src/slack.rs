@@ -712,6 +712,7 @@ impl Workspace {
         rho_slack::ui::Hooks {
             configure_editor: |editor, window, cx| {
                 rho_window::editor_config::configure(editor, window, cx);
+                editor.set_show_compact_gutter(false, cx);
                 editor.set_mouse_click_selection_enabled(true, cx);
             },
             configure_markdown: rho_window::markdown::configure_buffer,
