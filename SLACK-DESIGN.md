@@ -1,5 +1,16 @@
 # Slack in rho
 
+## Current workflow direction
+
+Slack's familiar navigation and everyday messaging workflows are the baseline.
+A persistent channel/DM sidebar surrounds editor-backed conversations; new DMs,
+channel discovery, search, drafts, activity, and message actions are first-class
+rather than requiring the dealer. Preserve editor/buffer interaction and Vim.
+The implementation and fake-server acceptance checklist is [Slack workflow parity](SLACK-PARITY-TODO.md).
+Multi-workspace support is excluded from this milestone. Older passages below
+that make the conversation list the only entry point describe the previous UX.
+
+
 A design for bringing Slack mentions and threads into rho's dealer and
 surfaces. This continues DESK-DESIGN.md and keeps its rules. It records the
 *why* behind each decision; the engineer building it decides the mechanics.
