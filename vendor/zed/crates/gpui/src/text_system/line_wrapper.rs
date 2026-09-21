@@ -42,9 +42,23 @@ impl LineWrapper {
         fragments: &'a [LineFragment],
         wrap_width: Pixels,
     ) -> impl Iterator<Item = Boundary> + 'a {
+        self.wrap_line_with_indent(fragments, wrap_width, None)
+    }
+
+    /// Wrap a line, optionally overriding the indentation of continuation lines.
+    ///
+    /// The indent is measured in space columns and reduces the width available
+    /// to every continuation line. Passing `None` preserves the indentation
+    /// inferred from the line's leading whitespace.
+    pub fn wrap_line_with_indent<'a>(
+        &'a mut self,
+        fragments: &'a [LineFragment],
+        wrap_width: Pixels,
+        indent: Option<u32>,
+    ) -> impl Iterator<Item = Boundary> + 'a {
         let mut width = px(0.);
         let mut first_non_whitespace_ix = None;
-        let mut indent = None;
+        let mut indent = indent.map(|indent| Self::MAX_INDENT.min(indent));
         let mut last_candidate_ix = 0;
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0;

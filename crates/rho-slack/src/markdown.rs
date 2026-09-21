@@ -92,7 +92,7 @@ fn marked(text: &str) -> String {
 pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
-        if matches!(character, '\\' | '*' | '`' | '[' | ']') {
+        if matches!(character, '\\' | '*' | '`' | '[' | ']' | '<' | '>') {
             out.push('\\');
         }
         out.push(character);
@@ -165,10 +165,10 @@ mod tests {
     /// Ids never survive, in either flavour: the mention is a name.
     #[test]
     fn a_mention_is_a_name_and_never_an_id() {
-        assert_eq!(said("<@U1> in <#C1>"), "@ada in #design");
+        assert_eq!(said("<@U1> in <#C1>"), "<mark>@ada</mark> in #design");
         assert_eq!(
             body(&[], "<@U9>", &[], &[], &NoNames),
-            "@someone",
+            "<mark>@someone</mark>",
             "an id the roster has not filled yet reads as the handle Slack \
              itself would show"
         );

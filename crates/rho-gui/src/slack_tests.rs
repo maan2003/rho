@@ -202,6 +202,149 @@ async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut
         .unwrap();
 }
 
+/// Formatting is semantic: literal code/escaped HTML must not become UI markup.
+#[gpui::test]
+async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message("C1", serde_json::json!({
+        "ts":"99.0", "user":"UA", "text":"fallback",
+        "blocks":[{"type":"rich_text","elements":[
+            {"type":"rich_text_section","elements":[
+                {"type":"broadcast","range":"channel"},
+                {"type":"text","text":" Plan\n\n"},
+                {"type":"text","text":"Trade-offs:", "style":{"bold":true,"underline":true}},
+                {"type":"text","text":"\n"},
+            ]},
+            {"type":"rich_text_list","style":"bullet","elements":[
+                {"type":"rich_text_section","elements":[
+                    {"type":"text","text":"A long list item with enough words to wrap across several rows in this deliberately narrow window."}
+                ]}
+            ]},
+            {"type":"rich_text_section","elements":[
+                {"type":"text","text":"\nUse "},
+                {"type":"text","text":"app_id <u>literal code</u>", "style":{"code":true}},
+                {"type":"text","text":" and <u>literal</u>.\n"}
+            ]},
+            {"type":"rich_text_preformatted","elements":[
+                {"type":"text","text":"- not a list\n\ncode spacing"}
+            ]}
+        ]}]
+    }));
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts":"100.0", "user":"UD", "text":"- another list item"
+        }),
+    );
+    fake.add_message("C1", serde_json::json!({
+        "ts":"101.0", "user":"UA",
+        "text":"Ordinary prose after a list must wrap at the body margin without inheriting indentation from the previous message."
+    }));
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let session = cx.new(|cx| {
+        rho_slack::session::Session::with_client(
+            client,
+            rho_slack::config::Paths::under(state.path()),
+            cx,
+        )
+    });
+    let window = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+    cx.simulate_window_resize(*window, gpui::size(gpui::px(500.), gpui::px(800.)));
+    let mut ready = false;
+    for _ in 0..300 {
+        cx.run_until_parked();
+        ready = window
+            .update(cx, |view, _, cx| {
+                view.display_text_for_test(cx).contains("• A long")
+            })
+            .unwrap();
+        if ready {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(ready, "syntax-backed bullet appeared");
+    cx.draw_window(*window);
+    window
+        .update(cx, |view, _, cx| {
+            let display = view.display_text_for_test(cx);
+            assert!(display.contains("@channel Plan"), "{display}");
+            assert!(display.contains("Trade-offs:"), "{display}");
+            assert!(
+                !display.contains("<mark>") && !display.contains("<u>**"),
+                "{display}"
+            );
+            assert!(display.contains("<u>literal</u>"), "{display}");
+            assert!(display.contains("app_id <u>literal code</u>"), "{display}");
+            assert!(
+                display.contains("- not a list\n\ncode spacing"),
+                "{display}"
+            );
+            assert!(!display.contains("Plan\n\n"), "{display}");
+            let lines = display.lines().collect::<Vec<_>>();
+            let ordinary = lines
+                .iter()
+                .position(|line| line.starts_with("Ordinary prose"))
+                .unwrap();
+            assert!(
+                !lines[ordinary + 1].starts_with(' '),
+                "list indentation must stop at the message boundary: {display}"
+            );
+
+            view.editor().update(cx, |editor, cx| {
+                for (id, expected_background, expected_underline) in
+                    [(601, true, false), (602, false, true), (603, true, false)]
+                {
+                    let (style, ranges) = editor
+                        .text_highlights(editor::HighlightKey::SyntaxTreeView(usize::MAX - id), cx)
+                        .unwrap();
+                    assert!(!ranges.is_empty());
+                    assert_eq!(style.background_color.is_some(), expected_background);
+                    assert_eq!(style.underline.is_some(), expected_underline);
+                }
+                let snapshot = editor.display_snapshot(cx);
+                let wrapped = snapshot
+                    .text()
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.starts_with("  ") && !line.trim().is_empty())
+                    .map(|(row, _)| row)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !wrapped.is_empty(),
+                    "list wraps with a hanging indent: {display}"
+                );
+            });
+        })
+        .unwrap();
+}
+
 /// Custom emoji travel through the real API, bounded cache, decoder, fold,
 /// and editor-inlay path. The buffer remains the Slack source of truth.
 #[gpui::test]

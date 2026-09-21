@@ -47,6 +47,7 @@ pub struct ChromeGutter;
 /// buffer while the display conceals it behind an image inlay.
 struct CustomEmojiFold;
 struct AvatarFold;
+struct MessageTextFold;
 
 struct EmojiDecoration {
     inlay: InlayId,
@@ -144,7 +145,9 @@ pub struct ConversationView {
     avatar_authors: HashMap<Row, crate::types::UserId>,
     avatar_folds: HashMap<Row, Range<MultiBufferAnchor>>,
     edited_inlays: HashMap<Row, InlayId>,
-    next_edited_inlay: usize,
+    next_custom_inlay: usize,
+    text_folds: Vec<Range<MultiBufferAnchor>>,
+    text_inlays: Vec<InlayId>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -462,6 +465,15 @@ impl ConversationView {
         let mut subscriptions = vec![cx.observe_in(&session, window, |this, _, window, cx| {
             this.refresh(window, cx);
         })];
+        subscriptions.push(cx.subscribe_in(
+            &transcript,
+            window,
+            |this, _, event: &BufferEvent, window, cx| {
+                if matches!(event, BufferEvent::Reparsed) && !this.editing {
+                    this.refresh(window, cx);
+                }
+            },
+        ));
         // The placeholder goes on the first keystroke and comes back when the
         // reader empties the composer again, so the boundary is never a bare
         // line whatever they do to it.
@@ -557,7 +569,9 @@ impl ConversationView {
             avatar_authors: HashMap::new(),
             avatar_folds: HashMap::new(),
             edited_inlays: HashMap::new(),
-            next_edited_inlay: 1,
+            next_custom_inlay: 1,
+            text_folds: Vec::new(),
+            text_inlays: Vec::new(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -1832,6 +1846,7 @@ impl ConversationView {
         self.place_unread(window, cx);
         self.settle_images(cx);
         self.refresh_custom_emoji(window, cx);
+        let paragraph_spacing = self.refresh_text_layout(window, cx);
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
@@ -1848,7 +1863,7 @@ impl ConversationView {
             .filter(|pair| continues_author(&pair[0], &pair[1], self.session.read(cx).model()))
             .map(|pair| Row::Message(pair[0].ts.clone()))
             .collect::<HashSet<_>>();
-        let spacing = self
+        let mut spacing: Vec<_> = self
             .transcript
             .keys()
             .filter(|row| matches!(row, Row::Message(_) | Row::Day(_)))
@@ -1876,6 +1891,7 @@ impl ConversationView {
             .collect();
         self.editor.update(cx, |editor, cx| {
             editor.set_centered_rows(dates, cx);
+            spacing.extend(paragraph_spacing);
             editor.set_row_spacing(spacing, cx);
         });
         self.refresh_chip(cx);
@@ -1981,6 +1997,117 @@ impl ConversationView {
         self.emoji_pending.clear();
     }
 
+    fn refresh_text_layout(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<editor::display_map::RowSpacing> {
+        let source = self.transcript.buffer().read(cx).snapshot();
+        let messages = self
+            .transcript
+            .keys()
+            .filter(|row| matches!(row, Row::Message(_)))
+            .filter_map(|row| self.transcript.range_of(row))
+            .map(|range| range.start.to_offset(&source)..range.end.to_offset(&source))
+            .collect::<Vec<_>>();
+        let layout = super::text_layout::TextLayout::from_snapshot(&source, &messages);
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let anchor = |offset| snapshot.anchor_in_excerpt(source.anchor_before(offset));
+        let range = |range: Range<usize>| Some(anchor(range.start)?..anchor(range.end)?);
+        let mut folds = layout
+            .concealed
+            .into_iter()
+            .filter_map(&range)
+            .collect::<Vec<_>>();
+        let mut inlays = Vec::new();
+        for bullet in layout.bullets {
+            if let Some(range) = range(bullet) {
+                let id = self.next_custom_inlay;
+                self.next_custom_inlay += 1;
+                inlays.push(Inlay::custom(id, range.start, "•"));
+                folds.push(range);
+            }
+        }
+        let code = layout.code.into_iter().filter_map(&range).collect();
+        let underlines = layout.underlines.into_iter().filter_map(&range).collect();
+        let mentions = layout.mentions.into_iter().filter_map(&range).collect();
+        let indents = layout
+            .lists
+            .into_iter()
+            .filter_map(|(source, indent)| range(source).map(|range| (range, indent)))
+            .collect::<Vec<_>>();
+        let spacing = layout
+            .paragraph_gaps
+            .into_iter()
+            .filter_map(|offset| {
+                let anchor = anchor(offset)?;
+                Some(editor::display_map::RowSpacing {
+                    range: anchor..anchor,
+                    minimum_height: 0.,
+                    gap_after: 0.5,
+                })
+            })
+            .collect();
+        let colors = cx.theme().colors();
+        let code_style = gpui::HighlightStyle {
+            color: Some(colors.terminal_ansi_yellow.into()),
+            background_color: Some(colors.element_background.into()),
+            ..Default::default()
+        };
+        let mention_style = gpui::HighlightStyle {
+            color: Some(colors.terminal_ansi_yellow.into()),
+            background_color: Some(gpui::Hsla::from(colors.terminal_ansi_yellow).opacity(0.18)),
+            font_weight: Some(gpui::FontWeight::BOLD),
+            ..Default::default()
+        };
+        let underline_style = gpui::HighlightStyle {
+            underline: Some(gpui::UnderlineStyle {
+                thickness: gpui::px(1.),
+                color: None,
+                wavy: false,
+            }),
+            ..Default::default()
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.remove_folds_with_type(
+                &self.text_folds,
+                TypeId::of::<MessageTextFold>(),
+                false,
+                cx,
+            );
+            self.text_inlays = {
+                let ids = inlays.iter().map(|inlay| inlay.id).collect();
+                editor.splice_inlays(&self.text_inlays, inlays, cx);
+                ids
+            };
+            editor.fold_creases(
+                folds
+                    .iter()
+                    .cloned()
+                    .map(|range| {
+                        Crease::simple(
+                            range,
+                            FoldPlaceholder::concealed(TypeId::of::<MessageTextFold>()),
+                        )
+                    })
+                    .collect(),
+                false,
+                window,
+                cx,
+            );
+            for (key, ranges, style) in [
+                (usize::MAX - 601, code, code_style),
+                (usize::MAX - 602, underlines, underline_style),
+                (usize::MAX - 603, mentions, mention_style),
+            ] {
+                editor.highlight_text(editor::HighlightKey::SyntaxTreeView(key), ranges, style, cx);
+            }
+            editor.set_hanging_indents(indents, cx);
+        });
+        self.text_folds = folds;
+        spacing
+    }
+
     fn decoded_image(
         &mut self,
         path: &std::path::PathBuf,
@@ -2071,8 +2198,8 @@ impl ConversationView {
                         .snapshot(cx)
                         .anchor_in_excerpt(anchor)
                     {
-                        let id = self.next_edited_inlay;
-                        self.next_edited_inlay += 1;
+                        let id = self.next_custom_inlay;
+                        self.next_custom_inlay += 1;
                         self.editor.update(cx, |editor, cx| {
                             editor.splice_inlays(&[], vec![Inlay::custom(id, anchor, " ✎")], cx);
                         });
@@ -4386,7 +4513,10 @@ mod tests {
 
         assert!(!text.contains("you"), "the word never appears: {text}");
         assert!(text.contains("Manmeet"), "{text}");
-        assert!(text.contains("can @Manmeet take this?"), "{text}");
+        assert!(
+            text.contains("can <mark>@Manmeet</mark> take this?"),
+            "{text}"
+        );
         assert_eq!(
             classed(&text, &styles, Class::You),
             vec!["Manmeet", "@Manmeet"],

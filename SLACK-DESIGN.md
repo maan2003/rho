@@ -579,6 +579,12 @@ transcript renders through, and owns none of its own. Concretely:
   Alignment is recalculated when wrapping changes. The editor's shared geometry
   owns wrapping, scrolling, selection and hit testing.
   Per-message and last-reply timestamps are hidden; date separators remain.
+- Message text keeps Markdown semantics: list continuations hang under their
+  body text and unordered markers display as bullets. Inline code has a tinted
+  background; actual Slack mentions are highlighted, not arbitrary `@` text.
+  Rich-text underline and combined emphasis survive conversion. Paragraph
+  breaks use half-line display spacing; code-block whitespace stays literal.
+  Decorations follow syntax and retain the source for copy/search.
 - Edits use a display-only `✎` suffix on the last content line, not a source
   metadata row. Markdown link targets and code fences remain unchanged.
 - Attachments and previews follow the body. Reactions and thread counts share

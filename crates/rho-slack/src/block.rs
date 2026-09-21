@@ -615,7 +615,14 @@ fn render_rich_text_element(flavour: Flavour, element: &Value, names: &dyn Names
                         false => "-".to_owned(),
                     };
                     let text = render_rich_text_element(flavour, item, names);
-                    format!("{indent}{bullet} {}", text.trim_end())
+                    let prefix = format!("{indent}{bullet} ");
+                    let continuation = " ".repeat(prefix.len());
+                    let mut lines = text.trim_end().split('\n');
+                    let mut rendered = format!("{prefix}{}", lines.next().unwrap_or_default());
+                    for line in lines {
+                        rendered.push_str(&format!("\n{continuation}{line}"));
+                    }
+                    rendered
                 })
                 .collect::<Vec<_>>();
             format!("{}\n", items.join("\n"))
@@ -638,6 +645,9 @@ fn render_inline(flavour: Flavour, element: &Value, names: &dyn Names) -> String
         // escaped, because here they are text and not formatting.
         "text" => match flavour {
             Flavour::Mrkdwn => string(element, "text").to_owned(),
+            Flavour::Markdown if element["style"]["code"].as_bool() == Some(true) => {
+                string(element, "text").to_owned()
+            }
             Flavour::Markdown => escape(string(element, "text")),
         },
         "user" => {
@@ -707,7 +717,22 @@ fn render_inline(flavour: Flavour, element: &Value, names: &dyn Names) -> String
         }
         _ => String::new(),
     };
+    let text = if matches!(
+        string(element, "type"),
+        "user" | "usergroup" | "broadcast" | "team"
+    ) {
+        mention(flavour, &text)
+    } else {
+        text
+    };
     apply_style(flavour, element.get("style"), &text)
+}
+
+fn mention(flavour: Flavour, text: &str) -> String {
+    match flavour {
+        Flavour::Markdown => format!("<mark>{}</mark>", escape(text)),
+        Flavour::Mrkdwn => text.to_owned(),
+    }
 }
 
 /// Slack's own emphasis markers, which is also what the composer accepts, so
@@ -725,18 +750,37 @@ fn apply_style(flavour: Flavour, style: Option<&Value>, text: &str) -> String {
         Flavour::Markdown => ("**", "*", "~~"),
     };
     if flag("code") {
-        return format!("`{text}`");
+        if flavour == Flavour::Mrkdwn {
+            return format!("`{text}`");
+        }
+        let ticks = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0) + 1;
+        let marker = "`".repeat(ticks);
+        let padding = if text.starts_with('`') || text.ends_with('`') {
+            " "
+        } else {
+            ""
+        };
+        return format!("{marker}{padding}{text}{padding}{marker}");
     }
-    if flag("bold") {
-        return format!("{bold}{text}{bold}");
+    let leading = &text[..text.len() - text.trim_start().len()];
+    let trailing = &text[text.trim_end().len()..];
+    let mut text = text.trim().to_owned();
+    if text.is_empty() {
+        return format!("{leading}");
     }
-    if flag("italic") {
-        return format!("{italic}{text}{italic}");
+    for (enabled, marker) in [
+        (flag("strike"), struck),
+        (flag("italic"), italic),
+        (flag("bold"), bold),
+    ] {
+        if enabled {
+            text = format!("{marker}{text}{marker}");
+        }
     }
-    if flag("strike") {
-        return format!("{struck}{text}{struck}");
+    if flag("underline") && flavour == Flavour::Markdown {
+        text = format!("<u>{text}</u>");
     }
-    text.to_owned()
+    format!("{leading}{text}{trailing}")
 }
 
 fn render_text_object(flavour: Flavour, object: Option<&Value>, names: &dyn Names) -> String {
@@ -759,6 +803,38 @@ pub fn render_mrkdwn(text: &str, names: &dyn Names) -> String {
 /// markers, since here it is formatting and not punctuation; what is not a
 /// marker is escaped, so a name with an underscore in it stays a name.
 pub fn render_mrkdwn_as(flavour: Flavour, text: &str, names: &dyn Names) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        let ticks = rest[start..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+        let after = start + ticks;
+        let mut search = after;
+        let mut end = None;
+        while let Some(at) = rest[search..].find('`') {
+            let at = search + at;
+            let count = rest[at..].bytes().take_while(|byte| *byte == b'`').count();
+            if count == ticks {
+                end = Some(at + count);
+                break;
+            }
+            search = at + count;
+        }
+        let Some(end) = end else {
+            break;
+        };
+        out.push_str(&render_mrkdwn_prose(flavour, &rest[..start], names));
+        // Mentions and HTML-shaped text inside code are literal, not metadata.
+        out.push_str(&unescape_entities(&rest[start..end]));
+        rest = &rest[end..];
+    }
+    out.push_str(&render_mrkdwn_prose(flavour, rest, names));
+    out
+}
+
+fn render_mrkdwn_prose(flavour: Flavour, text: &str, names: &dyn Names) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find('<') {
@@ -769,18 +845,22 @@ pub fn render_mrkdwn_as(flavour: Flavour, text: &str, names: &dyn Names) -> Stri
             rest = "";
             break;
         };
-        out.push_str(&render_escape(flavour, &after[..end], names));
+        out.push_str(&render_escape(
+            flavour,
+            &unescape_entities(&after[..end]),
+            names,
+        ));
         rest = &after[end + 1..];
     }
     out.push_str(&plain(flavour, rest));
-    unescape_entities(&out)
+    out
 }
 
 /// A run of a plain body between escapes, in the flavour asked for.
 fn plain(flavour: Flavour, text: &str) -> String {
     match flavour {
-        Flavour::Mrkdwn => text.to_owned(),
-        Flavour::Markdown => remark(text),
+        Flavour::Mrkdwn => unescape_entities(text),
+        Flavour::Markdown => remark(&unescape_entities(text)),
     }
 }
 
@@ -796,7 +876,7 @@ fn render_escape(flavour: Flavour, body: &str, names: &dyn Names) -> String {
                 .user(&id)
                 .or_else(|| label.map(str::to_owned))
                 .unwrap_or_else(|| "someone".to_owned());
-            format!("@{name}")
+            mention(flavour, &format!("@{name}"))
         }
         Some('#') => {
             let id = ChannelId(target[1..].to_owned());
@@ -807,10 +887,13 @@ fn render_escape(flavour: Flavour, body: &str, names: &dyn Names) -> String {
             format!("#{name}")
         }
         // `<!here>`, `<!channel>`, `<!subteam^S123|@team>`.
-        Some('!') => match label {
-            Some(label) => label.to_owned(),
-            None => format!("@{}", target[1..].split('^').next().unwrap_or_default()),
-        },
+        Some('!') => mention(
+            flavour,
+            &match label {
+                Some(label) => label.to_owned(),
+                None => format!("@{}", target[1..].split('^').next().unwrap_or_default()),
+            },
+        ),
         _ => match (flavour, label) {
             (Flavour::Mrkdwn, Some(label)) => label.to_owned(),
             (Flavour::Mrkdwn, None) => target.to_owned(),
@@ -913,6 +996,78 @@ mod tests {
             }],
         }));
         assert_eq!(rendered, "@ada look at #design *now* :wave:@here");
+    }
+
+    #[test]
+    fn markdown_retains_combined_rich_text_styles_and_semantic_mentions() {
+        let block = json!({
+            "type": "rich_text",
+            "elements": [{"type": "rich_text_section", "elements": [
+                {"type": "broadcast", "range": "channel"},
+                {"type": "text", "text": " Trade-offs:", "style": {"bold": true, "underline": true}},
+                {"type": "text", "text": "all", "style": {"bold": true, "italic": true, "strike": true}},
+                {"type": "text", "text": "<u>literal</u>"},
+            ]}]
+        });
+        assert_eq!(
+            render_block_as(Flavour::Markdown, &block, &NoNames),
+            "<mark>@channel</mark> <u>**Trade-offs:**</u>***~~all~~***\\<u\\>literal\\</u\\>"
+        );
+        assert_eq!(
+            render_mrkdwn_as(Flavour::Markdown, "<!here> <@U404|Ada Lovelace>", &NoNames),
+            "<mark>@here</mark> <mark>@Ada Lovelace</mark>"
+        );
+    }
+
+    #[test]
+    fn rich_inline_code_keeps_literal_characters_and_embedded_backticks() {
+        for (text, expected) in [
+            ("<!here> <u>code</u>", "`<!here> <u>code</u>`"),
+            ("a ` b", "``a ` b``"),
+            ("`edge`", "`` `edge` ``"),
+        ] {
+            let element = json!({"type":"text", "text":text, "style":{"code":true}});
+            assert_eq!(
+                render_inline(Flavour::Markdown, &element, &NoNames),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn literal_entity_encoded_html_is_not_generated_formatting() {
+        assert_eq!(
+            render_mrkdwn_as(Flavour::Markdown, "&lt;u&gt;literal&lt;/u&gt;", &NoNames),
+            r"\<u\>literal\</u\>"
+        );
+    }
+
+    #[test]
+    fn code_never_acquires_mention_markup() {
+        for text in [
+            "`<!here>` then <!here>",
+            "``a ` <!here>`` then <!here>",
+            "```\n<!here>\n``` then <!here>",
+        ] {
+            let rendered = render_mrkdwn_as(Flavour::Markdown, text, &NoNames);
+            assert_eq!(rendered.matches("<mark>").count(), 1, "{rendered}");
+            assert!(rendered.ends_with(" then <mark>@here</mark>"), "{rendered}");
+            assert!(rendered.contains("<!here>"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn multiline_list_items_keep_continuations_inside_the_item() {
+        let block = json!({"type":"rich_text","elements":[{
+            "type":"rich_text_list", "style":"ordered", "indent":1,
+            "elements":[{"type":"rich_text_section","elements":[
+                {"type":"text","text":"first\ncontinued"}
+            ]}]
+        }]});
+        assert_eq!(
+            render_block_as(Flavour::Markdown, &block, &NoNames),
+            "  1. first\n     continued\n"
+        );
     }
 
     #[test]

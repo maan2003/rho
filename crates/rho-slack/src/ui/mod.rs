@@ -10,6 +10,7 @@
 pub mod conversation;
 pub mod list;
 pub mod results;
+mod text_layout;
 
 use std::ops::Range;
 

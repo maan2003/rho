@@ -30,6 +30,9 @@ claims are not evidence that a workflow is complete.
   Wrapped paragraphs, leading code, and image attachments retain a common text margin.
   Names remain available for copy/search; initials remain on avatar failure.
   Message and last-reply timestamps are hidden.
+- Message text renders hanging list indents and bullets, inline-code backgrounds,
+  semantic mention highlights, and combined bold/italic/strike/underline.
+  Paragraph gaps are half a line; code whitespace and literal HTML stay literal.
 - Edited messages use a display-only `✎` suffix, with no extra source row.
   Reactions and thread counts share one muted footer; own reactions stay highlighted.
 - Date headings have a half-line gap below them and are centered by anchored editor row alignment, not replacement
@@ -44,8 +47,8 @@ claims are not evidence that a workflow is complete.
   `::skin-tone-2` through `::skin-tone-6` sequences render their variants,
   including supported joined emoji. Custom images and aliases stay on the
   bounded Slack asset path.
-- Verification: `cargo test -p rho-slack --features ui,fake`: 234 passed.
-  `cargo test -p rho-gui --lib`: 368 passed, 4 ignored, including the
+- Verification: `cargo test -p rho-slack --features ui,fake`: 239 passed.
+  `cargo test -p rho-gui --lib`: 370 passed, 4 ignored, including the
   bundled-font, 6.5:1-theme, and Slack rendering regressions.
   `cargo test -p rho-transcript --lib`: 11 passed, 2 ignored.
   After hiding timestamps and disabling popups:
@@ -87,6 +90,11 @@ claims are not evidence that a workflow is complete.
   one visual row and back. Only the one-row state is centered. Inspected
   `/src/slack-qa/screens/single-row-align.png` with short, multiline, wrapped,
   and footer-bearing messages.
+- Message-text QA uses the app-store comparison message at full and narrow
+  widths, plus nested lists, combined styles, literal HTML, and code whitespace.
+  Inspected `/src/slack-qa/screens/message-text.png`, `message-text-narrow.png`,
+  and `message-text-edge-cases.png`. Tests cover message-boundary isolation,
+  9./10. marker widths, nested indentation, resizing, and click mapping.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 

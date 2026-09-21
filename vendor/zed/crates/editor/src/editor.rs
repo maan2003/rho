@@ -9953,6 +9953,18 @@ impl Editor {
         cx.notify();
     }
 
+    /// Sets continuation indents, in space columns, for inclusive anchored source-row ranges.
+    /// Ranges must be ascending and nonoverlapping; an empty vector clears all overrides.
+    pub fn set_hanging_indents(
+        &mut self,
+        ranges: Vec<(Range<Anchor>, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map
+            .update(cx, |map, cx| map.set_hanging_indents(ranges, cx));
+        cx.notify();
+    }
+
     pub fn highlight_gutter<T: 'static>(
         &mut self,
         ranges: impl Into<Vec<Range<Anchor>>>,

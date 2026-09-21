@@ -9,7 +9,7 @@ use super::{
 use futures_lite::future::yield_now;
 use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
 use language::{LanguageAwareStyling, Point};
-use multi_buffer::RowInfo;
+use multi_buffer::{Anchor, RowInfo, ToPoint};
 use std::{
     cmp,
     collections::VecDeque,
@@ -118,6 +118,49 @@ impl_for_row_types! {
     WrapRow => RowDelta
 }
 
+/// Continuation indents keyed by inclusive anchored source-row ranges.
+#[derive(Clone, Default)]
+struct HangingIndentSnapshot {
+    ranges: Vec<(Range<Anchor>, u32)>,
+}
+
+impl HangingIndentSnapshot {
+    fn indent_for_tab_row(&self, snapshot: &TabSnapshot, row: u32) -> Option<u32> {
+        if self.ranges.is_empty() {
+            return None;
+        }
+
+        let max = snapshot.max_point();
+        let start = snapshot.tab_point_to_point(TabPoint::new(row, 0).min(max), Bias::Left);
+        let end = snapshot.tab_point_to_point(
+            TabPoint::new(row.saturating_add(1), 0).min(max),
+            Bias::Right,
+        );
+        let end_row = if end.column == 0 && end.row > start.row {
+            end.row - 1
+        } else {
+            end.row
+        };
+
+        let buffer = snapshot.buffer_snapshot();
+        let mut low = 0;
+        let mut high = self.ranges.len();
+        while low < high {
+            let mid = (low + high) / 2;
+            if self.ranges[mid].0.start.to_point(buffer).row <= end_row {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        low.checked_sub(1).and_then(|ix| {
+            let (range, indent) = &self.ranges[ix];
+            (range.end.to_point(buffer).row >= start.row).then_some(*indent)
+        })
+    }
+}
+
 /// Handles soft wrapping of text.
 ///
 /// See the [`display_map` module documentation](crate::display_map) for more information.
@@ -130,6 +173,7 @@ pub struct WrapMap {
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
     row_scales: RowScaleSnapshot,
+    hanging_indents: HangingIndentSnapshot,
     #[cfg(feature = "wrap-test-support")]
     sync_traces: Vec<WrapSyncTrace>,
     #[cfg(feature = "wrap-test-support")]
@@ -269,6 +313,7 @@ impl WrapMap {
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
                 row_scales,
+                hanging_indents: HangingIndentSnapshot::default(),
                 #[cfg(feature = "wrap-test-support")]
                 sync_traces: Vec::new(),
                 #[cfg(feature = "wrap-test-support")]
@@ -487,6 +532,20 @@ impl WrapMap {
         self.row_scales = row_scales;
     }
 
+    /// Sets continuation indents for inclusive anchored source-row ranges.
+    /// Ranges must be ascending and nonoverlapping.
+    pub fn set_hanging_indents(
+        &mut self,
+        ranges: Vec<(Range<Anchor>, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.hanging_indents.ranges == ranges {
+            return;
+        }
+        self.hanging_indents = HangingIndentSnapshot { ranges };
+        self.rewrap(cx);
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
         if wrap_width == self.wrap_width {
@@ -513,6 +572,7 @@ impl WrapMap {
             let (font, font_size) = self.font_with_size.clone();
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
             let row_scales = self.row_scales.clone();
+            let hanging_indents = self.hanging_indents.clone();
             let tab_snapshot = new_snapshot.tab_snapshot.clone();
             let total_rows = tab_snapshot.max_point().row() as usize + 1;
             let range = TabPoint::zero()..tab_snapshot.max_point();
@@ -527,6 +587,7 @@ impl WrapMap {
                     &tab_edits,
                     wrap_width,
                     &row_scales,
+                    &hanging_indents,
                     &mut line_wrapper,
                 ));
                 self.snapshot = new_snapshot;
@@ -539,6 +600,7 @@ impl WrapMap {
                             &tab_edits,
                             wrap_width,
                             &row_scales,
+                            &hanging_indents,
                             &mut line_wrapper,
                         )
                         .await;
@@ -650,6 +712,7 @@ impl WrapMap {
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            let hanging_indents = self.hanging_indents.clone();
             if cfg!(not(target_family = "wasm"))
                 && pending_edits.len() == 1
                 && affected_row_count(&pending_edits[0].2) < WRAP_YIELD_ROW_INTERVAL
@@ -663,6 +726,7 @@ impl WrapMap {
                     &tab_edits,
                     wrap_width,
                     &row_scales,
+                    &hanging_indents,
                     &mut line_wrapper,
                 ));
                 walked_items = walked_items.saturating_add(update_work);
@@ -730,6 +794,7 @@ impl WrapMap {
                                 &tab_edits,
                                 wrap_width,
                                 &row_scales,
+                                &hanging_indents,
                                 &mut line_wrapper,
                             )
                             .await;
@@ -949,6 +1014,7 @@ impl WrapSnapshot {
         tab_edits: &[TabEdit],
         wrap_width: Pixels,
         row_scales: &RowScaleSnapshot,
+        hanging_indents: &HangingIndentSnapshot,
         line_wrapper: &mut LineWrapper,
     ) -> (WrapPatch, u64) {
         #[derive(Debug)]
@@ -1082,8 +1148,12 @@ impl WrapSnapshot {
                     let row_scale = row_scales
                         .scale_for_tab_row(&new_tab_snapshot, edit.new_rows.start + i as u32);
                     let mut prev_boundary_ix = 0;
-                    for boundary in line_wrapper.wrap_line(&line_fragments, wrap_width / row_scale)
-                    {
+                    for boundary in line_wrapper.wrap_line_with_indent(
+                        &line_fragments,
+                        wrap_width / row_scale,
+                        hanging_indents
+                            .indent_for_tab_row(&new_tab_snapshot, edit.new_rows.start + i as u32),
+                    ) {
                         let wrapped = &line[prev_boundary_ix..boundary.ix];
                         push_isomorphic(&mut edit_transforms, TextSummary::from(wrapped));
                         edit_transforms.push(Transform::wrap(boundary.next_indent));

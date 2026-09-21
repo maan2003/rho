@@ -1626,6 +1626,13 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_wrap_width(width, cx))
     }
 
+    /// Sets hanging indents, in space columns, for inclusive anchored source-row ranges.
+    /// Ranges must be ascending and nonoverlapping; an empty vector clears all overrides.
+    pub fn set_hanging_indents(&self, ranges: Vec<(Range<Anchor>, u32)>, cx: &mut Context<Self>) {
+        self.wrap_map
+            .update(cx, |map, cx| map.set_hanging_indents(ranges, cx));
+    }
+
     #[instrument(skip_all)]
     pub fn update_fold_widths(
         &mut self,
