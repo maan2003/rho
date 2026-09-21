@@ -394,6 +394,15 @@ impl Workspace {
                 .session()
                 .is_some_and(|session| session.read(cx).favorite(source.channel()))
         });
+        let thread = source.as_ref().and_then(|source| match source {
+            Source::Thread(key) => Some(key.clone()),
+            _ => None,
+        });
+        let follows = thread.as_ref().is_some_and(|key| {
+            self.slack
+                .session()
+                .is_some_and(|session| session.read(cx).model().follows(key))
+        });
         let colors = cx.theme().colors();
         div()
             .id("slack-header")
@@ -425,6 +434,44 @@ impl Workspace {
                     })),
             )
             .child(div().font_weight(gpui::FontWeight::BOLD).child(label))
+            .when_some(thread, |header, key| {
+                let channel = key.channel.clone();
+                header
+                    .child(
+                        div()
+                            .id("slack-thread-channel")
+                            .cursor_pointer()
+                            .child("Back to channel")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_slack_source(
+                                    Source::Conversation(channel.clone()),
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("slack-thread-follow")
+                            .cursor_pointer()
+                            .child(if follows {
+                                "Unfollow thread"
+                            } else {
+                                "Follow thread"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(session) = this.slack.session() {
+                                    session.update(cx, |session, cx| {
+                                        if session.model().follows(&key) {
+                                            session.ignore_thread(&key, cx);
+                                        } else {
+                                            session.follow_thread(&key, cx);
+                                        }
+                                    });
+                                }
+                            })),
+                    )
+            })
             .when_some(source, |header, source| {
                 header
                     .child(
