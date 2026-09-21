@@ -1,11 +1,9 @@
-//! Slack's familiar navigation around the conversation editor.
+//! Slack discovery through Rho's minibuffer.
 use std::rc::Rc;
 
-use gpui::prelude::*;
-use gpui::{Context, Window, div, px, uniform_list};
+use gpui::{Context, Window};
 use rho_slack::session::Source;
-use rho_slack::types::{Conversation, ConversationKind};
-use theme::ActiveTheme;
+use rho_slack::types::Conversation;
 
 use crate::minibuffer::Candidate;
 use crate::workspace::{SurfaceView, Workspace};
@@ -29,11 +27,14 @@ impl Workspace {
                     .filter(|row| row.label.to_lowercase().contains(&query))
                     .map(|row| Candidate {
                         value: row.label,
-                        description: if row.unread {
-                            "unread".into()
-                        } else {
-                            String::new()
-                        },
+                        description: [
+                            session.read(cx).favorite(&row.id).then_some("starred"),
+                            row.unread.then_some("unread"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · "),
                     })
                     .collect()
             }),
@@ -203,399 +204,85 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn render_slack_sidebar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(session) = self.slack.session() else {
-            return div().into_any_element();
-        };
-        let session = session.read(cx);
-        let model = session.model();
-        let mut rows = model.conversation_window(0, model.conversation_count());
-        rows.sort_by_key(|row| {
-            let section = if session.favorite(&row.id) {
-                0
-            } else if model
-                .conversation(&row.id)
-                .is_some_and(|c| c.kind == ConversationKind::Channel)
-            {
-                1
-            } else {
-                2
-            };
-            (section, row.label.to_lowercase())
-        });
-        let mut entries = Vec::new();
-        let mut previous = None;
-        for row in rows {
-            let section = if session.favorite(&row.id) {
-                0
-            } else if model
-                .conversation(&row.id)
-                .is_some_and(|c| c.kind == ConversationKind::Channel)
-            {
-                1
-            } else {
-                2
-            };
-            if previous != Some(section) {
-                entries.push((
-                    None,
-                    ["Starred", "Channels", "Direct messages"][section].to_owned(),
-                    false,
-                    false,
-                ));
-                previous = Some(section);
-            }
-            let badge = if row.mention_count > 0 {
-                format!("  @{}", row.mention_count)
-            } else if row.unread_count > 0 {
-                format!("  {}", row.unread_count)
-            } else if row.unread {
-                "  ●".into()
-            } else {
-                String::new()
-            };
-            entries.push((
-                Some(row.id),
-                format!("{}{badge}", row.label),
-                row.unread,
-                row.muted,
-            ));
+    pub(crate) fn slack_toggle_broadcast(&mut self, cx: &mut Context<Self>) {
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
+            view.clone().update(cx, |view, cx| {
+                view.set_also_send_to_channel(!view.also_send_to_channel(), cx);
+            });
         }
-        let health = session.health_reason().map(str::to_owned);
-        let entries = Rc::new(entries);
-        let selected = match &self.active_surface().view {
-            SurfaceView::SlackConversation(view) => Some(view.read(cx).source().channel().clone()),
-            _ => None,
-        };
-        let colors = cx.theme().colors();
-        div()
-            .id("slack-sidebar")
-            .w(px(240.))
-            .min_w(px(180.))
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(colors.panel_background)
-            .text_color(colors.text)
-            .border_r_1()
-            .border_color(colors.border)
-            .p_2()
-            .gap_1()
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(model.workspace().0.clone()),
-            )
-            .when_some(health, |sidebar, reason| {
-                sidebar.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().status().error)
-                        .child(format!("Slack: {reason}")),
-                )
-            })
-            .child(
-                div()
-                    .id("slack-jump")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Jump to…  Ctrl-P")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.prompt_slack_switch(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("slack-find")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Search messages")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.prompt_slack_find_all(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("slack-find-files")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Search files")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.prompt_slack_find_files(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("slack-activity")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Activity")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_slack_activity(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("slack-saved")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Saved for later (local)")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_slack_saved(window, cx))),
-            )
-            .child(
-                div()
-                    .id("slack-drafts")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Drafts")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_slack_drafts(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("slack-new-dm")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("New message  Ctrl-N")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.prompt_slack_people(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("slack-browse")
-                    .p_1()
-                    .cursor_pointer()
-                    .child("Browse channels")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.slack_browse_channels(window, cx)),
-                    ),
-            )
-            .child(
-                uniform_list(
-                    "slack-sidebar-rooms",
-                    entries.len(),
-                    cx.processor(
-                        move |this,
-                              range: std::ops::Range<usize>,
-                              _: &mut Window,
-                              cx: &mut Context<Self>| {
-                            range
-                                .map(|index| {
-                                    let (channel, label, unread, muted) = &entries[index];
-                                    let mut row = div()
-                                        .id(("slack-room", index))
-                                        .w_full()
-                                        .h(px(28.))
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .overflow_hidden()
-                                        .child(label.clone());
-                                    if *muted {
-                                        row = row.text_color(cx.theme().colors().text_muted);
-                                    }
-                                    if *unread && !*muted {
-                                        row = row.font_weight(gpui::FontWeight::BOLD);
-                                    }
-                                    if let Some(channel) = channel {
-                                        let channel = channel.clone();
-                                        if selected.as_ref() == Some(&channel) {
-                                            row = row.bg(cx.theme().colors().element_selected);
-                                        }
-                                        row = row
-                                            .cursor_pointer()
-                                            .hover(|row| row.bg(cx.theme().colors().element_hover))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_slack_source(
-                                                    Source::Conversation(channel.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            }));
-                                    } else {
-                                        row = row
-                                            .text_color(cx.theme().colors().text_muted)
-                                            .font_weight(gpui::FontWeight::BOLD);
-                                    }
-                                    let _ = this;
-                                    row
-                                })
-                                .collect()
-                        },
-                    ),
-                )
-                .flex_1()
-                .min_h_0(),
-            )
-            .into_any_element()
     }
 
-    pub(crate) fn render_slack_header(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let source = match &self.active_surface().view {
-            SurfaceView::SlackConversation(view) => Some(view.read(cx).source().clone()),
-            _ => None,
+    pub(crate) fn slack_toggle_favorite(&mut self, cx: &mut Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
         };
-        let label = source
-            .as_ref()
-            .and_then(|source| {
-                self.slack
-                    .session()
-                    .map(|session| session.read(cx).label(source))
+        let channel = view.read(cx).source().channel().clone();
+        if let Some(session) = self.slack.session() {
+            session.update(cx, |session, cx| session.toggle_favorite(&channel, cx));
+            let label = if session.read(cx).favorite(&channel) {
+                "Conversation starred"
+            } else {
+                "Conversation unstarred"
+            };
+            self.echo(label, rho_window::style::StyleClass::SystemInfo, cx);
+        }
+    }
+
+    pub(crate) fn slack_toggle_follow(&mut self, cx: &mut Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let Source::Thread(key) = view.read(cx).source().clone() else {
+            return;
+        };
+        if let Some(session) = self.slack.session() {
+            session.update(cx, |session, cx| {
+                if session.model().follows(&key) {
+                    session.ignore_thread(&key, cx);
+                } else {
+                    session.follow_thread(&key, cx);
+                }
+            });
+        }
+    }
+
+    pub(crate) fn prompt_slack_detach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let view = view.clone();
+        let files = view.read(cx).attachments();
+        let choices = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| Candidate {
+                value: (index + 1).to_string(),
+                description: file.name.clone(),
             })
-            .unwrap_or_else(|| "Slack".into());
-        let star = source.as_ref().is_some_and(|source| {
-            self.slack
-                .session()
-                .is_some_and(|session| session.read(cx).favorite(source.channel()))
-        });
-        let thread = source.as_ref().and_then(|source| match source {
-            Source::Thread(key) => Some(key.clone()),
-            _ => None,
-        });
-        let follows = thread.as_ref().is_some_and(|key| {
-            self.slack
-                .session()
-                .is_some_and(|session| session.read(cx).model().follows(key))
-        });
-        let colors = cx.theme().colors();
-        div()
-            .id("slack-header")
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_3()
-            .p_2()
-            .text_color(colors.text)
-            .border_b_1()
-            .border_color(colors.border)
-            .child(
-                div()
-                    .id("slack-back")
-                    .cursor_pointer()
-                    .child("←")
-                    .on_click(cx.listener(|_this, _, window, cx| {
-                        window.dispatch_action(Box::new(crate::SurfaceBack), cx)
-                    })),
-            )
-            .child(
-                div()
-                    .id("slack-forward")
-                    .cursor_pointer()
-                    .child("→")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if !this.active_pane().at_newest() {
-                            this.cmd_surface_forward_or_deal(window, cx);
-                        }
-                    })),
-            )
-            .child(div().font_weight(gpui::FontWeight::BOLD).child(label))
-            .when_some(thread, |header, key| {
-                let channel = key.channel.clone();
-                header
-                    .child(
-                        div()
-                            .id("slack-thread-channel")
-                            .cursor_pointer()
-                            .child("Back to channel")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_slack_source(
-                                    Source::Conversation(channel.clone()),
-                                    window,
-                                    cx,
-                                )
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("slack-thread-follow")
-                            .cursor_pointer()
-                            .child(if follows {
-                                "Unfollow thread"
-                            } else {
-                                "Follow thread"
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(session) = this.slack.session() {
-                                    session.update(cx, |session, cx| {
-                                        if session.model().follows(&key) {
-                                            session.ignore_thread(&key, cx);
-                                        } else {
-                                            session.follow_thread(&key, cx);
-                                        }
-                                    });
-                                }
-                            })),
-                    )
-            })
-            .when(
-                source
-                    .as_ref()
-                    .is_some_and(|source| matches!(source, Source::Conversation(_))),
-                |header| {
-                    header.child(
-                        div()
-                            .id("slack-open-thread")
-                            .cursor_pointer()
-                            .child("Open thread")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let SurfaceView::SlackConversation(view) =
-                                    &this.active_surface().view
-                                else {
-                                    return;
-                                };
-                                let key =
-                                    view.clone().update(cx, |view, cx| view.cursor_thread(cx));
-                                if let Some(key) = key {
-                                    this.open_slack_source(Source::Thread(key), window, cx);
-                                }
-                            })),
-                    )
-                },
-            )
-            .when_some(source, |header, source| {
-                header
-                    .child(
-                        div()
-                            .id("slack-star")
-                            .cursor_pointer()
-                            .child(if star { "★" } else { "☆" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(session) = this.slack.session() {
-                                    session.update(cx, |session, cx| {
-                                        session.toggle_favorite(source.channel(), cx)
-                                    });
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("slack-message-actions")
-                            .cursor_pointer()
-                            .child("Message actions")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if !this.prompt_slack_message_actions(window, cx) {
-                                    this.echo(
-                                        "Select a message first",
-                                        rho_window::style::StyleClass::SystemInfo,
-                                        cx,
-                                    );
-                                }
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("slack-write")
-                            .cursor_pointer()
-                            .child("Write a message")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.slack_compose(window, cx)),
-                            ),
-                    )
-            })
-            .into_any_element()
+            .collect::<Vec<_>>();
+        self.open_prompt(
+            "Remove attachment:",
+            Rc::new(move |_, query, _| {
+                choices
+                    .iter()
+                    .filter(|choice| choice.value.starts_with(query))
+                    .cloned()
+                    .collect()
+            }),
+            Rc::new(move |_, input, _, cx| {
+                if let Some(index) = input
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                {
+                    view.update(cx, |view, cx| {
+                        view.remove_attachment(index, cx);
+                    });
+                }
+            }),
+            window,
+            cx,
+        );
     }
 }

@@ -1811,7 +1811,7 @@ async fn a_conversation_search_is_scoped_without_hiding_slack_operators(cx: &mut
 /// The explicit all-workspace entry point does not inherit the active
 /// conversation's scope. This is what sidebar search calls.
 #[gpui::test]
-async fn sidebar_message_search_stays_workspace_wide(cx: &mut TestAppContext) {
+async fn slack_menu_message_search_stays_workspace_wide(cx: &mut TestAppContext) {
     let (workspace, fake, _state) = slack_workspace(cx).await;
     fake.add_message(
         "C1",
@@ -3388,7 +3388,7 @@ fn slack_query_operators_are_explained_as_completions() {
     );
 }
 
-/// Clicking Write message defers insert mode until the conversation frame is
+/// Entering composition defers insert mode until the conversation frame is
 /// shown, so immediate typing loses no leading characters.
 #[gpui::test]
 async fn write_message_then_next_frame_typing_keeps_every_character(cx: &mut TestAppContext) {
@@ -3806,4 +3806,84 @@ async fn copy_message_link_writes_the_server_permalink(cx: &mut TestAppContext) 
         copied.as_deref(),
         Some("https://acme.slack.com/archives/C1/p510000321")
     );
+}
+
+/// The keyboard path must honor the broadcast setting without a Send button.
+#[gpui::test]
+async fn slack_keyboard_send_honors_broadcast_toggle(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts":"100.000000", "user":"UA", "text":"parent"}),
+    );
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack_source(
+                Source::Thread(rho_slack::types::ThreadKey {
+                    channel: ChannelId("C1".into()),
+                    thread_ts: rho_slack::types::Ts("100.000000".into()),
+                    workspace: rho_slack::WorkspaceName("acme".into()),
+                }),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    for (text, broadcast) in [("shared reply", true), ("thread only", false)] {
+        cx.simulate_keystrokes(*workspace, "space S b");
+        workspace
+            .update(cx, |workspace, window, cx| {
+                let crate::workspace::SurfaceView::SlackConversation(view) =
+                    &workspace.active_surface().view
+                else {
+                    panic!("conversation")
+                };
+                assert_eq!(view.read(cx).also_send_to_channel(), broadcast);
+                view.clone()
+                    .update(cx, |view, cx| view.set_compose_for_test(text.into(), cx));
+                workspace.slack_compose(window, cx);
+            })
+            .unwrap();
+        cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+            .unwrap();
+        cx.simulate_keystrokes(*workspace, "enter");
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if fake.posted().last().is_some_and(|post| post.text == text) {
+                break;
+            }
+            cx.executor()
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        let sent = fake
+            .posted()
+            .last()
+            .cloned()
+            .expect("keyboard sent the reply");
+        assert_eq!(sent.text, text);
+        assert_eq!(sent.also_sent_to_channel, broadcast);
+        assert_eq!(sent.thread_ts.as_deref(), Some("100.000000"));
+        cx.simulate_keystrokes(*workspace, "escape");
+    }
 }

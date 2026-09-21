@@ -861,14 +861,8 @@ impl Workspace {
                                 cx,
                             );
                         }
-                        rho_slack::ui::conversation::Event::AttachRequested => {
-                            workspace.prompt_slack_attach(window, cx);
-                        }
                         rho_slack::ui::conversation::Event::ActivateRequested => {
                             workspace.slack_open_row(window, cx);
-                        }
-                        rho_slack::ui::conversation::Event::SubmitRequested(broadcast) => {
-                            workspace.slack_submit_with_options(*broadcast, cx);
                         }
                     },
                 ));
@@ -1297,7 +1291,11 @@ impl Workspace {
     /// rewrite and an upload that failed both left a record of something
     /// that did not happen.
     pub(crate) fn slack_submit(&mut self, cx: &mut gpui::Context<Self>) {
-        self.slack_submit_with_options(false, cx);
+        let broadcast = match &self.active_surface().view {
+            SurfaceView::SlackConversation(view) => view.read(cx).also_send_to_channel(),
+            _ => false,
+        };
+        self.slack_submit_with_options(broadcast, cx);
     }
 
     pub(crate) fn slack_submit_with_options(

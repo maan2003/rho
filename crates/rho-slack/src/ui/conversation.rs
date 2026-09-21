@@ -165,8 +165,6 @@ pub enum Event {
     /// says so, because this crate has no notice line of its own.
     RewriteLost,
     BroadcastWithFilesUnsupported,
-    AttachRequested,
-    SubmitRequested(bool),
     ActivateRequested,
 }
 
@@ -1286,6 +1284,7 @@ impl ConversationView {
 
     pub fn set_also_send_to_channel(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.also_send_to_channel = matches!(self.source, Source::Thread(_)) && enabled;
+        self.refresh_chip(cx);
         cx.notify();
     }
 
@@ -1342,11 +1341,17 @@ impl ConversationView {
     /// composer, and a message arriving appends itself after whatever is
     /// at the end.
     fn refresh_chip(&mut self, cx: &mut Context<Self>) {
-        if self.attached.is_empty() && self.send_state == SendState::Ready {
+        if self.attached.is_empty()
+            && self.send_state == SendState::Ready
+            && !self.also_send_to_channel
+        {
             self.transcript.remove(&Row::Chip, cx);
             return;
         }
         let mut lines = self.attached.iter().map(Attached::line).collect::<Vec<_>>();
+        if self.also_send_to_channel {
+            lines.push("reply also goes to channel".to_owned());
+        }
         match self.send_state {
             SendState::Ready => {}
             SendState::Sending => lines.push("sending…".to_owned()),
@@ -3641,87 +3646,6 @@ impl gpui::Render for ConversationView {
             self.unseen = 0;
         }
         self.fill(position, screen, cx);
-        let attachments = self.attachments();
-        let thread = matches!(self.source, Source::Thread(_));
-        let sending = self.send_state == SendState::Sending;
-        let broadcast = thread && self.also_send_to_channel;
-        let controls = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
-            .text_color(cx.theme().colors().text)
-            .children(attachments.into_iter().enumerate().map(|(index, file)| {
-                div()
-                    .id(("slack-remove-attachment", index))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().colors().element_background)
-                    .cursor_pointer()
-                    .child(format!(
-                        "{} · {}  ×",
-                        file.name,
-                        crate::types::human_size(file.bytes)
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.remove_attachment(index, cx);
-                    }))
-            }))
-            .child(
-                div()
-                    .id("slack-attach")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().colors().element_background)
-                    .cursor_pointer()
-                    .child("Attach…")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::AttachRequested))),
-            )
-            .when(thread, |controls| {
-                controls.child(
-                    div()
-                        .id("slack-reply-broadcast")
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(cx.theme().colors().element_background)
-                        .cursor_pointer()
-                        .child(if self.also_send_to_channel {
-                            "☑ Also send to channel"
-                        } else {
-                            "☐ Also send to channel"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.also_send_to_channel = !this.also_send_to_channel;
-                            cx.notify();
-                        })),
-                )
-            })
-            .child(
-                div()
-                    .id("slack-send")
-                    .ml_auto()
-                    .px_3()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(cx.theme().colors().element_selected)
-                    .cursor_pointer()
-                    .child(match self.send_state {
-                        SendState::Ready => "Send",
-                        SendState::Sending => "Sending…",
-                        SendState::Failed => "Retry",
-                    })
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        if !sending {
-                            cx.emit(Event::SubmitRequested(broadcast));
-                        }
-                    })),
-            );
         div()
             .id("rho-slack-conversation")
             .key_context("RhoSlackConversation")
@@ -3766,7 +3690,6 @@ impl gpui::Render for ConversationView {
                     )
                     .child(self.editor.clone()),
             )
-            .child(controls)
     }
 }
 

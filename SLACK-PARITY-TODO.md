@@ -3,8 +3,9 @@
 Goal: use Rho as the only Slack client for everyday messaging. Match Slack's
 familiar workflows first, preserving Rho's conversation editor/buffer and Vim
 interaction. Multi-workspace support is explicitly excluded. Composition stays in the same
-editor/buffer model too; controls decorate that editor rather than replacing it
-with a separate message form.
+editor/buffer model too. Commands use Vim keys, transient menus, and minibuffer
+prompts; no permanent sidebar, toolbar, or composer buttons. This supersedes the
+original sidebar/button presentation recorded in the historical QA below.
 
 A box closes only after implementation and QA against the fake Slack server.
 Use real client paths, not GUI-side mocks; inspect rendered affected states.
@@ -12,7 +13,8 @@ Record checks and remaining limitations below. Existing historical checklist
 claims are not evidence that a workflow is complete.
 
 ## Navigation and discovery
-- [x] Persistent channel/DM sidebar, unread badges, favorites, quick switcher, back/forward.
+- [x] Editor-backed channel/DM list, unread counts, quick switcher, back/forward.
+- [x] Discovery and conversation commands available through the Slack transient.
 - [x] Find people, start a DM, create group DMs, browse and join channels.
 
 ## Finding things
@@ -103,3 +105,19 @@ product parity. Multi-workspace is excluded by the user.
   File download, cache, search, and inline image rendering were verified.
 - Some standard Unicode emoji glyphs are absent in the QA font environment.
   Custom image emoji and aliases were rendered and inspected.
+
+## Rho-native presentation correction
+
+The persistent sidebar, conversation toolbar, composer buttons, and search
+pagination buttons have been removed. Conversation navigation uses the existing
+editor list and quick-switch minibuffer. `Space Shift-S` exposes discovery,
+search, inventories, message actions, attachment add/remove, follow, favorite,
+and broadcast commands through the existing transient UI. Attachment and send
+state remain buffer text. Enter respects the broadcast toggle.
+
+Verified with 55 Slack GUI tests (one timing test ignored), 227 Slack crate
+tests, `cargo build -p rho-gui --bin rho-gui`, formatting and diff checks.
+The new keyboard regression sends one broadcast reply and one thread-only reply
+through the fake server and checks their wire flags. Inspected rendered list,
+composition with attachment, transient menu, and multi-page search in the
+isolated Wayland GUI. Captures are under `/src/slack-qa/screens/style-*.png`.

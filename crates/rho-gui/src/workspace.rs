@@ -6980,6 +6980,21 @@ impl Workspace {
             Command::SlackReact(name) => self.slack_react(&name, window, cx),
             Command::SlackReactByName => self.prompt_slack_react(window, cx),
             Command::SlackConversations => self.open_slack(window, cx),
+            Command::SlackSwitch => self.prompt_slack_switch(window, cx),
+            Command::SlackPeople => self.prompt_slack_people(window, cx),
+            Command::SlackBrowse => self.slack_browse_channels(window, cx),
+            Command::SlackFind => self.prompt_slack_find_all(window, cx),
+            Command::SlackFiles => self.prompt_slack_find_files(window, cx),
+            Command::SlackActivity => self.open_slack_activity(window, cx),
+            Command::SlackSaved => self.open_slack_saved(window, cx),
+            Command::SlackDrafts => self.open_slack_drafts(window, cx),
+            Command::SlackMessageActions => {
+                self.prompt_slack_message_actions(window, cx);
+            }
+            Command::SlackDetach => self.prompt_slack_detach(window, cx),
+            Command::SlackBroadcast => self.slack_toggle_broadcast(cx),
+            Command::SlackFavorite => self.slack_toggle_favorite(cx),
+            Command::SlackFollow => self.slack_toggle_follow(cx),
             Command::SlackAttach => self.prompt_slack_attach(window, cx),
             Command::SlackMessageEdit(ts) => self.slack_edit_message_at(ts, window, cx),
             Command::SlackMessageDelete(ts) => self.confirm_slack_delete_message(ts, window, cx),
@@ -8663,6 +8678,11 @@ impl Workspace {
                         .breadcrumb_for_page(*page, cx)
                         .map_or(leaf.clone(), |path| format!("{path} / {leaf}"))
                 }
+                SurfaceKey::SlackConversation(source) => self
+                    .slack
+                    .session()
+                    .map(|session| session.read(cx).label(source))
+                    .unwrap_or_else(|| self.surface_name(&self.active_surface().key)),
                 key => self.surface_name(key),
             }
         };
@@ -8706,16 +8726,12 @@ impl Workspace {
             crate::telemetry::record_surfaces(focused_surface, focused_surface.bit());
         }
         self.sync_diff_visibility(true, cx);
-        let slack = self.active_context == ContextId::Slack;
-        let sidebar = slack.then(|| self.render_slack_sidebar(cx));
-        let header = slack.then(|| self.render_slack_header(cx));
         div()
             .flex()
             .flex_row()
             .w_full()
             .flex_grow(1.0)
             .min_h_0()
-            .children(sidebar)
             .child(
                 div()
                     .flex()
@@ -8726,7 +8742,6 @@ impl Workspace {
                     .h_full()
                     .relative()
                     .overflow_hidden()
-                    .children(header)
                     .child(self.render_surface(self.active_surface())),
             )
             .into_any_element()

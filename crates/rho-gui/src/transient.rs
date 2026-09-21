@@ -86,6 +86,19 @@ pub(crate) enum Command {
     SlackReactByName,
     SlackConversations,
     SlackAttach,
+    SlackSwitch,
+    SlackPeople,
+    SlackBrowse,
+    SlackFind,
+    SlackFiles,
+    SlackActivity,
+    SlackSaved,
+    SlackDrafts,
+    SlackDetach,
+    SlackMessageActions,
+    SlackBroadcast,
+    SlackFavorite,
+    SlackFollow,
     SlackMarkReadBefore,
     SlackMarkUnread,
     SlackSaveForLater,
@@ -402,9 +415,62 @@ pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageA
 pub(crate) fn slack_menu() -> Menu {
     Menu::new("slack")
         .item(
+            "e",
+            "message actions…",
+            MenuAction::Command(Command::SlackMessageActions),
+        )
+        .item(
             "o",
             "conversations",
             MenuAction::Command(Command::SlackConversations),
+        )
+        .item("j", "jump…", MenuAction::Command(Command::SlackSwitch))
+        .item(
+            "n",
+            "new message…",
+            MenuAction::Command(Command::SlackPeople),
+        )
+        .item(
+            "c",
+            "browse channels…",
+            MenuAction::Command(Command::SlackBrowse),
+        )
+        .item(
+            "s",
+            "search messages…",
+            MenuAction::Command(Command::SlackFind),
+        )
+        .item(
+            "f",
+            "search files…",
+            MenuAction::Command(Command::SlackFiles),
+        )
+        .item("v", "activity", MenuAction::Command(Command::SlackActivity))
+        .item(
+            "l",
+            "saved (local)",
+            MenuAction::Command(Command::SlackSaved),
+        )
+        .item("d", "drafts", MenuAction::Command(Command::SlackDrafts))
+        .item(
+            "x",
+            "remove attachment…",
+            MenuAction::Command(Command::SlackDetach),
+        )
+        .item(
+            "b",
+            "broadcast reply",
+            MenuAction::Command(Command::SlackBroadcast),
+        )
+        .item(
+            "z",
+            "toggle favorite",
+            MenuAction::Command(Command::SlackFavorite),
+        )
+        .item(
+            "t",
+            "follow / unfollow",
+            MenuAction::Command(Command::SlackFollow),
         )
         .item(
             "a",

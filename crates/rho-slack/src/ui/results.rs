@@ -580,30 +580,6 @@ fn now_seconds() -> i64 {
 impl gpui::Render for ResultsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let previous = (self.page > 1 && !self.loading).then(|| {
-            div()
-                .id("slack-search-previous")
-                .cursor_pointer()
-                .px_2()
-                .py_1()
-                .bg(colors.element_background)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.request_adjacent(-1, window, cx);
-                }))
-                .child("← Previous")
-        });
-        let next = (self.page < self.pages && !self.loading).then(|| {
-            div()
-                .id("slack-search-next")
-                .cursor_pointer()
-                .px_2()
-                .py_1()
-                .bg(colors.element_background)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.request_adjacent(1, window, cx);
-                }))
-                .child("Next →")
-        });
         div()
             .key_context("RhoSlackResults")
             .size_full()
@@ -622,18 +598,6 @@ impl gpui::Render for ResultsView {
                     )
                     .child(self.editor.clone()),
             )
-            .children((self.pages > 1).then(|| {
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(colors.border_variant)
-                    .text_color(colors.text_muted)
-                    .child(div().flex_1().children(previous))
-                    .child(format!("Page {} of {}", self.page, self.pages))
-                    .child(div().flex_1().flex().justify_end().children(next))
-            }))
     }
 }
 

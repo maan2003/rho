@@ -2,13 +2,14 @@
 
 ## Current workflow direction
 
-Slack's familiar navigation and everyday messaging workflows are the baseline.
-A persistent channel/DM sidebar surrounds editor-backed conversations; new DMs,
-channel discovery, search, drafts, activity, and message actions are first-class
-rather than requiring the dealer. Preserve editor/buffer interaction and Vim.
+Slack's everyday messaging workflows use Rho's editor surfaces and Vim motions.
+Conversation navigation is an editor-backed list and minibuffer quick switcher.
+Discovery, search, drafts, activity, attachments, and message actions live in
+the Slack transient menu (`Space Shift-S`), not permanent sidebars or button bars.
+Composition stays in the conversation buffer; attachment, broadcast, sending,
+and retry state are text in that buffer. Enter sends; Shift-Enter inserts a line.
 The implementation and fake-server acceptance checklist is [Slack workflow parity](SLACK-PARITY-TODO.md).
-Multi-workspace support is excluded from this milestone. Older passages below
-that make the conversation list the only entry point describe the previous UX.
+Multi-workspace support is excluded from this milestone.
 
 
 A design for bringing Slack mentions and threads into rho's dealer and
