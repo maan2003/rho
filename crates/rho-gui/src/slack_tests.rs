@@ -73,6 +73,14 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
     fake.add_message(
         "C1",
         serde_json::json!({
+            "ts": "99.0",
+            "user": "UD",
+            "text": "~struck~ and <https://example.com/spec|the spec>\n```\nlet answer = 42;\n```"
+        }),
+    );
+    fake.add_message(
+        "C1",
+        serde_json::json!({
             "ts": "100.0",
             "user": "UA",
             "text": "before :party: after",
@@ -91,7 +99,7 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         rho_slack::ui::ConversationView::new(
             session,
             Source::Conversation(ChannelId("C1".into())),
-            rho_slack::ui::Hooks::inert(),
+            crate::workspace::Workspace::slack_hooks(),
             window,
             cx,
         )
@@ -125,6 +133,18 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         text.contains(":celebrate:"),
         "the alias name remains the reaction's buffer text"
     );
+    assert!(
+        text.contains("~~struck~~"),
+        "Slack strike becomes Markdown source: {text}"
+    );
+    assert!(
+        text.contains("[the spec](https://example.com/spec)"),
+        "Slack links remain copyable Markdown source: {text}"
+    );
+    assert!(
+        text.contains("```\nlet answer = 42;\n```"),
+        "fences remain copyable buffer source: {text}"
+    );
     let display = window
         .update(cx, |view, _, cx| view.display_text_for_test(cx))
         .unwrap();
@@ -135,6 +155,30 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
     assert!(
         !display.contains(":celebrate:"),
         "the active fold conceals the reaction shortcode: {display}"
+    );
+    assert!(
+        display.contains("struck"),
+        "strike content remains visible: {display}"
+    );
+    assert!(
+        !display.contains("~~"),
+        "strike delimiters are concealed: {display}"
+    );
+    assert!(
+        display.contains("the spec"),
+        "link label remains visible: {display}"
+    );
+    assert!(
+        !display.contains("https://example.com/spec") && !display.contains("[the spec]"),
+        "link destination and delimiters are concealed: {display}"
+    );
+    assert!(
+        display.contains("let answer = 42;"),
+        "fenced code remains visible: {display}"
+    );
+    assert!(
+        !display.contains("```"),
+        "fence delimiters are concealed: {display}"
     );
 
     let before = window
