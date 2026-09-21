@@ -2750,6 +2750,7 @@ impl Workspace {
         dialog: serde_json::Value,
         index: usize,
         submission: serde_json::Map<String, serde_json::Value>,
+        correction: Option<(String, String)>,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -2761,6 +2762,9 @@ impl Workspace {
         let kind = element["type"].as_str().unwrap_or_default();
         let name = element["name"].as_str().unwrap_or_default().to_owned();
         let label = element["label"].as_str().unwrap_or(&name).to_owned();
+        let (error, prefill) = correction
+            .map(|(error, input)| (Some(error), Some(input)))
+            .unwrap_or_default();
         if name.is_empty() {
             self.echo(
                 "slack: app dialog field has no name",
@@ -2776,16 +2780,16 @@ impl Workspace {
                 let retry_id = dialog_id.clone();
                 let retry_submission = submission.clone();
                 self.open_prompt(
-                    format!("{label}:"),
+                    slack_dialog_field_prompt(&label, error.as_deref()),
                     std::rc::Rc::new(|_, _, _| Vec::new()),
                     std::rc::Rc::new(move |workspace, input, window, cx| {
                         if let Some(error) = slack_dialog_text_error(&element, &input) {
-                            workspace.echo(&format!("slack: {error}"), StyleClass::SystemInfo, cx);
                             workspace.prompt_slack_dialog(
                                 retry_id.clone(),
                                 retry_dialog.clone(),
                                 index,
                                 retry_submission.clone(),
+                                Some((error, input)),
                                 window,
                                 cx,
                             );
@@ -2798,6 +2802,7 @@ impl Workspace {
                             submitted_dialog.clone(),
                             index + 1,
                             submission,
+                            None,
                             window,
                             cx,
                         );
@@ -2805,6 +2810,9 @@ impl Workspace {
                     window,
                     cx,
                 );
+                if let (Some(prefill), Some(minibuffer)) = (prefill, &mut self.minibuffer) {
+                    minibuffer.set_input(prefill, window, cx);
+                }
             }
             "select" if element["data_source"].as_str() == Some("static") => {
                 let options = element["options"].as_array().cloned().unwrap_or_default();
@@ -2814,7 +2822,7 @@ impl Workspace {
                 let retry_id = dialog_id.clone();
                 let retry_submission = submission.clone();
                 self.open_prompt(
-                    format!("{label}:"),
+                    slack_dialog_field_prompt(&label, error.as_deref()),
                     std::rc::Rc::new(move |_, needle, _| {
                         let needle = needle.to_lowercase();
                         choices
@@ -2837,16 +2845,12 @@ impl Workspace {
                                 .then(|| option["value"].as_str().map(str::to_owned))
                                 .flatten()
                         }) else {
-                            workspace.echo(
-                                "slack: choose one of the offered values",
-                                StyleClass::SystemInfo,
-                                cx,
-                            );
                             workspace.prompt_slack_dialog(
                                 retry_id.clone(),
                                 retry_dialog.clone(),
                                 index,
                                 retry_submission.clone(),
+                                Some(("choose one of the offered values".to_owned(), input)),
                                 window,
                                 cx,
                             );
@@ -2859,6 +2863,7 @@ impl Workspace {
                             next_dialog.clone(),
                             index + 1,
                             submission,
+                            None,
                             window,
                             cx,
                         );
@@ -2868,6 +2873,9 @@ impl Workspace {
                 );
                 if let Some(minibuffer) = &mut self.minibuffer {
                     minibuffer.set_complete_whole_input();
+                    if let Some(prefill) = prefill {
+                        minibuffer.set_input(prefill, window, cx);
+                    }
                 }
             }
             _ => self.echo(
@@ -3006,6 +3014,7 @@ impl Workspace {
                     dialog.clone(),
                     0,
                     serde_json::Map::new(),
+                    None,
                     window,
                     cx,
                 );
@@ -3332,6 +3341,13 @@ fn slack_view_text_error(
     None
 }
 
+fn slack_dialog_field_prompt(label: &str, error: Option<&str>) -> String {
+    match error {
+        Some(error) => format!("{label} — {error}:"),
+        None => format!("{label}:"),
+    }
+}
+
 fn slack_dialog_text_error(element: &serde_json::Value, input: &str) -> Option<String> {
     let label = element["label"].as_str().unwrap_or("field");
     let optional = element["optional"].as_bool().unwrap_or(false);
@@ -3431,11 +3447,13 @@ pub(crate) fn model_unit(unit: &SlackUnit) -> Unit {
 
 #[cfg(test)]
 mod tests {
+    use gpui::TestAppContext;
     use rho_slack::api::parse_message;
     use rho_slack::types::{Conversation, ConversationKind, UserId};
     use serde_json::json;
 
     use super::*;
+    use crate::tests::{bind_test_keymaps, test_workspace};
 
     fn model() -> Model {
         let mut model = Model::new(WorkspaceName("acme".into()));
@@ -3491,6 +3509,81 @@ mod tests {
             vec![(node(1), rho_desk::cells::SlackTs("100.0".to_owned()))],
             "the newer thread stays, and one the mirror has nothing on is left alone"
         );
+    }
+
+    #[gpui::test]
+    fn legacy_dialog_corrections_keep_invalid_text_and_select_input_in_the_prompt(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(bind_test_keymaps);
+        let workspace = test_workspace(cx);
+        let text_dialog = json!({
+            "elements": [{
+                "type": "text",
+                "name": "summary",
+                "label": "Summary",
+                "min_length": 3
+            }]
+        });
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.prompt_slack_dialog(
+                    "dialog-text".to_owned(),
+                    text_dialog,
+                    0,
+                    serde_json::Map::new(),
+                    None,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+
+        cx.simulate_keystrokes(*workspace, "n o enter");
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let prompt = workspace.minibuffer.as_ref().expect("text retry prompt");
+                assert_eq!(
+                    prompt.prompt(),
+                    "Summary — Summary needs at least 3 characters:"
+                );
+                assert_eq!(prompt.input(cx), "no");
+            })
+            .unwrap();
+
+        let select_dialog = json!({
+            "elements": [{
+                "type": "select",
+                "name": "color",
+                "label": "Color",
+                "data_source": "static",
+                "options": [{"label": "Red", "value": "red"}]
+            }]
+        });
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.prompt_slack_dialog(
+                    "dialog-select".to_owned(),
+                    select_dialog,
+                    0,
+                    serde_json::Map::new(),
+                    None,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+
+        cx.simulate_keystrokes(*workspace, "B l u e enter");
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let prompt = workspace.minibuffer.as_ref().expect("select retry prompt");
+                assert_eq!(prompt.prompt(), "Color — choose one of the offered values:");
+                assert_eq!(prompt.input(cx), "Blue");
+            })
+            .unwrap();
     }
 
     #[test]
