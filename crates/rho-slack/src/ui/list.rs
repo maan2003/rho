@@ -22,7 +22,7 @@ use theme::ActiveTheme as _;
 use crate::model::{ConversationRow, Empty};
 use crate::session::{Session, Source, Status};
 use crate::types::ChannelId;
-use crate::ui::{Class, Hooks, Span, lay_out, when_label};
+use crate::ui::{Class, Hooks, Span, lay_out};
 
 pub struct ListView {
     session: Entity<Session>,
@@ -494,7 +494,7 @@ impl ListView {
                     true => self.muted += 1,
                     false => self.unmuted += 1,
                 }
-                let line = render_row(&row, now_seconds(), self.session.read(cx).favorite(&row.id));
+                let line = render_row(&row, self.session.read(cx).favorite(&row.id));
                 let (text, styles) = lay_out(&line);
                 self.insert_line(
                     at,
@@ -779,7 +779,7 @@ impl ListView {
 }
 
 /// The rows the model handed over, laid out: one line per conversation, the
-/// name, what is waiting in it, and when it last spoke. No ids and no
+/// name and what is waiting in it. No ids, timestamps, and no
 /// last-message preview — the list is for choosing where to go, and a
 /// preview is the conversation's job. Narrowing happened before this: the
 /// model answers a query from its own index, so nothing here looks at every
@@ -788,10 +788,6 @@ fn render_rows(
     rows: &[ConversationRow],
     favorite: impl Fn(&ChannelId) -> bool,
 ) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
-    // Read once for the whole listing rather than once a row: every row is
-    // asking the same question, and the answer moving between two of them
-    // would put two days on one frame.
-    let now = now_seconds();
     let matching = rows.iter().collect::<Vec<_>>();
     let mut lines = Vec::with_capacity(matching.len());
     let mut targets = Vec::with_capacity(matching.len());
@@ -804,16 +800,10 @@ fn render_rows(
             lines.push(break_line());
             targets.push(None);
         }
-        lines.push(render_row(row, now, favorite(&row.id)));
+        lines.push(render_row(row, favorite(&row.id)));
         targets.push(Some(row.id.clone()));
     }
     (lines, targets)
-}
-
-/// The wall clock, read at the top of a draw. Its own function so the two
-/// places that draw a row ask the same thing.
-fn now_seconds() -> i64 {
-    chrono::Local::now().timestamp()
 }
 
 /// The one line under a banner whose narrowing reaches nothing.
@@ -864,11 +854,16 @@ fn break_line() -> Vec<Span> {
 
 /// One conversation's line. Factored out of the listing so that redrawing
 /// one row and redrawing all of them cannot drift apart.
-fn render_row(row: &ConversationRow, now: i64, favorite: bool) -> Vec<Span> {
-    let mut spans = vec![Span::styled(row.label.clone(), Class::Conversation)];
+fn render_row(row: &ConversationRow, favorite: bool) -> Vec<Span> {
+    let name_class = if row.unread {
+        Class::Unread
+    } else {
+        Class::Conversation
+    };
+    let mut spans = vec![Span::styled(row.label.clone(), name_class)];
     let mut waiting = Vec::new();
     if favorite {
-        waiting.push(Span::styled("★", Class::Mention));
+        waiting.push(Span::styled("★", Class::Conversation));
     }
     if row.mention_count > 0 {
         waiting.push(Span::styled(
@@ -876,16 +871,10 @@ fn render_row(row: &ConversationRow, now: i64, favorite: bool) -> Vec<Span> {
             Class::Mention,
         ));
     }
-    // A number when there is one to give. Slack counts DMs for us and rho
-    // counts what it has seen land; a channel unread since before the last
-    // start has neither, and says so in words.
     if row.unread_count > 0 {
-        waiting.push(Span::styled(
-            format!("{} new", row.unread_count),
-            Class::Unread,
-        ));
+        waiting.push(Span::styled(row.unread_count.to_string(), Class::Unread));
     } else if row.unread && row.mention_count == 0 {
-        waiting.push(Span::styled("unread", Class::Unread));
+        waiting.push(Span::styled("•", Class::Unread));
     }
     for (at, span) in waiting.into_iter().enumerate() {
         spans.push(Span::plain(match at {
@@ -893,13 +882,6 @@ fn render_row(row: &ConversationRow, now: i64, favorite: bool) -> Vec<Span> {
             _ => " · ",
         }));
         spans.push(span);
-    }
-    if let Some(latest) = &row.latest {
-        spans.push(Span::plain("  "));
-        spans.push(Span::styled(
-            when_label(latest.epoch_seconds() as i64, now),
-            Class::Time,
-        ));
     }
     spans
 }
@@ -1107,27 +1089,42 @@ mod tests {
     }
 
     #[test]
-    fn a_row_carries_its_counts_and_the_time_it_last_spoke() {
+    fn an_unread_row_keeps_counts_without_timestamp_or_repeated_words() {
         let mut design = row("#design", true, 2);
         design.unread_count = 5;
-        // A fixed instant, long enough ago to be a date rather than a
-        // clock: what is asserted here is the row's layout, and where the
-        // day boundaries fall is `when_label`'s own test.
-        design.latest = Some(Ts("1755780420.000100".into()));
-        let expected = format!(
-            "#design  @2 · 5 new  {}",
-            crate::ui::when_label(1_755_780_420, now_seconds())
+        let (lines, _) = render_rows(&[design], |_| true);
+        assert_eq!(text(&lines[0]), "#design  ★ · @2 · 5");
+        assert_eq!(
+            lines[0][0].class,
+            Some(Class::Unread),
+            "the unread name is bold"
         );
-        let (lines, _) = render_rows(&[design], |_| false);
-        assert_eq!(text(&lines[0]), expected);
+        assert_eq!(
+            lines[0][2].class,
+            Some(Class::Conversation),
+            "the star stays neutral"
+        );
+        assert_eq!(
+            lines[0][4].class,
+            Some(Class::Mention),
+            "only the mention is accented"
+        );
+        assert_eq!(
+            lines[0][6].class,
+            Some(Class::Unread),
+            "the unread count is bold"
+        );
     }
 
     #[test]
-    fn a_channel_unread_from_before_the_last_start_says_so_in_words() {
-        // Slack counts messages for DMs only, so a channel that was already
-        // unread at connect has no number to show and must not invent one.
-        let (lines, _) = render_rows(&[row("#design", true, 0)], |_| false);
-        assert_eq!(text(&lines[0]), "#design  unread");
+    fn count_less_unread_is_a_quiet_dot_and_read_names_are_regular() {
+        let rows = [row("#design", true, 0), row("#general", false, 0)];
+        let (lines, _) = render_rows(&rows, |_| false);
+        assert_eq!(text(&lines[0]), "#design  •");
+        assert_eq!(lines[0][0].class, Some(Class::Unread));
+        assert_eq!(lines[0][2].class, Some(Class::Unread));
+        assert_eq!(text(&lines[1]), "#general");
+        assert_eq!(lines[1][0].class, Some(Class::Conversation));
     }
 
     #[test]
@@ -1138,7 +1135,7 @@ mod tests {
         assert_eq!(text(&lines[0]), "#design  @2");
         assert_eq!(text(&lines[1]), "─────", "muted conversations start here");
         assert_eq!(targets[1], None, "the break opens nothing");
-        assert_eq!(text(&lines[2]), "#noise  unread");
+        assert_eq!(text(&lines[2]), "#noise  •");
     }
 
     /// Narrowing is the model's now, so the rows the view is handed are

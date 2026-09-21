@@ -13,6 +13,22 @@ Use real client paths, not GUI-side mocks; inspect rendered affected states.
 Record checks and remaining limitations below. Existing historical checklist
 claims are not evidence that a workflow is complete.
 
+## Message hierarchy and 7:1 theme QA
+
+- Rho OKSolar P3 body text measures 7.006:1 against its editor background
+  (previously 8.401:1). A regression test checks the bundled theme.
+- Read sidebar names stay regular and neutral; unread names are bold, mentions
+  accented. Message blocks use spaced bodies, grouped author/time headers, and
+  lazy profile-image inlays without removing names.
+- The composer uses agent-prompt styling and a short display-only hint.
+- `cargo test -p rho-gui --lib`: 360 passed, 4 ignored.
+  `cargo test -p rho-slack --features ui,fake`: 229 passed.
+  Formatting and diff checks pass.
+- Inspected native Wayland captures of empty and typed composers and a
+  multi-author conversation: `/src/slack-qa/screens/hierarchy-7.png` and
+  `/src/slack-qa/screens/hierarchy-typed.png`. Avatar fixtures are solid-color
+  PNGs, not real profile photographs. No production Slack session was used.
+
 ## Navigation and discovery
 - [x] Editor-backed channel/DM sidebar and full list, unread/mention counts,
   favorite stars, quick switcher, back/forward, and keyboard pane navigation.

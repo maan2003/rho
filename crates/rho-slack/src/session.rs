@@ -421,6 +421,10 @@ pub struct Session {
     /// Custom emoji have explicit terminal state so a failed public asset
     /// does not cause filesystem checks or retries on unrelated refreshes.
     cached_emoji: HashMap<String, EmojiFile>,
+    /// Profile avatars are requested only when their author is rendered.
+    /// Every user reaches one terminal state per session, so missing or
+    /// refused pictures are not retried on every draw.
+    cached_avatars: HashMap<UserId, EmojiFile>,
     /// What rho already knows, on disk. Surfaces render from here before the
     /// network answers, and a refresh asks only for what it does not hold.
     mirror: Option<Arc<Mirror>>,
@@ -479,6 +483,7 @@ impl Session {
             asked: 0,
             cached_files: HashMap::new(),
             cached_emoji: HashMap::new(),
+            cached_avatars: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
             focused: None,
@@ -504,6 +509,7 @@ impl Session {
             asked: 0,
             cached_files: HashMap::new(),
             cached_emoji: HashMap::new(),
+            cached_avatars: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
             focused: None,
@@ -2419,6 +2425,89 @@ impl Session {
         }));
     }
 
+    /// A cached profile image, once its bounded public download completes.
+    pub fn cached_avatar(&self, user: &UserId) -> Option<&std::path::Path> {
+        match self.cached_avatars.get(user) {
+            Some(EmojiFile::Ready(path)) => Some(path),
+            Some(EmojiFile::Loading | EmojiFile::Failed) | None => None,
+        }
+    }
+
+    /// Whether this user's first avatar request is still in flight.
+    ///
+    /// `false` covers both not-yet-requested and terminal failure; calling
+    /// [`Self::cache_avatar`] remains cheap and idempotent in either case.
+    pub fn avatar_loading(&self, user: &UserId) -> bool {
+        matches!(self.cached_avatars.get(user), Some(EmojiFile::Loading))
+    }
+
+    /// Lazily resolves and fetches one author's small profile image.
+    ///
+    /// The lookup and download happen at most once per user in this session,
+    /// including when Slack has no image or either request fails.
+    pub fn cache_avatar(&mut self, user: &UserId, cx: &mut Context<Self>) {
+        const MAX_AVATAR_BYTES: usize = 512 * 1024;
+        if self.cached_avatars.contains_key(user) {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            self.cached_avatars.insert(user.clone(), EmojiFile::Failed);
+            return;
+        };
+        self.cached_avatars.insert(user.clone(), EmojiFile::Loading);
+        let user = user.clone();
+        let failed_user = user.clone();
+        let files = self.paths.files.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let Some(url) = client.user_avatar_url(&user).await? else {
+                anyhow::bail!("the user has no profile image");
+            };
+            let id = avatar_cache_id(&url);
+            let file = crate::types::FileSummary {
+                id,
+                title: format!("{}.avatar", user.0),
+                filetype: String::new(),
+                size: 0,
+                url: url.clone(),
+                original_w: 0,
+                original_h: 0,
+                thumb_url: String::new(),
+            };
+            let path = file_cache_path(&files, &file)?;
+            if !path.exists() {
+                let bytes = client
+                    .download_public_bounded(&url, MAX_AVATAR_BYTES)
+                    .await?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, bytes)?;
+            }
+            anyhow::Ok((user, path))
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")));
+            let _ = this.update(cx, |session, cx| {
+                match result {
+                    Ok((user, path)) => {
+                        session
+                            .cached_avatars
+                            .insert(user, EmojiFile::Ready(path));
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, user = %failed_user.0, "slack avatar fetch failed");
+                        session
+                            .cached_avatars
+                            .insert(failed_user, EmojiFile::Failed);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// Fetches a file into the state cache so a surface can show it. Called
     /// when an image first comes into view, never ahead of time: the reader
     /// asked for a conversation, not for a download queue.
@@ -3797,10 +3886,18 @@ fn open_mirror(path: &std::path::Path) -> Option<Arc<Mirror>> {
 }
 
 fn custom_emoji_cache_id(url: &str) -> String {
+    cache_id("emoji", url)
+}
+
+fn avatar_cache_id(url: &str) -> String {
+    cache_id("avatar", url)
+}
+
+fn cache_id(kind: &str, url: &str) -> String {
     use std::hash::{Hash as _, Hasher as _};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut hash);
-    format!("emoji:{:016x}", hash.finish())
+    format!("{kind}:{:016x}", hash.finish())
 }
 
 fn file_cache_path(

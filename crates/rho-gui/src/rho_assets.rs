@@ -65,6 +65,52 @@ impl RhoAssets {
 mod tests {
     use super::*;
 
+    fn wcag_relative_luminance(color: gpui::Color) -> f32 {
+        let color = gpui::Rgba::from(color);
+        let linear = |component: f32| {
+            if component <= 0.04045 {
+                component / 12.92
+            } else {
+                ((component + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+
+    #[test]
+    fn oksolar_body_foreground_is_quieter_and_remains_accessible() {
+        let registry = theme::ThemeRegistry::new(Box::new(RhoAssets));
+        theme_settings::load_bundled_themes(&registry);
+        let theme = registry
+            .get("Rho OKSolar P3")
+            .expect("registered Rho OKSolar P3 theme");
+        let colors = theme.colors();
+
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../assets/themes/rho-oksolar-p3/rho-oksolar-p3.json"
+        ))
+        .expect("valid Rho OKSolar P3 source");
+        let style = &source["themes"][0]["style"];
+        assert_eq!(style["text"], "oklch(72.9% 0.012 95)");
+        assert_eq!(style["editor.foreground"], "oklch(72.9% 0.012 95)");
+        assert_eq!(
+            colors.text, colors.editor_foreground,
+            "general and editor body text use the same foreground"
+        );
+
+        let foreground = wcag_relative_luminance(colors.editor_foreground);
+        let background = wcag_relative_luminance(colors.editor_background);
+        let contrast = (foreground + 0.05) / (background + 0.05);
+        assert!(
+            contrast >= 7.0,
+            "body text contrast must remain at least 7:1, got {contrast:.2}:1"
+        );
+        assert!(
+            (contrast - 7.006).abs() < 0.005,
+            "unexpected contrast {contrast}"
+        );
+    }
+
     #[test]
     fn oled_theme_is_embedded_and_valid() {
         let path = "themes/rho-oled/rho-oled.json";

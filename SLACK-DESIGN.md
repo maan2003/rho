@@ -558,12 +558,14 @@ transcript renders through, and owns none of its own. Concretely:
   conversion is `rho-slack`'s `markdown` module and the one place the two
   markups are told apart; `block.rs` resolves the ids, links and lists the
   same way for both.
-- A message is one block of the document, keyed by its `ts`. A turn is named
-  the way the transcript names one: the sender and the time. One line of
-  speech reads `name: what they said  time`; words the parse would read as a
-  block of their own — a list, a quote, a fence, a table — cannot begin after
-  a name, so there the name and time are a line of their own and the words
-  start under them at the margin. Nothing is indented into place.
+- A message is one block of the document, keyed by its `ts`. A neutral,
+  bold author name and muted time head the body, with a small profile-image
+  inlay beside the name. Nearby messages from the same author share a header
+  (within five minutes and the same day); separate messages retain spacing.
+  Message bodies always start at the margin on their own line.
+- The composer uses the agent prompt's draft style and gutter. Its display-only
+  hint is `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
+  typing removes it. No buttons or permanent instruction row are added.
 - The day break and the unread line are the document's own headings, whose
   markers the parse hides.
 - What came with a message rather than being it — an attachment's card, a

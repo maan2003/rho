@@ -716,6 +716,7 @@ impl Workspace {
             },
             configure_markdown: rho_window::markdown::configure_buffer,
             gutter_colour: rho_window::style::user_prompt_gutter_color,
+            prompt_style: |cx| StyleClass::UserMessage.resolve(cx),
         }
     }
 

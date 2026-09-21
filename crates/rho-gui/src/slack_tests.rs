@@ -122,6 +122,23 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         decorations, 2,
         "body emoji and aliased reaction both render"
     );
+    let mut avatars = 0;
+    for _ in 0..300 {
+        cx.run_until_parked();
+        avatars = window
+            .update(cx, |view, _, _| view.avatar_count_for_test())
+            .unwrap();
+        if avatars == 2 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        avatars, 2,
+        "each author's header gets a bounded profile image"
+    );
     let text = window
         .update(cx, |view, _, cx| view.transcript_text_for_test(cx))
         .unwrap();
@@ -1120,7 +1137,10 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
         let drawn = window
             .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
             .unwrap();
-        if drawn.iter().any(|line| line.starts_with("ada:")) {
+        if drawn
+            .iter()
+            .any(|line| line.trim_start().starts_with("ada  "))
+        {
             break;
         }
         cx.executor()
@@ -1137,7 +1157,10 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
         drawn = window
             .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
             .unwrap();
-        if drawn.iter().any(|line| line.starts_with("zed:")) {
+        if drawn
+            .iter()
+            .any(|line| line.trim_start().starts_with("zed  "))
+        {
             break;
         }
         cx.executor()
@@ -1145,11 +1168,15 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
             .await;
     }
     assert!(
-        drawn.iter().any(|line| line.starts_with("zed:")),
+        drawn
+            .iter()
+            .any(|line| line.trim_start().starts_with("zed  ")),
         "the row the newcomer's message drew says who they are: {drawn:?}"
     );
     assert!(
-        !drawn.iter().any(|line| line.starts_with("someone:")),
+        !drawn
+            .iter()
+            .any(|line| line.trim_start().starts_with("someone  ")),
         "and no row is left saying someone: {drawn:?}"
     );
 }
@@ -4039,4 +4066,175 @@ async fn slack_sidebar_reuses_the_list_and_routes_enter_to_its_own_row(cx: &mut 
         arrived,
         "a mention must update the sidebar without reopening it"
     );
+}
+
+#[gpui::test]
+async fn slack_composer_placeholder_is_display_only_and_the_cursor_precedes_it(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack_source(Source::Conversation(ChannelId("C1".into())), window, cx);
+            workspace.slack_compose(window, cx);
+        })
+        .unwrap();
+
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack
+                    .session()
+                    .unwrap()
+                    .read(cx)
+                    .model()
+                    .label(&ChannelId("C1".into()))
+                    == "#design"
+            })
+            .unwrap()
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let crate::workspace::SurfaceView::SlackConversation(view) =
+                &workspace.active_surface().view
+            else {
+                panic!("conversation")
+            };
+            view.clone().update(cx, |view, cx| {
+                view.set_compose_for_test(String::new(), cx);
+                view.select_compose(window, cx);
+                assert_eq!(view.compose_text_for_test(cx), "");
+                let display = view.display_text_for_test(cx);
+                assert!(display.contains("Message #design…"), "{display}");
+                assert!(!display.contains("Enter sends"), "{display}");
+                view.editor().clone().update(cx, |editor, cx| {
+                    let display = editor.display_snapshot(cx);
+                    assert_eq!(
+                        editor.selections.newest_display(&display).head().column(),
+                        0
+                    );
+                });
+                view.set_compose_for_test("actual draft".into(), cx);
+                assert_eq!(view.compose_text_for_test(cx), "actual draft");
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let crate::workspace::SurfaceView::SlackConversation(view) =
+                &workspace.active_surface().view
+            else {
+                panic!("conversation")
+            };
+            view.clone().update(cx, |view, cx| {
+                assert!(!view.display_text_for_test(cx).contains("Message #design…"));
+            });
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn slack_message_grouping_restores_a_header_after_its_first_message_is_deleted(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    for (ts, user, text) in [
+        ("100.0", "UA", "first"),
+        ("101.0", "UA", "second"),
+        ("102.0", "UD", "third"),
+    ] {
+        fake.add_message("C1", serde_json::json!({"ts":ts, "user":user, "text":text}));
+    }
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+
+    let mut text = String::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        text = window
+            .update(cx, |view, _, cx| view.transcript_text_for_test(cx))
+            .unwrap();
+        if text.contains("ada") && text.contains("dana") {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(text.matches("ada").count(), 1, "{text}");
+    assert!(text.contains("first\n\nsecond\n"), "{text}");
+    fake.live(serde_json::json!({"kind":"delete", "channel":"C1", "ts":"100.0"}));
+    for _ in 0..200 {
+        cx.run_until_parked();
+        text = window
+            .update(cx, |view, _, cx| view.transcript_text_for_test(cx))
+            .unwrap();
+        if !text.contains("first") {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(!text.contains("first"), "{text}");
+    assert!(
+        text.contains("ada"),
+        "the surviving second message needs its own header: {text}"
+    );
+    assert!(text.contains("\nsecond\n"), "{text}");
+    assert_eq!(text.matches("dana").count(), 1, "{text}");
 }

@@ -340,18 +340,21 @@ AI APIs.
 ## Slack media
 
 - Slack message files use the authenticated workspace session because Slack's
-  private file endpoints require it. Custom emoji are different: `emoji.list`
-  may return public CDN or external URLs. Emoji asset GETs never carry the Slack
+  private file endpoints require it. Custom emoji and profile avatars are different:
+  `emoji.list` and `users.info` may return public CDN or external URLs.
+  Emoji and avatar asset GETs never carry the Slack
   bearer token or `d` cookie, including across redirects.
 - Custom emoji metadata is capped at 10,000 definitions. A conversation
-  reconciles at most 256 occurrences per changed message row. Asset responses
+  reconciles at most 256 occurrences per changed message row. Avatars are looked
+  up lazily, once per author per session. Both kinds of asset responses
   stream into a 512 KiB cap before persistence. Raster dimensions are capped at
   512×512, GIFs at 60 frames, and each conversation view retains at most 16 MiB
   of estimated decoded BGRA pixels. SVG is not decoded because its allocation
   cannot be bounded by the raster header check.
-- Emoji cache entries are keyed by a hash of the URL and have explicit loading,
+- Emoji and avatar cache entries are keyed by a hash of the URL and have explicit loading,
   ready, or failed state. A failed fetch or decode remains a readable shortcode
-  and is not retried until a new Slack session. Conversation decorations are
+  and is not retried until a new Slack session; a missing avatar leaves the
+  author's name intact. Conversation decorations are
   owned per message row; unchanged rows retain their anchors and decoded asset
   without rescanning the transcript or rereading the cache file.
 - Tests exercise URL and alias parsing, credential-free public asset requests,

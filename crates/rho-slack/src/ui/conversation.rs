@@ -36,6 +36,7 @@ use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out}
 /// The composer's placeholder, which is the only custom inlay this surface
 /// puts in its editor.
 const COMPOSE_PLACEHOLDER_INLAY_ID: usize = 0;
+const COMPOSE_DRAFT_HIGHLIGHT_KEY: usize = usize::MAX - 600;
 pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
@@ -66,6 +67,7 @@ enum DecodedEmoji {
 
 pub struct ConversationView {
     session: Entity<Session>,
+    hooks: Hooks,
     source: Source,
     /// The messages on screen, each keyed and each owning its own range: a
     /// new message rewrites one item, not the conversation.
@@ -146,6 +148,8 @@ pub struct ConversationView {
     emoji_images: HashMap<std::path::PathBuf, DecodedEmoji>,
     emoji_image_bytes: usize,
     emoji_revision: u64,
+    avatar_authors: HashMap<Row, crate::types::UserId>,
+    avatar_inlays: HashMap<Row, InlayId>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -516,6 +520,7 @@ impl ConversationView {
 
         let mut view = Self {
             session: session.clone(),
+            hooks,
             source: source.clone(),
             transcript: {
                 let mut transcript = Transcript::new(transcript);
@@ -555,6 +560,8 @@ impl ConversationView {
             emoji_images: HashMap::new(),
             emoji_image_bytes: 0,
             emoji_revision: 0,
+            avatar_authors: HashMap::new(),
+            avatar_inlays: HashMap::new(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -1544,18 +1551,22 @@ impl ConversationView {
         let inlays = match empty {
             true => vec![Inlay::custom(
                 COMPOSE_PLACEHOLDER_INLAY_ID,
-                start,
+                end,
                 placeholder,
             )],
             false => Vec::new(),
         };
+        let draft_style = (self.hooks.prompt_style)(cx);
+        let gutter_colour = self.hooks.gutter_colour;
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(COMPOSE_PLACEHOLDER_INLAY_ID)], inlays, cx);
-            editor.highlight_gutter::<ComposeGutter>(
-                vec![start..end],
-                |cx| cx.theme().colors().text_accent.into(),
+            editor.highlight_text(
+                editor::HighlightKey::SyntaxTreeView(COMPOSE_DRAFT_HIGHLIGHT_KEY),
+                if empty { Vec::new() } else { vec![start..end] },
+                draft_style,
                 cx,
             );
+            editor.highlight_gutter::<ComposeGutter>(vec![start..end], gutter_colour, cx);
         });
     }
 
@@ -1820,6 +1831,7 @@ impl ConversationView {
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
         self.refresh_chip(cx);
+        self.apply_compose_chrome(cx);
         cx.notify();
         #[cfg(any(test, feature = "fake"))]
         {
@@ -1859,6 +1871,11 @@ impl ConversationView {
     }
 
     #[cfg(any(test, feature = "fake"))]
+    pub fn avatar_count_for_test(&self) -> usize {
+        self.avatar_inlays.len()
+    }
+
+    #[cfg(any(test, feature = "fake"))]
     pub fn transcript_text_for_test(&self, cx: &App) -> String {
         self.transcript.buffer().read(cx).text()
     }
@@ -1870,6 +1887,10 @@ impl ConversationView {
     }
 
     fn remove_emoji_row(&mut self, row: &Row, cx: &mut Context<Self>) {
+        if let Some(inlay) = self.avatar_inlays.remove(row) {
+            self.editor
+                .update(cx, |editor, cx| editor.remove_image_inlay(inlay, cx));
+        }
         let Some(decorations) = self.emoji_decorations.remove(row) else {
             return;
         };
@@ -1887,7 +1908,12 @@ impl ConversationView {
     }
 
     fn clear_emoji_rows(&mut self, cx: &mut Context<Self>) {
-        let rows = self.emoji_decorations.keys().cloned().collect::<Vec<_>>();
+        let rows = self
+            .emoji_decorations
+            .keys()
+            .chain(self.avatar_inlays.keys())
+            .cloned()
+            .collect::<Vec<_>>();
         for row in rows {
             self.remove_emoji_row(&row, cx);
         }
@@ -1895,10 +1921,49 @@ impl ConversationView {
         self.emoji_pending.clear();
     }
 
+    fn decoded_image(
+        &mut self,
+        path: &std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<gpui::RenderImage>> {
+        const MAX_DECODED_EMOJI_BYTES: usize = 16 * 1024 * 1024;
+        if !self.emoji_images.contains_key(path) {
+            let decoded = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| {
+                    let format = emoji_image_format(&bytes)?;
+                    let allocation = emoji_image_allocation(&bytes, format)?;
+                    (self.emoji_image_bytes + allocation <= MAX_DECODED_EMOJI_BYTES)
+                        .then_some((bytes, format, allocation))
+                })
+                .and_then(|(bytes, format, allocation)| {
+                    let source = Arc::new(Image::from_bytes(format, bytes));
+                    source
+                        .to_image_data(cx.svg_renderer())
+                        .ok()
+                        .map(|image| (image, allocation))
+                });
+            match decoded {
+                Some((image, bytes)) => {
+                    self.emoji_image_bytes += bytes;
+                    self.emoji_images
+                        .insert(path.clone(), DecodedEmoji::Ready { image });
+                }
+                None => {
+                    self.emoji_images.insert(path.clone(), DecodedEmoji::Failed);
+                }
+            }
+        }
+
+        match self.emoji_images.get(path) {
+            Some(DecodedEmoji::Ready { image }) => Some(image.clone()),
+            _ => None,
+        }
+    }
+
     /// Reconciles only message rows whose text changed or whose requested
     /// asset completed. Stable rows retain both their fold and image anchors.
     fn refresh_custom_emoji(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        const MAX_DECODED_EMOJI_BYTES: usize = 16 * 1024 * 1024;
         let revision = self.session.read(cx).model().custom_emoji_revision();
         if revision != self.emoji_revision {
             self.emoji_revision = revision;
@@ -1943,37 +2008,9 @@ impl ConversationView {
                     crate::session::EmojiCache::Failed => continue,
                     crate::session::EmojiCache::Ready(path) => path.to_owned(),
                 };
-                if !self.emoji_images.contains_key(&path) {
-                    let decoded = std::fs::read(&path)
-                        .ok()
-                        .and_then(|bytes| {
-                            let format = emoji_image_format(&bytes)?;
-                            let allocation = emoji_image_allocation(&bytes, format)?;
-                            (self.emoji_image_bytes + allocation <= MAX_DECODED_EMOJI_BYTES)
-                                .then_some((bytes, format, allocation))
-                        })
-                        .and_then(|(bytes, format, allocation)| {
-                            let source = Arc::new(Image::from_bytes(format, bytes));
-                            source
-                                .to_image_data(cx.svg_renderer())
-                                .ok()
-                                .map(|image| (image, allocation))
-                        });
-                    match decoded {
-                        Some((image, bytes)) => {
-                            self.emoji_image_bytes += bytes;
-                            self.emoji_images
-                                .insert(path.clone(), DecodedEmoji::Ready { image });
-                        }
-                        None => {
-                            self.emoji_images.insert(path.clone(), DecodedEmoji::Failed);
-                        }
-                    }
-                }
-                let Some(DecodedEmoji::Ready { image }) = self.emoji_images.get(&path) else {
+                let Some(image) = self.decoded_image(&path, cx) else {
                     continue;
                 };
-                let image = image.clone();
                 let (start, end) = {
                     let buffer = self.transcript.buffer().read(cx);
                     (
@@ -2010,6 +2047,34 @@ impl ConversationView {
                         .entry(row.clone())
                         .or_default()
                         .push(decoration);
+                }
+            }
+            if let Some(user) = self.avatar_authors.get(&row).cloned() {
+                self.session
+                    .update(cx, |session, cx| session.cache_avatar(&user, cx));
+                let path = self
+                    .session
+                    .read(cx)
+                    .cached_avatar(&user)
+                    .map(std::path::Path::to_path_buf);
+                if let Some(path) = path {
+                    if let Some(image) = self.decoded_image(&path, cx) {
+                        let anchor = self.transcript.buffer().read(cx).anchor_before(base);
+                        if let Some(anchor) = self
+                            .multi_buffer
+                            .read(cx)
+                            .snapshot(cx)
+                            .anchor_in_excerpt(anchor)
+                        {
+                            if let Some(inlay) = self.editor.update(cx, |editor, cx| {
+                                editor.add_image_inlay(anchor, image, 3, cx)
+                            }) {
+                                self.avatar_inlays.insert(row.clone(), inlay);
+                            }
+                        }
+                    }
+                } else {
+                    pending |= self.session.read(cx).avatar_loading(&user);
                 }
             }
             if pending {
@@ -2082,6 +2147,7 @@ impl ConversationView {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.editing = true;
         self.clear_emoji_rows(cx);
+        self.avatar_authors.clear();
         self.transcript.clear(cx);
         // The rule went with everything else; where it belongs is worked
         // out again from the run that replaces it.
@@ -2126,6 +2192,30 @@ impl ConversationView {
         // an arriving message costs the message, and a transcript of a
         // thousand lines is not a thousand clones per frame of traffic.
         let in_thread = matches!(self.source, Source::Thread(_));
+        let successors = {
+            let session = self.session.read(cx);
+            session
+                .loaded(&self.source)
+                .map(|loaded| {
+                    let in_thread = matches!(self.source, Source::Thread(_));
+                    updates
+                        .iter()
+                        .filter_map(|update| {
+                            let ts = match update {
+                                Update::Inserted(ts)
+                                | Update::Replaced(ts)
+                                | Update::Removed(ts) => ts,
+                            };
+                            let next = loaded.messages.partition_point(|message| &message.ts <= ts);
+                            loaded.messages[next..]
+                                .iter()
+                                .find(|message| in_thread || message.is_top_level())
+                                .cloned()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         let (ops, messages) = {
             let session = self.session.read(cx);
             let shown = session
@@ -2202,10 +2292,20 @@ impl ConversationView {
                 }
                 Op::Remove(key) => {
                     self.remove_emoji_row(&key, cx);
+                    self.avatar_authors.remove(&key);
                     self.emoji_pending.remove(&key);
                     self.emoji_dirty.remove(&key);
                     self.transcript.remove(&key, cx);
                 }
+            }
+        }
+        let mut regrouped = HashSet::new();
+        for message in successors {
+            let key = Row::Message(message.ts.clone());
+            if regrouped.insert(key.clone()) && self.transcript.range_of(&key).is_some() {
+                let item = self.item_for(&message, cx);
+                self.remove_emoji_row(&key, cx);
+                self.transcript.replace(&key, item, cx);
             }
         }
         if let Some(key) = first_loaded {
@@ -2466,7 +2566,27 @@ impl ConversationView {
         let in_thread = matches!(self.source, Source::Thread(_));
         let mut item = {
             let session = self.session.read(cx);
-            message_item(message, session.model(), in_thread)
+            let previous = session.loaded(&self.source).and_then(|loaded| {
+                let at = loaded
+                    .messages
+                    .partition_point(|other| other.ts < message.ts);
+                loaded.messages[..at]
+                    .iter()
+                    .rev()
+                    .find(|other| in_thread || other.is_top_level())
+            });
+            let header = !previous
+                .is_some_and(|previous| continues_author(previous, message, session.model()));
+            let row = Row::Message(message.ts.clone());
+            if header
+                && system_line(message, session.model()).is_none()
+                && let Some(user) = &message.user
+            {
+                self.avatar_authors.insert(row, user.clone());
+            } else {
+                self.avatar_authors.remove(&row);
+            }
+            message_item_with_header(message, session.model(), in_thread, header)
         };
         let images = image_boxes(&item)
             .into_iter()
@@ -3003,15 +3123,33 @@ fn image_block(
     }
 }
 
-/// One message as a block of the document: `name: body  time`.
-///
-/// The shape is a chat log's, not a table's: the name introduces the words,
-/// the time trails them, and nothing is padded into a column, so one long
-/// name cannot push every other line across the screen. The words are
-/// markdown and the parse lays them out, so nothing is indented into place;
-/// only the chrome under a message sits at [`BODY_INDENT`]. No blank line
-/// between messages; a day is the only break.
+fn continues_author(previous: &Message, message: &Message, model: &Model) -> bool {
+    previous.user.is_some()
+        && previous.user == message.user
+        && previous.bot_name == message.bot_name
+        && message.ts.epoch_seconds() - previous.ts.epoch_seconds() <= 300.0
+        && !crosses_day(
+            previous.ts.epoch_seconds() as i64,
+            message.ts.epoch_seconds() as i64,
+        )
+        && system_line(previous, model).is_none()
+        && system_line(message, model).is_none()
+        && !message.edited
+}
+
+/// A message has a quiet author/time header, body, and a separating line.
+/// Keeping metadata off the body preserves Markdown block syntax consistently.
+#[cfg(test)]
 fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
+    message_item_with_header(message, model, in_thread, true)
+}
+
+fn message_item_with_header(
+    message: &Message,
+    model: &Model,
+    in_thread: bool,
+    header: bool,
+) -> Rendered {
     let at = message.ts.epoch_seconds() as i64;
     let thread = Some(message.thread_root());
     let indent = " ".repeat(BODY_INDENT);
@@ -3041,10 +3179,8 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             false => Class::Sender,
         },
     );
-    // The time trails what was said rather than heading it: it is the least
-    // of what the reader came for. It trails the words only: what the
-    // renderer hangs under a message (a card, a file, a picture) was not
-    // said at a time of its own.
+    // Metadata stays in the header rather than interrupting the words or
+    // looking like part of an attachment's label.
     let time = Span::styled(format!("  {}", clock_time(at)), Class::Time);
     // The reader is told what they are looking at is not what was sent.
     let edited = message
@@ -3075,23 +3211,12 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         images: Vec::new(),
     };
 
-    // One line of speech keeps the chat log's shape: `name: what they
-    // said  time`. Words the parse reads as a block of their own -- a list,
-    // a quote, a fence, a heading, a table -- cannot begin after a name, so
-    // there the name and the time are a line of their own and the words
-    // start under them, which is how the transcript names a turn.
-    if said.lines().count() <= 1 && !opens_a_block(&said) {
+    if header {
+        // A text-cell gap separates the profile inlay from the author name.
+        spans.push(Span::plain(" "));
         spans.push(name);
-        spans.push(Span::plain(": "));
-        push_body(&mut spans, &said, model, &message.files);
-        spans.extend(edited);
         spans.push(time);
-        spans.push(Span::plain("\n"));
-        lines.push(meta(&said));
-    } else {
-        spans.push(name);
         spans.extend(edited);
-        spans.push(time);
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread: thread.clone(),
@@ -3100,10 +3225,10 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             interaction: None,
             images: Vec::new(),
         });
-        push_body(&mut spans, &said, model, &message.files);
-        spans.push(Span::plain("\n"));
-        lines.extend(said.split('\n').map(&meta));
     }
+    push_body(&mut spans, &said, model, &message.files);
+    spans.push(Span::plain("\n"));
+    lines.extend(said.split('\n').map(&meta));
     // What came with the message rather than being it -- an attachment's
     // card, a link preview, a file -- is marked in the gutter and starts at
     // the margin like anything else. Nothing is drawn into the text to say
@@ -3170,6 +3295,14 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             images: Vec::new(),
         });
     }
+    spans.push(Span::plain("\n"));
+    lines.push(LineMeta {
+        thread: Some(message.thread_root()),
+        file: None,
+        link: None,
+        interaction: None,
+        images: Vec::new(),
+    });
     let item = item(Row::Message(message.ts.clone()), spans, lines);
     match gutter {
         Some(gutter) => item.with_gutter(gutter),
@@ -3188,10 +3321,10 @@ fn width(spans: &[Span]) -> usize {
 /// mistake this line exists to prevent.
 fn compose_placeholder(label: &str, thread: bool) -> String {
     let target = match thread {
-        false => format!("message {label}"),
-        true => format!("reply in {label}"),
+        false => format!("Message {label}…"),
+        true => format!("Reply in {label}…"),
     };
-    format!("{target} · Enter sends · Shift-Enter newline · Markdown supported")
+    target
 }
 
 /// Waits for the outcome of a write that is already on its way. The write
@@ -3320,21 +3453,6 @@ fn item(key: Row, spans: Vec<Span>, lines: Vec<LineMeta>) -> Rendered {
 /// all start: two columns in, so they read as belonging to the message
 /// above rather than as a message of their own.
 const BODY_INDENT: usize = 2;
-
-/// Whether words would be read as a block of their own rather than as a
-/// sentence: a heading, a list, a quote, a fence, a table. Such a message
-/// cannot begin after a name on the same line, because the marker only
-/// means what it means at the start of a line.
-fn opens_a_block(said: &str) -> bool {
-    let head = said.trim_start_matches(' ');
-    let opener = ["#", ">", "- ", "+ ", "* ", "```", "~~~", "|", "---", "==="];
-    opener.iter().any(|mark| head.starts_with(mark))
-        || head.split_once(['.', ')']).is_some_and(|(number, rest)| {
-            !number.is_empty()
-                && number.bytes().all(|byte| byte.is_ascii_digit())
-                && rest.starts_with(' ')
-        })
-}
 
 /// A membership or housekeeping event, as one line. Slack shows these and a
 /// channel reads wrong without them, but they are not what anyone came to
@@ -3680,6 +3798,8 @@ impl gpui::Render for ConversationView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .px(gpui::px(16.))
+                    .py(gpui::px(8.))
                     .on_mouse_up(
                         gpui::MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
@@ -4101,48 +4221,42 @@ mod tests {
     }
 
     #[test]
-    fn a_message_reads_as_name_body_then_time() {
-        let (text, styles, _) = render_messages(
+    fn messages_keep_author_metadata_off_the_body() {
+        let (text, styles, lines) = render_messages(
             &[
                 message("1700000000.0", None, "hello"),
-                message("1700000060.0", None, "over\ntwo lines"),
+                message("1700000600.0", None, "over\ntwo lines"),
             ],
             &model(),
             false,
         );
-        assert!(!text.contains("1700000000"), "no raw timestamps: {text}");
-        let body = text
-            .lines()
-            .find(|line| line.contains("hello"))
-            .expect("the message is on a line");
-        assert!(
-            body.starts_with("ada: hello  ") && body.len() == "ada: hello  00:00".len(),
-            "name, body, then the time trailing it: {body:?}"
-        );
-        assert!(
-            !text.contains("\n\n"),
-            "no blank line between messages: {text:?}"
-        );
-        // Words that run past one line cannot start after a name: the
-        // markup at the start of a line is what the parse reads, so the
-        // name and the time are a line of their own and the words follow.
-        let named = text
-            .lines()
-            .position(|line| line.starts_with("ada  "))
-            .expect("the turn is named on a line of its own");
-        assert_eq!(
-            text.lines().skip(named + 1).take(2).collect::<Vec<_>>(),
-            vec!["over", "two lines"],
-            "the words start under the name, at the margin: {text:?}"
-        );
-        let times = classed(&text, &styles, Class::Time);
-        assert_eq!(times.len(), 2, "one time per message: {times:?}");
-        assert!(
-            times
-                .iter()
-                .all(|time| time.starts_with("  ") && time.len() == 7),
-            "the time trails the body, two spaces after it: {times:?}"
-        );
+        let lines_text = text.lines().collect::<Vec<_>>();
+        let hello = lines_text.iter().position(|line| *line == "hello").unwrap();
+        assert!(lines_text[hello - 1].trim_start().starts_with("ada  "));
+        assert_eq!(lines_text[hello + 1], "");
+        let over = lines_text.iter().position(|line| *line == "over").unwrap();
+        assert!(lines_text[over - 1].trim_start().starts_with("ada  "));
+        assert_eq!(lines_text[over + 1], "two lines");
+        assert_eq!(classed(&text, &styles, Class::Time).len(), 2);
+        assert_eq!(lines.len(), text.matches('\n').count());
+    }
+
+    #[test]
+    fn only_nearby_messages_by_the_same_person_share_a_header() {
+        let model = model();
+        let first = message("1700000000.0", None, "one");
+        let mut next = message("1700000300.0", None, "two");
+        assert!(continues_author(&first, &next, &model));
+        next.ts = Ts("1700000301.0".into());
+        assert!(!continues_author(&first, &next, &model));
+        next.ts = Ts("1700000060.0".into());
+        next.user = Some(UserId("OTHER".into()));
+        assert!(!continues_author(&first, &next, &model));
+        next.user = first.user.clone();
+        next.edited = true;
+        assert!(!continues_author(&first, &next, &model));
+        let rendered = message_item_with_header(&next, &model, false, false);
+        assert_eq!(rendered.text, "two\n\n");
     }
 
     #[test]
@@ -4293,7 +4407,7 @@ mod tests {
             "edited": {"user": "U1", "ts": "1700000100.0"},
         }));
         let (text, styles, lines) = render_messages(&[message], &model(), false);
-        assert!(text.contains("friday it is (edited)  "), "{text}");
+        assert!(text.contains(" (edited)\nfriday it is\n"), "{text}");
         assert!(
             classed(&text, &styles, Class::Muted).contains(&" (edited)".to_owned()),
             "{text}"
@@ -4406,7 +4520,7 @@ mod tests {
     }
 
     #[test]
-    fn the_time_trails_the_words_and_never_the_chrome_under_them() {
+    fn the_time_stays_in_the_header_not_the_body_or_attachment() {
         let with_file = parsed(json!({
             "ts": "1700000000.0",
             "user": "U1",
@@ -4427,8 +4541,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(timed.len(), 1, "one time, on one line: {text}");
         assert!(
-            timed[0].contains("here is the deck"),
-            "the time trails what was said: {text}"
+            timed[0].trim_start().starts_with("ada  ") && !timed[0].contains("here is the deck"),
+            "the time belongs to the author header: {text}"
         );
         assert!(
             text.lines().any(|line| line.trim() == "deck.pdf · 220 KB"),
@@ -4708,16 +4822,10 @@ mod tests {
 
     #[test]
     fn the_empty_composer_says_where_the_message_is_going() {
-        assert_eq!(
-            compose_placeholder("#design", false),
-            "message #design · Enter sends · Shift-Enter newline · Markdown supported"
-        );
+        assert_eq!(compose_placeholder("#design", false), "Message #design…");
         // A thread's composer is the one place the reader can be wrong about
         // where the words land, so it says the thread out loud.
-        assert_eq!(
-            compose_placeholder("#design", true),
-            "reply in #design · Enter sends · Shift-Enter newline · Markdown supported"
-        );
+        assert_eq!(compose_placeholder("#design", true), "Reply in #design…");
     }
 
     #[test]

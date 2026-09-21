@@ -58,6 +58,8 @@ struct State {
     emoji: BTreeMap<String, String>,
     /// Whether a public emoji request leaked either workspace credential.
     emoji_credentials_seen: bool,
+    /// Whether a public avatar request leaked either workspace credential.
+    avatar_credentials_seen: bool,
     /// The threads Slack follows for the user, as
     /// `subscriptions.thread.getView` lists them: (channel, thread_ts).
     followed: Vec<(String, String)>,
@@ -286,6 +288,10 @@ impl Fake {
 
     pub fn emoji_credentials_seen(&self) -> bool {
         self.state.lock().unwrap().emoji_credentials_seen
+    }
+
+    pub fn avatar_credentials_seen(&self) -> bool {
+        self.state.lock().unwrap().avatar_credentials_seen
     }
 
     pub fn set_count(&self, channel: &str, has_unreads: bool, mentions: u32, latest: &str) {
@@ -669,6 +675,9 @@ async fn serve_api(
         }
         if path.starts_with("/emoji/") && has_credentials {
             state.lock().unwrap().emoji_credentials_seen = true;
+        }
+        if path.starts_with("/avatars/") && has_credentials {
+            state.lock().unwrap().avatar_credentials_seen = true;
         }
         if let Some(bytes) = binary_route(&path, &state) {
             let delay = match path.starts_with("/files/") {

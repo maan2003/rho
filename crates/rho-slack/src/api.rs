@@ -1272,6 +1272,20 @@ impl Client {
         }))
     }
 
+    /// The small public profile image for one user, if Slack supplies one.
+    ///
+    /// This deliberately remains separate from [`User`]: names are durable
+    /// workspace facts, while an avatar is a lazily fetched presentation
+    /// asset whose URL may change.
+    pub async fn user_avatar_url(&self, user: &UserId) -> anyhow::Result<Option<String>> {
+        let body = self
+            .post_form("users.info", &[("user", user.0.clone())])
+            .await?;
+        Ok(string(&body["user"]["profile"]["image_48"])
+            .filter(|url| !url.is_empty())
+            .or_else(|| string(&body["user"]["profile"]["image_72"]).filter(|url| !url.is_empty())))
+    }
+
     /// The whole roster in one call, which is how mentions get names without
     /// a request per author.
     pub async fn users(&self) -> anyhow::Result<Vec<User>> {

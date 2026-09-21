@@ -40,6 +40,8 @@ pub struct Hooks {
     /// The colour of the bar the host draws in the gutter beside a message,
     /// which is what marks the lines hung off one here.
     pub gutter_colour: fn(&App) -> Hsla,
+    /// The host's semantic treatment for text entered by the reader.
+    pub prompt_style: fn(&App) -> HighlightStyle,
 }
 
 impl Hooks {
@@ -50,6 +52,7 @@ impl Hooks {
             configure_editor: |_, _, _| {},
             configure_markdown: |_, _| {},
             gutter_colour: |_| gpui::transparent_black(),
+            prompt_style: |_| HighlightStyle::default(),
         }
     }
 }
@@ -179,13 +182,12 @@ impl Class {
     pub fn resolve(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
         let (color, weight) = match self {
-            Self::Sender => (colors.terminal_ansi_cyan, FontWeight::BOLD),
-            Self::You => (colors.text_accent, FontWeight::BOLD),
+            Self::Sender | Self::You => (colors.text, FontWeight::BOLD),
             Self::Time => (colors.text_muted, FontWeight::NORMAL),
-            Self::Conversation => (colors.terminal_ansi_green, FontWeight::BOLD),
+            Self::Conversation => (colors.text, FontWeight::NORMAL),
             Self::Topic => (colors.text, FontWeight::NORMAL),
-            Self::Unread => (colors.text_accent, FontWeight::NORMAL),
-            Self::Mention => (colors.terminal_ansi_yellow, FontWeight::BOLD),
+            Self::Unread => (colors.text, FontWeight::BOLD),
+            Self::Mention => (colors.text_accent, FontWeight::BOLD),
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
             Self::Dealt | Self::Found => (colors.text, FontWeight::NORMAL),

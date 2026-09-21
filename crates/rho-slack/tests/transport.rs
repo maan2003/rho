@@ -95,6 +95,38 @@ async fn custom_emoji_keep_urls_and_aliases_and_small_assets_are_bounded() {
 }
 
 #[tokio::test]
+async fn profile_avatars_are_selected_and_downloaded_as_bounded_public_assets() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UA", "ada", "Ada");
+    let client = client(&fake);
+    let url = client
+        .user_avatar_url(&rho_slack::types::UserId("UA".into()))
+        .await
+        .unwrap()
+        .expect("the fake user has an image_48");
+    assert!(url.ends_with("/avatars/adaav.png"), "{url}");
+
+    let bytes = client.download_public_bounded(&url, 1024).await.unwrap();
+    assert_eq!(&bytes[1..4], b"PNG");
+    assert!(
+        !fake.avatar_credentials_seen(),
+        "public avatars must receive neither Authorization nor Cookie"
+    );
+
+    let error = client.download_public_bounded(&url, 8).await.unwrap_err();
+    assert!(error.to_string().contains("exceeds 8 bytes"), "{error:#}");
+
+    let error = client
+        .download_public_bounded("file:///etc/passwd", 1024)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("fetching file:///etc/passwd"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn the_websocket_connects_and_delivers_a_mention_live() {
     let fake = Fake::start().await.unwrap();
     let (sender, mut receiver) = mpsc::unbounded();
