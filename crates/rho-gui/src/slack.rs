@@ -198,6 +198,7 @@ impl Workspace {
 #[derive(Default)]
 pub(crate) struct Slack {
     session: Option<gpui::Entity<Session>>,
+    pub(crate) list: Option<gpui::Entity<rho_slack::ui::ListView>>,
     degraded: Option<String>,
     /// Newest inbound message considered for a desktop notification per
     /// Slack unit. Focused messages are recorded too, so leaving the
@@ -218,6 +219,7 @@ impl Slack {
 
     /// Keeps a session that has just been started.
     pub(crate) fn start(&mut self, session: gpui::Entity<Session>) {
+        self.list = None;
         self.session = Some(session);
     }
 
@@ -333,6 +335,21 @@ impl Workspace {
             cx,
         );
         self.set_prompt_complete_whole_input();
+    }
+
+    pub(crate) fn slack_list_view(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<gpui::Entity<rho_slack::ui::ListView>> {
+        if let Some(list) = &self.slack.list {
+            return Some(list.clone());
+        }
+        let session = self.slack_session(window, cx)?;
+        let hooks = Self::slack_hooks();
+        let list = cx.new(|cx| rho_slack::ui::ListView::new(session, hooks, window, cx));
+        self.slack.list = Some(list.clone());
+        Some(list)
     }
 
     /// Opens the conversation list, starting the session on first entry.
@@ -814,6 +831,11 @@ impl Workspace {
         let Some(session) = self.slack_session(window, cx) else {
             return;
         };
+        if let Some(list) = self.slack_list_view(window, cx) {
+            list.update(cx, |list, cx| {
+                list.select_channel(source.channel(), window, cx)
+            });
+        }
         self.active_context = ContextId::Slack;
         // Opening a muted unit no longer takes the mute back (8 Sep): the
         // mute is Slack's, and rho unmuting a conversation because the

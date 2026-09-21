@@ -4,7 +4,8 @@ Goal: use Rho as the only Slack client for everyday messaging. Match Slack's
 familiar workflows first, preserving Rho's conversation editor/buffer and Vim
 interaction. Multi-workspace support is explicitly excluded. Composition stays in the same
 editor/buffer model too. Commands use Vim keys, transient menus, and minibuffer
-prompts; no permanent sidebar, toolbar, or composer buttons. This supersedes the
+prompts; the sidebar is a compact editor-backed awareness pane, without command
+rows, toolbar, or composer buttons. This supersedes the
 original sidebar/button presentation recorded in the historical QA below.
 
 A box closes only after implementation and QA against the fake Slack server.
@@ -13,7 +14,8 @@ Record checks and remaining limitations below. Existing historical checklist
 claims are not evidence that a workflow is complete.
 
 ## Navigation and discovery
-- [x] Editor-backed channel/DM list, unread counts, quick switcher, back/forward.
+- [x] Editor-backed channel/DM sidebar and full list, unread/mention counts,
+  favorite stars, quick switcher, back/forward, and keyboard pane navigation.
 - [x] Discovery and conversation commands available through the Slack transient.
 - [x] Find people, start a DM, create group DMs, browse and join channels.
 
@@ -121,3 +123,17 @@ The new keyboard regression sends one broadcast reply and one thread-only reply
 through the fake server and checks their wire flags. Inspected rendered list,
 composition with attachment, transient menu, and multi-page search in the
 isolated Wayland GUI. Captures are under `/src/slack-qa/screens/style-*.png`.
+
+## Sidebar awareness restored
+
+The sidebar is again persistent beside desktop Slack conversations and results.
+It reuses the full conversation-list editor rather than adding a second consumer
+of the session's row-edit stream. Favorite changes redraw their row; unread and
+mention counts update live. `Ctrl-W H/L` changes pane focus; Vim motions and
+Enter navigate without replacing the conversation until a row is opened.
+
+Verified: 56 Slack GUI tests and 227 Slack crate tests passed, including initial
+selection before roster arrival, shared list identity, sidebar Enter routing,
+favorite add/remove, and a pushed mention updating the visible list. Build,
+formatting, and diff checks passed. Inspected composition and sidebar-focused
+states: `/src/slack-qa/screens/sidebar-final.png` and `sidebar-focused.png`.

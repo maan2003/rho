@@ -5,7 +5,7 @@
 //! line. A test belongs to the surface it is about, and this is where
 //! rho-slack's are.
 
-use gpui::{AppContext as _, TestAppContext};
+use gpui::{AppContext as _, Focusable as _, TestAppContext};
 
 use super::tests::{bind_test_keymaps, init_test_app, test_workspace};
 
@@ -3886,4 +3886,157 @@ async fn slack_keyboard_send_honors_broadcast_toggle(cx: &mut TestAppContext) {
         assert_eq!(sent.thread_ts.as_deref(), Some("100.000000"));
         cx.simulate_keystrokes(*workspace, "escape");
     }
+}
+
+/// One list owns the row-edit stream whether it is full-width or beside a
+/// conversation.
+#[gpui::test]
+async fn slack_sidebar_reuses_the_list_and_routes_enter_to_its_own_row(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts":"100.000000", "user":"UA", "text":"parent"}),
+    );
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack_source(Source::Conversation(ChannelId("C1".into())), window, cx);
+        })
+        .unwrap();
+
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack
+                    .list
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .row_of_for_test(&ChannelId("C2".into()))
+                    .is_some()
+            })
+            .unwrap()
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let list = workspace
+        .update(cx, |workspace, window, cx| {
+            let list = workspace.slack.list.clone().unwrap();
+            assert_eq!(
+                list.update(cx, |list, cx| list.cursor_source(cx)),
+                Some(Source::Conversation(ChannelId("C1".into())))
+            );
+            let full = workspace.make_surface(crate::pane::SurfaceKey::SlackList, window, cx);
+            let crate::workspace::SurfaceView::SlackList(full) = full.view else {
+                panic!("list")
+            };
+            assert_eq!(
+                list.entity_id(),
+                full.entity_id(),
+                "two consumers would steal each other's row edits"
+            );
+            list
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "ctrl-w h");
+    workspace
+        .update(cx, |_, window, cx| {
+            assert!(list.read(cx).editor().focus_handle(cx).is_focused(window));
+            list.update(cx, |list, cx| {
+                list.select_channel(&ChannelId("C2".into()), window, cx)
+            });
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.active_surface().key,
+                crate::pane::SurfaceKey::SlackConversation(Source::Conversation(ChannelId(
+                    "C2".into()
+                )))
+            );
+            assert!(
+                workspace
+                    .active_editor(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            workspace.slack_toggle_favorite(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let text = list.read(cx).text_for_test(cx);
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with("#random") && line.contains('★')),
+                "{text}"
+            );
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.starts_with("#design") && line.contains('★')),
+                "{text}"
+            );
+            workspace.slack_toggle_favorite(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |_, _, cx| {
+            assert!(!list.read(cx).text_for_test(cx).contains('★'));
+        })
+        .unwrap();
+    fake.live(serde_json::json!({
+        "kind": "message", "channel": "C1", "user": "UA", "text": "<@ME> sidebar awareness"
+    }));
+    let mut arrived = false;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        arrived = workspace
+            .update(cx, |_, _, cx| {
+                list.read(cx)
+                    .text_for_test(cx)
+                    .lines()
+                    .any(|line| line.starts_with("#design") && line.contains("@1"))
+            })
+            .unwrap();
+        if arrived {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        arrived,
+        "a mention must update the sidebar without reopening it"
+    );
 }

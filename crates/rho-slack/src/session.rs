@@ -1127,6 +1127,7 @@ impl Session {
     pub fn toggle_favorite(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
         if let Some(mirror) = &self.mirror {
             mirror.set_favorite(&self.model.workspace().0, channel, !self.favorite(channel));
+            self.model.reindex(channel);
             cx.notify();
         }
     }

@@ -6380,15 +6380,10 @@ impl Workspace {
             SurfaceKey::Browser(_) => {
                 unreachable!("browser surfaces are created by create_browser_page")
             }
-            SurfaceKey::SlackList => {
-                let session = self
-                    .slack_session(window, cx)
-                    .expect("the slack list is only opened once a session exists");
-                let hooks = Self::slack_hooks();
-                SurfaceView::SlackList(
-                    cx.new(|cx| rho_slack::ui::ListView::new(session, hooks, window, cx)),
-                )
-            }
+            SurfaceKey::SlackList => SurfaceView::SlackList(
+                self.slack_list_view(window, cx)
+                    .expect("the slack list is only opened once a session exists"),
+            ),
             SurfaceKey::SlackResults { .. } => {
                 unreachable!("results surfaces are created by open_slack_results")
             }
@@ -8720,18 +8715,30 @@ impl Workspace {
         )
     }
 
-    fn render_workspace(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         {
             let focused_surface = self.active_surface().view.telemetry_kind();
             crate::telemetry::record_surfaces(focused_surface, focused_surface.bit());
         }
         self.sync_diff_visibility(true, cx);
+        let sidebar = if self.active_context == ContextId::Slack
+            && !matches!(self.active_surface().view, SurfaceView::SlackList(_))
+        {
+            self.render_slack_sidebar(window, cx)
+        } else {
+            None
+        };
         div()
             .flex()
             .flex_row()
             .w_full()
             .flex_grow(1.0)
             .min_h_0()
+            .children(sidebar)
             .child(
                 div()
                     .flex()
@@ -9078,6 +9085,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))
+            .on_action(
+                cx.listener(|this, _: &crate::SlackSidebarFocus, window, cx| {
+                    if this.active_context == ContextId::Slack {
+                        if let Some(list) = this.slack_list_view(window, cx) {
+                            window.focus(&list.read(cx).editor().focus_handle(cx), cx);
+                        }
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::SlackConversationFocus, window, cx| {
+                    this.focus_active_surface(window, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::SlackQuickSwitch, window, cx| {
                     this.prompt_slack_switch(window, cx);
@@ -9452,7 +9473,7 @@ impl Render for Workspace {
                     .child(if phone {
                         self.render_phone_body(&text_style, window, cx)
                     } else {
-                        self.render_workspace(cx)
+                        self.render_workspace(window, cx)
                     }),
             )
             .children(if phone {

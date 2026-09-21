@@ -41,6 +41,7 @@ pub struct ListView {
     muted: usize,
     /// Lines above the listing: the health notice, when there is one.
     banner: usize,
+    pending_selection: Option<ChannelId>,
     /// The buckets whose highlights this draw has to re-send, and how many
     /// lines each bucket holds. A bucket is a run of lines sharing one
     /// highlight key per class, so a line that moved costs its bucket and
@@ -132,6 +133,7 @@ impl ListView {
             unmuted: 0,
             muted: 0,
             banner: 0,
+            pending_selection: None,
             touched: BTreeSet::new(),
             held: BTreeMap::new(),
             painted: BTreeMap::new(),
@@ -211,6 +213,25 @@ impl ListView {
         cx: &mut Context<Self>,
     ) {
         self.place_cursor(row, window, cx);
+    }
+
+    /// Keep the navigation pane on the conversation opened by another route.
+    pub fn select_channel(
+        &mut self,
+        channel: &ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_selection = Some(channel.clone());
+        if let Some(row) = self.line_of_id(channel) {
+            self.place_cursor(row, window, cx);
+            self.pending_selection = None;
+        }
+    }
+
+    #[cfg(any(test, feature = "fake"))]
+    pub fn text_for_test(&self, cx: &gpui::App) -> String {
+        self.buffer.read(cx).text()
     }
 
     /// The conversation the cursor is on: what `enter` opens.
@@ -316,6 +337,12 @@ impl ListView {
         {
             self.place_cursor(row, window, cx);
         }
+        if let Some(channel) = self.pending_selection.clone()
+            && let Some(row) = self.line_of_id(&channel)
+        {
+            self.place_cursor(row, window, cx);
+            self.pending_selection = None;
+        }
         cx.notify();
         #[cfg(any(test, feature = "fake"))]
         {
@@ -357,7 +384,7 @@ impl ListView {
                 vec![None],
             ),
             _ => match session.status() {
-                _ if !known.is_empty() => render_rows(&known),
+                _ if !known.is_empty() => render_rows(&known, |id| session.favorite(id)),
                 Status::Failed(reason) => (
                     vec![vec![
                         Span::styled("slack unavailable: ", Class::Error),
@@ -467,7 +494,7 @@ impl ListView {
                     true => self.muted += 1,
                     false => self.unmuted += 1,
                 }
-                let line = render_row(&row, now_seconds());
+                let line = render_row(&row, now_seconds(), self.session.read(cx).favorite(&row.id));
                 let (text, styles) = lay_out(&line);
                 self.insert_line(
                     at,
@@ -757,7 +784,10 @@ impl ListView {
 /// preview is the conversation's job. Narrowing happened before this: the
 /// model answers a query from its own index, so nothing here looks at every
 /// conversation to decide what to draw.
-fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
+fn render_rows(
+    rows: &[ConversationRow],
+    favorite: impl Fn(&ChannelId) -> bool,
+) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
     // Read once for the whole listing rather than once a row: every row is
     // asking the same question, and the answer moving between two of them
     // would put two days on one frame.
@@ -774,7 +804,7 @@ fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelI
             lines.push(break_line());
             targets.push(None);
         }
-        lines.push(render_row(row, now));
+        lines.push(render_row(row, now, favorite(&row.id)));
         targets.push(Some(row.id.clone()));
     }
     (lines, targets)
@@ -834,9 +864,12 @@ fn break_line() -> Vec<Span> {
 
 /// One conversation's line. Factored out of the listing so that redrawing
 /// one row and redrawing all of them cannot drift apart.
-fn render_row(row: &ConversationRow, now: i64) -> Vec<Span> {
+fn render_row(row: &ConversationRow, now: i64, favorite: bool) -> Vec<Span> {
     let mut spans = vec![Span::styled(row.label.clone(), Class::Conversation)];
     let mut waiting = Vec::new();
+    if favorite {
+        waiting.push(Span::styled("★", Class::Mention));
+    }
     if row.mention_count > 0 {
         waiting.push(Span::styled(
             format!("@{}", row.mention_count),
@@ -1011,7 +1044,7 @@ mod tests {
         model.set_muted([ChannelId("C5".into())]);
 
         let known = model.conversation_rows();
-        let (_, targets) = render_rows(&known);
+        let (_, targets) = render_rows(&known, |_| false);
         let mut lines = Lines {
             drawn: targets,
             unmuted: known.iter().filter(|row| !row.muted).count(),
@@ -1024,7 +1057,7 @@ mod tests {
             for edit in &edits {
                 lines.apply(edit);
             }
-            let (_, expected) = render_rows(&model.conversation_rows());
+            let (_, expected) = render_rows(&model.conversation_rows(), |_| false);
             assert_eq!(lines.drawn, expected, "{at}");
         };
 
@@ -1085,7 +1118,7 @@ mod tests {
             "#design  @2 · 5 new  {}",
             crate::ui::when_label(1_755_780_420, now_seconds())
         );
-        let (lines, _) = render_rows(&[design]);
+        let (lines, _) = render_rows(&[design], |_| false);
         assert_eq!(text(&lines[0]), expected);
     }
 
@@ -1093,7 +1126,7 @@ mod tests {
     fn a_channel_unread_from_before_the_last_start_says_so_in_words() {
         // Slack counts messages for DMs only, so a channel that was already
         // unread at connect has no number to show and must not invent one.
-        let (lines, _) = render_rows(&[row("#design", true, 0)]);
+        let (lines, _) = render_rows(&[row("#design", true, 0)], |_| false);
         assert_eq!(text(&lines[0]), "#design  unread");
     }
 
@@ -1101,7 +1134,7 @@ mod tests {
     fn muted_conversations_sit_at_the_bottom_under_one_break() {
         let mut muted = row("#noise", true, 0);
         muted.muted = true;
-        let (lines, targets) = render_rows(&[row("#design", true, 2), muted]);
+        let (lines, targets) = render_rows(&[row("#design", true, 2), muted], |_| false);
         assert_eq!(text(&lines[0]), "#design  @2");
         assert_eq!(text(&lines[1]), "─────", "muted conversations start here");
         assert_eq!(targets[1], None, "the break opens nothing");
@@ -1113,7 +1146,7 @@ mod tests {
     /// what it is given and says so when it is given nothing.
     #[test]
     fn an_empty_narrowing_says_nothing_matches_rather_than_drawing_a_list() {
-        let (lines, targets) = render_rows(&[row("@ada", false, 0)]);
+        let (lines, targets) = render_rows(&[row("@ada", false, 0)], |_| false);
         assert_eq!(lines.len(), 1);
         assert_eq!(text(&lines[0]), "@ada");
         assert_eq!(targets[0], Some(ChannelId("@ada".into())));

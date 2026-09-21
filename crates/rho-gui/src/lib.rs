@@ -110,6 +110,8 @@ actions!(
         VerdictMenu,
         SurfaceClose,
         SlackQuickSwitch,
+        SlackSidebarFocus,
+        SlackConversationFocus,
         SlackNewMessage,
         SlackBrowseChannels,
         SlackOpenRow,
@@ -475,6 +477,12 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("ctrl-p", SlackQuickSwitch, Some(context)),
             KeyBinding::new("ctrl-n", SlackNewMessage, Some(context)),
+        ]);
+    }
+    for context in ["RhoSlackConversation", "RhoSlackResults", "RhoSlackList"] {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-w h", SlackSidebarFocus, Some(context)),
+            KeyBinding::new("ctrl-w l", SlackConversationFocus, Some(context)),
         ]);
     }
     // Writing is a conversation's, not the list's: both of these take a key

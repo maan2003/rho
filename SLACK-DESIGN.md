@@ -3,9 +3,11 @@
 ## Current workflow direction
 
 Slack's everyday messaging workflows use Rho's editor surfaces and Vim motions.
-Conversation navigation is an editor-backed list and minibuffer quick switcher.
+Conversation navigation is an editor-backed sidebar and minibuffer quick switcher.
+The sidebar reuses the full conversation list, with live unread/mention counts
+and favorite stars. `Ctrl-W H/L` moves focus between it and the conversation.
 Discovery, search, drafts, activity, attachments, and message actions live in
-the Slack transient menu (`Space Shift-S`), not permanent sidebars or button bars.
+the Slack transient menu (`Space Shift-S`), not command rows or button bars.
 Composition stays in the conversation buffer; attachment, broadcast, sending,
 and retry state are text in that buffer. Enter sends; Shift-Enter inserts a line.
 The implementation and fake-server acceptance checklist is [Slack workflow parity](SLACK-PARITY-TODO.md).

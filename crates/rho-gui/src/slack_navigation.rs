@@ -1,14 +1,54 @@
 //! Slack discovery through Rho's minibuffer.
 use std::rc::Rc;
 
+use gpui::prelude::*;
 use gpui::{Context, Window};
 use rho_slack::session::Source;
 use rho_slack::types::Conversation;
+use theme::ActiveTheme;
 
 use crate::minibuffer::Candidate;
 use crate::workspace::{SurfaceView, Workspace};
 
 impl Workspace {
+    pub(crate) fn render_slack_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let list = self.slack_list_view(window, cx)?;
+        let open_list = list.clone();
+        Some(
+            gpui::div()
+                .id("slack-sidebar")
+                .w(gpui::relative(0.25))
+                .max_w(gpui::px(300.))
+                .min_w(gpui::px(180.))
+                .h_full()
+                .flex_none()
+                .overflow_hidden()
+                .border_r_1()
+                .border_color(cx.theme().colors().border_variant.opacity(0.6))
+                .on_action(
+                    cx.listener(move |this, _: &crate::SlackOpenRow, window, cx| {
+                        let source = open_list.update(cx, |list, cx| list.cursor_source(cx));
+                        if let Some(source) = source {
+                            this.open_slack_source(source, window, cx);
+                        }
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &crate::SurfaceClose, window, cx| {
+                    this.focus_active_surface(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &crate::SlackSearch, window, cx| {
+                    this.open_slack(window, cx);
+                    this.prompt_slack_search(window, cx);
+                }))
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
     pub(crate) fn prompt_slack_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.slack_session(window, cx).is_none() {
             return;

@@ -963,7 +963,7 @@ impl Model {
     /// which key a conversation currently has, since the key itself cannot
     /// be worked backwards from the conversation once its counts have
     /// moved.
-    fn reindex(&mut self, channel: &ChannelId) {
+    pub(crate) fn reindex(&mut self, channel: &ChannelId) {
         // Shown, not merely listed: while a query stands the list on
         // screen is the narrowed one, so what a drawer has to be told
         // about is whether this conversation had a line there.
