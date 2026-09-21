@@ -3104,7 +3104,7 @@ fn image_block(
 ) -> BlockSpec {
     let rows = file.image_rows();
     BlockSpec {
-        line,
+        placement: editor::display_map::BlockPlacement::Below(line),
         height: rows,
         render: std::sync::Arc::new(move |cx| {
             let (file, view) = (file.clone(), view.clone());
@@ -3120,9 +3120,8 @@ fn image_block(
             let thumb = file.thumbnail();
             let picture =
                 cached(&file.id).or_else(|| thumb.as_ref().and_then(|thumb| cached(&thumb.id)));
-            // The spacer is real text in the transcript's own font, which is
-            // the only way to land the picture exactly under the body column
-            // whatever font the reader has set.
+            // Fixed blocks start at the editor edge, before the avatar
+            // gutter. Match the text origin rather than adding body spaces.
             let style = cx.editor_style.text.clone();
             let box_height = cx.line_height * rows as f32;
             let box_width = cx.line_height * (IMAGE_COLUMNS as f32 * CELL_ASPECT);
@@ -3164,7 +3163,7 @@ fn image_block(
                 .overflow_hidden()
                 .font_family(style.font_family.clone())
                 .text_size(style.font_size)
-                .child(" ".repeat(BODY_INDENT))
+                .pl(cx.margins.gutter.full_width())
                 .child(
                     div()
                         .id(("slack-image", line))
@@ -3355,7 +3354,7 @@ fn message_item_with_header(
         interaction: None,
         images: Vec::new(),
     });
-    // A new author's two-row avatar needs room even for a one-line message.
+    // A new author's 1.5-row avatar needs room even for a one-line message.
     // Longer messages, reactions, and threads already provide that height.
     if header && lines.len() == 3 {
         spans.push(Span::plain("\n"));
@@ -3483,6 +3482,25 @@ fn day_rule(label: String) -> Rendered {
         format!("## {label}\n"),
         Class::Muted,
     )
+    .with_blocks(vec![BlockSpec {
+        placement: editor::display_map::BlockPlacement::Replace(0..=0),
+        height: 1,
+        priority: 0,
+        render: Arc::new(move |cx| {
+            let style = &cx.editor_style.text;
+            div()
+                .w(cx.max_width)
+                .h(cx.line_height)
+                .flex()
+                .justify_center()
+                .items_center()
+                .font_family(style.font_family.clone())
+                .text_size(style.font_size)
+                .text_color(cx.theme().colors().text_muted)
+                .child(label.clone())
+                .into_any_element()
+        }),
+    }])
 }
 
 fn muted_item(key: Row, text: impl Into<String>, class: Class) -> Rendered {

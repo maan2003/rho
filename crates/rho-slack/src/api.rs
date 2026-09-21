@@ -1281,9 +1281,10 @@ impl Client {
         let body = self
             .post_form("users.info", &[("user", user.0.clone())])
             .await?;
-        Ok(string(&body["user"]["profile"]["image_48"])
-            .filter(|url| !url.is_empty())
-            .or_else(|| string(&body["user"]["profile"]["image_72"]).filter(|url| !url.is_empty())))
+        // 48px thumbnails blur when a gutter avatar is scaled on a HiDPI display.
+        Ok(["image_192", "image_96", "image_72", "image_48"]
+            .into_iter()
+            .find_map(|size| string(&body["user"]["profile"][size]).filter(|url| !url.is_empty())))
     }
 
     /// The whole roster in one call, which is how mentions get names without

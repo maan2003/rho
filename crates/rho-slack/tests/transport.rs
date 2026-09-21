@@ -103,8 +103,28 @@ async fn profile_avatars_are_selected_and_downloaded_as_bounded_public_assets() 
         .user_avatar_url(&rho_slack::types::UserId("UA".into()))
         .await
         .unwrap()
-        .expect("the fake user has an image_48");
-    assert!(url.ends_with("/avatars/adaav.png"), "{url}");
+        .expect("the fake user has an image_192");
+    assert!(url.ends_with("/avatars/adaav-192.png"), "{url}");
+
+    for (profile, expected) in [
+        (
+            serde_json::json!({"image_192":"", "image_96":"medium", "image_72":"small", "image_48":"tiny"}),
+            Some("medium"),
+        ),
+        (
+            serde_json::json!({"image_72":"small", "image_48":"tiny"}),
+            Some("small"),
+        ),
+        (serde_json::json!({"image_48":"tiny"}), Some("tiny")),
+        (serde_json::json!({}), None),
+    ] {
+        fake.set_user_profile("UA", profile);
+        let fallback = client
+            .user_avatar_url(&rho_slack::types::UserId("UA".into()))
+            .await
+            .unwrap();
+        assert_eq!(fallback.as_deref(), expected);
+    }
 
     let bytes = client.download_public_bounded(&url, 1024).await.unwrap();
     assert_eq!(&bytes[1..4], b"PNG");

@@ -5802,7 +5802,7 @@ impl EditorElement {
 
         let snapshot = &layout.position_map.snapshot.display_snapshot;
         let line_height = layout.position_map.line_height;
-        let side = line_height * 2.;
+        let side = line_height * 1.5;
         let images = self
             .editor
             .read(cx)
@@ -5829,7 +5829,7 @@ impl EditorElement {
                     let bounds =
                         Bounds::new(point(layout.gutter_hitbox.left(), y), size(side, side));
                     window
-                        .paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                        .paint_image(bounds, bounds, Corners::all(side * 0.12), image, 0, false)
                         .log_err();
                 }
             },

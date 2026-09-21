@@ -178,7 +178,7 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         "the reaction row carries the trailing time: {display}"
     );
     assert!(
-        display.contains("Thu 1 Jan\nlet answer = 42;"),
+        display.lines().nth(1) == Some("let answer = 42;"),
         "a leading code block starts beside its gutter avatar, without a blank header: {display}"
     );
     assert!(

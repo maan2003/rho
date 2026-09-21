@@ -558,8 +558,8 @@ transcript renders through, and owns none of its own. Concretely:
   conversion is `rho-slack`'s `markdown` module and the one place the two
   markups are told apart; `block.rs` resolves the ids, links and lists the
   same way for both.
-- A message is one block of the document, keyed by its `ts`. Two-line-high
-  square profile images occupy a dedicated gutter and replace author headers
+- A message is one block of the document, keyed by its `ts`. 1.5-line-high
+  subtly rounded profile images occupy a dedicated gutter and replace author headers
   visually. Names remain in the buffer for copy and search, and remain visible
   if an avatar cannot load. Nearby messages
   from the same author share an avatar (within five minutes and the same day).
@@ -570,8 +570,8 @@ transcript renders through, and owns none of its own. Concretely:
   `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
   typing removes it. The gutter contains avatars, not editing chrome; there
   are no buttons or permanent instruction rows.
-- The day break and the unread line are the document's own headings, whose
-  markers the parse hides.
+- Day labels are centered single-row replacement blocks; the date remains in
+  the source for copy/search. The unread line remains a document heading.
 - Attachments, previews, reactions, and thread summaries follow the body.
   The sidebar distinguishes unread conversations by text color rather than
   weight, with a separate accent for mentions.

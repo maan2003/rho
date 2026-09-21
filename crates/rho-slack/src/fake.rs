@@ -204,9 +204,23 @@ impl Fake {
                 "display_name": display,
                 "real_name": display,
                 "image_48": format!("{}/avatars/{hash}.png", self.api_base.trim_end_matches("/api")),
+                "image_192": format!("{}/avatars/{hash}-192.png", self.api_base.trim_end_matches("/api")),
             },
             "avatar_hash": hash,
         }));
+    }
+
+    pub fn set_user_profile(&self, id: &str, profile: Value) {
+        if let Some(user) = self
+            .state
+            .lock()
+            .unwrap()
+            .users
+            .iter_mut()
+            .find(|user| user["id"] == id)
+        {
+            user["profile"] = profile;
+        }
     }
 
     /// The picture a bot posts under, which lives in a different place in
@@ -785,6 +799,7 @@ fn binary_route(path: &str, state: &Arc<Mutex<State>>) -> Option<Vec<u8>> {
         );
     }
     let name = path.strip_prefix("/avatars/")?.trim_end_matches(".png");
+    let name = name.strip_suffix("-192").unwrap_or(name);
     Some(
         match name {
             "davidav" | "adaav" | "botav" => AVATAR_BLUE,

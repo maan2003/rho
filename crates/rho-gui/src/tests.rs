@@ -63,7 +63,7 @@ fn frame_distribution_reports_nearest_rank_percentiles() {
 }
 
 #[gpui::test]
-fn gutter_images_reserve_two_line_width_without_inserting_text(cx: &mut TestAppContext) {
+fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &mut TestAppContext) {
     cx.update(init_test_app);
     let window = cx.add_window(|window, cx| {
         let mut editor = Editor::multi_line(window, cx);
@@ -89,7 +89,7 @@ fn gutter_images_reserve_two_line_width_without_inserting_text(cx: &mut TestAppC
             let dimensions = editor
                 .snapshot(window, cx)
                 .gutter_dimensions(font_id, font_size, &style, window, cx);
-            assert_eq!(dimensions.width, line_height * 2. + font_size * 0.5);
+            assert_eq!(dimensions.width, line_height * 1.5 + font_size * 0.5);
             assert_eq!(
                 editor.display_snapshot(cx).text(),
                 before,

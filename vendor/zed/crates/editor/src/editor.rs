@@ -9898,7 +9898,7 @@ impl Editor {
         Some(text_highlights)
     }
 
-    /// Sets a two-line-high square image outside the text layout. The caller
+    /// Sets a 1.5-line-high square image outside the text layout. The caller
     /// reserves those rows; this decoration never inserts buffer text or rows.
     /// Removing the last image releases the gutter width.
     pub fn set_gutter_image(
@@ -12767,7 +12767,7 @@ impl EditorSnapshot {
     ) -> GutterDimensions {
         if self.has_gutter_images {
             GutterDimensions {
-                width: style.text.line_height_in_pixels(window.rem_size()) * 2. + font_size * 0.5,
+                width: style.text.line_height_in_pixels(window.rem_size()) * 1.5 + font_size * 0.5,
                 ..Default::default()
             }
         } else if self.show_compact_gutter
