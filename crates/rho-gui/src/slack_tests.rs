@@ -70,10 +70,18 @@ async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut
     fake.set_user_profile("UD", serde_json::json!({}));
     for (ts, user, text) in [
         ("99.0", "UA", "short"),
+        ("99.1", "UA", "follow-up"),
         ("100.0", "UD", "a longer message\nwith two lines"),
     ] {
         fake.add_message("C1", serde_json::json!({"ts":ts,"user":user,"text":text}));
     }
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "99.2", "user": "UA", "text": "edited follow-up",
+            "edited": {"user": "UA", "ts": "99.3"}
+        }),
+    );
     let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
     let client = std::sync::Arc::new(
         rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
@@ -107,6 +115,23 @@ async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut
                 );
                 view.editor().update(cx, |editor, cx| {
                     let snapshot = editor.snapshot(window, cx);
+                    let row = |text| {
+                        editor::display_map::DisplayRow(
+                            display.lines().position(|line| line == text).unwrap() as u32,
+                        )
+                    };
+                    let y = |text| snapshot.row_y(row(text).0 as f64);
+                    assert_eq!(snapshot.row_padding_before(row("short")), 0.125);
+                    assert_eq!(
+                        y("short") - snapshot.row_y((row("short").0 - 1) as f64),
+                        1.625,
+                        "date separator has a half-line gap before the avatar slot"
+                    );
+                    assert_eq!(snapshot.row_padding_before(row("a longer message")), 0.125);
+                    assert_eq!(snapshot.row_padding_before(row("follow-up")), 0.);
+                    assert_eq!(y("follow-up") - y("short"), 1.375);
+                    assert_eq!(y("edited follow-up ✎") - y("follow-up"), 1.25);
+                    assert_eq!(y("a longer message") - y("edited follow-up ✎"), 1.625);
                     let style = editor.style(cx).clone();
                     let font_size = style.text.font_size.to_pixels(window.rem_size());
                     let font_id = window.text_system().resolve_font(&style.text.font());
@@ -167,7 +192,12 @@ async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut
                     before
                 );
             });
-            assert!(view.transcript_text_for_test(cx).contains("ada"));
+            let source = view.transcript_text_for_test(cx);
+            assert!(source.contains("ada"));
+            assert!(
+                !source.contains('✎'),
+                "edit markers do not change source Markdown"
+            );
         })
         .unwrap();
 }

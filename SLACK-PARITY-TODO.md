@@ -21,13 +21,17 @@ claims are not evidence that a workflow is complete.
 - Lightly rounded avatars are consistently 1.25 lines high. Slack's 192px
   images are preferred for HiDPI. Initials fill pending or unavailable avatars;
   the gutter and folded author rows do not wait for the image download.
-  Message slots reserve at least 1.25 lines for avatars, then a half-line gap,
-  without blank source rows. Short text is vertically centered within its slot;
-  multiline bodies stay top-aligned. Same-author follow-ups need no avatar minimum.
+  Message slots reserve at least 1.25 lines for avatars, without blank source
+  rows. Every avatar is centered beside the first body line, including multiline
+  and wrapped messages. Same-author follow-ups (including edited messages) share
+  an avatar within five minutes on the same day. They need no avatar minimum
+  and use quarter-line gaps; author groups retain half-line gaps.
   Wrapped paragraphs, leading code, and image attachments retain a common text margin.
   Names remain available for copy/search; initials remain on avatar failure.
   Message and last-reply timestamps are hidden.
-- Date headings are centered by anchored editor row alignment, not replacement
+- Edited messages use a display-only `✎` suffix, with no extra source row.
+  Reactions and thread counts share one muted footer; own reactions stay highlighted.
+- Date headings have a half-line gap below them and are centered by anchored editor row alignment, not replacement
   blocks. Text, selection and mouse hits use the same alignment.
 - Desktop Slack notifications are disabled. Mentions, DMs and followed-thread
   replies still update in-app cards, unread state and the activity lamp.
@@ -39,7 +43,7 @@ claims are not evidence that a workflow is complete.
   `::skin-tone-2` through `::skin-tone-6` sequences render their variants,
   including supported joined emoji. Custom images and aliases stay on the
   bounded Slack asset path.
-- Verification: `cargo test -p rho-slack --features ui,fake`: 232 passed.
+- Verification: `cargo test -p rho-slack --features ui,fake`: 234 passed.
   `cargo test -p rho-gui --lib`: 368 passed, 4 ignored, including the
   bundled-font, 6.5:1-theme, and Slack rendering regressions.
   `cargo test -p rho-transcript --lib`: 11 passed, 2 ignored.
@@ -72,6 +76,12 @@ claims are not evidence that a workflow is complete.
   text, and top-aligned multiline/wrapped text. Inspected
   `/src/slack-qa/screens/compact-avatar-loading.png` and `compact-avatar-loaded.png`.
   Geometry tests also check adjacent short-message gaps and mouse hit positions.
+- Grouped-message QA verifies consistent first-line alignment, shared avatars
+  for edited follow-ups, quarter-line group spacing, date padding, and a single
+  reaction/thread footer. The inline edit marker preserves Markdown source.
+  Inspected `/src/slack-qa/screens/grouped-footer-loading.png`,
+  `grouped-footer-loaded.png`, and `grouped-footer-thread.png`. Enter on the
+  combined footer opens the matching thread.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 

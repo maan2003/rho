@@ -60,7 +60,7 @@ impl RowGeometry {
         }
     }
 
-    /// Center undersized content by moving half of its spare height before it.
+    /// Place leading padding before content while preserving the trailing gaps.
     pub(crate) fn with_padding(gaps: Vec<(u32, f32)>, mut padding: Vec<(u32, f32)>) -> Self {
         let mut gaps = Self::new(gaps)
             .entries

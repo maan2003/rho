@@ -16,6 +16,7 @@ fn a_gap_anchor_follows_its_source_row_through_a_prepend(cx: &mut TestAppContext
             vec![editor::display_map::RowSpacing {
                 range: anchor..anchor,
                 minimum_height: 0.,
+                padding_before: 0.,
                 gap_after: 0.5,
             }],
             cx,
@@ -66,6 +67,7 @@ fn a_gap_follows_the_last_visual_row_after_soft_wrap(cx: &mut TestAppContext) {
             vec![editor::display_map::RowSpacing {
                 range: snapshot.anchor_before(language::Point::new(0, 0))..anchor,
                 minimum_height: 1.25,
+                padding_before: 0.125,
                 gap_after: 0.5,
             }],
             cx,
@@ -91,7 +93,7 @@ fn a_gap_follows_the_last_visual_row_after_soft_wrap(cx: &mut TestAppContext) {
             let next = snapshot
                 .point_to_display_point(language::Point::new(1, 0), Bias::Left)
                 .row();
-            assert_eq!(snapshot.row_padding_before(DisplayRow(0)), 0.);
+            assert_eq!(snapshot.row_padding_before(DisplayRow(0)), 0.125);
             assert!(last_wrapped.0 > 0, "the source row must actually soft-wrap");
             assert!(next > last_wrapped);
             assert_eq!(
@@ -127,11 +129,13 @@ fn a_fold_end_row_keeps_its_gap_while_hidden_rows_do_not_pile_onto_it(cx: &mut T
                     editor::display_map::RowSpacing {
                         range: hidden..hidden,
                         minimum_height: 0.,
+                        padding_before: 0.,
                         gap_after: 0.75,
                     },
                     editor::display_map::RowSpacing {
                         range: body..body,
                         minimum_height: 0.,
+                        padding_before: 0.,
                         gap_after: 0.5,
                     },
                 ],
@@ -187,6 +191,7 @@ fn trailing_spacing_stays_after_attachment_blocks(cx: &mut TestAppContext) {
                 vec![editor::display_map::RowSpacing {
                     range: anchor..anchor,
                     minimum_height: 0.,
+                    padding_before: 0.,
                     gap_after: 0.5,
                 }],
                 cx,
@@ -220,11 +225,13 @@ fn avatar_minimum_height_does_not_add_a_blank_row_to_multiline_messages(cx: &mut
                 editor::display_map::RowSpacing {
                     range: at(0, 0)..at(0, 5),
                     minimum_height: 1.25,
+                    padding_before: 0.125,
                     gap_after: 0.5,
                 },
                 editor::display_map::RowSpacing {
                     range: at(1, 0)..at(2, 4),
                     minimum_height: 1.25,
+                    padding_before: 0.125,
                     gap_after: 0.5,
                 },
             ],
@@ -237,17 +244,17 @@ fn avatar_minimum_height_does_not_add_a_blank_row_to_multiline_messages(cx: &mut
             let snapshot = editor.display_snapshot(cx);
             assert_eq!(
                 snapshot.row_y(1.),
-                1.75,
-                "one-line body reserves 1.25 avatar + 0.5 gap"
+                1.875,
+                "one-line avatar slot + half-line gap + next body padding"
             );
             assert_eq!(
                 snapshot.row_y(2.),
-                2.75,
+                2.875,
                 "internal body lines remain consecutive"
             );
             assert_eq!(
                 snapshot.row_y(3.),
-                4.25,
+                4.375,
                 "multiline body adds only the half-line gap"
             );
             assert_eq!(
@@ -256,7 +263,7 @@ fn avatar_minimum_height_does_not_add_a_blank_row_to_multiline_messages(cx: &mut
                 "short text has equal top and bottom padding"
             );
             assert_eq!(snapshot.row_padding_before(DisplayRow(0)), 0.125);
-            assert_eq!(snapshot.row_padding_before(DisplayRow(1)), 0.);
+            assert_eq!(snapshot.row_padding_before(DisplayRow(1)), 0.125);
             for row in [0., 0.5, 1., 1.75, 2., 3.] {
                 assert!((snapshot.row_at_y(snapshot.row_y(row)) - row).abs() < 1e-9);
             }

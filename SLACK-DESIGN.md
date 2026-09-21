@@ -563,19 +563,26 @@ transcript renders through, and owns none of its own. Concretely:
   The gutter width and author slots are reserved before downloads start;
   initials occupy unavailable images without changing layout. Author headers
   are concealed from the first populated frame, retaining names for copy/search. Nearby messages
-  from the same author share an avatar (within five minutes and the same day).
+  from the same author share an avatar (within five minutes and the same day),
+  including edited follow-ups.
 - The composer uses the agent prompt's draft style. Its display-only hint is
   `Message #channel…` or `Reply in #channel…`, anchored after the cursor;
   typing removes it. The gutter contains avatars, not editing chrome; there
   are no buttons or permanent instruction rows.
 - Day breaks are source headings centered by an anchored editor row-alignment
-  primitive. They never replace body rows. The unread line stays left-aligned.
-  Message boundaries add half a line of display-only trailing space after the
-  larger of the body height and its 1.25-line avatar slot. Single-line
-  bodies are vertically centered in that slot; multiline bodies stay top-aligned.
-  The editor's shared geometry owns wrapping, scrolling, selection and hit testing.
+  primitive, with a half-line gap below them. They never replace body rows.
+  The unread line stays left-aligned.
+  Author groups have half a line of display-only trailing space; messages within
+  a group have a quarter line. Every avatar is centered beside the first text
+  line, whether the message is short, multiline, wrapped, or has metadata.
+  The 1.25-line avatar slot reserves an eighth-line top inset and any needed
+  bottom inset. The editor's shared geometry owns wrapping, scrolling,
+  selection and hit testing.
   Per-message and last-reply timestamps are hidden; date separators remain.
-- Attachments, previews, reactions, and thread summaries follow the body.
+- Edits use a display-only `✎` suffix on the last content line, not a source
+  metadata row. Markdown link targets and code fences remain unchanged.
+- Attachments and previews follow the body. Reactions and thread counts share
+  one muted footer line; the reader's own reactions remain highlighted.
   The sidebar distinguishes unread conversations by text color rather than
   weight, with a separate accent for mentions.
 - What the surface still paints for itself is only what the parse cannot

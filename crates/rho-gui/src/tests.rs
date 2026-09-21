@@ -158,11 +158,13 @@ fn centered_rows_and_fractional_gaps_share_paint_and_hit_geometry(cx: &mut TestA
                 editor::display_map::RowSpacing {
                     range: anchor(1)..anchor(1),
                     minimum_height: 1.25,
+                    padding_before: 0.125,
                     gap_after: 0.5,
                 },
                 editor::display_map::RowSpacing {
                     range: anchor(3)..anchor(3),
                     minimum_height: 0.,
+                    padding_before: 0.,
                     gap_after: 0.25,
                 },
             ],
