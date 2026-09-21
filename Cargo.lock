@@ -13544,6 +13544,7 @@ dependencies = [
  "language",
  "multi_buffer",
  "project",
+ "rand 0.8.7",
  "redb",
  "reqwest 0.12.28",
  "rho-db",

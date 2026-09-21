@@ -429,7 +429,9 @@ fn apply(
                     .and_then(|(channel, ts)| store.message(channel, ts))
                     .is_some_and(|(_, message)| message.bot_id.as_deref() == Some("BAPP"));
             let valid_common = form.get("service_id").map(String::as_str) == Some("BAPP")
-                && form.get("client_token").map(String::as_str) == Some("RhoSlack-acme")
+                && form.get("client_token").is_some_and(|token| {
+                    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
                 && action.get("block_id").and_then(Value::as_str) == Some("deploy");
             if !valid_container || !valid_common {
                 return Err(Refusal::InvalidArguments);

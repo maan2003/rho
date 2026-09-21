@@ -46,6 +46,7 @@ chrono = { version = "0.4", default-features = false, features = [
 # Shortcode to glyph, the table every Slack client needs.
 emojis = "0.6"
 futures.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

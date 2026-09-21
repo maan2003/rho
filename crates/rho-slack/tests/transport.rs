@@ -2095,3 +2095,90 @@ async fn standalone_files_are_found_through_search_files() {
         Some("retrospective")
     );
 }
+
+#[tokio::test]
+async fn app_actions_suggestions_and_dialogs_use_the_desktop_session_protocol() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("ME", "you");
+    fake.add_user("U1", "Ada");
+    fake.add_channel("C1", "design");
+    fake.add_message(
+        "C1",
+        json!({
+            "ts": "100.0",
+            "bot_id": "B1",
+            "username": "deploybot",
+            "text": "deploy",
+            "blocks": [{
+                "type": "actions",
+                "block_id": "deploy",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "open_details",
+                    "text": {"type": "plain_text", "text": "Add details"}
+                }]
+            }]
+        }),
+    );
+    let client = client(&fake);
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client.clone(),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    let _ = next_wire(&mut receiver).await;
+    wait_until_live(&catch_up).await;
+    assert!(matches!(
+        next_wire(&mut receiver).await,
+        Wire::Frame(WsEvent::Hello)
+    ));
+
+    let token = Client::interaction_token();
+    assert_eq!(token.len(), 32);
+    client
+        .block_action(
+            "B1",
+            json!({
+                "type": "button",
+                "block_id": "deploy",
+                "action_id": "open_details",
+                "text": {"type": "plain_text", "text": "Add details"}
+            }),
+            &ChannelId("C1".into()),
+            &Ts("100.0".into()),
+            &token,
+        )
+        .await
+        .unwrap();
+    let Wire::Frame(WsEvent::DialogOpened {
+        dialog_id,
+        client_token,
+    }) = next_wire(&mut receiver).await
+    else {
+        panic!("the action did not open its dialog");
+    };
+    assert_eq!(dialog_id, "DIALOG1");
+    assert_eq!(client_token, token);
+
+    let options = client
+        .block_suggestions(
+            "B1",
+            &json!({"block_id": "deploy", "action_id": "ticket"}),
+            &ChannelId("C1".into()),
+            &Ts("100.0".into()),
+            "checkout",
+        )
+        .await
+        .unwrap();
+    assert_eq!(options[0].value, "INC-412");
+
+    let dialog = client.dialog("DIALOG1").await.unwrap();
+    assert_eq!(dialog["title"], "Deployment details");
+    client
+        .submit_dialog("DIALOG1", json!({"note": "ship it", "urgency": "normal"}))
+        .await
+        .unwrap();
+}

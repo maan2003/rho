@@ -892,14 +892,14 @@ impl Client {
         Ok(())
     }
 
-    /// Puts an emoji on a message, as the signed-in user.
-    ///
-    /// `name` is Slack's shortcode without the colons — `thumbsup`, not
-    /// `:thumbsup:` — which is the form the API takes, the form the wire
-    /// carries back in `reaction_added`, and the form the emoji table
-    /// keys on. Slack answers `already_reacted` if it is already there,
-    /// which the caller treats as done rather than as a failure: two
-    /// clients racing to agree is not an error.
+    /// A fresh opaque correlation token for one interactive action.
+    pub fn interaction_token() -> String {
+        use rand::RngCore as _;
+        let mut bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     /// Dispatches a Block Kit action exactly as Slack's desktop client does.
     pub async fn block_action(
         &self,
@@ -907,6 +907,7 @@ impl Client {
         action: Value,
         channel: &ChannelId,
         message_ts: &Ts,
+        client_token: &str,
     ) -> anyhow::Result<()> {
         self.post_json(
             "blocks.actions",
@@ -919,11 +920,60 @@ impl Client {
                     "channel_id": channel.0,
                     "is_ephemeral": false,
                 },
-                "client_token": format!("RhoSlack-{}", self.credentials.workspace.0),
+                "client_token": client_token,
             }),
         )
         .await?;
         Ok(())
+    }
+
+    /// Fetches an external select's app-provided choices.
+    pub async fn block_suggestions(
+        &self,
+        service_id: &str,
+        action: &Value,
+        channel: &ChannelId,
+        message_ts: &Ts,
+        value: &str,
+    ) -> anyhow::Result<Vec<crate::block::InteractionOption>> {
+        let body = self
+            .post_json(
+                "blocks.suggestions",
+                json!({
+                    "value": value,
+                    "action_id": action["action_id"],
+                    "block_id": action["block_id"],
+                    "service_id": service_id,
+                    "container": {
+                        "type": "message",
+                        "message_ts": message_ts.0,
+                        "channel_id": channel.0,
+                        "is_ephemeral": false,
+                    },
+                }),
+            )
+            .await?;
+        let mut options = Vec::new();
+        let mut collect = |values: &Value| {
+            for option in values.as_array().map(Vec::as_slice).unwrap_or_default() {
+                let Some(value) = string(&option["value"]) else {
+                    continue;
+                };
+                let Some(label) = string(&option["text"]["text"]) else {
+                    continue;
+                };
+                options.push(crate::block::InteractionOption { label, value });
+            }
+        };
+        collect(&body["options"]);
+        for group in body["option_groups"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            collect(&group["options"]);
+        }
+        Ok(options)
     }
 
     /// Fetches a dialog announced by Slack's `dialog_opened` socket event.
@@ -949,6 +999,14 @@ impl Client {
         Ok(())
     }
 
+    /// Puts an emoji on a message, as the signed-in user.
+    ///
+    /// `name` is Slack's shortcode without the colons — `thumbsup`, not
+    /// `:thumbsup:` — which is the form the API takes, the form the wire
+    /// carries back in `reaction_added`, and the form the emoji table
+    /// keys on. Slack answers `already_reacted` if it is already there,
+    /// which the caller treats as done rather than as a failure: two
+    /// clients racing to agree is not an error.
     pub async fn add_reaction(
         &self,
         channel: &ChannelId,

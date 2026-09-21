@@ -844,6 +844,7 @@ async fn block_actions_and_the_dialog_round_trip_through_the_real_client_api() {
             }),
             &channel,
             &card.ts,
+            "0123456789abcdef0123456789abcdef",
         )
         .await
         .expect("button accepted");
@@ -863,6 +864,7 @@ async fn block_actions_and_the_dialog_round_trip_through_the_real_client_api() {
             }),
             &channel,
             &card.ts,
+            "0123456789abcdef0123456789abcdef",
         )
         .await
         .expect("selection accepted");
@@ -878,6 +880,7 @@ async fn block_actions_and_the_dialog_round_trip_through_the_real_client_api() {
             }),
             &channel,
             &card.ts,
+            "0123456789abcdef0123456789abcdef",
         )
         .await
         .expect("modal button accepted");
@@ -886,7 +889,7 @@ async fn block_actions_and_the_dialog_round_trip_through_the_real_client_api() {
         rho_slack::events::parse(&opened),
         rho_slack::events::WsEvent::DialogOpened {
             dialog_id: "DIALOG1".to_owned(),
-            client_token: "RhoSlack-acme".to_owned(),
+            client_token: "0123456789abcdef0123456789abcdef".to_owned(),
         }
     );
 

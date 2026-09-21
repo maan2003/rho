@@ -199,7 +199,7 @@ pub struct Interaction {
     pub action_id: String,
     pub value: Option<String>,
     pub options: Vec<InteractionOption>,
-    pub requires_confirmation: bool,
+    pub confirmation: Option<Confirmation>,
     /// Slack's original element payload, with the containing block id attached.
     pub payload: Value,
 }
@@ -209,6 +209,14 @@ pub struct Interaction {
 pub struct InteractionOption {
     pub label: String,
     pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Confirmation {
+    pub title: String,
+    pub text: String,
+    pub confirm: String,
+    pub deny: String,
 }
 
 /// Interactive controls in display order. Buttons and static selects can be
@@ -260,6 +268,12 @@ fn push_interaction(
             })
         })
         .collect();
+    let confirmation = element.get("confirm").map(|confirm| Confirmation {
+        title: render_text_object(Flavour::Mrkdwn, confirm.get("title"), names),
+        text: render_text_object(Flavour::Mrkdwn, confirm.get("text"), names),
+        confirm: render_text_object(Flavour::Mrkdwn, confirm.get("confirm"), names),
+        deny: render_text_object(Flavour::Mrkdwn, confirm.get("deny"), names),
+    });
     let mut payload = element.clone();
     if let Some(payload) = payload.as_object_mut() {
         payload.insert("block_id".to_owned(), Value::String(block_id.to_owned()));
@@ -278,7 +292,7 @@ fn push_interaction(
             .and_then(Value::as_str)
             .map(str::to_owned),
         options,
-        requires_confirmation: element.get("confirm").is_some(),
+        confirmation,
         payload,
     });
 }

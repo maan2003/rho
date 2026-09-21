@@ -1370,7 +1370,7 @@ fn handle(
         *remaining -= 1;
         return json!({"ok": false, "error": "fatal_error"});
     }
-    let form = parse_form(body);
+    let form = parse_fields(body);
     state
         .forms
         .entry(method.to_owned())
@@ -1972,6 +1972,115 @@ fn handle(
         }
         // An edit is `chat.update` plus the socket event every other client
         // sees, so the round trip a reader makes here is the live one.
+        "blocks.actions" => {
+            let actions = serde_json::from_str::<Value>(&field("actions")).unwrap_or(Value::Null);
+            let action = actions
+                .as_array()
+                .and_then(|actions| actions.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            let container =
+                serde_json::from_str::<Value>(&field("container")).unwrap_or(Value::Null);
+            let client_token = field("client_token");
+            let valid_token = client_token.len() == 32
+                && client_token.bytes().all(|byte| byte.is_ascii_hexdigit());
+            let valid = valid_token
+                && !field("service_id").is_empty()
+                && action["block_id"].as_str() == Some("deploy")
+                && container["type"].as_str() == Some("message")
+                && state
+                    .history
+                    .get(container["channel_id"].as_str().unwrap_or_default())
+                    .is_some_and(|messages| {
+                        messages.iter().any(|message| {
+                            message["ts"] == container["message_ts"]
+                                && message["bot_id"] == json!(field("service_id"))
+                        })
+                    });
+            if !valid {
+                json!({"ok": false, "error": "invalid_arguments"})
+            } else {
+                if action["action_id"].as_str() == Some("open_details") {
+                    let _ = frames.send(Frame::Text(
+                        json!({
+                            "type": "dialog_opened",
+                            "dialog_id": "DIALOG1",
+                            "client_token": client_token,
+                        })
+                        .to_string()
+                        .into(),
+                    ));
+                }
+                json!({"ok": true})
+            }
+        }
+        "blocks.suggestions" => {
+            let container =
+                serde_json::from_str::<Value>(&field("container")).unwrap_or(Value::Null);
+            if field("service_id") == "B1"
+                && field("block_id") == "deploy"
+                && field("action_id") == "ticket"
+                && container["type"].as_str() == Some("message")
+                && !field("value").is_empty()
+            {
+                let query = field("value").to_lowercase();
+                let options = [
+                    ("INC-412 · checkout latency", "INC-412"),
+                    ("INC-580 · payment errors", "INC-580"),
+                ]
+                .into_iter()
+                .filter(|(label, _)| label.to_lowercase().contains(&query))
+                .map(|(label, value)| {
+                    json!({"text": {"type": "plain_text", "text": label}, "value": value})
+                })
+                .collect::<Vec<_>>();
+                json!({"ok": true, "options": options})
+            } else {
+                json!({"ok": false, "error": "invalid_arguments"})
+            }
+        }
+        "dialog.get" if field("dialog_id") == "DIALOG1" => json!({
+            "ok": true,
+            "dialog": {
+                "title": "Deployment details",
+                "submit_label": "Send",
+                "elements": [
+                    {
+                        "type": "text",
+                        "name": "note",
+                        "label": "Deployment note",
+                        "min_length": 3,
+                        "max_length": 80,
+                    },
+                    {
+                        "type": "select",
+                        "name": "urgency",
+                        "label": "Urgency",
+                        "data_source": "static",
+                        "options": [
+                            {"label": "Normal", "value": "normal"},
+                            {"label": "Urgent", "value": "urgent"}
+                        ]
+                    }
+                ]
+            }
+        }),
+        "dialog.submit" => {
+            let submission =
+                serde_json::from_str::<Value>(&field("submission")).unwrap_or(Value::Null);
+            if field("dialog_id") == "DIALOG1"
+                && submission["note"]
+                    .as_str()
+                    .is_some_and(|note| (3..=80).contains(&note.chars().count()))
+                && submission["urgency"]
+                    .as_str()
+                    .is_some_and(|urgency| matches!(urgency, "normal" | "urgent"))
+            {
+                json!({"ok": true})
+            } else {
+                json!({"ok": false, "error": "invalid_arguments"})
+            }
+        }
         "chat.update" => {
             let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let channel = payload["channel"].as_str().unwrap_or_default().to_owned();
@@ -2077,6 +2186,22 @@ fn handle(
 
 /// Parses both `application/x-www-form-urlencoded` and the multipart body the
 /// activity feed uses, since the fake only needs the field values.
+fn parse_fields(body: &str) -> BTreeMap<String, String> {
+    if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body) {
+        return fields
+            .into_iter()
+            .map(|(name, value)| {
+                let value = match value {
+                    Value::String(value) => value,
+                    other => other.to_string(),
+                };
+                (name, value)
+            })
+            .collect();
+    }
+    parse_form(body)
+}
+
 fn parse_form(body: &str) -> BTreeMap<String, String> {
     let mut fields = BTreeMap::new();
     if body.contains("Content-Disposition: form-data") {

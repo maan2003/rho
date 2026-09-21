@@ -299,10 +299,69 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
                 "icons": {"image_48": bot_icon.clone()},
             },
             "text": "deploy finished",
-            "blocks": [{
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "*deploy finished* in 4m12s"},
-            }],
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "*deploy finished* in 4m12s"},
+                },
+                {
+                    "type": "actions",
+                    "block_id": "deploy",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "approve",
+                            "value": "yes",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "confirm": {
+                                "title": {"type": "plain_text", "text": "Approve deployment?"},
+                                "text": {"type": "mrkdwn", "text": "This sends approval to deploybot."},
+                                "confirm": {"type": "plain_text", "text": "Approve"},
+                                "deny": {"type": "plain_text", "text": "Cancel"}
+                            }
+                        },
+                        {
+                            "type": "overflow",
+                            "action_id": "more",
+                            "options": [
+                                {"text": {"type": "plain_text", "text": "Retry"}, "value": "retry"},
+                                {"text": {"type": "plain_text", "text": "Cancel deploy"}, "value": "cancel"}
+                            ]
+                        },
+                        {
+                            "type": "datepicker",
+                            "action_id": "schedule",
+                            "placeholder": {"type": "plain_text", "text": "Schedule"}
+                        },
+                        {
+                            "type": "users_select",
+                            "action_id": "owner",
+                            "placeholder": {"type": "plain_text", "text": "Choose owner"}
+                        },
+                        {
+                            "type": "channels_select",
+                            "action_id": "announce",
+                            "placeholder": {"type": "plain_text", "text": "Choose channel"}
+                        },
+                        {
+                            "type": "conversations_select",
+                            "action_id": "destination",
+                            "placeholder": {"type": "plain_text", "text": "Choose destination"}
+                        },
+                        {
+                            "type": "external_select",
+                            "action_id": "ticket",
+                            "min_query_length": 3,
+                            "placeholder": {"type": "plain_text", "text": "Choose incident"}
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "open_details",
+                            "text": {"type": "plain_text", "text": "Add details"}
+                        }
+                    ]
+                }
+            ],
             "attachments": [{
                 "title": "build #412",
                 "pretext": "pipeline",

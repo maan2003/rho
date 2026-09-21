@@ -588,6 +588,28 @@ impl ConversationView {
         })
     }
 
+    pub fn interaction_options(
+        &self,
+        element_type: &str,
+        cx: &App,
+    ) -> Vec<crate::block::InteractionOption> {
+        self.session
+            .read(cx)
+            .model()
+            .interaction_options(element_type)
+    }
+
+    pub fn fetch_external_options(
+        &mut self,
+        interaction: MessageInteraction,
+        query: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.update(cx, |session, cx| {
+            session.fetch_external_options(interaction.message, interaction.action, query, cx);
+        });
+    }
+
     /// Dispatches a button or selected static option. Larger controls are
     /// deliberately refused by the host before this is called.
     pub fn run_interaction(

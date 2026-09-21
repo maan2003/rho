@@ -93,6 +93,11 @@ pub enum SessionEvent {
         dialog_id: String,
         dialog: serde_json::Value,
     },
+    ExternalOptions {
+        message: Message,
+        action: crate::block::Interaction,
+        options: Vec<crate::block::InteractionOption>,
+    },
 }
 
 /// What came back from a search, ready to be drawn.
@@ -381,6 +386,8 @@ pub struct Session {
     /// the outage left before the lamp goes out.
     catch_up: Arc<Notify>,
     pending_sends: usize,
+    /// Per-action tokens awaiting a modal-opening socket event.
+    pending_interactions: HashSet<String>,
     /// Author ids `users.info` has already been asked about, whether or not
     /// it answered. One ask per person, so a channel full of a stranger's
     /// messages is one request, and a request that failed is not retried on
@@ -446,6 +453,7 @@ impl Session {
             loaded: HashMap::new(),
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
+            pending_interactions: HashSet::new(),
             asked_names: HashSet::new(),
             asked: 0,
             cached_files: HashMap::new(),
@@ -468,6 +476,7 @@ impl Session {
             loaded: HashMap::new(),
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
+            pending_interactions: HashSet::new(),
             asked_names: HashSet::new(),
             asked: 0,
             cached_files: HashMap::new(),
@@ -774,6 +783,33 @@ impl Session {
                 let key = self.model.key(&channel, &thread_ts);
                 self.note_read(&Source::Thread(key), &ts);
                 cx.notify();
+            }
+            Wire::Frame(WsEvent::DialogOpened {
+                dialog_id,
+                client_token,
+            }) => {
+                // A socket event can open UI only when it answers an action
+                // this session just sent. Removal also makes the token
+                // single-use, so a replay cannot reopen the dialog.
+                if !self.pending_interactions.remove(&client_token) {
+                    return;
+                }
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                let fetched_id = dialog_id.clone();
+                let task =
+                    gpui_tokio::Tokio::spawn(cx, async move { client.dialog(&fetched_id).await });
+                self._tasks.push(cx.spawn(async move |this, cx| {
+                    let fetched = task.await;
+                    let _ = this.update(cx, |_, cx| match fetched {
+                        Ok(Ok(dialog)) => cx.emit(SessionEvent::Dialog { dialog_id, dialog }),
+                        Ok(Err(error)) => {
+                            cx.emit(SessionEvent::Notice(format!("slack: {error:#}")))
+                        }
+                        Err(error) => cx.emit(SessionEvent::Notice(format!("slack: {error}"))),
+                    });
+                }));
             }
             Wire::Frame(_) => {}
             Wire::Disconnected(reason) => {
@@ -2631,17 +2667,32 @@ impl Session {
         };
         let mut payload = action.payload;
         if let Some(selected) = selected {
-            payload["selected_option"] = serde_json::json!({
-                "text": {"type": "plain_text", "text": selected.label},
-                "value": selected.value,
-            });
+            match action.element_type.as_str() {
+                "users_select" => payload["selected_user"] = serde_json::json!(selected.value),
+                "channels_select" => {
+                    payload["selected_channel"] = serde_json::json!(selected.value)
+                }
+                "conversations_select" => {
+                    payload["selected_conversation"] = serde_json::json!(selected.value)
+                }
+                "datepicker" => payload["selected_date"] = serde_json::json!(selected.value),
+                _ => {
+                    payload["selected_option"] = serde_json::json!({
+                        "text": {"type": "plain_text", "text": selected.label},
+                        "value": selected.value,
+                    });
+                }
+            }
         }
         let service_id = message.bot_id.unwrap_or_else(|| "B01".to_owned());
+        let client_token = Client::interaction_token();
+        self.pending_interactions.insert(client_token.clone());
+        let pending_token = client_token.clone();
         let channel = message.channel;
         let ts = message.ts;
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
-                .block_action(&service_id, payload, &channel, &ts)
+                .block_action(&service_id, payload, &channel, &ts, &client_token)
                 .await
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
@@ -2653,6 +2704,52 @@ impl Session {
             if let Some(notice) = notice {
                 let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Notice(notice)));
             }
+        }));
+        let expiry = gpui_tokio::Tokio::spawn(cx, async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            pending_token
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            if let Ok(token) = expiry.await {
+                let _ = this.update(cx, |this, _| {
+                    this.pending_interactions.remove(&token);
+                });
+            }
+        }));
+    }
+
+    /// Asks the app behind an external select for its query-dependent choices.
+    pub fn fetch_external_options(
+        &mut self,
+        message: Message,
+        action: crate::block::Interaction,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            cx.emit(SessionEvent::Notice("slack: not connected".to_owned()));
+            return;
+        };
+        let service_id = message.bot_id.clone().unwrap_or_else(|| "B01".to_owned());
+        let channel = message.channel.clone();
+        let ts = message.ts.clone();
+        let sent_action = action.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client
+                .block_suggestions(&service_id, &sent_action.payload, &channel, &ts, &value)
+                .await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let fetched = task.await;
+            let _ = this.update(cx, |_, cx| match fetched {
+                Ok(Ok(options)) => cx.emit(SessionEvent::ExternalOptions {
+                    message,
+                    action,
+                    options,
+                }),
+                Ok(Err(error)) => cx.emit(SessionEvent::Notice(format!("slack: {error:#}"))),
+                Err(error) => cx.emit(SessionEvent::Notice(format!("slack: {error}"))),
+            });
         }));
     }
 

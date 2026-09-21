@@ -582,6 +582,40 @@ impl Model {
         people
     }
 
+    /// Choices for Block Kit's roster-backed select controls.
+    pub fn interaction_options(&self, element_type: &str) -> Vec<crate::block::InteractionOption> {
+        let mut options = match element_type {
+            "users_select" => self
+                .users
+                .values()
+                .map(|user| crate::block::InteractionOption {
+                    label: format!("@{}", user.name),
+                    value: user.id.0.clone(),
+                })
+                .collect::<Vec<_>>(),
+            "channels_select" => self
+                .conversations
+                .values()
+                .filter(|conversation| conversation.kind == ConversationKind::Channel)
+                .map(|conversation| crate::block::InteractionOption {
+                    label: self.label(&conversation.id),
+                    value: conversation.id.0.clone(),
+                })
+                .collect(),
+            "conversations_select" => self
+                .conversations
+                .values()
+                .map(|conversation| crate::block::InteractionOption {
+                    label: self.label(&conversation.id),
+                    value: conversation.id.0.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        options.sort_by(|left, right| left.label.cmp(&right.label));
+        options
+    }
+
     pub fn conversation(&self, channel: &ChannelId) -> Option<&Conversation> {
         self.conversations.get(channel)
     }
