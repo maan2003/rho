@@ -93,6 +93,16 @@ pub enum SessionEvent {
         dialog_id: String,
         dialog: serde_json::Value,
     },
+    /// A trusted modern modal view, ready for the host to collect.
+    View {
+        view: serde_json::Value,
+    },
+    /// The structured result of submitting a modern view.
+    ViewSubmitted {
+        view: serde_json::Value,
+        state: serde_json::Value,
+        result: crate::api::ViewSubmission,
+    },
     ExternalOptions {
         message: Message,
         action: crate::block::Interaction,
@@ -798,7 +808,7 @@ impl Session {
                 // A socket event can open UI only when it answers an action
                 // this session just sent. Removal also makes the token
                 // single-use, so a replay cannot reopen the dialog.
-                if !self.pending_interactions.remove(&client_token) {
+                if !take_pending_interaction(&mut self.pending_interactions, &client_token) {
                     return;
                 }
                 let Some(client) = self.client.clone() else {
@@ -811,6 +821,50 @@ impl Session {
                     let fetched = task.await;
                     let _ = this.update(cx, |_, cx| match fetched {
                         Ok(Ok(dialog)) => cx.emit(SessionEvent::Dialog { dialog_id, dialog }),
+                        Ok(Err(error)) => {
+                            cx.emit(SessionEvent::Notice(format!("slack: {error:#}")))
+                        }
+                        Err(error) => cx.emit(SessionEvent::Notice(format!("slack: {error}"))),
+                    });
+                }));
+            }
+            Wire::Frame(WsEvent::ViewOpened {
+                view_id,
+                view_type,
+                previous_view_id,
+                client_token,
+                view,
+            }) => {
+                if view_type != "modal"
+                    || !take_pending_interaction(&mut self.pending_interactions, &client_token)
+                {
+                    return;
+                }
+                let Some(client) = self.client.clone() else {
+                    return;
+                };
+                let supplied = view.filter(|view| {
+                    view["id"].as_str().is_some_and(|id| id == view_id)
+                        && view["type"].as_str().is_some_and(|kind| kind == "modal")
+                });
+                let fetched_id = view_id.clone();
+                let task = gpui_tokio::Tokio::spawn(cx, async move {
+                    match supplied {
+                        Some(view) => Ok(view),
+                        None => client.view(&fetched_id).await,
+                    }
+                });
+                self._tasks.push(cx.spawn(async move |this, cx| {
+                    let fetched = task.await;
+                    let _ = this.update(cx, |_, cx| match fetched {
+                        Ok(Ok(mut view)) => {
+                            if view["previous_view_id"].is_null()
+                                && let Some(previous) = previous_view_id
+                            {
+                                view["previous_view_id"] = serde_json::json!(previous);
+                            }
+                            cx.emit(SessionEvent::View { view });
+                        }
                         Ok(Err(error)) => {
                             cx.emit(SessionEvent::Notice(format!("slack: {error:#}")))
                         }
@@ -2700,9 +2754,7 @@ impl Session {
             }
         }
         let service_id = message.bot_id.unwrap_or_else(|| "B01".to_owned());
-        let client_token = Client::interaction_token();
-        self.pending_interactions.insert(client_token.clone());
-        let pending_token = client_token.clone();
+        let client_token = self.remember_interaction(cx);
         let channel = message.channel;
         let ts = message.ts;
         let task = gpui_tokio::Tokio::spawn(cx, async move {
@@ -2720,6 +2772,12 @@ impl Session {
                 let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Notice(notice)));
             }
         }));
+    }
+
+    fn remember_interaction(&mut self, cx: &mut Context<Self>) -> String {
+        let token = Client::interaction_token();
+        self.pending_interactions.insert(token.clone());
+        let pending_token = token.clone();
         let expiry = gpui_tokio::Tokio::spawn(cx, async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             pending_token
@@ -2731,6 +2789,7 @@ impl Session {
                 });
             }
         }));
+        token
     }
 
     /// Asks the app behind an external select for its query-dependent choices.
@@ -2765,6 +2824,75 @@ impl Session {
                 Ok(Err(error)) => cx.emit(SessionEvent::Notice(format!("slack: {error:#}"))),
                 Err(error) => cx.emit(SessionEvent::Notice(format!("slack: {error}"))),
             });
+        }));
+    }
+
+    /// Submits one modern modal and reports Slack's response action.
+    pub fn submit_view(
+        &mut self,
+        view: serde_json::Value,
+        state: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            cx.emit(SessionEvent::Notice("slack: not connected".to_owned()));
+            return;
+        };
+        let Some(view_id) = view["id"].as_str().map(str::to_owned) else {
+            cx.emit(SessionEvent::Notice(
+                "slack: modal has no view id".to_owned(),
+            ));
+            return;
+        };
+        let client_token = self.remember_interaction(cx);
+        let submitted_view = view.clone();
+        let submitted_state = state.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client.submit_view(&view_id, state, &client_token).await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let submitted = task.await;
+            let _ = this.update(cx, |_, cx| match submitted {
+                Ok(Ok(result)) => cx.emit(SessionEvent::ViewSubmitted {
+                    view: submitted_view,
+                    state: submitted_state,
+                    result,
+                }),
+                Ok(Err(error)) => cx.emit(SessionEvent::Notice(format!("slack: {error:#}"))),
+                Err(error) => cx.emit(SessionEvent::Notice(format!("slack: {error}"))),
+            });
+        }));
+    }
+
+    /// Closes one modern modal without submitting it.
+    pub fn close_view(&mut self, view: serde_json::Value, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            cx.emit(SessionEvent::Notice("slack: not connected".to_owned()));
+            return;
+        };
+        let Some(view_id) = view["id"].as_str().map(str::to_owned) else {
+            cx.emit(SessionEvent::Notice(
+                "slack: modal has no view id".to_owned(),
+            ));
+            return;
+        };
+        let root_view_id = view["root_view_id"].as_str().unwrap_or(&view_id).to_owned();
+        let client_token = self.remember_interaction(cx);
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client
+                .close_view(&view_id, &root_view_id, &client_token)
+                .await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let closed = task.await;
+            let notice = match closed {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("slack: {error:#}")),
+                Err(error) => Some(format!("slack: {error}")),
+            };
+            if let Some(notice) = notice {
+                let _ = this.update(cx, |_, cx| cx.emit(SessionEvent::Notice(notice)));
+            }
         }));
     }
 
@@ -3617,6 +3745,10 @@ fn file_cache_path(
     Ok(files.join(format!("{}-{name}", file.id)))
 }
 
+fn take_pending_interaction(pending: &mut HashSet<String>, token: &str) -> bool {
+    pending.remove(token)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4368,6 +4500,17 @@ mod tests {
         assert!(
             older_request(loading, reached_oldest, cursor, None).is_some(),
             "and the next scroll is still allowed to ask"
+        );
+    }
+
+    #[test]
+    fn modal_correlation_tokens_are_trusted_once() {
+        let mut pending = HashSet::from(["expected".to_owned()]);
+        assert!(!take_pending_interaction(&mut pending, "injected"));
+        assert!(take_pending_interaction(&mut pending, "expected"));
+        assert!(
+            !take_pending_interaction(&mut pending, "expected"),
+            "a replay cannot reopen UI"
         );
     }
 

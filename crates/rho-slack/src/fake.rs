@@ -871,6 +871,17 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             };
             let ts = next_ts(state, &channel, now);
             let mut message = json!({"type": "message", "ts": ts, "user": user, "text": text});
+            let bot_id = field("bot_id");
+            if !bot_id.is_empty() {
+                message["bot_id"] = json!(bot_id);
+                message.as_object_mut().unwrap().remove("user");
+            }
+            if let Some(blocks) = request["blocks"]
+                .as_array()
+                .filter(|blocks| blocks.len() <= 100)
+            {
+                message["blocks"] = json!(blocks);
+            }
             if kind == "reply" {
                 message["thread_ts"] = json!(field("thread_ts"));
             }
@@ -1352,6 +1363,65 @@ fn bump_count(state: &mut State, channel: &str, ts: &str, mentions_me: bool) {
         let mentions = count["mention_count"].as_u64().unwrap_or(0) + 1;
         count["mention_count"] = json!(mentions);
     }
+}
+
+fn fake_modal_view(id: &str, previous_view_id: Option<&str>) -> Value {
+    let mut view = json!({
+        "id": id,
+        "root_view_id": "VMODAL1",
+        "type": "modal",
+        "callback_id": "deploy_modal",
+        "title": {"type": "plain_text", "text": "Deploy release"},
+        "submit": {"type": "plain_text", "text": "Deploy"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "deploy_note",
+                "label": {"type": "plain_text", "text": "Deployment note"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "note",
+                    "min_length": 3,
+                    "max_length": 80
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "deploy_urgency",
+                "label": {"type": "plain_text", "text": "Urgency"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "urgency",
+                    "options": [
+                        {"text": {"type": "plain_text", "text": "Normal"}, "value": "normal"},
+                        {"text": {"type": "plain_text", "text": "Update view"}, "value": "update"},
+                        {"text": {"type": "plain_text", "text": "Push view"}, "value": "push"}
+                    ]
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "deploy_date",
+                "label": {"type": "plain_text", "text": "Release date"},
+                "element": {"type": "datepicker", "action_id": "date"}
+            },
+            {
+                "type": "input",
+                "block_id": "deploy_owner",
+                "label": {"type": "plain_text", "text": "Owner"},
+                "element": {"type": "users_select", "action_id": "owner"}
+            }
+        ]
+    });
+    if let Some(previous) = previous_view_id {
+        view["previous_view_id"] = json!(previous);
+    }
+    view
+}
+
+fn valid_client_token(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn handle(
@@ -2008,8 +2078,7 @@ fn handle(
             let container =
                 serde_json::from_str::<Value>(&field("container")).unwrap_or(Value::Null);
             let client_token = field("client_token");
-            let valid_token = client_token.len() == 32
-                && client_token.bytes().all(|byte| byte.is_ascii_hexdigit());
+            let valid_token = valid_client_token(&client_token);
             let valid = valid_token
                 && !field("service_id").is_empty()
                 && action["block_id"].as_str() == Some("deploy")
@@ -2036,6 +2105,25 @@ fn handle(
                         .to_string()
                         .into(),
                     ));
+                } else if matches!(
+                    action["action_id"].as_str(),
+                    Some("open_modal" | "open_modal_fetch")
+                ) {
+                    let mut event = json!({
+                        "type": "view_opened",
+                        "view_id": "VMODAL1",
+                        "view_type": "modal",
+                        "client_token": client_token,
+                        "timeout_range": 10000,
+                        "app_id": "A1",
+                        "title": {"type": "plain_text", "text": "Deploy release"},
+                        "submit": {"type": "plain_text", "text": "Deploy"},
+                        "close": {"type": "plain_text", "text": "Cancel"}
+                    });
+                    if action["action_id"].as_str() == Some("open_modal") {
+                        event["view"] = fake_modal_view("VMODAL1", None);
+                    }
+                    let _ = frames.send(Frame::Text(event.to_string().into()));
                 }
                 json!({"ok": true})
             }
@@ -2061,6 +2149,59 @@ fn handle(
                 })
                 .collect::<Vec<_>>();
                 json!({"ok": true, "options": options})
+            } else {
+                json!({"ok": false, "error": "invalid_arguments"})
+            }
+        }
+        "views.get" if field("view_id") == "VMODAL1" => {
+            json!({"ok": true, "view": fake_modal_view("VMODAL1", None)})
+        }
+        "views.submit" => {
+            let state_value = serde_json::from_str::<Value>(&field("state")).unwrap_or(Value::Null);
+            let values = &state_value["values"];
+            let note = values["deploy_note"]["note"]["value"].as_str();
+            let urgency = values["deploy_urgency"]["urgency"]["selected_option"]["value"].as_str();
+            let date = values["deploy_date"]["date"]["selected_date"].as_str();
+            let owner = values["deploy_owner"]["owner"]["selected_user"].as_str();
+            let valid = matches!(field("view_id").as_str(), "VMODAL1" | "VMODAL2")
+                && valid_client_token(&field("client_token"))
+                && note.is_some_and(|note| (3..=80).contains(&note.chars().count()))
+                && urgency.is_some_and(|urgency| matches!(urgency, "normal" | "update" | "push"))
+                && date.is_some_and(|date| {
+                    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok()
+                })
+                && owner.is_some_and(|owner| state.users.iter().any(|user| user["id"] == owner));
+            if !valid {
+                json!({"ok": false, "error": "invalid_arguments"})
+            } else if note == Some("reject") {
+                json!({
+                    "ok": false,
+                    "error": "validation_failed",
+                    "errors": {"deploy_note": "The app rejected this deployment note"}
+                })
+            } else if urgency == Some("update") {
+                json!({
+                    "ok": true,
+                    "response_action": "update",
+                    "view": fake_modal_view("VMODAL1", None),
+                    "toast_message": "Deployment form updated"
+                })
+            } else if urgency == Some("push") {
+                json!({
+                    "ok": true,
+                    "response_action": "push",
+                    "view": fake_modal_view("VMODAL2", Some("VMODAL1"))
+                })
+            } else {
+                json!({"ok": true, "toast_message": "Deployment queued"})
+            }
+        }
+        "views.close" => {
+            if matches!(field("view_id").as_str(), "VMODAL1" | "VMODAL2")
+                && field("root_view_id") == "VMODAL1"
+                && valid_client_token(&field("client_token"))
+            {
+                json!({"ok": true})
             } else {
                 json!({"ok": false, "error": "invalid_arguments"})
             }

@@ -57,6 +57,16 @@ pub struct RtmConnection {
     pub team_name: String,
 }
 
+/// Slack's answer after submitting a modern Block Kit view.
+#[derive(Clone, Debug, Default)]
+pub struct ViewSubmission {
+    pub response_action: Option<String>,
+    pub view: Option<Value>,
+    pub toast_message: Option<String>,
+    pub errors: serde_json::Map<String, Value>,
+    pub view_error: Option<String>,
+}
+
 /// One entry of the activity feed, reduced to what decides an item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivityItem {
@@ -974,6 +984,75 @@ impl Client {
             collect(&group["options"]);
         }
         Ok(options)
+    }
+
+    /// Fetches a modern view when `view_opened` carried only its id.
+    pub async fn view(&self, view_id: &str) -> anyhow::Result<Value> {
+        let body = self
+            .post_form("views.get", &[("view_id", view_id.to_owned())])
+            .await?;
+        body.get("view")
+            .cloned()
+            .context("views.get returned no view")
+    }
+
+    /// Submits the state of a modern Block Kit view.
+    pub async fn submit_view(
+        &self,
+        view_id: &str,
+        state: Value,
+        client_token: &str,
+    ) -> anyhow::Result<ViewSubmission> {
+        // Validation failures are structured answers the UI can correct, not
+        // transport failures. Read this response before the common `ok`
+        // decoder turns it into an opaque error string.
+        let response = self
+            .authorize(self.http.post(self.endpoint("views.submit")))
+            .form(&[
+                ("client_token", client_token.to_owned()),
+                ("view_id", view_id.to_owned()),
+                ("state", state.to_string()),
+            ])
+            .send()
+            .await
+            .context("calling views.submit")?;
+        let status = response.status();
+        let body = response
+            .json::<Value>()
+            .await
+            .with_context(|| format!("decoding views.submit ({status})"))?;
+        let validation_failed = body["error"].as_str() == Some("validation_failed");
+        if body["ok"].as_bool() != Some(true) && !validation_failed {
+            let error = string(&body["error"]).unwrap_or_else(|| "unknown error".to_owned());
+            anyhow::bail!("views.submit failed: {error}");
+        }
+        Ok(ViewSubmission {
+            response_action: string(&body["response_action"])
+                .or_else(|| validation_failed.then(|| "errors".to_owned())),
+            view: body.get("view").filter(|view| view.is_object()).cloned(),
+            toast_message: string(&body["toast_message"]),
+            errors: body["errors"].as_object().cloned().unwrap_or_default(),
+            view_error: string(&body["view_error"]),
+        })
+    }
+
+    /// Closes a modern view without submitting it.
+    pub async fn close_view(
+        &self,
+        view_id: &str,
+        root_view_id: &str,
+        client_token: &str,
+    ) -> anyhow::Result<()> {
+        self.post_form(
+            "views.close",
+            &[
+                ("client_token", client_token.to_owned()),
+                ("view_id", view_id.to_owned()),
+                ("root_view_id", root_view_id.to_owned()),
+            ],
+        )
+        .await?;
+        Ok(())
     }
 
     /// Fetches a dialog announced by Slack's `dialog_opened` socket event.

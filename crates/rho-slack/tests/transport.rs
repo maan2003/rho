@@ -2263,3 +2263,184 @@ async fn uploaded_text_file_is_not_reported_as_an_image() {
     assert!(!file.is_image());
     assert!(file.thumbnail().is_none());
 }
+
+#[tokio::test]
+async fn modern_views_open_submit_validate_update_and_close_by_the_desktop_protocol() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "Ada");
+    fake.add_channel("C1", "design");
+    fake.add_message(
+        "C1",
+        json!({
+            "ts": "100.0",
+            "bot_id": "B1",
+            "text": "deploy",
+            "blocks": [{
+                "type": "actions",
+                "block_id": "deploy",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "open_modal_fetch",
+                    "text": {"type": "plain_text", "text": "Deploy release"}
+                }]
+            }]
+        }),
+    );
+    let client = client(&fake);
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client.clone(),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    let _ = next_wire(&mut receiver).await;
+    wait_until_live(&catch_up).await;
+    let _ = next_wire(&mut receiver).await;
+
+    let open_token = Client::interaction_token();
+    client
+        .block_action(
+            "B1",
+            json!({
+                "type": "button",
+                "block_id": "deploy",
+                "action_id": "open_modal_fetch",
+                "text": {"type": "plain_text", "text": "Deploy release"}
+            }),
+            &ChannelId("C1".into()),
+            &Ts("100.0".into()),
+            &open_token,
+        )
+        .await
+        .unwrap();
+    let Wire::Frame(WsEvent::ViewOpened {
+        view_id,
+        view_type,
+        client_token,
+        view,
+        ..
+    }) = next_wire(&mut receiver).await
+    else {
+        panic!("the action did not open its modern view");
+    };
+    assert_eq!(view_id, "VMODAL1");
+    assert_eq!(view_type, "modal");
+    assert_eq!(client_token, open_token);
+    assert!(view.is_none(), "this fixture exercises views.get");
+    let modal = client.view(&view_id).await.unwrap();
+    assert_eq!(modal["title"]["text"], "Deploy release");
+
+    let state = |note: &str, urgency: &str| {
+        json!({"values": {
+            "deploy_note": {"note": {"type": "plain_text_input", "value": note}},
+            "deploy_urgency": {"urgency": {
+                "type": "static_select",
+                "selected_option": {
+                    "text": {"type": "plain_text", "text": urgency},
+                    "value": urgency
+                }
+            }},
+            "deploy_date": {"date": {"type": "datepicker", "selected_date": "2026-08-15"}},
+            "deploy_owner": {"owner": {"type": "users_select", "selected_user": "U1"}}
+        }})
+    };
+
+    let rejected = client
+        .submit_view(
+            &view_id,
+            state("reject", "normal"),
+            &Client::interaction_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.response_action.as_deref(), Some("errors"));
+    assert_eq!(
+        rejected.errors["deploy_note"],
+        "The app rejected this deployment note"
+    );
+
+    let updated = client
+        .submit_view(
+            &view_id,
+            state("ship it", "update"),
+            &Client::interaction_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.response_action.as_deref(), Some("update"));
+    assert_eq!(updated.view.as_ref().unwrap()["id"], "VMODAL1");
+
+    let pushed = client
+        .submit_view(
+            &view_id,
+            state("ship it", "push"),
+            &Client::interaction_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pushed.response_action.as_deref(), Some("push"));
+    assert_eq!(pushed.view.as_ref().unwrap()["previous_view_id"], "VMODAL1");
+
+    let submitted = client
+        .submit_view(
+            &view_id,
+            state("ship it", "normal"),
+            &Client::interaction_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.response_action, None);
+    assert_eq!(
+        submitted.toast_message.as_deref(),
+        Some("Deployment queued")
+    );
+
+    client
+        .close_view(
+            &view_id,
+            modal["root_view_id"].as_str().unwrap(),
+            &Client::interaction_token(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fake.calls("views.close"), 1);
+}
+
+#[tokio::test]
+async fn control_messages_can_carry_fresh_app_blocks() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(fake.control_url())
+        .json(&json!({
+            "kind": "message",
+            "channel": "C1",
+            "bot_id": "B1",
+            "text": "fresh app card",
+            "blocks": [{
+                "type": "actions",
+                "block_id": "deploy",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "open_modal",
+                    "text": {"type": "plain_text", "text": "Deploy release"}
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ts = response["ts"].as_str().unwrap();
+    let history = client(&fake)
+        .conversations_history_around(&ChannelId("C1".into()), &Ts(ts.into()), 5)
+        .await
+        .unwrap();
+    let card = history.iter().find(|message| message.ts.0 == ts).unwrap();
+    assert_eq!(card.bot_id.as_deref(), Some("B1"));
+    assert_eq!(card.blocks[0]["block_id"], "deploy");
+}

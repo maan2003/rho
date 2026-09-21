@@ -458,3 +458,93 @@ async fn mark_unread_round_trips_to_slack_and_uses_the_previous_message(cx: &mut
     }
     panic!("the backward conversations.mark never reached Slack");
 }
+
+#[gpui::test]
+async fn only_a_locally_correlated_view_event_can_open_a_modal(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    let opened = cx.new(|_| Vec::<serde_json::Value>::new());
+    cx.update(|cx| {
+        cx.subscribe(&rig.session, {
+            let opened = opened.clone();
+            move |_, event: &SessionEvent, cx| {
+                if let SessionEvent::View { view } = event {
+                    opened.update(cx, |opened, _| opened.push(view.clone()));
+                }
+            }
+        })
+        .detach();
+    });
+
+    rig.fake.push_frame(serde_json::json!({
+        "type": "view_opened",
+        "view_id": "VMODAL1",
+        "view_type": "modal",
+        "client_token": "0123456789abcdef0123456789abcdef",
+        "view": {"id": "VMODAL1", "type": "modal", "blocks": []}
+    }));
+    cx.executor()
+        .timer(std::time::Duration::from_millis(30))
+        .await;
+    cx.run_until_parked();
+    assert!(
+        opened.read_with(cx, |opened, _| opened.is_empty()),
+        "a token this session never sent cannot inject UI"
+    );
+
+    rig.fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "600.0",
+            "bot_id": "B1",
+            "text": "deploy",
+            "blocks": [{
+                "type": "actions",
+                "block_id": "deploy",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "open_modal",
+                    "text": {"type": "plain_text", "text": "Deploy release"}
+                }]
+            }]
+        }),
+    );
+    let message = rho_slack::api::parse_message(
+        &serde_json::json!({
+            "ts": "600.0",
+            "bot_id": "B1",
+            "text": "deploy",
+            "blocks": [{
+                "type": "actions",
+                "block_id": "deploy",
+                "elements": [{
+                    "type": "button",
+                    "action_id": "open_modal",
+                    "text": {"type": "plain_text", "text": "Deploy release"}
+                }]
+            }]
+        }),
+        &ChannelId("C1".into()),
+    )
+    .unwrap();
+    let action = rho_slack::block::interactions(&message.blocks, &rho_slack::block::NoNames)
+        .into_iter()
+        .next()
+        .unwrap();
+    rig.session.update(cx, |session, cx| {
+        session.run_interaction(message, action, None, cx)
+    });
+
+    for _ in 0..100 {
+        cx.run_until_parked();
+        if opened.read_with(cx, |opened, _| !opened.is_empty()) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let views = opened.read_with(cx, |opened, _| opened.clone());
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0]["id"], "VMODAL1");
+}

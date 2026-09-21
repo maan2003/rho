@@ -76,6 +76,14 @@ pub enum WsEvent {
         dialog_id: String,
         client_token: String,
     },
+    /// Slack opened or stacked a modern Block Kit view.
+    ViewOpened {
+        view_id: String,
+        view_type: String,
+        previous_view_id: Option<String>,
+        client_token: String,
+        view: Option<Value>,
+    },
     Ignored,
 }
 
@@ -92,6 +100,20 @@ pub fn parse(frame: &Value) -> WsEvent {
                 WsEvent::DialogOpened {
                     dialog_id: dialog_id.to_owned(),
                     client_token: client_token.to_owned(),
+                }
+            }
+            _ => WsEvent::Ignored,
+        },
+        "view_opened" => match (frame["view_id"].as_str(), frame["client_token"].as_str()) {
+            (Some(view_id), Some(client_token))
+                if !view_id.is_empty() && !client_token.is_empty() =>
+            {
+                WsEvent::ViewOpened {
+                    view_id: view_id.to_owned(),
+                    view_type: frame["view_type"].as_str().unwrap_or_default().to_owned(),
+                    previous_view_id: frame["previous_view_id"].as_str().map(str::to_owned),
+                    client_token: client_token.to_owned(),
+                    view: frame.get("view").filter(|view| view.is_object()).cloned(),
                 }
             }
             _ => WsEvent::Ignored,
@@ -319,6 +341,33 @@ mod tests {
         assert_eq!(
             parse(&json!({"type": "thread_subscribed", "subscription": {}})),
             WsEvent::Ignored
+        );
+    }
+
+    #[test]
+    fn a_modern_view_open_keeps_its_correlation_and_optional_body() {
+        let view = json!({"id": "V1", "type": "modal", "blocks": []});
+        assert_eq!(
+            parse(&json!({
+                "type": "view_opened",
+                "view_id": "V1",
+                "view_type": "modal",
+                "previous_view_id": "V0",
+                "client_token": "secret",
+                "view": view,
+            })),
+            WsEvent::ViewOpened {
+                view_id: "V1".into(),
+                view_type: "modal".into(),
+                previous_view_id: Some("V0".into()),
+                client_token: "secret".into(),
+                view: Some(view),
+            }
+        );
+        assert_eq!(
+            parse(&json!({"type": "view_opened", "view_id": "V1"})),
+            WsEvent::Ignored,
+            "an uncorrelated view is not UI"
         );
     }
 

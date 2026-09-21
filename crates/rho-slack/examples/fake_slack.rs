@@ -358,6 +358,11 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
                             "type": "button",
                             "action_id": "open_details",
                             "text": {"type": "plain_text", "text": "Add details"}
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "open_modal",
+                            "text": {"type": "plain_text", "text": "Deploy release"}
                         }
                     ]
                 }
