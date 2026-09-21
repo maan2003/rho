@@ -18,11 +18,12 @@ claims are not evidence that a workflow is complete.
 - Rho OKSolar P3 body text measures 6.509:1 against its editor background.
   Sidebar unread/mention state uses color, not bold weight; the conversation
   has a 4px inset and an avatar gutter.
-- Lightly rounded avatars are consistently 1.5 lines high. Slack's 192px
+- Lightly rounded avatars are consistently 1.25 lines high. Slack's 192px
   images are preferred for HiDPI. Initials fill pending or unavailable avatars;
   the gutter and folded author rows do not wait for the image download.
-  Message slots reserve at least 1.5 lines for avatars, then a half-line gap,
-  without blank source rows. Same-author follow-ups need no avatar minimum.
+  Message slots reserve at least 1.25 lines for avatars, then a half-line gap,
+  without blank source rows. Short text is vertically centered within its slot;
+  multiline bodies stay top-aligned. Same-author follow-ups need no avatar minimum.
   Wrapped paragraphs, leading code, and image attachments retain a common text margin.
   Names remain available for copy/search; initials remain on avatar failure.
   Message and last-reply timestamps are hidden.
@@ -67,6 +68,10 @@ claims are not evidence that a workflow is complete.
   The regression asserts unchanged display text, height and gutter width after
   release, including another author with no avatar. Inspected both states:
   `/src/slack-qa/screens/avatar-loading.png` and `avatar-loaded.png`.
+- Compact-avatar QA verifies 1.25-line images and initials, centered single-line
+  text, and top-aligned multiline/wrapped text. Inspected
+  `/src/slack-qa/screens/compact-avatar-loading.png` and `compact-avatar-loaded.png`.
+  Geometry tests also check adjacent short-message gaps and mouse hit positions.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 

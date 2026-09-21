@@ -64,8 +64,8 @@ fn a_gap_follows_the_last_visual_row_after_soft_wrap(cx: &mut TestAppContext) {
         ));
         editor.set_row_spacing(
             vec![editor::display_map::RowSpacing {
-                range: anchor..anchor,
-                minimum_height: 0.,
+                range: snapshot.anchor_before(language::Point::new(0, 0))..anchor,
+                minimum_height: 1.25,
                 gap_after: 0.5,
             }],
             cx,
@@ -91,6 +91,7 @@ fn a_gap_follows_the_last_visual_row_after_soft_wrap(cx: &mut TestAppContext) {
             let next = snapshot
                 .point_to_display_point(language::Point::new(1, 0), Bias::Left)
                 .row();
+            assert_eq!(snapshot.row_padding_before(DisplayRow(0)), 0.);
             assert!(last_wrapped.0 > 0, "the source row must actually soft-wrap");
             assert!(next > last_wrapped);
             assert_eq!(
@@ -218,12 +219,12 @@ fn avatar_minimum_height_does_not_add_a_blank_row_to_multiline_messages(cx: &mut
             vec![
                 editor::display_map::RowSpacing {
                     range: at(0, 0)..at(0, 5),
-                    minimum_height: 1.5,
+                    minimum_height: 1.25,
                     gap_after: 0.5,
                 },
                 editor::display_map::RowSpacing {
                     range: at(1, 0)..at(2, 4),
-                    minimum_height: 1.5,
+                    minimum_height: 1.25,
                     gap_after: 0.5,
                 },
             ],
@@ -236,19 +237,29 @@ fn avatar_minimum_height_does_not_add_a_blank_row_to_multiline_messages(cx: &mut
             let snapshot = editor.display_snapshot(cx);
             assert_eq!(
                 snapshot.row_y(1.),
-                2.,
-                "one-line body reserves 1.5 avatar + 0.5 gap"
+                1.75,
+                "one-line body reserves 1.25 avatar + 0.5 gap"
             );
             assert_eq!(
                 snapshot.row_y(2.),
-                3.,
+                2.75,
                 "internal body lines remain consecutive"
             );
             assert_eq!(
                 snapshot.row_y(3.),
-                4.5,
+                4.25,
                 "multiline body adds only the half-line gap"
             );
+            assert_eq!(
+                snapshot.row_y(0.),
+                0.125,
+                "short text has equal top and bottom padding"
+            );
+            assert_eq!(snapshot.row_padding_before(DisplayRow(0)), 0.125);
+            assert_eq!(snapshot.row_padding_before(DisplayRow(1)), 0.);
+            for row in [0., 0.5, 1., 1.75, 2., 3.] {
+                assert!((snapshot.row_at_y(snapshot.row_y(row)) - row).abs() < 1e-9);
+            }
             assert_eq!(snapshot.text(), "short\nlong\nbody\nnext");
         })
         .unwrap();

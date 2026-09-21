@@ -7,6 +7,8 @@
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RowGeometry {
     entries: Vec<Entry>,
+    padding: Vec<(u32, f32)>,
+    leading: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,12 +53,45 @@ impl RowGeometry {
                 entry
             })
             .collect();
-        Self { entries }
+        Self {
+            entries,
+            padding: Vec::new(),
+            leading: 0.0,
+        }
+    }
+
+    /// Center undersized content by moving half of its spare height before it.
+    pub(crate) fn with_padding(gaps: Vec<(u32, f32)>, mut padding: Vec<(u32, f32)>) -> Self {
+        let mut gaps = Self::new(gaps)
+            .entries
+            .into_iter()
+            .map(|entry| (entry.row, entry.gap as f32))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        padding.sort_unstable_by_key(|(row, _)| *row);
+        padding.dedup_by_key(|(row, _)| *row);
+        let mut leading = 0.0;
+        for &(row, inset) in &padding {
+            if row == 0 {
+                leading = inset as f64;
+            } else {
+                *gaps.entry(row - 1).or_default() += inset;
+            }
+        }
+        let mut geometry = Self::new(gaps.into_iter().collect());
+        geometry.padding = padding;
+        geometry.leading = leading;
+        geometry
+    }
+
+    pub(crate) fn padding_before(&self, row: u32) -> f64 {
+        self.padding
+            .binary_search_by_key(&row, |(row, _)| *row)
+            .map_or(0.0, |ix| self.padding[ix].1 as f64)
     }
 
     pub(crate) fn row_y(&self, row: f64) -> f64 {
         if self.entries.is_empty() || row < 0.0 {
-            return row;
+            return row + self.leading;
         }
 
         let logical_row = row.floor().min(u32::MAX as f64) as u32;
@@ -72,10 +107,11 @@ impl RowGeometry {
             .get(ix)
             .filter(|entry| entry.row == logical_row)
             .map_or(0.0, |entry| entry.gap);
-        row + prefix + row.fract() * gap
+        row + self.leading + prefix + row.fract() * gap
     }
 
     pub(crate) fn row_at_y(&self, y: f64) -> f64 {
+        let y = y - self.leading;
         if self.entries.is_empty() || y < 0.0 {
             return y;
         }
@@ -101,6 +137,25 @@ mod tests {
 
     fn close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn centers_adjacent_short_rows_without_changing_the_message_gap() {
+        let geometry =
+            RowGeometry::with_padding(vec![(0, 0.625), (1, 0.625)], vec![(0, 0.125), (1, 0.125)]);
+        close(geometry.row_y(0.), 0.125);
+        close(geometry.row_y(1.), 1.875);
+        close(geometry.row_y(2.), 3.5);
+        close(
+            geometry.row_y(1.)
+                - geometry.padding_before(1)
+                - (geometry.row_y(0.) - geometry.padding_before(0) + 1.25),
+            0.5,
+        );
+        for row in [0., 0.25, 0.999, 1., 1.5, 2., 7.25] {
+            close(geometry.row_at_y(geometry.row_y(row)), row);
+        }
+        assert!(!geometry.is_empty());
     }
 
     #[test]

@@ -9911,7 +9911,7 @@ impl Editor {
         Some(text_highlights)
     }
 
-    /// Sets a 1.5-line gutter avatar without changing text or row geometry.
+    /// Sets a 1.25-line gutter avatar without changing text or row geometry.
     /// Callers reserve its content height using `RowSpacing`.
     /// Removing the last image releases the gutter width unless explicitly reserved.
     pub fn set_gutter_image(
@@ -12825,7 +12825,7 @@ impl EditorSnapshot {
     ) -> GutterDimensions {
         if self.has_gutter_images {
             GutterDimensions {
-                width: style.text.line_height_in_pixels(window.rem_size()) * 1.5 + font_size * 0.5,
+                width: style.text.line_height_in_pixels(window.rem_size()) * 1.25 + font_size * 0.5,
                 ..Default::default()
             }
         } else if self.show_compact_gutter

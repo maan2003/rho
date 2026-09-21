@@ -559,7 +559,7 @@ transcript renders through, and owns none of its own. Concretely:
   markups are told apart; `block.rs` resolves the ids, links and lists the
   same way for both.
 - A message is one block of the document, keyed by its `ts`. Subtly rounded
-  profile images occupy a dedicated gutter at a consistent 1.5-line size.
+  profile images occupy a dedicated gutter at a consistent 1.25-line size.
   The gutter width and author slots are reserved before downloads start;
   initials occupy unavailable images without changing layout. Author headers
   are concealed from the first populated frame, retaining names for copy/search. Nearby messages
@@ -571,8 +571,9 @@ transcript renders through, and owns none of its own. Concretely:
 - Day breaks are source headings centered by an anchored editor row-alignment
   primitive. They never replace body rows. The unread line stays left-aligned.
   Message boundaries add half a line of display-only trailing space after the
-  larger of the body height and its 1.5-line avatar slot. The editor's shared
-  geometry owns wrapping, scrolling, selection and hit testing.
+  larger of the body height and its 1.25-line avatar slot. Single-line
+  bodies are vertically centered in that slot; multiline bodies stay top-aligned.
+  The editor's shared geometry owns wrapping, scrolling, selection and hit testing.
   Per-message and last-reply timestamps are hidden; date separators remain.
 - Attachments, previews, reactions, and thread summaries follow the body.
   The sidebar distinguishes unread conversations by text color rather than

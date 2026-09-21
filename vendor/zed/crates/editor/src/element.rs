@@ -5907,19 +5907,15 @@ impl EditorElement {
             }),
             |window| {
                 for (row, avatar) in images {
-                    let side = line_height * 1.5;
+                    let side = line_height * 1.25;
                     let y = layout.gutter_hitbox.top()
                         + Pixels::from(
-                            snapshot.row_y(row.as_f64()) * ScrollPixelOffset::from(line_height)
+                            (snapshot.row_y(row.as_f64()) - snapshot.row_padding_before(row))
+                                * ScrollPixelOffset::from(line_height)
                                 - layout.position_map.scroll_pixel_position.y,
                         );
-                    let bounds = Bounds::new(
-                        point(
-                            layout.gutter_hitbox.left() + (line_height * 1.5 - side) / 2.,
-                            y,
-                        ),
-                        size(side, side),
-                    );
+                    let bounds =
+                        Bounds::new(point(layout.gutter_hitbox.left(), y), size(side, side));
                     let corners = Corners::all(side * 0.12);
                     // The fallback is also painted beneath a pending GPU upload.
                     window.paint_quad(

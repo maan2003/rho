@@ -1851,7 +1851,7 @@ impl ConversationView {
                     range: snapshot.anchor_in_excerpt(range.start)?
                         ..snapshot.anchor_in_excerpt(buffer.anchor_before(end - 1))?,
                     minimum_height: if self.avatar_authors.contains_key(row) {
-                        1.5
+                        1.25
                     } else {
                         0.
                     },

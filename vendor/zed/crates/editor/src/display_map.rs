@@ -234,6 +234,7 @@ pub struct RowSpacing {
     /// Anchors in the first and last source rows of the content.
     pub range: Range<Anchor>,
     /// The minimum space reserved for content, including any attached blocks.
+    /// Content shorter than this is centered vertically within the reserved space.
     pub minimum_height: f32,
     /// Space following the larger of the content height and its minimum height.
     pub gap_after: f32,
@@ -1945,6 +1946,11 @@ impl DisplaySnapshot {
         self.row_geometry.row_at_y(y)
     }
 
+    /// Space above content centered in a minimum-height slot.
+    pub fn row_padding_before(&self, row: DisplayRow) -> f64 {
+        self.row_geometry.padding_before(row.0)
+    }
+
     pub(crate) fn has_row_spacing(&self) -> bool {
         !self.row_geometry.is_empty()
     }
@@ -1956,6 +1962,7 @@ impl DisplaySnapshot {
         let buffer = self.buffer_snapshot();
         let max_buffer_row = buffer.max_point().row;
         let mut gaps = Vec::with_capacity(spacing.len());
+        let mut padding = Vec::new();
         for spacing in spacing {
             let anchor = spacing.range.end;
             let gap = spacing.gap_after;
@@ -1986,13 +1993,14 @@ impl DisplaySnapshot {
             if boundary >= last_text_row {
                 let first = spacing.range.start.to_display_point(self).row();
                 let content_height = boundary.0.saturating_sub(first.0) as f32 + 1.;
-                gaps.push((
-                    boundary.0,
-                    gap + (spacing.minimum_height - content_height).max(0.),
-                ));
+                let inset = (spacing.minimum_height - content_height).max(0.) / 2.;
+                if inset > 0. {
+                    padding.push((first.0, inset));
+                }
+                gaps.push((boundary.0, gap + inset));
             }
         }
-        row_geometry::RowGeometry::new(gaps)
+        row_geometry::RowGeometry::with_padding(gaps, padding)
     }
 
     pub fn wrap_snapshot(&self) -> &WrapSnapshot {

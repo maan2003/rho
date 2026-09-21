@@ -64,7 +64,9 @@ fn frame_distribution_reports_nearest_rank_percentiles() {
 }
 
 #[gpui::test]
-fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &mut TestAppContext) {
+fn gutter_images_reserve_one_and_a_quarter_line_width_without_inserting_text(
+    cx: &mut TestAppContext,
+) {
     cx.update(init_test_app);
     let window = cx.add_window(|window, cx| {
         let mut editor = Editor::multi_line(window, cx);
@@ -92,7 +94,7 @@ fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &m
                 .width;
             assert_eq!(
                 reserved,
-                line_height * 1.5 + font_size * 0.5,
+                line_height * 1.25 + font_size * 0.5,
                 "reserve the final width before there are any images"
             );
 
@@ -108,7 +110,7 @@ fn gutter_images_reserve_one_and_a_half_line_width_without_inserting_text(cx: &m
             let dimensions = editor
                 .snapshot(window, cx)
                 .gutter_dimensions(font_id, font_size, &style, window, cx);
-            assert_eq!(dimensions.width, line_height * 1.5 + font_size * 0.5);
+            assert_eq!(dimensions.width, line_height * 1.25 + font_size * 0.5);
             assert_eq!(
                 editor.display_snapshot(cx).text(),
                 before,
@@ -155,7 +157,7 @@ fn centered_rows_and_fractional_gaps_share_paint_and_hit_geometry(cx: &mut TestA
             vec![
                 editor::display_map::RowSpacing {
                     range: anchor(1)..anchor(1),
-                    minimum_height: 0.,
+                    minimum_height: 1.25,
                     gap_after: 0.5,
                 },
                 editor::display_map::RowSpacing {
@@ -191,12 +193,16 @@ fn centered_rows_and_fractional_gaps_share_paint_and_hit_geometry(cx: &mut TestA
                             .unwrap()
                     };
                 let origin = position(editor, 1, 0, window, cx);
+                assert_eq!(snapshot.row_y(1.), 1.125);
+                assert_eq!(snapshot.row_padding_before(DisplayRow(1)), 0.125);
                 let next = position(editor, 2, 0, window, cx);
-                assert!((f32::from(next.y - origin.y) - f32::from(line_height) * 1.5).abs() < 0.1);
+                assert!(
+                    (f32::from(next.y - origin.y) - f32::from(line_height) * 1.625).abs() < 0.1
+                );
                 let date = position(editor, 4, 0, window, cx);
                 let first_date = position(editor, 0, 0, window, cx);
                 assert!(
-                    (f32::from(date.y - first_date.y) - f32::from(line_height) * 4.75).abs() < 0.1
+                    (f32::from(date.y - first_date.y) - f32::from(line_height) * 5.).abs() < 0.1
                 );
                 assert!(date.x > origin.x + px(80.), "dates center; body stays left");
                 for (row, offset) in [(0, 0), (1, 10), (2, 16), (3, 28), (4, 33), (5, 43)] {
