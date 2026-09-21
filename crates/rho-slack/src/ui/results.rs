@@ -320,7 +320,10 @@ impl ResultsView {
             return;
         }
         self.inventory_state = Some(state);
-        let selected = self.cursor_place(cx);
+        let selected = match self.cursor_target(cx) {
+            Some(Target::Message(place)) => Some(place),
+            _ => None,
+        };
         let mut lines = vec![(None, vec![Span::styled(heading.to_owned(), Class::Muted)])];
         if let Some(reason) = health {
             lines.push((None, vec![Span::styled(reason, Class::Error)]));
