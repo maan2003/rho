@@ -3770,3 +3770,40 @@ async fn closing_the_view_during_send_still_cleans_pending_and_gates_reopen(
         Submitted::Nothing
     );
 }
+
+#[gpui::test]
+async fn copy_message_link_writes_the_server_permalink(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "510.000321", "user": "UD", "text": "copy this message"
+        }),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId("C1".into())),
+                window,
+                cx,
+            );
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".into()));
+            workspace.slack_copy_message_link(rho_slack::types::Ts("510.000321".into()), cx);
+        })
+        .unwrap();
+    let mut copied = None;
+    for _ in 0..100 {
+        cx.run_until_parked();
+        copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        if copied.as_deref() != Some("unchanged") {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        copied.as_deref(),
+        Some("https://acme.slack.com/archives/C1/p510000321")
+    );
+}
