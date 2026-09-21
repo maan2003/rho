@@ -37,6 +37,8 @@ use crate::types::{
 /// byte order and time order agree.
 const SEPARATOR: char = '\u{1f}';
 
+const FAVORITES: TableDefinition<&str, bool> = TableDefinition::new("rho_slack_favorites_v1");
+
 const MESSAGES: TableDefinition<&str, Sen<StoredMessage>> =
     TableDefinition::new("rho_slack_messages_v1");
 const GAPS: TableDefinition<&str, Sen<StoredGap>> = TableDefinition::new("rho_slack_gaps_v1");
@@ -158,6 +160,7 @@ impl Mirror {
         // rather than a panic.
         futures::executor::block_on(async {
             let mut write = db.write().await;
+            write.open_table(FAVORITES);
             write.open_table(MESSAGES);
             write.open_table(GAPS);
             write.open_table(USERS);
@@ -610,6 +613,28 @@ impl Mirror {
             .collect();
         names.dedup();
         names
+    }
+
+    pub fn favorite(&self, workspace: &str, channel: &ChannelId) -> bool {
+        self.db
+            .read()
+            .open_table(FAVORITES)
+            .get(format!("{workspace}{SEPARATOR}{}", channel.as_str()).as_str())
+            .is_some()
+    }
+
+    pub fn set_favorite(&self, workspace: &str, channel: &ChannelId, favorite: bool) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(FAVORITES);
+            let key = format!("{workspace}{SEPARATOR}{}", channel.as_str());
+            if favorite {
+                table.insert(key.as_str(), true);
+            } else {
+                table.remove(key.as_str());
+            }
+        }
+        txn.commit();
     }
 
     pub fn put_conversations(&self, workspace: &str, conversations: &[Conversation]) {

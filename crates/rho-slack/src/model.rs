@@ -573,6 +573,12 @@ impl Model {
         }
     }
 
+    pub fn people(&self) -> Vec<User> {
+        let mut people: Vec<_> = self.users.values().cloned().collect();
+        people.sort_by_key(|user| (user.name.to_lowercase(), user.id.clone()));
+        people
+    }
+
     pub fn conversation(&self, channel: &ChannelId) -> Option<&Conversation> {
         self.conversations.get(channel)
     }

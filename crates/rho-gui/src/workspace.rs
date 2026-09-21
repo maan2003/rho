@@ -8613,20 +8613,27 @@ impl Workspace {
             crate::telemetry::record_surfaces(focused_surface, focused_surface.bit());
         }
         self.sync_diff_visibility(true, cx);
+        let slack = self.active_context == ContextId::Slack;
+        let sidebar = slack.then(|| self.render_slack_sidebar(cx));
+        let header = slack.then(|| self.render_slack_header(cx));
         div()
             .flex()
             .flex_row()
             .w_full()
             .flex_grow(1.0)
             .min_h_0()
+            .children(sidebar)
             .child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
                     .h_full()
                     .relative()
                     .overflow_hidden()
+                    .children(header)
                     .child(self.render_surface(self.active_surface())),
             )
             .into_any_element()
@@ -8963,6 +8970,19 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))
+            .on_action(
+                cx.listener(|this, _: &crate::SlackQuickSwitch, window, cx| {
+                    this.prompt_slack_switch(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::SlackNewMessage, window, cx| {
+                this.prompt_slack_people(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &crate::SlackBrowseChannels, window, cx| {
+                    this.slack_browse_channels(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &SlackOpenRow, window, cx| {
                 this.slack_open_row(window, cx);
             }))

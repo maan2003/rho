@@ -19,6 +19,7 @@ pub mod rho_assets;
 mod sampler;
 pub(crate) mod search;
 pub mod slack;
+mod slack_navigation;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod transient;
@@ -108,6 +109,9 @@ actions!(
         OverviewToggle,
         VerdictMenu,
         SurfaceClose,
+        SlackQuickSwitch,
+        SlackNewMessage,
+        SlackBrowseChannels,
         SlackOpenRow,
         SlackCompose,
         SlackSearch,
@@ -442,7 +446,18 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             // The next conversation with something in it. `shift-n` and
             // not `n`, because `n` in a transcript is the search the reader
             // just ran.
+            KeyBinding::new("ctrl-p", SlackQuickSwitch, Some(context)),
+            KeyBinding::new("ctrl-n", SlackNewMessage, Some(context)),
             KeyBinding::new("shift-n", SlackNextUnread, Some(context)),
+        ]);
+    }
+    for context in [
+        "RhoSlackResults > Editor && vim_mode == normal",
+        "RhoSlackResults > Editor && vim_mode == helix_normal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-p", SlackQuickSwitch, Some(context)),
+            KeyBinding::new("ctrl-n", SlackNewMessage, Some(context)),
         ]);
     }
     // Writing is a conversation's, not the list's: both of these take a key

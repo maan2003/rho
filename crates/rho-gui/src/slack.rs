@@ -1514,6 +1514,14 @@ impl Workspace {
             self.slack_labels.insert(source, label);
         }
         match event {
+            SessionEvent::OpenConversation(channel) => {
+                self.open_slack_source(Source::Conversation(channel.clone()), window, cx);
+                self.slack_compose(window, cx);
+                self.enter_insert_when_shown(window, cx);
+            }
+            SessionEvent::Directory(channels) => {
+                self.prompt_slack_directory(channels.clone(), window, cx);
+            }
             SessionEvent::Found(found) => {
                 self.slack_found(found, window, cx);
             }

@@ -168,6 +168,18 @@ impl Fake {
     /// A user whose display name differs from the handle, which is the
     /// normal case in a real workspace and the one that catches a client
     /// rendering the handle.
+    pub fn add_unjoined_channel(&self, id: &str, name: &str) {
+        self.add_channel(id, name);
+        let mut state = self.state.lock().unwrap();
+        if let Some(channel) = state
+            .conversations
+            .iter_mut()
+            .find(|channel| channel["id"] == id)
+        {
+            channel["is_member"] = json!(false);
+        }
+    }
+
     pub fn add_user_named(&self, id: &str, handle: &str, display: &str) {
         // Every user carries a picture and the hash that decides whether a
         // cached copy is still current, because that pair is what the
@@ -1267,6 +1279,94 @@ fn handle(
             "self": {"id": "ME", "name": "you"},
             "team": {"name": "acme"},
         }),
+        "conversations.open" => {
+            let mut users: Vec<String> = field("users")
+                .split(',')
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .collect();
+            users.sort();
+            users.dedup();
+            if users.is_empty()
+                || users.len() > 8
+                || users
+                    .iter()
+                    .any(|id| !state.users.iter().any(|user| user["id"] == *id))
+            {
+                return json!({"ok": false, "error": "user_not_found"});
+            }
+            let existing = state
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    if users.len() == 1 {
+                        conversation["is_im"] == true && conversation["user"] == users[0]
+                    } else {
+                        let mut members: Vec<String> = conversation["members"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|member| member.as_str())
+                            .filter(|id| *id != "ME")
+                            .map(str::to_owned)
+                            .collect();
+                        members.sort();
+                        conversation["is_mpim"] == true && members == users
+                    }
+                })
+                .cloned();
+            let conversation = existing.unwrap_or_else(|| {
+                let id = format!(
+                    "{}{}",
+                    if users.len() == 1 { "D" } else { "G" },
+                    state.conversations.len() + 100
+                );
+                let conversation = if users.len() == 1 {
+                    json!({"id": id, "is_im": true, "user": users[0], "name": users[0]})
+                } else {
+                    let mut members = users.clone();
+                    members.push("ME".to_owned());
+                    json!({"id": id, "is_mpim": true, "members": members, "name": "group"})
+                };
+                state.conversations.push(conversation.clone());
+                conversation
+            });
+            json!({"ok": true, "channel": conversation})
+        }
+        "conversations.list" => {
+            let channels: Vec<_> = state
+                .conversations
+                .iter()
+                .filter(|channel| {
+                    channel["is_im"] != true
+                        && channel["is_mpim"] != true
+                        && channel["is_private"] != true
+                })
+                .cloned()
+                .collect();
+            let start = field("cursor")
+                .parse::<usize>()
+                .unwrap_or(0)
+                .min(channels.len());
+            let end =
+                (start + field("limit").parse::<usize>().unwrap_or(200).max(1)).min(channels.len());
+            json!({"ok": true, "channels": channels[start..end], "response_metadata": {
+                "next_cursor": if end < channels.len() { end.to_string() } else { String::new() }
+            }})
+        }
+        "conversations.join" => {
+            let id = field("channel");
+            let Some(channel) = state.conversations.iter_mut().find(|channel| {
+                channel["id"] == id
+                    && channel["is_private"] != true
+                    && channel["is_im"] != true
+                    && channel["is_mpim"] != true
+            }) else {
+                return json!({"ok": false, "error": "channel_not_found"});
+            };
+            channel["is_member"] = json!(true);
+            json!({"ok": true, "channel": channel})
+        }
         "users.list" => json!({"ok": true, "members": state.users}),
         "users.info" => {
             let id = field("user");
@@ -1280,7 +1380,9 @@ fn handle(
                 None => json!({"ok": false, "error": "user_not_found"}),
             }
         }
-        "users.conversations" => json!({"ok": true, "channels": state.conversations}),
+        "users.conversations" => {
+            json!({"ok": true, "channels": state.conversations.iter().filter(|channel| channel["is_member"] != false).collect::<Vec<_>>()})
+        }
         "conversations.info" => {
             let id = field("channel");
             match state

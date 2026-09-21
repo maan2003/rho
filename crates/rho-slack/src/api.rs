@@ -550,6 +550,71 @@ impl Client {
         }
     }
 
+    /// Open (or reuse) a direct/group conversation. Slack, not a local guessed
+    /// channel id, decides the membership and identity.
+    pub async fn open_direct(&self, users: &[UserId]) -> anyhow::Result<Conversation> {
+        anyhow::ensure!(
+            !users.is_empty() && users.len() <= 8,
+            "choose one to eight people"
+        );
+        let body = self
+            .post_form(
+                "conversations.open",
+                &[
+                    (
+                        "users",
+                        users
+                            .iter()
+                            .map(|user| user.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    ("return_im", "true".to_owned()),
+                ],
+            )
+            .await?;
+        parse_conversation(&body["channel"])
+            .ok_or_else(|| anyhow::anyhow!("Slack did not return a conversation"))
+    }
+
+    /// Public channels include rooms the reader has not joined.
+    pub async fn channel_directory(&self) -> anyhow::Result<Vec<Conversation>> {
+        let mut channels = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let body = self
+                .post_form(
+                    "conversations.list",
+                    &[
+                        ("types", "public_channel".to_owned()),
+                        ("exclude_archived", "true".to_owned()),
+                        ("limit", "200".to_owned()),
+                        ("cursor", cursor),
+                    ],
+                )
+                .await?;
+            channels.extend(
+                body["channels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(parse_conversation),
+            );
+            cursor = string(&body["response_metadata"]["next_cursor"]).unwrap_or_default();
+            if cursor.is_empty() {
+                return Ok(channels);
+            }
+        }
+    }
+
+    pub async fn join_channel(&self, channel: &ChannelId) -> anyhow::Result<Conversation> {
+        let body = self
+            .post_form("conversations.join", &[("channel", channel.0.clone())])
+            .await?;
+        parse_conversation(&body["channel"])
+            .ok_or_else(|| anyhow::anyhow!("Slack did not return the joined channel"))
+    }
+
     pub async fn conversation_info(&self, channel: &ChannelId) -> anyhow::Result<Conversation> {
         let body = self
             .post_form("conversations.info", &[("channel", channel.0.clone())])

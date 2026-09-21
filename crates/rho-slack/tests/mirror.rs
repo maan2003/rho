@@ -430,3 +430,22 @@ async fn scrolling_into_a_gap_costs_one_bounded_page() {
     );
     assert_eq!(fake.calls("conversations.history"), 1);
 }
+
+#[test]
+fn favorite_survives_reopening_without_leaking_to_another_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("favorites.redb");
+    let c1 = ChannelId::from("C1");
+    let c2 = ChannelId::from("C2");
+    {
+        let mirror = Mirror::open(&path).unwrap();
+        assert!(!mirror.favorite("acme", &c1));
+        mirror.set_favorite("acme", &c1, true);
+        assert!(!mirror.favorite("acme", &c2));
+    }
+    let mirror = Mirror::open(&path).unwrap();
+    assert!(mirror.favorite("acme", &c1));
+    assert!(!mirror.favorite("other", &c1));
+    mirror.set_favorite("acme", &c1, false);
+    assert!(!mirror.favorite("acme", &c1));
+}

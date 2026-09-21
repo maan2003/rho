@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     fake.add_group(GROUP, GROUP_NAME, &["ME", "UD", "UK"]);
     fake.add_channel("C1", "design");
     fake.add_channel("C2", "random");
+    fake.add_unjoined_channel("CNEW", "new-project");
     fake.add_private_channel("P1", "founders");
     fake.add_dm("D1", "UD");
 

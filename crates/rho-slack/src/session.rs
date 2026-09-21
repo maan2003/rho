@@ -67,6 +67,8 @@ pub enum Status {
 #[derive(Clone, Debug)]
 pub enum SessionEvent {
     Connected,
+    OpenConversation(ChannelId),
+    Directory(Vec<crate::types::Conversation>),
     Disconnected(String),
     /// Threads whose obligation changed, for the inbox and the journal.
     Changed(Vec<Change>),
@@ -968,6 +970,93 @@ impl Session {
     /// raced: `asked` counts queries, and an answer that is not the current
     /// one is dropped, so what the reader is shown is always the last thing
     /// they typed and never an older answer that took longer.
+    pub fn favorite(&self, channel: &ChannelId) -> bool {
+        self.mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.favorite(&self.model.workspace().0, channel))
+    }
+
+    pub fn toggle_favorite(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if let Some(mirror) = &self.mirror {
+            mirror.set_favorite(&self.model.workspace().0, channel, !self.favorite(channel));
+            cx.notify();
+        }
+    }
+
+    pub fn open_direct(&mut self, users: Vec<UserId>, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let task = gpui_tokio::Tokio::spawn(cx, async move { client.open_direct(&users).await });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            let _ = this.update(cx, |session, cx| match answer {
+                Ok(Ok(conversation)) => session.joined_conversation(conversation, cx),
+                Ok(Err(error)) => cx.emit(SessionEvent::Notice(format!(
+                    "Could not open conversation: {error}"
+                ))),
+                Err(error) => cx.emit(SessionEvent::Notice(format!(
+                    "Could not open conversation: {error}"
+                ))),
+            });
+        }));
+    }
+
+    pub fn browse_channels(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let task = gpui_tokio::Tokio::spawn(cx, async move { client.channel_directory().await });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            let _ = this.update(cx, |_, cx| match answer {
+                Ok(Ok(channels)) => cx.emit(SessionEvent::Directory(channels)),
+                Ok(Err(error)) => cx.emit(SessionEvent::Notice(format!(
+                    "Could not browse channels: {error}"
+                ))),
+                Err(error) => cx.emit(SessionEvent::Notice(format!(
+                    "Could not browse channels: {error}"
+                ))),
+            });
+        }));
+    }
+
+    pub fn join_channel(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let task = gpui_tokio::Tokio::spawn(cx, async move { client.join_channel(&channel).await });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            let _ = this.update(cx, |session, cx| match answer {
+                Ok(Ok(conversation)) => session.joined_conversation(conversation, cx),
+                Ok(Err(error)) => cx.emit(SessionEvent::Notice(format!(
+                    "Could not join channel: {error}"
+                ))),
+                Err(error) => cx.emit(SessionEvent::Notice(format!(
+                    "Could not join channel: {error}"
+                ))),
+            });
+        }));
+    }
+
+    fn joined_conversation(
+        &mut self,
+        conversation: crate::types::Conversation,
+        cx: &mut Context<Self>,
+    ) {
+        let channel = conversation.id.clone();
+        if let Some(mirror) = &self.mirror {
+            mirror.put_conversations(
+                &self.model.workspace().0,
+                std::slice::from_ref(&conversation),
+            );
+        }
+        self.model.add_conversations([conversation]);
+        cx.emit(SessionEvent::OpenConversation(channel));
+        cx.notify();
+    }
+
     pub fn search(&mut self, query: &str, page: u32, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;

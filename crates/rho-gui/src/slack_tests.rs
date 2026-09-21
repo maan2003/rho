@@ -2760,3 +2760,53 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
         })
         .unwrap();
 }
+
+/// The people picker must not duplicate the already-completed first recipient
+/// when completion replaces the second recipient. The real fake checks users.
+#[gpui::test]
+async fn new_message_picker_opens_a_group_and_sends(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    cx.simulate_keystrokes(*workspace, "ctrl-n");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "a d a , space d a n a enter");
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.slack_open_label_for_test(cx)
+            })
+            .unwrap()
+            .is_some_and(|label| label.contains("ada") && label.contains("dana"))
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let label = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.slack_open_label_for_test(cx)
+        })
+        .unwrap();
+    assert!(
+        label
+            .as_ref()
+            .is_some_and(|label| label.contains("ada") && label.contains("dana")),
+        "{label:?}"
+    );
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "h e l l o enter");
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if !fake.posted().is_empty() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(fake.posted().last().unwrap().text, "hello");
+}

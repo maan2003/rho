@@ -1853,3 +1853,63 @@ async fn a_second_page_of_hits_is_the_next_ones_and_not_the_same_ones() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(seen.len(), 45, "no message is on both pages");
 }
+
+#[tokio::test]
+async fn discovery_opens_reuses_and_joins_real_conversations() {
+    use rho_slack::types::{ConversationKind, UserId};
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UA", "ada", "Ada");
+    fake.add_user_named("UB", "bea", "Bea");
+    fake.add_unjoined_channel("NEW", "new-room");
+    let client = client(&fake);
+    assert!(
+        !client
+            .conversations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id.as_str() == "NEW")
+    );
+    let dm = client.open_direct(&[UserId("UB".into())]).await.unwrap();
+    assert_eq!(dm.user, Some(UserId("UB".into())));
+    assert_eq!(dm.kind, ConversationKind::DirectMessage);
+    assert_eq!(
+        client.open_direct(&[UserId("UB".into())]).await.unwrap().id,
+        dm.id
+    );
+    let group = client
+        .open_direct(&[UserId("UA".into()), UserId("UB".into())])
+        .await
+        .unwrap();
+    assert_eq!(group.kind, ConversationKind::Group);
+    assert!(group.members.contains(&UserId("UA".into())));
+    assert!(group.members.contains(&UserId("UB".into())));
+    assert!(
+        client
+            .open_direct(&[UserId("UNKNOWN".into())])
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .channel_directory()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id.as_str() == "NEW")
+    );
+    client.join_channel(&ChannelId("NEW".into())).await.unwrap();
+    assert!(
+        client
+            .conversations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id.as_str() == "NEW")
+    );
+    client
+        .post_message(&dm.id, None, "hello Bea")
+        .await
+        .unwrap();
+    assert_eq!(fake.posted().last().unwrap().channel, dm.id.0);
+}
