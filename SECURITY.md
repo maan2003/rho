@@ -359,6 +359,19 @@ AI APIs.
   folds plus fixed-cell image inlays, and preservation of shortcode text for
   copy and search.
 
+## Slack app interactions
+
+- App messages are remote content, not local commands. Buttons and selections
+  dispatch only after explicit user activation, using the authenticated Slack
+  API. Confirmation fields require a separate confirmation; modal submissions
+  have an explicit Submit/Cancel step.
+- Each dispatched app action uses a fresh 128-bit random correlation token.
+  Dialog and view-opening events must consume a locally pending token within
+  60 seconds; unsolicited, expired, and duplicate opening events are ignored.
+  Modal state is submitted through Slack's views API, not to arbitrary URLs
+  supplied in message content. URL buttons use the existing browser path only
+  after user activation.
+
 ## Remote UI transport (iroh)
 
 - With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
