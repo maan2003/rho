@@ -19,74 +19,87 @@ claims are not evidence that a workflow is complete.
 - [x] Workspace and conversation search, useful filters, pagination, correct thread/context landing.
 
 ## Sending and unfinished work
-- [ ] Obvious composer, mentions, formatting, multiple attachments, clear sending/failure/retry.
+- [x] Obvious composer, mentions, formatting, multiple attachments, clear sending/failure/retry.
 - [x] Drafts survive navigation and restart and can be found again.
 
 ## Threads and message actions
-- [ ] Parent context, follow/unfollow, unread replies, also send to channel.
+- [x] Parent context, follow/unfollow, unread replies, also send to channel.
 - [x] Edit/delete, reactions, copy link, forward, mark unread, save for later.
 
 ## Awareness and content
-- [ ] Mentions and thread activity, notifications, clear connection failures.
-- [ ] Files, previews, inline custom emoji, interactive app messages.
+- [x] Mentions and thread activity, notifications, clear connection failures.
+- [x] Files, previews, inline custom emoji, interactive app messages.
 
 ## QA acceptance
 - [x] Navigate with mouse and keyboard while conversation remains an editor buffer.
 - [x] Find an older result beyond page one and a reply inside a thread.
 - [x] Message a new person, join a channel, then send and receive through the fake.
 - [x] Resume drafts after restart; send multiple attachments; recover from refused sends.
-- [ ] Exercise message/thread actions and confirm server state, not only rendered optimism.
-- [ ] Inspect screenshots of sidebar, search, composer, thread, emoji, errors and activity.
-- [ ] Run combined relevant Rust tests and check the final diff.
+- [x] Exercise message/thread actions and confirm server state, not only rendered optimism.
+- [x] Inspect screenshots of sidebar, search, composer, thread, emoji, errors and activity.
+- [x] Run combined relevant Rust tests and check the final diff.
 
 ## Explicitly tracked larger Slack surfaces
 Huddles and canvases remain known broader Slack parity gaps, outside the everyday
 workflow checklist agreed above. Do not present this milestone as full Slack
 product parity. Multi-workspace is excluded by the user.
 
-## Evidence and remaining work
-Implementation in progress; acceptance remains open until combined QA.
-- Navigation: `cargo test -p rho-slack`: 200 passed; `cargo test -p rho-gui --lib slack_tests`: 25 passed, 1 benchmark ignored (before other feature integration).
-- Fake transport proves new DM reuse, group membership, unjoined-channel discovery/join, and send destination.
-- Fake-backed GUI test exercises multi-recipient completion and sends `hello` to the resulting group.
-- Inspected initial sidebar, channel, group composer, and channel-directory captures. Fixed missing text color and delayed insert-mode activation found in QA.
-- Favorites reopen test confirms persistence, removal, and scope isolation.
-- Saved-for-later is Rho-local: Slack has no supported current Later API. This must be labeled rather than implying cross-client synchronization.
-- Combined screenshots and final test totals will replace intermediate evidence on completion.
+## Verification evidence
 
-### Integrated navigation QA
-- `cargo test -p rho-gui --lib slack_tests`: 29 passed, 1 performance benchmark ignored.
-- `cargo test -p rho-slack`: 211 passed across unit/config/mirror/transport suites at first integration.
-- Inspected `/src/slack-qa/screens/header6.png`, `thread6.png`, `thread-followed6.png`,
-  `starred6.png`, `back6.png`, and `forward6.png`: mouse selection opens the selected
-  message's thread, parent/replies remain an editor buffer, favorite moves into Starred,
-  muted room is subdued, back/forward restores the correct conversation.
-- Fake `subscriptions.thread.getView` returned C1 / 1789809000.000000 after clicking
-  Follow and an empty list after Unfollow. Both UI states were inspected.
-- Remaining acceptance stays open for integrated search, composer, emoji and app followups.
+- Combined command:
+  `cargo test -p rho-gui -p rho-slack -p rho-window -p rho-journal -p rho-fake-slack --features rho-slack/ui,rho-slack/fake`
+  — 646 passed, 0 failed, 4 ignored. Log: `/src/slack-qa/verification.log`.
+- Explicit `one_arriving_message_costs_what_it_touches -- --ignored --nocapture`
+  passed separately: 306 sidebar rows cost 6.66 ms for the listing and 8.54 ms
+  for the conversation, versus 3.63 ms / 9.52 ms with six rows. These are this
+  debug QA run's measurements, not a production latency guarantee.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+- Fake-backed GUI/transport tests verify new DM reuse, group membership,
+  directory/join, destination-correct sends, thread-context search landing,
+  scoped versus workspace search, pagination, and separate file-search identity.
+- Mouse QA opened backlog result 459 on page two without pagination navigating
+  away. File search found `review.pdf`; clicking downloaded it into the cache.
+- A draft survived full GUI restart. Two files reached fake history with
+  distinct 17-byte and 34-byte contents. A refused send retained exact text,
+  displayed Retry, and posted it after the refusal was cleared.
+- Session-owned send tests cover closing/reopening the composing view during
+  an in-flight request, duplicate gating, durable pending cleanup, later typing,
+  partial upload failure, and restart recovery without automatic replay.
+- Edits, reactions, forwarding, deletion, follow/unfollow, broadcast, and
+  mark-unread were checked against fake state. Clipboard copy matches the
+  server permalink. Saved inventory retains author/snippet and refreshes live.
+- Stopping the fake exposed a persistent connection reason; restart reconnected,
+  caught up, and cleared it without resetting the accumulated client mirror.
+- App QA exercised button confirmation/cancel, external-select suggestions,
+  modern modal required/server validation, retained correction text, successful
+  submission (`Deployment queued`), and Escape (`views.close` reached the fake).
+  Transport tests cover all implemented selector/state shapes and view updates.
+- Rendered QA inspected sidebar/navigation, search pages, editor composer,
+  attachment chips, thread controls, activity/saved inventories, preview images,
+  custom emoji/aliases, formatting, failure/recovery, and app prompts. It found
+  and fixed contrast, focus, empty Saved-table initialization, emoji concealment,
+  menu mouse/key routing, and a generic visualization-fence regression.
+- Representative inspected captures are in `/src/slack-qa/screens/`, including
+  `composer-final.png`, `formatting-final23.png`, `modal-required-final.png`,
+  `modal-server-error-final.png`, `app-confirmation-final.png`,
+  `external-select-final.png`, `connection-failed22.png`, and
+  `connection-recovered22.png`.
+- Legacy-dialog invalid text/select corrections passed targeted GUI checks.
+  Rendered QA showed the retained required-field error; corrected submission
+  reached `dialog.submit`. Final `cargo test -p rho-gui --lib slack`:
+  54 passed, 0 failed, 1 ignored (the separately executed cost benchmark).
+  Log: `/src/slack-qa/final-slack-gui.log`.
 
+## Deliberate limits and environment gaps
 
-### Integrated workflow QA
-- Full GUI pass before final followups: 346 passed, 4 ignored, 1 regression
-  (`visualization_refs_become_inline_editor_blocks`) found and being corrected.
-  Do not treat this intermediate run as green.
-- Latest Slack GUI subset: 38 passed, 1 performance benchmark ignored.
-- Search page-two mouse selection opened backlog message 459; pagination did not
-  navigate away. File search returned `review.pdf`, and clicking downloaded it
-  into the state cache. External opening is unavailable in this QA environment
-  (`xdg-open` is absent).
-- Draft text survived a full GUI restart. Multi-file send reached fake history
-  with distinct 17-byte and 34-byte files. Refused text send displayed Retry,
-  retained exact text, and posted it once the fake refusal was cleared.
-- Session-owned send tests cover closing the original view, reopening the same
-  source during the request, duplicate gating, and durable pending cleanup.
-- Edited message content and forwarded permalink were checked through fake
-  history. Save displayed the persisted author/snippet; reactions and delete
-  reached the fake. Mark-unread navigation and persistence are covered by the
-  fake-session regression.
-- Modern modal mouse opening, all four fixture inputs, refused submission, and
-  corrected successful submission were exercised through real socket/API paths.
-  The UI reported `Deployment queued`. Error visibility/correction is still in
-  final QA.
-- Notification dedup/focus suppression tests pass. Actual OS notification
-  delivery is unavailable: the headless session has no notification daemon.
+- Saved for later is explicitly labeled local to Rho; Slack has no supported
+  current Later API. It does not imply cross-client synchronization.
+- File+thread-broadcast is explicitly refused rather than silently dropping the
+  broadcast flag. Text replies support also-send-to-channel.
+- OS notification delivery could not be verified: the headless session has no
+  notification daemon. Deduplication and focused-conversation suppression pass
+  tests before delivery.
+- External document opening could not be verified because `xdg-open` is absent.
+  File download, cache, search, and inline image rendering were verified.
+- Some standard Unicode emoji glyphs are absent in the QA font environment.
+  Custom image emoji and aliases were rendered and inspected.
