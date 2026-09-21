@@ -2182,3 +2182,34 @@ async fn app_actions_suggestions_and_dialogs_use_the_desktop_session_protocol() 
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_partial_multi_file_upload_can_be_retried_as_the_same_message() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    let client = client(&fake);
+    let files = vec![
+        ("same.png".to_owned(), vec![0; 32]),
+        ("same.png".to_owned(), vec![0; 32]),
+    ];
+    fake.fail_next("files.completeUploadExternal", 1);
+    assert!(
+        client
+            .upload_files(&ChannelId("C1".into()), None, files.clone(), "caption")
+            .await
+            .is_err()
+    );
+    client
+        .upload_files(&ChannelId("C1".into()), None, files, "caption")
+        .await
+        .unwrap();
+    assert_eq!(fake.calls("files.getUploadURLExternal"), 4);
+    assert_eq!(fake.calls("files.completeUploadExternal"), 2);
+    let page = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].files.len(), 2);
+    assert_eq!(page.messages[0].text, "caption");
+}

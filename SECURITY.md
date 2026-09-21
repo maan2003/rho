@@ -52,6 +52,13 @@ AI APIs.
   to the tool output budget before entering context.
 - Local filesystem state may contain transcripts and OAuth credentials;
   credential files are secrets.
+- The Slack client mirror contains message history and unsent drafts. Draft
+  attachment bytes are private local state and are uploaded only when the user
+  submits that draft. A draft accepts at most 10 files, 25 MiB per file, and
+  100 MiB total; path attachments are size-checked before reading. Composer
+  text and attachment bytes use separate tables so an ordinary keystroke never
+  decodes or rewrites file content. Failed and interrupted sends retain the
+  durable draft for explicit retry; they are never replayed automatically.
 - Provider debug logs under the rho state directory may contain full inference
   request bodies, tool results, and raw provider events; treat them like
   transcripts.

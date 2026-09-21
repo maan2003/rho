@@ -505,6 +505,25 @@ fn drafts_round_trip_per_source_and_empty_removes_them() {
 
     let reopened = Mirror::open(dir.path().join("slack.redb")).unwrap();
     assert_eq!(reopened.draft(&channel), Some(channel_draft.clone()));
+    reopened.put_draft_text(&channel, "changed without touching files");
+    let changed = reopened.draft(&channel).unwrap();
+    assert_eq!(changed.text, "changed without touching files");
+    assert_eq!(changed.files, channel_draft.files);
+    reopened.put_draft_files(
+        &channel,
+        &[
+            DraftFile {
+                name: "same.png".into(),
+                bytes: vec![1],
+            },
+            DraftFile {
+                name: "same.png".into(),
+                bytes: vec![1],
+            },
+        ],
+    );
+    assert_eq!(reopened.draft(&channel).unwrap().files.len(), 2);
+    reopened.put_draft(&channel, &channel_draft);
     let inventory = reopened.drafts("acme");
     assert_eq!(inventory.len(), 2);
     assert!(

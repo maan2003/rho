@@ -68,10 +68,12 @@ const SAVED: TableDefinition<&str, Sen<StoredSaved>> = TableDefinition::new("rho
 /// forgets what the reader always uses is a picker they stop using.
 const REACTED_WITH: TableDefinition<&str, Sen<StoredReactedWith>> =
     TableDefinition::new("rho_slack_reacted_with_v1");
-/// Unsent composer contents, one row per conversation or thread. This is a
-/// new table rather than a changed record shape, so existing mirrors open
-/// without a format migration.
-const DRAFTS: TableDefinition<&str, Sen<StoredDraft>> = TableDefinition::new("rho_slack_drafts_v1");
+/// Unsent composer contents, split so a text edit never rewrites file bytes.
+/// These are new tables rather than changed record shapes, so existing
+/// mirrors open without a format migration.
+const DRAFT_TEXT: TableDefinition<&str, &str> = TableDefinition::new("rho_slack_draft_text_v1");
+const DRAFT_FILES: TableDefinition<&str, Sen<StoredDraftFiles>> =
+    TableDefinition::new("rho_slack_draft_files_v1");
 
 /// One locally saved message. Its source is retained so opening a saved
 /// thread reply returns to the thread rather than the channel timeline.
@@ -207,7 +209,8 @@ impl Mirror {
             write.open_table(CURSORS);
             write.open_table(REACTED_WITH);
             write.open_table(UNITS);
-            write.open_table(DRAFTS);
+            write.open_table(DRAFT_TEXT);
+            write.open_table(DRAFT_FILES);
             write.commit();
         });
         Ok(Self { db })
@@ -862,24 +865,100 @@ impl Mirror {
     /// Reads the draft for one source.
     pub fn draft(&self, scope: &Scope) -> Option<Draft> {
         let txn = self.db.read();
-        let table = txn.open_table(DRAFTS);
-        table
-            .get(scope.prefix().as_str())
-            .map(|value| value.value().as_ref().into())
+        let key = scope.prefix();
+        let text = txn
+            .open_table(DRAFT_TEXT)
+            .get(key.as_str())
+            .map(|value| value.value().to_owned())
+            .unwrap_or_default();
+        let files = txn
+            .open_table(DRAFT_FILES)
+            .get(key.as_str())
+            .map(|value| {
+                value
+                    .value()
+                    .as_ref()
+                    .files
+                    .iter()
+                    .map(|file| DraftFile {
+                        name: file.name.clone(),
+                        bytes: file.bytes.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let draft = Draft { text, files };
+        (!draft.is_empty()).then_some(draft)
     }
 
-    /// Replaces one draft atomically. Empty drafts are removed so inventory
-    /// contains only work the reader can resume.
+    /// Replaces both halves of one draft. Normal text edits use
+    /// `put_draft_text`, so attachment bytes are not decoded and rewritten
+    /// for every keystroke.
     pub fn put_draft(&self, scope: &Scope, draft: &Draft) {
+        let key = scope.prefix();
         let mut txn = self.write();
         {
-            let mut table = txn.open_table(DRAFTS);
-            if draft.is_empty() {
+            let mut text = txn.open_table(DRAFT_TEXT);
+            if draft.text.is_empty() {
+                text.remove(key.as_str());
+            } else {
+                text.insert(key.as_str(), draft.text.as_str());
+            }
+        }
+        {
+            let mut files = txn.open_table(DRAFT_FILES);
+            if draft.files.is_empty() {
+                files.remove(key.as_str());
+            } else {
+                files.insert(
+                    key.as_str(),
+                    SenValue::owned(StoredDraftFiles {
+                        files: draft
+                            .files
+                            .iter()
+                            .map(|file| StoredDraftFile {
+                                name: file.name.clone(),
+                                bytes: file.bytes.clone(),
+                            })
+                            .collect(),
+                    }),
+                );
+            }
+        }
+        txn.commit();
+    }
+
+    pub fn put_draft_text(&self, scope: &Scope, text: &str) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(DRAFT_TEXT);
+            if text.is_empty() {
+                table.remove(scope.prefix().as_str());
+            } else {
+                table.insert(scope.prefix().as_str(), text);
+            }
+        }
+        txn.commit();
+    }
+
+    pub fn put_draft_files(&self, scope: &Scope, files: &[DraftFile]) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(DRAFT_FILES);
+            if files.is_empty() {
                 table.remove(scope.prefix().as_str());
             } else {
                 table.insert(
                     scope.prefix().as_str(),
-                    SenValue::owned(StoredDraft::from(draft)),
+                    SenValue::owned(StoredDraftFiles {
+                        files: files
+                            .iter()
+                            .map(|file| StoredDraftFile {
+                                name: file.name.clone(),
+                                bytes: file.bytes.clone(),
+                            })
+                            .collect(),
+                    }),
                 );
             }
         }
@@ -889,16 +968,37 @@ impl Mirror {
     /// Every resumable draft in a workspace.
     pub fn drafts(&self, workspace: &str) -> Vec<(Scope, Draft)> {
         let txn = self.db.read();
-        let table = txn.open_table(DRAFTS);
         let prefix = format!("{workspace}{SEPARATOR}");
         let end = format!(
             "{workspace}{}",
             char::from_u32(SEPARATOR as u32 + 1).unwrap()
         );
-        table
+        let mut drafts = std::collections::BTreeMap::<String, Draft>::new();
+        for (key, value) in txn
+            .open_table(DRAFT_TEXT)
             .range(prefix.as_str()..end.as_str())
-            .filter_map(|(key, value)| {
-                let mut parts = key.value().split(SEPARATOR);
+        {
+            drafts.entry(key.value().to_owned()).or_default().text = value.value().to_owned();
+        }
+        for (key, value) in txn
+            .open_table(DRAFT_FILES)
+            .range(prefix.as_str()..end.as_str())
+        {
+            drafts.entry(key.value().to_owned()).or_default().files = value
+                .value()
+                .as_ref()
+                .files
+                .iter()
+                .map(|file| DraftFile {
+                    name: file.name.clone(),
+                    bytes: file.bytes.clone(),
+                })
+                .collect();
+        }
+        drafts
+            .into_iter()
+            .filter_map(|(key, draft)| {
+                let mut parts = key.split(SEPARATOR);
                 let workspace = parts.next()?.to_owned();
                 let channel = ChannelId(parts.next()?.to_owned());
                 let thread = parts
@@ -911,7 +1011,7 @@ impl Mirror {
                         channel,
                         thread,
                     },
-                    value.value().as_ref().into(),
+                    draft,
                 ))
             })
             .collect()
@@ -1046,8 +1146,7 @@ fn saved_key(workspace: &str, saved: &Saved) -> String {
 /// recent first, capped where the picker stops showing them.
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct StoredDraft {
-    text: String,
+struct StoredDraftFiles {
     files: Vec<StoredDraftFile>,
 }
 
@@ -1055,38 +1154,6 @@ struct StoredDraft {
 struct StoredDraftFile {
     name: String,
     bytes: Vec<u8>,
-}
-
-impl From<&Draft> for StoredDraft {
-    fn from(draft: &Draft) -> Self {
-        Self {
-            text: draft.text.clone(),
-            files: draft
-                .files
-                .iter()
-                .map(|file| StoredDraftFile {
-                    name: file.name.clone(),
-                    bytes: file.bytes.clone(),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<&StoredDraft> for Draft {
-    fn from(draft: &StoredDraft) -> Self {
-        Self {
-            text: draft.text.clone(),
-            files: draft
-                .files
-                .iter()
-                .map(|file| DraftFile {
-                    name: file.name.clone(),
-                    bytes: file.bytes.clone(),
-                })
-                .collect(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

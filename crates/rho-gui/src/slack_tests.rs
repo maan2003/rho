@@ -889,6 +889,27 @@ async fn a_refused_rewrite_and_a_failed_upload_answer_with_a_refusal(cx: &mut Te
         Submitted::Refused,
         "an upload that failed is not a file that was sent"
     );
+    assert_eq!(
+        window.update(cx, |view, _, _| view.send_state()).unwrap(),
+        rho_slack::ui::conversation::SendState::Failed,
+        "the composer visibly offers Retry"
+    );
+    assert_eq!(
+        window
+            .update(cx, |view, _, _| view.attachments().len())
+            .unwrap(),
+        1,
+        "the failed file remains attached"
+    );
+    let retry = window
+        .update(cx, |view, _, cx| view.submit(cx))
+        .unwrap()
+        .await;
+    assert_eq!(
+        retry,
+        Submitted::FileSent(8),
+        "Retry sends the same retained draft"
+    );
 }
 
 /// A narrowing that takes the point's row away puts the point on the first
@@ -3187,5 +3208,173 @@ fn slack_query_operators_are_explained_as_completions() {
             .collect::<Vec<_>>(),
         vec!["before:"],
         "completion follows the query's current token"
+    );
+}
+
+/// Clicking Write message defers insert mode until the conversation frame is
+/// shown, so immediate typing loses no leading characters.
+#[gpui::test]
+async fn write_message_then_next_frame_typing_keeps_every_character(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack_source(Source::Conversation(ChannelId("C1".into())), window, cx);
+            workspace.slack_compose(window, cx);
+        })
+        .unwrap();
+
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "Q A space r e t r y");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace
+                .slack_compose_text_for_test(cx))
+            .unwrap(),
+        Some("QA retry".to_owned()),
+    );
+}
+
+/// A pending send leaves its exact durable draft available to another
+/// surface, clears the active composer, and preserves text typed while the
+/// request is in flight after success.
+#[gpui::test]
+async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    use rho_slack::ui::conversation::{Attaching, SendState, Submitted};
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.live(serde_json::json!({"kind": "send_delay", "ms": 150}));
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    let source = Source::Conversation(ChannelId("C1".into()));
+    let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+    let window = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            source.clone(),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, _, cx| {
+            view.set_compose_for_test("send exactly once".into(), cx);
+            assert_eq!(
+                view.attach("same.png".into(), vec![1; 8], cx),
+                Attaching::Attached
+            );
+            assert_eq!(
+                view.attach("same.png".into(), vec![1; 8], cx),
+                Attaching::Attached
+            );
+        })
+        .unwrap();
+    let sending = window.update(cx, |view, _, cx| view.submit(cx)).unwrap();
+    assert_eq!(
+        window.update(cx, |view, _, _| view.send_state()).unwrap(),
+        SendState::Sending
+    );
+    assert_eq!(
+        window
+            .update(cx, |view, _, cx| view.compose_text_for_test(cx))
+            .unwrap(),
+        ""
+    );
+    let durable = session.read_with(cx, |session, _| session.draft(&source).unwrap());
+    assert_eq!(durable.text, "send exactly once");
+    assert_eq!(
+        durable.files.len(),
+        2,
+        "same-name identical files remain distinct"
+    );
+
+    // Reopening during the request restores the retry snapshot rather than
+    // an empty composer.
+    let reopened = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            source.clone(),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+    assert_eq!(
+        reopened
+            .update(cx, |view, _, cx| view.compose_text_for_test(cx))
+            .unwrap(),
+        "send exactly once"
+    );
+    assert_eq!(
+        reopened
+            .update(cx, |view, _, _| view.attachments().len())
+            .unwrap(),
+        2
+    );
+
+    window
+        .update(cx, |view, _, cx| {
+            view.set_compose_for_test("next thought".into(), cx)
+        })
+        .unwrap();
+    assert_eq!(sending.await, Submitted::FileSent(16));
+    assert_eq!(
+        window
+            .update(cx, |view, _, cx| view.compose_text_for_test(cx))
+            .unwrap(),
+        "next thought"
+    );
+    assert!(
+        window
+            .update(cx, |view, _, _| view.attachments().is_empty())
+            .unwrap()
+    );
+    let remaining = session.read_with(cx, |session, _| session.draft(&source).unwrap());
+    assert_eq!(remaining.text, "next thought");
+    assert!(remaining.files.is_empty());
+    assert_eq!(
+        fake.posted()
+            .iter()
+            .filter(|post| post.text == "send exactly once")
+            .count(),
+        0,
+        "file messages are completed through the upload API, not chat.postMessage"
     );
 }

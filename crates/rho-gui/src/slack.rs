@@ -259,6 +259,79 @@ fn should_notify_slack(
 }
 
 impl Workspace {
+    /// Opens the durable Slack draft inventory. Selecting one opens its
+    /// source at the existing composer and enters insert mode.
+    pub(crate) fn open_slack_drafts(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack_session(window, cx) else {
+            return;
+        };
+        let drafts = session
+            .read(cx)
+            .drafts()
+            .into_iter()
+            .map(|(source, draft)| {
+                let label = session.read(cx).label(&source);
+                let target = match &source {
+                    Source::Conversation(_) => label,
+                    Source::Thread(key) => format!("{label} / thread {}", key.thread_ts.0),
+                };
+                let snippet = draft
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect::<String>();
+                let description = match (snippet.is_empty(), draft.files.len()) {
+                    (false, 0) => snippet,
+                    (false, count) => format!("{snippet} · {count} file(s)"),
+                    (true, count) => format!("{count} file(s)"),
+                };
+                (target, description, source)
+            })
+            .collect::<Vec<_>>();
+        if drafts.is_empty() {
+            self.echo("slack: no drafts", StyleClass::SystemInfo, cx);
+            return;
+        }
+        let complete = drafts.clone();
+        let select = drafts;
+        self.open_prompt(
+            "slack drafts:",
+            std::rc::Rc::new(move |_, needle, _| {
+                let needle = needle.to_lowercase();
+                complete
+                    .iter()
+                    .filter(|(label, _, _)| label.to_lowercase().contains(&needle))
+                    .map(|(label, description, _)| Candidate {
+                        value: label.clone(),
+                        description: description.clone(),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(move |workspace: &mut Workspace, input, window, cx| {
+                let Some((_, _, source)) =
+                    select.iter().find(|(label, _, _)| label == input.trim())
+                else {
+                    return;
+                };
+                workspace.open_slack_source(source.clone(), window, cx);
+                if let SurfaceView::SlackConversation(view) = &workspace.active_surface().view {
+                    view.clone()
+                        .update(cx, |view, cx| view.select_compose(window, cx));
+                }
+                workspace.enter_insert_when_shown(window, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
     /// Opens the conversation list, starting the session on first entry.
     /// This is the way in: everything else is reached from a row.
     pub(crate) fn open_slack(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
@@ -538,6 +611,14 @@ impl Workspace {
         view.read(cx).drawn_lines_for_test(cx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn slack_compose_text_for_test(&self, cx: &gpui::App) -> Option<String> {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return None;
+        };
+        Some(view.read(cx).compose_text_for_test(cx))
+    }
+
     /// What the list's last redraw cost, and how many lines it drew.
     ///
     /// Found across the open surfaces rather than on the active one: the
@@ -746,12 +827,13 @@ impl Workspace {
                 let view = cx.new(|cx| {
                     rho_slack::ui::ConversationView::new(session, source, hooks, window, cx)
                 });
-                self._slack_view_subscriptions.push(cx.subscribe(
+                self._slack_view_subscriptions.push(cx.subscribe_in(
                     &view,
-                    |workspace, view, event, cx| match event {
+                    window,
+                    |workspace, view, event, window, cx| match event {
                         rho_slack::ui::conversation::Event::OpenFile(file) => {
                             if file.is_image() {
-                                workspace.open_slack_image(view, file.clone(), cx);
+                                workspace.open_slack_image(view.clone(), file.clone(), cx);
                             } else {
                                 view.update(cx, |view, cx| view.open_file(file.clone(), cx));
                             }
@@ -768,6 +850,19 @@ impl Workspace {
                                 StyleClass::SystemImportant,
                                 cx,
                             );
+                        }
+                        rho_slack::ui::conversation::Event::BroadcastWithFilesUnsupported => {
+                            workspace.echo(
+                                "slack: files cannot also be sent to the channel",
+                                StyleClass::SystemImportant,
+                                cx,
+                            );
+                        }
+                        rho_slack::ui::conversation::Event::AttachRequested => {
+                            workspace.prompt_slack_attach(window, cx);
+                        }
+                        rho_slack::ui::conversation::Event::SubmitRequested(broadcast) => {
+                            workspace.slack_submit_with_options(*broadcast, cx);
                         }
                     },
                 ));
@@ -1170,8 +1265,9 @@ impl Workspace {
         if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
             view.clone()
                 .update(cx, |view, cx| view.select_compose(window, cx));
-            // `i` is vim's own insert key, and this binding took it.
-            self.enter_composer(window, cx);
+            // The editor is shown on the next frame. Enter insert there so
+            // a mouse click followed by typing cannot lose its first keys.
+            self.enter_insert_when_shown(window, cx);
         }
     }
 
@@ -1195,12 +1291,22 @@ impl Workspace {
     /// rewrite and an upload that failed both left a record of something
     /// that did not happen.
     pub(crate) fn slack_submit(&mut self, cx: &mut gpui::Context<Self>) {
+        self.slack_submit_with_options(false, cx);
+    }
+
+    pub(crate) fn slack_submit_with_options(
+        &mut self,
+        also_send_to_channel: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return;
         };
         let view = view.clone();
         let channel = view.read(cx).source().channel().clone();
-        let submitting = view.update(cx, |view, cx| view.submit(cx));
+        let submitting = view.update(cx, |view, cx| {
+            view.submit_with_options(also_send_to_channel, cx)
+        });
         cx.spawn(async move |this, cx| {
             let submitted = submitting.await;
             let _ = this.update(cx, |this, cx| {
@@ -1260,6 +1366,12 @@ impl Workspace {
             Attaching::Replaced => format!("slack: {name} attached, replacing the last one"),
             Attaching::Attached => format!("slack: {name} attached · {}", human_size(size)),
             Attaching::NotWhileEditing => NOT_WHILE_EDITING.to_owned(),
+            Attaching::Sending => "slack: wait for the current send to finish".to_owned(),
+            Attaching::TooMany => format!(
+                "slack: at most {} files can be attached",
+                rho_slack::ui::conversation::MAX_ATTACHMENTS
+            ),
+            Attaching::TooLarge => "slack: attachment limit exceeded".to_owned(),
         };
         self.echo(&said, StyleClass::SystemInfo, cx);
         // Taken either way: a refusal that fell back to pasting the picture's
@@ -1286,6 +1398,12 @@ impl Workspace {
                     }
                     Attaching::Attached => format!("slack: {} attached", path.display()),
                     Attaching::NotWhileEditing => NOT_WHILE_EDITING.to_owned(),
+                    Attaching::Sending => "slack: wait for the current send to finish".to_owned(),
+                    Attaching::TooMany => format!(
+                        "slack: at most {} files can be attached",
+                        rho_slack::ui::conversation::MAX_ATTACHMENTS
+                    ),
+                    Attaching::TooLarge => "slack: attachment limit exceeded".to_owned(),
                 };
                 self.echo(&said, StyleClass::SystemInfo, cx);
             }
@@ -1429,6 +1547,58 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    pub(crate) fn prompt_slack_message_actions(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return false;
+        };
+        let Some(actions) = view.clone().update(cx, |view, cx| view.message_actions(cx)) else {
+            return false;
+        };
+        self.open_menu(crate::transient::slack_message_menu(&actions), window, cx);
+        true
+    }
+
+    pub(crate) fn slack_edit_message_at(
+        &mut self,
+        ts: Ts,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        if matches!(
+            view.clone()
+                .update(cx, |view, cx| view.start_edit_at(&ts, window, cx)),
+            EditStart::Started(_)
+        ) {
+            self.enter_composer(window, cx);
+        }
+    }
+
+    pub(crate) fn slack_react_at(
+        &mut self,
+        ts: Ts,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        let Some(choices) = view
+            .clone()
+            .update(cx, |view, cx| view.reaction_choices_for(&ts, cx))
+        else {
+            return;
+        };
+        self.slack_reacting = Some(ts);
+        self.open_menu(crate::transient::slack_react_menu(&choices), window, cx);
     }
 
     /// Opens an explicit confirmation prompt before deleting an own message.

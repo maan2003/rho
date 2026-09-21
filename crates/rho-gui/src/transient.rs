@@ -88,6 +88,11 @@ pub(crate) enum Command {
     SlackAttach,
     SlackMarkReadBefore,
     SlackRegister,
+    SlackMessageEdit(rho_slack::types::Ts),
+    SlackMessageDelete(rho_slack::types::Ts),
+    SlackMessageReact(rho_slack::types::Ts),
+    SlackMessageCopyLink(rho_slack::types::Ts),
+    SlackMessageForward(rho_slack::types::Ts),
     // Hosts.
     HostsList,
     HostAttach,
@@ -342,6 +347,45 @@ pub(crate) fn slack_react_menu(choices: &rho_slack::ui::ReactionChoices) -> Menu
         "by name…",
         MenuAction::Command(Command::SlackReactByName),
     )
+}
+
+pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageActions) -> Menu {
+    let ts = actions.ts.clone();
+    let mut menu = Menu::new("message");
+    if actions.can_edit {
+        menu = menu.item(
+            "e",
+            "edit",
+            MenuAction::Command(Command::SlackMessageEdit(ts.clone())),
+        );
+    }
+    menu = menu.item(
+        "r",
+        "react…",
+        MenuAction::Command(Command::SlackMessageReact(ts.clone())),
+    );
+    if actions.can_copy_link {
+        menu = menu.item(
+            "c",
+            "copy link",
+            MenuAction::Command(Command::SlackMessageCopyLink(ts.clone())),
+        );
+    }
+    if actions.can_forward {
+        menu = menu.item(
+            "f",
+            "forward…",
+            MenuAction::Command(Command::SlackMessageForward(ts.clone())),
+        );
+    }
+    if actions.can_delete {
+        menu = menu.item(
+            "d",
+            "delete…",
+            MenuAction::Command(Command::SlackMessageDelete(ts)),
+        );
+    }
+    menu
 }
 
 pub(crate) fn slack_menu() -> Menu {

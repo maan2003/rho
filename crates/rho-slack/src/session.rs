@@ -2928,6 +2928,18 @@ impl Session {
         }
     }
 
+    pub fn save_draft_text(&self, source: &Source, text: &str) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.put_draft_text(&source.scope(&self.model.workspace().0), text);
+        }
+    }
+
+    pub fn save_draft_files(&self, source: &Source, files: &[crate::mirror::DraftFile]) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.put_draft_files(&source.scope(&self.model.workspace().0), files);
+        }
+    }
+
     pub fn send(
         &mut self,
         source: &Source,

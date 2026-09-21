@@ -36,6 +36,9 @@ use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out}
 /// The composer's placeholder, which is the only custom inlay this surface
 /// puts in its editor.
 const COMPOSE_PLACEHOLDER_INLAY_ID: usize = 0;
+pub const MAX_ATTACHMENTS: usize = 10;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 
 /// The stripe down the gutter beside the composer, the agent transcript's
 /// prompt marker worn by the Slack surface.
@@ -122,6 +125,7 @@ pub struct ConversationView {
     /// Files carried by the next message, in attachment order.
     attached: Vec<Attached>,
     send_state: SendState,
+    also_send_to_channel: bool,
     /// The message being rewritten, if `e` is open on one: tinted, and what
     /// `enter` updates instead of sending. The composer's own text is held
     /// beside it so `escape` gives the reader back what they were writing.
@@ -160,6 +164,9 @@ pub enum Event {
     /// rewrite has closed and the words are back in the composer; the host
     /// says so, because this crate has no notice line of its own.
     RewriteLost,
+    BroadcastWithFilesUnsupported,
+    AttachRequested,
+    SubmitRequested(bool),
 }
 
 /// What a press of enter turned out to be, once Slack had answered.
@@ -193,6 +200,9 @@ pub enum Attaching {
     Replaced,
     /// An edit is open, and a rewrite cannot carry a picture.
     NotWhileEditing,
+    Sending,
+    TooMany,
+    TooLarge,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -265,6 +275,7 @@ pub enum EditStart {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageActions {
     pub ts: Ts,
+    pub can_edit: bool,
     pub can_delete: bool,
     pub can_forward: bool,
     pub can_copy_link: bool,
@@ -456,7 +467,7 @@ impl ConversationView {
         subscriptions.push(cx.subscribe(&input, |this, _, event: &BufferEvent, cx| {
             if matches!(event, BufferEvent::Edited { .. }) {
                 this.apply_compose_chrome(cx);
-                this.persist_draft(cx);
+                this.persist_draft_text(cx);
             }
         }));
         // History fills as the reader scrolls, and there is no other way to
@@ -533,6 +544,7 @@ impl ConversationView {
             held_compose: None,
             attached: saved_files,
             send_state: SendState::Ready,
+            also_send_to_channel: false,
             awaiting_images: Vec::new(),
             awaiting_names: Vec::new(),
             emoji_decorations: HashMap::new(),
@@ -704,6 +716,10 @@ impl ConversationView {
         if self.send_state == SendState::Sending {
             return Task::ready(Submitted::Sending);
         }
+        if also_send_to_channel && !self.attached.is_empty() {
+            cx.emit(Event::BroadcastWithFilesUnsupported);
+            return Task::ready(Submitted::Refused);
+        }
         // A file is a message on its own; words are not required.
         if text.trim().is_empty() && self.attached.is_empty() {
             return Task::ready(Submitted::Nothing);
@@ -737,6 +753,7 @@ impl ConversationView {
             return watch(cx, told);
         }
         self.send_state = SendState::Sending;
+        self.set_compose(String::new(), cx);
         self.refresh_chip(cx);
         cx.notify();
         let sending = self.session.update(cx, |session, cx| {
@@ -748,12 +765,6 @@ impl ConversationView {
                 Ok(()) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Ready;
-                        let current = this.input.read(cx).text();
-                        if current == text {
-                            this.set_compose(String::new(), cx);
-                        } else if let Some(after) = current.strip_prefix(&text) {
-                            this.set_compose(after.to_owned(), cx);
-                        }
                         this.persist_draft(cx);
                         this.refresh_chip(cx);
                         cx.notify();
@@ -763,6 +774,7 @@ impl ConversationView {
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Failed;
+                        this.restore_compose(text, cx);
                         this.persist_draft(cx);
                         this.refresh_chip(cx);
                         cx.notify();
@@ -922,6 +934,22 @@ impl ConversationView {
     /// under the point is the transcript's own lookup, as it is for `e`.)
     pub fn reaction_choices(&self, cx: &mut Context<Self>) -> Option<ReactionChoices> {
         let message = self.cursor_message(cx)?;
+        self.reaction_choices_for_message(message, cx)
+    }
+
+    pub fn reaction_choices_for(&self, ts: &Ts, cx: &mut Context<Self>) -> Option<ReactionChoices> {
+        let message = self
+            .shown_messages(cx)
+            .into_iter()
+            .find(|message| &message.ts == ts)?;
+        self.reaction_choices_for_message(message, cx)
+    }
+
+    fn reaction_choices_for_message(
+        &self,
+        message: Message,
+        cx: &mut Context<Self>,
+    ) -> Option<ReactionChoices> {
         let session = self.session.read(cx);
         let mine = session.model().self_id().clone();
         let on_message = message
@@ -965,9 +993,11 @@ impl ConversationView {
     /// this for either a context menu or header menu.
     pub fn message_actions(&self, cx: &mut Context<Self>) -> Option<MessageActions> {
         let message = self.cursor_message(cx)?;
+        let mine = message.user.as_ref() == Some(self.session.read(cx).model().self_id());
         Some(MessageActions {
             ts: message.ts,
-            can_delete: message.user.as_ref() == Some(self.session.read(cx).model().self_id()),
+            can_edit: mine,
+            can_delete: mine,
             can_forward: true,
             can_copy_link: true,
         })
@@ -995,6 +1025,26 @@ impl ConversationView {
         self.session.update(cx, |session, cx| {
             session.forward_message(&source, ts, destination, cx)
         })
+    }
+
+    pub fn start_edit_at(
+        &mut self,
+        ts: &Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EditStart {
+        let Some(message) = self
+            .shown_messages(cx)
+            .into_iter()
+            .find(|message| &message.ts == ts)
+        else {
+            return EditStart::Nothing;
+        };
+        if message.user.as_ref() != Some(self.session.read(cx).model().self_id()) {
+            return EditStart::NotYours;
+        }
+        self.begin_edit(&message, window, cx);
+        EditStart::Started(message.ts)
     }
 
     /// `e`: rewrite the message under the cursor. Only the reader's own can
@@ -1074,11 +1124,28 @@ impl ConversationView {
         if self.editing_message.is_some() {
             return Attaching::NotWhileEditing;
         }
+        if self.send_state == SendState::Sending {
+            return Attaching::Sending;
+        }
+        if self.attached.len() >= MAX_ATTACHMENTS {
+            return Attaching::TooMany;
+        }
+        let bytes_len = bytes.len() as u64;
+        let total = self
+            .attached
+            .iter()
+            .map(|file| file.bytes.len() as u64)
+            .sum::<u64>();
+        if bytes_len > MAX_ATTACHMENT_BYTES
+            || total.saturating_add(bytes_len) > MAX_DRAFT_ATTACHMENT_BYTES
+        {
+            return Attaching::TooLarge;
+        }
         self.attached.push(Attached {
             name,
             bytes: std::sync::Arc::new(bytes),
         });
-        self.persist_draft(cx);
+        self.persist_draft_files(cx);
         self.refresh_chip(cx);
         cx.notify();
         Attaching::Attached
@@ -1095,6 +1162,27 @@ impl ConversationView {
         // Asked before the file is read, so a refusal costs no disk.
         if self.editing_message.is_some() {
             return Ok(Attaching::NotWhileEditing);
+        }
+        let size = std::fs::metadata(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?
+            .len();
+        if size > MAX_ATTACHMENT_BYTES {
+            anyhow::bail!(
+                "{} is larger than the {} attachment limit",
+                path.display(),
+                crate::types::human_size(MAX_ATTACHMENT_BYTES)
+            );
+        }
+        let total = self
+            .attached
+            .iter()
+            .map(|file| file.bytes.len() as u64)
+            .sum::<u64>();
+        if total.saturating_add(size) > MAX_DRAFT_ATTACHMENT_BYTES {
+            anyhow::bail!(
+                "attachments exceed the {} draft limit",
+                crate::types::human_size(MAX_DRAFT_ATTACHMENT_BYTES)
+            );
         }
         let bytes = std::fs::read(path)
             .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
@@ -1117,11 +1205,11 @@ impl ConversationView {
 
     /// Removes one attachment chip by its displayed index.
     pub fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
-        if index >= self.attached.len() {
+        if self.send_state == SendState::Sending || index >= self.attached.len() {
             return false;
         }
         self.attached.remove(index);
-        self.persist_draft(cx);
+        self.persist_draft_files(cx);
         self.refresh_chip(cx);
         cx.notify();
         true
@@ -1129,10 +1217,13 @@ impl ConversationView {
 
     /// Drops the attachment without sending it.
     pub fn clear_attachment(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.send_state == SendState::Sending {
+            return false;
+        }
         let had = !self.attached.is_empty();
         self.attached.clear();
         if had {
-            self.persist_draft(cx);
+            self.persist_draft_files(cx);
             self.refresh_chip(cx);
             cx.notify();
         }
@@ -1153,6 +1244,15 @@ impl ConversationView {
         self.send_state
     }
 
+    pub fn also_send_to_channel(&self) -> bool {
+        self.also_send_to_channel
+    }
+
+    pub fn set_also_send_to_channel(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.also_send_to_channel = matches!(self.source, Source::Thread(_)) && enabled;
+        cx.notify();
+    }
+
     /// Uploads the picture with the message. Nothing is drawn from the
     /// local bytes: the message arrives from Slack like any other. A
     /// refusal puts the chip and the words back, so the reader can try
@@ -1164,6 +1264,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> Task<Submitted> {
         self.send_state = SendState::Sending;
+        self.set_compose(String::new(), cx);
         self.refresh_chip(cx);
         cx.notify();
         let source = self.source.clone();
@@ -1181,12 +1282,6 @@ impl ConversationView {
                 Ok(()) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Ready;
-                        let current = this.input.read(cx).text();
-                        if current == text {
-                            this.set_compose(String::new(), cx);
-                        } else if let Some(after) = current.strip_prefix(&text) {
-                            this.set_compose(after.to_owned(), cx);
-                        }
                         if this.attached == files {
                             this.attached.clear();
                         }
@@ -1199,6 +1294,7 @@ impl ConversationView {
                 Err(_) => {
                     let _ = this.update(cx, |this, cx| {
                         this.send_state = SendState::Failed;
+                        this.restore_compose(text, cx);
                         this.persist_draft(cx);
                         this.refresh_chip(cx);
                         cx.notify();
@@ -1241,25 +1337,46 @@ impl ConversationView {
         self.editing_message.as_ref()
     }
 
-    fn persist_draft(&self, cx: &App) {
-        let text = self
-            .held_compose
+    fn draft_text(&self, cx: &App) -> String {
+        self.held_compose
             .as_ref()
             .filter(|_| self.editing_message.is_some())
             .cloned()
-            .unwrap_or_else(|| self.input.read(cx).text());
-        let draft = Draft {
-            text,
-            files: self
-                .attached
-                .iter()
-                .map(|file| DraftFile {
-                    name: file.name.clone(),
-                    bytes: file.bytes.as_ref().clone(),
-                })
-                .collect(),
-        };
-        self.session.read(cx).save_draft(&self.source, &draft);
+            .unwrap_or_else(|| self.input.read(cx).text())
+    }
+
+    fn draft_files(&self) -> Vec<DraftFile> {
+        self.attached
+            .iter()
+            .map(|file| DraftFile {
+                name: file.name.clone(),
+                bytes: file.bytes.as_ref().clone(),
+            })
+            .collect()
+    }
+
+    fn persist_draft_text(&self, cx: &App) {
+        if self.send_state != SendState::Sending {
+            self.session
+                .read(cx)
+                .save_draft_text(&self.source, &self.draft_text(cx));
+        }
+    }
+
+    fn persist_draft_files(&self, cx: &App) {
+        self.session
+            .read(cx)
+            .save_draft_files(&self.source, &self.draft_files());
+    }
+
+    fn persist_draft(&self, cx: &App) {
+        self.session.read(cx).save_draft(
+            &self.source,
+            &Draft {
+                text: self.draft_text(cx),
+                files: self.draft_files(),
+            },
+        );
     }
 
     fn set_compose(&mut self, text: String, cx: &mut Context<Self>) {
@@ -3468,10 +3585,92 @@ impl gpui::Render for ConversationView {
             self.unseen = 0;
         }
         self.fill(position, screen, cx);
+        let attachments = self.attachments();
+        let thread = matches!(self.source, Source::Thread(_));
+        let sending = self.send_state == SendState::Sending;
+        let broadcast = thread && self.also_send_to_channel;
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .children(attachments.into_iter().enumerate().map(|(index, file)| {
+                div()
+                    .id(("slack-remove-attachment", index))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .cursor_pointer()
+                    .child(format!(
+                        "{} · {}  ×",
+                        file.name,
+                        crate::types::human_size(file.bytes)
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_attachment(index, cx);
+                    }))
+            }))
+            .child(
+                div()
+                    .id("slack-attach")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .cursor_pointer()
+                    .child("Attach…")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::AttachRequested))),
+            )
+            .when(thread, |controls| {
+                controls.child(
+                    div()
+                        .id("slack-reply-broadcast")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().element_background)
+                        .cursor_pointer()
+                        .child(if self.also_send_to_channel {
+                            "☑ Also send to channel"
+                        } else {
+                            "☐ Also send to channel"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.also_send_to_channel = !this.also_send_to_channel;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("slack-send")
+                    .ml_auto()
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_selected)
+                    .cursor_pointer()
+                    .child(match self.send_state {
+                        SendState::Ready => "Send",
+                        SendState::Sending => "Sending…",
+                        SendState::Failed => "Retry",
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if !sending {
+                            cx.emit(Event::SubmitRequested(broadcast));
+                        }
+                    })),
+            );
         div()
             .id("rho-slack-conversation")
             .key_context("RhoSlackConversation")
             .size_full()
+            .flex()
+            .flex_col()
             .bg(cx.theme().colors().editor_background)
             // A file dropped on the conversation is an attachment for the
             // next message, the same as pasting one.
@@ -3483,11 +3682,21 @@ impl gpui::Render for ConversationView {
                     match this.attach_path(&path, cx) {
                         Ok(Attaching::NotWhileEditing) => cx.emit(Event::AttachRefused),
                         Ok(Attaching::Attached | Attaching::Replaced) => {}
+                        Ok(Attaching::Sending) => cx.emit(Event::AttachFailed(
+                            "wait for the current send to finish".to_owned(),
+                        )),
+                        Ok(Attaching::TooMany) => cx.emit(Event::AttachFailed(format!(
+                            "at most {MAX_ATTACHMENTS} files can be attached"
+                        ))),
+                        Ok(Attaching::TooLarge) => {
+                            cx.emit(Event::AttachFailed("attachment limit exceeded".to_owned()))
+                        }
                         Err(error) => cx.emit(Event::AttachFailed(format!("{error:#}"))),
                     }
                 }),
             )
-            .child(self.editor.clone())
+            .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .child(controls)
     }
 }
 
