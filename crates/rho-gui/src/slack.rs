@@ -372,6 +372,19 @@ impl Workspace {
             None => {
                 let hooks = Self::slack_hooks();
                 let view = cx.new(|cx| rho_slack::ui::ResultsView::new(session, hooks, window, cx));
+                self._slack_view_subscriptions.push(cx.subscribe_in(
+                    &view,
+                    window,
+                    |workspace, _, event: &rho_slack::ui::results::Event, window, cx| {
+                        if let rho_slack::ui::results::Event::Open(place) = event {
+                            workspace.open_slack_search_target(
+                                rho_slack::ui::Target::Message(place.clone()),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                ));
                 Self::wrap_surface(key, SurfaceView::SlackResults(view))
             }
         };
