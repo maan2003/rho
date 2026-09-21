@@ -91,8 +91,8 @@ mod tests {
         ))
         .expect("valid Rho OKSolar P3 source");
         let style = &source["themes"][0]["style"];
-        assert_eq!(style["text"], "oklch(68.8% 0.012 95)");
-        assert_eq!(style["editor.foreground"], "oklch(68.8% 0.012 95)");
+        assert_eq!(style["text"], "oklch(70.9% 0.012 95)");
+        assert_eq!(style["editor.foreground"], "oklch(70.9% 0.012 95)");
         assert_eq!(
             colors.text, colors.editor_foreground,
             "general and editor body text use the same foreground"
@@ -102,11 +102,11 @@ mod tests {
         let background = wcag_relative_luminance(colors.editor_background);
         let contrast = (foreground + 0.05) / (background + 0.05);
         assert!(
-            contrast >= 6.0,
-            "body text contrast must remain at least 6:1, got {contrast:.2}:1"
+            contrast >= 6.5,
+            "body text contrast must remain at least 6.5:1, got {contrast:.2}:1"
         );
         assert!(
-            (contrast - 6.017).abs() < 0.005,
+            (contrast - 6.509).abs() < 0.005,
             "unexpected contrast {contrast}"
         );
     }
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn bundled_noto_color_emoji_is_used_by_automatic_fallback() -> anyhow::Result<()> {
-        use gpui::{FontRun, PlatformTextSystem as _};
+        use gpui::{FontFallbacks, FontRun, PlatformTextSystem as _};
         use gpui_wgpu::CosmicTextSystem;
 
         let font_bytes = |path| {
@@ -162,12 +162,18 @@ mod tests {
                 .any(|name| name == "Noto Color Emoji")
         );
 
-        let primary_id = text_system.font_id(&gpui::font("Rho Font"))?;
-        for (description, text) in [
-            ("skin-tone emoji", "👍🏽"),
-            ("skin-tone ZWJ emoji", "👩🏽‍💻"),
-            ("standard emoji", "🎉"),
+        for (description, text, explicit_fallback) in [
+            ("skin-tone emoji", "👍🏽", false),
+            ("skin-tone ZWJ emoji", "👩🏽‍💻", false),
+            ("standard emoji", "🎉", false),
+            ("emoji-presentation skull", "☠️", true),
+            ("emoji-presentation frown", "☹️", true),
         ] {
+            let mut font = gpui::font("Rho Font");
+            if explicit_fallback {
+                font.fallbacks = Some(FontFallbacks::from_fonts(vec!["Noto Color Emoji".into()]));
+            }
+            let primary_id = text_system.font_id(&font)?;
             let layout = text_system.layout_line(
                 text,
                 gpui::px(16.0),

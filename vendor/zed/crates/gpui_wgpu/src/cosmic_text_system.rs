@@ -334,7 +334,9 @@ impl CosmicTextSystemState {
                 "Segoe Fluent Icons",
             ];
 
+            let is_known_emoji_font = check_is_known_emoji_font(&postscript_name);
             if font.as_swash().charmap().map('m') == 0
+                && !is_known_emoji_font
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
             {
                 self.font_system.db_mut().remove_face(font.id());
@@ -347,7 +349,7 @@ impl CosmicTextSystemState {
                 font,
                 variations: SmallVec::new(),
                 features: cosmic_features.clone(),
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                is_known_emoji_font,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
         }
@@ -680,7 +682,20 @@ impl CosmicTextSystemState {
             } else {
                 let loaded_fonts = &self.loaded_fonts;
                 let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
-                compute_run_spans(text, offs, run.len, run.font_id, &fallback_chain, &covers)
+                let is_color_emoji = |id: FontId| {
+                    loaded_fonts
+                        .get(id.0)
+                        .is_some_and(|font| font.is_known_emoji_font)
+                };
+                compute_run_spans(
+                    text,
+                    offs,
+                    run.len,
+                    run.font_id,
+                    &fallback_chain,
+                    &covers,
+                    &is_color_emoji,
+                )
             };
 
             for span in spans {
@@ -999,6 +1014,7 @@ fn compute_run_spans(
     primary: FontId,
     fallback_chain: &[(FontId, SharedString)],
     covers: &impl Fn(FontId, char) -> bool,
+    is_color_emoji: &impl Fn(FontId) -> bool,
 ) -> SmallVec<[RunSpan; 4]> {
     let mut spans = SmallVec::new();
     let run_end = run_offset + run_len;
@@ -1021,7 +1037,18 @@ fn compute_run_spans(
     for (grapheme_idx, grapheme) in run_text.grapheme_indices(true) {
         let abs = run_offset + grapheme_idx;
         let ch = grapheme.chars().next().unwrap_or('\0');
-        let next_slot = pick_covering_slot(ch, span_slot, primary, fallback_chain, covers);
+        let next_slot = if grapheme.contains('\u{FE0F}') {
+            fallback_chain
+                .iter()
+                .position(|(fb_id, _)| is_color_emoji(*fb_id) && covers(*fb_id, ch))
+                .or_else(|| pick_covering_slot(ch, span_slot, primary, fallback_chain, covers))
+        } else if grapheme.contains('\u{FE0E}') {
+            pick_covering_slot(ch, span_slot, primary, fallback_chain, &|id, ch| {
+                !is_color_emoji(id) && covers(id, ch)
+            })
+        } else {
+            pick_covering_slot(ch, span_slot, primary, fallback_chain, covers)
+        };
         if next_slot == span_slot {
             continue;
         }
@@ -1496,7 +1523,7 @@ mod tests {
         let fb: SmallVec<[(FontId, SharedString); 4]> = SmallVec::new();
         let covers = |_: FontId, _: char| false;
         let text = "hello";
-        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers);
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers, &|_| false);
         assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
     }
 
@@ -1513,7 +1540,7 @@ mod tests {
             }
         };
         let text = "a字b";
-        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers);
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers, &|_| false);
         // '字' is 3 bytes so split is at 1 then 4.
         assert_eq!(
             spans.as_slice(),
@@ -1540,7 +1567,7 @@ mod tests {
         let text = "xx字y";
         let run_offset = 2;
         let run_len = text.len() - run_offset;
-        let spans = compute_run_spans(text, run_offset, run_len, primary, &fb, &covers);
+        let spans = compute_run_spans(text, run_offset, run_len, primary, &fb, &covers, &|_| false);
         assert_eq!(
             spans.as_slice(),
             &[span(2, 5, Some(0), fid(1)), span(5, 6, None, primary)]
@@ -1563,8 +1590,59 @@ mod tests {
         };
         // \u{0905} devanagari short a + \u{0902} candrabindu mark.
         let text = "\u{0905}\u{0902}";
-        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers);
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers, &|_| false);
         assert_eq!(spans.as_slice(), &[span(0, text.len(), Some(0), fid(1))]);
+    }
+
+    #[test]
+    fn emoji_presentation_selector_prefers_color_fallback_over_monochrome_faces() {
+        let primary = fid(0);
+        let fb = chain(&[1, 2]);
+        let covers = |_: FontId, ch: char| matches!(ch, '\u{2620}' | '\u{2639}');
+        let is_color_emoji = |id: FontId| id == fid(2);
+
+        for base in ["\u{2620}", "\u{2639}"] {
+            let spans =
+                compute_run_spans(base, 0, base.len(), primary, &fb, &covers, &is_color_emoji);
+            assert_eq!(
+                spans.as_slice(),
+                &[span(0, base.len(), None, primary)],
+                "text presentation stays in the primary font"
+            );
+
+            let text = format!("{base}\u{FE0E}");
+            let spans =
+                compute_run_spans(&text, 0, text.len(), primary, &fb, &covers, &is_color_emoji);
+            assert_eq!(
+                spans.as_slice(),
+                &[span(0, text.len(), None, primary)],
+                "VS15 stays in the primary font"
+            );
+
+            let emoji = format!("{base}\u{FE0F}");
+            let spans = compute_run_spans(
+                &emoji,
+                0,
+                emoji.len(),
+                primary,
+                &fb,
+                &covers,
+                &is_color_emoji,
+            );
+            assert_eq!(
+                spans.as_slice(),
+                &[span(0, emoji.len(), Some(1), fid(2))],
+                "VS16 skips the covering monochrome fallback for the color face"
+            );
+
+            let spans =
+                compute_run_spans(&emoji, 0, emoji.len(), primary, &fb, &covers, &|_| false);
+            assert_eq!(
+                spans.as_slice(),
+                &[span(0, emoji.len(), None, primary)],
+                "without a known color face VS16 retains normal fallback selection"
+            );
+        }
     }
 
     #[test]
@@ -1575,7 +1653,7 @@ mod tests {
         let covers = |id: FontId, ch: char| id == fid(1) && ch != '\u{200D}';
         // family zwj sequence woman zwj girl.
         let text = "\u{1F469}\u{200D}\u{1F467}";
-        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers);
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers, &|_| false);
         assert_eq!(spans.as_slice(), &[span(0, text.len(), Some(0), fid(1))]);
     }
 
@@ -1591,7 +1669,7 @@ mod tests {
             }
         };
         let text = "字字字";
-        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers);
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers, &|_| false);
         assert_eq!(spans.as_slice(), &[span(0, text.len(), Some(0), fid(1))]);
     }
 
@@ -1600,7 +1678,7 @@ mod tests {
         let primary = fid(0);
         let fb = chain(&[1]);
         let covers = |_: FontId, _: char| true;
-        let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers);
+        let spans = compute_run_spans("anything", 3, 0, primary, &fb, &covers, &|_| false);
         assert!(spans.is_empty());
     }
 }

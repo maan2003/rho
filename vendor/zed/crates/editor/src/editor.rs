@@ -1111,6 +1111,7 @@ pub struct Editor {
     syntax_concealments_dirty: bool,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
+    gutter_images: HashMap<Anchor, Arc<gpui::RenderImage>>,
     allow_git_diff_scrollbar_markers: bool,
     scrollbar_marker_state: ScrollbarMarkerState,
     active_indent_guides_state: ActiveIndentGuidesState,
@@ -1369,6 +1370,7 @@ impl NextScrollCursorCenterTopBottom {
 #[derive(Clone)]
 pub struct EditorSnapshot {
     pub mode: EditorMode,
+    has_gutter_images: bool,
     show_gutter: bool,
     show_compact_gutter: bool,
     offset_content: bool,
@@ -2571,6 +2573,7 @@ impl Editor {
             syntax_concealments_dirty: true,
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
+            gutter_images: HashMap::default(),
             allow_git_diff_scrollbar_markers: false,
             scrollbar_marker_state: ScrollbarMarkerState::default(),
             active_indent_guides_state: ActiveIndentGuidesState::default(),
@@ -3368,6 +3371,7 @@ impl Editor {
 
         EditorSnapshot {
             mode: self.mode.clone(),
+            has_gutter_images: !self.gutter_images.is_empty(),
             show_gutter: self.show_gutter,
             show_compact_gutter: self.show_compact_gutter,
             offset_content: self.offset_content,
@@ -9894,6 +9898,26 @@ impl Editor {
         Some(text_highlights)
     }
 
+    /// Sets a two-line-high square image outside the text layout. The caller
+    /// reserves those rows; this decoration never inserts buffer text or rows.
+    /// Removing the last image releases the gutter width.
+    pub fn set_gutter_image(
+        &mut self,
+        anchor: Anchor,
+        image: Option<Arc<gpui::RenderImage>>,
+        cx: &mut Context<Self>,
+    ) {
+        match image {
+            Some(image) => {
+                self.gutter_images.insert(anchor, image);
+            }
+            None => {
+                self.gutter_images.remove(&anchor);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn highlight_gutter<T: 'static>(
         &mut self,
         ranges: impl Into<Vec<Range<Anchor>>>,
@@ -12741,7 +12765,12 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &App,
     ) -> GutterDimensions {
-        if self.show_compact_gutter
+        if self.has_gutter_images {
+            GutterDimensions {
+                width: style.text.line_height_in_pixels(window.rem_size()) * 2. + font_size * 0.5,
+                ..Default::default()
+            }
+        } else if self.show_compact_gutter
             && let Some(ch_width) = cx.text_system().ch_width(font_id, font_size).log_err()
         {
             GutterDimensions {

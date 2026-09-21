@@ -30,7 +30,7 @@
   "buffer_font_family": "Rho Font",
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
-  "buffer_font_fallbacks": null,
+  "buffer_font_fallbacks": ["Noto Color Emoji"],
   // The OpenType features to enable for text in the editor.
   "buffer_font_features": {
     // Disable ligatures:
@@ -60,7 +60,7 @@
   "ui_font_family": "Rho Font",
   // Set the UI's font fallbacks, this will be merged with the platform's
   // default font fallbacks.
-  "ui_font_fallbacks": null,
+  "ui_font_fallbacks": ["Noto Color Emoji"],
   // The OpenType features to enable for text in the UI
   "ui_font_features": {
     // Disable ligatures:

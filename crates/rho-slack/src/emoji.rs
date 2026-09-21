@@ -5,7 +5,46 @@
 //! a workspace's custom emoji has no glyph anywhere but Slack, so it stays a
 //! shortcode, and code keeps whatever was typed in it.
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::LazyLock;
+
+const SLACK_SHORTCODE_DATA: &str = include_str!("../assets/iamcal-emoji-data/slack-shortcodes.tsv");
+
+static SLACK_SHORTCODES: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    SLACK_SHORTCODE_DATA
+        .lines()
+        .map(|line| {
+            line.split_once('\t')
+                .expect("generated Slack shortcode row contains a tab")
+        })
+        .collect()
+});
+
+struct StandardEmoji {
+    glyph: &'static str,
+    emoji: Option<&'static emojis::Emoji>,
+}
+
+fn standard_emoji(name: &str) -> Option<StandardEmoji> {
+    // Modifiers are meaningful only after a modifiable base. Leaving a
+    // standalone modifier as a shortcode also preserves custom-emoji lookup.
+    if skin_tone(name).is_some() {
+        return None;
+    }
+
+    if let Some(&glyph) = SLACK_SHORTCODES.get(name) {
+        return Some(StandardEmoji {
+            glyph,
+            emoji: emojis::get(glyph),
+        });
+    }
+
+    emojis::get_by_shortcode(name).map(|emoji| StandardEmoji {
+        glyph: emoji.as_str(),
+        emoji: Some(emoji),
+    })
+}
 
 /// Replaces every standard shortcode with its glyph. Unknown shortcodes,
 /// which is what a custom emoji looks like from here, are left alone.
@@ -17,18 +56,19 @@ pub fn render(text: &str) -> String {
         out.push_str(&text[cursor..range.start]);
         let name = &text[range.start + 1..range.end - 1];
         cursor = range.end;
-        match (literal, emojis::get_by_shortcode(name)) {
-            (false, Some(mut emoji)) => {
+        match (literal, standard_emoji(name)) {
+            (false, Some(standard)) => {
+                let mut glyph = standard.glyph;
                 if let Some((tone_range, false)) = tokens.peek()
                     && tone_range.start == cursor
                     && let Some(tone) = skin_tone(&text[tone_range.start + 1..tone_range.end - 1])
-                    && let Some(toned) = emoji.with_skin_tone(tone)
+                    && let Some(toned) = standard.emoji.and_then(|emoji| emoji.with_skin_tone(tone))
                 {
-                    emoji = toned;
+                    glyph = toned.as_str();
                     cursor = tone_range.end;
                     tokens.next();
                 }
-                out.push_str(emoji.as_str());
+                out.push_str(glyph);
             }
             _ => out.push_str(&text[range]),
         }
@@ -56,7 +96,7 @@ pub fn shortcodes(text: &str) -> Vec<Range<usize>> {
     scan(text)
         .into_iter()
         .filter(|(range, literal)| {
-            !literal && emojis::get_by_shortcode(&text[range.start + 1..range.end - 1]).is_none()
+            !literal && standard_emoji(&text[range.start + 1..range.end - 1]).is_none()
         })
         .map(|(range, _)| range)
         .collect()
@@ -133,6 +173,20 @@ mod tests {
         assert_eq!(render(":heart::skin-tone-4:"), "❤️:skin-tone-4:");
         assert_eq!(render(":custom::skin-tone-4:"), ":custom::skin-tone-4:");
         assert_eq!(render(":thumbsup::skin-tone-7:"), "👍:skin-tone-7:");
+    }
+
+    #[test]
+    fn slack_aliases_use_qualified_unicode() {
+        assert_eq!(
+            render(":thinking_face: :rolling_on_the_floor_laughing:"),
+            "🤔 🤣"
+        );
+        assert_eq!(
+            render(":skull_and_crossbones: :white_frowning_face:"),
+            "☠️ ☹️",
+            "text-default symbols retain Slack's emoji-presentation selector"
+        );
+        assert_eq!(SLACK_SHORTCODES.len(), 1972);
     }
 
     #[test]

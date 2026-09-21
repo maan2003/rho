@@ -15,26 +15,30 @@ claims are not evidence that a workflow is complete.
 
 ## Compact message and emoji QA
 
-- Rho OKSolar P3 body text measures 6.017:1 against its editor background.
+- Rho OKSolar P3 body text measures 6.509:1 against its editor background.
   Sidebar unread/mention state uses color, not bold weight; the conversation
-  has a 4px inset and no empty gutter.
-- Square avatars replace visible names once loaded. Names remain available
-  for copy/search and as a failed-avatar fallback. Times follow messages,
+  has a 4px inset and an avatar gutter.
+- Two-line-high square avatars in the gutter replace visible names once loaded.
+  Short messages reserve enough height to keep adjacent avatars from overlapping;
+  wrapped paragraphs and leading code blocks align at the same text margin.
+  Names remain available for copy/search and as a failed-avatar fallback. Times follow messages,
   with a separate footer after fenced code.
 - Fixed the shared WGPU BGRA/RGBA upload conversion; avatars, custom emoji,
   and other images retain their source colors.
-- Standard color emoji are bundled in Rho via Noto Color Emoji. Slack
+- Standard color emoji are bundled in Rho via Noto Color Emoji. Slack alias
+  names come from a pinned, compact iamcal emoji-data table; emoji-presentation
+  symbols prefer the color font rather than a monochrome symbol face. Slack
   `::skin-tone-2` through `::skin-tone-6` sequences render their variants,
   including supported joined emoji. Custom images and aliases stay on the
   bounded Slack asset path.
-- Verification: `cargo test -p rho-slack --features ui,fake`: 230 passed.
-  `cargo test -p rho-gui --lib`: 361 passed, 4 ignored, including the
-  bundled-font, 6:1-theme, and Slack rendering regressions. The two atlas upload
+- Verification: `cargo test -p rho-slack --features ui,fake`: 231 passed.
+  `cargo test -p rho-gui --lib`: 362 passed, 4 ignored, including the
+  bundled-font, 6.5:1-theme, and Slack rendering regressions. The two atlas upload
   helper tests pass in an isolated Rust harness; the vendored graphics test
   workspace itself is blocked by its existing SQLite dependency conflict.
 - Inspected native captures of compact messages, empty and typed composers,
   standard/skin-tone/joined emoji, custom emoji, and corrected image colors:
-  `/src/slack-qa/screens/refine-final.png` and `refine-final-draft.png`.
+  `/src/slack-qa/screens/gutter-emoji-final.png` and `gutter-emoji-draft.png`.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 

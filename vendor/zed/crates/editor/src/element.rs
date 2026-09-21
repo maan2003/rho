@@ -5800,6 +5800,41 @@ impl EditorElement {
             self.paint_gutter_diff_hunks(layout, self.split_side, window, cx)
         }
 
+        let snapshot = &layout.position_map.snapshot.display_snapshot;
+        let line_height = layout.position_map.line_height;
+        let side = line_height * 2.;
+        let images = self
+            .editor
+            .read(cx)
+            .gutter_images
+            .iter()
+            .filter_map(|(anchor, image)| {
+                let row = anchor.to_display_point(snapshot).row();
+                (row.0 + 2 > layout.visible_display_row_range.start.0
+                    && row < layout.visible_display_row_range.end)
+                    .then(|| (row, image.clone()))
+            })
+            .collect::<Vec<_>>();
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: layout.gutter_hitbox.bounds,
+            }),
+            |window| {
+                for (row, image) in images {
+                    let y = layout.gutter_hitbox.top()
+                        + Pixels::from(
+                            row.0 as f64 * ScrollPixelOffset::from(line_height)
+                                - layout.position_map.scroll_pixel_position.y,
+                        );
+                    let bounds =
+                        Bounds::new(point(layout.gutter_hitbox.left(), y), size(side, side));
+                    window
+                        .paint_image(bounds, bounds, Corners::default(), image, 0, false)
+                        .log_err();
+                }
+            },
+        );
+
         let compact_gutter = layout.position_map.snapshot.show_compact_gutter;
         let highlight_width = if compact_gutter {
             (layout.position_map.em_advance * 0.125).max(px(1.))

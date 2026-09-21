@@ -41,14 +41,7 @@ pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_DRAFT_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 
-/// The stripe down the gutter beside the composer, the agent transcript's
-/// prompt marker worn by the Slack surface.
-pub struct ComposeGutter;
-
-/// The stripe beside what hangs off a message: an attachment's card, a link
-/// preview, a file. The agent transcript marks the user's own message this
-/// way, and here it says the same thing -- these lines came with the
-/// message rather than being the words in it.
+/// The transcript's decoration namespace for Slack message blocks.
 pub struct ChromeGutter;
 
 /// Marks folds owned by custom emoji rendering. The shortcode stays in the
@@ -151,7 +144,7 @@ pub struct ConversationView {
     emoji_image_bytes: usize,
     emoji_revision: u64,
     avatar_authors: HashMap<Row, crate::types::UserId>,
-    avatar_inlays: HashMap<Row, EmojiDecoration>,
+    avatar_folds: HashMap<Row, Range<MultiBufferAnchor>>,
     time_folds: HashMap<Row, Range<MultiBufferAnchor>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -525,11 +518,7 @@ impl ConversationView {
             session: session.clone(),
             hooks,
             source: source.clone(),
-            transcript: {
-                let mut transcript = Transcript::new(transcript);
-                transcript.set_gutter(hooks.gutter_colour);
-                transcript
-            },
+            transcript: Transcript::new(transcript),
             input,
             multi_buffer,
             editor,
@@ -564,7 +553,7 @@ impl ConversationView {
             emoji_image_bytes: 0,
             emoji_revision: 0,
             avatar_authors: HashMap::new(),
-            avatar_inlays: HashMap::new(),
+            avatar_folds: HashMap::new(),
             time_folds: HashMap::new(),
             _subscriptions: subscriptions,
         };
@@ -1531,10 +1520,8 @@ impl ConversationView {
         }
     }
 
-    /// The composer's chrome, which is the agent transcript's prompt worn by
-    /// a Slack surface: a stripe down the gutter marking where the reader
-    /// writes, and, while there is nothing in it, a muted `message #design`
-    /// standing in the empty line rather than a bare gap.
+    /// The agent prompt's draft style and a display-only destination hint.
+    /// The gutter is reserved for author avatars, not a composer stripe.
     fn apply_compose_chrome(&self, cx: &mut Context<Self>) {
         let placeholder = self.compose_placeholder(cx);
         let (empty, start, end) = {
@@ -1561,7 +1548,6 @@ impl ConversationView {
             false => Vec::new(),
         };
         let draft_style = (self.hooks.prompt_style)(cx);
-        let gutter_colour = self.hooks.gutter_colour;
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[InlayId::Custom(COMPOSE_PLACEHOLDER_INLAY_ID)], inlays, cx);
             editor.highlight_text(
@@ -1570,7 +1556,6 @@ impl ConversationView {
                 draft_style,
                 cx,
             );
-            editor.highlight_gutter::<ComposeGutter>(vec![start..end], gutter_colour, cx);
         });
     }
 
@@ -1876,7 +1861,7 @@ impl ConversationView {
 
     #[cfg(any(test, feature = "fake"))]
     pub fn avatar_count_for_test(&self) -> usize {
-        self.avatar_inlays.len()
+        self.avatar_folds.len()
     }
 
     #[cfg(any(test, feature = "fake"))]
@@ -1896,11 +1881,11 @@ impl ConversationView {
                 editor.remove_folds_with_type(&[range], TypeId::of::<MessageTimeFold>(), false, cx);
             });
         }
-        if let Some(decoration) = self.avatar_inlays.remove(row) {
+        if let Some(range) = self.avatar_folds.remove(row) {
             self.editor.update(cx, |editor, cx| {
-                editor.remove_image_inlay(decoration.inlay, cx);
+                editor.set_gutter_image(range.start, None, cx);
                 editor.remove_folds_with_type(
-                    std::slice::from_ref(&decoration.range),
+                    std::slice::from_ref(&range),
                     TypeId::of::<AvatarFold>(),
                     false,
                     cx,
@@ -1927,7 +1912,7 @@ impl ConversationView {
         let rows = self
             .emoji_decorations
             .keys()
-            .chain(self.avatar_inlays.keys())
+            .chain(self.avatar_folds.keys())
             .chain(self.time_folds.keys())
             .cloned()
             .collect::<Vec<_>>();
@@ -2109,7 +2094,15 @@ impl ConversationView {
                     .map(std::path::Path::to_path_buf);
                 if let Some(path) = path {
                     if let Some(image) = self.decoded_image(&path, cx) {
-                        let header_end = text.find('\n').map_or(0, |offset| offset + 1);
+                        let mut header_end = text.find('\n').map_or(0, |offset| offset + 1);
+                        // The opening fence has no visible text. Hide that row
+                        // with the author header so code starts beside the avatar.
+                        let body = &text[header_end..];
+                        if (body.starts_with("```") || body.starts_with("~~~"))
+                            && let Some(end) = body.find('\n')
+                        {
+                            header_end += end + 1;
+                        }
                         let (start, end) = {
                             let buffer = self.transcript.buffer().read(cx);
                             (
@@ -2122,9 +2115,9 @@ impl ConversationView {
                             snapshot.anchor_in_excerpt(start),
                             snapshot.anchor_in_excerpt(end),
                         ) {
-                            if let Some(decoration) = self.editor.update(cx, |editor, cx| {
-                                let inlay = editor.add_image_inlay(start, image, 3, cx)?;
-                                let range = start..end;
+                            let range = start..end;
+                            self.editor.update(cx, |editor, cx| {
+                                editor.set_gutter_image(start, Some(image), cx);
                                 editor.fold_creases(
                                     vec![Crease::simple(
                                         range.clone(),
@@ -2134,10 +2127,8 @@ impl ConversationView {
                                     window,
                                     cx,
                                 );
-                                Some(EmojiDecoration { inlay, range })
-                            }) {
-                                self.avatar_inlays.insert(row.clone(), decoration);
-                            }
+                            });
+                            self.avatar_folds.insert(row.clone(), range);
                         }
                     }
                 } else {
@@ -3294,17 +3285,11 @@ fn message_item_with_header(
     push_body(&mut spans, &said, model, &message.files);
     spans.push(Span::plain("\n"));
     lines.extend(said.split('\n').map(&meta));
-    // What came with the message rather than being it -- an attachment's
-    // card, a link preview, a file -- is marked in the gutter and starts at
-    // the margin like anything else. Nothing is drawn into the text to say
-    // so: that is what the bar beside it is for.
-    let mut gutter = None;
+    // Attachment and preview text follows the body at the same margin.
     if !chrome.is_empty() {
         let text = chrome.join("\n");
-        let from = width(&spans);
         push_body(&mut spans, &text, model, &message.files);
         spans.push(Span::plain("\n"));
-        gutter = Some(from..width(&spans));
         lines.extend(text.split('\n').map(&meta));
     }
     // The pictures hang under everything the message said and named, and
@@ -3370,17 +3355,16 @@ fn message_item_with_header(
         interaction: None,
         images: Vec::new(),
     });
-    let item = item(Row::Message(message.ts.clone()), spans, lines);
-    match gutter {
-        Some(gutter) => item.with_gutter(gutter),
-        None => item,
+    // A new author's two-row avatar needs room even for a one-line message.
+    // Longer messages, reactions, and threads already provide that height.
+    if header && lines.len() == 3 {
+        spans.push(Span::plain("\n"));
+        lines.push(LineMeta {
+            thread: Some(message.thread_root()),
+            ..LineMeta::default()
+        });
     }
-}
-
-/// How far into the item's text the spans have got, which is where the next
-/// one starts. The item's own text is what a gutter range is measured in.
-fn width(spans: &[Span]) -> usize {
-    spans.iter().map(|span| span.text.len()).sum()
+    item(Row::Message(message.ts.clone()), spans, lines)
 }
 
 /// What the empty composer says it is for. A thread's composer says so in
@@ -4300,6 +4284,11 @@ mod tests {
         let hello = lines_text.iter().position(|line| *line == "hello").unwrap();
         assert!(lines_text[hello - 1].trim() == "ada");
         assert_eq!(lines_text[hello + 1].trim(), clock_time(1_700_000_000));
+        assert_eq!(
+            lines_text[hello + 2],
+            "",
+            "short messages reserve the avatar's second row"
+        );
         let over = lines_text.iter().position(|line| *line == "over").unwrap();
         assert!(lines_text[over - 1].trim() == "ada");
         assert_eq!(lines_text[over + 1], "two lines");
@@ -4527,9 +4516,7 @@ mod tests {
             "a bot is named like anyone: {text}"
         );
         assert!(text.contains("branch: main"), "{text}");
-        // An app card is the same quote box as a preview: it starts at the
-        // margin with the bar beside it, not a stray dash in the middle of
-        // the conversation.
+        // An app card starts at the text margin without a decorative dash.
         assert!(text.lines().any(|line| line == "pipeline"), "{text}");
         assert!(!text.contains("— pipeline"), "{text}");
         let _ = &styles;
@@ -4562,7 +4549,7 @@ mod tests {
         );
         assert!(
             !text.contains("\u{258e}"),
-            "the card's edge is the gutter's bar, not a column of text: {text}"
+            "a preview adds no decorative bar to the text: {text}"
         );
         let _ = &styles;
         assert!(
@@ -4577,21 +4564,8 @@ mod tests {
                 >= 2,
             "every line of the card opens the page it stands for"
         );
-        // The card is marked in the gutter, which is the whole of what
-        // makes it one thing: the bar runs beside every row of it and
-        // beside nothing the sender said.
         let item = message_item(&preview, &model(), false);
-        let marked = item.gutter.clone().expect("the card is marked");
-        assert_eq!(
-            item.text[marked].lines().collect::<Vec<_>>(),
-            vec![
-                "Worth a read · example.com",
-                "the first line",
-                "the second line"
-            ],
-            "the bar covers the card and stops there: {:?}",
-            item.text
-        );
+        assert!(item.gutter.is_none(), "the gutter is reserved for avatars");
     }
 
     #[test]

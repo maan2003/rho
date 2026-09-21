@@ -75,7 +75,7 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         serde_json::json!({
             "ts": "99.0",
             "user": "UD",
-            "text": "~struck~ and <https://example.com/spec|the spec>\n```\nlet answer = 42;\n```"
+            "text": "```\nlet answer = 42;\n```\n~struck~ and <https://example.com/spec|the spec>"
         }),
     );
     fake.add_message(
@@ -178,8 +178,12 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         "the reaction row carries the trailing time: {display}"
     );
     assert!(
-        display.contains("let answer = 42;\n  00:01"),
-        "a fenced block keeps its time outside the code: {display}"
+        display.contains("Thu 1 Jan\nlet answer = 42;"),
+        "a leading code block starts beside its gutter avatar, without a blank header: {display}"
+    );
+    assert!(
+        display.lines().any(|line| line.starts_with("before ")),
+        "the gutter avatar occupies no text columns: {display}"
     );
     assert!(
         !display.contains(":party:"),

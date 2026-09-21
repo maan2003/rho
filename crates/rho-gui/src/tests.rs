@@ -63,6 +63,52 @@ fn frame_distribution_reports_nearest_rank_percentiles() {
 }
 
 #[gpui::test]
+fn gutter_images_reserve_two_line_width_without_inserting_text(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let window = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        rho_window::editor_config::configure(&mut editor, window, cx);
+        editor.set_show_compact_gutter(false, cx);
+        editor.set_text("first\nsecond", window, cx);
+        editor
+    });
+    window
+        .update(cx, |editor, window, cx| {
+            let style = editor.style(cx).clone();
+            let font_size = style.text.font_size.to_pixels(window.rem_size());
+            let font_id = window.text_system().resolve_font(&style.text.font());
+            let line_height = style.text.line_height_in_pixels(window.rem_size());
+            let anchor = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_before(editor::MultiBufferOffset(0));
+            let before = editor.display_snapshot(cx).text();
+            let image = std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::new()));
+            editor.set_gutter_image(anchor, Some(image), cx);
+            let dimensions = editor
+                .snapshot(window, cx)
+                .gutter_dimensions(font_id, font_size, &style, window, cx);
+            assert_eq!(dimensions.width, line_height * 2. + font_size * 0.5);
+            assert_eq!(
+                editor.display_snapshot(cx).text(),
+                before,
+                "avatars consume no text columns or rows"
+            );
+            editor.set_gutter_image(anchor, None, cx);
+            let dimensions = editor
+                .snapshot(window, cx)
+                .gutter_dimensions(font_id, font_size, &style, window, cx);
+            assert_eq!(
+                dimensions.width,
+                gpui::px(0.),
+                "removing the last avatar releases its gutter"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn image_inlays_are_fixed_cell_decorations(cx: &mut TestAppContext) {
     cx.update(init_test_app);
     let editor = cx.add_window(|window, cx| {
