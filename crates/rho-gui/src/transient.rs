@@ -387,9 +387,16 @@ pub(crate) fn slack_message_menu(actions: &rho_slack::ui::conversation::MessageA
             MenuAction::Command(Command::SlackMessageDelete(ts)),
         );
     }
-    menu
-        .item("u", "mark unread", MenuAction::Command(Command::SlackMarkUnread))
-        .item("s", "save / unsave for later (local)", MenuAction::Command(Command::SlackSaveForLater))
+    menu.item(
+        "u",
+        "mark unread",
+        MenuAction::Command(Command::SlackMarkUnread),
+    )
+    .item(
+        "s",
+        "save / unsave for later (local)",
+        MenuAction::Command(Command::SlackSaveForLater),
+    )
 }
 
 pub(crate) fn slack_menu() -> Menu {
