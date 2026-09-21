@@ -340,7 +340,7 @@ impl Workspace {
                     .id("slack-saved")
                     .p_1()
                     .cursor_pointer()
-                    .child("Saved for later")
+                    .child("Saved for later (local)")
                     .on_click(cx.listener(|this, _, window, cx| this.open_slack_saved(window, cx))),
             )
             .child(
