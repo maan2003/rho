@@ -544,7 +544,10 @@ impl ConversationView {
             editing_message: None,
             held_compose: None,
             attached: saved_files,
-            send_state: SendState::Ready,
+            send_state: match session.read(cx).is_sending_draft(&source) {
+                true => SendState::Sending,
+                false => SendState::Ready,
+            },
             also_send_to_channel: false,
             awaiting_images: Vec::new(),
             awaiting_names: Vec::new(),
@@ -746,7 +749,10 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> Task<Submitted> {
         let text = self.input.read(cx).text();
-        if self.send_state == SendState::Sending {
+        if self.send_state == SendState::Sending
+            || self.session.read(cx).is_sending_draft(&self.source)
+        {
+            self.send_state = SendState::Sending;
             return Task::ready(Submitted::Sending);
         }
         if also_send_to_channel && !self.attached.is_empty() {
@@ -785,71 +791,30 @@ impl ConversationView {
             .detach();
             return watch(cx, told);
         }
-        self.session.read(cx).save_pending_draft(
-            &source,
-            &Draft {
-                text: text.clone(),
-                files: Vec::new(),
-            },
-        );
         self.send_state = SendState::Sending;
         self.set_compose(String::new(), cx);
         self.refresh_chip(cx);
         cx.notify();
         let sending = self.session.update(cx, |session, cx| {
-            session.send_with_options(&source, text.clone(), also_send_to_channel, cx)
+            session.submit_draft(
+                &source,
+                Draft {
+                    text: text.clone(),
+                    files: Vec::new(),
+                },
+                also_send_to_channel,
+                cx,
+            )
         });
         let (tell, told) = futures::channel::oneshot::channel();
         cx.spawn(async move |this, cx| {
             let outcome = match sending.await {
                 Ok(()) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.send_state = SendState::Ready;
-                        let next = Draft {
-                            text: this.draft_text(cx),
-                            files: this.draft_files(),
-                        };
-                        let resolved =
-                            this.session
-                                .read(cx)
-                                .finish_pending_draft(&this.source, &next, true);
-                        this.set_compose(resolved.text, cx);
-                        this.attached = resolved
-                            .files
-                            .into_iter()
-                            .map(|file| Attached {
-                                name: file.name,
-                                bytes: std::sync::Arc::new(file.bytes),
-                            })
-                            .collect();
-                        this.refresh_chip(cx);
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.settle_draft_send(true, cx));
                     Submitted::Sent
                 }
                 Err(_) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.send_state = SendState::Failed;
-                        let next = Draft {
-                            text: this.draft_text(cx),
-                            files: this.draft_files(),
-                        };
-                        let resolved =
-                            this.session
-                                .read(cx)
-                                .finish_pending_draft(&this.source, &next, false);
-                        this.set_compose(resolved.text, cx);
-                        this.attached = resolved
-                            .files
-                            .into_iter()
-                            .map(|file| Attached {
-                                name: file.name,
-                                bytes: std::sync::Arc::new(file.bytes),
-                            })
-                            .collect();
-                        this.refresh_chip(cx);
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.settle_draft_send(false, cx));
                     Submitted::Refused
                 }
             };
@@ -1227,33 +1192,39 @@ impl ConversationView {
         path: &std::path::Path,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Attaching> {
-        // Asked before the file is read, so a refusal costs no disk.
+        // Reject before opening whenever metadata is enough, then enforce
+        // the same bound while reading so a growing file cannot race it.
         if self.editing_message.is_some() {
             return Ok(Attaching::NotWhileEditing);
         }
-        let size = std::fs::metadata(path)
-            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?
-            .len();
-        if size > MAX_ATTACHMENT_BYTES {
-            anyhow::bail!(
-                "{} is larger than the {} attachment limit",
-                path.display(),
-                crate::types::human_size(MAX_ATTACHMENT_BYTES)
-            );
+        if self.attached.len() >= MAX_ATTACHMENTS {
+            return Ok(Attaching::TooMany);
+        }
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            anyhow::bail!("{} is not a regular file", path.display());
         }
         let total = self
             .attached
             .iter()
             .map(|file| file.bytes.len() as u64)
             .sum::<u64>();
-        if total.saturating_add(size) > MAX_DRAFT_ATTACHMENT_BYTES {
-            anyhow::bail!(
-                "attachments exceed the {} draft limit",
-                crate::types::human_size(MAX_DRAFT_ATTACHMENT_BYTES)
-            );
+        let remaining = MAX_DRAFT_ATTACHMENT_BYTES.saturating_sub(total);
+        let limit = MAX_ATTACHMENT_BYTES.min(remaining);
+        if metadata.len() > limit {
+            return Ok(Attaching::TooLarge);
         }
-        let bytes = std::fs::read(path)
+        use std::io::Read as _;
+        let mut bytes = Vec::with_capacity(metadata.len().min(limit) as usize);
+        std::fs::File::open(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
             .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+        if bytes.len() as u64 > limit {
+            return Ok(Attaching::TooLarge);
+        }
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1328,19 +1299,6 @@ impl ConversationView {
         text: String,
         cx: &mut Context<Self>,
     ) -> Task<Submitted> {
-        self.session.read(cx).save_pending_draft(
-            &self.source,
-            &Draft {
-                text: text.clone(),
-                files: files
-                    .iter()
-                    .map(|file| DraftFile {
-                        name: file.name.clone(),
-                        bytes: file.bytes.as_ref().clone(),
-                    })
-                    .collect(),
-            },
-        );
         self.send_state = SendState::Sending;
         self.attached.clear();
         self.set_compose(String::new(), cx);
@@ -1349,64 +1307,28 @@ impl ConversationView {
         cx.notify();
         let source = self.source.clone();
         let bytes = files.iter().map(|file| file.bytes.len() as u64).sum();
-        let upload = files
-            .iter()
-            .map(|file| (file.name.clone(), file.bytes.as_ref().clone()))
-            .collect();
+        let pending = Draft {
+            text: text.clone(),
+            files: files
+                .iter()
+                .map(|file| DraftFile {
+                    name: file.name.clone(),
+                    bytes: file.bytes.as_ref().clone(),
+                })
+                .collect(),
+        };
         let sending = self.session.update(cx, |session, cx| {
-            session.send_files(&source, upload, text.clone(), cx)
+            session.submit_draft(&source, pending, false, cx)
         });
         let (tell, told) = futures::channel::oneshot::channel();
         cx.spawn(async move |this, cx| {
             let outcome = match sending.await {
                 Ok(()) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.send_state = SendState::Ready;
-                        let next = Draft {
-                            text: this.draft_text(cx),
-                            files: this.draft_files(),
-                        };
-                        let resolved =
-                            this.session
-                                .read(cx)
-                                .finish_pending_draft(&this.source, &next, true);
-                        this.set_compose(resolved.text, cx);
-                        this.attached = resolved
-                            .files
-                            .into_iter()
-                            .map(|file| Attached {
-                                name: file.name,
-                                bytes: std::sync::Arc::new(file.bytes),
-                            })
-                            .collect();
-                        this.refresh_chip(cx);
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.settle_draft_send(true, cx));
                     Submitted::FileSent(bytes)
                 }
                 Err(_) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.send_state = SendState::Failed;
-                        let next = Draft {
-                            text: this.draft_text(cx),
-                            files: this.draft_files(),
-                        };
-                        let resolved =
-                            this.session
-                                .read(cx)
-                                .finish_pending_draft(&this.source, &next, false);
-                        this.set_compose(resolved.text, cx);
-                        this.attached = resolved
-                            .files
-                            .into_iter()
-                            .map(|file| Attached {
-                                name: file.name,
-                                bytes: std::sync::Arc::new(file.bytes),
-                            })
-                            .collect();
-                        this.refresh_chip(cx);
-                        cx.notify();
-                    });
+                    let _ = this.update(cx, |this, cx| this.settle_draft_send(false, cx));
                     Submitted::Refused
                 }
             };
@@ -1443,6 +1365,43 @@ impl ConversationView {
     /// Which message an open edit is about, for the host's journal.
     pub fn editing_message(&self) -> Option<&Ts> {
         self.editing_message.as_ref()
+    }
+
+    fn settle_draft_send(&mut self, succeeded: bool, cx: &mut Context<Self>) {
+        // The Session resolved durable pending state before answering. Read
+        // that result rather than reconstructing it in a view that may have
+        // been closed while the request was in flight.
+        let resolved = self
+            .session
+            .read(cx)
+            .draft(&self.source)
+            .unwrap_or_default();
+        self.send_state = match succeeded {
+            true => SendState::Ready,
+            false => SendState::Failed,
+        };
+        self.set_compose(resolved.text, cx);
+        self.attached = resolved
+            .files
+            .into_iter()
+            .map(|file| Attached {
+                name: file.name,
+                bytes: std::sync::Arc::new(file.bytes),
+            })
+            .collect();
+        self.refresh_chip(cx);
+        cx.notify();
+    }
+
+    fn settle_session_send(&mut self, cx: &mut Context<Self>) {
+        if self.send_state != SendState::Sending
+            || self.session.read(cx).is_sending_draft(&self.source)
+        {
+            return;
+        }
+        if let Some(succeeded) = self.session.read(cx).draft_send_outcome(&self.source) {
+            self.settle_draft_send(succeeded, cx);
+        }
     }
 
     fn draft_text(&self, cx: &App) -> String {
@@ -1796,6 +1755,7 @@ impl ConversationView {
     /// item, a page costs one insert, and everything else keeps its anchors,
     /// so the cursor and the scroll stay where the reader put them.
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_session_send(cx);
         #[cfg(any(test, feature = "fake"))]
         let started = std::time::Instant::now();
         // The point is the reader's, and no redraw is allowed to move it.

@@ -315,9 +315,11 @@ impl Workspace {
                     .collect()
             }),
             std::rc::Rc::new(move |workspace: &mut Workspace, input, window, cx| {
-                let Some((_, _, source)) =
-                    select.iter().find(|(label, _, _)| label == input.trim())
-                else {
+                let chosen = match input.trim() {
+                    "" => select.first(),
+                    input => select.iter().find(|(label, _, _)| label == input),
+                };
+                let Some((_, _, source)) = chosen else {
                     return;
                 };
                 workspace.open_slack_source(source.clone(), window, cx);

@@ -405,6 +405,8 @@ pub struct Session {
     pending_sends: usize,
     /// Per-action tokens awaiting a modal-opening socket event.
     pending_interactions: HashSet<String>,
+    sending_drafts: HashSet<Source>,
+    send_outcomes: HashMap<Source, bool>,
     /// Author ids `users.info` has already been asked about, whether or not
     /// it answered. One ask per person, so a channel full of a stranger's
     /// messages is one request, and a request that failed is not retried on
@@ -471,6 +473,8 @@ impl Session {
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
             pending_interactions: HashSet::new(),
+            sending_drafts: HashSet::new(),
+            send_outcomes: HashMap::new(),
             asked_names: HashSet::new(),
             asked: 0,
             cached_files: HashMap::new(),
@@ -494,6 +498,8 @@ impl Session {
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
             pending_interactions: HashSet::new(),
+            sending_drafts: HashSet::new(),
+            send_outcomes: HashMap::new(),
             asked_names: HashSet::new(),
             asked: 0,
             cached_files: HashMap::new(),
@@ -3037,7 +3043,12 @@ impl Session {
     /// The saved composer for one source.
     pub fn draft(&self, source: &Source) -> Option<Draft> {
         let workspace = self.model.workspace().0.as_str();
-        self.mirror.as_ref()?.draft(&source.scope(workspace))
+        let mirror = self.mirror.as_ref()?;
+        let scope = source.scope(workspace);
+        match self.sending_drafts.contains(source) {
+            true => mirror.next_draft(&scope),
+            false => mirror.draft(&scope),
+        }
     }
 
     /// Every non-empty saved composer, for a draft inventory.
@@ -3096,6 +3107,65 @@ impl Session {
                 mirror.finish_pending_draft(&source.scope(&self.model.workspace().0), next, sent)
             })
             .unwrap_or_else(|| next.clone())
+    }
+
+    pub fn is_sending_draft(&self, source: &Source) -> bool {
+        self.sending_drafts.contains(source)
+    }
+
+    pub fn draft_send_outcome(&self, source: &Source) -> Option<bool> {
+        self.send_outcomes.get(source).copied()
+    }
+
+    /// Owns one source's pending send independently of any conversation view.
+    pub fn submit_draft(
+        &mut self,
+        source: &Source,
+        draft: Draft,
+        also_send_to_channel: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        if !self.sending_drafts.insert(source.clone()) {
+            return Task::ready(Err(anyhow::anyhow!("this draft is already being sent")));
+        }
+        self.send_outcomes.remove(source);
+        self.save_pending_draft(source, &draft);
+        let sending = match draft.files.is_empty() {
+            true => self.send_with_options(source, draft.text, also_send_to_channel, cx),
+            false => self.send_files(
+                source,
+                draft
+                    .files
+                    .into_iter()
+                    .map(|file| (file.name, file.bytes))
+                    .collect(),
+                draft.text,
+                cx,
+            ),
+        };
+        let source = source.clone();
+        let (tell, told) = futures::channel::oneshot::channel();
+        cx.spawn(async move |this, cx| {
+            let outcome = sending.await;
+            let succeeded = outcome.is_ok();
+            let _ = this.update(cx, |session, cx| {
+                if let Some(mirror) = session.mirror.as_ref() {
+                    mirror.finish_pending_from_store(
+                        &source.scope(&session.model.workspace().0),
+                        succeeded,
+                    );
+                }
+                session.sending_drafts.remove(&source);
+                session.send_outcomes.insert(source, succeeded);
+                cx.notify();
+            });
+            let _ = tell.send(outcome);
+        })
+        .detach();
+        cx.background_spawn(async move {
+            told.await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("send was cancelled")))
+        })
     }
 
     pub fn send(

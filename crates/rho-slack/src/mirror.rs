@@ -868,6 +868,14 @@ impl Mirror {
 
     /// Reads the draft for one source.
     pub fn draft(&self, scope: &Scope) -> Option<Draft> {
+        self.read_draft(scope, true)
+    }
+
+    pub fn next_draft(&self, scope: &Scope) -> Option<Draft> {
+        self.read_draft(scope, false)
+    }
+
+    fn read_draft(&self, scope: &Scope, include_pending: bool) -> Option<Draft> {
         let txn = self.db.read();
         let key = scope.prefix();
         let text = txn
@@ -892,24 +900,27 @@ impl Mirror {
             })
             .unwrap_or_default();
         let draft = Draft { text, files };
-        let pending = txn
-            .open_table(PENDING_DRAFTS)
-            .get(key.as_str())
-            .map(|value| {
-                let value = value.value();
-                let value = value.as_ref();
-                Draft {
-                    text: value.text.clone(),
-                    files: value
-                        .files
-                        .iter()
-                        .map(|file| DraftFile {
-                            name: file.name.clone(),
-                            bytes: file.bytes.clone(),
-                        })
-                        .collect(),
-                }
-            });
+        let pending = if include_pending {
+            txn.open_table(PENDING_DRAFTS)
+                .get(key.as_str())
+                .map(|value| {
+                    let value = value.value();
+                    let value = value.as_ref();
+                    Draft {
+                        text: value.text.clone(),
+                        files: value
+                            .files
+                            .iter()
+                            .map(|file| DraftFile {
+                                name: file.name.clone(),
+                                bytes: file.bytes.clone(),
+                            })
+                            .collect(),
+                    }
+                })
+        } else {
+            None
+        };
         let draft = match pending {
             Some(pending) => merge_drafts(pending, draft),
             None => draft,
@@ -1002,6 +1013,11 @@ impl Mirror {
             );
         }
         txn.commit();
+    }
+
+    pub fn finish_pending_from_store(&self, scope: &Scope, sent: bool) -> Draft {
+        let next = self.next_draft(scope).unwrap_or_default();
+        self.finish_pending_draft(scope, &next, sent)
     }
 
     /// Resolves the pending snapshot and the next composer in one transaction.

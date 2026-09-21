@@ -2035,6 +2035,42 @@ async fn multiple_files_message_actions_and_thread_broadcast_round_trip() {
         .await
         .unwrap();
     assert!(fake.posted().last().unwrap().also_sent_to_channel);
+    client
+        .post_message(
+            &ChannelId("C1".into()),
+            Some(&Ts("500.0".into())),
+            "thread only",
+        )
+        .await
+        .unwrap();
+    let channel = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    assert!(
+        channel
+            .messages
+            .iter()
+            .any(|message| { message.text == "reply" && message.is_broadcast() }),
+        "the API round trip preserves thread_broadcast"
+    );
+    assert!(
+        channel
+            .messages
+            .iter()
+            .all(|message| message.text != "thread only"),
+        "ordinary replies are absent from channel history"
+    );
+    let replies = client
+        .conversations_replies(&ChannelId("C1".into()), &Ts("500.0".into()), None)
+        .await
+        .unwrap();
+    assert!(
+        replies
+            .messages
+            .iter()
+            .any(|message| message.text == "thread only")
+    );
 
     let link = client
         .message_link(&ChannelId("C1".into()), &Ts("500.0".into()))

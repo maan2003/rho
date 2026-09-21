@@ -701,7 +701,10 @@ async fn serve_api(
         // Slack is not instant either: the wait is here, before anything is
         // stored or echoed, so the client shows a sent message the way it
         // does when the network is slow rather than absent.
-        if method == "chat.postMessage" {
+        if matches!(
+            method.as_str(),
+            "chat.postMessage" | "files.completeUploadExternal"
+        ) {
             let delay = state.lock().unwrap().send_delay_ms;
             if delay > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -1822,6 +1825,11 @@ fn handle(
         "conversations.history" => {
             let channel = field("channel");
             let mut messages = state.history.get(&channel).cloned().unwrap_or_default();
+            // Ordinary replies belong only to conversations.replies. Slack
+            // includes a reply here only when it was broadcast to the room.
+            messages.retain(|message| {
+                message["thread_ts"].is_null() || message["subtype"] == json!("thread_broadcast")
+            });
             // Slack hands history back newest first, and pages backwards from
             // there, so the cursor counts messages already handed out.
             messages.reverse();
@@ -2306,6 +2314,9 @@ fn handle(
             });
             if let Some(thread_ts) = &thread_ts {
                 message["thread_ts"] = json!(thread_ts);
+                if payload["reply_broadcast"].as_bool().unwrap_or(false) {
+                    message["subtype"] = json!("thread_broadcast");
+                }
             }
             state
                 .history
