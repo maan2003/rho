@@ -1915,18 +1915,33 @@ fn handle(
                     return json!({"ok": false, "error": "upload_not_found"});
                 }
                 let (width, height) = png_size(&bytes);
-                completed.push(json!({
+                let extension = title
+                    .rsplit_once('.')
+                    .map(|(_, extension)| extension)
+                    .unwrap_or("");
+                let mimetype = match extension {
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "pdf" => "application/pdf",
+                    "txt" => "text/plain",
+                    _ => "application/octet-stream",
+                };
+                let mut completed_file = json!({
                     "id": id,
                     "name": title,
                     "title": title,
-                    "mimetype": "image/png",
-                    "filetype": "png",
+                    "mimetype": mimetype,
+                    "filetype": extension,
                     "size": bytes.len(),
                     "url_private": format!("{base}/files/{id}/{title}"),
                     "original_w": width,
                     "original_h": height,
-                    "thumb_64": format!("{base}/thumbs/{id}.png"),
-                }));
+                });
+                if mimetype.starts_with("image/") {
+                    completed_file["thumb_64"] = json!(format!("{base}/thumbs/{id}.png"));
+                }
+                completed.push(completed_file);
             }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

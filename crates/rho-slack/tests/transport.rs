@@ -2239,3 +2239,27 @@ async fn file_search_indexes_seeded_attachments_and_deduplicates_shared_ids() {
     assert_eq!(page.files[0].id, "FSEED");
     assert_eq!(page.files[0].title, "review.pdf");
 }
+
+#[tokio::test]
+async fn uploaded_text_file_is_not_reported_as_an_image() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    let client = client(&fake);
+    client
+        .upload_files(
+            &ChannelId("C1".into()),
+            None,
+            vec![("notes.txt".into(), b"Plain text, not PNG".to_vec())],
+            "caption",
+        )
+        .await
+        .unwrap();
+    let page = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    let file = &page.messages[0].files[0];
+    assert_eq!(file.filetype, "txt");
+    assert!(!file.is_image());
+    assert!(file.thumbnail().is_none());
+}
