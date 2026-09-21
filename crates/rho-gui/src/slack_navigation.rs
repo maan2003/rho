@@ -241,6 +241,7 @@ impl Workspace {
                     None,
                     ["Starred", "Channels", "Direct messages"][section].to_owned(),
                     false,
+                    false,
                 ));
                 previous = Some(section);
             }
@@ -253,7 +254,12 @@ impl Workspace {
             } else {
                 String::new()
             };
-            entries.push((Some(row.id), format!("{}{badge}", row.label), row.unread));
+            entries.push((
+                Some(row.id),
+                format!("{}{badge}", row.label),
+                row.unread,
+                row.muted,
+            ));
         }
         let health = session.health_reason().map(str::to_owned);
         let entries = Rc::new(entries);
@@ -358,7 +364,7 @@ impl Workspace {
                               cx: &mut Context<Self>| {
                             range
                                 .map(|index| {
-                                    let (channel, label, unread) = &entries[index];
+                                    let (channel, label, unread, muted) = &entries[index];
                                     let mut row = div()
                                         .id(("slack-room", index))
                                         .w_full()
@@ -368,7 +374,10 @@ impl Workspace {
                                         .items_center()
                                         .overflow_hidden()
                                         .child(label.clone());
-                                    if *unread {
+                                    if *muted {
+                                        row = row.text_color(cx.theme().colors().text_muted);
+                                    }
+                                    if *unread && !*muted {
                                         row = row.font_weight(gpui::FontWeight::BOLD);
                                     }
                                     if let Some(channel) = channel {
@@ -435,6 +444,7 @@ impl Workspace {
         div()
             .id("slack-header")
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .p_2()
@@ -500,6 +510,31 @@ impl Workspace {
                             })),
                     )
             })
+            .when(
+                source
+                    .as_ref()
+                    .is_some_and(|source| matches!(source, Source::Conversation(_))),
+                |header| {
+                    header.child(
+                        div()
+                            .id("slack-open-thread")
+                            .cursor_pointer()
+                            .child("Open thread")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let SurfaceView::SlackConversation(view) =
+                                    &this.active_surface().view
+                                else {
+                                    return;
+                                };
+                                let key =
+                                    view.clone().update(cx, |view, cx| view.cursor_thread(cx));
+                                if let Some(key) = key {
+                                    this.open_slack_source(Source::Thread(key), window, cx);
+                                }
+                            })),
+                    )
+                },
+            )
             .when_some(source, |header, source| {
                 header
                     .child(
