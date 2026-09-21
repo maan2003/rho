@@ -167,6 +167,7 @@ pub enum Event {
     BroadcastWithFilesUnsupported,
     AttachRequested,
     SubmitRequested(bool),
+    ActivateRequested,
 }
 
 /// What a press of enter turned out to be, once Slack had answered.
@@ -598,6 +599,38 @@ impl ConversationView {
             message: self.cursor_message(cx)?,
             action,
         })
+    }
+
+    fn activate_clicked(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let hit = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor
+                .selections
+                .newest::<Point>(&snapshot)
+                .is_empty()
+                .then(|| editor.buffer_location_for_window_position(position, language::Bias::Left))
+                .flatten()
+        });
+        let Some((_, buffer_id, offset)) = hit else {
+            return;
+        };
+        let buffer = self.transcript.buffer().read(cx);
+        if buffer.remote_id() != buffer_id {
+            return;
+        }
+        let snapshot = buffer.snapshot();
+        let point = snapshot.offset_to_point(offset);
+        // The editor clips whitespace to the line end. Only the actual control
+        // text is clickable, never the row's trailing padding or a selection.
+        if point.column >= snapshot.line_len(point.row)
+            || !self
+                .transcript
+                .line_meta(point.row, cx)
+                .is_some_and(|meta| meta.interaction.is_some())
+        {
+            return;
+        }
+        cx.emit(Event::ActivateRequested);
     }
 
     pub fn interaction_options(
@@ -3759,7 +3792,20 @@ impl gpui::Render for ConversationView {
                     }
                 }),
             )
-            .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                            if event.click_count == 1 {
+                                this.activate_clicked(event.position, cx);
+                            }
+                        }),
+                    )
+                    .child(self.editor.clone()),
+            )
             .child(controls)
     }
 }

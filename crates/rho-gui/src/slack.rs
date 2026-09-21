@@ -862,6 +862,9 @@ impl Workspace {
                         rho_slack::ui::conversation::Event::AttachRequested => {
                             workspace.prompt_slack_attach(window, cx);
                         }
+                        rho_slack::ui::conversation::Event::ActivateRequested => {
+                            workspace.slack_open_row(window, cx);
+                        }
                         rho_slack::ui::conversation::Event::SubmitRequested(broadcast) => {
                             workspace.slack_submit_with_options(*broadcast, cx);
                         }

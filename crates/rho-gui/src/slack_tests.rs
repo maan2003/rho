@@ -3556,3 +3556,102 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
     assert_eq!(remaining.text, "send exactly once\n\nnext thought");
     assert_eq!(remaining.files.len(), 3);
 }
+
+#[gpui::test]
+async fn app_control_click_dispatches_but_padding_does_not(cx: &mut TestAppContext) {
+    use editor::SelectionEffects;
+    use language::Point;
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts":"990.0", "bot_id":"B1", "text":"choose carefully",
+            "blocks":[{"type":"actions","block_id":"deploy","elements":[{
+                "type":"button","action_id":"approve",
+                "text":{"type":"plain_text","text":"Approve"}
+            }]}]
+        }),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId("C1".into())),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    let mut row = None;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        row = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack_transcript_for_test(cx)
+                    .iter()
+                    .position(|line| line.contains("[Approve]"))
+            })
+            .unwrap();
+        if row.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let row = row.expect("the fake app control is drawn") as u32;
+    cx.draw_window(*workspace);
+    let position = workspace
+        .update(cx, |workspace, window, cx| {
+            let editor = workspace.active_editor(cx);
+            editor.update(cx, |editor, cx| {
+                let point = Point::new(row, 2);
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([point..point]);
+                });
+                let snapshot = editor.snapshot(window, cx);
+                let point = editor.selections.newest_display(&snapshot).head();
+                let mut position = editor
+                    .window_position_for_display_point(point, &snapshot, window, cx)
+                    .unwrap();
+                position.y += gpui::px(5.);
+                position
+            })
+        })
+        .unwrap();
+    cx.draw_window(*workspace);
+    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
+    visual.simulate_click(
+        position + gpui::point(gpui::px(400.), gpui::px(0.)),
+        gpui::Modifiers::none(),
+    );
+    cx.run_until_parked();
+    assert_eq!(fake.calls("blocks.actions"), 0, "padding must not dispatch");
+    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
+    visual.simulate_click(position, gpui::Modifiers::none());
+    for _ in 0..100 {
+        cx.run_until_parked();
+        if fake.calls("blocks.actions") > 0 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        fake.calls("blocks.actions"),
+        1,
+        "the clicked control dispatched once"
+    );
+    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
+    let end = position + gpui::point(gpui::px(35.), gpui::px(0.));
+    visual.simulate_mouse_down(position, gpui::MouseButton::Left, gpui::Modifiers::none());
+    visual.simulate_mouse_move(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+    visual.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        fake.calls("blocks.actions"),
+        1,
+        "dragging selects without dispatching"
+    );
+}
