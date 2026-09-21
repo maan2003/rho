@@ -312,7 +312,17 @@ impl Workspace {
                     .cursor_pointer()
                     .child("Search messages")
                     .on_click(
-                        cx.listener(|this, _, window, cx| this.prompt_slack_find(window, cx)),
+                        cx.listener(|this, _, window, cx| this.prompt_slack_find_all(window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("slack-find-files")
+                    .p_1()
+                    .cursor_pointer()
+                    .child("Search files")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.prompt_slack_find_files(window, cx)),
                     ),
             )
             .child(
