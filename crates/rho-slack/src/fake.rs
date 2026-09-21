@@ -257,12 +257,21 @@ impl Fake {
         }
     }
 
-    pub fn add_emoji(&self, name: &str, url: &str) {
+    pub fn add_emoji(&self, name: &str, _url: &str) {
+        let base = self.api_base.trim_end_matches("/api");
         self.state
             .lock()
             .unwrap()
             .emoji
-            .insert(name.to_owned(), url.to_owned());
+            .insert(name.to_owned(), format!("{base}/emoji/{name}.png"));
+    }
+
+    pub fn add_emoji_alias(&self, name: &str, target: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .emoji
+            .insert(name.to_owned(), format!("alias:{target}"));
     }
 
     pub fn set_count(&self, channel: &str, has_unreads: bool, mentions: u32, latest: &str) {
@@ -704,12 +713,31 @@ fn binary_route(path: &str, state: &Arc<Mutex<State>>) -> Option<Vec<u8>> {
         // client is told nothing about: its bytes are a tall picture, so a
         // box sized from the cap alone shows up as a box the picture does
         // not fit.
+        if id == "FPDF" {
+            return Some(
+                b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+                    .to_vec(),
+            );
+        }
         if id == "tall.png" {
             static TALL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
             return Some(TALL.get_or_init(|| preview_png(400, 1000)).clone());
         }
         static PREVIEW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         return Some(PREVIEW.get_or_init(|| preview_png(320, 200)).clone());
+    }
+    if let Some(name) = path.strip_prefix("/emoji/") {
+        return Some(
+            match name
+                .trim_end_matches(".png")
+                .bytes()
+                .fold(0u8, u8::wrapping_add)
+                % 2
+            {
+                0 => AVATAR_BLUE.to_vec(),
+                _ => AVATAR_GREEN.to_vec(),
+            },
+        );
     }
     let name = path.strip_prefix("/avatars/")?.trim_end_matches(".png");
     Some(

@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::config::Credentials;
 use crate::types::{
-    Attachment, ChannelId, Conversation, ConversationKind, FileSummary, Message, Ts, User, UserId,
+    Attachment, ChannelId, Conversation, ConversationKind, CustomEmoji, CustomEmojiSource,
+    FileSummary, Message, Ts, User, UserId,
 };
 
 const DEFAULT_BASE: &str = "https://slack.com/api";
@@ -622,15 +623,58 @@ impl Client {
         parse_conversation(&body["channel"]).context("conversations.info returned no channel")
     }
 
-    /// The workspace's custom emoji, by name. They have no glyph anywhere
-    /// but Slack, so knowing which shortcodes are real is what keeps a
-    /// custom one from reading as a stray word.
-    pub async fn custom_emoji(&self) -> anyhow::Result<Vec<String>> {
+    /// The workspace's custom emoji. Slack returns either an image URL or
+    /// `alias:name`; both are retained so the renderer can reach the bytes.
+    pub async fn custom_emoji(&self) -> anyhow::Result<Vec<CustomEmoji>> {
+        const MAX_CUSTOM_EMOJI: usize = 10_000;
         let body = self.post_form("emoji.list", &[]).await?;
         Ok(body["emoji"]
             .as_object()
-            .map(|emoji| emoji.keys().cloned().collect())
-            .unwrap_or_default())
+            .into_iter()
+            .flat_map(|emoji| emoji.iter())
+            .take(MAX_CUSTOM_EMOJI)
+            .filter_map(|(name, value)| {
+                let value = value.as_str()?.trim();
+                let source = match value.strip_prefix("alias:") {
+                    Some(alias) if !alias.is_empty() => CustomEmojiSource::Alias(alias.to_owned()),
+                    None if !value.is_empty() => CustomEmojiSource::Url(value.to_owned()),
+                    _ => return None,
+                };
+                Some(CustomEmoji {
+                    name: name.clone(),
+                    source,
+                })
+            })
+            .collect())
+    }
+
+    /// A bounded download for small display assets such as custom emoji.
+    pub async fn download_bounded(&self, url: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+        use futures::StreamExt as _;
+        let response = self
+            .authorize(self.http.get(url))
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?
+            .error_for_status()
+            .with_context(|| format!("fetching {url}"))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            anyhow::bail!("download exceeds {limit} bytes");
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            anyhow::ensure!(
+                bytes.len() + chunk.len() <= limit,
+                "download exceeds {limit} bytes"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     /// The bytes behind a file. Slack serves them from the same session as

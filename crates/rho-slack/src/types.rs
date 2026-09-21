@@ -214,6 +214,19 @@ pub struct Attachment {
     pub service: Option<String>,
 }
 
+/// One entry from Slack's workspace emoji table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomEmoji {
+    pub name: String,
+    pub source: CustomEmojiSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CustomEmojiSource {
+    Url(String),
+    Alias(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSummary {
     pub id: String,
@@ -284,10 +297,9 @@ impl FileSummary {
     }
 
     pub fn is_image(&self) -> bool {
-        matches!(
-            self.filetype.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
-        )
+        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]
+            .iter()
+            .any(|image| self.filetype.eq_ignore_ascii_case(image))
     }
 }
 
@@ -338,6 +350,18 @@ mod tests {
         assert_eq!(picture(2400, 100).image_rows(), 1);
         // Slack did not say, so the box is the cap it would have had.
         assert_eq!(picture(0, 0).image_rows(), IMAGE_ROWS);
+    }
+
+    #[test]
+    fn only_image_filetypes_use_the_image_viewer() {
+        let mut file = picture(320, 200);
+        file.filetype = "JPEG".into();
+        assert!(file.is_image(), "Slack file types are case-insensitive");
+        file.filetype = "pdf".into();
+        assert!(
+            !file.is_image(),
+            "ordinary files belong to the desktop opener"
+        );
     }
 
     #[test]

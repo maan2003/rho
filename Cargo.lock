@@ -13540,6 +13540,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_tokio",
+ "image",
  "language",
  "multi_buffer",
  "project",

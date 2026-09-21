@@ -22,6 +22,7 @@ ui = [
   "dep:editor",
   "dep:gpui",
   "dep:gpui_tokio",
+  "dep:image",
   "dep:language",
   "dep:multi_buffer",
   "dep:project",
@@ -69,6 +70,7 @@ senax-encoder = { workspace = true, optional = true }
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, optional = true }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio", optional = true }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp", "bmp"], optional = true }
 language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 project = { path = "../../vendor/zed/crates/project", default-features = false, optional = true }

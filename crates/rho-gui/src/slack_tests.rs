@@ -52,6 +52,81 @@ async fn wait_for_rows(
     panic!("the fake's conversations never reached the listing");
 }
 
+/// Custom emoji travel through the real API, bounded cache, decoder, fold,
+/// and editor-inlay path. The buffer remains the Slack source of truth.
+#[gpui::test]
+async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_emoji("party", "the fake serves its deterministic PNG");
+    fake.add_emoji_alias("celebrate", "party");
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "100.0",
+            "user": "UA",
+            "text": "before :party: after",
+            "reactions": [{"name": "celebrate", "count": 2, "users": ["UA", "UD"]}]
+        }),
+    );
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    let mut decorations = 0;
+    for _ in 0..300 {
+        cx.run_until_parked();
+        decorations = window
+            .update(cx, |view, _, _| view.emoji_decoration_count_for_test())
+            .unwrap();
+        if decorations == 2 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        decorations, 2,
+        "body emoji and aliased reaction both render"
+    );
+    let text = window
+        .update(cx, |view, _, cx| view.transcript_text_for_test(cx))
+        .unwrap();
+    assert!(
+        text.contains(":party:"),
+        "copy/search text keeps the shortcode"
+    );
+    assert!(
+        text.contains(":celebrate:"),
+        "the alias name remains the reaction's buffer text"
+    );
+}
+
 /// The point follows the conversation, not the line number.
 ///
 /// A message arriving in a busier conversation moves rows above the reader.

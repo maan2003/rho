@@ -13,7 +13,7 @@ use rho_slack::events::WsEvent;
 use rho_slack::fake::Fake;
 use rho_slack::model::{Change, Model, Waiting};
 use rho_slack::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
-use rho_slack::types::{ChannelId, Ts};
+use rho_slack::types::{ChannelId, CustomEmoji, CustomEmojiSource, Ts};
 use serde_json::json;
 use tokio::sync::Notify;
 
@@ -56,6 +56,38 @@ async fn wait_until_live(catch_up: &Notify) {
     tokio::time::timeout(Duration::from_secs(5), catch_up.notified())
         .await
         .expect("the socket never came up");
+}
+
+#[tokio::test]
+async fn custom_emoji_keep_urls_and_aliases_and_small_assets_are_bounded() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_emoji("party", "ignored by the deterministic fake");
+    fake.add_emoji_alias("celebrate", "party");
+    let client = client(&fake);
+    assert_eq!(
+        client.custom_emoji().await.unwrap(),
+        vec![
+            CustomEmoji {
+                name: "celebrate".into(),
+                source: CustomEmojiSource::Alias("party".into()),
+            },
+            CustomEmoji {
+                name: "party".into(),
+                source: CustomEmojiSource::Url(format!(
+                    "{}/emoji/party.png",
+                    fake.api_base().trim_end_matches("/api")
+                )),
+            },
+        ]
+    );
+    let url = format!(
+        "{}/emoji/party.png",
+        fake.api_base().trim_end_matches("/api")
+    );
+    let bytes = client.download_bounded(&url, 1024).await.unwrap();
+    assert_eq!(&bytes[1..4], b"PNG");
+    let error = client.download_bounded(&url, 8).await.unwrap_err();
+    assert!(error.to_string().contains("exceeds 8 bytes"), "{error:#}");
 }
 
 #[tokio::test]

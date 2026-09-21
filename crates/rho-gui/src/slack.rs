@@ -649,7 +649,11 @@ impl Workspace {
                     &view,
                     |workspace, view, event, cx| match event {
                         rho_slack::ui::conversation::Event::OpenFile(file) => {
-                            workspace.open_slack_image(view, file.clone(), cx);
+                            if file.is_image() {
+                                workspace.open_slack_image(view, file.clone(), cx);
+                            } else {
+                                view.update(cx, |view, cx| view.open_file(file.clone(), cx));
+                            }
                         }
                         rho_slack::ui::conversation::Event::AttachRefused => {
                             workspace.echo(NOT_WHILE_EDITING, StyleClass::SystemInfo, cx);

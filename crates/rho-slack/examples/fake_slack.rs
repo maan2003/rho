@@ -50,12 +50,12 @@ async fn main() -> anyhow::Result<()> {
     fake.add_private_channel("P1", "founders");
     fake.add_dm("D1", "UD");
 
-    // One custom emoji, which stays a shortcode, next to standard ones that
-    // become glyphs.
+    // Custom emoji and an alias are served as deterministic local PNGs.
     fake.add_emoji(
         "forrest_gump_wave",
         "https://emoji.slack-edge.com/T1/forrest_gump_wave.png",
     );
+    fake.add_emoji_alias("wave_alias", "forrest_gump_wave");
 
     seed_reference_group(&fake, &at);
     seed_design(&fake, &at);
@@ -125,7 +125,7 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
     say(
         at(6, 11, 3),
         "UD",
-        "kicking this off :thumbsup: :forrest_gump_wave:",
+        "kicking this off :thumbsup: :forrest_gump_wave: alias :wave_alias:",
     );
     say(
         at(6, 11, 4),
@@ -171,6 +171,7 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
             "reactions": [
                 {"name": "thumbsup", "users": ["UK", "ME"], "count": 2},
                 {"name": "tada", "users": ["UD"], "count": 1},
+                {"name": "wave_alias", "users": ["UK"], "count": 1},
             ],
         }),
     );
@@ -235,6 +236,25 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
                 "original_w": 320,
                 "original_h": 200,
                 "thumb_64": thumb.clone(),
+            }],
+        }),
+    );
+
+    // A non-image file exercises the desktop opener rather than the image viewer.
+    fake.add_message(
+        GROUP,
+        json!({
+            "ts": at(3, 9, 41),
+            "user": "UD",
+            "text": "and the review deck",
+            "files": [{
+                "id": "FPDF",
+                "name": "review.pdf",
+                "title": "review.pdf",
+                "mimetype": "application/pdf",
+                "filetype": "pdf",
+                "size": 96,
+                "url_private": format!("{}/files/FPDF/review.pdf", fake.api_base().trim_end_matches("/api")),
             }],
         }),
     );

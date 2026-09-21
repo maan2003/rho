@@ -2147,6 +2147,64 @@ impl Session {
         })
     }
 
+    pub fn cached_custom_emoji(&self, name: &str) -> Option<&std::path::Path> {
+        let url = self.model.custom_emoji_url(name)?;
+        self.cached_file(&custom_emoji_cache_id(url))
+    }
+
+    /// Lazily fetches one custom emoji. Emoji are small UI assets, so unlike
+    /// ordinary Slack files their response is capped before it reaches disk.
+    pub fn cache_custom_emoji(&mut self, name: &str, cx: &mut Context<Self>) {
+        const MAX_EMOJI_BYTES: usize = 512 * 1024;
+        let Some(url) = self.model.custom_emoji_url(name).map(str::to_owned) else {
+            return;
+        };
+        let id = custom_emoji_cache_id(&url);
+        let file = crate::types::FileSummary {
+            id,
+            title: format!("{name}.emoji"),
+            filetype: String::new(),
+            size: 0,
+            url: url.clone(),
+            original_w: 0,
+            original_h: 0,
+            thumb_url: String::new(),
+        };
+        if self.cached_files.contains_key(&file.id) {
+            return;
+        }
+        let Ok(path) = file_cache_path(&self.paths.files, &file) else {
+            return;
+        };
+        self.cached_files.insert(file.id.clone(), path.clone());
+        if path.exists() {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let id = file.id;
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let bytes = client.download_bounded(&url, MAX_EMOJI_BYTES).await?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, bytes)?;
+            anyhow::Ok(id)
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")));
+            let _ = this.update(cx, |_, cx| {
+                if let Err(error) = result {
+                    tracing::warn!(error = %error, "slack custom emoji fetch failed");
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// Fetches a file into the state cache so a surface can show it. Called
     /// when an image first comes into view, never ahead of time: the reader
     /// asked for a conversation, not for a download queue.
@@ -3094,6 +3152,13 @@ fn open_mirror(path: &std::path::Path) -> Option<Arc<Mirror>> {
             None
         }
     }
+}
+
+fn custom_emoji_cache_id(url: &str) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hash);
+    format!("emoji:{:016x}", hash.finish())
 }
 
 fn file_cache_path(

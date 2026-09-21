@@ -18,7 +18,8 @@ use crate::api::{ActivityItem, ActivityKind, ConversationCount};
 use crate::block::{Names, render_message};
 use crate::config::WorkspaceName;
 use crate::types::{
-    ChannelId, Conversation, ConversationKind, Message, Reason, ThreadKey, Ts, User, UserId,
+    ChannelId, Conversation, ConversationKind, CustomEmoji, CustomEmojiSource, Message, Reason,
+    ThreadKey, Ts, User, UserId,
 };
 
 /// Whether the last word in a thread is theirs or yours. Yours is the done
@@ -343,8 +344,8 @@ pub struct Model {
     users: BTreeMap<UserId, User>,
     conversations: BTreeMap<ChannelId, Conversation>,
     counts: BTreeMap<ChannelId, ConversationCount>,
-    /// The workspace's own emoji names, which stay shortcodes on screen.
-    custom_emoji: BTreeSet<String>,
+    /// The workspace's custom emoji sources, including aliases.
+    custom_emoji: BTreeMap<String, CustomEmojiSource>,
     units: BTreeMap<Unit, UnitFacts>,
     /// Every (channel, timestamp) the model has already accounted for. This
     /// is the whole of the deduplication between the feed and the socket.
@@ -487,7 +488,7 @@ impl Model {
             users: BTreeMap::new(),
             conversations: BTreeMap::new(),
             counts: BTreeMap::new(),
-            custom_emoji: BTreeSet::new(),
+            custom_emoji: BTreeMap::new(),
             units: BTreeMap::new(),
             seen: BTreeSet::new(),
             followed: BTreeSet::new(),
@@ -660,14 +661,29 @@ impl Model {
             .unwrap_or_else(|| handle.to_owned())
     }
 
-    pub fn set_custom_emoji(&mut self, names: impl IntoIterator<Item = String>) {
-        self.custom_emoji.extend(names);
+    pub fn set_custom_emoji(&mut self, emoji: impl IntoIterator<Item = CustomEmoji>) {
+        self.custom_emoji = emoji
+            .into_iter()
+            .map(|emoji| (emoji.name, emoji.source))
+            .collect();
     }
 
-    /// Whether `name` is a workspace emoji, which is the difference between
-    /// muting a shortcode and leaving a word alone.
     pub fn is_custom_emoji(&self, name: &str) -> bool {
-        self.custom_emoji.contains(name)
+        self.custom_emoji.contains_key(name)
+    }
+
+    /// Resolves aliases to the image URL. Broken and cyclic aliases remain
+    /// shortcodes rather than causing a fetch or hiding readable text.
+    pub fn custom_emoji_url(&self, name: &str) -> Option<&str> {
+        let mut name = name;
+        let mut seen = BTreeSet::new();
+        while seen.insert(name) {
+            match self.custom_emoji.get(name)? {
+                CustomEmojiSource::Url(url) => return Some(url),
+                CustomEmojiSource::Alias(alias) => name = alias,
+            }
+        }
+        None
     }
 
     /// Slack's unread bookkeeping, replacing what rho held.
@@ -1376,11 +1392,9 @@ impl Model {
                 .collect(),
             ':' => self
                 .custom_emoji
-                .iter()
+                .keys()
                 .map(|name| Suggestion {
                     value: format!(":{name}:"),
-                    // Nowhere but Slack has a glyph for one of these, which
-                    // is why it stays a shortcode on screen too.
                     detail: "custom".to_owned(),
                 })
                 .chain(emojis::iter().filter_map(|emoji| {
@@ -3992,7 +4006,10 @@ mod tests {
         // A workspace's own emoji has no glyph anywhere else, and is offered
         // the same as any other.
         let mut model = model;
-        model.set_custom_emoji(["forrest_gump_wave".to_owned()]);
+        model.set_custom_emoji([CustomEmoji {
+            name: "forrest_gump_wave".to_owned(),
+            source: CustomEmojiSource::Url("https://example.test/wave.png".to_owned()),
+        }]);
         assert_eq!(
             model.suggestions(&design, ':', "forrest")[0].value,
             ":forrest_gump_wave:"

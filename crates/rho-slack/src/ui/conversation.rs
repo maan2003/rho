@@ -8,17 +8,20 @@
 //! prose carrying the host's Markdown pipeline, exactly like the agent
 //! transcript beside it.
 
-use std::collections::HashSet;
+use std::any::TypeId;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use editor::display_map::{Crease, CreaseId};
 use editor::scroll::{Autoscroll, AutoscrollStrategy};
 use editor::{
-    CompletionContext, CompletionProvider, Editor, EditorEvent, EditorMode, Inlay,
+    CompletionContext, CompletionProvider, Editor, EditorEvent, EditorMode, FoldPlaceholder, Inlay,
     SelectionEffects, SizingBehavior,
 };
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, EventEmitter, Task, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, Image, ImageFormat, Task, Window, div};
 use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
@@ -42,6 +45,10 @@ pub struct ComposeGutter;
 /// way, and here it says the same thing -- these lines came with the
 /// message rather than being the words in it.
 pub struct ChromeGutter;
+
+/// Marks folds owned by custom emoji rendering. The shortcode stays in the
+/// buffer while the display conceals it behind an image inlay.
+struct CustomEmojiFold;
 
 pub struct ConversationView {
     session: Entity<Session>,
@@ -119,6 +126,8 @@ pub struct ConversationView {
     /// and is not in the update log either, so the surface remembers which
     /// rows are waiting on one and redraws exactly those.
     awaiting_names: Vec<Ts>,
+    emoji_decorations: Vec<(InlayId, CreaseId)>,
+    emoji_images: HashMap<std::path::PathBuf, Arc<gpui::RenderImage>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -469,6 +478,8 @@ impl ConversationView {
             attached: None,
             awaiting_images: Vec::new(),
             awaiting_names: Vec::new(),
+            emoji_decorations: Vec::new(),
+            emoji_images: HashMap::new(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -1377,6 +1388,7 @@ impl ConversationView {
         self.place_dealt(window, cx);
         self.place_unread(window, cx);
         self.settle_images(cx);
+        self.refresh_custom_emoji(cx);
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
         self.refresh_chip(cx);
@@ -1399,6 +1411,105 @@ impl ConversationView {
     #[cfg(any(test, feature = "fake"))]
     pub fn drawn_row_count_for_test(&self) -> usize {
         self.transcript.keys().count()
+    }
+
+    #[cfg(any(test, feature = "fake"))]
+    pub fn emoji_decoration_count_for_test(&self) -> usize {
+        self.emoji_decorations.len()
+    }
+
+    #[cfg(any(test, feature = "fake"))]
+    pub fn transcript_text_for_test(&self, cx: &App) -> String {
+        self.transcript.buffer().read(cx).text()
+    }
+
+    /// Reconciles custom emoji with fixed-cell image decorations. The source
+    /// shortcode remains buffer text for selection, copy and search; a
+    /// concealed fold removes only its display cells while the image inlay
+    /// occupies two emoji-width columns at the same anchor.
+    fn refresh_custom_emoji(&mut self, cx: &mut Context<Self>) {
+        let old = std::mem::take(&mut self.emoji_decorations);
+        self.editor.update(cx, |editor, cx| {
+            for (inlay, crease) in old {
+                editor.remove_image_inlay(inlay, cx);
+                editor.remove_creases([crease], cx);
+            }
+        });
+
+        let text = self.transcript.buffer().read(cx).text();
+        let names = {
+            let model = self.session.read(cx).model();
+            custom_emoji_ranges(&text, model)
+        };
+        for (_, name) in &names {
+            self.session.update(cx, |session, cx| {
+                session.cache_custom_emoji(name, cx);
+            });
+        }
+
+        for (range, name) in names {
+            let Some(path) = self
+                .session
+                .read(cx)
+                .cached_custom_emoji(&name)
+                .filter(|path| path.exists())
+            else {
+                continue;
+            };
+            let path = path.to_owned();
+            let image = match self.emoji_images.get(&path) {
+                Some(image) => image.clone(),
+                None => {
+                    let Ok(bytes) = std::fs::read(&path) else {
+                        continue;
+                    };
+                    let Some(format) = emoji_image_format(&bytes) else {
+                        continue;
+                    };
+                    if !emoji_dimensions_are_bounded(&bytes, format) {
+                        continue;
+                    }
+                    let source = Arc::new(Image::from_bytes(format, bytes));
+                    let Ok(image) = source.to_image_data(cx.svg_renderer()) else {
+                        continue;
+                    };
+                    self.emoji_images.insert(path, image.clone());
+                    image
+                }
+            };
+
+            let (start, end) = {
+                let buffer = self.transcript.buffer().read(cx);
+                (
+                    buffer.anchor_before(range.start),
+                    buffer.anchor_after(range.end),
+                )
+            };
+            let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+            let (Some(start), Some(end)) = (
+                snapshot.anchor_in_excerpt(start),
+                snapshot.anchor_in_excerpt(end),
+            ) else {
+                continue;
+            };
+            self.editor.update(cx, |editor, cx| {
+                let creases = editor.insert_creases(
+                    [Crease::simple(
+                        start..end,
+                        FoldPlaceholder::concealed(TypeId::of::<CustomEmojiFold>()),
+                    )],
+                    cx,
+                );
+                let Some(crease) = creases.into_iter().next() else {
+                    return;
+                };
+                if let Some(inlay) = editor.add_image_inlay(start, image, 2, cx) {
+                    self.emoji_decorations.push((inlay, crease));
+                } else {
+                    editor.remove_creases([crease], cx);
+                }
+            });
+        }
     }
 
     /// A picture whose bytes were still arriving when its message was
@@ -2766,6 +2877,68 @@ fn link_on(line: &str, links: &[crate::block::Link]) -> Option<String> {
         .map(|link| link.url.clone())
 }
 
+fn custom_emoji_ranges(text: &str, model: &Model) -> Vec<(Range<usize>, String)> {
+    crate::emoji::shortcodes(text)
+        .into_iter()
+        .filter_map(|range| {
+            let name = &text[range.start + 1..range.end - 1];
+            model
+                .custom_emoji_url(name)
+                .map(|_| (range, name.to_owned()))
+        })
+        .take(256)
+        .collect()
+}
+
+fn emoji_image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageFormat::Png)
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some(ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(ImageFormat::Gif)
+    } else if bytes.starts_with(b"BM") {
+        Some(ImageFormat::Bmp)
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml") {
+        Some(ImageFormat::Svg)
+    } else {
+        None
+    }
+}
+
+fn emoji_dimensions_are_bounded(bytes: &[u8], format: ImageFormat) -> bool {
+    const MAX_SIDE: u32 = 512;
+    let format = match format {
+        ImageFormat::Png => image::ImageFormat::Png,
+        ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+        ImageFormat::Gif => image::ImageFormat::Gif,
+        ImageFormat::Webp => image::ImageFormat::WebP,
+        ImageFormat::Bmp => image::ImageFormat::Bmp,
+        _ => return false,
+    };
+    let dimensions = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .is_ok_and(|(width, height)| {
+            width > 0 && height > 0 && width <= MAX_SIDE && height <= MAX_SIDE
+        });
+    if !dimensions {
+        return false;
+    }
+    if format == image::ImageFormat::Gif {
+        use image::AnimationDecoder as _;
+        const MAX_FRAMES: usize = 60;
+        let Ok(decoder) = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)) else {
+            return false;
+        };
+        if decoder.into_frames().take(MAX_FRAMES + 1).count() > MAX_FRAMES {
+            return false;
+        }
+    }
+    true
+}
+
 fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, files: &[FileSummary]) {
     let mut marked: Vec<(Range<usize>, Class)> = Vec::new();
     // Lines the renderer added rather than the author: an attachment's card,
@@ -3444,9 +3617,14 @@ mod tests {
     }
 
     #[test]
-    fn standard_emoji_are_glyphs_and_workspace_emoji_stay_muted_shortcodes() {
+    fn standard_emoji_are_glyphs_and_workspace_emoji_remain_in_buffer_text() {
         let mut model = model();
-        model.set_custom_emoji(["forrest_gump_wave".to_owned()]);
+        model.set_custom_emoji([crate::types::CustomEmoji {
+            name: "forrest_gump_wave".to_owned(),
+            source: crate::types::CustomEmojiSource::Url(
+                "https://example.test/wave.png".to_owned(),
+            ),
+        }]);
         let (text, styles, _) = render_messages(
             &[message(
                 "1700000000.0",
@@ -4006,6 +4184,70 @@ mod tests {
         // The point was somewhere else. That is the reader's own place: a
         // deletion further up the conversation does not move them.
         assert_eq!(point_after_removal(false, Some(first), None), None);
+    }
+
+    #[test]
+    fn custom_emoji_ranges_keep_exact_buffer_offsets_and_resolve_aliases() {
+        let mut model = model();
+        model.set_custom_emoji([
+            crate::types::CustomEmoji {
+                name: "party".into(),
+                source: crate::types::CustomEmojiSource::Url(
+                    "https://example.test/party.png".into(),
+                ),
+            },
+            crate::types::CustomEmoji {
+                name: "celebrate".into(),
+                source: crate::types::CustomEmojiSource::Alias("party".into()),
+            },
+            crate::types::CustomEmoji {
+                name: "broken".into(),
+                source: crate::types::CustomEmojiSource::Alias("missing".into()),
+            },
+        ]);
+        let text = "é before :party: middle :celebrate: after :broken:";
+        let ranges = custom_emoji_ranges(text, &model);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|(range, name)| (&text[range.clone()], name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(":party:", "party"), (":celebrate:", "celebrate")],
+        );
+        assert_eq!(
+            ranges[0].0.start,
+            "é before ".len(),
+            "offsets are UTF-8 bytes, as buffer anchors are"
+        );
+        assert_eq!(
+            model.custom_emoji_url("celebrate"),
+            Some("https://example.test/party.png")
+        );
+    }
+
+    #[test]
+    fn cyclic_aliases_and_invalid_image_bytes_fall_back_to_shortcodes() {
+        let mut model = model();
+        model.set_custom_emoji([
+            crate::types::CustomEmoji {
+                name: "one".into(),
+                source: crate::types::CustomEmojiSource::Alias("two".into()),
+            },
+            crate::types::CustomEmoji {
+                name: "two".into(),
+                source: crate::types::CustomEmojiSource::Alias("one".into()),
+            },
+        ]);
+        assert!(custom_emoji_ranges(":one:", &model).is_empty());
+        assert_eq!(emoji_image_format(b"not an image"), None);
+
+        // A valid PNG header claiming a 513px side is rejected before GPUI
+        // allocates decoded pixels.
+        let mut oversized = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        oversized.extend_from_slice(&513u32.to_be_bytes());
+        oversized.extend_from_slice(&1u32.to_be_bytes());
+        oversized.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(!emoji_dimensions_are_bounded(&oversized, ImageFormat::Png));
     }
 
     #[test]
