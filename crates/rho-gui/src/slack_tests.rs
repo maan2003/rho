@@ -3452,6 +3452,7 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
         .unwrap()
         .unwrap();
     seed_workspace(&fake);
+    fake.live(serde_json::json!({"kind": "send_delay", "ms": 150}));
     fake.fail_next("files.completeUploadExternal", 1);
     let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
     let client = std::sync::Arc::new(
@@ -3504,15 +3505,15 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
         })
         .unwrap();
     let durable = session.read_with(cx, |session, _| session.draft(&source).unwrap());
-    assert_eq!(durable.text, "send exactly once\n\nnext thought");
+    assert_eq!(durable.text, "next thought");
     assert_eq!(
         durable.files.len(),
-        3,
-        "pending and next files remain distinct"
+        1,
+        "the active session exposes only the next draft"
     );
 
-    // Reopening during the request restores both the retry snapshot and the
-    // next draft; neither is automatically sent.
+    // Reopening during the request exposes only the next draft while the
+    // retry snapshot remains owned by the in-flight operation.
     let reopened = cx.add_window(|window, cx| {
         rho_slack::ui::ConversationView::new(
             session.clone(),
@@ -3526,13 +3527,21 @@ async fn an_in_flight_send_has_one_durable_retry_and_keeps_later_typing(cx: &mut
         reopened
             .update(cx, |view, _, cx| view.compose_text_for_test(cx))
             .unwrap(),
-        "send exactly once\n\nnext thought"
+        "next thought"
     );
     assert_eq!(
         reopened
             .update(cx, |view, _, _| view.attachments().len())
             .unwrap(),
-        3
+        1
+    );
+    assert_eq!(
+        reopened
+            .update(cx, |view, _, cx| view.submit(cx))
+            .unwrap()
+            .await,
+        Submitted::Sending,
+        "a second surface cannot send the same source concurrently"
     );
 
     assert_eq!(sending.await, Submitted::Refused);
@@ -3653,5 +3662,111 @@ async fn app_control_click_dispatches_but_padding_does_not(cx: &mut TestAppConte
         fake.calls("blocks.actions"),
         1,
         "dragging selects without dispatching"
+    );
+}
+
+/// Session ownership outlives the composing surface: closing it cannot leave
+/// a confirmed send as a durable retry or let a recreated surface duplicate it.
+#[gpui::test]
+async fn closing_the_view_during_send_still_cleans_pending_and_gates_reopen(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    use rho_slack::ui::conversation::{SendState, Submitted};
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.live(serde_json::json!({"kind": "send_delay", "ms": 150}));
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let paths = rho_slack::config::Paths::under(state.path());
+    let source = Source::Conversation(ChannelId("C1".into()));
+    let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+    let window = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            source.clone(),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, _, cx| {
+            view.set_compose_for_test("once only".into(), cx)
+        })
+        .unwrap();
+    let answer = window.update(cx, |view, _, cx| view.submit(cx)).unwrap();
+    drop(answer);
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+
+    let reopened = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session.clone(),
+            source.clone(),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+    assert_eq!(
+        reopened.update(cx, |view, _, _| view.send_state()).unwrap(),
+        SendState::Sending
+    );
+    assert_eq!(
+        reopened
+            .update(cx, |view, _, cx| view.submit(cx))
+            .unwrap()
+            .await,
+        Submitted::Sending,
+    );
+
+    for _ in 0..100 {
+        cx.run_until_parked();
+        if !session.read_with(cx, |session, _| session.is_sending_draft(&source)) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(!session.read_with(cx, |session, _| session.is_sending_draft(&source)));
+    assert!(
+        session
+            .read_with(cx, |session, _| session.draft(&source))
+            .is_none()
+    );
+    assert_eq!(
+        fake.posted()
+            .iter()
+            .filter(|post| post.text == "once only")
+            .count(),
+        1
+    );
+
+    cx.run_until_parked();
+    assert_eq!(
+        reopened.update(cx, |view, _, _| view.send_state()).unwrap(),
+        SendState::Ready
+    );
+    assert_eq!(
+        reopened
+            .update(cx, |view, _, cx| view.submit(cx))
+            .unwrap()
+            .await,
+        Submitted::Nothing
     );
 }
