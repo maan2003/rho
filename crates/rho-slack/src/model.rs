@@ -346,6 +346,7 @@ pub struct Model {
     counts: BTreeMap<ChannelId, ConversationCount>,
     /// The workspace's custom emoji sources, including aliases.
     custom_emoji: BTreeMap<String, CustomEmojiSource>,
+    custom_emoji_revision: u64,
     units: BTreeMap<Unit, UnitFacts>,
     /// Every (channel, timestamp) the model has already accounted for. This
     /// is the whole of the deduplication between the feed and the socket.
@@ -489,6 +490,7 @@ impl Model {
             conversations: BTreeMap::new(),
             counts: BTreeMap::new(),
             custom_emoji: BTreeMap::new(),
+            custom_emoji_revision: 0,
             units: BTreeMap::new(),
             seen: BTreeSet::new(),
             followed: BTreeSet::new(),
@@ -685,6 +687,11 @@ impl Model {
             .into_iter()
             .map(|emoji| (emoji.name, emoji.source))
             .collect();
+        self.custom_emoji_revision = self.custom_emoji_revision.wrapping_add(1);
+    }
+
+    pub fn custom_emoji_revision(&self) -> u64 {
+        self.custom_emoji_revision
     }
 
     pub fn is_custom_emoji(&self, name: &str) -> bool {

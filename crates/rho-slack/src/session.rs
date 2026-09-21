@@ -359,6 +359,18 @@ impl Loaded {
     }
 }
 
+enum EmojiFile {
+    Loading,
+    Ready(std::path::PathBuf),
+    Failed,
+}
+
+pub enum EmojiCache<'a> {
+    Loading,
+    Ready(&'a std::path::Path),
+    Failed,
+}
+
 pub struct Session {
     client: Option<Arc<Client>>,
     model: Model,
@@ -380,6 +392,9 @@ pub struct Session {
     /// Files already fetched into the state cache, by Slack file id. An
     /// image is shown from here, so a redraw never refetches.
     cached_files: HashMap<String, std::path::PathBuf>,
+    /// Custom emoji have explicit terminal state so a failed public asset
+    /// does not cause filesystem checks or retries on unrelated refreshes.
+    cached_emoji: HashMap<String, EmojiFile>,
     /// What rho already knows, on disk. Surfaces render from here before the
     /// network answers, and a refresh asks only for what it does not hold.
     mirror: Option<Arc<Mirror>>,
@@ -434,6 +449,7 @@ impl Session {
             asked_names: HashSet::new(),
             asked: 0,
             cached_files: HashMap::new(),
+            cached_emoji: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
             focused: None,
@@ -455,6 +471,7 @@ impl Session {
             asked_names: HashSet::new(),
             asked: 0,
             cached_files: HashMap::new(),
+            cached_emoji: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
             focused: None,
@@ -2213,9 +2230,15 @@ impl Session {
         })
     }
 
-    pub fn cached_custom_emoji(&self, name: &str) -> Option<&std::path::Path> {
-        let url = self.model.custom_emoji_url(name)?;
-        self.cached_file(&custom_emoji_cache_id(url))
+    pub fn cached_custom_emoji(&self, name: &str) -> EmojiCache<'_> {
+        let Some(url) = self.model.custom_emoji_url(name) else {
+            return EmojiCache::Failed;
+        };
+        match self.cached_emoji.get(&custom_emoji_cache_id(url)) {
+            Some(EmojiFile::Ready(path)) => EmojiCache::Ready(path),
+            Some(EmojiFile::Failed) => EmojiCache::Failed,
+            Some(EmojiFile::Loading) | None => EmojiCache::Loading,
+        }
     }
 
     /// Lazily fetches one custom emoji. Emoji are small UI assets, so unlike
@@ -2236,35 +2259,48 @@ impl Session {
             original_h: 0,
             thumb_url: String::new(),
         };
-        if self.cached_files.contains_key(&file.id) {
+        if self.cached_emoji.contains_key(&file.id) {
             return;
         }
         let Ok(path) = file_cache_path(&self.paths.files, &file) else {
+            self.cached_emoji.insert(file.id, EmojiFile::Failed);
             return;
         };
-        self.cached_files.insert(file.id.clone(), path.clone());
         if path.exists() {
+            self.cached_emoji.insert(file.id, EmojiFile::Ready(path));
             return;
         }
         let Some(client) = self.client.clone() else {
+            self.cached_emoji.insert(file.id, EmojiFile::Failed);
             return;
         };
+        self.cached_emoji
+            .insert(file.id.clone(), EmojiFile::Loading);
         let id = file.id;
+        let failed_id = id.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
-            let bytes = client.download_bounded(&url, MAX_EMOJI_BYTES).await?;
+            let bytes = client
+                .download_public_bounded(&url, MAX_EMOJI_BYTES)
+                .await?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, bytes)?;
-            anyhow::Ok(id)
+            anyhow::Ok((id, path))
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
             let result = task
                 .await
                 .unwrap_or_else(|error| Err(anyhow::anyhow!("{error}")));
-            let _ = this.update(cx, |_, cx| {
-                if let Err(error) = result {
-                    tracing::warn!(error = %error, "slack custom emoji fetch failed");
+            let _ = this.update(cx, |session, cx| {
+                match result {
+                    Ok((id, path)) => {
+                        session.cached_emoji.insert(id, EmojiFile::Ready(path));
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "slack custom emoji fetch failed");
+                        session.cached_emoji.insert(failed_id, EmojiFile::Failed);
+                    }
                 }
                 cx.notify();
             });

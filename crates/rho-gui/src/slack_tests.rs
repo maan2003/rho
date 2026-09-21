@@ -125,6 +125,50 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         text.contains(":celebrate:"),
         "the alias name remains the reaction's buffer text"
     );
+    let display = window
+        .update(cx, |view, _, cx| view.display_text_for_test(cx))
+        .unwrap();
+    assert!(
+        !display.contains(":party:"),
+        "the active fold conceals the body shortcode: {display}"
+    );
+    assert!(
+        !display.contains(":celebrate:"),
+        "the active fold conceals the reaction shortcode: {display}"
+    );
+
+    let before = window
+        .update(cx, |view, _, _| view.emoji_inlays_for_test())
+        .unwrap();
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C1",
+        "ts": "101.0",
+        "user": "UD",
+        "text": "an unrelated message",
+    }));
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let arrived = window
+            .update(cx, |view, _, cx| {
+                view.transcript_text_for_test(cx)
+                    .contains("an unrelated message")
+            })
+            .unwrap();
+        if arrived {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let after = window
+        .update(cx, |view, _, _| view.emoji_inlays_for_test())
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "an unrelated append retains existing emoji decorations and anchors"
+    );
 }
 
 /// The point follows the conversation, not the line number.

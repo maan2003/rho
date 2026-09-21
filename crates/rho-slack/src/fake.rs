@@ -56,6 +56,8 @@ struct State {
     marked: Vec<(String, String)>,
     /// Custom workspace emoji, as `emoji.list` returns them.
     emoji: BTreeMap<String, String>,
+    /// Whether a public emoji request leaked either workspace credential.
+    emoji_credentials_seen: bool,
     /// The threads Slack follows for the user, as
     /// `subscriptions.thread.getView` lists them: (channel, thread_ts).
     followed: Vec<(String, String)>,
@@ -280,6 +282,10 @@ impl Fake {
             .unwrap()
             .emoji
             .insert(name.to_owned(), format!("alias:{target}"));
+    }
+
+    pub fn emoji_credentials_seen(&self) -> bool {
+        self.state.lock().unwrap().emoji_credentials_seen
     }
 
     pub fn set_count(&self, channel: &str, has_unreads: bool, mentions: u32, latest: &str) {
@@ -643,7 +649,7 @@ async fn serve_api(
     frames: broadcast::Sender<Frame>,
 ) -> anyhow::Result<()> {
     loop {
-        let Some((path, body)) = read_request(&mut stream).await? else {
+        let Some((path, body, has_credentials)) = read_request(&mut stream).await? else {
             return Ok(());
         };
         // Avatars and file downloads are bytes, not JSON: the same server
@@ -660,6 +666,9 @@ async fn serve_api(
                 .insert(id.to_owned(), body.clone());
             write_json(&mut stream, &json!({"ok": true})).await?;
             continue;
+        }
+        if path.starts_with("/emoji/") && has_credentials {
+            state.lock().unwrap().emoji_credentials_seen = true;
         }
         if let Some(bytes) = binary_route(&path, &state) {
             let delay = match path.starts_with("/files/") {
@@ -776,7 +785,7 @@ fn binary_route(path: &str, state: &Arc<Mutex<State>>) -> Option<Vec<u8>> {
 /// Reads one HTTP request, returning its path and body. Enough of HTTP/1.1
 /// for a client we control: a request line, headers, and a `Content-Length`
 /// body.
-async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, Vec<u8>, bool)>> {
     let mut buffer = Vec::new();
     let head_end = loop {
         if let Some(index) = find(&buffer, b"\r\n\r\n") {
@@ -790,6 +799,11 @@ async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, 
         buffer.extend_from_slice(&chunk[..read]);
     };
     let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+    let has_credentials = head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, _)| {
+            name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("cookie")
+        })
+    });
     let path = head
         .lines()
         .next()
@@ -814,7 +828,7 @@ async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, 
         }
         body.extend_from_slice(&chunk[..read]);
     }
-    Ok(Some((path, body)))
+    Ok(Some((path, body, has_credentials)))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

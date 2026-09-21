@@ -84,9 +84,13 @@ async fn custom_emoji_keep_urls_and_aliases_and_small_assets_are_bounded() {
         "{}/emoji/party.png",
         fake.api_base().trim_end_matches("/api")
     );
-    let bytes = client.download_bounded(&url, 1024).await.unwrap();
+    let bytes = client.download_public_bounded(&url, 1024).await.unwrap();
     assert_eq!(&bytes[1..4], b"PNG");
-    let error = client.download_bounded(&url, 8).await.unwrap_err();
+    assert!(
+        !fake.emoji_credentials_seen(),
+        "public emoji assets must receive neither Authorization nor Cookie"
+    );
+    let error = client.download_public_bounded(&url, 8).await.unwrap_err();
     assert!(error.to_string().contains("exceeds 8 bytes"), "{error:#}");
 }
 

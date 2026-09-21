@@ -693,10 +693,17 @@ impl Client {
     }
 
     /// A bounded download for small display assets such as custom emoji.
-    pub async fn download_bounded(&self, url: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
+    pub async fn download_public_bounded(
+        &self,
+        url: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<u8>> {
         use futures::StreamExt as _;
+        // Custom emoji URLs are public CDN assets and are not constrained
+        // to Slack-owned hosts. Never disclose the workspace session to them.
         let response = self
-            .authorize(self.http.get(url))
+            .http
+            .get(url)
             .send()
             .await
             .with_context(|| format!("fetching {url}"))?
