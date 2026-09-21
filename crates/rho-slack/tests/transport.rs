@@ -1913,3 +1913,48 @@ async fn discovery_opens_reuses_and_joins_real_conversations() {
         .unwrap();
     assert_eq!(fake.posted().last().unwrap().channel, dm.id.0);
 }
+
+/// Slack's query operators go upstream unchanged, while the fake applies
+/// enough of their semantics to catch a client that silently drops a scope.
+#[tokio::test]
+async fn search_query_operators_filter_asymmetrically_and_are_not_rewritten() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("UA", "ada");
+    fake.add_user("UD", "dana");
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "random");
+    fake.add_message(
+        "C1",
+        json!({"type": "message", "ts": "100.0", "user": "UD", "text": "staging decision"}),
+    );
+    fake.add_message(
+        "C1",
+        json!({"type": "message", "ts": "101.0", "user": "UA", "text": "staging decision"}),
+    );
+    fake.add_message(
+        "C2",
+        json!({"type": "message", "ts": "102.0", "user": "UD", "text": "staging decision"}),
+    );
+    let client = client(&fake);
+    let query = "staging in:design from:@dana";
+
+    let found = client.search_messages(query, 1).await.unwrap();
+
+    assert_eq!(
+        found
+            .hits
+            .iter()
+            .map(|hit| (
+                hit.channel.0.as_str(),
+                hit.message.user.as_ref().map(|id| id.0.as_str())
+            ))
+            .collect::<Vec<_>>(),
+        vec![("C1", Some("UD"))],
+        "each operator excludes a different decoy"
+    );
+    assert_eq!(
+        fake.last_field("search.messages", "query").as_deref(),
+        Some(query),
+        "Slack, rather than rho, owns the query grammar"
+    );
+}

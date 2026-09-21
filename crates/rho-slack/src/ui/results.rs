@@ -17,7 +17,7 @@ use theme::ActiveTheme as _;
 
 use crate::api::SearchHit;
 use crate::session::{SearchRefused, Session, Source};
-use crate::types::Ts;
+use crate::types::{ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
 
 /// A place the reader chose: which conversation, and which message in it.
@@ -35,6 +35,10 @@ pub struct ResultsView {
     /// What each line of the buffer says, and where the line goes. One
     /// entry per line, so the line the cursor is on *is* the lookup.
     drawn: Vec<DrawnLine>,
+    query: String,
+    page: u32,
+    pages: u32,
+    loading: bool,
 }
 
 struct DrawnLine {
@@ -90,6 +94,10 @@ impl ResultsView {
             multi_buffer,
             editor,
             drawn: Vec::new(),
+            query: String::new(),
+            page: 0,
+            pages: 0,
+            loading: false,
         }
     }
 
@@ -101,6 +109,10 @@ impl ResultsView {
     /// a network and the reader is owed the difference between "still
     /// asking" and "nothing".
     pub fn asking(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.query = query.to_owned();
+        self.page = 0;
+        self.pages = 0;
+        self.loading = true;
         self.draw(
             vec![(
                 None,
@@ -117,12 +129,16 @@ impl ResultsView {
     pub fn found(
         &mut self,
         query: &str,
-        hits: &[SearchHit],
-        total: u32,
+        page: &crate::api::SearchPage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut lines = vec![(None, heading(query, hits.len(), total))];
+        self.query = query.to_owned();
+        self.page = page.page;
+        self.pages = page.pages;
+        self.loading = false;
+        let hits = &page.hits;
+        let mut lines = vec![(None, heading(query, hits.len(), page.total))];
         if hits.is_empty() {
             lines.push((None, vec![Span::styled("nobody said that", Class::Muted)]));
         }
@@ -136,8 +152,16 @@ impl ResultsView {
                 true => when_label(at as i64, now),
                 false => String::new(),
             };
+            let source = match hit.message.thread_ts.as_ref() {
+                Some(thread_ts) if thread_ts != &hit.message.ts => Source::Thread(ThreadKey {
+                    workspace: session.model().workspace().clone(),
+                    channel: hit.channel.clone(),
+                    thread_ts: thread_ts.clone(),
+                }),
+                _ => Source::Conversation(hit.channel.clone()),
+            };
             let place = Place {
-                source: Source::Conversation(hit.channel.clone()),
+                source,
                 ts: hit.message.ts.clone(),
             };
             lines.push((
@@ -171,7 +195,62 @@ impl ResultsView {
                 ))],
             ));
         }
+        if page.pages > 1 {
+            let mut navigation = Vec::new();
+            if page.page > 1 {
+                navigation.push("[ previous");
+            }
+            if page.page < page.pages {
+                navigation.push("] next");
+            }
+            lines.push((
+                None,
+                vec![Span::styled(
+                    format!(
+                        "page {} of {}{}",
+                        page.page,
+                        page.pages,
+                        if navigation.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", navigation.join(" · "))
+                        }
+                    ),
+                    Class::Muted,
+                )],
+            ));
+        }
         self.draw(lines, window, cx);
+    }
+
+    /// The adjacent page to request, if one exists and no request is in flight.
+    pub fn adjacent_page(
+        &mut self,
+        offset: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, u32)> {
+        if self.loading || self.page == 0 {
+            return None;
+        }
+        let page = i64::from(self.page) + i64::from(offset);
+        if page < 1 || page > i64::from(self.pages) {
+            return None;
+        }
+        let page = page as u32;
+        self.loading = true;
+        self.draw(
+            vec![(
+                None,
+                vec![Span::styled(
+                    format!("looking for {}, page {page}…", self.query),
+                    Class::Muted,
+                )],
+            )],
+            window,
+            cx,
+        );
+        Some((self.query.clone(), page))
     }
 
     /// What the reader is told when the search did not answer. One line,
@@ -183,6 +262,7 @@ impl ResultsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.loading = false;
         let said = match why {
             SearchRefused::NotAllowed => {
                 "this slack session is not allowed to search; a fresh token and cookie will fix it"

@@ -117,6 +117,8 @@ actions!(
         SlackSearch,
         SlackFindMessage,
         SlackOpenFound,
+        SlackSearchPreviousPage,
+        SlackSearchNextPage,
         SlackMarkReadBefore,
         SlackNextUnread,
         SlackEditMessage,
@@ -403,6 +405,12 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         // `escape` and `q` leave the way any other surface is left, and
         // `shift-s` asks again without going back to the list first.
         KeyBinding::new("enter", SlackOpenFound, Some("RhoSlackResults > Editor")),
+        KeyBinding::new(
+            "[",
+            SlackSearchPreviousPage,
+            Some("RhoSlackResults > Editor"),
+        ),
+        KeyBinding::new("]", SlackSearchNextPage, Some("RhoSlackResults > Editor")),
         KeyBinding::new("escape", SurfaceClose, Some("RhoSlackResults > Editor")),
         KeyBinding::new("q", SurfaceClose, Some("RhoSlackResults > Editor")),
         KeyBinding::new(

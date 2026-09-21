@@ -1438,6 +1438,173 @@ async fn a_search_finds_places_and_enter_goes_to_one(cx: &mut TestAppContext) {
     );
 }
 
+/// Search pages are reachable from the results buffer instead of silently
+/// stranding every hit after the first forty.
+#[gpui::test]
+async fn search_results_move_to_the_next_numbered_page(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    for n in 0..45 {
+        fake.add_message(
+            "C1",
+            serde_json::json!({
+                "ts": format!("{}.0", 1000 + n),
+                "user": "UD",
+                "text": format!("pagination marker {n}"),
+            }),
+        );
+    }
+
+    cx.simulate_keystrokes(*workspace, "shift-s");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "p a g i n a t i o n enter");
+    let first = wait_for_results(cx, &workspace).await;
+    assert!(
+        first.iter().any(|line| line == "page 1 of 2 · ] next"),
+        "the next page is discoverable in the buffer: {first:?}"
+    );
+    assert!(
+        first
+            .iter()
+            .any(|line| line.contains("pagination marker 44")),
+        "the first page holds the newest hit: {first:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "]");
+    let second = wait_for_results(cx, &workspace).await;
+    assert!(
+        second.iter().any(|line| line == "page 2 of 2 · [ previous"),
+        "the reader can return as well as advance: {second:?}"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|line| line.contains("pagination marker 4"))
+            && !second
+                .iter()
+                .any(|line| line.contains("pagination marker 44")),
+        "page two replaces page one with the five older hits: {second:?}"
+    );
+    cx.simulate_keystrokes(*workspace, "[");
+    let first_again = wait_for_results(cx, &workspace).await;
+    assert!(
+        first_again
+            .iter()
+            .any(|line| line.contains("pagination marker 44")),
+        "previous returns to the first page: {first_again:?}"
+    );
+    assert_eq!(
+        fake.fields("search.messages", "page"),
+        vec![
+            Some("1".to_owned()),
+            Some("2".to_owned()),
+            Some("1".to_owned())
+        ]
+    );
+}
+
+/// `shift-s` in a conversation uses Slack's own `in:` operator, while the
+/// same key on the list remains a workspace-wide search.
+#[gpui::test]
+async fn a_conversation_search_is_scoped_without_hiding_slack_operators(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "800.0", "user": "UA", "text": "asymmetric scope marker"}),
+    );
+    fake.add_message(
+        "C3",
+        serde_json::json!({"ts": "700.0", "user": "UD", "text": "asymmetric scope marker"}),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId(
+                    "C3".to_owned(),
+                )),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "shift-s");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "a s y m m e t r i c enter");
+    let lines = wait_for_results(cx, &workspace).await;
+
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("1 for asymmetric in:dev-ops")
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("#dev-ops"))
+            && !lines.iter().any(|line| line.contains("#design")),
+        "the channel operator excludes the newer hit elsewhere: {lines:?}"
+    );
+    assert_eq!(
+        fake.last_field("search.messages", "query").as_deref(),
+        Some("asymmetric in:dev-ops")
+    );
+}
+
+/// A reply hit belongs to its thread, not to the channel transcript that
+/// normally omits non-broadcast replies.
+#[gpui::test]
+async fn a_reply_search_hit_opens_its_thread_context(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "900.0", "user": "UA", "text": "thread root"}),
+    );
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "901.0",
+            "thread_ts": "900.0",
+            "user": "UD",
+            "text": "reply-only search marker",
+        }),
+    );
+
+    cx.simulate_keystrokes(*workspace, "shift-s");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r e p l y - o n l y enter");
+    let lines = wait_for_results(cx, &workspace).await;
+    assert_eq!(lines.first().map(String::as_str), Some("1 for reply-only"));
+
+    cx.simulate_keystrokes(*workspace, "enter");
+    let mut transcript = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        transcript = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.slack_transcript_for_test(cx)
+            })
+            .unwrap();
+        if transcript.iter().any(|line| line.contains("reply-only")) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace
+                .slack_open_label_for_test(cx))
+            .unwrap()
+            .as_deref(),
+        Some("#design · thread")
+    );
+    assert!(
+        transcript.iter().any(|line| line.contains("thread root"))
+            && transcript
+                .iter()
+                .any(|line| line.contains("reply-only search marker")),
+        "the reply lands with its parent context: {transcript:?}"
+    );
+}
+
 /// A search that does not answer says so, once, where the results would be.
 /// Silence and "nobody said that" are different facts and the reader is
 /// owed the difference.

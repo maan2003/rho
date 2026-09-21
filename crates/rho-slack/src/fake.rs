@@ -1021,17 +1021,53 @@ fn png_size(bytes: &[u8]) -> (u32, u32) {
     }
 }
 
-/// When a feed item happened, from wherever its own shape keeps it: a
-/// mention carries the message, a thread bundle carries its latest reply.
-/// The words a fake search matches on: whitespace-separated and lowered.
-/// Slack parses `from:` and `in:` and its own operators, and this does not
-/// pretend to -- a fake that guessed at that grammar would be asserting
-/// against rho's guess rather than against Slack.
-fn search_terms(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>()
+/// The small part of Slack's query grammar the fake needs for end-to-end QA.
+///
+/// Production sends the query through untouched. The fake recognizes the two
+/// scopes exercised by the GUI so a scoped test cannot pass merely because
+/// every fixture happens to be in the same channel or written by one person.
+#[derive(Default)]
+struct SearchQuery {
+    terms: Vec<String>,
+    channel: Option<String>,
+    author: Option<String>,
+    has: Option<String>,
+    thread_only: bool,
+}
+
+fn search_query(query: &str) -> SearchQuery {
+    let mut parsed = SearchQuery::default();
+    for token in query.split_whitespace() {
+        let token = token.to_lowercase();
+        if let Some(value) = token.strip_prefix("in:") {
+            parsed.channel = Some(value.trim_start_matches(['#', '@']).to_owned());
+        } else if let Some(value) = token.strip_prefix("from:") {
+            parsed.author = Some(value.trim_start_matches('@').to_owned());
+        } else if let Some(value) = token.strip_prefix("has:") {
+            parsed.has = Some(value.to_owned());
+        } else if token == "is:thread" {
+            parsed.thread_only = true;
+        } else if !token.contains(':') {
+            parsed.terms.push(token);
+        }
+    }
+    parsed
+}
+
+fn search_author_matches(state: &State, message: &Value, wanted: &str) -> bool {
+    let Some(user) = message["user"].as_str() else {
+        return false;
+    };
+    state.users.iter().any(|candidate| {
+        candidate["id"] == json!(user)
+            && [
+                candidate["name"].as_str(),
+                candidate["profile"]["display_name"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|name| name.eq_ignore_ascii_case(wanted))
+    })
 }
 
 /// When a match happened, for ordering. A message with no readable `ts`
@@ -1043,6 +1079,8 @@ fn search_ts(message: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// When a feed item happened, from wherever its own shape keeps it: a
+/// mention carries the message, a thread bundle carries its latest reply.
 fn feed_ts(item: &Value) -> f64 {
     let entry = &item["item"];
     entry["message"]["ts"]
@@ -1522,7 +1560,7 @@ fn handle(
             // Every conversation at once, which is what makes a search
             // different from history: the hit names its own channel because
             // the request did not.
-            let terms = search_terms(&field("query"));
+            let query = search_query(&field("query"));
             let mut matches = Vec::new();
             for (channel, messages) in &state.history {
                 let name = state
@@ -1532,9 +1570,29 @@ fn handle(
                     .and_then(|conversation| conversation["name"].as_str())
                     .unwrap_or_default()
                     .to_owned();
+                if query
+                    .channel
+                    .as_ref()
+                    .is_some_and(|wanted| !name.eq_ignore_ascii_case(wanted))
+                {
+                    continue;
+                }
                 for message in messages {
                     let text = message["text"].as_str().unwrap_or_default().to_lowercase();
-                    if terms.iter().all(|term| text.contains(term)) {
+                    let terms_match = query.terms.iter().all(|term| text.contains(term));
+                    let author_matches = query
+                        .author
+                        .as_ref()
+                        .is_none_or(|wanted| search_author_matches(&state, message, wanted));
+                    let has_matches = query.has.as_deref().is_none_or(|wanted| match wanted {
+                        "file" | "files" => message["files"]
+                            .as_array()
+                            .is_some_and(|files| !files.is_empty()),
+                        "link" | "links" => text.contains("http://") || text.contains("https://"),
+                        _ => true,
+                    });
+                    let thread_matches = !query.thread_only || message["thread_ts"].is_string();
+                    if terms_match && author_matches && has_matches && thread_matches {
                         let mut hit = message.clone();
                         hit["channel"] = json!({"id": channel, "name": name});
                         matches.push(hit);

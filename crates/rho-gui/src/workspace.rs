@@ -98,9 +98,9 @@ use crate::{
     MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat, SearchRepeatReverse, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
     SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackNextUnread,
-    SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu,
-    VoiceToggle,
+    SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch, SlackSearchNextPage,
+    SlackSearchPreviousPage, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
+    UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -8999,6 +8999,18 @@ impl Render for Workspace {
                 // Not on a hit: the line opens nothing, so `enter` is the
                 // editor's own again.
                 if !this.slack_open_found(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &SlackSearchPreviousPage, window, cx| {
+                    if !this.slack_search_page(-1, window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
+            .on_action(cx.listener(|this, _: &SlackSearchNextPage, window, cx| {
+                if !this.slack_search_page(1, window, cx) {
                     cx.propagate();
                 }
             }))

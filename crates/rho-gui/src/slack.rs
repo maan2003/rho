@@ -1315,11 +1315,32 @@ impl Workspace {
         if self.slack_session(window, cx).is_none() {
             return;
         }
+        let scope = match &self.active_surface().view {
+            SurfaceView::SlackConversation(view) => {
+                let source = view.read(cx).source();
+                let label = self
+                    .slack
+                    .session()
+                    .map(|session| session.read(cx).model().label(source.channel()))
+                    .unwrap_or_default();
+                Some(label.trim_start_matches(['#', '@']).to_owned())
+            }
+            _ => None,
+        };
+        let prompt = match &scope {
+            Some(label) => format!("slack find in {label} (from: before: after: has: is:):"),
+            None => "slack find (from: in: before: after: has: is:):".to_owned(),
+        };
         self.open_prompt(
-            "slack find:",
+            prompt,
             std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new()),
-            std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
-                workspace.slack_find(&input, window, cx);
+            std::rc::Rc::new(move |workspace: &mut Workspace, input, window, cx| {
+                let query = match (input.trim(), &scope) {
+                    ("", _) => String::new(),
+                    (input, Some(label)) => format!("{input} in:{label}"),
+                    (_, None) => input,
+                };
+                workspace.slack_find(&query, window, cx);
             }),
             window,
             cx,
@@ -1359,6 +1380,30 @@ impl Workspace {
         }
         session.update(cx, |session, cx| session.search(&query, 1, cx));
         cx.notify();
+    }
+
+    /// Requests the adjacent numbered search page. Slack's message search
+    /// uses page numbers rather than cursors.
+    pub(crate) fn slack_search_page(
+        &mut self,
+        offset: i32,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackResults(view) = &self.active_surface().view else {
+            return false;
+        };
+        let Some((query, page)) = view
+            .clone()
+            .update(cx, |view, cx| view.adjacent_page(offset, window, cx))
+        else {
+            return false;
+        };
+        let Some(session) = self.slack.session() else {
+            return false;
+        };
+        session.update(cx, |session, cx| session.search(&query, page, cx));
+        true
     }
 
     /// `enter` on a hit: the conversation, opened at that message. The
@@ -1404,7 +1449,7 @@ impl Workspace {
         };
         let found = found.clone();
         view.update(cx, |view, cx| match &found.page {
-            Ok(page) => view.found(&found.query, &page.hits, page.total, window, cx),
+            Ok(page) => view.found(&found.query, page, window, cx),
             Err(why) => view.refused(&found.query, why, window, cx),
         });
         cx.notify();
