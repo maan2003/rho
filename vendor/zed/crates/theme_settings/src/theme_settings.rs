@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ::settings::{IntoGpui, Settings, SettingsStore};
 use anyhow::{Context as _, Result};
-use gpui::{App, Font, HighlightStyle, Pixels, Refineable, px};
+use gpui::{App, Font, HighlightStyle, Pixels, Refineable, StrikethroughStyle, px};
 use gpui_util::ResultExt;
 use theme::{
     AccentColors, Appearance, AppearanceContent, DEFAULT_DARK_THEME, DEFAULT_ICON_THEME_NAME,
@@ -330,19 +330,24 @@ pub fn refine_theme(theme: &ThemeContent) -> Theme {
     merge_accent_colors(&mut refined_accent_colors, &theme.style.accents);
 
     let syntax_highlights = theme.style.syntax.iter().map(|(syntax_token, highlight)| {
+        let color = highlight
+            .color
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok().map(Into::into));
         (
             syntax_token.clone(),
             HighlightStyle {
-                color: highlight
-                    .color
-                    .as_ref()
-                    .and_then(|color| try_parse_color(color).ok().map(Into::into)),
+                color,
                 background_color: highlight
                     .background_color
                     .as_ref()
                     .and_then(|color| try_parse_color(color).ok().map(Into::into)),
                 font_style: highlight.font_style.map(|s| s.into_gpui()),
                 font_weight: highlight.font_weight.map(|w| w.into_gpui()),
+                strikethrough: (syntax_token == "strikethrough").then_some(StrikethroughStyle {
+                    thickness: 1.0.into(),
+                    color,
+                }),
                 ..Default::default()
             },
         )

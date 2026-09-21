@@ -78,6 +78,18 @@ mod tests {
 
         let registry = theme::ThemeRegistry::new(Box::new(RhoAssets));
         theme_settings::load_bundled_themes(&registry);
-        registry.get("Rho OLED").expect("registered OLED theme");
+        for name in ["Rho OLED", "Rho OKSolar P3"] {
+            let theme = registry
+                .get(name)
+                .unwrap_or_else(|_| panic!("registered {name} theme"));
+            let strike = theme
+                .syntax()
+                .style_for_name("strikethrough")
+                .unwrap_or_else(|| panic!("{name} maps Markdown strikethrough"));
+            assert!(
+                strike.strikethrough.is_some(),
+                "{name} draws a strike rather than only dimming the text"
+            );
+        }
     }
 }

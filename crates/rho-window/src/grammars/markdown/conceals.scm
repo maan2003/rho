@@ -8,8 +8,9 @@
     (atx_h6_marker)
   ] @conceal @conceal.line_prefix) @conceal.context
 
-(fenced_code_block
+((fenced_code_block
   [
     (fenced_code_block_delimiter)
     (info_string)
   ] @conceal) @conceal.context
+  (#not-match? @conceal.context "^(```|~~~)[ \\t]*(visualization|diagram|mermaid)([ \\t\\r\\n]|$)"))
