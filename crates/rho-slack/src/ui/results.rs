@@ -9,14 +9,14 @@ use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, EventEmitter, MouseButton, Window, div};
+use gpui::{Context, Entity, EventEmitter, MouseButton, MouseUpEvent, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::ToPoint as _;
-use text::Anchor;
+use text::{Anchor, Bias};
 use theme::ActiveTheme as _;
 
 use crate::api::{FileSearchPage, SearchHit, SearchPage};
-use crate::session::{ActivityEntry, SearchRefused, Session, Source};
+use crate::session::{ActivityEntry, SearchKind, SearchRefused, Session, Source};
 use crate::types::{FileSummary, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
 
@@ -31,12 +31,6 @@ pub struct Place {
 pub enum Target {
     Message(Place),
     File(FileSummary),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchKind {
-    Messages,
-    Files,
 }
 
 #[derive(Clone, Debug)]
@@ -399,18 +393,23 @@ impl ResultsView {
         self.drawn.get(row).and_then(|line| line.target.clone())
     }
 
-    fn open_clicked(&mut self, cx: &mut Context<Self>) {
-        let empty = self.editor.update(cx, |editor, cx| {
-            editor
+    fn open_clicked(&mut self, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let hit = self.editor.update(cx, |editor, cx| {
+            let selection = editor
                 .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
+                .newest::<Point>(&editor.display_snapshot(cx));
+            selection
                 .is_empty()
+                .then(|| editor.buffer_location_for_window_position(position, Bias::Left))
+                .flatten()
+                .map(|(_, _, offset)| offset)
         });
-        if empty && let Some(target) = self.cursor_target(cx) {
-            match target {
-                Target::Message(place) => cx.emit(Event::Open(place)),
-                Target::File(file) => cx.emit(Event::OpenFile(file)),
-            }
+        let Some(target) = target_for_click(&self.drawn, hit) else {
+            return;
+        };
+        match target {
+            Target::Message(place) => cx.emit(Event::Open(place)),
+            Target::File(file) => cx.emit(Event::OpenFile(file)),
         }
     }
 
@@ -498,6 +497,23 @@ impl ResultsView {
         });
         apply_highlights(&self.editor, &self.multi_buffer, &anchored, cx);
     }
+}
+
+fn target_for_click(lines: &[DrawnLine], offset: Option<usize>) -> Option<Target> {
+    target_at_offset(lines, offset?)
+}
+
+fn target_at_offset(lines: &[DrawnLine], offset: usize) -> Option<Target> {
+    let mut start = 0;
+    for line in lines {
+        let end = start + line.text.len();
+        if (start..end).contains(&offset) {
+            return line.target.clone();
+        }
+        // `draw` writes one newline after every line.
+        start = end + 1;
+    }
+    None
 }
 
 fn append_navigation(lines: &mut Vec<(Option<Target>, Vec<Span>)>, page: u32, pages: u32) {
@@ -594,22 +610,77 @@ impl gpui::Render for ResultsView {
             .flex()
             .flex_col()
             .bg(colors.editor_background)
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.open_clicked(cx)),
-            )
-            .child(div().flex_1().min_h_0().child(self.editor.clone()))
             .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            this.open_clicked(event.position, cx)
+                        }),
+                    )
+                    .child(self.editor.clone()),
+            )
+            .children((self.pages > 1).then(|| {
                 div()
                     .flex_none()
                     .flex()
+                    .items_center()
                     .border_t_1()
                     .border_color(colors.border_variant)
                     .text_color(colors.text_muted)
-                    .children(previous)
-                    .child(div().flex_1())
-                    .children(next),
-            )
+                    .child(div().flex_1().children(previous))
+                    .child(format!("Page {} of {}", self.page, self.pages))
+                    .child(div().flex_1().flex().justify_end().children(next))
+            }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file() -> FileSummary {
+        FileSummary {
+            id: "F1".to_owned(),
+            title: "report.pdf".to_owned(),
+            filetype: "pdf".to_owned(),
+            size: 1,
+            url: String::new(),
+            original_w: 0,
+            original_h: 0,
+            thumb_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_text_inside_a_result_row_is_a_mouse_target() {
+        let target = Target::File(file());
+        let lines = vec![
+            DrawnLine {
+                target: None,
+                text: "heading".to_owned(),
+                styles: Vec::new(),
+            },
+            DrawnLine {
+                target: Some(target.clone()),
+                text: "report.pdf".to_owned(),
+                styles: Vec::new(),
+            },
+        ];
+
+        assert_eq!(target_for_click(&lines, Some(8)), Some(target));
+        assert_eq!(
+            target_for_click(&lines, Some(18)),
+            None,
+            "the newline or right-side padding after the result does not open it"
+        );
+        assert_eq!(
+            target_for_click(&lines, None),
+            None,
+            "pagination is outside the editor hit region and cannot emit Open"
+        );
     }
 }
 

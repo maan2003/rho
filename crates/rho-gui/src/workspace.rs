@@ -4365,7 +4365,10 @@ impl Workspace {
             ),
             SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::SlackList => "slack".to_owned(),
-            SurfaceKey::SlackResults { query } => query.clone(),
+            SurfaceKey::SlackResults { query, kind } => match kind {
+                rho_slack::session::SearchKind::Messages => query.clone(),
+                rho_slack::session::SearchKind::Files => format!("files {query}"),
+            },
             SurfaceKey::SlackInventory(kind) => kind.title().to_owned(),
             SurfaceKey::SlackConversation(source) => self
                 .slack_labels
@@ -4510,8 +4513,11 @@ impl Workspace {
                 page_id: page_id.to_string(),
             },
             SurfaceKey::SlackList => SurfaceIdentity::SlackList,
-            SurfaceKey::SlackResults { query } => SurfaceIdentity::SlackSearch {
-                query: query.clone(),
+            SurfaceKey::SlackResults { query, kind } => SurfaceIdentity::SlackSearch {
+                query: match kind {
+                    rho_slack::session::SearchKind::Messages => query.clone(),
+                    rho_slack::session::SearchKind::Files => format!("files:{query}"),
+                },
             },
             SurfaceKey::SlackInventory(kind) => SurfaceIdentity::SlackInventory {
                 name: kind.title().to_owned(),
@@ -5210,6 +5216,7 @@ impl Workspace {
         Self::wrap_surface(
             SurfaceKey::SlackResults {
                 query: name.to_owned(),
+                kind: rho_slack::session::SearchKind::Messages,
             },
             SurfaceView::DeskNode(editor),
         )

@@ -105,9 +105,16 @@ pub enum SessionEvent {
 /// The query is carried with the answer because the surface has to say what
 /// it is showing the results *of*, and by the time an answer lands the
 /// reader may have typed something else entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SearchKind {
+    Messages,
+    Files,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
     pub query: String,
+    pub kind: SearchKind,
     pub page: Result<FoundPage, SearchRefused>,
 }
 
@@ -1166,7 +1173,11 @@ impl Session {
                     },
                     Err(_) => Err(SearchRefused::Failed),
                 };
-                cx.emit(SessionEvent::Found(Found { query, page }));
+                cx.emit(SessionEvent::Found(Found {
+                    query,
+                    kind: SearchKind::Messages,
+                    page,
+                }));
             });
         }));
     }
@@ -1198,7 +1209,11 @@ impl Session {
                     },
                     Err(_) => Err(SearchRefused::Failed),
                 };
-                cx.emit(SessionEvent::Found(Found { query, page }));
+                cx.emit(SessionEvent::Found(Found {
+                    query,
+                    kind: SearchKind::Files,
+                    page,
+                }));
             });
         }));
     }

@@ -1754,6 +1754,62 @@ async fn standalone_file_search_has_its_own_result_choice(cx: &mut TestAppContex
     );
 }
 
+/// Message and file searches with the same query are separate surfaces and
+/// an answer for one kind cannot replace the other kind's rows.
+#[gpui::test]
+async fn the_same_query_keeps_message_and_file_results_separate(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "820.0", "user": "UA", "text": "collision marker"}),
+    );
+    fake.add_file("FCOLLISION", "collision-report.pdf");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.prompt_slack_find_all(window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "c o l l i s i o n enter");
+    let messages = wait_for_results(cx, &workspace).await;
+    assert!(
+        messages
+            .iter()
+            .any(|line| line.contains("collision marker"))
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.prompt_slack_find_files(window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "c o l l i s i o n enter");
+    let files = wait_for_results(cx, &workspace).await;
+    assert_eq!(
+        files,
+        vec![
+            "1 for collision".to_owned(),
+            "collision-report.pdf · 128 B".to_owned(),
+        ]
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let names = workspace.buffer_table();
+            assert!(names.iter().any(|(name, _)| name == "collision"));
+            assert!(names.iter().any(|(name, _)| name == "files collision"));
+            workspace.switch_buffer("collision", window, cx);
+            assert!(
+                workspace
+                    .slack_results_for_test(cx)
+                    .iter()
+                    .any(|line| line.contains("collision marker")),
+                "returning to message results preserves their rows"
+            );
+        })
+        .unwrap();
+}
+
 /// A reply hit belongs to its thread, not to the channel transcript that
 /// normally omits non-broadcast replies.
 #[gpui::test]

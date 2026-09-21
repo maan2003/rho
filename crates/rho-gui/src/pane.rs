@@ -55,11 +55,12 @@ pub enum SurfaceKey {
     },
     Browser(rho_browser::PageId),
     SlackList,
-    /// The places one Slack search found. The query is the identity, so a
-    /// second search replaces the surface rather than stacking another one
-    /// behind it: the results are a way through, not a thing to keep.
+    /// The places one Slack search found. The query and result kind are the
+    /// identity, so repeating one search replaces its surface while message
+    /// and file results for the same words remain distinct.
     SlackResults {
         query: String,
+        kind: rho_slack::session::SearchKind,
     },
     /// Activity and Saved reuse the results editor, but are durable
     /// inventories with identities that cannot collide with literal searches.

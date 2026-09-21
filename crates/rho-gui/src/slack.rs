@@ -2137,6 +2137,7 @@ impl Workspace {
         self.active_context = ContextId::Slack;
         let key = SurfaceKey::SlackResults {
             query: query.clone(),
+            kind,
         };
         let surface = match self.find_surface(|surface| surface.key == key).cloned() {
             Some(surface) => surface,
@@ -2244,6 +2245,7 @@ impl Workspace {
     ) {
         let key = SurfaceKey::SlackResults {
             query: found.query.clone(),
+            kind: found.kind,
         };
         let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() else {
             return;

@@ -19,9 +19,11 @@ use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Hsla, Window};
 use language::Buffer;
 pub use list::ListView;
 use multi_buffer::MultiBuffer;
-pub use results::{Place, ResultsView, SearchKind, Target};
+pub use results::{Place, ResultsView, Target};
 use text::Anchor;
 use theme::ActiveTheme as _;
+
+pub use crate::session::SearchKind;
 
 /// Host-supplied editor and buffer configuration.
 ///
