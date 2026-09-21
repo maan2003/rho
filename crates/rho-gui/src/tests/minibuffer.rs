@@ -119,3 +119,34 @@ fn a_prompt_without_a_change_handler_is_untouched(cx: &mut TestAppContext) {
         "and submit still receives the typed input"
     );
 }
+
+/// Escape is observable for prompts that own remote state; ordinary prompts
+/// retain their existing drop-only behavior.
+#[gpui::test]
+fn a_cancellable_prompt_runs_its_cancel_handler_on_escape(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let cancelled = Rc::new(RefCell::new(0));
+    let count = cancelled.clone();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_prompt_cancellable(
+                "remote field:",
+                Rc::new(|_, _, _| Vec::new()),
+                Rc::new(|_, _, _, _| {}),
+                Rc::new(move |_, _, _| *count.borrow_mut() += 1),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::MinibufferCancel);
+    cx.run_until_parked();
+
+    assert_eq!(
+        *cancelled.borrow(),
+        1,
+        "Escape closes the external interaction exactly once"
+    );
+}

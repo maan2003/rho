@@ -6530,8 +6530,12 @@ impl Workspace {
             // snapshot is only honest for as long as the reader is looking
             // at the rows it made.
             self.find_snapshot = None;
+            let on_cancel = minibuffer.on_cancel();
             self.finish_overlay_focus(window, cx);
             self.restore_slack_search(window, cx);
+            if let Some(on_cancel) = on_cancel {
+                on_cancel(self, window, cx);
+            }
             cx.notify();
         }
     }
@@ -6558,7 +6562,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_prompt_watching(prompt, complete, None, on_submit, window, cx);
+        self.open_prompt_inner(prompt, complete, None, on_submit, None, window, cx);
+    }
+
+    pub(crate) fn open_prompt_cancellable(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: crate::minibuffer::CandidateSource,
+        on_submit: crate::minibuffer::SubmitHandler,
+        on_cancel: crate::minibuffer::CancelHandler,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_prompt_inner(
+            prompt,
+            complete,
+            None,
+            on_submit,
+            Some(on_cancel),
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn set_prompt_complete_whole_input(&mut self) {
@@ -6579,6 +6603,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_prompt_inner(prompt, complete, on_change, on_submit, None, window, cx);
+    }
+
+    fn open_prompt_inner(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: crate::minibuffer::CandidateSource,
+        on_change: Option<crate::minibuffer::ChangeHandler>,
+        on_submit: crate::minibuffer::SubmitHandler,
+        on_cancel: Option<crate::minibuffer::CancelHandler>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prompt = prompt.into();
         rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
@@ -6593,6 +6630,7 @@ impl Workspace {
             complete,
             on_change,
             on_submit,
+            on_cancel,
             window,
             cx,
         );

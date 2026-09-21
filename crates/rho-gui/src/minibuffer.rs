@@ -129,6 +129,8 @@ pub type CandidateSource = Rc<dyn Fn(&Workspace, &str, &App) -> Vec<Candidate>>;
 /// Receives the typed input (tab-completions applied) after the
 /// minibuffer has closed.
 pub type SubmitHandler = Rc<dyn Fn(&mut Workspace, String, &mut Window, &mut Context<Workspace>)>;
+/// Runs when Escape dismisses a prompt that owns external state.
+pub type CancelHandler = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 /// Receives the input as it now stands, after each edit, while the
 /// minibuffer is still open.
 ///
@@ -146,6 +148,7 @@ pub struct Minibuffer {
     complete: CandidateSource,
     on_change: Option<ChangeHandler>,
     on_submit: SubmitHandler,
+    on_cancel: Option<CancelHandler>,
     candidates: Vec<Candidate>,
     selected: usize,
     /// The user moved the selection since the last edit, making the
@@ -171,6 +174,7 @@ impl Minibuffer {
         complete: CandidateSource,
         on_change: Option<ChangeHandler>,
         on_submit: SubmitHandler,
+        on_cancel: Option<CancelHandler>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Self {
@@ -205,6 +209,7 @@ impl Minibuffer {
             complete,
             on_change,
             on_submit,
+            on_cancel,
             candidates: Vec::new(),
             selected: 0,
             selection_moved: false,
@@ -223,6 +228,20 @@ impl Minibuffer {
     /// minibuffer lives in the workspace.
     pub fn on_change(&self) -> Option<ChangeHandler> {
         self.on_change.clone()
+    }
+
+    pub fn on_cancel(&self) -> Option<CancelHandler> {
+        self.on_cancel.clone()
+    }
+
+    pub fn set_input(&mut self, input: String, window: &mut Window, cx: &mut App) {
+        self.editor.update(cx, |editor, cx| {
+            editor.set_text(input.clone(), window, cx);
+            let end = multi_buffer::MultiBufferOffset(input.len());
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([end..end]);
+            });
+        });
     }
 
     /// Recomputes candidates against `workspace`; called by the workspace
