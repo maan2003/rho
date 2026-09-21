@@ -234,9 +234,8 @@ pub struct RowSpacing {
     /// Anchors in the first and last source rows of the content.
     pub range: Range<Anchor>,
     /// The minimum space reserved for content, including any attached blocks.
+    /// Content shorter than this is vertically centered; taller content is top-aligned.
     pub minimum_height: f32,
-    /// Leading space inside the minimum-height slot, in line-height units.
-    pub padding_before: f32,
     /// Space following the larger of the content height and its minimum height.
     pub gap_after: f32,
 }
@@ -1994,7 +1993,7 @@ impl DisplaySnapshot {
             if boundary >= last_text_row {
                 let first = spacing.range.start.to_display_point(self).row();
                 let content_height = boundary.0.saturating_sub(first.0) as f32 + 1.;
-                let inset = spacing.padding_before;
+                let inset = (spacing.minimum_height - content_height).max(0.) / 2.;
                 if inset > 0. {
                     padding.push((first.0, inset));
                 }

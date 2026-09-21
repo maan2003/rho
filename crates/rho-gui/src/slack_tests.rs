@@ -127,11 +127,11 @@ async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut
                         1.625,
                         "date separator has a half-line gap before the avatar slot"
                     );
-                    assert_eq!(snapshot.row_padding_before(row("a longer message")), 0.125);
+                    assert_eq!(snapshot.row_padding_before(row("a longer message")), 0.);
                     assert_eq!(snapshot.row_padding_before(row("follow-up")), 0.);
                     assert_eq!(y("follow-up") - y("short"), 1.375);
                     assert_eq!(y("edited follow-up ✎") - y("follow-up"), 1.25);
-                    assert_eq!(y("a longer message") - y("edited follow-up ✎"), 1.625);
+                    assert_eq!(y("a longer message") - y("edited follow-up ✎"), 1.5);
                     let style = editor.style(cx).clone();
                     let font_size = style.text.font_size.to_pixels(window.rem_size());
                     let font_id = window.text_system().resolve_font(&style.text.font());

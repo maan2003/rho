@@ -22,8 +22,9 @@ claims are not evidence that a workflow is complete.
   images are preferred for HiDPI. Initials fill pending or unavailable avatars;
   the gutter and folded author rows do not wait for the image download.
   Message slots reserve at least 1.25 lines for avatars, without blank source
-  rows. Every avatar is centered beside the first body line, including multiline
-  and wrapped messages. Same-author follow-ups (including edited messages) share
+  rows. Only single-visual-row messages are vertically centered. Multiline,
+  wrapped, and footer-bearing messages start at the avatar's top and flow down.
+  Same-author follow-ups (including edited messages) share
   an avatar within five minutes on the same day. They need no avatar minimum
   and use quarter-line gaps; author groups retain half-line gaps.
   Wrapped paragraphs, leading code, and image attachments retain a common text margin.
@@ -82,6 +83,10 @@ claims are not evidence that a workflow is complete.
   Inspected `/src/slack-qa/screens/grouped-footer-loading.png`,
   `grouped-footer-loaded.png`, and `grouped-footer-thread.png`. Enter on the
   combined footer opens the matching thread.
+- Single-row alignment regression resizes the same message from wrapped to
+  one visual row and back. Only the one-row state is centered. Inspected
+  `/src/slack-qa/screens/single-row-align.png` with short, multiline, wrapped,
+  and footer-bearing messages.
 - QA uses only the local fake Slack server. Its avatar and custom emoji
   fixtures are solid-color PNGs, not real profile photographs.
 

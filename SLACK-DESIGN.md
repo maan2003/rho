@@ -573,11 +573,11 @@ transcript renders through, and owns none of its own. Concretely:
   primitive, with a half-line gap below them. They never replace body rows.
   The unread line stays left-aligned.
   Author groups have half a line of display-only trailing space; messages within
-  a group have a quarter line. Every avatar is centered beside the first text
-  line, whether the message is short, multiline, wrapped, or has metadata.
-  The 1.25-line avatar slot reserves an eighth-line top inset and any needed
-  bottom inset. The editor's shared geometry owns wrapping, scrolling,
-  selection and hit testing.
+  a group have a quarter line. Only single-visual-row messages are centered
+  in their 1.25-line avatar slot, with equal eighth-line top and bottom insets.
+  Multiline, wrapped, and footer-bearing messages are top-aligned and flow down.
+  Alignment is recalculated when wrapping changes. The editor's shared geometry
+  owns wrapping, scrolling, selection and hit testing.
   Per-message and last-reply timestamps are hidden; date separators remain.
 - Edits use a display-only `✎` suffix on the last content line, not a source
   metadata row. Markdown link targets and code fences remain unchanged.

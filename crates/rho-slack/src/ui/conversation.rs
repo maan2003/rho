@@ -1866,11 +1866,6 @@ impl ConversationView {
                     } else {
                         0.
                     },
-                    padding_before: if self.avatar_authors.contains_key(row) {
-                        0.125
-                    } else {
-                        0.
-                    },
                     gap_after: if compact_after.contains(row) {
                         0.25
                     } else {
