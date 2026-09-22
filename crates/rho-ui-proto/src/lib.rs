@@ -765,6 +765,15 @@ pub enum ServerMessage {
         contents: Vec<WorkspaceDiffBaseContent>,
     },
     WaylandOpened,
+    DesktopSessions {
+        sessions: Vec<DesktopSession>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack)]
+pub struct DesktopSession {
+    pub agent: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use gpui::prelude::*;
 use gpui::*;
 use rho_desktop_proto::Input;
+use theme::ActiveTheme as _;
 
 pub struct WaylandView {
     viewer: rho_hosts::wayland::Viewer,
@@ -90,6 +91,10 @@ impl WaylandView {
     pub fn with_target(mut self, target: Option<Entity<rho_agents::AgentModel>>) -> Self {
         self.target = target;
         self
+    }
+    pub(crate) fn toggle_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        self.annotate(cx);
     }
     fn annotate(&mut self, cx: &mut Context<Self>) {
         if self.frozen.is_some() {
@@ -287,6 +292,21 @@ impl Render for WaylandView {
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.frozen.is_some() {
+                    let key = &event.keystroke;
+                    match key.key.as_str() {
+                        "escape" => this.annotate(cx),
+                        "u" if !key.modifiers.control && !key.modifiers.alt => {
+                            this.strokes.pop();
+                            cx.notify();
+                        }
+                        "y" if !key.modifiers.control && !key.modifiers.alt => {
+                            this.export(false, cx)
+                        }
+                        "enter" => this.export(true, cx),
+                        "g" if key.modifiers.control => this.annotate(cx),
+                        _ => {}
+                    }
+                    cx.stop_propagation();
                     return;
                 }
                 if cfg!(target_os = "linux") {
@@ -383,56 +403,54 @@ impl Render for WaylandView {
                     }),
                 );
         }
-        let button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .px_3()
-                .py_1()
-                .cursor_pointer()
-                .bg(rgb(0x303840))
-                .text_color(rgb(0xffffff))
-                .child(label)
-        };
-        let mut toolbar = div().flex().gap_2().p_2().bg(rgb(0x20242a)).child(
-            button(
-                "annotate",
-                if self.frozen.is_some() {
-                    "Resume live"
-                } else {
-                    "Annotate"
-                },
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.annotate(cx))),
-        );
-        if self.frozen.is_some() {
-            toolbar = toolbar
-                .child(
-                    button("undo", "Undo").on_click(cx.listener(|this, _, _, cx| {
-                        this.strokes.pop();
-                        cx.notify();
-                    })),
-                )
-                .child(
-                    button("copy", "Copy")
-                        .on_click(cx.listener(|this, _, _, cx| this.export(false, cx))),
-                );
-            if self.target.is_some() {
-                toolbar = toolbar.child(
-                    button("attach", "Add to prompt")
-                        .on_click(cx.listener(|this, _, _, cx| this.export(true, cx))),
-                );
-            }
-        }
-        if let Some(status) = &self.status {
-            toolbar = toolbar.child(div().text_color(rgb(0xa8d8b0)).child(status.clone()));
-        }
         let mut root = div()
             .size_full()
             .flex()
             .flex_col()
             .relative()
-            .child(toolbar)
             .child(surface);
+        if self.frozen.is_some() {
+            let action =
+                |id: &'static str, label: &'static str| div().id(id).cursor_pointer().child(label);
+            let mut mode_line = div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py(px(3.))
+                .text_size(px(12.))
+                .bg(cx.theme().colors().editor_background)
+                .text_color(cx.theme().colors().text_muted)
+                .child(
+                    div()
+                        .text_color(cx.theme().colors().text_accent)
+                        .child("DRAW"),
+                )
+                .child(
+                    action("undo", "u undo").on_click(cx.listener(|this, _, _, cx| {
+                        this.strokes.pop();
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    action("copy", "y copy")
+                        .on_click(cx.listener(|this, _, _, cx| this.export(false, cx))),
+                );
+            if self.target.is_some() {
+                mode_line = mode_line.child(
+                    action("attach", "↵ attach")
+                        .on_click(cx.listener(|this, _, _, cx| this.export(true, cx))),
+                );
+            }
+            mode_line = mode_line.child(
+                action("resume", "esc live")
+                    .on_click(cx.listener(|this, _, _, cx| this.annotate(cx))),
+            );
+            if let Some(status) = &self.status {
+                mode_line = mode_line.child(div().child(status.clone()));
+            }
+            root = root.child(mode_line);
+        }
         if let Some(error) = &self.error {
             root = root.child(
                 div()

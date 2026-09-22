@@ -780,8 +780,17 @@ converts full-range BT.601 to RGB in the draw shader, bypassing the image atlas.
 Unchanged frames retain their upload identity. CPU BGRA conversion happens only
 when exporting a frozen annotation, which requires no GPU readback.
 
-`rho wayland` forwards to `rho-agent-desktop wayland`. The GUI's desktop window
-sends input to the compositor's normal input path. Annotation freezes the
-presented image locally; strokes can be copied as a PNG or added to the selected
+`rho wayland` forwards to `rho-agent-desktop wayland`. Desktops publish atomic
+advertisements containing their name and owning `RHO_AGENT_ID`, under the agent's
+runtime directory. Multiple named desktops can belong to one agent. The daemon
+reconciles live advertisements through existing workset workers once a second
+and pushes changed availability over the authenticated GUI control stream; it
+never starts media capture for discovery. The GUI mode line shows availability.
+`Space w` opens the sole desktop or offers the advertised names in a completing
+read. The compositor holds a lifetime lock; unlocked advertisements are omitted,
+including leftovers after a crash.
+
+The GUI's desktop window sends input to the compositor's normal input path.
+Annotation freezes the presented image locally; strokes can be copied as a PNG or added to the selected
 agent's existing prompt-image attachments. The compositor has no annotation
 objects.

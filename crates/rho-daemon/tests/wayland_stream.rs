@@ -85,7 +85,9 @@ fn main() -> Result<()> {
                 _=>{}
             }
         };
-        let desktop=std::env::var_os("RHO_AGENT_DESKTOP_BIN").map(PathBuf::from)
+        let desktop_name = "preview".to_owned();
+        let desktop_directory = runtime.join("rho-desktop/agents").join(agent.encoded());
+        let desktop_program=std::env::var_os("RHO_AGENT_DESKTOP_BIN").map(PathBuf::from)
             .unwrap_or_else(||PathBuf::from("rho-agent-desktop"));
         let config=temp.path().join("desktop.kdl");
         std::fs::write(&config,r##"animations { off; }
@@ -95,17 +97,26 @@ layout { background-color "#315b97"; }
 "##)?;
 
         let desktop_log=temp.path().join("desktop.log");
-        let mut desktop=Child(Command::new(desktop)
-            .env("XDG_RUNTIME_DIR",&runtime).env("LIBGL_ALWAYS_SOFTWARE","1")
-            .args(["--headless","--name","capture","--width","640","--height","480","--scale","1","--config"])
-            .arg(config).stdout(Stdio::null()).stderr(std::fs::File::create(&desktop_log)?).spawn()?);
+        let mut desktop=Child(Command::new(&desktop_program)
+            .env("XDG_RUNTIME_DIR",&runtime).env("LIBGL_ALWAYS_SOFTWARE","1").env("RHO_AGENT_ID",agent.encoded())
+            .args(["--headless","--name",&desktop_name,"--width","640","--height","480","--scale","1","--config"])
+            .arg(&config).stdout(Stdio::null()).stderr(std::fs::File::create(&desktop_log)?).spawn()?);
         let deadline=tokio::time::Instant::now()+Duration::from_secs(20);
-        while !runtime.join("rho-desktop/capture.json").exists() {
+        while !desktop_directory.join(format!("{desktop_name}.json")).exists() {
             ensure!(desktop.0.try_wait()?.is_none(),"desktop exited: {}",std::fs::read_to_string(&desktop_log)?);
             ensure!(tokio::time::Instant::now()<deadline,"desktop startup timed out");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let descriptor:serde_json::Value=serde_json::from_slice(&std::fs::read(runtime.join("rho-desktop/capture.json"))?)?;
+        let descriptor:serde_json::Value=serde_json::from_slice(&std::fs::read(desktop_directory.join(format!("{desktop_name}.json")))?)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let S::DesktopSessions { sessions } = read_frame::<_,S>(&mut local).await? {
+                    ensure!(sessions == vec![rho_ui_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
+                    break;
+                }
+            }
+            Ok::<_,anyhow::Error>(())
+        }).await??;
         let mut status=tokio::io::BufReader::new(rho_desktop_proto::local::connect(descriptor["socket"].as_str().unwrap()).await?);
         rho_desktop_proto::local::request(&mut status,rho_desktop_proto::Request::Hello{version:rho_desktop_proto::VERSION}).await?;
         ensure!(desktop_status(&mut status).await?==(false,0,0),"video work exists without subscriber");
@@ -126,7 +137,7 @@ layout { background-color "#315b97"; }
         let transport=mux.session(1)?;
         let (send,recv)=connection.open_bi().await?;
         let mut input=rho_rpc::Stream::new(recv,send);
-        write_frame(&mut input,&C::WaylandOpen {media_id:1,agent:agent.encoded(),session:"capture".into()}).await?;
+        write_frame(&mut input,&C::WaylandOpen {media_id:1,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,S>(&mut input).await?,S::WaylandOpened),"open failed");
         rho_rpc::write_frame(&mut input,&rho_desktop_proto::Input::Quality {bitrate:2_000_000,keyframe:true},65536).await?;
         let origin=rho_desktop_media::media::origin();
@@ -163,7 +174,7 @@ layout { background-color "#315b97"; }
         tokio::time::sleep(Duration::from_millis(900)).await;
         let (send2,recv2)=connection.open_bi().await?;
         let mut input2=rho_rpc::Stream::new(recv2,send2);
-        write_frame(&mut input2,&C::WaylandOpen {media_id:2,agent:agent.encoded(),session:"capture".into()}).await?;
+        write_frame(&mut input2,&C::WaylandOpen {media_id:2,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,S>(&mut input2).await?,S::WaylandOpened),"second viewer open failed");
         let origin2=rho_desktop_media::media::origin();
         let media2=rho_desktop_media::media::subscribe(mux.session(2)?,origin2.clone()).await?;
@@ -204,13 +215,42 @@ layout { background-color "#315b97"; }
         }}
         uni.abort(); bi.abort();
         client.close().await;
+        // A second named desktop is advertised, then excluded after a crash
+        // even though SIGKILL leaves its manifest behind.
+        let mut second = Child(Command::new(&desktop_program)
+            .env("XDG_RUNTIME_DIR", &runtime).env("RHO_AGENT_ID", agent.encoded())
+            .args(["--headless", "--name", "browser", "--width", "128", "--height", "96", "--scale", "1", "--config"])
+            .arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let S::DesktopSessions { sessions } = read_frame::<_, S>(&mut local).await? {
+                    if sessions.len() == 2 {
+                        ensure!(sessions.iter().all(|session| session.agent == agent.encoded()), "wrong owner");
+                        ensure!(sessions.iter().map(|session| session.name.as_str()).collect::<Vec<_>>() == vec!["browser", "preview"], "wrong session names");
+                        break;
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        second.0.kill()?;
+        second.0.wait()?;
+        ensure!(desktop_directory.join("browser.json").exists(), "crash fixture did not leave an advertisement");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let S::DesktopSessions { sessions } = read_frame::<_, S>(&mut local).await? {
+                    if sessions == vec![rho_ui_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }] { break; }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
         if let Some(path) = std::env::var_os("RHO_WAYLAND_TEST_PREVIEW") {
             std::fs::write(path, serde_json::to_vec(&serde_json::json!({
                 "endpoint":endpoint.to_string(),"agent":agent.encoded(),"socket":socket,"runtime":runtime
             }))?)?;
             tokio::signal::ctrl_c().await?;
         }
-        println!("wayland_stream passed: in-process desktop VP9 frame through direct daemon relay; idle/static/unsubscribe counters verified; RPC survived viewer detach");
+        println!("wayland_stream passed: session advertisements and crash cleanup; in-process desktop VP9 frame through direct daemon relay; idle/static/unsubscribe counters verified; RPC survived viewer detach");
         Ok::<(),anyhow::Error>(())
     });
     if result.is_err() {

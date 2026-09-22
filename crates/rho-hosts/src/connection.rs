@@ -99,6 +99,7 @@ impl EventSink {
 }
 
 pub enum ConnEvent {
+    DesktopSessions(Vec<rho_ui_proto::DesktopSession>),
     DeskSynced {
         store: rho_desk::cells::DeviceId,
         node_namespace: u16,
@@ -1299,6 +1300,9 @@ async fn run(
             },
         };
         let event = match message {
+            ServerMessage::DesktopSessions { sessions } => {
+                Some(ConnEvent::DesktopSessions(sessions))
+            }
             ServerMessage::DeskSynced {
                 store,
                 node_namespace,

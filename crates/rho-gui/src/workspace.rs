@@ -576,6 +576,8 @@ pub struct Workspace {
     /// [`crate::overlay::OverlayFocus`].
     overlay_focus: crate::overlay::OverlayFocus,
     desktop: Option<Entity<crate::wayland_view::WaylandView>>,
+    desktop_name: String,
+    desktop_sessions: HashMap<HostId, Vec<rho_ui_proto::DesktopSession>>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -1071,6 +1073,8 @@ impl Workspace {
             menu_buffer: None,
             overlay_focus: crate::overlay::OverlayFocus::default(),
             desktop: None,
+            desktop_name: String::new(),
+            desktop_sessions: HashMap::new(),
             echo: None,
             git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
@@ -2075,6 +2079,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
+            ConnEvent::DesktopSessions(sessions) => {
+                self.desktop_sessions.insert(host, sessions);
+                cx.notify();
+            }
             ConnEvent::DeskSynced {
                 store,
                 node_namespace,
@@ -2324,6 +2332,7 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Disconnected(reason) => {
+                self.desktop_sessions.remove(&host);
                 // A daemon that goes is a daemon that is no longer asking;
                 // the request still has to be answered, or it is left
                 // blocked on a channel nobody will send on.
@@ -6966,7 +6975,7 @@ impl Workspace {
             Command::OpenFile => self.prompt_open_file(window, cx),
             Command::FindNode => self.open_find(window, cx),
             Command::NotesForThis => self.open_notes_for_surface(window, cx),
-            Command::Wayland => self.prompt_wayland(window, cx),
+            Command::Wayland => self.open_desktop(window, cx),
             Command::Shell => self.cmd_shell(window, cx),
             Command::ShellClose => self.cmd_shell_close(window, cx),
             Command::Changes => self.cmd_diff(window, cx),
@@ -7078,58 +7087,112 @@ impl Workspace {
         }
     }
 
-    fn prompt_wayland(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let Some(agent) = workspace.subject_agent_or_notice("Wayland", window, cx) else {
-                    return;
-                };
-                let Some(connection) = workspace.connection_for(agent) else {
-                    return;
-                };
-                let session = if input.trim().is_empty() {
-                    "default".to_owned()
-                } else {
-                    input.trim().to_owned()
-                };
-                let target = workspace.models.get(&agent).cloned();
-                let task = connection.open_wayland_task(agent.encoded(), session, cx);
-                cx.spawn_in(window, async move |this, cx| match task.await {
-                    Ok(viewer) => {
-                        let _ = this.update_in(cx, |this, window, cx| {
-                            this.overlay_focus.capture(window, cx);
-                            this.desktop = Some(cx.new(|cx| {
-                                crate::wayland_view::WaylandView::new(viewer, window, cx)
-                                    .with_target(target)
-                            }));
-                            cx.notify();
-                        });
-                    }
-                    Err(error) => {
-                        let _ = this.update(cx, |this, cx| {
-                            this.notice_on(
-                                None,
-                                &format!("Wayland: {error:#}"),
-                                StyleClass::SystemInfo,
-                                cx,
-                            )
-                        });
-                    }
+    fn open_desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent) = self.subject_agent_or_notice("Desktop", window, cx) else {
+            return;
+        };
+        let sessions = self.available_desktops(agent);
+        if sessions.len() == 1 {
+            self.open_desktop_session(agent, sessions[0].clone(), window, cx);
+            return;
+        }
+        if sessions.is_empty() {
+            self.notice_on(
+                None,
+                "No desktop available; the agent has not started one",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        let complete = std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &App| {
+            workspace
+                .available_desktops(agent)
+                .into_iter()
+                .filter(|name| name.to_lowercase().contains(&input.to_lowercase()))
+                .map(|name| crate::commands::Candidate {
+                    value: name,
+                    description: "available".into(),
                 })
-                .detach();
+                .collect()
+        });
+        let submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let sessions = workspace.available_desktops(agent);
+                let name = if input.is_empty() {
+                    sessions.first().cloned()
+                } else {
+                    sessions.into_iter().find(|name| name == &input)
+                };
+                if let Some(name) = name {
+                    workspace.open_desktop_session(agent, name, window, cx);
+                } else {
+                    workspace.notice_on(
+                        None,
+                        "That desktop is no longer available",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
             },
         );
-        self.open_prompt(
-            "Wayland session (default):",
-            complete,
-            on_submit,
-            window,
-            cx,
-        );
+        self.open_prompt("desktop:", complete, submit, window, cx);
+        self.set_prompt_complete_whole_input();
+    }
+
+    pub(crate) fn available_desktops(&self, agent: AgentId) -> Vec<String> {
+        let owner = agent.encoded();
+        let mut sessions: Vec<_> = self
+            .desktop_sessions
+            .values()
+            .flatten()
+            .filter(|session| session.agent == owner)
+            .map(|session| session.name.clone())
+            .collect();
+        sessions.sort();
+        sessions.dedup();
+        sessions
+    }
+
+    fn open_desktop_session(
+        &mut self,
+        agent: AgentId,
+        session: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = self.connection_for(agent) else {
+            return;
+        };
+        let target = self.models.get(&agent).cloned();
+        let task = connection.open_wayland_task(agent.encoded(), session.clone(), cx);
+        cx.spawn_in(window, async move |this, cx| match task.await {
+            Ok(viewer) => {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.overlay_focus.capture(window, cx);
+                    this.desktop_name = session;
+                    this.desktop = Some(cx.new(|cx| {
+                        crate::wayland_view::WaylandView::new(viewer, window, cx)
+                            .with_target(target)
+                    }));
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice_on(
+                        None,
+                        &format!("Desktop: {error:#}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    )
+                });
+            }
+        })
+        .detach();
     }
 
     /// Prompt for a path to open from the current agent's workspace.
@@ -8766,8 +8829,27 @@ impl Workspace {
                 .text_color(cx.theme().colors().text_accent)
                 .child(format!("{unseen} new"))
         });
+        let desktops = agent_in_view
+            .map(|agent| self.available_desktops(agent).len())
+            .unwrap_or(0);
+        let available = (desktops > 0).then(|| {
+            div()
+                .id("desktop-available")
+                .cursor_pointer()
+                .text_color(cx.theme().colors().text_accent)
+                .child(if desktops == 1 {
+                    "desktop available · SPC w".to_owned()
+                } else {
+                    format!("{desktops} desktops · SPC w")
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.open_desktop(window, cx)))
+        });
         self.status_row(
-            div().child(left).children(state).children(unseen),
+            div()
+                .child(left)
+                .children(state)
+                .children(unseen)
+                .children(available),
             right,
             text_style,
             window,
@@ -9096,7 +9178,10 @@ fn agent_role_label(config: AgentRole) -> String {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(desktop) = self.desktop.clone() {
+            let editor = self.active_editor(cx);
+            let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
             return div()
+                .font_family(text_style.font_family)
                 .size_full()
                 .flex()
                 .flex_col()
@@ -9106,18 +9191,51 @@ impl Render for Workspace {
                     div()
                         .flex()
                         .justify_between()
-                        .p(px(8.))
-                        .child("Agent desktop")
+                        .items_center()
+                        .px(px(8.))
+                        .py(px(3.))
+                        .text_size(px(12.))
+                        .text_color(cx.theme().colors().text_muted)
+                        .child(format!("desktop / {}", self.desktop_name))
                         .child(
                             div()
-                                .id("close-desktop")
-                                .cursor_pointer()
-                                .child("Close desktop")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.desktop = None;
-                                    this.finish_overlay_focus(window, cx);
-                                    cx.notify();
-                                })),
+                                .flex()
+                                .items_center()
+                                .gap(px(12.))
+                                .child(
+                                    div()
+                                        .id("annotate-desktop")
+                                        .p(px(4.))
+                                        .tooltip(ui::Tooltip::text("Toggle drawing mode"))
+                                        .cursor_pointer()
+                                        .child(
+                                            gpui::svg()
+                                                .path("icons/pencil.svg")
+                                                .size(px(14.))
+                                                .text_color(cx.theme().colors().text_muted),
+                                        )
+                                        .on_click({
+                                            let desktop = desktop.clone();
+                                            move |_, window, cx| {
+                                                desktop.update(cx, |view, cx| {
+                                                    view.toggle_annotation(window, cx)
+                                                });
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("close-desktop")
+                                        .px(px(4.))
+                                        .tooltip(ui::Tooltip::text("Return to agent"))
+                                        .cursor_pointer()
+                                        .child("×")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.desktop = None;
+                                            this.finish_overlay_focus(window, cx);
+                                            cx.notify();
+                                        })),
+                                ),
                         ),
                 )
                 .child(div().flex_1().min_h_0().child(desktop))

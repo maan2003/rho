@@ -310,7 +310,7 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
         )
         .item(
             "w",
-            "view Wayland app…",
+            "agent desktop",
             MenuAction::Command(Command::Wayland),
         )
         .item("t", "terminal", MenuAction::Command(Command::Terminal))

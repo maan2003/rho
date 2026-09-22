@@ -12,7 +12,7 @@ Use `rho wayland` to launch and control GUI applications in a headless Wayland s
 Start the application as trailing arguments after `--`:
 
 ```bash
-rho wayland --session gui start -- APPLICATION ARG...
+rho wayland start -- APPLICATION ARG...
 ```
 
 The default output matches a 13-inch MacBook display: 2560×1664 physical
@@ -26,8 +26,13 @@ rho_socket="$XDG_RUNTIME_DIR/rho/rho.sock"
 rho wayland --session gui start -- rho-gui --attach "local=unix:$rho_socket"
 ```
 
-Use distinct session names when operating more than one application. A session
-continues after `start` returns. Always stop it when finished.
+Inside agent commands, desktops are scoped to `RHO_AGENT_ID` and advertised to
+the user's GUI automatically. Use `--session` to name multiple desktops, for
+example `browser` and `preview`; different agents can reuse the same names.
+The user selects the agent and presses `Space w` to choose an available desktop.
+They never need to type a session name. Outside an agent, desktops are local QA
+sessions and are not advertised to a user's agent.
+A desktop continues after `start` returns. Stop temporary QA desktops when done.
 
 ## Observe and interact
 
@@ -82,5 +87,6 @@ For a visual change, capture the relevant state, inspect the screenshot with
 the interaction separately; a screenshot does not prove that input worked.
 
 For live interaction, the user opens the agent's desktop inside their existing
-Rho GUI. Give them the session name; do not ask them to launch another GUI.
+Rho GUI. Tell them to select the agent and press `Space w`; do not give them a session
+name or ask them to launch another GUI.
 Leave the session running when handing it over, and state that it remains open.

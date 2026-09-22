@@ -12079,3 +12079,55 @@ fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppC
         "and what is held of it is said, so the daemon sends only the rest: {held:?}"
     );
 }
+
+#[gpui::test]
+fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let sessions = [
+                (agent(1), "preview"),
+                (agent(2), "other"),
+                (agent(1), "browser"),
+            ]
+            .into_iter()
+            .map(|(agent, name)| rho_ui_proto::DesktopSession {
+                agent: agent.encoded(),
+                name: name.into(),
+            })
+            .collect();
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::DesktopSessions(sessions),
+                window,
+                cx,
+            );
+            assert_eq!(
+                workspace.available_desktops(agent(1)),
+                ["browser", "preview"]
+            );
+            assert_eq!(workspace.available_desktops(agent(2)), ["other"]);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::DesktopSessions(vec![rho_ui_proto::DesktopSession {
+                    agent: agent(1).encoded(),
+                    name: "preview".into(),
+                }]),
+                window,
+                cx,
+            );
+            assert_eq!(workspace.available_desktops(agent(1)), ["preview"]);
+            assert!(workspace.available_desktops(agent(2)).is_empty());
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::Disconnected("test".into()),
+                window,
+                cx,
+            );
+            assert!(workspace.available_desktops(agent(1)).is_empty());
+        })
+        .unwrap();
+}

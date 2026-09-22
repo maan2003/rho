@@ -982,7 +982,11 @@ Desktop processes and their applications run with the invoking user's authority;
 they are not a sandbox. Session descriptors live in private `XDG_RUNTIME_DIR`
 directories. Desktop control and MoQ listeners use Linux abstract Unix sockets
 and reject peers whose kernel-reported UID differs from the desktop process.
-The worker resolves a session name in the agent's filesystem view; the daemon
+Advertisements contain the owning agent ID and session name and live under
+`rho-desktop/agents/<agent>/` in that runtime directory. Workers list live
+advertisements without opening a media subscription. Advertisements are
+same-user metadata, not an authentication boundary.
+The worker resolves a selected session within that agent's directory; the daemon
 connects to that endpoint directly. No unauthenticated network desktop listener
 is exposed.
 

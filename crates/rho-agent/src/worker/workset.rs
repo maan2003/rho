@@ -21,8 +21,10 @@ pub enum Action {
         agent: rho_core::AgentId,
     },
     Desktop {
+        agent: rho_core::AgentId,
         session: String,
     },
+    DesktopList,
 }
 
 #[derive(Encode, Decode)]
@@ -48,6 +50,7 @@ pub enum Reply {
     Shells(Vec<rho_ui_proto::shell::ShellInfo>),
     Error(String),
     Desktop { socket: String },
+    DesktopSessions(Vec<rho_ui_proto::DesktopSession>),
 }
 
 #[derive(Encode, Decode)]
@@ -139,7 +142,7 @@ pub(super) struct Execution {
 impl Execution {
     pub async fn action(&self, action: Action) -> anyhow::Result<Reply> {
         Ok(match action {
-            Action::Desktop { session } => {
+            Action::Desktop { agent, session } => {
                 anyhow::ensure!(
                     !session.is_empty()
                         && session
@@ -152,10 +155,12 @@ impl Execution {
                 let descriptor: serde_json::Value = serde_json::from_slice(
                     &tokio::fs::read(
                         std::path::PathBuf::from(runtime)
-                            .join("rho-desktop")
+                            .join("rho-desktop/agents")
+                            .join(agent.encoded())
                             .join(format!("{session}.json")),
                     )
-                    .await?,
+                    .await
+                    .context("No desktop is running for this agent; ask the agent to open an application")?,
                 )?;
                 Reply::Desktop {
                     socket: descriptor["socket"]
@@ -164,6 +169,7 @@ impl Execution {
                         .to_owned(),
                 }
             }
+            Action::DesktopList => Reply::DesktopSessions(desktop_sessions().await?),
             Action::TerminalList => Reply::Terminals(
                 self.terminals
                     .list()
@@ -423,4 +429,78 @@ async fn serve_shell(
         Ok::<(), anyhow::Error>(())
     };
     tokio::select! { result = output => result, result = input => result }
+}
+
+// Advertisements are ephemeral: starting a desktop atomically publishes one,
+// orderly stop removes it, and the lifetime lock excludes leftovers after a
+// crash.
+async fn desktop_sessions() -> anyhow::Result<Vec<rho_ui_proto::DesktopSession>> {
+    let mut sessions = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return Ok(sessions);
+        };
+        let root = std::path::PathBuf::from(runtime).join("rho-desktop/agents");
+        let mut agents = match tokio::fs::read_dir(root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(sessions),
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(agent) = agents.next_entry().await? {
+            if !agent.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut entries = match tokio::fs::read_dir(agent.path()).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                if entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "json")
+                {
+                    continue;
+                }
+                let Ok(bytes) = tokio::fs::read(entry.path()).await else {
+                    continue;
+                };
+                let Ok(advertisement) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                let (Some(owner), Some(name), Some(_socket)) = (
+                    advertisement["agent"].as_str(),
+                    advertisement["name"].as_str(),
+                    advertisement["socket"].as_str(),
+                ) else {
+                    continue;
+                };
+                if agent.file_name() != owner
+                    || entry.file_name() != format!("{name}.json").as_str()
+                {
+                    continue;
+                }
+                // The compositor holds this lock from before publishing until
+                // shutdown. Checking it cannot block on a full socket backlog.
+                use std::os::fd::AsRawFd;
+                let Ok(lock) = tokio::fs::File::open(entry.path().with_extension("lock")).await
+                else {
+                    continue;
+                };
+                if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+                {
+                    sessions.push(rho_ui_proto::DesktopSession {
+                        agent: owner.to_owned(),
+                        name: name.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    sessions.sort();
+    sessions.dedup();
+    Ok(sessions)
 }

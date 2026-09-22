@@ -1384,6 +1384,44 @@ where
         }
     });
 
+    // Reconcile ephemeral advertisements in workset namespaces. Only changes
+    // cross the authenticated GUI stream; discovery never starts an encoder.
+    let desktop_task = matches!(&first, ClientMessage::Subscribe).then(|| {
+        let services = services.clone();
+        let outgoing = outgoing_tx.clone();
+        tokio::spawn(async move {
+            let mut previous = Vec::new();
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = outgoing.closed() => break,
+                    _ = timer.tick() => {}
+                }
+                let mut sessions = Vec::new();
+                for process in services.pool.executions().await {
+                    match process.action(rho_agent::WorksetAction::DesktopList).await {
+                        Ok(rho_agent::WorksetReply::DesktopSessions(entries)) => {
+                            sessions.extend(entries)
+                        }
+                        Ok(_) => tracing::warn!("unexpected desktop discovery reply"),
+                        Err(error) => tracing::debug!(%error, "desktop discovery unavailable"),
+                    }
+                }
+                sessions.sort();
+                sessions.dedup();
+                if sessions != previous {
+                    previous = sessions.clone();
+                    if outgoing
+                        .send(ServerMessage::DesktopSessions { sessions })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+    });
+
     let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
     let mut first = Some(first);
     let result = loop {
@@ -1473,6 +1511,9 @@ where
         }
     }
     events_task.abort();
+    if let Some(task) = desktop_task {
+        task.abort();
+    }
     if let Some(log_follow) = log_follow {
         log_follow.abort();
     }
@@ -4337,7 +4378,10 @@ where
         #[cfg(target_os = "linux")]
         {
             let rho_agent::WorksetReply::Desktop { socket } = process
-                .action(rho_agent::WorksetAction::Desktop { session: name })
+                .action(rho_agent::WorksetAction::Desktop {
+                    agent,
+                    session: name,
+                })
                 .await?
             else {
                 anyhow::bail!("unexpected desktop discovery reply");
