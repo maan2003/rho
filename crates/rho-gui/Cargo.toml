@@ -20,6 +20,7 @@ bench-support = []
 walk-support = ["gpui/test-support", "dep:gpui_wgpu"]
 
 [dependencies]
+rho-desktop-proto.workspace = true
 anyhow.workspace = true
 assets = { path = "../../vendor/zed/crates/assets" }
 base64.workspace = true

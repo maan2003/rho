@@ -180,7 +180,36 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
+    pub fn mime_types(&self) -> Vec<String> {
+        let mut types = Vec::new();
+        if let Some(contents) = &self.contents {
+            if contents.text().is_some() {
+                types.extend(TEXT_MIME_TYPES.map(str::to_owned));
+            }
+            for entry in &contents.entries {
+                if let ClipboardEntry::Image(image) = entry {
+                    types.push(image.format.mime_type().to_owned());
+                }
+            }
+        }
+        types
+    }
+
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        if let Some(contents) = &self.contents {
+            for entry in &contents.entries {
+                if let ClipboardEntry::Image(image) = entry {
+                    if image.format.mime_type() == mime_type {
+                        self.send_bytes(fd, image.bytes.clone());
+                        return;
+                    }
+                }
+            }
+        }
+        if !TEXT_MIME_TYPES.contains(&mime_type.as_str()) {
+            return;
+        }
+
         if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
             self.send_bytes(fd, text.as_bytes().to_owned());
         }

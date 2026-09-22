@@ -11,7 +11,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+moq-net.workspace = true
+rho-desktop-proto.workspace = true
 anyhow.workspace = true
+bytes.workspace = true
 octo-types = { workspace = true }
 senax-encoder = { workspace = true }
 camino.workspace = true
@@ -36,3 +41,7 @@ test-support = []
 [dev-dependencies]
 rho-core = { workspace = true }
 tempfile = { workspace = true }
+
+[dependencies.rho-desktop-media]
+workspace = true
+features = ["decoder", "iroh"]

@@ -133,3 +133,5 @@ impl HostSink for DroppedSink {
         false
     }
 }
+
+pub mod wayland;

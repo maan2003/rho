@@ -511,7 +511,10 @@ impl AsyncWrite for Stream {
 pub enum Dialer {
     #[cfg(unix)]
     Unix(std::path::PathBuf),
-    Iroh(iroh::endpoint::Connection),
+    Iroh {
+        connection: iroh::endpoint::Connection,
+        media: moq_tokio::shared_iroh::Mux,
+    },
 }
 
 impl Dialer {
@@ -519,7 +522,7 @@ impl Dialer {
         match self {
             #[cfg(unix)]
             Self::Unix(path) => connect_unix(path).await,
-            Self::Iroh(connection) => {
+            Self::Iroh { connection, .. } => {
                 let (send, recv) = connection.open_bi().await.context("open iroh stream")?;
                 if let Some(priority) = priority {
                     send.set_priority(priority)
@@ -960,4 +963,31 @@ mod tests {
             .unwrap();
         assert_eq!(read, 0);
     }
+}
+
+/// Stream-scoped media routing on the existing authenticated connection.
+pub use moq_tokio::shared_iroh as media;
+
+/// Route a media stream or return an ordinary compressed application stream.
+/// Authentication must finish before this function is called.
+pub async fn accept_iroh_stream(
+    media: &media::Mux,
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> anyhow::Result<Option<(Reader, iroh::endpoint::SendStream)>> {
+    tokio::time::timeout(PREFACE_TIMEOUT, async {
+        let mut prefix = [0; 1];
+        recv.read_exact(&mut prefix).await?;
+        if prefix[0] == media::PREFIX {
+            media.route_bi(send, recv).await?;
+            return Ok(None);
+        }
+        anyhow::ensure!(prefix[0] == 0x28, "invalid RPC stream prefix");
+        Ok(Some((
+            Reader::new(std::io::Cursor::new(prefix).chain(recv)),
+            send,
+        )))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("application stream preface timed out"))?
 }

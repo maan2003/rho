@@ -20,6 +20,7 @@ server = [
 ]
 
 [dependencies]
+moq-tokio = { workspace = true, features = ["shared-iroh"] }
 anyhow.workspace = true
 async-compression.workspace = true
 iroh.workspace = true

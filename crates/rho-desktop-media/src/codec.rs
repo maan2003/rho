@@ -1,0 +1,207 @@
+//! VP9 Profile 1, full-resolution color, with no encoder lookahead.
+use anyhow::{Result, ensure};
+use shiguredo_libvpx as vpx;
+
+pub const MAX_PIXELS: usize = 4096 * 4096;
+
+#[cfg(feature = "encoder")]
+pub struct Encoder {
+    inner: vpx::Encoder,
+    size: (usize, usize),
+    planes: [Vec<u8>; 3],
+}
+
+#[cfg(feature = "encoder")]
+pub struct Packet {
+    pub keyframe: bool,
+    pub data: Vec<u8>,
+}
+
+#[cfg(feature = "encoder")]
+impl Encoder {
+    pub fn new(width: usize, height: usize, bitrate: usize) -> Result<Self> {
+        ensure!(
+            width > 0 && height > 0 && width.checked_mul(height).is_some_and(|n| n <= MAX_PIXELS),
+            "invalid video dimensions"
+        );
+        let mut config = vpx::EncoderConfig::new(
+            width,
+            height,
+            vpx::ImageFormat::I444,
+            vpx::CodecConfig::Vp9(vpx::Vp9Config {
+                profile: vpx::Vp9Profile::Profile1,
+                tune_content: Some(vpx::ContentType::Screen),
+                row_mt: true,
+                ..Default::default()
+            }),
+        );
+        config.target_bitrate = bitrate;
+        config.deadline = vpx::EncodingDeadline::Realtime;
+        config.rate_control = vpx::RateControlMode::Cbr;
+        config.cpu_used = Some(7);
+        config.threads = std::num::NonZeroUsize::new(2);
+        config.error_resilient = true;
+        config.max_quantizer = 40;
+        Ok(Self {
+            inner: vpx::Encoder::new(config)?,
+            size: (width, height),
+            planes: std::array::from_fn(|_| vec![0; width * height]),
+        })
+    }
+
+    pub fn encode(&mut self, bgra: &[u8], keyframe: bool) -> Result<Vec<Packet>> {
+        ensure!(
+            bgra.len() == self.size.0 * self.size.1 * 4,
+            "invalid BGRA frame length"
+        );
+        let [y, u, v] = &mut self.planes;
+        let mut planar = yuv::YuvPlanarImageMut {
+            y_plane: yuv::BufferStoreMut::Borrowed(y),
+            y_stride: self.size.0 as u32,
+            u_plane: yuv::BufferStoreMut::Borrowed(u),
+            u_stride: self.size.0 as u32,
+            v_plane: yuv::BufferStoreMut::Borrowed(v),
+            v_stride: self.size.0 as u32,
+            width: self.size.0 as u32,
+            height: self.size.1 as u32,
+        };
+        yuv::bgra_to_yuv444(
+            &mut planar,
+            bgra,
+            self.size.0 as u32 * 4,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )?;
+        self.inner.encode(
+            &vpx::ImageData::I444 {
+                y: &self.planes[0],
+                u: &self.planes[1],
+                v: &self.planes[2],
+            },
+            &vpx::EncodeOptions {
+                force_keyframe: keyframe,
+            },
+        )?;
+        let mut packets = Vec::new();
+        while let Some(frame) = self.inner.next_frame() {
+            packets.push(Packet {
+                keyframe: frame.is_keyframe(),
+                data: frame.data().to_vec(),
+            });
+        }
+        Ok(packets)
+    }
+
+    pub fn quality(&mut self, bitrate: usize, settled: bool) -> Result<()> {
+        let mut params = vpx::ReconfigureParams::default();
+        params.target_bitrate = Some(bitrate);
+        params.max_quantizer = Some(if settled { 12 } else { 40 });
+        self.inner.reconfigure(&params)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "decoder")]
+pub struct Decoder(vpx::Decoder);
+
+pub struct Image {
+    pub width: usize,
+    pub height: usize,
+    pub bgra: Vec<u8>,
+}
+
+#[cfg(feature = "decoder")]
+impl Decoder {
+    pub fn new() -> Result<Self> {
+        let mut config = vpx::DecoderConfig::new(vpx::DecoderCodec::Vp9);
+        config.threads = 2;
+        Ok(Self(vpx::Decoder::new(config)?))
+    }
+
+    pub fn decode(&mut self, data: &[u8]) -> Result<Option<Image>> {
+        ensure!(data.len() <= 16 * 1024 * 1024, "video packet too large");
+        self.0.decode(data)?;
+        let mut image = None;
+        while let Some(frame) = self.0.next_frame()? {
+            let (width, height) = (frame.width(), frame.height());
+            ensure!(
+                width > 0
+                    && height > 0
+                    && width.checked_mul(height).is_some_and(|n| n <= MAX_PIXELS),
+                "invalid decoded dimensions"
+            );
+            ensure!(
+                !frame.is_high_depth() && frame.chroma_shift() == (0, 0),
+                "expected VP9 8-bit 4:4:4"
+            );
+            let mut bgra = vec![0; width * height * 4];
+            let planar = yuv::YuvPlanarImage {
+                y_plane: frame.y_plane(),
+                y_stride: frame.y_stride() as u32,
+                u_plane: frame.u_plane(),
+                u_stride: frame.u_stride() as u32,
+                v_plane: frame.v_plane(),
+                v_stride: frame.v_stride() as u32,
+                width: width as u32,
+                height: height as u32,
+            };
+            yuv::yuv444_to_bgra(
+                &planar,
+                &mut bgra,
+                width as u32 * 4,
+                yuv::YuvRange::Full,
+                yuv::YuvStandardMatrix::Bt601,
+            )?;
+            image = Some(Image {
+                width,
+                height,
+                bgra,
+            });
+        }
+        Ok(image)
+    }
+}
+
+#[cfg(all(test, feature = "encoder", feature = "decoder"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_one_preserves_color_in_bottom_half_and_predicts_frames() -> Result<()> {
+        // Odd dimensions and alternating colored columns expose stride and
+        // chroma-subsampling mistakes; different top/bottom halves expose a
+        // decoder that returns only half of the chroma plane.
+        let (w, h) = (65, 47);
+        let mut pixels = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                pixels.extend_from_slice(if y < 23 {
+                    if x % 2 == 0 {
+                        &[20, 30, 220, 255]
+                    } else {
+                        &[200, 180, 10, 255]
+                    }
+                } else if x % 2 == 0 {
+                    &[210, 25, 40, 255]
+                } else {
+                    &[15, 220, 160, 255]
+                });
+            }
+        }
+        let mut encoder = Encoder::new(w, h, 8_000_000)?;
+        encoder.quality(8_000_000, true)?;
+        let mut decoder = Decoder::new()?;
+        for force in [true, false, true] {
+            let packets = encoder.encode(&pixels, force)?;
+            assert_eq!(packets.len(), 1);
+            assert_eq!(packets[0].keyframe, force);
+            let image = decoder.decode(&packets[0].data)?.unwrap();
+            assert_eq!((image.width, image.height), (w, h));
+            for (got, want) in image.bgra.iter().zip(&pixels) {
+                assert!((*got as i16 - *want as i16).abs() <= 18, "{got} != {want}");
+            }
+        }
+        Ok(())
+    }
+}

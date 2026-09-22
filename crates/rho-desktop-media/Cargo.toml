@@ -1,0 +1,25 @@
+[package]
+name = "rho-desktop-media"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+encoder = ["dep:shiguredo_libvpx", "dep:yuv"]
+decoder = ["dep:shiguredo_libvpx", "dep:yuv"]
+iroh = ["moq-tokio/shared-iroh"]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "io-util", "net", "time", "macros"] }
+moq-net = { path = "../../vendor/moq/rs/moq-net" }
+moq-tokio = { path = "../../vendor/moq/rs/moq-tokio", default-features = false }
+qmux = { version = "0.5.1", default-features = false, features = ["tcp"] }
+shiguredo_libvpx = { path = "../../vendor/libvpx-rs", optional = true }
+yuv = { version = "0.8.19", optional = true }
+
+[dev-dependencies]
+rho-rpc = { path = "../rho-rpc" }
+iroh = { workspace = true }

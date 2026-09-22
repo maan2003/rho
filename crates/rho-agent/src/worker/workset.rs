@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot};
 
@@ -18,6 +19,9 @@ pub enum Action {
     },
     ShellClose {
         agent: rho_core::AgentId,
+    },
+    Desktop {
+        session: String,
     },
 }
 
@@ -43,6 +47,7 @@ pub enum Reply {
     Terminals(Vec<rho_ui_proto::term::TerminalInfo>),
     Shells(Vec<rho_ui_proto::shell::ShellInfo>),
     Error(String),
+    Desktop { socket: String },
 }
 
 #[derive(Encode, Decode)]
@@ -134,6 +139,31 @@ pub(super) struct Execution {
 impl Execution {
     pub async fn action(&self, action: Action) -> anyhow::Result<Reply> {
         Ok(match action {
+            Action::Desktop { session } => {
+                anyhow::ensure!(
+                    !session.is_empty()
+                        && session
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                    "invalid desktop session name"
+                );
+                let runtime =
+                    std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is required")?;
+                let descriptor: serde_json::Value = serde_json::from_slice(
+                    &tokio::fs::read(
+                        std::path::PathBuf::from(runtime)
+                            .join("rho-desktop")
+                            .join(format!("{session}.json")),
+                    )
+                    .await?,
+                )?;
+                Reply::Desktop {
+                    socket: descriptor["socket"]
+                        .as_str()
+                        .context("desktop descriptor missing socket")?
+                        .to_owned(),
+                }
+            }
             Action::TerminalList => Reply::Terminals(
                 self.terminals
                     .list()

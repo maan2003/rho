@@ -17,6 +17,8 @@ members = [
   "crates/rho-context-config",
   "crates/rho-core",
   "crates/rho-daemon",
+  "crates/rho-desktop-proto",
+  "crates/rho-desktop-media",
   "crates/rho-db",
   "crates/rho-desk",
   "crates/rho-fake-model",
@@ -58,6 +60,8 @@ members = [
 ]
 exclude = [
   "vendor/brush",
+  "vendor/moq",
+  "vendor/libvpx-rs",
   "vendor/noq",
   "vendor/zed",
 ]
@@ -143,6 +147,12 @@ rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-python = { path = "crates/rho-python" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-hosts = { path = "crates/rho-hosts" }
+rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }
+rho-desktop-media = { path = "crates/rho-desktop-media" }
+moq-net = { path = "vendor/moq/rs/moq-net" }
+moq-tokio = { path = "vendor/moq/rs/moq-tokio", default-features = false }
+shiguredo_libvpx = { path = "vendor/libvpx-rs" }
+web-transport-iroh = "0.7"
 rho-window = { path = "crates/rho-window" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }
@@ -229,3 +239,6 @@ redb = { path = "vendor/redb" }
 # Upstream fix for integer comparison ambiguity exposed by RustPython/malachite.
 redb-derive = { git = "https://github.com/cberner/redb", rev = "32f8a1368f766fee33042a7f88abe3173d529ffe" }
 tree-sitter-language = { path = "vendor/tree-sitter-language" }
+
+# Share MoQ model primitives with its Iroh transport.
+kio = { path = "vendor/moq/rs/kio" }

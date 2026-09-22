@@ -13,6 +13,7 @@ keywords = ["quic", "http3", "webtransport", "media", "live"]
 categories = ["multimedia", "network-programming", "web-programming"]
 
 [features]
+shared-iroh = ["dep:web-transport-iroh"]
 default = ["noq", "aws-lc-rs", "websocket", "tcp", "uds"]
 noq = ["_transport", "_certs", "dep:web-transport-noq", "dep:reqwest", "watch", "dep:dns-lookup"]
 # Server-side certificate handling: chains loaded from disk, self-signed generation,

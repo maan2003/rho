@@ -119,12 +119,14 @@ pub enum DecoderCodec {
 pub struct DecoderConfig {
     /// デコードするコーデック
     pub codec: DecoderCodec,
+    /// デコードに使用するスレッド数
+    pub threads: u32,
 }
 
 impl DecoderConfig {
     /// 指定したコーデックでデコーダー設定を生成する
     pub fn new(codec: DecoderCodec) -> Self {
-        Self { codec }
+        Self { codec, threads: 1 }
     }
 }
 
@@ -142,18 +144,23 @@ impl Decoder {
                 DecoderCodec::Vp8 => sys::vpx_codec_vp8_dx(),
                 DecoderCodec::Vp9 => sys::vpx_codec_vp9_dx(),
             };
-            Self::init(iface)
+            Self::init(iface, config.threads)
         }
     }
 
-    fn init(iface: *const sys::vpx_codec_iface) -> Result<Self, Error> {
+    fn init(iface: *const sys::vpx_codec_iface, threads: u32) -> Result<Self, Error> {
         let mut ctx = MaybeUninit::<sys::vpx_codec_ctx>::zeroed();
         unsafe {
+            let cfg = sys::vpx_codec_dec_cfg_t {
+                threads,
+                w: 0,
+                h: 0,
+            };
             let code = sys::vpx_codec_dec_init_ver(
                 ctx.as_mut_ptr(),
                 iface,
-                std::ptr::null(), // cfg
-                0,                // flags
+                &cfg,
+                0, // flags
                 sys::VPX_DECODER_ABI_VERSION as i32,
             );
             let ctx = ctx.assume_init();
@@ -229,10 +236,12 @@ impl Decoder {
             }
             let image = &*image;
 
-            // デコーダーは I420 または 16-bit I420 のみ対応
+            // 画面共有用の I444 と既存の I420 を受け入れる
             if !matches!(
                 image.fmt,
-                sys::vpx_img_fmt_VPX_IMG_FMT_I420 | sys::vpx_img_fmt_VPX_IMG_FMT_I42016
+                sys::vpx_img_fmt_VPX_IMG_FMT_I420
+                    | sys::vpx_img_fmt_VPX_IMG_FMT_I42016
+                    | sys::vpx_img_fmt_VPX_IMG_FMT_I444
             ) {
                 self.iter = std::ptr::null();
                 return Err(Error::with_reason(
@@ -279,6 +288,11 @@ impl DecodedFrame<'_> {
         self.0.fmt == sys::vpx_img_fmt_VPX_IMG_FMT_I42016
     }
 
+    /// クロマの水平・垂直縮小シフトを返す
+    pub fn chroma_shift(&self) -> (u32, u32) {
+        (self.0.x_chroma_shift, self.0.y_chroma_shift)
+    }
+
     /// フレームの Y 成分のデータを返す
     pub fn y_plane(&self) -> &[u8] {
         unsafe {
@@ -291,7 +305,7 @@ impl DecodedFrame<'_> {
         unsafe {
             std::slice::from_raw_parts(
                 self.0.planes[1],
-                self.0.d_h.div_ceil(2) as usize * self.u_stride(),
+                self.0.d_h.div_ceil(1 << self.0.y_chroma_shift) as usize * self.u_stride(),
             )
         }
     }
@@ -301,7 +315,7 @@ impl DecodedFrame<'_> {
         unsafe {
             std::slice::from_raw_parts(
                 self.0.planes[2],
-                self.0.d_h.div_ceil(2) as usize * self.v_stride(),
+                self.0.d_h.div_ceil(1 << self.0.y_chroma_shift) as usize * self.v_stride(),
             )
         }
     }
@@ -608,6 +622,8 @@ pub enum Vp9Profile {
     /// Profile 0 (8-bit 4:2:0)
     #[default]
     Profile0,
+    /// Profile 1 (8-bit 4:4:4 / 4:2:2)
+    Profile1,
     /// Profile 2 (10/12-bit 4:2:0)
     Profile2,
 }
@@ -951,6 +967,7 @@ impl Encoder {
         if let CodecConfig::Vp9(vp9_config) = &encoder_config.codec {
             vpx_config.g_profile = match vp9_config.profile {
                 Vp9Profile::Profile0 => 0,
+                Vp9Profile::Profile1 => 1,
                 Vp9Profile::Profile2 => 2,
             };
         }
@@ -970,6 +987,8 @@ impl Encoder {
         // 上の上限検査で cq_level <= 63 が保証されるため c_uint に必ず収まる
         let cq_level = encoder_config.cq_level as c_uint;
 
+        // None は先読みを無効にする。libvpx の既定値を残さない。
+        vpx_config.g_lag_in_frames = 0;
         if let Some(lag) = encoder_config.lag_in_frames {
             vpx_config.g_lag_in_frames = c_uint::try_from(lag.get())
                 .map_err(|_| invalid_param(FUNCTION, "lag_in_frames is out of range"))?;

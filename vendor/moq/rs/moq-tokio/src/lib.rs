@@ -103,3 +103,7 @@ pub mod mdns;
 pub fn qlog_supported() -> bool {
 	cfg!(feature = "qlog")
 }
+
+/// Stream-scoped sessions on an application-owned Iroh connection.
+#[cfg(feature = "shared-iroh")]
+pub mod shared_iroh;

@@ -674,6 +674,25 @@ impl DiffClient {
 }
 
 impl Connection {
+    pub fn open_wayland_task(
+        &self,
+        agent: String,
+        session: String,
+        cx: &App,
+    ) -> Task<anyhow::Result<crate::wayland::Viewer>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        let task = Tokio::spawn(cx, async move {
+            let Some(ChannelDialer::Iroh { connection, media }) = dialer else {
+                anyhow::bail!("the live Wayland viewer requires an Iroh host");
+            };
+            open_wayland_stream(connection, media, agent, session).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("Wayland task failed: {error}"))?
+        })
+    }
+
     pub fn upload_gui_telemetry_task(
         &self,
         snapshot: Vec<u8>,
@@ -1169,7 +1188,15 @@ async fn run(
         } => {
             let (stream, connection, endpoint) =
                 connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?;
-            *dialer.lock().unwrap() = Some(ChannelDialer::Iroh(connection.clone()));
+            let media = rho_rpc::media::Mux::new(connection.clone());
+            let uni = media.clone();
+            tokio::spawn(async move { uni.receive_uni().await });
+            let bi = media.clone();
+            tokio::spawn(async move { bi.receive_bi().await });
+            *dialer.lock().unwrap() = Some(ChannelDialer::Iroh {
+                connection: connection.clone(),
+                media,
+            });
             (stream, Some(connection), Some(endpoint))
         }
     };
@@ -1432,7 +1459,8 @@ async fn run(
             | ServerMessage::RealtimeOpened { .. }
             | ServerMessage::RealtimeRefused { .. }
             | ServerMessage::VisualizationContent { .. }
-            | ServerMessage::VisualizationRefused { .. } => None,
+            | ServerMessage::VisualizationRefused { .. }
+            | ServerMessage::WaylandOpened => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
@@ -2343,4 +2371,35 @@ mod tests {
                 assert!(received.is_empty());
             });
     }
+}
+
+async fn open_wayland_stream(
+    connection: iroh::endpoint::Connection,
+    media: rho_rpc::media::Mux,
+    agent: String,
+    session: String,
+) -> anyhow::Result<crate::wayland::Viewer> {
+    static NEXT_MEDIA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_MEDIA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let transport = media.session(id)?;
+    let (send, recv) = connection.open_bi().await?;
+    send.set_priority(100)?;
+    let mut stream = rho_rpc::Stream::new(recv, send);
+    write_frame(
+        &mut stream,
+        &ClientMessage::WaylandOpen {
+            media_id: id,
+            agent,
+            session,
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        matches!(
+            read_frame::<_, ServerMessage>(&mut stream).await?,
+            ServerMessage::WaylandOpened
+        ),
+        "Wayland open refused"
+    );
+    crate::wayland::open(transport, stream).await
 }

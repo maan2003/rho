@@ -751,3 +751,32 @@ providers.
 `rho-agent` is the canonical owner of the in-memory transcript during an agent
 run and decides when to persist blocks. Inference crates may derive requests from
 the transcript but should not mutate it directly.
+
+## Agent desktop
+
+`rho-agent-desktop` is a separate Linux compositor executable and hard fork of
+niri, maintained in `maan2003/niri` on `rho/agent-desktop`. Rho owns the lightweight
+`rho-desktop-proto` wire contract and `rho-desktop-media` transport/optional codec
+crate. The desktop pins these crates by Git revision; neither the daemon nor the
+worker owns or launches an encoder.
+
+The workset worker resolves a named desktop to its abstract Unix socket. The
+daemon connects directly to that desktop for control and MoQ over QMux; no media
+passes through the worker's agent-service connection. Abstract sockets cross the
+workset's filesystem namespace while retaining kernel peer credentials. The
+daemon relays MoQ origins to the GUI over independent QUIC streams on the GUI's
+existing authenticated Iroh connection. Media stream/session teardown never
+closes that connection.
+
+The compositor owns damage-driven composition and a subscription-owned VP9
+Profile 1 encoder thread. Groups start with keyframes; dependent frames stay in
+their group. Static output gets a bounded quality-refinement frame, then idles.
+No video subscriber means no video composition or encoder. Lossless requested
+screenshots remain independent. The client decodes/converts pixels off the UI
+thread, coalesces decoded images, and retains compressed-frame dependency order.
+
+`rho wayland` forwards to `rho-agent-desktop wayland`. The GUI's desktop window
+sends input to the compositor's normal input path. Annotation freezes the
+presented image locally; strokes can be copied as a PNG or added to the selected
+agent's existing prompt-image attachments. The compositor has no annotation
+objects.

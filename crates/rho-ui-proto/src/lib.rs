@@ -429,6 +429,12 @@ pub enum ClientMessage {
         commit_id: String,
         paths: Vec<Utf8PathBuf>,
     },
+    /// Attach one live application over MoQ streams on this connection.
+    WaylandOpen {
+        media_id: u64,
+        agent: String,
+        session: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -758,6 +764,7 @@ pub enum ServerMessage {
     DiffBaseContents {
         contents: Vec<WorkspaceDiffBaseContent>,
     },
+    WaylandOpened,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

@@ -240,6 +240,7 @@
           pkgs.libgbm
           pkgs.libglvnd
           pkgs.libva
+          pkgs.libvpx
           pkgs.libxkbcommon
           pkgs.openssl
           pkgs.vulkan-loader

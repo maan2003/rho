@@ -575,6 +575,7 @@ pub struct Workspace {
     /// keyboard focus never changes dashboard/work mode: see
     /// [`crate::overlay::OverlayFocus`].
     overlay_focus: crate::overlay::OverlayFocus,
+    desktop: Option<Entity<crate::wayland_view::WaylandView>>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -1069,6 +1070,7 @@ impl Workspace {
             transient_focus: cx.focus_handle(),
             menu_buffer: None,
             overlay_focus: crate::overlay::OverlayFocus::default(),
+            desktop: None,
             echo: None,
             git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
@@ -6964,6 +6966,7 @@ impl Workspace {
             Command::OpenFile => self.prompt_open_file(window, cx),
             Command::FindNode => self.open_find(window, cx),
             Command::NotesForThis => self.open_notes_for_surface(window, cx),
+            Command::Wayland => self.prompt_wayland(window, cx),
             Command::Shell => self.cmd_shell(window, cx),
             Command::ShellClose => self.cmd_shell_close(window, cx),
             Command::Changes => self.cmd_diff(window, cx),
@@ -7054,7 +7057,10 @@ impl Workspace {
     }
 
     fn has_modal_overlay(&self) -> bool {
-        self.minibuffer.is_some() || self.menu_buffer.is_some() || self.git_approval.waiting()
+        self.desktop.is_some()
+            || self.minibuffer.is_some()
+            || self.menu_buffer.is_some()
+            || self.git_approval.waiting()
     }
 
     /// Captures normal focus on the first overlay in a chain. Replacements
@@ -7070,6 +7076,60 @@ impl Workspace {
             }
             None => self.focus_active_surface(window, cx),
         }
+    }
+
+    fn prompt_wayland(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let Some(agent) = workspace.subject_agent_or_notice("Wayland", window, cx) else {
+                    return;
+                };
+                let Some(connection) = workspace.connection_for(agent) else {
+                    return;
+                };
+                let session = if input.trim().is_empty() {
+                    "default".to_owned()
+                } else {
+                    input.trim().to_owned()
+                };
+                let target = workspace.models.get(&agent).cloned();
+                let task = connection.open_wayland_task(agent.encoded(), session, cx);
+                cx.spawn_in(window, async move |this, cx| match task.await {
+                    Ok(viewer) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.overlay_focus.capture(window, cx);
+                            this.desktop = Some(cx.new(|cx| {
+                                crate::wayland_view::WaylandView::new(viewer, window, cx)
+                                    .with_target(target)
+                            }));
+                            cx.notify();
+                        });
+                    }
+                    Err(error) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.notice_on(
+                                None,
+                                &format!("Wayland: {error:#}"),
+                                StyleClass::SystemInfo,
+                                cx,
+                            )
+                        });
+                    }
+                })
+                .detach();
+            },
+        );
+        self.open_prompt(
+            "Wayland session (default):",
+            complete,
+            on_submit,
+            window,
+            cx,
+        );
     }
 
     /// Prompt for a path to open from the current agent's workspace.
@@ -9035,6 +9095,34 @@ fn agent_role_label(config: AgentRole) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(desktop) = self.desktop.clone() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(cx.theme().colors().editor_background)
+                .text_color(cx.theme().colors().text)
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .p(px(8.))
+                        .child("Agent desktop")
+                        .child(
+                            div()
+                                .id("close-desktop")
+                                .cursor_pointer()
+                                .child("Close desktop")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.desktop = None;
+                                    this.finish_overlay_focus(window, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(div().flex_1().min_h_0().child(desktop))
+                .into_any_element();
+        }
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let phone = self.phone_mode(window, cx);
@@ -9535,6 +9623,7 @@ impl Render for Workspace {
                     (None, None) => None,
                 },
             )
+            .into_any_element()
     }
 }
 

@@ -975,3 +975,28 @@ Future changes that add providers, credential storage, transcript persistence,
 subprocess execution, filesystem writes, or background tasks must update this
 file and document their primary trust boundaries, resource bounds, cancellation
 behavior, and tests.
+
+## Agent desktop transport
+
+Desktop processes and their applications run with the invoking user's authority;
+they are not a sandbox. Session descriptors live in private `XDG_RUNTIME_DIR`
+directories. Desktop control and MoQ listeners use Linux abstract Unix sockets
+and reject peers whose kernel-reported UID differs from the desktop process.
+The worker resolves a session name in the agent's filesystem view; the daemon
+connects to that endpoint directly. No unauthenticated network desktop listener
+is exposed.
+
+Remote desktop opening is permitted only after the existing Iroh authentication.
+The GUI's existing connection demultiplexes media streams by a reserved 0xff
+prefix and per-viewer identifier; ordinary compressed RPC keeps its framing.
+Each connection admits at most 32 media sessions, with bounded incoming stream
+queues and header deadlines. Closing a viewer closes its media route, not the
+authenticated connection or sibling viewers.
+
+Desktop JSON headers are capped at 64 KiB; dimensions are capped at 4096 in each
+axis and VP9 packets at 16 MiB. Raw/encoded queues are bounded. The MoQ cache
+uses a 32 MiB target and short retention; this target is not a hard process-memory
+limit. The decoder still processes compressed data from an authorized desktop
+using libvpx. Same-user desktop clients can control applications and capture
+their contents; annotations copied or attached to a prompt disclose the exact
+frozen image selected by the user.

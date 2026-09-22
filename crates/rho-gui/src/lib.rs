@@ -679,3 +679,5 @@ mod tests;
 pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
     dashboard::dealer_policy_snapshot()
 }
+
+pub mod wayland_view;

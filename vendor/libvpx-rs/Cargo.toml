@@ -21,7 +21,7 @@ version = "v1.16.0"
 
 [build-dependencies]
 bindgen = "0.72"
-shiguredo_toml = "2026.2"
+pkg-config = "0.3"
 
 [features]
 source-build = []

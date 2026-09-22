@@ -68,6 +68,7 @@ pub(crate) enum Command {
     NotesForThis,
     Shell,
     ShellClose,
+    Wayland,
     Changes,
     Terminal,
     NewTerminal,
@@ -306,6 +307,11 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
             "d",
             "changes",
             MenuAction::Command(Command::Changes),
+        )
+        .item(
+            "w",
+            "view Wayland app…",
+            MenuAction::Command(Command::Wayland),
         )
         .item("t", "terminal", MenuAction::Command(Command::Terminal))
         .item(

@@ -600,22 +600,45 @@ async fn run_iroh_listener(
         let services = services.clone();
         let iroh_auth = iroh_auth.clone();
         tokio::spawn(async move {
+            let media = rho_rpc::media::Mux::new(connection.clone());
+            let uni = media.clone();
+            let uni_task = tokio::spawn(async move { uni.receive_uni().await });
             // One UI control session per iroh connection; the rest of its
             // streams are dedicated (files, shells, one-shot queries).
             let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let services = services.clone();
                 let control_claimed = control_claimed.clone();
+                let media = media.clone();
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let mut recv = rho_rpc::Reader::new(recv);
+                        let Some((mut recv, send)) =
+                            rho_rpc::accept_iroh_stream(&media, send, recv).await?
+                        else {
+                            return Ok(());
+                        };
                         let first = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
                             read_frame::<_, ClientMessage>(&mut recv),
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
+                        if let ClientMessage::WaylandOpen {
+                            media_id,
+                            agent,
+                            session,
+                        } = first
+                        {
+                            let transport = media.session(media_id)?;
+                            send.set_priority(100)?;
+                            let mut writer = rho_rpc::Writer::new(send);
+                            write_frame(&mut writer, &ServerMessage::WaylandOpened).await?;
+                            return serve_wayland(
+                                services, transport, recv, writer, agent, session,
+                            )
+                            .await;
+                        }
                         // Dedicated streams (workspace files, shells,
                         // terminals, one-shot queries) are not the UI control
                         // session and must not claim it.
@@ -626,6 +649,7 @@ async fn run_iroh_listener(
                                 | ClientMessage::DiffSnapshot { .. }
                                 | ClientMessage::GuiTelemetryUpload { .. }
                                 | ClientMessage::VisualizationGet { .. }
+                                | ClientMessage::WaylandOpen { .. }
                                 | ClientMessage::TerminalCreate { .. }
                                 | ClientMessage::TerminalAttach { .. }
                                 | ClientMessage::TerminalList { .. }
@@ -662,10 +686,16 @@ async fn run_iroh_listener(
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
-                        let send = rho_rpc::Writer::new(send);
-                        let result =
-                            serve_connection_io(services, iroh_auth, recv, send, None, Some(first))
-                                .await;
+                        let writer = rho_rpc::Writer::new(send);
+                        let result = serve_connection_io(
+                            services,
+                            iroh_auth,
+                            recv,
+                            writer,
+                            None,
+                            Some(first),
+                        )
+                        .await;
                         if control {
                             control_claimed.store(false, Ordering::Release);
                         }
@@ -677,6 +707,7 @@ async fn run_iroh_listener(
                     }
                 });
             }
+            uni_task.abort();
         });
     }
     listener.close().await;
@@ -2658,6 +2689,7 @@ async fn handle_message(
         | ClientMessage::DiffBaseContents { .. }
         | ClientMessage::GuiTelemetryUpload { .. }
         | ClientMessage::VisualizationGet { .. }
+        | ClientMessage::WaylandOpen { .. }
         | ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
         | ClientMessage::TerminalList { .. }
@@ -4280,4 +4312,77 @@ mod tests {
             .unwrap(),
         )
     }
+}
+
+/// Authenticate before reading even the media-open request. No video capture
+/// exists until the remote subscribes to the track.
+async fn serve_wayland<R, W>(
+    services: Arc<Services>,
+    transport: rho_rpc::media::Session,
+    mut reader: R,
+    mut writer: W,
+    agent: String,
+    name: String,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use rho_desktop_proto::{Input, Packet, Request, Response};
+    let result = async {
+        let agent = services.resolve_display_agent_id(&agent).await?;
+        let process = services.pool.execution(agent).await?;
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("agent desktops require a Linux daemon");
+        #[cfg(target_os = "linux")]
+        {
+            let rho_agent::WorksetReply::Desktop { socket } = process
+                .action(rho_agent::WorksetAction::Desktop { session: name })
+                .await?
+            else {
+                anyhow::bail!("unexpected desktop discovery reply");
+            };
+            let desktop = rho_desktop_proto::local::Desktop::open(&socket).await?;
+            let mut control = desktop.control;
+            let from_gui = async {
+                loop {
+                    let (input, _) =
+                        rho_rpc::read_frame::<_, Input>(&mut reader, 64 * 1024).await?;
+                    anyhow::ensure!(
+                        matches!(
+                            rho_desktop_proto::local::request(
+                                &mut control,
+                                Request::Input { input }
+                            )
+                            .await?,
+                            Response::Done
+                        ),
+                        "unexpected desktop input reply"
+                    );
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), anyhow::Error>(())
+            };
+            let media = async {
+                let origin = rho_desktop_media::media::origin();
+                let local = rho_desktop_media::media::SessionGuard(
+                    rho_desktop_media::media::local_client(desktop.media, origin.clone()).await?,
+                );
+                let remote = rho_desktop_media::media::SessionGuard(
+                    rho_desktop_media::media::publish(transport, &origin).await?,
+                );
+                tokio::select! {
+                    error=local.0.closed()=>anyhow::bail!("desktop media closed: {error}"),
+                    _=remote.0.closed()=>Ok::<(),anyhow::Error>(()),
+                }
+            };
+            tokio::select! {result=from_gui=>result,result=media=>result}
+        }
+    }
+    .await;
+    if let Err(error) = &result {
+        let _ = rho_rpc::write_frame(&mut writer, &Packet::Error(format!("{error:#}")), 64 * 1024)
+            .await;
+    }
+    result
 }
