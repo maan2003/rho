@@ -166,6 +166,8 @@ impl WaylandView {
         }
     }
     fn position(&self, p: Point<Pixels>) -> Option<(u32, u32)> {
+        // Before the first frame, the placeholder dimensions are not coordinates.
+        self.image.as_ref()?;
         let bounds = self.bounds.get();
         if !bounds.contains(&p) || bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
             return None;

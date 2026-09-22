@@ -110,7 +110,10 @@
           # Bundle Mesa rather than requiring the user to configure a driver path.
           postInstall = ''
             wrapProgram $out/bin/rho-agent-desktop \
-              --set-default __EGL_VENDOR_LIBRARY_FILENAMES "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+              --set-default __EGL_VENDOR_LIBRARY_FILENAMES "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json" \
+              --set-default FONTCONFIG_FILE "${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-color-emoji ]; }}" \
+              --prefix XCURSOR_PATH : "${pkgs.adwaita-icon-theme}/share/icons" \
+              --set-default XCURSOR_THEME Adwaita
           '';
           passthru = old.passthru // { providedSessions = [ ]; };
           meta = old.meta // {

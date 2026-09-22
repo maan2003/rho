@@ -52,6 +52,7 @@ impl Drop for Viewer {
 pub(crate) async fn open(
     transport: rho_rpc::media::Session,
     stream: rho_rpc::Stream,
+    started: Instant,
 ) -> Result<Viewer> {
     let (mut reader, mut writer) = stream.into_split();
     let origin = rho_desktop_media::media::origin();
@@ -70,8 +71,16 @@ pub(crate) async fn open(
     // Decode off GPUI and Tokio IO workers. GPUI samples the retained YUV planes.
     let decode_task = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut decoder = Decoder::new()?;
+        let mut first = true;
         while let Some(packet) = decode.blocking_recv() {
             if let Some(frame) = decoder.decode_planes(&packet)? {
+                if first {
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "desktop first frame decoded"
+                    );
+                    first = false;
+                }
                 let planes = Arc::new(frame);
                 let render = gpui::VideoFrame::new(Arc::new(VideoData(planes.clone())))?;
                 decoded.send_replace(Some(Arc::new(Image {
@@ -104,9 +113,17 @@ pub(crate) async fn open(
                     break;
                 }
             }
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "desktop video announced"
+            );
             let broadcast = origin.consume().request_broadcast("app").await?;
             let track = broadcast.track("video")?;
             let mut subscription = track.subscribe(None).await?.ordered();
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "desktop video subscribed"
+            );
             let mut rate = 2_000_000u32;
             let mut sample = Instant::now();
             let mut baseline: Option<i128> = None;

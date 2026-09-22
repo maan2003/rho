@@ -2383,6 +2383,7 @@ async fn open_wayland_stream(
     agent: String,
     session: String,
 ) -> anyhow::Result<crate::wayland::Viewer> {
+    let started = std::time::Instant::now();
     static NEXT_MEDIA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT_MEDIA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let transport = media.session(id)?;
@@ -2405,5 +2406,6 @@ async fn open_wayland_stream(
         ),
         "Wayland open refused"
     );
-    crate::wayland::open(transport, stream).await
+    tracing::info!(elapsed_ms = started.elapsed().as_millis(), "desktop open acknowledged");
+    crate::wayland::open(transport, stream, started).await
 }
