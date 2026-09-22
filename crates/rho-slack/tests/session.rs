@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use gpui::{AppContext as _, Entity, TestAppContext};
 use rho_slack::fake::Fake;
-use rho_slack::session::{Session, SessionEvent, Source};
-use rho_slack::types::{ChannelId, Ts};
+use rho_slack::session::{Session, SessionEvent, Source, Update};
+use rho_slack::types::{ChannelId, Ts, UserId};
 
 /// Everything a session test needs, kept together so the tempdir outlives
 /// the session that writes into it.
@@ -547,4 +547,183 @@ async fn only_a_locally_correlated_view_event_can_open_a_modal(cx: &mut TestAppC
     let views = opened.read_with(cx, |opened, _| opened.clone());
     assert_eq!(views.len(), 1);
     assert_eq!(views[0]["id"], "VMODAL1");
+}
+
+/// Old mirrors and incomplete history pages can know that a thread exists
+/// without carrying Slack's participant summary. The visible root is repaired
+/// from one bounded replies call; the root row and authorless replies are not
+/// participants, duplicates collapse, and the UI's ordinary replacement log
+/// announces the repair.
+#[gpui::test]
+async fn a_visible_root_hydrates_three_distinct_replying_users(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    rig.fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "600.0", "user": "UROOT", "text": "question",
+            "reply_count": 7, "reply_users": []
+        }),
+    );
+    for reply in [
+        serde_json::json!({"ts": "601.0", "thread_ts": "600.0", "bot_id": "B1", "text": "automatic"}),
+        serde_json::json!({"ts": "602.0", "thread_ts": "600.0", "user": "U1", "text": "one"}),
+        serde_json::json!({"ts": "603.0", "thread_ts": "600.0", "user": "U1", "text": "again"}),
+        serde_json::json!({"ts": "604.0", "thread_ts": "600.0", "user": "U2", "text": "two"}),
+        serde_json::json!({"ts": "605.0", "thread_ts": "600.0", "user": "U3", "text": "three"}),
+        serde_json::json!({"ts": "606.0", "thread_ts": "600.0", "user": "U4", "text": "four"}),
+    ] {
+        rig.fake.add_message("C1", reply);
+    }
+
+    rig.session
+        .update(cx, |session, cx| session.open(&design(), cx));
+
+    let root = Ts("600.0".into());
+    let mut participants = Vec::new();
+    let mut updates = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        (participants, updates) = rig.session.read_with(cx, |session, _| {
+            let loaded = session.loaded(&design()).unwrap();
+            (
+                loaded
+                    .held(&root)
+                    .map(|message| message.reply_users.clone())
+                    .unwrap_or_default(),
+                loaded.updates_since(1).unwrap_or_default(),
+            )
+        });
+        if !participants.is_empty() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    assert_eq!(
+        participants,
+        vec![
+            UserId("U1".into()),
+            UserId("U2".into()),
+            UserId("U3".into())
+        ],
+        "the root, missing ids, duplicates, and the fourth distinct replier are excluded"
+    );
+    assert!(
+        updates.contains(&Update::Replaced(root)),
+        "the established loaded-message change log announces the repaired root"
+    );
+    assert_eq!(rig.fake.calls("conversations.replies"), 1);
+}
+
+/// A root whose replies reveal no participant, and one whose request fails,
+/// each reach a terminal session state. Reopening the conversation must not
+/// turn either omission into a network loop.
+#[gpui::test]
+async fn empty_and_failed_participant_hydration_are_not_retried(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    rig.fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts": "600.0", "user": "UA", "text": "empty old summary",
+            "reply_count": 2, "reply_users": []
+        }),
+    );
+
+    rig.session
+        .update(cx, |session, cx| session.open(&design(), cx));
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if rig.fake.calls("conversations.replies") == 1 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    rig.session
+        .update(cx, |session, cx| session.open(&design(), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        rig.fake.calls("conversations.replies"),
+        1,
+        "an empty reply page is terminal"
+    );
+
+    rig.fake.add_message(
+        "C2",
+        serde_json::json!({
+            "ts": "700.0", "user": "UA", "text": "failed old summary",
+            "reply_count": 1, "reply_users": []
+        }),
+    );
+    rig.fake.fail_next("conversations.replies", 1);
+    let other = Source::Conversation(ChannelId("C2".into()));
+    rig.session
+        .update(cx, |session, cx| session.open(&other, cx));
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if rig.fake.calls("conversations.replies") == 2 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    rig.session
+        .update(cx, |session, cx| session.open(&other, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        rig.fake.calls("conversations.replies"),
+        2,
+        "a failed participant request is terminal"
+    );
+}
+
+#[gpui::test]
+async fn removing_our_reaction_preserves_other_reactors_after_socket_echo(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    rig.fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts":"800.0", "user":"UA", "text":"react here",
+            "reactions":[{"name":"thumbsup", "count":2, "users":["ME", "UA"]}]
+        }),
+    );
+    rig.session
+        .update(cx, |session, cx| session.open(&design(), cx));
+    let ts = Ts("800.0".into());
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if rig.session.read_with(cx, |session, _| {
+            session
+                .loaded(&design())
+                .is_some_and(|loaded| loaded.held(&ts).is_some())
+        }) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    rig.session.update(cx, |session, cx| {
+        session.toggle_reaction(&design(), &ts, "thumbsup", cx)
+    });
+    for _ in 0..100 {
+        cx.run_until_parked();
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    rig.session.read_with(cx, |session, _| {
+        let message = session.loaded(&design()).unwrap().held(&ts).unwrap();
+        assert_eq!(message.reactions.len(), 1);
+        assert_eq!(message.reactions[0].count, 1);
+        assert_eq!(message.reactions[0].users, vec![UserId("UA".into())]);
+    });
+    assert_eq!(rig.fake.calls("reactions.remove"), 1);
 }

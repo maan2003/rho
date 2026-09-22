@@ -499,7 +499,13 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         decorations = window
             .update(cx, |view, _, _| view.emoji_decoration_count_for_test())
             .unwrap();
-        if decorations == 2 {
+        if decorations == 1
+            && window
+                .update(cx, |view, _, cx| {
+                    !view.display_text_for_test(cx).contains(":celebrate:")
+                })
+                .unwrap()
+        {
             break;
         }
         cx.executor()
@@ -507,8 +513,8 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
             .await;
     }
     assert_eq!(
-        decorations, 2,
-        "body emoji and aliased reaction both render"
+        decorations, 1,
+        "body emoji uses an inlay; the aliased reaction renders inside its chip"
     );
     let mut avatars = 0;
     for _ in 0..300 {

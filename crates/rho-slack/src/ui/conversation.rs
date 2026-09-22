@@ -50,7 +50,7 @@ struct AvatarFold;
 struct MessageTextFold;
 struct PreviewRows;
 struct CodeBlockRows;
-struct ReactionCountFold;
+struct ReactionChipFold;
 struct PreviewTailFold;
 
 struct EmojiDecoration {
@@ -394,7 +394,8 @@ struct LineMeta {
     preview_hidden: Option<usize>,
     preview_toggle: Option<usize>,
     reply_users: Vec<crate::types::UserId>,
-    reaction_counts: Vec<Range<usize>>,
+    reaction_chips: Vec<(Range<usize>, String, bool)>,
+    replies: bool,
 }
 
 type Rendered = Item<Row, Class, LineMeta>;
@@ -466,6 +467,7 @@ impl ConversationView {
             );
             (hooks.configure_editor)(&mut editor, window, cx);
             editor.set_reserve_image_gutter(true, cx);
+            editor.set_gutter_highlight_text_inset(Some(0.5), cx);
             editor.disable_header_for_buffer(transcript.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
             // Completion is the composer's, not the transcript's: the
@@ -665,7 +667,9 @@ impl ConversationView {
             || !self
                 .transcript
                 .line_meta(point.row, cx)
-                .is_some_and(|meta| meta.interaction.is_some() || meta.preview_toggle.is_some())
+                .is_some_and(|meta| {
+                    meta.interaction.is_some() || meta.preview_toggle.is_some() || meta.replies
+                })
         {
             return;
         }
@@ -2132,6 +2136,7 @@ impl ConversationView {
         let mut inset_rows = Vec::new();
         let mut hidden: Vec<Range<usize>> = Vec::new();
         let mut controls = Vec::new();
+        let mut reply_links = Vec::new();
         let mut previews: Vec<Range<MultiBufferAnchor>> = Vec::new();
         let mut previous_preview = false;
         let mut reaction_folds = Vec::new();
@@ -2169,23 +2174,93 @@ impl ConversationView {
                 {
                     controls.push(control);
                 }
-                for count in &meta.reaction_counts {
-                    if let Some(anchored) = range(offset + count.start..offset + count.end) {
-                        let label: gpui::SharedString = line[count.clone()].to_owned().into();
+                if meta.replies
+                    && let Some(link) = range(offset..offset + line.len() - 1)
+                {
+                    reply_links.push(link);
+                }
+                let chips = meta.reaction_chips.clone();
+                for (chip, name, mine) in chips {
+                    if let Some(anchored) = range(offset + chip.start..offset + chip.end) {
+                        let label = line[chip.clone()].to_owned();
+                        let (emoji, count) = label.rsplit_once(' ').unwrap();
+                        let emoji: gpui::SharedString = emoji.to_owned().into();
+                        let count: gpui::SharedString = count.to_owned().into();
+                        let path = match self.session.read(cx).cached_custom_emoji(&name) {
+                            crate::session::EmojiCache::Ready(path) => Some(path.to_owned()),
+                            _ => None,
+                        };
+                        let image = path.as_ref().and_then(|path| self.decoded_image(path, cx));
+                        let display_label = if image.is_some() {
+                            format!("  {count}")
+                        } else {
+                            label.clone()
+                        };
+                        let ts = match self.transcript.key_at_row(row as u32, cx) {
+                            Some(Row::Message(ts)) => ts.clone(),
+                            _ => continue,
+                        };
+                        let session = self.session.clone();
+                        let source = self.source.clone();
+                        let chip_id = offset + chip.start;
                         reaction_folds.push(Crease::simple(
                             anchored,
                             FoldPlaceholder {
                                 render: Arc::new(move |_, _, cx| {
+                                    let colors = cx.theme().colors();
+                                    let accent = gpui::Hsla::from(colors.terminal_ansi_blue);
+                                    let icon = match &image {
+                                        Some(image) => gpui::img(image.clone())
+                                            .size(count_size * 1.35)
+                                            .into_any_element(),
+                                        None => div()
+                                            .text_size(count_size * 1.2)
+                                            .child(emoji.clone())
+                                            .into_any_element(),
+                                    };
+                                    let session = session.clone();
+                                    let source = source.clone();
+                                    let ts = ts.clone();
+                                    let name = name.clone();
                                     div()
+                                        .id(("slack-reaction", chip_id))
+                                        .cursor_pointer()
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            session.update(cx, |session, cx| {
+                                                session.toggle_reaction(&source, &ts, &name, cx);
+                                            });
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .gap(gpui::px(5.))
+                                        .px(gpui::px(6.))
+                                        .rounded(gpui::px(5.))
+                                        .border_1()
+                                        .border_color(if mine {
+                                            accent.opacity(0.55)
+                                        } else {
+                                            colors.border_variant.into()
+                                        })
+                                        .bg(if mine {
+                                            accent.opacity(0.12)
+                                        } else {
+                                            colors.element_background.into()
+                                        })
                                         .text_size(count_size)
-                                        .text_color(cx.theme().colors().text_muted)
-                                        .child(label.clone())
+                                        .text_color(if mine {
+                                            accent
+                                        } else {
+                                            colors.text_muted.into()
+                                        })
+                                        .child(icon)
+                                        .child(count.clone())
                                         .into_any_element()
                                 }),
                                 constrain_width: false,
                                 merge_adjacent: false,
-                                type_tag: Some(TypeId::of::<ReactionCountFold>()),
-                                collapsed_text: Some(line[count.clone()].to_owned().into()),
+                                type_tag: Some(TypeId::of::<ReactionChipFold>()),
+                                collapsed_text: Some(display_label.into()),
                                 ..Default::default()
                             },
                         ));
@@ -2332,6 +2407,7 @@ impl ConversationView {
             );
             for (key, ranges, style) in [
                 (usize::MAX - 601, code, code_style),
+                (usize::MAX - 605, reply_links, control_style),
                 (usize::MAX - 602, underlines, underline_style),
                 (usize::MAX - 603, mentions, mention_style),
             ] {
@@ -2339,7 +2415,7 @@ impl ConversationView {
             }
             editor.remove_folds_with_type(
                 &self.reaction_folds,
-                TypeId::of::<ReactionCountFold>(),
+                TypeId::of::<ReactionChipFold>(),
                 false,
                 cx,
             );
@@ -2581,6 +2657,20 @@ impl ConversationView {
                     crate::session::EmojiCache::Failed => continue,
                     crate::session::EmojiCache::Ready(path) => path.to_owned(),
                 };
+                let source_row = self
+                    .transcript
+                    .buffer()
+                    .read(cx)
+                    .snapshot()
+                    .offset_to_point(base + range.start)
+                    .row;
+                if self
+                    .transcript
+                    .line_meta(source_row, cx)
+                    .is_some_and(|meta| !meta.reaction_chips.is_empty())
+                {
+                    continue;
+                }
                 let Some(image) = self.decoded_image(&path, cx) else {
                     continue;
                 };
@@ -3997,11 +4087,11 @@ fn message_item_with_header(
     // resolves the same thread as the body, without a mouse-only block.
     if !message.reactions.is_empty() {
         spans.push(Span::plain(&indent));
-        let reaction_counts = push_reactions(&mut spans, message, model);
+        let reaction_chips = push_reactions(&mut spans, message, model);
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread: thread.clone(),
-            reaction_counts,
+            reaction_chips,
             ..LineMeta::default()
         });
     }
@@ -4012,6 +4102,7 @@ fn message_item_with_header(
         lines.push(LineMeta {
             thread,
             reply_users: message.reply_users.iter().take(3).cloned().collect(),
+            replies: true,
             ..LineMeta::default()
         });
     }
@@ -4175,7 +4266,11 @@ fn system_line(message: &Message, model: &Model) -> Option<String> {
 /// The reactions under a message: `👍 3  🎉 1`. One the reader added is in
 /// their own class, which is the whole of how they can tell; a word for it
 /// would be noise on every line.
-fn push_reactions(spans: &mut Vec<Span>, message: &Message, model: &Model) -> Vec<Range<usize>> {
+fn push_reactions(
+    spans: &mut Vec<Span>,
+    message: &Message,
+    model: &Model,
+) -> Vec<(Range<usize>, String, bool)> {
     let mut counts = Vec::new();
     let mut offset = BODY_INDENT;
     for (index, reaction) in message.reactions.iter().enumerate() {
@@ -4185,10 +4280,10 @@ fn push_reactions(spans: &mut Vec<Span>, message: &Message, model: &Model) -> Ve
         }
         let emoji = crate::emoji::render(&format!(":{}:", reaction.name));
         let count = reaction.count.to_string();
-        let start = offset + emoji.len() + 1;
-        offset = start + count.len();
-        counts.push(start..offset);
+        let start = offset;
+        offset += emoji.len() + 1 + count.len();
         let mine = reaction.users.iter().any(|user| user == model.self_id());
+        counts.push((start..offset, reaction.name.clone(), mine));
         spans.push(Span::styled(
             format!("{emoji} {count}"),
             match mine {
@@ -5139,7 +5234,10 @@ mod tests {
             vec![UserId("U1".into()), UserId("ME".into())]
         );
         assert!(rendered.lines[2].reply_users.is_empty());
-        assert_eq!(rendered.lines[2].reaction_counts, vec![7..8]);
+        assert_eq!(
+            rendered.lines[2].reaction_chips,
+            vec![(2..8, "thumbsup".into(), true)]
+        );
         assert!(classed(&rendered.text, &rendered.styles, Class::You).contains(&"👍 3".to_owned()));
         let thread = message_item(&message, &model(), true);
         assert!(thread.text.ends_with("body\n  👍 3\n"));

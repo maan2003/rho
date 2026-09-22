@@ -39,9 +39,17 @@ const SEPARATOR: char = '\u{1f}';
 
 const FAVORITES: TableDefinition<&str, bool> = TableDefinition::new("rho_slack_favorites_v1");
 
-const MESSAGES: TableDefinition<&str, Sen<StoredMessage>> =
-    TableDefinition::new("rho_slack_messages_v1");
-const GAPS: TableDefinition<&str, Sen<StoredGap>> = TableDefinition::new("rho_slack_gaps_v1");
+/// Cached Slack message fields changed without changing Slack message identity.
+/// Unlike drafts and read state, the cache is disposable: a generation change
+/// drops only the tables and cursor facts derived from fetched history.
+const CACHE_GENERATION: TableDefinition<(), String> =
+    TableDefinition::new("rho_slack_cache_generation_v1");
+const CURRENT_CACHE_GENERATION: &str = "a73c9f21";
+
+const MESSAGES_TABLE: &str = "rho_slack_messages_v1";
+const MESSAGES: TableDefinition<&str, Sen<StoredMessage>> = TableDefinition::new(MESSAGES_TABLE);
+const GAPS_TABLE: &str = "rho_slack_gaps_v1";
+const GAPS: TableDefinition<&str, Sen<StoredGap>> = TableDefinition::new(GAPS_TABLE);
 const USERS: TableDefinition<&str, Sen<StoredUser>> = TableDefinition::new("rho_slack_users_v1");
 const CONVERSATIONS: TableDefinition<&str, Sen<StoredConversation>> =
     TableDefinition::new("rho_slack_conversations_v1");
@@ -215,6 +223,8 @@ impl Mirror {
             write.open_table(DRAFT_TEXT);
             write.open_table(DRAFT_FILES);
             write.open_table(PENDING_DRAFTS);
+            write.open_table(CACHE_GENERATION);
+            invalidate_stale_history(&mut write);
             write.commit();
         });
         Ok(Self { db })
@@ -1200,6 +1210,45 @@ impl Mirror {
     }
 }
 
+/// Invalidates only network-rebuildable history when its cached shape changes.
+///
+/// `CURSORS` also owns durable read and workflow state, so the table cannot be
+/// dropped whole. Only `…␟begins` is derived from a cached history run and
+/// must go with that run. A missing marker is the one legacy generation; an
+/// unknown marker is likewise a disposable cache from another build.
+fn invalidate_stale_history(write: &mut rho_db::WriteTxn) {
+    let current = write
+        .open_table(CACHE_GENERATION)
+        .get(&())
+        .map(|generation| generation.value());
+    if current.as_deref() == Some(CURRENT_CACHE_GENERATION) {
+        return;
+    }
+
+    write.delete_table(MESSAGES_TABLE);
+    write.delete_table(GAPS_TABLE);
+    write.open_table(MESSAGES);
+    write.open_table(GAPS);
+
+    let begins = {
+        let cursors = write.open_table(CURSORS);
+        cursors
+            .iter()
+            .map(|(key, _)| key.value().to_owned())
+            .filter(|key| key.ends_with(&format!("{SEPARATOR}begins")))
+            .collect::<Vec<_>>()
+    };
+    {
+        let mut cursors = write.open_table(CURSORS);
+        for key in begins {
+            cursors.remove(key.as_str());
+        }
+    }
+    write
+        .open_table(CACHE_GENERATION)
+        .insert(&(), &CURRENT_CACHE_GENERATION.to_owned());
+}
+
 /// The timestamp part of a composed key.
 fn ts_of(key: &str) -> Option<Ts> {
     key.rsplit(SEPARATOR).next().map(Ts::from)
@@ -1610,8 +1659,151 @@ impl From<&StoredMessage> for Message {
 }
 
 #[cfg(test)]
-mod participant_compatibility_tests {
+mod compatibility_tests {
     use super::*;
+
+    const OTHER_CLIENT_STATE: TableDefinition<(), &str> =
+        TableDefinition::new("rho_slack_test_credentials");
+
+    #[test]
+    fn stale_history_is_invalidated_once_without_touching_local_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(dir.path().join("rho.redb"));
+        let scope = Scope::conversation("acme", &ChannelId::from("C1"));
+        let cached = Message {
+            ts: Ts::from("100.000000"),
+            thread_ts: None,
+            channel: ChannelId::from("C1"),
+            user: Some(UserId::from("U1")),
+            bot_name: None,
+            bot_id: None,
+            blocks: Vec::new(),
+            text: "legacy cache".into(),
+            attachments: Vec::new(),
+            files: Vec::new(),
+            subtype: None,
+            reply_count: 3,
+            reply_users: Vec::new(),
+            latest_reply: Some(Ts::from("103.000000")),
+            edited: false,
+            reactions: Vec::new(),
+        };
+        let unit = Unit::conversation(&ChannelId::from("C1"));
+        let facts = UnitFacts {
+            reason: Reason::Mention,
+            newest: cached.ts.clone(),
+            newest_from_other: Some(cached.ts.clone()),
+            newest_from_you: false,
+            others_replied: false,
+            first_seen_ms: 42,
+        };
+        let saved = Saved {
+            channel: ChannelId::from("C1"),
+            thread: None,
+            ts: cached.ts.clone(),
+            summary: "kept summary".into(),
+        };
+
+        // This is the pre-generation database: history and its shape facts
+        // exist, as do local state and a table owned by the surrounding
+        // client database, but CACHE_GENERATION does not.
+        futures::executor::block_on(async {
+            let mut write = db.write().await;
+            write.open_table(MESSAGES).insert(
+                scope.key(&cached.ts).as_str(),
+                SenValue::owned(StoredMessage::from(&cached)),
+            );
+            write.open_table(GAPS).insert(
+                scope.key(&cached.ts).as_str(),
+                SenValue::owned(StoredGap {
+                    page_before: cached.ts.0.clone(),
+                }),
+            );
+            {
+                let mut cursors = write.open_table(CURSORS);
+                cursors.insert(
+                    format!("{}begins", scope.prefix()).as_str(),
+                    SenValue::owned(StoredCursor::Flag(true)),
+                );
+                cursors.insert(
+                    format!("{}read", scope.prefix()).as_str(),
+                    SenValue::owned(StoredCursor::Stamp("90.000000".into())),
+                );
+            }
+            write.open_table(UNITS).insert(
+                unit_key("acme", &unit).as_str(),
+                SenValue::owned(StoredUnit::of(&unit, &facts)),
+            );
+            write
+                .open_table(DRAFT_TEXT)
+                .insert(scope.prefix().as_str(), "unfinished");
+            write
+                .open_table(FAVORITES)
+                .insert(format!("acme{SEPARATOR}C1").as_str(), true);
+            write.open_table(SAVED).insert(
+                saved_key("acme", &saved).as_str(),
+                SenValue::owned(StoredSaved {
+                    channel: "C1".into(),
+                    thread: None,
+                    ts: cached.ts.0.clone(),
+                    summary: saved.summary.clone(),
+                }),
+            );
+            write
+                .open_table(OTHER_CLIENT_STATE)
+                .insert(&(), "credential sentinel");
+            write.commit();
+        });
+
+        let mirror = Mirror::open_on(db.clone()).unwrap();
+        assert!(mirror.all_messages(&scope).is_empty());
+        assert!(mirror.gap_below(&scope, None).is_none());
+        assert!(!mirror.history_begins(&scope));
+        assert_eq!(
+            mirror.last_read(&scope),
+            Some(Ts::from("90.000000")),
+            "read state is not cache shape"
+        );
+        assert_eq!(mirror.units("acme"), vec![(unit, facts)]);
+        assert_eq!(
+            mirror.draft(&scope),
+            Some(Draft {
+                text: "unfinished".into(),
+                files: Vec::new(),
+            })
+        );
+        assert!(mirror.favorite("acme", &ChannelId::from("C1")));
+        assert_eq!(mirror.saved("acme"), vec![saved]);
+        assert_eq!(
+            db.read()
+                .open_table(OTHER_CLIENT_STATE)
+                .get(&())
+                .map(|value| value.value().to_owned()),
+            Some("credential sentinel".to_owned()),
+            "opening Slack's mirror does not wipe the shared client database"
+        );
+
+        let mut fresh = cached;
+        fresh.text = "fresh cache".into();
+        fresh.reply_users = vec![UserId::from("U2")];
+        mirror.insert_messages(&scope, std::slice::from_ref(&fresh));
+        mirror.put_gap(&scope, &fresh.ts, &fresh.ts);
+        mirror.set_history_begins(&scope);
+        drop(mirror);
+
+        let reopened = Mirror::open_on(db).unwrap();
+        assert_eq!(reopened.all_messages(&scope), vec![fresh.clone()]);
+        assert_eq!(
+            reopened
+                .gap_below(&scope, None)
+                .map(|(at, gap)| (at, gap.page_before)),
+            Some((fresh.ts.clone(), fresh.ts.clone()))
+        );
+        assert!(
+            reopened.history_begins(&scope),
+            "the current generation survives subsequent opens"
+        );
+    }
 
     #[derive(Encode)]
     struct LegacyMessage {

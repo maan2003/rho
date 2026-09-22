@@ -5960,7 +5960,13 @@ impl EditorElement {
             0.275 * layout.position_map.line_height
         };
         let highlight_corner_radii = Corners::all(0.05 * layout.position_map.line_height);
-        window.paint_layer(layout.gutter_hitbox.bounds, |window| {
+        let text_inset = self.editor.read(cx).gutter_highlight_text_inset;
+        let rule_bounds = if text_inset.is_some() {
+            layout.position_map.text_hitbox.bounds
+        } else {
+            layout.gutter_hitbox.bounds
+        };
+        window.paint_layer(rule_bounds, |window| {
             for (range, color) in &layout.highlighted_gutter_ranges {
                 let start_row = if range.start.row() < layout.visible_display_row_range.start {
                     layout.visible_display_row_range.start - DisplayRow(1)
@@ -5985,7 +5991,10 @@ impl EditorElement {
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - layout.position_map.scroll_pixel_position.y,
                     );
-                let highlight_left = if image_gutter {
+                let highlight_left = if let Some(inset) = text_inset {
+                    layout.content_origin.x + layout.position_map.em_advance * inset
+                        - Pixels::from(layout.position_map.scroll_pixel_position.x)
+                } else if image_gutter {
                     layout.gutter_hitbox.right()
                         - layout.position_map.em_advance * 0.5
                         - highlight_width

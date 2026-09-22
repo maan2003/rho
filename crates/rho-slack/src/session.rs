@@ -412,6 +412,14 @@ pub struct Session {
     /// messages is one request, and a request that failed is not retried on
     /// every page.
     asked_names: HashSet<UserId>,
+    /// Thread roots whose missing participant summary has already caused a
+    /// bounded replies request. Empty answers and failures are terminal for
+    /// this session, so opening or redrawing the same conversation cannot
+    /// turn incomplete old history into a request loop.
+    asked_participants: HashSet<ThreadKey>,
+    /// Serializes participant repair even when a loaded page contains many
+    /// incomplete roots.
+    participant_loading: bool,
     /// How many searches the reader has asked for. The answer to any but
     /// the last is not shown: see `search`.
     asked: u64,
@@ -480,6 +488,8 @@ impl Session {
             sending_drafts: HashSet::new(),
             send_outcomes: HashMap::new(),
             asked_names: HashSet::new(),
+            asked_participants: HashSet::new(),
+            participant_loading: false,
             asked: 0,
             cached_files: HashMap::new(),
             cached_emoji: HashMap::new(),
@@ -506,6 +516,8 @@ impl Session {
             sending_drafts: HashSet::new(),
             send_outcomes: HashMap::new(),
             asked_names: HashSet::new(),
+            asked_participants: HashSet::new(),
+            participant_loading: false,
             asked: 0,
             cached_files: HashMap::new(),
             cached_emoji: HashMap::new(),
@@ -1072,6 +1084,11 @@ impl Session {
         let mut reacted = None;
         for source in sources {
             if let Some(loaded) = self.loaded.get_mut(&source)
+                // Our removal is optimistic. The socket echo must not
+                // subtract a second person after our ID is already gone.
+                && (added || user != self.model.self_id()
+                    || loaded.held(ts).is_some_and(|message| message.reactions.iter()
+                        .any(|reaction| reaction.name == name && reaction.users.contains(user))))
                 && loaded.react(ts, user, name, added)
             {
                 reacted = loaded.held(ts).cloned();
@@ -1818,6 +1835,7 @@ impl Session {
     pub fn open(&mut self, source: &Source, cx: &mut Context<Self>) {
         self.focused = Some(source.clone());
         if self.loaded.contains_key(source) {
+            self.hydrate_participants(source, cx);
             return;
         }
         // The mirror answers first, so the conversation is on screen before
@@ -1845,7 +1863,92 @@ impl Session {
                 ..Loaded::default()
             },
         );
+        self.hydrate_participants(source, cx);
         self.fetch(source.clone(), None, since, cx);
+    }
+
+    /// Fills the participant summary omitted by old mirror rows or incomplete
+    /// history responses. Only roots already on screen qualify, and each one
+    /// gets one bounded request per session regardless of its outcome.
+    fn hydrate_participants(&mut self, source: &Source, cx: &mut Context<Self>) {
+        if self.participant_loading || self.focused.as_ref() != Some(source) {
+            return;
+        }
+        let Source::Conversation(channel) = source else {
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(loaded) = self.loaded.get(source) else {
+            return;
+        };
+        let Some((key, root)) = loaded
+            .messages
+            .iter()
+            .filter(|message| message.is_top_level())
+            .filter(|message| message.reply_count > 0 && message.reply_users.is_empty())
+            .map(|message| {
+                let key = self.model.key(channel, &message.ts);
+                (key, message.ts.clone())
+            })
+            .find(|(key, _)| !self.asked_participants.contains(key))
+        else {
+            return;
+        };
+
+        // Claim before spawning: two page completions in the same turn still
+        // produce one request. Empty answers and failures deliberately keep
+        // the claim, like failed name and avatar lookups do.
+        if !self.asked_participants.insert(key.clone()) {
+            return;
+        }
+        self.participant_loading = true;
+        let request_source = source.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, {
+            let channel = key.channel.clone();
+            let root = root.clone();
+            async move { client.conversations_replies(&channel, &root, None).await }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            let _ = this.update(cx, |session, cx| {
+                session.participant_loading = false;
+                if let Ok(Ok(page)) = answer {
+                    let mut users = Vec::new();
+                    for reply in page.messages.iter().filter(|message| message.ts != root) {
+                        if let Some(user) = &reply.user
+                            && !users.contains(user)
+                        {
+                            users.push(user.clone());
+                            if users.len() == 3 {
+                                break;
+                            }
+                        }
+                    }
+                    session.learn_names(&page.messages, cx);
+                    if !users.is_empty()
+                        && let Some(mut parent) = session
+                            .loaded
+                            .get(&request_source)
+                            .and_then(|loaded| loaded.held(&root))
+                            .cloned()
+                        // A live reply may have filled this while the request
+                        // was in flight. Never replace fresher participant data.
+                        && parent.reply_users.is_empty()
+                    {
+                        parent.reply_users = users;
+                        session.edit(parent);
+                        cx.notify();
+                    }
+                }
+                // Continue serially in whichever conversation is focused
+                // now. It may have changed while this request was in flight.
+                if let Some(focused) = session.focused.clone() {
+                    session.hydrate_participants(&focused, cx);
+                }
+            });
+        }));
     }
 
     /// Brings the chunk holding `ts` into an open conversation. A deal is
@@ -1889,6 +1992,7 @@ impl Session {
         loaded.older_cursor = None;
         loaded.reached_oldest =
             mirror.gap_at_or_below(&scope, ts).is_none() && mirror.history_begins(&scope);
+        self.hydrate_participants(source, cx);
         cx.notify();
         true
     }
@@ -2027,6 +2131,7 @@ impl Session {
                     }
                 }
                 session.learn_names(&fetched, cx);
+                session.hydrate_participants(&source, cx);
                 cx.notify();
             });
         }));
@@ -2130,6 +2235,7 @@ impl Session {
                 }
                 session.mirror_page(&source, &fetched, true, reached_oldest);
                 session.learn_names(&fetched, cx);
+                session.hydrate_participants(&source, cx);
                 cx.notify();
             });
         }));
@@ -2297,6 +2403,7 @@ impl Session {
                 }
                 session.mirror_page(&source, &fetched, bounded.is_none(), reached_oldest);
                 session.learn_names(&fetched, cx);
+                session.hydrate_participants(&source, cx);
                 let messages = session
                     .loaded
                     .get(&source)

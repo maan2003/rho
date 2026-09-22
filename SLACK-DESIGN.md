@@ -593,9 +593,12 @@ transcript renders through, and owns none of its own. Concretely:
   their full source behind cursor-addressable Show more / Show less rows.
   Code blocks have the same inner padding and a faint background extending to
   the right edge, including blank lines. Prose after lists returns to the inset.
-  Reactions have a compact row with smaller counts; replies have a separate
-  cursor-addressable row with participant avatars. Enter on that row opens the
-  thread. Mentions use a faint blue highlight rather than yellow.
+  Reactions are compact clickable chips with smaller counts; your reactions
+  have a blue border and tint. Replies have a separate cursor-addressable blue
+  link with participant avatars. Click or Enter opens the thread. Missing
+  participant summaries are fetched once per session, one thread at a time.
+  A cache-generation reset discards old message history and its gap/beginning
+  markers so new metadata is fetched; local drafts and read/workflow state stay. Mentions use a faint blue highlight rather than yellow.
   Same-workspace archive URLs keep sender-authored labels; raw URLs display as
   message/reply references. Enter jumps to their message, fetching its window
   when absent. Workspace identity

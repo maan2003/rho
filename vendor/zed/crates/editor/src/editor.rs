@@ -1111,6 +1111,7 @@ pub struct Editor {
     syntax_concealments_dirty: bool,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
+    gutter_highlight_text_inset: Option<f32>,
     gutter_images: HashMap<Anchor, GutterImage>,
     centered_rows: Arc<[Anchor]>,
     reserve_image_gutter: bool,
@@ -2583,6 +2584,7 @@ impl Editor {
             syntax_concealments_dirty: true,
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
+            gutter_highlight_text_inset: None,
             gutter_images: HashMap::default(),
             centered_rows: Arc::default(),
             reserve_image_gutter: false,
@@ -9962,6 +9964,13 @@ impl Editor {
     ) {
         self.display_map
             .update(cx, |map, cx| map.set_hanging_indents(ranges, cx));
+        cx.notify();
+    }
+
+    /// Places gutter highlight rules inside the text area, in space columns.
+    /// None retains the normal gutter position; callers reserve the text inset.
+    pub fn set_gutter_highlight_text_inset(&mut self, inset: Option<f32>, cx: &mut Context<Self>) {
+        self.gutter_highlight_text_inset = inset;
         cx.notify();
     }
 
