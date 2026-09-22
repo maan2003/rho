@@ -13053,6 +13053,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-desktop-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rho-fake-model"
 version = "0.1.0"
 dependencies = [

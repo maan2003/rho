@@ -17,6 +17,7 @@ members = [
   "crates/rho-context-config",
   "crates/rho-core",
   "crates/rho-daemon",
+  "crates/rho-desktop-proto",
   "crates/rho-db",
   "crates/rho-desk",
   "crates/rho-fake-model",
