@@ -216,6 +216,17 @@ pub struct Attachment {
     pub url: Option<String>,
     /// The site Slack named for an unfurl, `github.com` and the like.
     pub service: Option<String>,
+    /// Inline identity Slack supplies for a linked message's author.
+    pub author_name: Option<String>,
+    /// The linked message's author, resolved through the roster when no
+    /// inline name was supplied.
+    pub author_id: Option<UserId>,
+    /// The conversation containing a linked message.
+    pub channel_id: Option<ChannelId>,
+    /// Rich message content nested in an attachment. Slack calls the
+    /// enclosing wire field `message_blocks`; only its display blocks are
+    /// retained here.
+    pub blocks: Vec<serde_json::Value>,
 }
 
 /// One entry from Slack's workspace emoji table.

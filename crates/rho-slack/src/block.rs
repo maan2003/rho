@@ -441,62 +441,108 @@ const UNFURL_LINES: usize = 2;
 /// the same bar the agent transcript puts beside a message -- so the card's
 /// own words start at the margin like everything else.
 ///
-/// A preview keeps its title and at most two description lines rather than
-/// reproducing the page beneath the message. The Markdown surface paints a
-/// full-width background and a gutter rule; neither becomes copied text.
+/// A preview keeps its supplied title distinct from its body. Markdown keeps
+/// the complete source so its surface can collapse and expand without another
+/// rendering pass; the legacy mrkdwn surface retains its short preview.
 /// An app card keeps what it was given: its pretext, title, body, and the
 /// labelled values it hung under them.
-fn render_attachment(flavour: Flavour, attachment: &Attachment, names: &dyn Names) -> Vec<String> {
-    let headline = attachment
-        .title
-        .clone()
-        .or_else(|| attachment.text.clone())
-        .or_else(|| attachment.fallback.clone())
-        .unwrap_or_default();
-    if headline.trim().is_empty() {
-        return Vec::new();
-    }
-    // The title names the page and the site says where it is.
-    let title = render_mrkdwn_as(flavour, &headline, names);
+pub(crate) fn render_attachment(
+    flavour: Flavour,
+    attachment: &Attachment,
+    names: &dyn Names,
+) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(pretext) = attachment
         .pretext
         .as_deref()
         .filter(|_| !attachment.is_unfurl)
     {
-        lines.push(render_mrkdwn_as(flavour, pretext, names));
+        lines.extend(
+            render_mrkdwn_as(flavour, pretext, names)
+                .lines()
+                .map(str::to_owned),
+        );
     }
-    match flavour {
-        Flavour::Markdown => {
-            if let Some(site) = attachment
-                .service
-                .as_deref()
-                .filter(|site| !site.is_empty())
-            {
-                lines.push(escape(site));
+
+    let author = attachment
+        .author_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| attachment.author_id.as_ref().and_then(|id| names.user(id)));
+    let channel = attachment
+        .channel_id
+        .as_ref()
+        .and_then(|id| names.channel(id))
+        .map(|name| format!("#{name}"));
+    let header = [author, channel]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let has_header = !header.is_empty();
+    if has_header {
+        lines.push(match flavour {
+            Flavour::Mrkdwn => header,
+            Flavour::Markdown => escape(&header),
+        });
+    } else if flavour == Flavour::Markdown {
+        if let Some(site) = attachment
+            .service
+            .as_deref()
+            .filter(|site| !site.is_empty())
+        {
+            lines.push(escape(site));
+        }
+    }
+
+    if let Some(title) = attachment
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        let title = render_mrkdwn_as(flavour, title, names);
+        match flavour {
+            Flavour::Markdown => {
+                lines.extend(title.lines().map(|line| format!("**{line}**")));
             }
-            lines.push(format!("**{title}**"));
-        }
-        Flavour::Mrkdwn => lines.push(match attachment.service.as_deref() {
-            Some(site) if !site.is_empty() => format!("{title} · {site}"),
-            _ => title,
-        }),
-    }
-    if let Some(text) = attachment.text.as_deref().filter(|text| *text != headline) {
-        let body = render_mrkdwn_as(flavour, text, names);
-        let body = body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        // Two lines of description are as much of someone else's web page as
-        // a conversation should carry; an app card's body is its own words,
-        // written for this message, so it is kept whole.
-        match attachment.is_unfurl {
-            true => lines.extend(body.into_iter().take(UNFURL_LINES)),
-            false => lines.extend(body),
+            Flavour::Mrkdwn => {
+                let title = match attachment.service.as_deref() {
+                    Some(site) if !site.is_empty() && !has_header => {
+                        format!("{title} · {site}")
+                    }
+                    _ => title,
+                };
+                lines.extend(title.lines().map(str::to_owned));
+            }
         }
     }
+
+    let body = if attachment.blocks.is_empty() {
+        attachment
+            .text
+            .as_deref()
+            .or(attachment.fallback.as_deref())
+            .map(|text| render_mrkdwn_as(flavour, text, names))
+    } else {
+        Some(
+            attachment
+                .blocks
+                .iter()
+                .map(|block| render_block_as(flavour, block, names))
+                .filter(|part| !part.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
+        let body = body.trim_end_matches('\n').lines().map(str::to_owned);
+        match (flavour, attachment.is_unfurl) {
+            (Flavour::Mrkdwn, true) => lines.extend(body.take(UNFURL_LINES)),
+            _ => lines.extend(body),
+        }
+    }
+
     if !attachment.fields.is_empty() {
         lines.push(
             attachment
@@ -532,10 +578,28 @@ pub fn render_block(block: &Value, names: &dyn Names) -> String {
 /// The same, in the flavour asked for.
 pub fn render_block_as(flavour: Flavour, block: &Value, names: &dyn Names) -> String {
     match string(block, "type") {
-        "rich_text" => array(block, "elements")
-            .iter()
-            .map(|element| render_rich_text_element(flavour, element, names))
-            .collect::<String>(),
+        "rich_text" => {
+            let mut rendered = String::new();
+            let mut previous_was_list = false;
+            for element in array(block, "elements") {
+                let part = render_rich_text_element(flavour, element, names);
+                let part = part.trim_end_matches('\n');
+                if part.trim().is_empty() {
+                    continue;
+                }
+                let current_is_list = string(element, "type") == "rich_text_list";
+                if !rendered.is_empty() {
+                    rendered.push_str(if previous_was_list && !current_is_list {
+                        "\n\n"
+                    } else {
+                        "\n"
+                    });
+                }
+                rendered.push_str(part);
+                previous_was_list = current_is_list;
+            }
+            rendered
+        }
         "section" => {
             let mut parts = Vec::new();
             let text = render_text_object(flavour, block.get("text"), names);
@@ -1089,7 +1153,34 @@ mod tests {
         }]});
         assert_eq!(
             render_block_as(Flavour::Markdown, &block, &NoNames),
-            "  1. first\n     continued\n"
+            "  1. first\n     continued"
+        );
+    }
+
+    #[test]
+    fn adjacent_nested_lists_share_one_list_boundary() {
+        let block = json!({"type":"rich_text","elements":[
+            {
+                "type":"rich_text_list", "style":"bullet", "indent":0,
+                "elements":[{"type":"rich_text_section","elements":[
+                    {"type":"text","text":"parent"}
+                ]}]
+            },
+            {
+                "type":"rich_text_list", "style":"bullet", "indent":1,
+                "elements":[{"type":"rich_text_section","elements":[
+                    {"type":"text","text":"child"}
+                ]}]
+            },
+            {
+                "type":"rich_text_section",
+                "elements":[{"type":"text","text":"After"}]
+            }
+        ]});
+        assert_eq!(
+            render_block_as(Flavour::Markdown, &block, &NoNames),
+            "- parent\n  - child\n\nAfter",
+            "adjacent list nodes form one list; only following prose starts a paragraph"
         );
     }
 
@@ -1137,7 +1228,7 @@ mod tests {
         }));
         assert_eq!(
             rendered,
-            "  1. first\n  2. second\n> they said\n> this\n```\ncargo test\n```\n"
+            "  1. first\n  2. second\n\n> they said\n> this\n```\ncargo test\n```"
         );
     }
 
@@ -1269,11 +1360,75 @@ mod tests {
             is_unfurl: true,
             service: Some("example.com".to_owned()),
             url: Some("https://example.com/post".to_owned()),
+            ..Attachment::default()
         };
         assert_eq!(
             render_message(&[], "worth a read", &[preview], &[], &Roster),
             "worth a read\n\u{258e} Worth a read · example.com\n\u{258e} A long preview body that never reaches the buffer.",
             "a preview is a quote box of a title and two lines, not a page"
+        );
+    }
+
+    #[test]
+    fn markdown_attachment_body_is_plain_complete_and_keeps_paragraphs() {
+        let attachment = Attachment {
+            text: Some("first line\n\nsecond paragraph\nthird\nfourth".to_owned()),
+            fallback: Some("notification fallback".to_owned()),
+            is_unfurl: true,
+            ..Attachment::default()
+        };
+        assert_eq!(
+            render_attachment(Flavour::Markdown, &attachment, &Roster),
+            vec!["first line", "", "second paragraph", "third", "fourth"],
+            "body-only previews are not promoted to bold titles or truncated"
+        );
+        assert_eq!(
+            render_attachment(Flavour::Mrkdwn, &attachment, &Roster),
+            vec![format!("{UNFURL_BAR}first line"), UNFURL_BAR.to_owned(),],
+            "the legacy surface retains its two-line preview limit"
+        );
+    }
+
+    #[test]
+    fn attachment_prefers_rich_blocks_and_keeps_list_boundaries_and_metadata() {
+        let attachment = Attachment {
+            title: Some("Linked discussion".to_owned()),
+            text: Some("stale fallback".to_owned()),
+            author_id: Some(UserId("U1".to_owned())),
+            channel_id: Some(ChannelId("C1".to_owned())),
+            blocks: vec![json!({
+                "type": "rich_text",
+                "elements": [
+                    {"type": "rich_text_section", "elements": [
+                        {"type": "text", "text": "Context"}
+                    ]},
+                    {"type": "rich_text_list", "style": "bullet", "elements": [
+                        {"type": "rich_text_section", "elements": [
+                            {"type": "text", "text": "one"}
+                        ]},
+                        {"type": "rich_text_section", "elements": [
+                            {"type": "text", "text": "two"}
+                        ]}
+                    ]},
+                    {"type": "rich_text_section", "elements": [
+                        {"type": "text", "text": "Conclusion"}
+                    ]}
+                ]
+            })],
+            is_unfurl: true,
+            ..Attachment::default()
+        };
+        assert_eq!(
+            render_attachment(Flavour::Markdown, &attachment, &Roster),
+            vec![
+                "ada · #design",
+                "**Linked discussion**",
+                "Context",
+                "- one",
+                "- two",
+                "",
+                "Conclusion",
+            ]
         );
     }
 

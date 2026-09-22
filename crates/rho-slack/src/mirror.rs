@@ -1437,6 +1437,14 @@ struct StoredAttachment {
     is_unfurl: bool,
     url: Option<String>,
     service: Option<String>,
+    #[senax(default)]
+    author_name: Option<String>,
+    #[senax(default)]
+    author_id: Option<String>,
+    #[senax(default)]
+    channel_id: Option<String>,
+    #[senax(default)]
+    blocks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -1490,6 +1498,10 @@ impl From<&Message> for StoredMessage {
                     is_unfurl: attachment.is_unfurl,
                     url: attachment.url.clone(),
                     service: attachment.service.clone(),
+                    author_name: attachment.author_name.clone(),
+                    author_id: attachment.author_id.as_ref().map(|id| id.0.clone()),
+                    channel_id: attachment.channel_id.as_ref().map(|id| id.0.clone()),
+                    blocks: attachment.blocks.iter().map(ToString::to_string).collect(),
                 })
                 .collect(),
             files: message
@@ -1555,6 +1567,14 @@ impl From<&StoredMessage> for Message {
                     is_unfurl: attachment.is_unfurl,
                     url: attachment.url.clone(),
                     service: attachment.service.clone(),
+                    author_name: attachment.author_name.clone(),
+                    author_id: attachment.author_id.clone().map(UserId),
+                    channel_id: attachment.channel_id.clone().map(ChannelId),
+                    blocks: attachment
+                        .blocks
+                        .iter()
+                        .filter_map(|block| serde_json::from_str(block).ok())
+                        .collect(),
                 })
                 .collect(),
             files: stored
@@ -1611,6 +1631,67 @@ mod participant_compatibility_tests {
         latest_reply: Option<String>,
         edited: bool,
         reactions: Vec<StoredReaction>,
+    }
+
+    #[derive(Encode)]
+    struct LegacyAttachment {
+        title: Option<String>,
+        text: Option<String>,
+        fallback: Option<String>,
+        pretext: Option<String>,
+        fields: Vec<(String, String)>,
+        is_unfurl: bool,
+        url: Option<String>,
+        service: Option<String>,
+    }
+
+    #[test]
+    fn cached_attachments_without_rich_metadata_still_decode() {
+        let old = LegacyAttachment {
+            title: Some("Old preview".into()),
+            text: Some("old body".into()),
+            fallback: None,
+            pretext: None,
+            fields: Vec::new(),
+            is_unfurl: true,
+            url: Some("https://example.com".into()),
+            service: Some("example.com".into()),
+        };
+        let mut bytes = senax_encoder::encode(&old).unwrap();
+        let stored: StoredAttachment = senax_encoder::decode(&mut bytes).unwrap();
+        assert_eq!(stored.title.as_deref(), Some("Old preview"));
+        assert_eq!(stored.text.as_deref(), Some("old body"));
+        assert!(stored.author_name.is_none());
+        assert!(stored.author_id.is_none());
+        assert!(stored.channel_id.is_none());
+        assert!(stored.blocks.is_empty());
+    }
+
+    #[test]
+    fn attachment_rich_metadata_round_trips() {
+        let stored = StoredAttachment {
+            title: Some("Discussion".into()),
+            text: Some("fallback".into()),
+            fallback: None,
+            pretext: None,
+            fields: Vec::new(),
+            is_unfurl: true,
+            url: Some("https://example.com".into()),
+            service: None,
+            author_name: Some("Ada".into()),
+            author_id: Some("U1".into()),
+            channel_id: Some("C1".into()),
+            blocks: vec![
+                serde_json::json!({
+                    "type": "rich_text",
+                    "elements": []
+                })
+                .to_string(),
+            ],
+        };
+        let mut bytes = senax_encoder::encode(&stored).unwrap();
+        let decoded: StoredAttachment = senax_encoder::decode(&mut bytes).unwrap();
+        assert_eq!(decoded, stored);
     }
 
     #[test]

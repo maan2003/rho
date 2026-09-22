@@ -76,6 +76,19 @@ impl TextLayout {
                             });
                             let mut offset = row_start;
                             for line in source[row_start..end].split_inclusive('\n') {
+                                // Slack source newlines are author-entered, not soft
+                                // wraps. An unindented following paragraph is not a
+                                // lazy Markdown continuation of this list item.
+                                if offset != row_start
+                                    && !line.trim().is_empty()
+                                    && line
+                                        .chars()
+                                        .take_while(|ch| *ch == ' ' || *ch == '\t')
+                                        .count()
+                                        < indent as usize
+                                {
+                                    break;
+                                }
                                 let end = offset + line.trim_end_matches('\n').len();
                                 lists.insert(offset, (offset..end, indent));
                                 offset += line.len();

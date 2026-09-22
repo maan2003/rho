@@ -955,6 +955,13 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view
+            && view
+                .clone()
+                .update(cx, |view, cx| view.toggle_cursor_preview(window, cx))
+        {
+            return;
+        }
         // An app control is more specific than the thread around its message.
         if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
             let view = view.clone();

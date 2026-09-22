@@ -495,8 +495,10 @@ fn parse_ts(value: &str) -> Option<Ts> {
 }
 
 impl Names for Model {
-    fn link_label(&self, url: &str, _label: &str) -> Option<String> {
-        self.archive_link_label(url)
+    fn link_label(&self, url: &str, label: &str) -> Option<String> {
+        (label.is_empty() || label == url)
+            .then(|| self.archive_link_label(url))
+            .flatten()
     }
 
     fn user(&self, id: &UserId) -> Option<String> {
@@ -2819,18 +2821,30 @@ mod tests {
     }
 
     #[test]
-    fn markdown_uses_the_distinct_archive_label() {
+    fn markdown_preserves_archive_link_labels_and_names_only_bare_links() {
         let mut model = model();
         model.set_archive_domain("acme");
-        let message = message(
-            "C1",
-            "1.000000",
-            "U1",
-            "see <https://acme.slack.com/archives/C1/p1700000000123456|this>",
-        );
+        let url = "https://acme.slack.com/archives/C1/p1700000000123456";
+        let labelled = message("C1", "1.000000", "U1", &format!("see <{url}|why>"));
         assert_eq!(
-            model.markdown_parts(&message).0,
-            "see [↪ message in #design](https://acme.slack.com/archives/C1/p1700000000123456)"
+            model.markdown_parts(&labelled).0,
+            format!("see [why]({url})"),
+            "a sender's meaningful legacy label is content"
+        );
+
+        let mut rich = message("C1", "2.000000", "U1", "");
+        rich.blocks = vec![json!({
+            "type": "rich_text",
+            "elements": [{"type": "rich_text_section", "elements": [
+                {"type": "link", "url": url, "text": "why"},
+                {"type": "text", "text": " / "},
+                {"type": "link", "url": url, "text": url}
+            ]}]
+        })];
+        assert_eq!(
+            model.markdown_parts(&rich).0,
+            format!("[why]({url}) / [↪ message in #design]({url})"),
+            "rich labels are preserved while a raw URL gets the archive reference"
         );
     }
 

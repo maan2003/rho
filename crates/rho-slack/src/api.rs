@@ -1377,6 +1377,30 @@ fn number(value: &Value) -> Option<u32> {
         .and_then(|number| u32::try_from(number).ok())
 }
 
+/// Display blocks can arrive directly on an app attachment or nested in the
+/// `message_blocks` wrappers Slack uses for a linked Slack message.
+fn attachment_blocks(attachment: &Value) -> Vec<Value> {
+    if let Some(blocks) = attachment["blocks"]
+        .as_array()
+        .filter(|blocks| !blocks.is_empty())
+    {
+        return blocks.clone();
+    }
+    attachment["message_blocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|wrapper| {
+            wrapper["message"]["blocks"]
+                .as_array()
+                .or_else(|| wrapper["blocks"].as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        })
+        .cloned()
+        .collect()
+}
+
 /// Parses one message payload. The same shape arrives over the websocket, so
 /// this is the single place that decides what a message is.
 pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Message> {
@@ -1422,6 +1446,20 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
                 service: string(&attachment["service_name"])
                     .or_else(|| string(&attachment["service_url"]))
                     .filter(|name| !name.is_empty()),
+                author_name: string(&attachment["author_name"]).filter(|name| !name.is_empty()),
+                author_id: string(&attachment["author_id"])
+                    .filter(|id| !id.is_empty())
+                    .map(UserId),
+                channel_id: string(&attachment["channel_id"])
+                    .filter(|id| !id.is_empty())
+                    .map(ChannelId)
+                    .or_else(|| {
+                        attachment["message_blocks"]
+                            .as_array()?
+                            .iter()
+                            .find_map(|block| string(&block["channel"]).map(ChannelId))
+                    }),
+                blocks: attachment_blocks(attachment),
             })
             .collect(),
         subtype: string(&value["subtype"]).filter(|subtype| !subtype.is_empty()),
@@ -1650,7 +1688,23 @@ mod tests {
                 "text": "hello",
                 "blocks": [{"type": "rich_text"}],
                 "files": [{"name": "log.txt"}],
-                "attachments": [{"title": "Build", "fallback": "b"}],
+                "attachments": [{
+                    "title": "Build",
+                    "fallback": "b",
+                    "author_name": "Ada",
+                    "author_id": "U2",
+                    "channel_id": "C2",
+                    "message_blocks": [{
+                        "team": "T1",
+                        "channel": "C2",
+                        "message": {"blocks": [{
+                            "type": "rich_text",
+                            "elements": [{"type": "rich_text_section", "elements": [
+                                {"type": "text", "text": "rich body"}
+                            ]}]
+                        }]}
+                    }]
+                }],
             }),
             &ChannelId("C1".into()),
         )
@@ -1660,7 +1714,13 @@ mod tests {
         assert_eq!(message.user, Some(UserId("U1".into())));
         assert_eq!(message.blocks.len(), 1);
         assert_eq!(message.files[0].title, "log.txt");
-        assert_eq!(message.attachments[0].title.as_deref(), Some("Build"));
+        let attachment = &message.attachments[0];
+        assert_eq!(attachment.title.as_deref(), Some("Build"));
+        assert_eq!(attachment.author_name.as_deref(), Some("Ada"));
+        assert_eq!(attachment.author_id, Some(UserId("U2".into())));
+        assert_eq!(attachment.channel_id, Some(ChannelId("C2".into())));
+        assert_eq!(attachment.blocks.len(), 1);
+        assert_eq!(attachment.blocks[0]["type"], "rich_text");
 
         // A message that is not in a thread is its own thread root.
         let root = parse_message(&json!({"ts": "5.0"}), &ChannelId("C1".into())).unwrap();

@@ -9,7 +9,7 @@
 //! transcript beside it.
 
 use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -51,6 +51,7 @@ struct MessageTextFold;
 struct PreviewRows;
 struct CodeBlockRows;
 struct ReactionCountFold;
+struct PreviewTailFold;
 
 struct EmojiDecoration {
     inlay: InlayId,
@@ -152,6 +153,9 @@ pub struct ConversationView {
     next_custom_inlay: usize,
     text_folds: Vec<Range<MultiBufferAnchor>>,
     reaction_folds: Vec<Range<MultiBufferAnchor>>,
+    preview_folds: Vec<Range<MultiBufferAnchor>>,
+    preview_ranges: Vec<Range<MultiBufferAnchor>>,
+    expanded_previews: HashSet<(Ts, usize)>,
     text_inlays: Vec<InlayId>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -386,6 +390,9 @@ struct LineMeta {
     edited: bool,
     /// Attachment chrome, decorated without border glyphs in the buffer.
     preview: bool,
+    preview_start: bool,
+    preview_hidden: Option<usize>,
+    preview_toggle: Option<usize>,
     reply_users: Vec<crate::types::UserId>,
     reaction_counts: Vec<Range<usize>>,
 }
@@ -582,6 +589,9 @@ impl ConversationView {
             next_custom_inlay: 1,
             text_folds: Vec::new(),
             reaction_folds: Vec::new(),
+            preview_folds: Vec::new(),
+            preview_ranges: Vec::new(),
+            expanded_previews: HashSet::new(),
             text_inlays: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -655,11 +665,67 @@ impl ConversationView {
             || !self
                 .transcript
                 .line_meta(point.row, cx)
-                .is_some_and(|meta| meta.interaction.is_some())
+                .is_some_and(|meta| meta.interaction.is_some() || meta.preview_toggle.is_some())
         {
             return;
         }
         cx.emit(Event::ActivateRequested);
+    }
+
+    /// Expands/collapses a quote before Enter considers URL or thread
+    /// navigation.
+    pub fn toggle_cursor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let row = self.cursor_row(cx) as u32;
+        let Some(index) = self
+            .transcript
+            .line_meta(row, cx)
+            .and_then(|meta| meta.preview_toggle)
+        else {
+            return false;
+        };
+        let Some(message) = self.cursor_message(cx) else {
+            return false;
+        };
+        let key = (message.ts.clone(), index);
+        if !self.expanded_previews.remove(&key) {
+            self.expanded_previews.insert(key);
+        }
+        let key = Row::Message(message.ts.clone());
+        let item = self.item_for(&message, cx);
+        let toggle_row = item
+            .lines
+            .iter()
+            .position(|meta| meta.preview_toggle == Some(index))
+            .unwrap();
+        self.editing = true;
+        self.remove_emoji_row(&key, cx);
+        self.transcript.replace(&key, item, cx);
+        self.editing = false;
+        self.refresh(window, cx);
+        if let Some(range) = self.transcript.range_of(&key) {
+            let source = self.transcript.buffer().read(cx).snapshot();
+            let row = text::ToPoint::to_point(&range.start, &source).row + toggle_row as u32;
+            let anchor = source.anchor_before(Point::new(row, 0));
+            if let Some(anchor) = self
+                .multi_buffer
+                .read(cx)
+                .snapshot(cx)
+                .anchor_in_excerpt(anchor)
+            {
+                self.editor.update(cx, |editor, cx| {
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_anchor_ranges([anchor..anchor]);
+                        },
+                    );
+                    editor.request_autoscroll(Autoscroll::fit(), cx);
+                });
+            }
+        }
+        true
     }
 
     pub fn interaction_options(
@@ -1968,10 +2034,7 @@ impl ConversationView {
     ) -> (Vec<Range<MultiBufferAnchor>>, Vec<Range<MultiBufferAnchor>>) {
         let editor = self.editor.read(cx);
         (
-            editor
-                .highlighted_rows::<PreviewRows>(cx)
-                .map(|(range, _)| range)
-                .collect(),
+            self.preview_ranges.clone(),
             editor
                 .highlighted_rows::<CodeBlockRows>(cx)
                 .map(|(range, _)| range)
@@ -2051,9 +2114,24 @@ impl ConversationView {
         let code_blocks = layout
             .code_blocks
             .iter()
+            .filter(|block| {
+                let row = source.offset_to_point(block.start).row;
+                !self
+                    .transcript
+                    .line_meta(row, cx)
+                    .is_some_and(|meta| meta.preview_hidden.is_some())
+            })
             .cloned()
             .filter_map(&range)
             .collect::<Vec<_>>();
+        let mut indents = layout
+            .lists
+            .iter()
+            .map(|(range, indent)| (range.start, (range.clone(), *indent)))
+            .collect::<BTreeMap<_, _>>();
+        let mut inset_rows = Vec::new();
+        let mut hidden: Vec<Range<usize>> = Vec::new();
+        let mut controls = Vec::new();
         let mut previews: Vec<Range<MultiBufferAnchor>> = Vec::new();
         let mut previous_preview = false;
         let mut reaction_folds = Vec::new();
@@ -2066,13 +2144,31 @@ impl ConversationView {
                 if meta.preview
                     && let Some(anchored) = range(offset..offset + line.len().saturating_sub(1))
                 {
-                    if previous_preview {
+                    if previous_preview && !meta.preview_start {
                         previews.last_mut().unwrap().end = anchored.end;
                     } else {
                         previews.push(anchored);
                     }
                 }
                 previous_preview = meta.preview;
+                if let Some(column) = meta.preview_hidden {
+                    let start = if column == 0 {
+                        offset.saturating_sub(1)
+                    } else {
+                        offset + column
+                    };
+                    let end = offset + line.trim_end_matches('\n').len();
+                    if let Some(last) = hidden.last_mut().filter(|last| last.end + 1 >= start) {
+                        last.end = end;
+                    } else {
+                        hidden.push(start..end);
+                    }
+                }
+                if meta.preview_toggle.is_some()
+                    && let Some(control) = range(offset..offset + line.len() - 1)
+                {
+                    controls.push(control);
+                }
                 for count in &meta.reaction_counts {
                     if let Some(anchored) = range(offset + count.start..offset + count.end) {
                         let label: gpui::SharedString = line[count.clone()].to_owned().into();
@@ -2098,33 +2194,82 @@ impl ConversationView {
             } else {
                 previous_preview = false;
             }
+            let meta = self.transcript.line_meta(row as u32, cx);
+            let in_code = layout
+                .code_blocks
+                .iter()
+                .any(|block| block.contains(&offset));
+            if (meta.is_some_and(|meta| meta.preview) || in_code)
+                && !meta.is_some_and(|meta| meta.preview_hidden == Some(0))
+                && !line.trim().is_empty()
+            {
+                inset_rows.push(offset);
+                let end = offset + line.trim_end_matches('\n').len();
+                let indent = indents.entry(offset).or_insert_with(|| {
+                    (
+                        offset..end,
+                        line.chars()
+                            .take_while(|ch| *ch == ' ' || *ch == '\t')
+                            .count() as u32,
+                    )
+                });
+                indent.1 += 2;
+            }
             offset += line.len();
         }
+        let preview_folds = hidden
+            .iter()
+            .cloned()
+            .filter_map(&range)
+            .collect::<Vec<_>>();
         let mut folds = layout
             .concealed
-            .into_iter()
+            .iter()
+            .cloned()
             .filter_map(&range)
             .collect::<Vec<_>>();
         let mut inlays = Vec::new();
+        for &offset in &inset_rows {
+            if layout.bullets.iter().any(|bullet| bullet.start == offset) {
+                continue;
+            }
+            let mut visible = offset;
+            while let Some(concealed) = layout.concealed.iter().find(|range| range.start == visible)
+            {
+                visible = concealed.end;
+            }
+            // Right bias keeps the inset outside a preceding concealed
+            // paragraph break ending at this exact source position.
+            if let Some(anchor) = snapshot.anchor_in_excerpt(source.anchor_after(visible)) {
+                let id = self.next_custom_inlay;
+                self.next_custom_inlay += 1;
+                inlays.push(Inlay::custom(id, anchor, "  "));
+            }
+        }
         for bullet in layout.bullets {
+            let label = if inset_rows.contains(&bullet.start) {
+                "  •"
+            } else {
+                "•"
+            };
             if let Some(range) = range(bullet) {
                 let id = self.next_custom_inlay;
                 self.next_custom_inlay += 1;
-                inlays.push(Inlay::custom(id, range.start, "•"));
+                inlays.push(Inlay::custom(id, range.start, label));
                 folds.push(range);
             }
         }
         let code = layout.code.into_iter().filter_map(&range).collect();
         let underlines = layout.underlines.into_iter().filter_map(&range).collect();
         let mentions = layout.mentions.into_iter().filter_map(&range).collect();
-        let indents = layout
-            .lists
-            .into_iter()
+        let indents = indents
+            .into_values()
             .filter_map(|(source, indent)| range(source).map(|range| (range, indent)))
             .collect::<Vec<_>>();
-        let mut spacing: Vec<_> = layout
+        let spacing: Vec<_> = layout
             .paragraph_gaps
             .into_iter()
+            .filter(|offset| !hidden.iter().any(|range| range.contains(offset)))
             .filter_map(|offset| {
                 let anchor = anchor(offset)?;
                 Some(editor::display_map::RowSpacing {
@@ -2134,26 +2279,6 @@ impl ConversationView {
                 })
             })
             .collect();
-        for preview in &previews {
-            let start = multi_buffer::ToOffset::to_offset(&preview.start, &snapshot).0;
-            if start > 0 {
-                let before = snapshot.anchor_before(multi_buffer::MultiBufferOffset(start - 1));
-                // Only a new preview group needs separation from speech.
-                let row = multi_buffer::ToPoint::to_point(&preview.start, &snapshot).row;
-                if row > 0
-                    && !self
-                        .transcript
-                        .line_meta(row - 1, cx)
-                        .is_some_and(|meta| meta.preview)
-                {
-                    spacing.push(editor::display_map::RowSpacing {
-                        range: before..before,
-                        minimum_height: 0.,
-                        gap_after: 0.25,
-                    });
-                }
-            }
-        }
         let colors = cx.theme().colors();
         let code_style = gpui::HighlightStyle {
             color: Some(colors.terminal_ansi_yellow.into()),
@@ -2164,6 +2289,10 @@ impl ConversationView {
             color: Some(colors.terminal_ansi_blue.into()),
             background_color: Some(gpui::Hsla::from(colors.terminal_ansi_blue).opacity(0.10)),
             font_weight: Some(gpui::FontWeight::NORMAL),
+            ..Default::default()
+        };
+        let control_style = gpui::HighlightStyle {
+            color: Some(colors.terminal_ansi_blue.into()),
             ..Default::default()
         };
         let underline_style = gpui::HighlightStyle {
@@ -2219,23 +2348,38 @@ impl ConversationView {
                 .map(|crease| crease.range().clone())
                 .collect();
             editor.fold_creases(reaction_folds, false, window, cx);
-            editor.clear_row_highlights::<PreviewRows>();
+            editor.remove_folds_with_type(
+                &self.preview_folds,
+                TypeId::of::<PreviewTailFold>(),
+                false,
+                cx,
+            );
+            editor.fold_creases(
+                preview_folds
+                    .iter()
+                    .cloned()
+                    .map(|range| {
+                        Crease::simple(
+                            range,
+                            FoldPlaceholder::concealed(TypeId::of::<PreviewTailFold>()),
+                        )
+                    })
+                    .collect(),
+                false,
+                window,
+                cx,
+            );
+            editor.highlight_text(
+                editor::HighlightKey::SyntaxTreeView(usize::MAX - 604),
+                controls,
+                control_style,
+                cx,
+            );
             editor.clear_row_highlights::<CodeBlockRows>();
-            for range in &previews {
-                editor.highlight_rows::<PreviewRows>(
-                    range.clone(),
-                    |cx| cx.theme().colors().element_background.into(),
-                    editor::RowHighlightOptions {
-                        autoscroll: false,
-                        include_gutter: false,
-                    },
-                    cx,
-                );
-            }
             for range in code_blocks {
                 editor.highlight_rows::<CodeBlockRows>(
                     range,
-                    |cx| cx.theme().colors().element_background.into(),
+                    |cx| gpui::Hsla::from(cx.theme().colors().element_background).opacity(0.45),
                     editor::RowHighlightOptions {
                         autoscroll: false,
                         include_gutter: false,
@@ -2244,13 +2388,15 @@ impl ConversationView {
                 );
             }
             editor.highlight_gutter::<PreviewRows>(
-                previews,
-                |cx| cx.theme().colors().border_variant.into(),
+                previews.clone(),
+                |cx| gpui::Hsla::from(cx.theme().colors().text_muted).opacity(0.65),
                 cx,
             );
             editor.set_hanging_indents(indents, cx);
         });
         self.text_folds = folds;
+        self.preview_folds = preview_folds;
+        self.preview_ranges = previews;
         spacing
     }
 
@@ -2751,6 +2897,9 @@ impl ConversationView {
                     }
                 }
                 Op::Remove(key) => {
+                    if let Row::Message(ts) = &key {
+                        self.expanded_previews.retain(|(message, _)| message != ts);
+                    }
                     self.remove_emoji_row(&key, cx);
                     self.avatar_authors.remove(&key);
                     self.emoji_pending.remove(&key);
@@ -3046,7 +3195,13 @@ impl ConversationView {
             } else {
                 self.avatar_authors.remove(&row);
             }
-            message_item_with_header(message, session.model(), in_thread, header)
+            message_item_with_header(
+                message,
+                session.model(),
+                in_thread,
+                header,
+                &self.expanded_previews,
+            )
         };
         let images = image_boxes(&item)
             .into_iter()
@@ -3582,6 +3737,28 @@ fn image_block(
     }
 }
 
+/// Bound the initial quote by both lines and characters, cutting at a word
+/// boundary. Source and formatting beyond this point remain in the buffer.
+fn preview_cutoff(text: &str) -> Option<usize> {
+    let mut lines = 0;
+    let mut boundary = 0;
+    for (characters, (offset, ch)) in text.char_indices().enumerate() {
+        if ch.is_whitespace() {
+            boundary = offset;
+        }
+        if ch == '\n' {
+            lines += 1;
+        }
+        if characters >= 480 || lines >= 6 {
+            if text[boundary..].chars().count() > 80 {
+                return Some(boundary);
+            }
+            return None;
+        }
+    }
+    None
+}
+
 fn continues_author(previous: &Message, message: &Message, model: &Model) -> bool {
     previous.user.is_some()
         && previous.user == message.user
@@ -3599,7 +3776,7 @@ fn continues_author(previous: &Message, message: &Message, model: &Model) -> boo
 /// Keeping metadata off the body preserves Markdown block syntax consistently.
 #[cfg(test)]
 fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
-    message_item_with_header(message, model, in_thread, true)
+    message_item_with_header(message, model, in_thread, true, &HashSet::new())
 }
 
 fn message_item_with_header(
@@ -3607,6 +3784,7 @@ fn message_item_with_header(
     model: &Model,
     in_thread: bool,
     header: bool,
+    expanded: &HashSet<(Ts, usize)>,
 ) -> Rendered {
     let thread = Some(message.thread_root());
     let indent = " ".repeat(BODY_INDENT);
@@ -3638,7 +3816,7 @@ fn message_item_with_header(
             false => Class::Sender,
         },
     );
-    let (said, chrome) = model.markdown_parts(message);
+    let said = crate::markdown::body(&message.blocks, &message.text, &[], &[], model);
     let said = said.trim_end().to_owned();
     let mut links = crate::block::links(&message.blocks, &message.text, &message.attachments);
     // Keep original attachment-title labels as well as rewritten body links.
@@ -3710,27 +3888,81 @@ fn message_item_with_header(
             .map_or(0, |(row, _)| row);
         lines[body_start + row].edited = true;
     }
-    // Attachment and preview text follows the body at the same margin.
-    if !chrome.is_empty() {
-        let text = chrome.join("\n");
-        for line in text.split('\n') {
-            if message
-                .attachments
-                .iter()
-                .filter_map(|attachment| attachment.service.as_deref())
-                .any(|site| crate::markdown::escape(site) == line)
+    // Keep the full quote source. Display folds hide only the collapsed tail;
+    // the toggle is a source row, not a mouse-only block.
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        let text =
+            crate::block::render_attachment(crate::block::Flavour::Markdown, attachment, model)
+                .into_iter()
+                .map(|line| crate::emoji::render(&line))
+                .collect::<Vec<_>>()
+                .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        // A blank source boundary prevents Markdown's lazy list continuation
+        // from absorbing the next attachment or its Show more control.
+        spans.push(Span::plain("\n"));
+        lines.push(LineMeta::default());
+        let cutoff = attachment
+            .is_unfurl
+            .then(|| preview_cutoff(&text))
+            .flatten();
+        let is_expanded = expanded.contains(&(message.ts.clone(), index));
+        let mut offset = 0;
+        for (row, line) in text.split('\n').enumerate() {
+            let mut line_meta = meta(line);
+            line_meta.preview = true;
+            line_meta.preview_start = row == 0;
+            if let Some(cutoff) = cutoff.filter(|_| !is_expanded)
+                && offset + line.len() > cutoff
+            {
+                line_meta.preview_hidden = Some(cutoff.saturating_sub(offset));
+            }
+            if attachment
+                .service
+                .as_deref()
+                .is_some_and(|site| crate::markdown::escape(site) == line)
+                || (row == 0
+                    && attachment.is_unfurl
+                    && (attachment.author_name.is_some()
+                        || attachment.author_id.is_some()
+                        || attachment.channel_id.is_some()))
             {
                 spans.push(Span::styled(line, Class::Muted));
             } else {
-                push_body(&mut spans, line, model, &message.files);
+                push_body(&mut spans, line, model, &[]);
             }
             spans.push(Span::plain("\n"));
+            lines.push(line_meta);
+            offset += line.len() + 1;
         }
-        lines.extend(text.split('\n').map(|line| {
-            let mut line_meta = meta(line);
-            line_meta.preview = line_meta.file.is_none();
-            line_meta
-        }));
+        if cutoff.is_some() {
+            spans.push(Span::plain("\n"));
+            lines.push(LineMeta {
+                preview: true,
+                ..LineMeta::default()
+            });
+            spans.push(Span::styled(
+                if is_expanded {
+                    "Show less ↑\n"
+                } else {
+                    "Show more ↓\n"
+                },
+                Class::Muted,
+            ));
+            lines.push(LineMeta {
+                preview: true,
+                preview_toggle: Some(index),
+                ..LineMeta::default()
+            });
+        }
+    }
+    for file in message.files.iter().filter(|file| !file.is_image()) {
+        let line = file.line();
+        push_body(&mut spans, &line, model, &message.files);
+        spans.push(Span::plain("\n"));
+        lines.push(meta(&line));
     }
     // The pictures hang under everything the message said and named, and
     // above its reactions and its thread line: those are about the message,
@@ -4740,7 +4972,7 @@ mod tests {
             continues_author(&first, &next, &model),
             "edits do not start a new author group"
         );
-        let rendered = message_item_with_header(&next, &model, false, false);
+        let rendered = message_item_with_header(&next, &model, false, false, &HashSet::new());
         assert_eq!(rendered.text, "two\n");
         assert!(rendered.lines[0].edited);
     }
@@ -5004,6 +5236,34 @@ mod tests {
     }
 
     #[test]
+    fn preview_collapse_retains_unicode_source_and_a_separate_toggle_row() {
+        let body = format!("{}\n{}", "🧵 café words ".repeat(60), "tail ".repeat(30));
+        let message = parsed(json!({
+            "ts":"1700000000.0", "user":"U1", "text":"look",
+            "attachments":[{"is_msg_unfurl":true,"text":body}]
+        }));
+        let rendered = message_item(&message, &model(), false);
+        assert!(rendered.text.contains(&body));
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.preview_hidden.is_some())
+        );
+        let control = rendered
+            .text
+            .lines()
+            .position(|line| line == "Show more ↓")
+            .unwrap();
+        assert_eq!(rendered.lines[control].preview_toggle, Some(0));
+        assert!(rendered.lines[control].link.is_none());
+        assert!(rendered.lines[control].thread.is_none());
+        assert_eq!(preview_cutoff("short quote"), None);
+        let cutoff = preview_cutoff(&body).unwrap();
+        assert!(body.is_char_boundary(cutoff));
+    }
+
+    #[test]
     fn an_unfurl_reads_as_a_quote_box_and_enter_opens_it() {
         let preview = parsed(json!({
             "ts": "1700000120.0",
@@ -5024,8 +5284,8 @@ mod tests {
             "the title names the page and the site says where it is: {text}"
         );
         assert!(
-            text.contains("the second line") && !text.contains("the third line"),
-            "two lines of someone else's page, no more: {text}"
+            text.contains("the second line") && text.contains("the third line"),
+            "the full source remains available for expansion and copying: {text}"
         );
         assert!(
             !text.contains("\u{258e}"),

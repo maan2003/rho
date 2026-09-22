@@ -588,13 +588,17 @@ transcript renders through, and owns none of its own. Concretely:
 - Edits use a display-only `✎` suffix on the last content line, not a source
   metadata row. Markdown link targets and code fences remain unchanged.
 - Attachments and previews follow the body, with a painted inner-gutter rule,
-  muted site name, emphasized title, and a full-width neutral background.
-  Code-block backgrounds also extend to the right edge, including blank lines.
+  two-character inset, and no background fill. Supplied author/channel metadata
+  forms a compact header; only actual titles are emphasized. Long previews keep
+  their full source behind cursor-addressable Show more / Show less rows.
+  Code blocks have the same inner padding and a faint background extending to
+  the right edge, including blank lines. Prose after lists returns to the inset.
   Reactions have a compact row with smaller counts; replies have a separate
   cursor-addressable row with participant avatars. Enter on that row opens the
   thread. Mentions use a faint blue highlight rather than yellow.
-  Same-workspace archive URLs display as message/reply references and Enter
-  jumps to their message, fetching its window when absent. Workspace identity
+  Same-workspace archive URLs keep sender-authored labels; raw URLs display as
+  message/reply references. Enter jumps to their message, fetching its window
+  when absent. Workspace identity
   comes from Slack's RTM domain and is retained offline; other hosts stay URLs.
   The sidebar distinguishes unread conversations by text color rather than
   weight, with a separate accent for mentions.

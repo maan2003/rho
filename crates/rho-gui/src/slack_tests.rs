@@ -313,7 +313,7 @@ async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
             assert!(display.contains("<u>literal</u>"), "{display}");
             assert!(display.contains("app_id <u>literal code</u>"), "{display}");
             assert!(
-                display.contains("- not a list\n\ncode spacing"),
+                display.contains("  - not a list\n\n  code spacing"),
                 "{display}"
             );
             assert!(!display.contains("Plan\n\n"), "{display}");
@@ -331,7 +331,7 @@ async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
             assert_eq!(
                 previews.len(),
                 1,
-                "adjacent preview rows share a full-width background"
+                "one preview has one continuous gutter rule"
             );
             assert_eq!(code_blocks.len(), 1);
             let source = view.transcript_text_for_test(cx);
@@ -566,7 +566,7 @@ async fn custom_emoji_render_as_inlays_without_replacing_buffer_text(cx: &mut Te
         "message and reaction rows do not show timestamps: {display}"
     );
     assert!(
-        display.contains("Thu 1 Jan\nlet answer = 42;"),
+        display.contains("Thu 1 Jan\n  let answer = 42;"),
         "a leading code block starts beside its gutter avatar, without a blank header: {display}"
     );
     assert!(
@@ -4697,7 +4697,7 @@ async fn archive_reference_enter_fetches_and_selects_the_referenced_reply(cx: &m
                 workspace
                     .slack_transcript_for_test(cx)
                     .iter()
-                    .position(|line| line.contains("↪ reply in #design"))
+                    .position(|line| line.contains("[context]("))
             })
             .unwrap();
         if row.is_some() {
@@ -4707,7 +4707,7 @@ async fn archive_reference_enter_fetches_and_selects_the_referenced_reply(cx: &m
             .timer(std::time::Duration::from_millis(10))
             .await;
     }
-    let row = row.expect("special archive reference rendered") as u32;
+    let row = row.expect("authored archive link label preserved") as u32;
     assert_eq!(fake.calls("conversations.replies"), 0);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -4757,6 +4757,174 @@ async fn archive_reference_enter_fetches_and_selects_the_referenced_reply(cx: &m
                     .iter()
                     .any(|line| line.contains("archive reply target"))
             );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn quoted_previews_expand_without_rewriting_source_or_losing_their_inset(
+    cx: &mut TestAppContext,
+) {
+    use editor::SelectionEffects;
+    use editor::display_map::ToDisplayPoint as _;
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    use text::Point;
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let paragraph = "Since this is a separate paragraph, every wrapped continuation must use the quote inset and not the preceding list's hanging indent. ".repeat(5);
+    let quote = format!(
+        "<!channel> Opening paragraph.\n\n1. First option\n2. Second option\nTrade-offs:\n- A bullet with enough words to wrap onto another visual row in a narrow window.\n{paragraph}\nLAST QUOTED LINE"
+    );
+    fake.add_message("C1", serde_json::json!({
+        "ts":"99.0", "user":"UA", "text":"See <https://acme.slack.com/archives/C1/p100123456|why>",
+        "attachments":[
+            {"is_msg_unfurl":true, "author_name":"Ada", "channel_id":"C1",
+             "from_url":"https://acme.slack.com/archives/C1/p100123456", "text":quote},
+            {"title":"Another preview", "text":"A short independent preview.", "title_link":"https://example.com"}
+        ]
+    }));
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let session = cx.new(|cx| {
+        rho_slack::session::Session::with_client(
+            client,
+            rho_slack::config::Paths::under(state.path()),
+            cx,
+        )
+    });
+    let window = cx.add_window(|window, cx| {
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            crate::workspace::Workspace::slack_hooks(),
+            window,
+            cx,
+        )
+    });
+    cx.simulate_window_resize(*window, gpui::size(gpui::px(500.), gpui::px(800.)));
+    let mut ready = false;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        ready = window
+            .update(cx, |view, _, cx| {
+                view.display_text_for_test(cx).contains("Show more")
+            })
+            .unwrap();
+        if ready {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(ready);
+    cx.draw_window(*window);
+    let collapsed_source = window
+        .update(cx, |view, window, cx| {
+            let source = view.transcript_text_for_test(cx);
+            let display = view.display_text_for_test(cx);
+            assert!(
+                source.contains("LAST QUOTED LINE"),
+                "hidden text remains in source"
+            );
+            assert!(!display.contains("LAST QUOTED LINE"), "{display}");
+            assert!(display.contains("why"), "{display}");
+            assert!(
+                display.lines().any(|line| line.starts_with("  @channel")),
+                "{display}"
+            );
+            assert!(!display.contains("↪ message"), "{display}");
+            assert!(!display.contains("**"), "{display}");
+            assert!(
+                display
+                    .lines()
+                    .any(|line| line.starts_with("  Another preview")),
+                "{display}"
+            );
+            assert!(
+                display.lines().any(|line| line.starts_with("  Show more")),
+                "{display}"
+            );
+            assert!(
+                display.lines().any(|line| line.starts_with("  Ada")),
+                "{display}"
+            );
+            assert!(
+                display.lines().any(|line| line.starts_with("  1. First")),
+                "{display}"
+            );
+            assert_eq!(view.chrome_ranges_for_test(cx).0.len(), 2);
+            view.editor().update(cx, |editor, cx| {
+                assert!(
+                    editor.highlighted_display_rows(window, cx).is_empty(),
+                    "quotes have no background fill"
+                );
+                let row = source
+                    .lines()
+                    .position(|line| line == "Show more ↓")
+                    .unwrap() as u32;
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
+                });
+            });
+            assert!(view.toggle_cursor_preview(window, cx));
+            source
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.draw_window(*window);
+    window
+        .update(cx, |view, window, cx| {
+            let source = view.transcript_text_for_test(cx);
+            assert_eq!(
+                source,
+                collapsed_source.replace("Show more ↓", "Show less ↑")
+            );
+            let display = view.display_text_for_test(cx);
+            assert!(display.contains("LAST QUOTED LINE"), "{display}");
+            assert!(
+                display.lines().any(|line| line.starts_with("  • A bullet")),
+                "{display}"
+            );
+            let shown = display.lines().collect::<Vec<_>>();
+            let paragraph = shown
+                .iter()
+                .position(|line| line.contains("Since this"))
+                .unwrap();
+            assert!(shown[paragraph].starts_with("  Since"), "{display}");
+            assert!(
+                shown[paragraph + 1].starts_with("  ") && !shown[paragraph + 1].starts_with("   "),
+                "prose wraps at two-space quote inset, not list indent: {display}"
+            );
+            view.editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                let source_row = source
+                    .lines()
+                    .position(|line| line == "Show less ↑")
+                    .unwrap() as u32;
+                assert_eq!(
+                    editor.selections.newest::<Point>(&snapshot).head().row,
+                    source_row,
+                    "expansion retains cursor on toggle"
+                );
+                let point = Point::new(source_row, 0).to_display_point(&snapshot);
+                assert!(point.row() <= snapshot.max_point().row());
+            });
+            assert!(view.toggle_cursor_preview(window, cx));
+            assert!(!view.display_text_for_test(cx).contains("LAST QUOTED LINE"));
+            assert_eq!(view.transcript_text_for_test(cx), collapsed_source);
         })
         .unwrap();
 }
