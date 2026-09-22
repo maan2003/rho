@@ -9,8 +9,8 @@ use rho_desktop_proto::Input;
 
 pub struct WaylandView {
     viewer: rho_hosts::wayland::Viewer,
-    image: Option<Arc<RenderImage>>,
-    frozen: Option<Arc<RenderImage>>,
+    image: Option<Arc<rho_hosts::wayland::Image>>,
+    frozen: Option<Arc<rho_hosts::wayland::Image>>,
     strokes: Vec<Vec<(u32, u32)>>,
     drawing: bool,
     target: Option<Entity<rho_agents::AgentModel>>,
@@ -51,7 +51,7 @@ impl WaylandView {
                             if this.frozen.is_none() {
                                 this.size = (image.width, image.height);
                             }
-                            this.image = Some(image.render.clone());
+                            this.image = Some(image);
                         }
                         this.error = error;
                         cx.notify();
@@ -111,10 +111,14 @@ impl WaylandView {
         let Some(image) = self.frozen.as_ref() else {
             return;
         };
-        let Some(bytes) = image.as_bytes(0) else {
-            return;
+        let mut pixels = match image.export_bgra() {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
         };
-        let mut pixels = bytes.to_vec();
         for stroke in &self.strokes {
             if let Some(&point) = stroke.first() {
                 draw_line(&mut pixels, self.size, point, point);
@@ -192,7 +196,8 @@ impl Render for WaylandView {
             },
             move |_, bounds, window, _| {
                 if let Some(image) = image {
-                    let _ = window.paint_image(bounds, bounds, Corners::default(), image, 0, false);
+                    #[cfg(target_os = "linux")]
+                    window.paint_video(bounds, image.render.clone());
                 }
                 let map = |(x, y): (u32, u32)| {
                     bounds.origin
@@ -483,6 +488,11 @@ fn draw_line(pixels: &mut [u8], size: (usize, usize), from: (u32, u32), to: (u32
 #[cfg(test)]
 mod tests {
     use super::draw_line;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn planar_video_gpu_rendering() -> anyhow::Result<()> {
+        gpui_wgpu::video_tests::planar_video_renders_color_stride_and_clipping()
+    }
     #[test]
     fn stroke_keeps_channels_and_clips_at_image_edges() {
         let mut pixels = vec![7; 13 * 9 * 4];

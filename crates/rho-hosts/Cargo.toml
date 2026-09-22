@@ -11,8 +11,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-image = { version = "0.25", default-features = false }
-smallvec = "1"
 moq-net.workspace = true
 rho-desktop-proto.workspace = true
 anyhow.workspace = true

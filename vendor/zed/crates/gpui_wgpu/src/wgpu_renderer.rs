@@ -147,6 +147,130 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct VideoTextures {
+    id: u64,
+    size: (u32, u32),
+    planes: [wgpu::Texture; 3],
+    views: [wgpu::TextureView; 3],
+}
+#[cfg(target_os = "linux")]
+impl VideoTextures {
+    fn new(device: &wgpu::Device, size: (u32, u32)) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let planes = std::array::from_fn(|_| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("video_plane"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        });
+        let views = std::array::from_fn(|i| planes[i].create_view(&Default::default()));
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            size,
+            planes,
+            views,
+        }
+    }
+    fn upload(&self, queue: &wgpu::Queue, frame: &gpui::VideoFrame) {
+        // write_texture takes its staging copy before returning. Decoder memory
+        // need not survive GPU execution, and no BGRA intermediate is allocated.
+        for i in 0..3 {
+            queue.write_texture(
+                self.planes[i].as_image_copy(),
+                frame.plane(i),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.stride(i)),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: self.size.0,
+                    height: self.size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+struct VideoDraw {
+    texture_id: u64,
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+#[cfg(target_os = "linux")]
+impl VideoDraw {
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        texture: &VideoTextures,
+    ) -> Self {
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("video_params"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("video_planes"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&texture.views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&texture.views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&texture.views[2]),
+                },
+            ],
+        });
+        Self {
+            texture_id: texture.id,
+            uniform,
+            bind_group,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
@@ -218,6 +342,8 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    #[cfg(target_os = "linux")]
+    video: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -246,6 +372,8 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    #[cfg(target_os = "linux")]
+    video: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -320,6 +448,10 @@ pub struct WgpuRenderer {
     needs_redraw: bool,
     #[cfg(target_os = "linux")]
     imported_dma_bufs: HashMap<u64, ImportedDmaBuf>,
+    #[cfg(target_os = "linux")]
+    video_textures: HashMap<u64, VideoTextures>,
+    #[cfg(target_os = "linux")]
+    video_draws: HashMap<usize, VideoDraw>,
 }
 
 impl WgpuRenderer {
@@ -710,6 +842,10 @@ impl WgpuRenderer {
             needs_redraw: false,
             #[cfg(target_os = "linux")]
             imported_dma_bufs: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            video_textures: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            video_draws: HashMap::new(),
         })
     }
 
@@ -872,11 +1008,38 @@ impl WgpuRenderer {
             ],
         });
 
+        #[cfg(target_os = "linux")]
+        let video = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("video_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(64),
+                    },
+                    count: None,
+                },
+                texture_layout_entry(1),
+                texture_layout_entry(3),
+                texture_layout_entry(4),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
             surfaces,
+            #[cfg(target_os = "linux")]
+            video,
         }
     }
 
@@ -1202,6 +1365,19 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        #[cfg(target_os = "linux")]
+        let video = create_pipeline(
+            "video",
+            "vs_surface",
+            "fs_video",
+            &layouts.globals,
+            &layouts.video,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -1229,6 +1405,8 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            #[cfg(target_os = "linux")]
+            video,
         }
     }
 
@@ -1595,6 +1773,8 @@ impl WgpuRenderer {
             })?;
 
         #[cfg(target_os = "linux")]
+        self.prepare_video(scene)?;
+        #[cfg(target_os = "linux")]
         let (acquire_commands, mut new_imports, stale_ids, release_commands) =
             self.prepare_dma_bufs(scene)?;
 
@@ -1711,10 +1891,25 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    PrimitiveBatch::Surfaces(surfaces) =>
-                    {
+                    PrimitiveBatch::Surfaces(surfaces) => {
                         #[cfg(target_os = "linux")]
-                        for surface in &scene.surfaces[surfaces] {
+                        for (index, surface) in scene
+                            .surfaces
+                            .iter()
+                            .enumerate()
+                            .take(surfaces.end)
+                            .skip(surfaces.start)
+                        {
+                            if let gpui::SurfaceSource::Video(_) = &surface.source {
+                                let draw = &self.video_draws[&index];
+                                pass.set_pipeline(&self.resources().pipelines.video);
+                                pass.set_bind_group(1, &draw.bind_group, &[]);
+                                pass.draw(0..4, 0..1);
+                                continue;
+                            }
+                            let gpui::SurfaceSource::DmaBuf(dma_buf) = &surface.source else {
+                                continue;
+                            };
                             let ((source_x, source_y), (source_width, source_height)) =
                                 surface.source_rect;
                             anyhow::ensure!(
@@ -1726,29 +1921,28 @@ impl WgpuRenderer {
                                     && source_y >= 0.0
                                     && source_width > 0.0
                                     && source_height > 0.0
-                                    && source_x + source_width <= surface.dma_buf.width() as f32
-                                    && source_y + source_height <= surface.dma_buf.height() as f32,
+                                    && source_x + source_width <= dma_buf.width() as f32
+                                    && source_y + source_height <= dma_buf.height() as f32,
                                 "DMA-BUF source rectangle is invalid or out of bounds"
                             );
                             let imported = self
                                 .imported_dma_bufs
-                                .get(&surface.dma_buf.lease_id())
-                                .or_else(|| new_imports.get(&surface.dma_buf.lease_id()))
+                                .get(&dma_buf.lease_id())
+                                .or_else(|| new_imports.get(&dma_buf.lease_id()))
                                 .context("DMA-BUF surface was not imported")?;
                             let params = SurfaceParams {
                                 bounds: surface.bounds.into(),
                                 content_mask: surface.content_mask.bounds.into(),
                                 texture_origin: [
-                                    source_x / surface.dma_buf.width() as f32,
-                                    source_y / surface.dma_buf.height() as f32,
+                                    source_x / dma_buf.width() as f32,
+                                    source_y / dma_buf.height() as f32,
                                 ],
                                 texture_size: [
-                                    source_width / surface.dma_buf.width() as f32,
-                                    source_height / surface.dma_buf.height() as f32,
+                                    source_width / dma_buf.width() as f32,
+                                    source_height / dma_buf.height() as f32,
                                 ],
-                                opaque: (surface.dma_buf.fourcc() == u32::from_le_bytes(*b"XR24"))
-                                    as u32,
-                                y_inverted: surface.dma_buf.y_inverted() as u32,
+                                opaque: (dma_buf.fourcc() == u32::from_le_bytes(*b"XR24")) as u32,
+                                y_inverted: dma_buf.y_inverted() as u32,
                                 _pad: [0; 2],
                             };
                             let buffer =
@@ -1867,6 +2061,94 @@ impl WgpuRenderer {
     }
 
     #[cfg(target_os = "linux")]
+    fn prepare_video(&mut self, scene: &Scene) -> Result<()> {
+        let resources = self
+            .resources
+            .as_ref()
+            .context("GPU resources unavailable")?;
+        let device = &resources.device;
+        let queue = &resources.queue;
+        #[cfg(target_os = "linux")]
+        {
+            let frames: HashMap<_, _> = scene
+                .surfaces
+                .iter()
+                .filter_map(|surface| match &surface.source {
+                    gpui::SurfaceSource::Video(frame) => Some((frame.id(), frame)),
+                    _ => None,
+                })
+                .collect();
+            let mut unused = Vec::new();
+            self.video_textures.retain(|id, texture| {
+                if frames.contains_key(id) {
+                    true
+                } else {
+                    unused.push(texture.clone());
+                    false
+                }
+            });
+            for (&id, frame) in &frames {
+                if !self.video_textures.contains_key(&id) {
+                    let size = frame.size();
+                    anyhow::ensure!(
+                        size.0 <= device.limits().max_texture_dimension_2d
+                            && size.1 <= device.limits().max_texture_dimension_2d,
+                        "video exceeds texture size limit"
+                    );
+                    let texture = if let Some(index) =
+                        unused.iter().position(|texture| texture.size == size)
+                    {
+                        unused.swap_remove(index)
+                    } else {
+                        VideoTextures::new(device, size)
+                    };
+                    texture.upload(queue, frame);
+                    self.video_textures.insert(id, texture);
+                }
+            }
+            self.video_draws.retain(|index, _| {
+                scene
+                    .surfaces
+                    .get(*index)
+                    .is_some_and(|surface| matches!(surface.source, gpui::SurfaceSource::Video(_)))
+            });
+            for (index, surface) in scene.surfaces.iter().enumerate() {
+                let gpui::SurfaceSource::Video(frame) = &surface.source else {
+                    continue;
+                };
+                let texture = &self.video_textures[&frame.id()];
+                let draw = self.video_draws.entry(index).or_insert_with(|| {
+                    VideoDraw::new(
+                        device,
+                        &resources.bind_group_layouts.video,
+                        &resources.atlas_sampler,
+                        texture,
+                    )
+                });
+                if draw.texture_id != texture.id {
+                    *draw = VideoDraw::new(
+                        device,
+                        &resources.bind_group_layouts.video,
+                        &resources.atlas_sampler,
+                        texture,
+                    );
+                }
+                let params = SurfaceParams {
+                    bounds: surface.bounds.into(),
+                    content_mask: surface.content_mask.bounds.into(),
+                    texture_origin: [0., 0.],
+                    texture_size: [1., 1.],
+                    opaque: 1,
+                    y_inverted: 0,
+                    _pad: [0; 2],
+                };
+                queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&params));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     fn prepare_dma_bufs(
         &self,
         scene: &Scene,
@@ -1879,7 +2161,10 @@ impl WgpuRenderer {
         let active: HashSet<_> = scene
             .surfaces
             .iter()
-            .map(|surface| surface.dma_buf.lease_id())
+            .filter_map(|surface| match &surface.source {
+                gpui::SurfaceSource::DmaBuf(buffer) => Some(buffer.lease_id()),
+                _ => None,
+            })
             .collect();
         let stale_ids: Vec<_> = self
             .imported_dma_bufs
@@ -1891,9 +2176,12 @@ impl WgpuRenderer {
             .collect();
         let mut new_imports = HashMap::new();
         for surface in &scene.surfaces {
-            let id = surface.dma_buf.lease_id();
+            let gpui::SurfaceSource::DmaBuf(buffer) = &surface.source else {
+                continue;
+            };
+            let id = buffer.lease_id();
             if !self.imported_dma_bufs.contains_key(&id) && !new_imports.contains_key(&id) {
-                new_imports.insert(id, self.import_dma_buf(surface.dma_buf.clone())?);
+                new_imports.insert(id, self.import_dma_buf(buffer.clone())?);
             }
         }
 
@@ -2603,6 +2891,10 @@ impl WgpuRenderer {
         // window can be destroyed before the renderer itself is dropped.
         #[cfg(target_os = "linux")]
         self.retire_all_dma_bufs();
+        #[cfg(target_os = "linux")]
+        self.video_textures.clear();
+        #[cfg(target_os = "linux")]
+        self.video_draws.clear();
         self.resources.take();
     }
 
@@ -2858,5 +3150,193 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+    }
+}
+
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+pub mod video_tests {
+    use super::*;
+    use wgpu::util::DeviceExt;
+    struct Planes([Vec<u8>; 3]);
+    impl gpui::Yuv444Data for Planes {
+        fn size(&self) -> (u32, u32) {
+            (3, 2)
+        }
+        fn plane(&self, index: usize) -> &[u8] {
+            &self.0[index]
+        }
+        fn stride(&self, _: usize) -> u32 {
+            5
+        }
+    }
+    #[cfg_attr(test, test)]
+    pub fn planar_video_renders_color_stride_and_clipping() -> Result<()> {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await?;
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await?;
+            let frame = gpui::VideoFrame::new(Arc::new(Planes([
+                vec![0, 100, 76, 99, 99, 29, 150, 100, 99, 99],
+                vec![128, 128, 85, 99, 99, 255, 44, 128, 99, 99],
+                vec![128, 128, 255, 99, 99, 107, 21, 128, 99, 99],
+            ])))?;
+            let textures = VideoTextures::new(&device, (3, 2));
+            textures.upload(&queue, &frame);
+            let layouts = WgpuRenderer::create_bind_group_layouts(&device, false);
+            let pipelines = WgpuRenderer::create_pipelines(
+                &device,
+                &layouts,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::CompositeAlphaMode::Opaque,
+                1,
+                false,
+                false,
+            );
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+            let draw = VideoDraw::new(&device, &layouts.video, &sampler, &textures);
+            let params = SurfaceParams {
+                bounds: PodBounds {
+                    origin: [0., 0.],
+                    size: [3., 2.],
+                },
+                content_mask: PodBounds {
+                    origin: [0., 0.],
+                    size: [2., 2.],
+                },
+                texture_origin: [0., 0.],
+                texture_size: [1., 1.],
+                opaque: 1,
+                y_inverted: 0,
+                _pad: [0; 2],
+            };
+            queue.write_buffer(&draw.uniform, 0, bytemuck::bytes_of(&params));
+            let globals = GlobalParams {
+                viewport_size: [3., 2.],
+                premultiplied_alpha: 0,
+                output_color_space: 0,
+                framebuffer_is_srgb: 1,
+                _pad: [0; 3],
+            };
+            let global = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::bytes_of(&globals),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let gamma = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::bytes_of(&GammaParams::zeroed()),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let globals = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layouts.globals,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: global.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: gamma.as_entire_binding(),
+                    },
+                ],
+            });
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 3,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 512,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let view = target.create_view(&Default::default());
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipelines.video);
+                pass.set_bind_group(0, &globals, &[]);
+                pass.set_bind_group(1, &draw.bind_group, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 3,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            let (send, recv) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    send.send(result).unwrap()
+                });
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            recv.recv()??;
+            let pixels = readback.slice(..).get_mapped_range()?;
+            for (offset, expected) in [
+                (0, [0u8, 0, 0, 255]),
+                (4, [100, 100, 100, 255]),
+                (256, [0, 0, 254, 255]),
+                (260, [0, 255, 1, 255]),
+                (8, [0, 0, 0, 0]),
+                (264, [0, 0, 0, 0]),
+            ] {
+                for (got, want) in pixels[offset..offset + 4].iter().zip(expected) {
+                    assert!(
+                        (i16::from(*got) - i16::from(want)).abs() <= 2,
+                        "offset {offset}: {got} != {want}"
+                    );
+                }
+            }
+            Ok(())
+        })
     }
 }

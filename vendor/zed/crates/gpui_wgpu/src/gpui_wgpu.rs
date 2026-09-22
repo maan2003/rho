@@ -10,3 +10,6 @@ pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
 pub use wgpu_renderer::{GpuContext, WgpuOutputColorSpace, WgpuRenderer, WgpuSurfaceConfig};
+
+#[cfg(all(feature="test-support",target_os="linux"))]
+pub use wgpu_renderer::video_tests;

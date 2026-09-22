@@ -1457,3 +1457,24 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     let converted = srgba_asset_to_framebuffer(vec4<f32>(color.rgb / alpha, alpha));
     return vec4<f32>(converted.rgb * alpha, alpha);
 }
+
+// Planar software video uses the same geometry and color-management path as
+// imported surfaces, without an intermediate RGB image or atlas allocation.
+@group(1) @binding(3) var t_video_u: texture_2d<f32>;
+@group(1) @binding(4) var t_video_v: texture_2d<f32>;
+
+@fragment
+fn fs_video(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let y = textureSampleLevel(t_surface, s_surface, input.texture_position, 0.0).r;
+    let u = textureSampleLevel(t_video_u, s_surface, input.texture_position, 0.0).r - 128.0 / 255.0;
+    let v = textureSampleLevel(t_video_v, s_surface, input.texture_position, 0.0).r - 128.0 / 255.0;
+    let rgb = clamp(
+        vec3<f32>(y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+    return srgba_asset_to_framebuffer(vec4<f32>(rgb, 1.0));
+}

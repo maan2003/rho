@@ -9,6 +9,9 @@ use refineable::Refineable;
 /// A source of a surface's content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SurfaceSource {
+    /// Software-decoded planar video, uploaded without RGB conversion.
+    #[cfg(target_os = "linux")]
+    Video(crate::VideoFrame),
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
@@ -115,6 +118,14 @@ impl Element for Surface {
         _: &mut App,
     ) {
         match &self.source {
+            #[cfg(target_os = "linux")]
+            SurfaceSource::Video(frame) => {
+                let (width, height) = frame.size();
+                let bounds = self
+                    .object_fit
+                    .get_bounds(bounds, crate::size(width.into(), height.into()));
+                window.paint_video(bounds, frame.clone());
+            }
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(surface) => {
                 let size = crate::size(surface.get_width().into(), surface.get_height().into());

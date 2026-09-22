@@ -997,6 +997,11 @@ Desktop JSON headers are capped at 64 KiB; dimensions are capped at 4096 in each
 axis and VP9 packets at 16 MiB. Raw/encoded queues are bounded. The MoQ cache
 uses a 32 MiB target and short retention; this target is not a hard process-memory
 limit. The decoder still processes compressed data from an authorized desktop
-using libvpx. Same-user desktop clients can control applications and capture
+using libvpx. External decoder allocations reject requests above 256 MiB each;
+retained planes are range-checked against their backing allocation. Buffers are
+reused only when neither libvpx nor a displayed/frozen frame owns them. GPUI
+validates plane lengths/strides and checks the GPU texture size limit before
+upload. These per-allocation checks are not a hard process-memory limit.
+Same-user desktop clients can control applications and capture
 their contents; annotations copied or attached to a prompt disclose the exact
 frozen image selected by the user.

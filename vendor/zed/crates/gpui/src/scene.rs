@@ -1135,7 +1135,7 @@ pub struct PaintSurface {
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     #[cfg(target_os = "linux")]
-    pub dma_buf: crate::LinuxDmaBufSurface,
+    pub source: crate::SurfaceSource,
     #[cfg(target_os = "linux")]
     pub source_rect: ((f32, f32), (f32, f32)),
 }

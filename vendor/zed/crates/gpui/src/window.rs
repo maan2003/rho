@@ -4811,8 +4811,22 @@ impl Window {
             order: 0,
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
-            dma_buf,
+            source: crate::SurfaceSource::DmaBuf(dma_buf),
             source_rect,
+        });
+    }
+
+    /// Paint a full-range BT.601 planar video frame without an image-atlas upload.
+    #[cfg(target_os = "linux")]
+    pub fn paint_video(&mut self, bounds: Bounds<Pixels>, frame: crate::VideoFrame) {
+        self.invalidator.debug_assert_paint();
+        let (width, height) = frame.size();
+        self.next_frame.scene.insert_primitive(crate::PaintSurface {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            source: crate::SurfaceSource::Video(frame),
+            source_rect: ((0., 0.), (width as f32, height as f32)),
         });
     }
 

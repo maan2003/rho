@@ -10,7 +10,26 @@ use tokio::sync::{mpsc, watch};
 pub struct Image {
     pub width: usize,
     pub height: usize,
-    pub render: Arc<gpui::RenderImage>,
+    pub render: gpui::VideoFrame,
+    pub planes: Arc<rho_desktop_media::codec::RetainedFrame>,
+}
+impl Image {
+    /// Convert only when the user exports a screenshot.
+    pub fn export_bgra(&self) -> Result<Vec<u8>> {
+        Ok(rho_desktop_media::codec::export_bgra(&self.planes)?.bgra)
+    }
+}
+struct VideoData(Arc<rho_desktop_media::codec::RetainedFrame>);
+impl gpui::Yuv444Data for VideoData {
+    fn size(&self) -> (u32, u32) {
+        (self.0.width() as u32, self.0.height() as u32)
+    }
+    fn plane(&self, index: usize) -> &[u8] {
+        self.0.plane(index)
+    }
+    fn stride(&self, index: usize) -> u32 {
+        self.0.stride(index) as u32
+    }
 }
 pub struct Viewer {
     pub images: watch::Receiver<Option<Arc<Image>>>,
@@ -46,29 +65,24 @@ pub(crate) async fn open(
         keyframe: true,
     });
     let (motion, mut movement) = watch::channel(None);
-    let (packets, mut decode) = mpsc::channel::<(bool, bytes::Bytes)>(2);
+    let (packets, mut decode) = mpsc::channel::<bytes::Bytes>(2);
     let decoded = images.clone();
-    // libvpx and color conversion run off both GPUI and Tokio's IO workers.
+    // Decode off GPUI and Tokio IO workers. GPUI samples the retained YUV planes.
     let decode_task = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut decoder = Decoder::new()?;
-        while let Some((keyframe, packet)) = decode.blocking_recv() {
-            if keyframe {
-                decoder = Decoder::new()?;
-            }
-            if let Some(frame) = decoder.decode(&packet)? {
-                let pixels =
-                    image::RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.bgra)
-                        .unwrap();
-                let render = Arc::new(gpui::RenderImage::new(smallvec::smallvec![
-                    image::Frame::new(pixels)
-                ]));
+        while let Some(packet) = decode.blocking_recv() {
+            if let Some(frame) = decoder.decode_planes(&packet)? {
+                let planes = Arc::new(frame);
+                let render = gpui::VideoFrame::new(Arc::new(VideoData(planes.clone())))?;
                 decoded.send_replace(Some(Arc::new(Image {
-                    width: frame.width,
-                    height: frame.height,
+                    width: planes.width(),
+                    height: planes.height(),
                     render,
+                    planes,
                 })));
             }
         }
+
         Ok(())
     });
     let task = tokio::spawn(async move {
@@ -99,9 +113,8 @@ pub(crate) async fn open(
             let clock = Instant::now();
 
             while let Some(mut group) = subscription.next_group().await? {
-                // Every group starts independently. Never feed a dependent frame
-                // from an abandoned group into the next group's decoder.
-                let mut first = true;
+                // Every group begins with a keyframe, which resets references
+                // without destroying the decoder or its reusable frame pool.
                 loop {
                     let frame = async {
                         let Some(mut frame) = group.next_frame().await? else {
@@ -123,10 +136,9 @@ pub(crate) async fn open(
                             *base = (*base).min(offset);
                             let lag = offset - *base;
                             packets
-                                .send((first, frame.payload))
+                                .send(frame.payload)
                                 .await
                                 .map_err(|_| anyhow::anyhow!("decoder stopped"))?;
-                            first = false;
                             lag
                         }
                         Ok(None) => break,

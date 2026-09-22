@@ -139,4 +139,4 @@ editor = { path = "../../vendor/zed/crates/editor", features = [
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",
 ] }
-gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu" }
+gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu", features = ["test-support"] }

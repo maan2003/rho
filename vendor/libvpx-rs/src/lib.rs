@@ -11,7 +11,9 @@ use std::{
 };
 
 mod codec_info;
+mod retained;
 mod sys;
+pub use retained::RetainedFrame;
 
 pub use codec_info::*;
 
@@ -121,12 +123,18 @@ pub struct DecoderConfig {
     pub codec: DecoderCodec,
     /// デコードに使用するスレッド数
     pub threads: u32,
+    /// VP9 の外部フレームバッファを保持可能にする。
+    pub retain_frames: bool,
 }
 
 impl DecoderConfig {
     /// 指定したコーデックでデコーダー設定を生成する
     pub fn new(codec: DecoderCodec) -> Self {
-        Self { codec, threads: 1 }
+        Self {
+            codec,
+            threads: 1,
+            retain_frames: false,
+        }
     }
 }
 
@@ -134,6 +142,7 @@ impl DecoderConfig {
 pub struct Decoder {
     ctx: sys::vpx_codec_ctx,
     iter: sys::vpx_codec_iter_t,
+    pool: Option<Box<retained::Pool>>,
 }
 
 impl Decoder {
@@ -144,7 +153,19 @@ impl Decoder {
                 DecoderCodec::Vp8 => sys::vpx_codec_vp8_dx(),
                 DecoderCodec::Vp9 => sys::vpx_codec_vp9_dx(),
             };
-            Self::init(iface, config.threads)
+            let mut decoder = Self::init(iface, config.threads)?;
+            if config.retain_frames {
+                let mut pool = Box::new(std::sync::Mutex::new(Vec::new()));
+                let code = sys::vpx_codec_set_frame_buffer_functions(
+                    &mut decoder.ctx,
+                    Some(retained::get),
+                    Some(retained::release),
+                    (&mut *pool as *mut retained::Pool).cast(),
+                );
+                Error::check(code, "vpx_codec_set_frame_buffer_functions", Some(&decoder.ctx))?;
+                decoder.pool = Some(pool);
+            }
+            Ok(decoder)
         }
     }
 
@@ -169,6 +190,7 @@ impl Decoder {
             Ok(Self {
                 ctx,
                 iter: std::ptr::null(),
+                pool: None,
             })
         }
     }
@@ -251,7 +273,7 @@ impl Decoder {
                 ));
             }
 
-            Ok(Some(DecodedFrame(image)))
+            Ok(Some(DecodedFrame(image, self.pool.is_some())))
         }
     }
 }
@@ -273,9 +295,21 @@ impl std::fmt::Debug for Decoder {
 }
 
 /// デコードされた映像フレーム (I420 形式)
-pub struct DecodedFrame<'a>(&'a sys::vpx_image);
+pub struct DecodedFrame<'a>(&'a sys::vpx_image, bool);
 
 impl DecodedFrame<'_> {
+    /// コピーせずにフレームを保持する。retain_frames が必要。
+    pub fn retain(&self) -> Result<RetainedFrame, Error> {
+        if !self.1 {
+            return Err(Error::with_reason(
+                sys::vpx_codec_err_t_VPX_CODEC_ERROR,
+                "retain_frame",
+                "external buffers not enabled",
+            ));
+        }
+        unsafe { RetainedFrame::from_image(self.0) }
+    }
+
     /// フレームが高ビット深度（16ビット）かどうかを返す
     //
     // libvpx での高ビット深度フォーマットについてのメモ：

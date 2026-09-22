@@ -772,8 +772,13 @@ The compositor owns damage-driven composition and a subscription-owned VP9
 Profile 1 encoder thread. Groups start with keyframes; dependent frames stay in
 their group. Static output gets a bounded quality-refinement frame, then idles.
 No video subscriber means no video composition or encoder. Lossless requested
-screenshots remain independent. The client decodes/converts pixels off the UI
-thread, coalesces decoded images, and retains compressed-frame dependency order.
+screenshots remain independent. The client software-decodes off the UI thread,
+coalesces decoded frames, and retains compressed-frame dependency order. Libvpx
+external buffers keep YUV444 planes alive without copying until both decoder
+and display release them. GPUI uploads the planes into reusable R8 textures and
+converts full-range BT.601 to RGB in the draw shader, bypassing the image atlas.
+Unchanged frames retain their upload identity. CPU BGRA conversion happens only
+when exporting a frozen annotation, which requires no GPU readback.
 
 `rho wayland` forwards to `rho-agent-desktop wayland`. The GUI's desktop window
 sends input to the compositor's normal input path. Annotation freezes the

@@ -116,10 +116,12 @@ impl Decoder {
     pub fn new() -> Result<Self> {
         let mut config = vpx::DecoderConfig::new(vpx::DecoderCodec::Vp9);
         config.threads = 2;
+        config.retain_frames = true;
         Ok(Self(vpx::Decoder::new(config)?))
     }
 
-    pub fn decode(&mut self, data: &[u8]) -> Result<Option<Image>> {
+    /// Retain the decoder allocation; no pixel conversion or copy.
+    pub fn decode_planes(&mut self, data: &[u8]) -> Result<Option<vpx::RetainedFrame>> {
         ensure!(data.len() <= 16 * 1024 * 1024, "video packet too large");
         self.0.decode(data)?;
         let mut image = None;
@@ -135,32 +137,47 @@ impl Decoder {
                 !frame.is_high_depth() && frame.chroma_shift() == (0, 0),
                 "expected VP9 8-bit 4:4:4"
             );
-            let mut bgra = vec![0; width * height * 4];
-            let planar = yuv::YuvPlanarImage {
-                y_plane: frame.y_plane(),
-                y_stride: frame.y_stride() as u32,
-                u_plane: frame.u_plane(),
-                u_stride: frame.u_stride() as u32,
-                v_plane: frame.v_plane(),
-                v_stride: frame.v_stride() as u32,
-                width: width as u32,
-                height: height as u32,
-            };
-            yuv::yuv444_to_bgra(
-                &planar,
-                &mut bgra,
-                width as u32 * 4,
-                yuv::YuvRange::Full,
-                yuv::YuvStandardMatrix::Bt601,
-            )?;
-            image = Some(Image {
-                width,
-                height,
-                bgra,
-            });
+            image = Some(frame.retain()?);
         }
         Ok(image)
     }
+    /// Explicit CPU export, not used for live presentation.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Option<Image>> {
+        self.decode_planes(data)?
+            .map(|frame| export_bgra(&frame))
+            .transpose()
+    }
+}
+
+#[cfg(feature = "decoder")]
+pub use vpx::RetainedFrame;
+
+#[cfg(feature = "decoder")]
+pub fn export_bgra(frame: &RetainedFrame) -> Result<Image> {
+    let (width, height) = (frame.width(), frame.height());
+    let mut bgra = vec![0; width * height * 4];
+    let planar = yuv::YuvPlanarImage {
+        y_plane: frame.plane(0),
+        y_stride: frame.stride(0) as u32,
+        u_plane: frame.plane(1),
+        u_stride: frame.stride(1) as u32,
+        v_plane: frame.plane(2),
+        v_stride: frame.stride(2) as u32,
+        width: width as u32,
+        height: height as u32,
+    };
+    yuv::yuv444_to_bgra(
+        &planar,
+        &mut bgra,
+        width as u32 * 4,
+        yuv::YuvRange::Full,
+        yuv::YuvStandardMatrix::Bt601,
+    )?;
+    Ok(Image {
+        width,
+        height,
+        bgra,
+    })
 }
 
 #[cfg(all(test, feature = "encoder", feature = "decoder"))]
@@ -201,6 +218,51 @@ mod tests {
             for (got, want) in image.bgra.iter().zip(&pixels) {
                 assert!((*got as i16 - *want as i16).abs() <= 18, "{got} != {want}");
             }
+        }
+        Ok(())
+    }
+    #[test]
+    fn retained_planes_survive_reuse_keyframes_and_decoder_drop() -> Result<()> {
+        let (width, height) = (65, 47);
+        let mut encoder = Encoder::new(width, height, 8_000_000)?;
+        let mut decoder = Decoder::new()?;
+        let pixels = vec![73u8; width * height * 4];
+        let first = encoder.encode(&pixels, true)?.remove(0);
+        let frozen = decoder.decode_planes(&first.data)?.unwrap();
+        let saved: Vec<_> = (0..3).map(|p| frozen.plane(p).to_vec()).collect();
+        let mut allocations = std::collections::HashSet::new();
+        for i in 0..40 {
+            let mut pixels = pixels.clone();
+            for (n, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                pixel.copy_from_slice(&[
+                    (n % 251) as u8,
+                    (i * 5) as u8,
+                    (n / width * 3) as u8,
+                    255,
+                ]);
+            }
+            let packet = encoder.encode(&pixels, i % 7 == 0)?.remove(0);
+            let frame = decoder.decode_planes(&packet.data)?.unwrap();
+            allocations.insert(frame.plane(0).as_ptr() as usize);
+            for p in 0..3 {
+                assert_eq!(frozen.plane(p), saved[p]);
+            }
+        }
+        assert!(allocations.len() < 40, "decoder buffers must be reused");
+        for (width, height) in [(129, 71), (31, 19)] {
+            let mut encoder = Encoder::new(width, height, 8_000_000)?;
+            let packet = encoder
+                .encode(&vec![150; width * height * 4], true)?
+                .remove(0);
+            let resized = decoder.decode_planes(&packet.data)?.unwrap();
+            assert_eq!((resized.width(), resized.height()), (width, height));
+            for p in 0..3 {
+                assert_eq!(frozen.plane(p), saved[p]);
+            }
+        }
+        drop(decoder);
+        for p in 0..3 {
+            assert_eq!(frozen.plane(p), saved[p]);
         }
         Ok(())
     }

@@ -13,6 +13,7 @@ path = "src/gpui_wgpu.rs"
 
 [features]
 default = []
+test-support = []
 font-kit = ["dep:font-kit"]
 
 [dependencies]
