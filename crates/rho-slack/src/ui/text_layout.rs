@@ -10,6 +10,7 @@ pub(super) struct TextLayout {
     pub lists: Vec<(Range<usize>, u32)>,
     pub bullets: Vec<Range<usize>>,
     pub code: Vec<Range<usize>>,
+    pub code_blocks: Vec<Range<usize>>,
     pub underlines: Vec<Range<usize>>,
     pub mentions: Vec<Range<usize>>,
     pub concealed: Vec<Range<usize>>,
@@ -29,6 +30,7 @@ impl TextLayout {
                 let range = node.byte_range();
                 match node.kind() {
                     "fenced_code_block" | "indented_code_block" => {
+                        layout.code_blocks.push(range.clone());
                         protected.push(range);
                         continue;
                     }

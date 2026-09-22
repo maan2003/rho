@@ -40,6 +40,7 @@ fn message(ts: &str, text: &str) -> Message {
         files: Vec::new(),
         subtype: None,
         reply_count: 0,
+        reply_users: Vec::new(),
         latest_reply: None,
         edited: false,
         reactions: Vec::new(),
@@ -544,6 +545,20 @@ fn drafts_round_trip_per_source_and_empty_removes_them() {
 }
 
 #[test]
+fn archive_domain_survives_for_offline_cached_links() {
+    let (dir, mirror) = mirror();
+    mirror.set_archive_domain("acme", "actual-domain");
+    drop(mirror);
+
+    let reopened = Mirror::open(dir.path().join("slack.redb")).unwrap();
+    assert_eq!(
+        reopened.archive_domain("acme").as_deref(),
+        Some("actual-domain")
+    );
+    assert_eq!(reopened.archive_domain("other"), None);
+}
+
+#[test]
 fn exact_message_lookup_does_not_drift_to_later_chatter() {
     let (_dir, mirror) = mirror();
     mirror.insert_messages(
@@ -576,4 +591,16 @@ fn shared_database_open_initializes_saved_before_its_first_read() {
     // start after the table has been added.
     let reopened = Mirror::open_on(db).unwrap();
     assert!(reopened.saved("acme").is_empty());
+}
+
+#[test]
+fn thread_participants_survive_mirror_reopen() {
+    let (dir, mirror) = mirror();
+    let mut parent = message("100.123456", "thread");
+    parent.reply_count = 9;
+    parent.reply_users = vec!["UA".into(), "UD".into(), "ME".into()];
+    mirror.insert_messages(&scope(), &[parent.clone()]);
+    drop(mirror);
+    let reopened = Mirror::open(dir.path().join("slack.redb")).unwrap();
+    assert_eq!(reopened.newest_chunk(&scope(), 1), vec![parent]);
 }

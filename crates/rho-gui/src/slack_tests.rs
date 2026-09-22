@@ -207,9 +207,12 @@ async fn opening_with_uncached_or_missing_avatars_keeps_the_same_layout(cx: &mut
 async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
     cx: &mut TestAppContext,
 ) {
+    use editor::RowExt as _;
+    use editor::display_map::ToDisplayPoint as _;
     use rho_slack::fake::Fake;
     use rho_slack::session::Source;
     use rho_slack::types::ChannelId;
+    use text::Point;
     cx.update(init_test_app);
     cx.executor().allow_parking();
     let fake = cx
@@ -218,8 +221,15 @@ async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
         .unwrap()
         .unwrap();
     seed_workspace(&fake);
+    fake.pause_avatars(true);
     fake.add_message("C1", serde_json::json!({
         "ts":"99.0", "user":"UA", "text":"fallback",
+        "reply_count": 7, "reply_users": ["UA", "UD"],
+        "reactions": [{"name":"thumbsup", "count":12, "users":["ME"]}, {"name":"tada","count":3,"users":["UA"]}],
+        "attachments": [{
+            "is_msg_unfurl":true, "title":"A useful article", "title_link":"https://example.com/article",
+            "service_name":"example.com", "text":"A preview description long enough to wrap in the narrow editor and remain inside its decoration."
+        }],
         "blocks":[{"type":"rich_text","elements":[
             {"type":"rich_text_section","elements":[
                 {"type":"broadcast","range":"channel"},
@@ -291,8 +301,8 @@ async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
     }
     assert!(ready, "syntax-backed bullet appeared");
     cx.draw_window(*window);
-    window
-        .update(cx, |view, _, cx| {
+    let before_avatars = window
+        .update(cx, |view, window, cx| {
             let display = view.display_text_for_test(cx);
             assert!(display.contains("@channel Plan"), "{display}");
             assert!(display.contains("Trade-offs:"), "{display}");
@@ -317,7 +327,50 @@ async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
                 "list indentation must stop at the message boundary: {display}"
             );
 
+            let (previews, code_blocks) = view.chrome_ranges_for_test(cx);
+            assert_eq!(
+                previews.len(),
+                1,
+                "adjacent preview rows share a full-width background"
+            );
+            assert_eq!(code_blocks.len(), 1);
+            let source = view.transcript_text_for_test(cx);
+            assert!(source.contains("  👍 12  🎉 3\n  7 replies →\n"));
+            assert!(!source.contains('│') && !source.contains('▎'));
+            let reply_row = source
+                .lines()
+                .position(|line| line.contains("7 replies →"))
+                .unwrap() as u32;
             view.editor().update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let preview = &previews[0];
+                let first = multi_buffer::ToPoint::to_point(&preview.start, &snapshot).row;
+                let last = multi_buffer::ToPoint::to_point(&preview.end, &snapshot).row;
+                assert_eq!(source.lines().nth(first as usize), Some("example.com"));
+                assert!(
+                    source
+                        .lines()
+                        .nth(last as usize)
+                        .unwrap()
+                        .starts_with("A preview description")
+                );
+                let code_start =
+                    multi_buffer::ToPoint::to_point(&code_blocks[0].start, &snapshot).row;
+                let code_end = multi_buffer::ToPoint::to_point(&code_blocks[0].end, &snapshot).row;
+                assert!(
+                    code_end - code_start >= 4,
+                    "code background includes blank lines"
+                );
+                editor.change_selections(
+                    editor::SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| {
+                        selections.select_ranges([
+                            text::Point::new(reply_row, 2)..text::Point::new(reply_row, 2)
+                        ]);
+                    },
+                );
                 for (id, expected_background, expected_underline) in
                     [(601, true, false), (602, false, true), (603, true, false)]
                 {
@@ -339,6 +392,48 @@ async fn slack_message_text_has_lists_inline_styles_and_compact_paragraphs(
                 assert!(
                     !wrapped.is_empty(),
                     "list wraps with a hanging indent: {display}"
+                );
+            });
+            assert_eq!(view.cursor_thread(cx).unwrap().thread_ts.0, "99.0");
+            view.editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                let row = Point::new(reply_row, 2).to_display_point(&snapshot).row();
+                (
+                    row,
+                    snapshot.row_y(row.as_f64()),
+                    snapshot.row_y(snapshot.max_point().row().as_f64()),
+                )
+            })
+        })
+        .unwrap();
+    fake.pause_avatars(false);
+    let mut loaded = false;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        loaded = window
+            .update(cx, |view, _, cx| {
+                !view.display_text_for_test(cx).contains("◦ ")
+            })
+            .unwrap();
+        if loaded {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        loaded,
+        "thread participant images replace their fixed-width placeholders"
+    );
+    window
+        .update(cx, |view, _, cx| {
+            view.editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert_eq!(snapshot.row_y(before_avatars.0.as_f64()), before_avatars.1);
+                assert_eq!(
+                    snapshot.row_y(snapshot.max_point().row().as_f64()),
+                    before_avatars.2
                 );
             });
         })
@@ -4561,4 +4656,107 @@ async fn slack_message_grouping_restores_a_header_after_its_first_message_is_del
     );
     assert!(text.contains("\nsecond\n"), "{text}");
     assert_eq!(text.matches("dana").count(), 1, "{text}");
+}
+
+// An archive reference is native navigation, including a reply not yet in the
+// mirror.
+#[gpui::test]
+async fn archive_reference_enter_fetches_and_selects_the_referenced_reply(cx: &mut TestAppContext) {
+    use editor::SelectionEffects;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    use text::Point;
+
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts":"100.123456", "user":"UA", "text":"archive root"
+        }),
+    );
+    fake.add_message(
+        "C1",
+        serde_json::json!({
+            "ts":"101.654321", "thread_ts":"100.123456", "user":"UD", "text":"archive reply target"
+        }),
+    );
+    fake.add_message("D1", serde_json::json!({
+        "ts":"200.123456", "user":"UD",
+        "text":"See <https://acme.slack.com/archives/C1/p101654321?thread_ts=100.123456&cid=C1|context>"
+    }));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(Source::Conversation(ChannelId("D1".into())), window, cx);
+        })
+        .unwrap();
+    let mut row = None;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        row = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .slack_transcript_for_test(cx)
+                    .iter()
+                    .position(|line| line.contains("↪ reply in #design"))
+            })
+            .unwrap();
+        if row.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let row = row.expect("special archive reference rendered") as u32;
+    assert_eq!(fake.calls("conversations.replies"), 0);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.active_editor(cx).update(cx, |editor, cx| {
+                let point = Point::new(row, 0);
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([point..point]);
+                });
+            });
+            workspace.slack_open_row(window, cx);
+        })
+        .unwrap();
+    let mut selected = None;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        selected = workspace
+            .update(cx, |workspace, _, cx| {
+                let crate::workspace::SurfaceView::SlackConversation(view) =
+                    &workspace.active_surface().view
+                else {
+                    return None;
+                };
+                view.clone().update(cx, |view, cx| {
+                    view.cursor_message(cx).map(|message| message.ts.0)
+                })
+            })
+            .unwrap();
+        if selected.as_deref() == Some("101.654321") {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(selected.as_deref(), Some("101.654321"));
+    assert!(fake.calls("conversations.replies") > 0);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.slack_open_label_for_test(cx).as_deref(),
+                Some("#design · thread")
+            );
+            let lines = workspace.slack_transcript_for_test(cx);
+            assert!(lines.iter().any(|line| line.contains("archive root")));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("archive reply target"))
+            );
+        })
+        .unwrap();
 }

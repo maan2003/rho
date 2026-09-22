@@ -277,6 +277,7 @@ impl Default for RtmConnection {
             self_id: crate::types::UserId(String::new()),
             self_name: String::new(),
             team_name: String::new(),
+            team_domain: String::new(),
         }
     }
 }

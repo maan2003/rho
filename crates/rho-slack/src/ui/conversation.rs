@@ -48,6 +48,9 @@ pub struct ChromeGutter;
 struct CustomEmojiFold;
 struct AvatarFold;
 struct MessageTextFold;
+struct PreviewRows;
+struct CodeBlockRows;
+struct ReactionCountFold;
 
 struct EmojiDecoration {
     inlay: InlayId,
@@ -145,8 +148,10 @@ pub struct ConversationView {
     avatar_authors: HashMap<Row, crate::types::UserId>,
     avatar_folds: HashMap<Row, Range<MultiBufferAnchor>>,
     edited_inlays: HashMap<Row, InlayId>,
+    thread_inlays: HashMap<Row, Vec<InlayId>>,
     next_custom_inlay: usize,
     text_folds: Vec<Range<MultiBufferAnchor>>,
+    reaction_folds: Vec<Range<MultiBufferAnchor>>,
     text_inlays: Vec<InlayId>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -379,6 +384,10 @@ struct LineMeta {
     images: Vec<FileSummary>,
     /// Attach a display-only edit suffix to this body line.
     edited: bool,
+    /// Attachment chrome, decorated without border glyphs in the buffer.
+    preview: bool,
+    reply_users: Vec<crate::types::UserId>,
+    reaction_counts: Vec<Range<usize>>,
 }
 
 type Rendered = Item<Row, Class, LineMeta>;
@@ -569,8 +578,10 @@ impl ConversationView {
             avatar_authors: HashMap::new(),
             avatar_folds: HashMap::new(),
             edited_inlays: HashMap::new(),
+            thread_inlays: HashMap::new(),
             next_custom_inlay: 1,
             text_folds: Vec::new(),
+            reaction_folds: Vec::new(),
             text_inlays: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -1950,7 +1961,29 @@ impl ConversationView {
             .update(cx, |editor, cx| editor.display_snapshot(cx).text())
     }
 
+    #[cfg(any(test, feature = "fake"))]
+    pub fn chrome_ranges_for_test(
+        &self,
+        cx: &App,
+    ) -> (Vec<Range<MultiBufferAnchor>>, Vec<Range<MultiBufferAnchor>>) {
+        let editor = self.editor.read(cx);
+        (
+            editor
+                .highlighted_rows::<PreviewRows>(cx)
+                .map(|(range, _)| range)
+                .collect(),
+            editor
+                .highlighted_rows::<CodeBlockRows>(cx)
+                .map(|(range, _)| range)
+                .collect(),
+        )
+    }
+
     fn remove_emoji_row(&mut self, row: &Row, cx: &mut Context<Self>) {
+        if let Some(ids) = self.thread_inlays.remove(row) {
+            self.editor
+                .update(cx, |editor, cx| editor.splice_inlays(&ids, vec![], cx));
+        }
         if let Some(id) = self.edited_inlays.remove(row) {
             self.editor
                 .update(cx, |editor, cx| editor.splice_inlays(&[id], vec![], cx));
@@ -1988,6 +2021,7 @@ impl ConversationView {
             .keys()
             .chain(self.avatar_folds.keys())
             .chain(self.edited_inlays.keys())
+            .chain(self.thread_inlays.keys())
             .cloned()
             .collect::<Vec<_>>();
         for row in rows {
@@ -2014,6 +2048,58 @@ impl ConversationView {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let anchor = |offset| snapshot.anchor_in_excerpt(source.anchor_before(offset));
         let range = |range: Range<usize>| Some(anchor(range.start)?..anchor(range.end)?);
+        let code_blocks = layout
+            .code_blocks
+            .iter()
+            .cloned()
+            .filter_map(&range)
+            .collect::<Vec<_>>();
+        let mut previews: Vec<Range<MultiBufferAnchor>> = Vec::new();
+        let mut previous_preview = false;
+        let mut reaction_folds = Vec::new();
+        let count_size = self.editor.update(cx, |editor, cx| {
+            editor.style(cx).text.font_size.to_pixels(window.rem_size()) * 0.8
+        });
+        let mut offset = 0;
+        for (row, line) in source.text().split_inclusive('\n').enumerate() {
+            if let Some(meta) = self.transcript.line_meta(row as u32, cx) {
+                if meta.preview
+                    && let Some(anchored) = range(offset..offset + line.len().saturating_sub(1))
+                {
+                    if previous_preview {
+                        previews.last_mut().unwrap().end = anchored.end;
+                    } else {
+                        previews.push(anchored);
+                    }
+                }
+                previous_preview = meta.preview;
+                for count in &meta.reaction_counts {
+                    if let Some(anchored) = range(offset + count.start..offset + count.end) {
+                        let label: gpui::SharedString = line[count.clone()].to_owned().into();
+                        reaction_folds.push(Crease::simple(
+                            anchored,
+                            FoldPlaceholder {
+                                render: Arc::new(move |_, _, cx| {
+                                    div()
+                                        .text_size(count_size)
+                                        .text_color(cx.theme().colors().text_muted)
+                                        .child(label.clone())
+                                        .into_any_element()
+                                }),
+                                constrain_width: false,
+                                merge_adjacent: false,
+                                type_tag: Some(TypeId::of::<ReactionCountFold>()),
+                                collapsed_text: Some(line[count.clone()].to_owned().into()),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                }
+            } else {
+                previous_preview = false;
+            }
+            offset += line.len();
+        }
         let mut folds = layout
             .concealed
             .into_iter()
@@ -2036,7 +2122,7 @@ impl ConversationView {
             .into_iter()
             .filter_map(|(source, indent)| range(source).map(|range| (range, indent)))
             .collect::<Vec<_>>();
-        let spacing = layout
+        let mut spacing: Vec<_> = layout
             .paragraph_gaps
             .into_iter()
             .filter_map(|offset| {
@@ -2048,6 +2134,26 @@ impl ConversationView {
                 })
             })
             .collect();
+        for preview in &previews {
+            let start = multi_buffer::ToOffset::to_offset(&preview.start, &snapshot).0;
+            if start > 0 {
+                let before = snapshot.anchor_before(multi_buffer::MultiBufferOffset(start - 1));
+                // Only a new preview group needs separation from speech.
+                let row = multi_buffer::ToPoint::to_point(&preview.start, &snapshot).row;
+                if row > 0
+                    && !self
+                        .transcript
+                        .line_meta(row - 1, cx)
+                        .is_some_and(|meta| meta.preview)
+                {
+                    spacing.push(editor::display_map::RowSpacing {
+                        range: before..before,
+                        minimum_height: 0.,
+                        gap_after: 0.25,
+                    });
+                }
+            }
+        }
         let colors = cx.theme().colors();
         let code_style = gpui::HighlightStyle {
             color: Some(colors.terminal_ansi_yellow.into()),
@@ -2055,9 +2161,9 @@ impl ConversationView {
             ..Default::default()
         };
         let mention_style = gpui::HighlightStyle {
-            color: Some(colors.terminal_ansi_yellow.into()),
-            background_color: Some(gpui::Hsla::from(colors.terminal_ansi_yellow).opacity(0.18)),
-            font_weight: Some(gpui::FontWeight::BOLD),
+            color: Some(colors.terminal_ansi_blue.into()),
+            background_color: Some(gpui::Hsla::from(colors.terminal_ansi_blue).opacity(0.10)),
+            font_weight: Some(gpui::FontWeight::NORMAL),
             ..Default::default()
         };
         let underline_style = gpui::HighlightStyle {
@@ -2102,6 +2208,46 @@ impl ConversationView {
             ] {
                 editor.highlight_text(editor::HighlightKey::SyntaxTreeView(key), ranges, style, cx);
             }
+            editor.remove_folds_with_type(
+                &self.reaction_folds,
+                TypeId::of::<ReactionCountFold>(),
+                false,
+                cx,
+            );
+            self.reaction_folds = reaction_folds
+                .iter()
+                .map(|crease| crease.range().clone())
+                .collect();
+            editor.fold_creases(reaction_folds, false, window, cx);
+            editor.clear_row_highlights::<PreviewRows>();
+            editor.clear_row_highlights::<CodeBlockRows>();
+            for range in &previews {
+                editor.highlight_rows::<PreviewRows>(
+                    range.clone(),
+                    |cx| cx.theme().colors().element_background.into(),
+                    editor::RowHighlightOptions {
+                        autoscroll: false,
+                        include_gutter: false,
+                    },
+                    cx,
+                );
+            }
+            for range in code_blocks {
+                editor.highlight_rows::<CodeBlockRows>(
+                    range,
+                    |cx| cx.theme().colors().element_background.into(),
+                    editor::RowHighlightOptions {
+                        autoscroll: false,
+                        include_gutter: false,
+                    },
+                    cx,
+                );
+            }
+            editor.highlight_gutter::<PreviewRows>(
+                previews,
+                |cx| cx.theme().colors().border_variant.into(),
+                cx,
+            );
             editor.set_hanging_indents(indents, cx);
         });
         self.text_folds = folds;
@@ -2209,6 +2355,67 @@ impl ConversationView {
                 }
                 offset += content.len();
             }
+            let mut pending = false;
+            let mut line_offset = base;
+            for (line, content) in text.split_inclusive('\n').enumerate() {
+                let users = self
+                    .transcript
+                    .line_meta(first_row + line as u32, cx)
+                    .map(|meta| meta.reply_users.clone())
+                    .unwrap_or_default();
+                if !users.is_empty() {
+                    let anchor = self
+                        .transcript
+                        .buffer()
+                        .read(cx)
+                        .anchor_before(line_offset + BODY_INDENT);
+                    if let Some(anchor) = self
+                        .multi_buffer
+                        .read(cx)
+                        .snapshot(cx)
+                        .anchor_in_excerpt(anchor)
+                    {
+                        let mut ids = Vec::new();
+                        for user in users {
+                            self.session
+                                .update(cx, |session, cx| session.cache_avatar(&user, cx));
+                            let path = self
+                                .session
+                                .read(cx)
+                                .cached_avatar(&user)
+                                .map(std::path::Path::to_path_buf);
+                            let image = path.as_ref().and_then(|path| self.decoded_image(path, cx));
+                            pending |= self.session.read(cx).avatar_loading(&user);
+                            if let Some(image) = image {
+                                if let Some(id) = self.editor.update(cx, |editor, cx| {
+                                    editor.add_image_inlay(anchor, image, 2, cx)
+                                }) {
+                                    ids.push(id);
+                                }
+                            } else {
+                                let id = self.next_custom_inlay;
+                                self.next_custom_inlay += 1;
+                                self.editor.update(cx, |editor, cx| {
+                                    editor.splice_inlays(
+                                        &[],
+                                        vec![Inlay::custom(id, anchor, "◦ ")],
+                                        cx,
+                                    )
+                                });
+                                ids.push(InlayId::Custom(id));
+                            }
+                        }
+                        let id = self.next_custom_inlay;
+                        self.next_custom_inlay += 1;
+                        self.editor.update(cx, |editor, cx| {
+                            editor.splice_inlays(&[], vec![Inlay::custom(id, anchor, " ")], cx);
+                        });
+                        ids.push(InlayId::Custom(id));
+                        self.thread_inlays.insert(row.clone(), ids);
+                    }
+                }
+                line_offset += content.len();
+            }
             let names = {
                 let model = self.session.read(cx).model();
                 custom_emoji_ranges(&text, model)
@@ -2219,7 +2426,6 @@ impl ConversationView {
                 });
             }
 
-            let mut pending = false;
             for (range, name) in names {
                 let path = match self.session.read(cx).cached_custom_emoji(&name) {
                     crate::session::EmojiCache::Loading => {
@@ -3419,6 +3625,7 @@ fn message_item_with_header(
             interaction: None,
             images: Vec::new(),
             edited: false,
+            ..LineMeta::default()
         });
         return item(Row::Message(message.ts.clone()), spans, lines);
     }
@@ -3433,7 +3640,20 @@ fn message_item_with_header(
     );
     let (said, chrome) = model.markdown_parts(message);
     let said = said.trim_end().to_owned();
-    let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
+    let mut links = crate::block::links(&message.blocks, &message.text, &message.attachments);
+    // Keep original attachment-title labels as well as rewritten body links.
+    let archive_labels = links
+        .iter()
+        .filter_map(|link| {
+            model
+                .archive_link_label(&link.url)
+                .map(|label| crate::block::Link {
+                    label,
+                    url: link.url.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    links.extend(archive_labels);
     let interactions = crate::block::interactions(&message.blocks, model);
     // A file's line is the one that reads as the file: `enter` there opens
     // it rather than the thread.
@@ -3454,6 +3674,7 @@ fn message_item_with_header(
             .cloned(),
         images: Vec::new(),
         edited: false,
+        ..LineMeta::default()
     };
 
     if header {
@@ -3468,6 +3689,7 @@ fn message_item_with_header(
             interaction: None,
             images: Vec::new(),
             edited: false,
+            ..LineMeta::default()
         });
     }
     push_body(&mut spans, &said, model, &message.files);
@@ -3491,9 +3713,24 @@ fn message_item_with_header(
     // Attachment and preview text follows the body at the same margin.
     if !chrome.is_empty() {
         let text = chrome.join("\n");
-        push_body(&mut spans, &text, model, &message.files);
-        spans.push(Span::plain("\n"));
-        lines.extend(text.split('\n').map(&meta));
+        for line in text.split('\n') {
+            if message
+                .attachments
+                .iter()
+                .filter_map(|attachment| attachment.service.as_deref())
+                .any(|site| crate::markdown::escape(site) == line)
+            {
+                spans.push(Span::styled(line, Class::Muted));
+            } else {
+                push_body(&mut spans, line, model, &message.files);
+            }
+            spans.push(Span::plain("\n"));
+        }
+        lines.extend(text.split('\n').map(|line| {
+            let mut line_meta = meta(line);
+            line_meta.preview = line_meta.file.is_none();
+            line_meta
+        }));
     }
     // The pictures hang under everything the message said and named, and
     // above its reactions and its thread line: those are about the message,
@@ -3521,23 +3758,28 @@ fn message_item_with_header(
             interaction: None,
             images: Vec::new(),
             edited: false,
+            ..LineMeta::default()
         });
     }
-    // Reactions and the thread link form one compact footer. The line retains
-    // its message metadata so keyboard thread/reaction actions work unchanged.
-    let has_thread = !in_thread && message.reply_count > 0;
-    if !message.reactions.is_empty() || has_thread {
-        spans.push(Span::plain(indent));
-        push_reactions(&mut spans, message, model);
-        if has_thread {
-            if !message.reactions.is_empty() {
-                spans.push(Span::styled("  ·  ", Class::Muted));
-            }
-            spans.push(Span::styled(replies_line(message), Class::Muted));
-        }
+    // Each footer is a real source row: Vim can land on replies and Enter
+    // resolves the same thread as the body, without a mouse-only block.
+    if !message.reactions.is_empty() {
+        spans.push(Span::plain(&indent));
+        let reaction_counts = push_reactions(&mut spans, message, model);
+        spans.push(Span::plain("\n"));
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            reaction_counts,
+            ..LineMeta::default()
+        });
+    }
+    if !in_thread && message.reply_count > 0 {
+        spans.push(Span::plain(&indent));
+        spans.push(Span::styled(replies_line(message), Class::Muted));
         spans.push(Span::plain("\n"));
         lines.push(LineMeta {
             thread,
+            reply_users: message.reply_users.iter().take(3).cloned().collect(),
             ..LineMeta::default()
         });
     }
@@ -3698,34 +3940,39 @@ fn system_line(message: &Message, model: &Model) -> Option<String> {
     })
 }
 
-/// The reactions under a message: `👍 3 · 🎉 1`. One the reader added is in
+/// The reactions under a message: `👍 3  🎉 1`. One the reader added is in
 /// their own class, which is the whole of how they can tell; a word for it
 /// would be noise on every line.
-fn push_reactions(spans: &mut Vec<Span>, message: &Message, model: &Model) {
+fn push_reactions(spans: &mut Vec<Span>, message: &Message, model: &Model) -> Vec<Range<usize>> {
+    let mut counts = Vec::new();
+    let mut offset = BODY_INDENT;
     for (index, reaction) in message.reactions.iter().enumerate() {
         if index > 0 {
-            spans.push(Span::styled(" · ", Class::Muted));
+            spans.push(Span::styled("  ", Class::Muted));
+            offset += 2;
         }
+        let emoji = crate::emoji::render(&format!(":{}:", reaction.name));
+        let count = reaction.count.to_string();
+        let start = offset + emoji.len() + 1;
+        offset = start + count.len();
+        counts.push(start..offset);
         let mine = reaction.users.iter().any(|user| user == model.self_id());
         spans.push(Span::styled(
-            format!(
-                "{} {}",
-                crate::emoji::render(&format!(":{}:", reaction.name)),
-                reaction.count
-            ),
+            format!("{emoji} {count}"),
             match mine {
                 true => Class::You,
                 false => Class::Muted,
             },
         ));
     }
+    counts
 }
 
 /// The reply count, without per-message or last-reply timestamps.
 fn replies_line(message: &Message) -> String {
     let count = message.reply_count;
     let plural = if count == 1 { "reply" } else { "replies" };
-    format!("↳ {count} {plural}")
+    format!("{count} {plural} →")
 }
 
 /// A body, with the workspace's own emoji muted. `:forrest_gump_wave:` is a
@@ -4589,7 +4836,7 @@ mod tests {
             "a broadcast was said to the room: {text}"
         );
         assert!(text.contains("also sent to the channel"), "{text}");
-        assert!(text.contains("↳ 3 replies\n"), "{text}");
+        assert!(text.contains("3 replies →\n"), "{text}");
         assert!(!text.contains("in thread"), "the marker is gone: {text}");
         assert_eq!(
             lines.len(),
@@ -4607,7 +4854,7 @@ mod tests {
         let (text, _, _) = render_messages(&messages, &model(), true);
         assert!(text.contains("deal curve is fine"), "{text}");
         assert!(
-            !text.contains("↳ 3 replies"),
+            !text.contains("3 replies →"),
             "a thread does not count itself: {text}"
         );
     }
@@ -4630,7 +4877,7 @@ mod tests {
             ],
         }));
         let (text, styles, lines) = render_messages(&[message], &model, false);
-        assert!(text.contains("👍 2 · 🎉 1"), "{text}");
+        assert!(text.contains("👍 2  🎉 1"), "{text}");
         assert!(!text.contains("you"), "no word for it: {text}");
         assert!(
             classed(&text, &styles, Class::You).contains(&"👍 2".to_owned()),
@@ -4641,20 +4888,26 @@ mod tests {
     }
 
     #[test]
-    fn reactions_and_thread_count_share_one_footer() {
+    fn reactions_and_thread_count_have_separate_cursor_rows() {
         let message = parsed(json!({
             "ts": "1700000000.0", "user": "U1", "text": "body",
-            "reply_count": 4,
+            "reply_count": 4, "reply_users": ["U1", "ME"],
             "reactions": [{"name": "thumbsup", "count": 3, "users": ["ME"]}]
         }));
         let rendered = message_item(&message, &model(), false);
         assert!(
-            rendered.text.ends_with("body\n  👍 3  ·  ↳ 4 replies\n"),
+            rendered.text.ends_with("body\n  👍 3\n  4 replies →\n"),
             "{}",
             rendered.text
         );
-        assert_eq!(rendered.lines.len(), 3);
-        assert_eq!(rendered.lines[2].thread, Some(message.thread_root()));
+        assert_eq!(rendered.lines.len(), 4);
+        assert_eq!(rendered.lines[3].thread, Some(message.thread_root()));
+        assert_eq!(
+            rendered.lines[3].reply_users,
+            vec![UserId("U1".into()), UserId("ME".into())]
+        );
+        assert!(rendered.lines[2].reply_users.is_empty());
+        assert_eq!(rendered.lines[2].reaction_counts, vec![7..8]);
         assert!(classed(&rendered.text, &rendered.styles, Class::You).contains(&"👍 3".to_owned()));
         let thread = message_item(&message, &model(), true);
         assert!(thread.text.ends_with("body\n  👍 3\n"));
@@ -4767,7 +5020,7 @@ mod tests {
         let (text, styles, lines) =
             render_messages(std::slice::from_ref(&preview), &model(), false);
         assert!(
-            text.contains("Worth a read · example.com"),
+            text.contains("example.com\n**Worth a read**"),
             "the title names the page and the site says where it is: {text}"
         );
         assert!(

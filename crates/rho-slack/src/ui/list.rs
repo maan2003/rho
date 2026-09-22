@@ -959,6 +959,7 @@ mod tests {
                 files: Vec::new(),
                 subtype: None,
                 reply_count: 0,
+                reply_users: Vec::new(),
                 latest_reply: None,
                 edited: false,
                 reactions: Vec::new(),

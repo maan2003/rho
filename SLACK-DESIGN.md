@@ -587,8 +587,15 @@ transcript renders through, and owns none of its own. Concretely:
   Decorations follow syntax and retain the source for copy/search.
 - Edits use a display-only `✎` suffix on the last content line, not a source
   metadata row. Markdown link targets and code fences remain unchanged.
-- Attachments and previews follow the body. Reactions and thread counts share
-  one muted footer line; the reader's own reactions remain highlighted.
+- Attachments and previews follow the body, with a painted inner-gutter rule,
+  muted site name, emphasized title, and a full-width neutral background.
+  Code-block backgrounds also extend to the right edge, including blank lines.
+  Reactions have a compact row with smaller counts; replies have a separate
+  cursor-addressable row with participant avatars. Enter on that row opens the
+  thread. Mentions use a faint blue highlight rather than yellow.
+  Same-workspace archive URLs display as message/reply references and Enter
+  jumps to their message, fetching its window when absent. Workspace identity
+  comes from Slack's RTM domain and is retained offline; other hosts stay URLs.
   The sidebar distinguishes unread conversations by text color rather than
   weight, with a separate accent for mentions.
 - What the surface still paints for itself is only what the parse cannot

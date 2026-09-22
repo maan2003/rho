@@ -593,6 +593,9 @@ impl Session {
         if let Some(id) = mirror.self_id(&workspace) {
             self.model.set_self(id);
         }
+        if let Some(domain) = mirror.archive_domain(&workspace) {
+            self.model.set_archive_domain(&domain);
+        }
         self.model.set_reacted_with(mirror.reacted_with(&workspace));
         seed_read_cursors(&mut self.model, &mirror);
         // The units as the last run left them: one range scan, one row per
@@ -750,8 +753,15 @@ impl Session {
                 self.status = Status::Connected;
                 if let Some(mirror) = self.mirror.as_ref() {
                     mirror.set_self_id(&self.model.workspace().0, &connection.self_id);
+                    if !connection.team_domain.is_empty() {
+                        mirror
+                            .set_archive_domain(&self.model.workspace().0, &connection.team_domain);
+                    }
                 }
                 self.model.set_self(connection.self_id);
+                if !connection.team_domain.is_empty() {
+                    self.model.set_archive_domain(&connection.team_domain);
+                }
                 let signal = self.health.connected(now);
                 self.signal(signal, cx);
                 // What the outage swallowed is not replayed by Slack: the
@@ -986,6 +996,12 @@ impl Session {
                     let mut parent = parent.clone();
                     parent.reply_count = parent.reply_count.saturating_add(1);
                     parent.latest_reply = Some(message.ts.clone());
+                    if let Some(user) = &message.user
+                        && parent.reply_users.len() < 3
+                        && !parent.reply_users.contains(user)
+                    {
+                        parent.reply_users.push(user.clone());
+                    }
                     parent
                 });
             if let Some(parent) = grown {
@@ -3356,6 +3372,7 @@ impl Session {
             files: Vec::new(),
             subtype: None,
             reply_count: 0,
+            reply_users: Vec::new(),
             latest_reply: None,
             edited: false,
             reactions: Vec::new(),
@@ -3585,6 +3602,7 @@ impl Session {
             files: Vec::new(),
             subtype: None,
             reply_count: 0,
+            reply_users: Vec::new(),
             latest_reply: None,
             edited: false,
             reactions: Vec::new(),

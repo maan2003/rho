@@ -342,6 +342,7 @@ fn message(channel: &str, seconds: i64) -> Message {
         files: Vec::new(),
         subtype: None,
         reply_count: 0,
+        reply_users: Vec::new(),
         latest_reply: None,
         edited: false,
         reactions: Vec::new(),

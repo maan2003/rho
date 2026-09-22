@@ -51,6 +51,22 @@ pub(crate) fn slack_filter_candidates(typed: &str) -> Vec<crate::minibuffer::Can
     .collect()
 }
 
+fn slack_archive_target(model: &Model, address: &str) -> Option<rho_slack::ui::Target> {
+    let archive = model.archive_link(address)?;
+    let source = match archive.thread_ts {
+        Some(thread_ts) => Source::Thread(ThreadKey {
+            workspace: model.workspace().clone(),
+            channel: archive.channel,
+            thread_ts,
+        }),
+        None => Source::Conversation(archive.channel),
+    };
+    Some(rho_slack::ui::Target::Message(rho_slack::ui::Place {
+        source,
+        ts: archive.ts,
+    }))
+}
+
 impl Workspace {
     /// Registers a workspace by hand: name, then token, then cookie. Three
     /// prompts rather than one line because the token and cookie are long
@@ -995,7 +1011,15 @@ impl Workspace {
             let view = view.clone();
             let link = view.update(cx, |view, cx| view.cursor_link(cx));
             if let Some(link) = link {
-                self.create_browser_page(link, None, window, cx);
+                let archive = self.slack.session().and_then(|session| {
+                    let session = session.read(cx);
+                    slack_archive_target(session.model(), &link)
+                });
+                if let Some(target) = archive {
+                    self.open_slack_search_target(target, window, cx);
+                } else {
+                    self.create_browser_page(link, None, window, cx);
+                }
                 return;
             }
         }
@@ -3626,6 +3650,33 @@ mod tests {
             value["thread_ts"] = json!(thread_ts);
         }
         parse_message(&value, &ChannelId("C1".into())).unwrap()
+    }
+
+    #[test]
+    fn archive_targets_open_the_referenced_reply_in_its_thread() {
+        let mut model = model();
+        model.set_archive_domain("acme");
+        assert_eq!(
+            slack_archive_target(
+                &model,
+                "https://acme.slack.com/archives/C1/p1700000000123456?thread_ts=1699999999.654321&cid=C1"
+            ),
+            Some(rho_slack::ui::Target::Message(rho_slack::ui::Place {
+                source: Source::Thread(ThreadKey {
+                    workspace: WorkspaceName("acme".into()),
+                    channel: ChannelId("C1".into()),
+                    thread_ts: Ts("1699999999.654321".into()),
+                }),
+                ts: Ts("1700000000.123456".into()),
+            }))
+        );
+        assert_eq!(
+            slack_archive_target(
+                &model,
+                "https://outside.slack.com/archives/C1/p1700000000123456"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -919,6 +919,12 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             {
                 message["blocks"] = json!(blocks);
             }
+            if let Some(attachments) = request["attachments"]
+                .as_array()
+                .filter(|items| items.len() <= 100)
+            {
+                message["attachments"] = json!(attachments);
+            }
             if kind == "reply" {
                 message["thread_ts"] = json!(field("thread_ts"));
             }
@@ -935,6 +941,14 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                     let count = parent["reply_count"].as_u64().unwrap_or_default() + 1;
                     parent["reply_count"] = json!(count);
                     parent["latest_reply"] = json!(ts);
+                    let mut users = parent["reply_users"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    if !users.contains(&json!(user)) {
+                        users.push(json!(user));
+                    }
+                    parent["reply_users"] = json!(users);
                 }
             }
             let mentions_me = text.contains("<@ME>");
@@ -1492,7 +1506,7 @@ fn handle(
             "ok": true,
             "url": ws_url,
             "self": {"id": "ME", "name": "you"},
-            "team": {"name": "acme"},
+            "team": {"name": "acme", "domain": "acme"},
         }),
         "conversations.open" => {
             let mut users: Vec<String> = field("users")

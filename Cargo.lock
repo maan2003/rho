@@ -13561,6 +13561,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "ui",
+ "url",
 ]
 
 [[package]]

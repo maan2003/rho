@@ -34,7 +34,9 @@ claims are not evidence that a workflow is complete.
   semantic mention highlights, and combined bold/italic/strike/underline.
   Paragraph gaps are half a line; code whitespace and literal HTML stay literal.
 - Edited messages use a display-only `✎` suffix, with no extra source row.
-  Reactions and thread counts share one muted footer; own reactions stay highlighted.
+  Reactions use smaller counts; the separate replies row keeps Vim cursor/Enter navigation and participant avatars.
+  Previews have a painted gutter rule and full-width neutral background; code blocks share the full-width treatment.
+  Same-workspace archive references jump to the named message or reply.
 - Date headings have a half-line gap below them and are centered by anchored editor row alignment, not replacement
   blocks. Text, selection and mouse hits use the same alignment.
 - Desktop Slack notifications are disabled. Mentions, DMs and followed-thread

@@ -21,6 +21,11 @@ use crate::types::{Attachment, ChannelId, FileSummary, UserId};
 pub trait Names {
     fn user(&self, id: &UserId) -> Option<String>;
     fn channel(&self, id: &ChannelId) -> Option<String>;
+    /// Replaces a link label when workspace-specific semantics make it more
+    /// useful than the sender's label. Ordinary renderers leave it alone.
+    fn link_label(&self, _url: &str, _label: &str) -> Option<String> {
+        None
+    }
 }
 
 /// No names known: every mention falls back to its placeholder. Used by the
@@ -436,9 +441,9 @@ const UNFURL_LINES: usize = 2;
 /// the same bar the agent transcript puts beside a message -- so the card's
 /// own words start at the margin like everything else.
 ///
-/// A preview collapses to its title. Slack paints the whole page under the
-/// message, which buries the conversation the reader came for; the title is
-/// the part they act on and the link is already in the message above it.
+/// A preview keeps its title and at most two description lines rather than
+/// reproducing the page beneath the message. The Markdown surface paints a
+/// full-width background and a gutter rule; neither becomes copied text.
 /// An app card keeps what it was given: its pretext, title, body, and the
 /// labelled values it hung under them.
 fn render_attachment(flavour: Flavour, attachment: &Attachment, names: &dyn Names) -> Vec<String> {
@@ -461,10 +466,22 @@ fn render_attachment(flavour: Flavour, attachment: &Attachment, names: &dyn Name
     {
         lines.push(render_mrkdwn_as(flavour, pretext, names));
     }
-    lines.push(match attachment.service.as_deref() {
-        Some(site) if !site.is_empty() => format!("{title} · {site}"),
-        _ => title,
-    });
+    match flavour {
+        Flavour::Markdown => {
+            if let Some(site) = attachment
+                .service
+                .as_deref()
+                .filter(|site| !site.is_empty())
+            {
+                lines.push(escape(site));
+            }
+            lines.push(format!("**{title}**"));
+        }
+        Flavour::Mrkdwn => lines.push(match attachment.service.as_deref() {
+            Some(site) if !site.is_empty() => format!("{title} · {site}"),
+            _ => title,
+        }),
+    }
     if let Some(text) = attachment.text.as_deref().filter(|text| *text != headline) {
         let body = render_mrkdwn_as(flavour, text, names);
         let body = body
@@ -678,7 +695,9 @@ fn render_inline(flavour: Flavour, element: &Value, names: &dyn Names) -> String
         // which is what `enter` opens.
         "link" => {
             let url = string(element, "url");
-            let label = string(element, "text");
+            let original = string(element, "text");
+            let special = names.link_label(url, original);
+            let label = special.as_deref().unwrap_or(original);
             match (flavour, label) {
                 (Flavour::Mrkdwn, "") => url.to_owned(),
                 (Flavour::Mrkdwn, label) => label.to_owned(),
@@ -894,12 +913,16 @@ fn render_escape(flavour: Flavour, body: &str, names: &dyn Names) -> String {
                 None => format!("@{}", target[1..].split('^').next().unwrap_or_default()),
             },
         ),
-        _ => match (flavour, label) {
-            (Flavour::Mrkdwn, Some(label)) => label.to_owned(),
-            (Flavour::Mrkdwn, None) => target.to_owned(),
-            (Flavour::Markdown, Some(label)) => format!("[{}]({target})", escape(label)),
-            (Flavour::Markdown, None) => format!("<{target}>"),
-        },
+        _ => {
+            let special = names.link_label(target, label.unwrap_or(target));
+            let label = special.as_deref().or(label);
+            match (flavour, label) {
+                (Flavour::Mrkdwn, Some(label)) => label.to_owned(),
+                (Flavour::Mrkdwn, None) => target.to_owned(),
+                (Flavour::Markdown, Some(label)) => format!("[{}]({target})", escape(label)),
+                (Flavour::Markdown, None) => format!("<{target}>"),
+            }
+        }
     }
 }
 

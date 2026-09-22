@@ -532,6 +532,22 @@ impl Mirror {
         );
     }
 
+    /// Slack's authoritative archive subdomain, retained so cached messages
+    /// keep native permalink behavior while the workspace is offline.
+    pub fn archive_domain(&self, workspace: &str) -> Option<String> {
+        match self.cursor(&format!("{workspace}{SEPARATOR}archive-domain")) {
+            Some(StoredCursor::Stamp(domain)) => Some(domain),
+            _ => None,
+        }
+    }
+
+    pub fn set_archive_domain(&self, workspace: &str, domain: &str) {
+        self.put_cursor(
+            &format!("{workspace}{SEPARATOR}archive-domain"),
+            StoredCursor::Stamp(domain.to_owned()),
+        );
+    }
+
     /// How far the reader has said they are done in this unit, in rho's own
     /// words. The other half of the same question is Slack's read mark, and
     /// what has been dealt with is the later of the two; this is the half
@@ -1405,6 +1421,8 @@ struct StoredMessage {
     subtype: Option<String>,
     reply_count: u32,
     latest_reply: Option<String>,
+    #[senax(default)]
+    reply_users: Vec<String>,
     edited: bool,
     reactions: Vec<StoredReaction>,
 }
@@ -1490,6 +1508,11 @@ impl From<&Message> for StoredMessage {
                 .collect(),
             subtype: message.subtype.clone(),
             reply_count: message.reply_count,
+            reply_users: message
+                .reply_users
+                .iter()
+                .map(|user| user.0.clone())
+                .collect(),
             latest_reply: message.latest_reply.as_ref().map(|ts| ts.0.clone()),
             edited: message.edited,
             reactions: message
@@ -1550,6 +1573,7 @@ impl From<&StoredMessage> for Message {
                 .collect(),
             subtype: stored.subtype.clone(),
             reply_count: stored.reply_count,
+            reply_users: stored.reply_users.iter().cloned().map(UserId).collect(),
             latest_reply: stored.latest_reply.clone().map(Ts),
             edited: stored.edited,
             reactions: stored
@@ -1562,5 +1586,59 @@ impl From<&StoredMessage> for Message {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod participant_compatibility_tests {
+    use super::*;
+
+    #[derive(Encode)]
+    struct LegacyMessage {
+        ts: String,
+        thread_ts: Option<String>,
+        channel: String,
+        user: Option<String>,
+        bot_name: Option<String>,
+        #[senax(default)]
+        bot_id: Option<String>,
+        blocks: Vec<String>,
+        text: String,
+        attachments: Vec<StoredAttachment>,
+        files: Vec<StoredFile>,
+        subtype: Option<String>,
+        reply_count: u32,
+        latest_reply: Option<String>,
+        edited: bool,
+        reactions: Vec<StoredReaction>,
+    }
+
+    #[test]
+    fn cached_messages_without_participants_still_decode() {
+        let old = LegacyMessage {
+            ts: "123.456789".into(),
+            thread_ts: None,
+            channel: "C1".into(),
+            user: Some("UA".into()),
+            bot_name: None,
+            bot_id: None,
+            blocks: Vec::new(),
+            text: "old cached message".into(),
+            attachments: Vec::new(),
+            files: Vec::new(),
+            subtype: None,
+            reply_count: 7,
+            latest_reply: Some("124.123456".into()),
+            edited: true,
+            reactions: Vec::new(),
+        };
+        let mut bytes = senax_encoder::encode(&old).unwrap();
+        let stored: StoredMessage = senax_encoder::decode(&mut bytes).unwrap();
+        let message = Message::from(&stored);
+        assert!(message.reply_users.is_empty());
+        assert_eq!(message.reply_count, 7);
+        assert_eq!(message.latest_reply.unwrap().0, "124.123456");
+        assert!(message.edited);
+        assert_eq!(message.text, "old cached message");
     }
 }

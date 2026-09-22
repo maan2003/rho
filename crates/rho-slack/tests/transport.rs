@@ -163,6 +163,7 @@ async fn the_websocket_connects_and_delivers_a_mention_live() {
     };
     assert_eq!(connection.self_id.0, fake.self_id());
     assert_eq!(connection.team_name, "acme");
+    assert_eq!(connection.team_domain, "acme");
     wait_until_live(&catch_up).await;
 
     assert!(

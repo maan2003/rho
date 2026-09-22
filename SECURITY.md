@@ -59,6 +59,9 @@ AI APIs.
   text and attachment bytes use separate tables so an ordinary keystroke never
   decodes or rewrites file content. Failed and interrupted sends retain the
   durable draft for explicit retry; they are never replayed automatically.
+  Slack archive links navigate natively only for the exact HTTPS archive host
+  learned from RTM's workspace domain (and retained in the local mirror), with
+  validated channel and message/thread timestamps. Other URLs stay browser links.
 - Provider debug logs under the rho state directory may contain full inference
   request bodies, tool results, and raw provider events; treat them like
   transcripts.

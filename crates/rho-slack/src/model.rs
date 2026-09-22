@@ -334,8 +334,24 @@ pub enum Empty {
     Gone,
 }
 
+/// A same-workspace Slack archive link, reduced to its navigation identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveLink {
+    pub channel: ChannelId,
+    /// The message named by the permalink, including a reply when the URL names
+    /// one.
+    pub ts: Ts,
+    /// The thread root from `thread_ts`, when the permalink points into a
+    /// thread.
+    pub thread_ts: Option<Ts>,
+    /// The distinct text used in place of Slack's raw or supplied link label.
+    pub label: String,
+}
+
 pub struct Model {
     workspace: WorkspaceName,
+    /// Learned from Slack, never inferred from the user-visible workspace name.
+    archive_domain: Option<String>,
     self_id: UserId,
     /// The emoji the reader has reacted with, most recent first and
     /// capped at what a picker shows. Kept here so the menu is built from
@@ -437,7 +453,52 @@ pub struct Model {
     asking: BTreeMap<Unit, Attention>,
 }
 
+fn valid_archive_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 63
+        && domain
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !domain.starts_with('-')
+        && !domain.ends_with('-')
+}
+
+fn valid_channel_id(channel: &str) -> bool {
+    matches!(channel.as_bytes().first(), Some(b'C' | b'D' | b'G'))
+        && channel.len() > 1
+        && channel
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn permalink_ts(digits: &str) -> Option<Ts> {
+    if digits.len() <= 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(Ts(format!(
+        "{}.{}",
+        &digits[..digits.len() - 6],
+        &digits[digits.len() - 6..]
+    )))
+}
+
+fn parse_ts(value: &str) -> Option<Ts> {
+    let (seconds, micros) = value.split_once('.')?;
+    if seconds.is_empty()
+        || micros.len() != 6
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || !micros.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(Ts(value.to_owned()))
+}
+
 impl Names for Model {
+    fn link_label(&self, url: &str, _label: &str) -> Option<String> {
+        self.archive_link_label(url)
+    }
+
     fn user(&self, id: &UserId) -> Option<String> {
         // The reader is a person in the conversation like anyone else: they
         // read their own name, and the class is what marks it as theirs. A
@@ -481,6 +542,7 @@ impl Model {
     pub fn new(workspace: WorkspaceName) -> Self {
         Self {
             workspace,
+            archive_domain: None,
             self_id: UserId(String::new()),
             reacted_with: FIRST_REACTIONS
                 .iter()
@@ -514,6 +576,66 @@ impl Model {
 
     pub fn workspace(&self) -> &WorkspaceName {
         &self.workspace
+    }
+
+    /// Records Slack's authoritative archive subdomain. Invalid values disable
+    /// native archive handling rather than broadening which hosts are trusted.
+    pub fn set_archive_domain(&mut self, domain: &str) {
+        self.archive_domain = valid_archive_domain(domain).then(|| domain.to_ascii_lowercase());
+    }
+
+    /// Recognizes a permalink only when its HTTPS host is exactly this
+    /// workspace's Slack archive host.
+    pub fn archive_link(&self, address: &str) -> Option<ArchiveLink> {
+        let domain = self.archive_domain.as_deref()?;
+        let url = url::Url::parse(address).ok()?;
+        if url.scheme() != "https"
+            || url.username() != ""
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.host_str()? != format!("{domain}.slack.com")
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        let mut segments = url.path_segments()?;
+        if segments.next()? != "archives" {
+            return None;
+        }
+        let channel = segments.next()?;
+        let permalink = segments.next()?;
+        if segments.next().is_some() || !valid_channel_id(channel) {
+            return None;
+        }
+        let digits = permalink.strip_prefix('p')?;
+        let ts = permalink_ts(digits)?;
+        let mut thread_ts = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "thread_ts" if thread_ts.is_none() => {
+                    thread_ts = Some(parse_ts(&value)?);
+                }
+                // Slack includes the channel redundantly in copied thread links.
+                "cid" if value == channel => {}
+                _ => return None,
+            }
+        }
+        let channel = ChannelId(channel.to_owned());
+        let kind = match thread_ts.as_ref().is_some_and(|root| root != &ts) {
+            true => "reply",
+            false => "message",
+        };
+        Some(ArchiveLink {
+            label: format!("↪ {kind} in {}", self.label(&channel)),
+            channel,
+            ts,
+            thread_ts,
+        })
+    }
+
+    /// The special label for a same-workspace archive URL, when it is one.
+    pub fn archive_link_label(&self, address: &str) -> Option<String> {
+        self.archive_link(address).map(|link| link.label)
     }
 
     pub fn set_self(&mut self, id: UserId) {
@@ -2648,6 +2770,70 @@ mod tests {
         model
     }
 
+    #[test]
+    fn same_workspace_archive_links_are_labeled_and_reduced_to_message_targets() {
+        let mut model = model();
+        model.set_archive_domain("acme");
+        assert_eq!(
+            model.archive_link(
+                "https://acme.slack.com/archives/C1/p1700000000123456?thread_ts=1699999999.654321&cid=C1"
+            ),
+            Some(ArchiveLink {
+                channel: ChannelId("C1".into()),
+                ts: Ts("1700000000.123456".into()),
+                thread_ts: Some(Ts("1699999999.654321".into())),
+                label: "↪ reply in #design".into(),
+            })
+        );
+        assert_eq!(
+            model.archive_link("https://acme.slack.com/archives/C1/p1700000000123456"),
+            Some(ArchiveLink {
+                channel: ChannelId("C1".into()),
+                ts: Ts("1700000000.123456".into()),
+                thread_ts: None,
+                label: "↪ message in #design".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn archive_links_fail_closed_for_other_hosts_and_malformed_targets() {
+        let mut model = model();
+        model.set_archive_domain("acme");
+        for address in [
+            "http://acme.slack.com/archives/C1/p1700000000123456",
+            "https://acme.slack.com.evil.example/archives/C1/p1700000000123456",
+            "https://other.slack.com/archives/C1/p1700000000123456",
+            "https://acme.slack.com/archives/not-a-channel/p1700000000123456",
+            "https://acme.slack.com/archives/C1/p1700000000.123456",
+            "https://acme.slack.com/archives/C1/p1700000000123456?thread_ts=bad",
+            "https://acme.slack.com/archives/C1/p1700000000123456?cid=C2",
+        ] {
+            assert_eq!(model.archive_link(address), None, "{address}");
+        }
+        model.set_archive_domain("acme.slack.com");
+        assert_eq!(
+            model.archive_link("https://acme.slack.com/archives/C1/p1700000000123456"),
+            None
+        );
+    }
+
+    #[test]
+    fn markdown_uses_the_distinct_archive_label() {
+        let mut model = model();
+        model.set_archive_domain("acme");
+        let message = message(
+            "C1",
+            "1.000000",
+            "U1",
+            "see <https://acme.slack.com/archives/C1/p1700000000123456|this>",
+        );
+        assert_eq!(
+            model.markdown_parts(&message).0,
+            "see [↪ message in #design](https://acme.slack.com/archives/C1/p1700000000123456)"
+        );
+    }
+
     fn message(channel: &str, ts: &str, user: &str, text: &str) -> Message {
         Message {
             ts: Ts(ts.into()),
@@ -2662,6 +2848,7 @@ mod tests {
             files: Vec::new(),
             subtype: None,
             reply_count: 0,
+            reply_users: Vec::new(),
             latest_reply: None,
             edited: false,
             reactions: Vec::new(),

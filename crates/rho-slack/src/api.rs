@@ -55,6 +55,8 @@ pub struct RtmConnection {
     pub self_id: UserId,
     pub self_name: String,
     pub team_name: String,
+    /// The subdomain used by this workspace's `*.slack.com` archive URLs.
+    pub team_domain: String,
 }
 
 /// Slack's answer after submitting a modern Block Kit view.
@@ -297,6 +299,7 @@ impl Client {
             self_id: UserId(string(&body["self"]["id"]).unwrap_or_default()),
             self_name: string(&body["self"]["name"]).unwrap_or_default(),
             team_name: string(&body["team"]["name"]).unwrap_or_default(),
+            team_domain: string(&body["team"]["domain"]).unwrap_or_default(),
         })
     }
 
@@ -1423,6 +1426,13 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
             .collect(),
         subtype: string(&value["subtype"]).filter(|subtype| !subtype.is_empty()),
         reply_count: value["reply_count"].as_u64().unwrap_or(0) as u32,
+        reply_users: value["reply_users"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|user| string(user).map(UserId))
+            .take(3)
+            .collect(),
         latest_reply: string(&value["latest_reply"]).map(Ts),
         edited: value["edited"].is_object(),
         reactions: value["reactions"]

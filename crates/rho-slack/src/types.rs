@@ -158,6 +158,8 @@ pub struct Message {
     /// The thread hanging under this message, as Slack counts it. Only a
     /// parent carries these.
     pub reply_count: u32,
+    /// Participants Slack includes with the thread summary, in display order.
+    pub reply_users: Vec<UserId>,
     pub latest_reply: Option<Ts>,
     /// Whether the author changed it after sending.
     pub edited: bool,

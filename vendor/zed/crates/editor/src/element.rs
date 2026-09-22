@@ -5385,7 +5385,8 @@ impl EditorElement {
                             * (layout
                                 .position_map
                                 .snapshot
-                                .row_y(highlight_row_end.next_row().as_f64())
+                                .row_y(highlight_row_end.as_f64())
+                                + 1.
                                 - layout
                                     .position_map
                                     .snapshot
@@ -5952,7 +5953,8 @@ impl EditorElement {
         );
 
         let compact_gutter = layout.position_map.snapshot.show_compact_gutter;
-        let highlight_width = if compact_gutter {
+        let image_gutter = layout.position_map.snapshot.has_gutter_images;
+        let highlight_width = if compact_gutter || image_gutter {
             (layout.position_map.em_advance * 0.125).max(px(1.))
         } else {
             0.275 * layout.position_map.line_height
@@ -5979,14 +5981,17 @@ impl EditorElement {
                     );
                 let end_y = layout.gutter_hitbox.top()
                     + Pixels::from(
-                        layout
-                            .position_map
-                            .snapshot
-                            .row_y(end_row.next_row().as_f64())
+                        (layout.position_map.snapshot.row_y(end_row.as_f64()) + 1.)
                             * ScrollPixelOffset::from(layout.position_map.line_height)
                             - layout.position_map.scroll_pixel_position.y,
                     );
-                let highlight_left = layout.gutter_hitbox.left();
+                let highlight_left = if image_gutter {
+                    layout.gutter_hitbox.right()
+                        - layout.position_map.em_advance * 0.5
+                        - highlight_width
+                } else {
+                    layout.gutter_hitbox.left()
+                };
                 let bounds = Bounds::from_corners(
                     point(highlight_left, start_y),
                     point(highlight_left + highlight_width, end_y),
