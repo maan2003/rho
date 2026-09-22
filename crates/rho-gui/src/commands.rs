@@ -89,27 +89,14 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
         .is_none_or(char::is_whitespace);
     let words = trimmed.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() || (words.len() == 1 && !typing_new_token) {
-        return [
-            "eng",
-            "eng-mini",
-            "eng-low",
-            "eng-cheap",
-            "eng-high",
-            "eng-high-notes",
-            "eng-ultra",
-            "eng-alt",
-            "pm",
-        ]
-        .into_iter()
-        .filter(|mode| fuzzy_contains(mode, token))
-        .map(|mode| Candidate {
-            value: mode.to_owned(),
-            description: match mode {
-                "pm" => "project manager".to_owned(),
-                _ => "engineer intelligence".to_owned(),
-            },
-        })
-        .collect();
+        return ["mini-eng", "med-eng", "high-eng", "med1-eng", "high1-eng"]
+            .into_iter()
+            .filter(|mode| fuzzy_contains(mode, token))
+            .map(|mode| Candidate {
+                value: mode.to_owned(),
+                description: "engineer mode".to_owned(),
+            })
+            .collect();
     }
 
     Vec::new()
@@ -311,14 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn role_field_completes_roles_and_intelligence() {
-        let candidates = role_field_candidates("eng-h");
-        assert_eq!(
-            candidates
+    fn role_field_completes_current_engineer_modes() {
+        let values = |needle| {
+            role_field_candidates(needle)
                 .iter()
-                .map(|c| c.value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["eng-high", "eng-high-notes"]
+                .map(|candidate| candidate.value.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            values(""),
+            ["mini-eng", "med-eng", "high-eng", "med1-eng", "high1-eng"]
         );
+        assert_eq!(values("high"), ["high-eng", "high1-eng"]);
     }
 }

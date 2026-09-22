@@ -66,7 +66,7 @@ configuration.
   WebSocket defaults, and event-loop timeouts/pings.
 - `responses/route.rs` owns the production-only ChatGPT edge comparison loop.
   Every 30 minutes it measures DNS and two bounded direct-dial candidates with
-  authenticated `gpt-5.6-luna`, default-tier, `generate: false` requests. Its
+  authenticated `gpt-6-luna`, default-tier, `generate: false` requests. Its
   score is send-to-first-`codex.rate_limits` latency; it still drains each probe
   through completion before reusing the socket. Its account-scoped winner
   applies only to Luna/default sessions; custom endpoints and every other

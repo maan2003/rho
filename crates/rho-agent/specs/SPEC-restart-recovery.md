@@ -102,8 +102,8 @@ Required by
 
 ### Context eviction
 
-Only `eng-high-notes` considers old completed tool exchanges for eviction.
-At the compaction threshold, it applies an eviction plan only if the estimate
+No current role opts into proactive tool-history eviction. Historical rotation
+records remain replayable, and the retained planner applies an eviction plan only if the estimate
 reaches 40,000 tokens remaining; otherwise it discards the plan and requests
 provider compaction without new evictions. A request never combines these two
 actions. Eviction items preserve original call identities and transcript

@@ -22,9 +22,9 @@ pub(crate) struct EvalArgs {
     pub prompt: Option<String>,
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
-    /// Native engineer role. eng-high selects GPT-6 Astra; every role works
+    /// Native engineer role. high-eng selects GPT-6 Astra; every role works
     /// in the Python notebook.
-    #[arg(long, default_value = "eng-high", value_parser = ["eng-high-notes", "eng-high", "eng", "eng-cheap", "eng-low"])]
+    #[arg(long, default_value = "high-eng", value_parser = ["mini-eng", "med-eng", "high-eng"])]
     pub role: String,
     /// Use this LIVE working directory. Defaults to an empty temporary
     /// directory.
@@ -120,11 +120,9 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     .await;
     let role = AgentRole::Engineer {
         intelligence: match args.role.as_str() {
-            "eng-high" => EngineerIntelligence::High,
-            "eng-high-notes" => EngineerIntelligence::HighNotes,
-            "eng" => EngineerIntelligence::Medium,
-            "eng-cheap" => EngineerIntelligence::Cheap,
-            "eng-low" => EngineerIntelligence::Low,
+            "mini-eng" => EngineerIntelligence::Mini,
+            "med-eng" => EngineerIntelligence::Medium,
+            "high-eng" => EngineerIntelligence::High,
             _ => unreachable!("clap validates evaluation roles"),
         },
     };

@@ -16,20 +16,16 @@ pub enum ReasoningEffort {
 /// stay unchanged.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InferenceModel {
-    Gpt55,
-    Gpt56Sol,
-    Gpt56Luna,
-    Gpt56Terra,
+    Gpt6Sol,
+    Gpt6Luna,
     Gpt6Astra,
 }
 
 impl InferenceModel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Gpt55 => "gpt-5.5",
-            Self::Gpt56Sol => "gpt-5.6-sol",
-            Self::Gpt56Luna => "gpt-5.6-luna",
-            Self::Gpt56Terra => "gpt-5.6-terra",
+            Self::Gpt6Sol => "gpt-6-sol",
+            Self::Gpt6Luna => "gpt-6-luna",
             Self::Gpt6Astra => "gpt-6-astra",
         }
     }

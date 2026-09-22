@@ -178,7 +178,7 @@ impl ResponsesRequest {
     pub(crate) fn luna_default_probe(prompt_cache_key: uuid::Uuid) -> Self {
         Self {
             generate: Some(false),
-            model: "gpt-5.6-luna".to_owned(),
+            model: "gpt-6-luna".to_owned(),
             instructions: Arc::from(""),
             input: vec![json!({
                 "type": "additional_tools",
@@ -416,7 +416,7 @@ impl ResponsesRequest {
         let previous_response_id = previous_response.map(|(id, _)| id);
         let config = &session.responses_config;
 
-        // Responses Lite (gpt-5.6): tools and instructions are developer
+        // Responses Lite: tools and instructions are developer
         // items at the head of the input instead of top-level fields. When
         // continuing from a previous response the server already holds the
         // prefix, so only fresh replays carry it.

@@ -1091,16 +1091,14 @@ impl Agent {
         let switchable = |intelligence| {
             matches!(
                 intelligence,
-                EngineerIntelligence::Low
-                    | EngineerIntelligence::Cheap
+                EngineerIntelligence::Mini
                     | EngineerIntelligence::Medium
                     | EngineerIntelligence::High
-                    | EngineerIntelligence::HighNotes
             )
         };
         anyhow::ensure!(
             switchable(requested),
-            "this agent can switch only between eng-low, eng-cheap, eng, eng-high, and eng-high-notes"
+            "this agent can switch only between mini-eng, med-eng, and high-eng"
         );
         let current = self.head.read().expect("poison").config.role;
         let role = match current {
@@ -1109,9 +1107,9 @@ impl Agent {
                     intelligence: requested,
                 }
             }
-            _ => anyhow::bail!(
-                "this agent can switch only between eng-low, eng-cheap, eng, eng-high, and eng-high-notes"
-            ),
+            _ => {
+                anyhow::bail!("this agent can switch only between mini-eng, med-eng, and high-eng")
+            }
         };
         if role == current {
             return Ok(());
@@ -1859,8 +1857,7 @@ impl Agent {
 fn usage_model(model: InferenceModel) -> AgentUsageModel {
     match model {
         InferenceModel::Gpt6Astra => AgentUsageModel::ASTRA,
-        InferenceModel::Gpt56Terra => AgentUsageModel::TERRA,
-        InferenceModel::Gpt56Luna => AgentUsageModel::LUNA,
+        InferenceModel::Gpt6Luna => AgentUsageModel::LUNA,
         _ => AgentUsageModel::GPT,
     }
 }

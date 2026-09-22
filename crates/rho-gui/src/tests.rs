@@ -11008,7 +11008,7 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .update(cx, |workspace, _, cx| {
             let draft = workspace.draft_model_for_test().read(cx);
             assert_eq!(draft.workdir_text(cx), "ok", "the row holds what was typed");
-            assert_eq!(draft.role_text(cx), "eng", "the row below is untouched");
+            assert_eq!(draft.role_text(cx), "med-eng", "the row below is untouched");
         })
         .expect("read the rows");
 }

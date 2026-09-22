@@ -17,7 +17,7 @@ pub const DEFAULT_START: &str = "auto";
 /// The git revision represented by [`DEFAULT_START`]: none, so the agent
 /// starts where a fresh clone is born, on the remote's default branch.
 pub const AUTO_BASE_REV: &str = "";
-pub const DEFAULT_ROLE: &str = "eng";
+pub const DEFAULT_ROLE: &str = "med-eng";
 /// The filesystem a new agent gets unless the draft says otherwise: the
 /// minimal generated root, with the workset at /src.
 pub const DEFAULT_FILESYSTEM: &str = "view";
@@ -208,30 +208,21 @@ pub fn parse_start(
 
 pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
     match text.trim().to_ascii_lowercase().as_str() {
-        "" | "eng" => Ok(AgentRole::default()),
-        "eng-mini" => Ok(AgentRole::Engineer {
+        "" | "med-eng" => Ok(AgentRole::default()),
+        "mini-eng" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
         }),
-        "eng-low" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Low,
-        }),
-        "eng-cheap" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-        }),
-        "eng-high-notes" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::HighNotes,
-        }),
-        "eng-high" => Ok(AgentRole::Engineer {
+        "high-eng" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         }),
-        "eng-ultra" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Ultra,
+        "med1-eng" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium1,
         }),
-        "eng-alt" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Alt,
+        "high1-eng" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High1,
         }),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-high-notes, eng-ultra, or eng-alt"
+            "unknown role `{other}`; use mini-eng, med-eng, high-eng, med1-eng, or high1-eng"
         )),
     }
 }
@@ -258,36 +249,23 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
     match parse_agent_role(current).unwrap_or_default() {
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
-            ..
-        } => "eng-low",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Low,
-            ..
-        } => "eng-cheap",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-            ..
-        } => "eng",
+        } => "med-eng",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
-            ..
-        } => "eng-high",
+        } => "high-eng",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High | EngineerIntelligence::HighNotes,
-            ..
-        } => "eng-ultra",
+            intelligence: EngineerIntelligence::High,
+        } => "med1-eng",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Ultra,
-            ..
-        } => "eng-alt",
+            intelligence: EngineerIntelligence::Medium1,
+        } => "high1-eng",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Alt,
-            ..
-        } => "pm",
-        AgentRole::Advisor { .. }
+            intelligence: EngineerIntelligence::High1,
+        }
+        | AgentRole::Advisor { .. }
         | AgentRole::Engineer {
             intelligence: EngineerIntelligence::LegacyGemini,
-        } => "eng",
+        } => "mini-eng",
     }
 }
 
@@ -307,28 +285,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_role() {
+    fn parses_and_cycles_current_agent_roles() {
+        assert_eq!(parse_agent_role("").unwrap(), AgentRole::default());
+        assert_eq!(parse_agent_role("med-eng").unwrap(), AgentRole::default());
         assert_eq!(
-            parse_agent_role("eng-high-notes").unwrap(),
+            parse_agent_role("mini-eng").unwrap(),
             AgentRole::Engineer {
-                intelligence: EngineerIntelligence::HighNotes
+                intelligence: EngineerIntelligence::Mini,
             }
         );
-        assert!(parse_agent_role("eng-py").is_err());
-        assert!(parse_agent_role("eng-ultra-py").is_err());
-        assert_eq!(cycle_agent_role_text("eng"), "eng-high");
-        assert_eq!(cycle_agent_role_text("eng-ultra"), "eng-alt");
-
-        assert_eq!(
-            parse_agent_role("eng-low").unwrap(),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Low,
-            }
-        );
-        assert!(parse_agent_role("eng-gemini").is_err());
-        assert!(parse_agent_role("pm ultra").is_err());
-        assert!(parse_agent_role("eng-ultra-fast").is_err());
-        assert!(parse_agent_role("advisor high").is_err());
+        assert_eq!(cycle_agent_role_text("mini-eng"), "med-eng");
+        assert_eq!(cycle_agent_role_text("med-eng"), "high-eng");
+        assert_eq!(cycle_agent_role_text("high-eng"), "med1-eng");
+        assert_eq!(cycle_agent_role_text("med1-eng"), "high1-eng");
+        assert_eq!(cycle_agent_role_text("high1-eng"), "mini-eng");
+        for retired in ["eng", "eng-low", "eng-cheap", "eng-high", "eng-ultra"] {
+            assert!(parse_agent_role(retired).is_err(), "{retired}");
+        }
     }
 
     /// A base that names an agent on one host and a workdir on another is

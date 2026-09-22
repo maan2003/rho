@@ -3,13 +3,12 @@
 `rho eval` runs the real agent loop and the selected role's tool surface in-process,
 using configured provider credentials but a temporary database and (by default)
 an empty temporary working directory. It does not connect to or restart the
-running daemon. `eng-high` is GPT-6 Astra, using the same role profile as the GUI.
+running daemon. `high-eng` is GPT-6 Astra, using the same role profile as the GUI.
 These evaluations make paid/provider-metered requests.
-Among eval roles, only `eng-high` currently defaults to Python; `eng`, `eng-cheap`, and `eng-low`
-use JavaScript. Earlier cross-model Python transcripts predate this default change.
+The native eval roles are `mini-eng`, `med-eng`, and `high-eng`; all use the Python notebook.
 
 ```sh
-cargo run -p rho-cli -- eval --role eng-high --workdir /path/to/task-checkout \
+cargo run -p rho-cli -- eval --role high-eng --workdir /path/to/task-checkout \
   --prompt-file task.txt --require-tool exec --timeout 600 > coding-eval.jsonl
 ```
 
@@ -67,7 +66,7 @@ with tempfile.TemporaryDirectory() as work:
     shutil.copytree(fixture / 'retry-report', work, dirs_exist_ok=True)
     with open('coding-eval.jsonl', 'w') as log:
         result = subprocess.run([
-            'target/debug/rho', 'eval', '--role', 'eng-high', '--workdir', work,
+            'target/debug/rho', 'eval', '--role', 'high-eng', '--workdir', work,
             '--prompt-file', str(fixture / 'retry-report.txt'),
             '--require-tool', 'exec', '--timeout', '300',
         ], stdout=log)
@@ -76,4 +75,4 @@ with tempfile.TemporaryDirectory() as work:
 PY
 ```
 
-Change the role to `eng` for Sol or `eng-cheap` for Terra/high reasoning.
+Change the role to `med-eng` for Sol or `mini-eng` for Luna.

@@ -281,7 +281,7 @@ fn test_inference_service_with(
             effort: ReasoningEffort::Medium,
             fast_mode: false,
         },
-        InferenceModel::Gpt55,
+        InferenceModel::Gpt6Sol,
         prompt_cache_key,
     );
     session.config.responses_config = super::session::ResponsesConfig {

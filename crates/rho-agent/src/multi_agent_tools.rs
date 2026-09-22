@@ -156,9 +156,11 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
 fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligence {
     match role {
         AgentRole::Engineer {
-            intelligence:
-                crate::db::EngineerIntelligence::High | crate::db::EngineerIntelligence::HighNotes,
-        } => crate::db::AdvisorIntelligence::High,
+            intelligence: crate::db::EngineerIntelligence::Mini,
+        } => crate::db::AdvisorIntelligence::Low,
+        AgentRole::Engineer {
+            intelligence: crate::db::EngineerIntelligence::High,
+        } => crate::db::AdvisorIntelligence::Medium1,
         _ => crate::db::AdvisorIntelligence::Medium,
     }
 }
@@ -171,7 +173,7 @@ struct SpawnArgs {
 }
 
 pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
-    anyhow::ensure!(role == "eng", "only Engineer spawning is supported");
+    anyhow::ensure!(role == "med-eng", "only med-eng spawning is supported");
     Ok(AgentRole::default())
 }
 
@@ -300,17 +302,23 @@ mod tests {
 
     #[test]
     fn parses_spawn_role() {
-        assert_eq!(parse_spawn_role("eng").unwrap(), AgentRole::default());
+        assert_eq!(parse_spawn_role("med-eng").unwrap(), AgentRole::default());
         assert!(parse_spawn_role("terra").is_err());
     }
 
     #[test]
-    fn high_engineers_get_high_advisors() {
+    fn engineer_modes_choose_the_requested_advisor_tiers() {
         assert_eq!(
             default_advisor_intelligence(AgentRole::Engineer {
                 intelligence: crate::db::EngineerIntelligence::High,
             }),
-            crate::db::AdvisorIntelligence::High
+            crate::db::AdvisorIntelligence::Medium1
+        );
+        assert_eq!(
+            default_advisor_intelligence(AgentRole::Engineer {
+                intelligence: crate::db::EngineerIntelligence::Mini,
+            }),
+            crate::db::AdvisorIntelligence::Low
         );
         assert_eq!(
             default_advisor_intelligence(AgentRole::default()),

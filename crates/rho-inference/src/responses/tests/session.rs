@@ -19,11 +19,11 @@ fn chatgpt_codex_config_sets_endpoint_defaults() {
 }
 
 #[test]
-fn gpt56_models_use_explicit_context_and_compaction_limits() {
-    for model in [
-        InferenceModel::Gpt56Sol,
-        InferenceModel::Gpt56Luna,
-        InferenceModel::Gpt56Terra,
+fn gpt6_models_use_the_normal_context_window() {
+    for (model, name) in [
+        (InferenceModel::Gpt6Sol, "gpt-6-sol"),
+        (InferenceModel::Gpt6Luna, "gpt-6-luna"),
+        (InferenceModel::Gpt6Astra, "gpt-6-astra"),
     ] {
         let (_temp, auth) = test_oauth_file("token", None);
         let session = InferenceSession::new_deep(
@@ -33,30 +33,12 @@ fn gpt56_models_use_explicit_context_and_compaction_limits() {
             PromptCacheKey::from_bytes(*b"testkey2"),
         );
 
-        assert_eq!(session.context_window(), Some(372_000));
-        assert_eq!(session.auto_compact_token_limit(), Some(280_000));
+        assert_eq!(session.config.responses_config.model.as_str(), name);
+        assert!(session.config.responses_config.model.use_responses_lite());
+        assert_eq!(session.context_window(), Some(272_000));
+        assert_eq!(session.auto_compact_token_limit(), Some(232_560));
         assert_eq!(session.config.responses_config.auto_compaction, None);
     }
-}
-
-#[test]
-fn astra_uses_the_normal_context_window() {
-    let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceSession::new_deep(
-        Inference::for_test(auth),
-        InferenceProfile::default(),
-        InferenceModel::Gpt6Astra,
-        PromptCacheKey::from_bytes(*b"testkey2"),
-    );
-
-    assert_eq!(
-        session.config.responses_config.model.as_str(),
-        "gpt-6-astra"
-    );
-    assert!(session.config.responses_config.model.use_responses_lite());
-    assert_eq!(session.context_window(), Some(272_000));
-    assert_eq!(session.auto_compact_token_limit(), Some(232_560));
-    assert_eq!(session.config.responses_config.auto_compaction, None);
 }
 
 #[test]
@@ -105,32 +87,4 @@ fn provider_debug_request_redacts_image_data() {
         "[image data redacted]"
     );
     assert!(!value.to_string().contains("SECRET"));
-}
-
-#[test]
-fn notes_policy_disables_server_compaction_and_can_restore_it() {
-    let (_temp, auth) = test_oauth_file("token", None);
-    let mut session = InferenceSession::new_deep(
-        Inference::for_test(auth),
-        InferenceProfile::default(),
-        InferenceModel::Gpt55,
-        PromptCacheKey::from_bytes(*b"noteskey"),
-    );
-    assert_eq!(
-        session.config.responses_config.auto_compaction,
-        Some(232_560)
-    );
-    session.set_context_rotation(true);
-    assert_eq!(session.config.responses_config.auto_compaction, None);
-    session.set_context_rotation(false);
-    assert_eq!(
-        session.config.responses_config.auto_compaction,
-        Some(232_560)
-    );
-    session.set_deep_config(InferenceProfile::default(), InferenceModel::Gpt6Astra);
-    session.set_context_rotation(false);
-    assert_eq!(
-        session.config.responses_config.auto_compaction, None,
-        "Lite uses explicit triggers"
-    );
 }

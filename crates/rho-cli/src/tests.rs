@@ -140,13 +140,13 @@ fn record_visualization_parses() {
 #[test]
 fn evaluation_accepts_sol_role() {
     let args = Args::try_parse(
-        ["eval", "task", "--role", "eng"]
+        ["eval", "task", "--role", "med-eng"]
             .into_iter()
             .map(str::to_owned),
     )
     .unwrap();
     assert!(matches!(
-        args.command, Command::Eval(eval::EvalArgs { role, .. }) if role == "eng"
+        args.command, Command::Eval(eval::EvalArgs { role, .. }) if role == "med-eng"
     ));
 }
 
@@ -167,7 +167,7 @@ fn evaluation_defaults_to_astra_and_requires_a_prompt() {
     )
     .unwrap();
     assert!(
-        matches!(args.command, Command::Eval(eval::EvalArgs {role, expect, require_tool,..}) if role == "eng-high" && expect == ["PASS"] && require_tool == ["exec"])
+        matches!(args.command, Command::Eval(eval::EvalArgs {role, expect, require_tool,..}) if role == "high-eng" && expect == ["PASS"] && require_tool == ["exec"])
     );
     assert!(
         Args::try_parse(

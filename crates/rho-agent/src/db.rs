@@ -54,7 +54,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "7a2ecf91";
+const CURRENT_AGENT_DB_FORMAT: &str = "b906d137";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -63,7 +63,12 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+mod migration;
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "7a2ecf91",
+    to: CURRENT_AGENT_DB_FORMAT,
+    migrate: migration::migrate,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -215,8 +220,7 @@ pub(crate) fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) ->
     match runtime {
         AgentRuntime::Rho { .. } => match binding.deep_model() {
             Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
-            Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
-            Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
+            Some(InferenceModel::Gpt6Luna) => AgentUsageModel::LUNA,
             _ => AgentUsageModel::GPT,
         },
         AgentRuntime::Claude { .. } => match binding.claude_model() {
@@ -422,41 +426,31 @@ impl senax_encoder::Decoder for AgentSpawnedBy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum SessionBinding {
-    ResponsesGpt55(InferenceProfile),
     ClaudeFable {
         effort: ClaudeEffort,
     },
     ClaudeOpus {
         effort: ClaudeEffort,
     },
-    // gpt-5.6 deep modes; appended after Deep so persisted modes keep
-    // decoding.
     ResponsesSol(InferenceProfile),
     ResponsesLuna(InferenceProfile),
-    ResponsesTerra(InferenceProfile),
-    /// Ultra advisory agent. Kept distinct from an ultra engineer so its role
-    /// survives session pinning.
+    /// Fable-backed advisor; distinct so its role survives session pinning.
     ClaudeAdvisor {
         effort: ClaudeEffort,
     },
-    /// Sol-backed advisory agent.
+    /// Sol-backed advisor.
     AdvisorSol(InferenceProfile),
-    /// Terra-backed cheap advisory agent. Appended so persisted modes keep
-    /// decoding.
-    AdvisorTerra(InferenceProfile),
-    /// GPT-6 Astra-backed engineer.
     ResponsesAstra(InferenceProfile),
-    /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
+    /// Astra-backed advisor; distinct so its role survives session pinning.
     AdvisorAstra(InferenceProfile),
-    ResponsesAstraNotes(InferenceProfile),
     /// Retained historical configuration, never a runnable provider binding.
     LegacyGemini(InferenceProfile),
 }
 
-/// `SessionBinding` as rows wrote it while the PM role existed. The
-/// coordinator bindings were Sol and Terra with a PM prompt; they read as
-/// the plain Sol and Terra bindings now. The Python-suffixed bindings named
-/// a tool surface every engineer has since, so they read as their models.
+/// Binding names used by prior database formats. Retired variants normalize
+/// into the exhaustive current role matrix while the temporary format
+/// migration rewrites every nested agent configuration.
+#[allow(dead_code)]
 #[derive(Decode)]
 enum StoredSessionBinding {
     ResponsesGpt55(InferenceProfile),
@@ -476,31 +470,42 @@ enum StoredSessionBinding {
     ClaudeFablePython { effort: ClaudeEffort },
     ResponsesAstraNotes(InferenceProfile),
     AntigravityFlashLow(InferenceProfile),
+    ResponsesSolCheap(InferenceProfile),
     LegacyGemini(InferenceProfile),
 }
 
 impl senax_encoder::Decoder for SessionBinding {
     fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
         use StoredSessionBinding as Stored;
+        let deep = |effort| InferenceProfile {
+            effort,
+            fast_mode: false,
+        };
         Ok(match Stored::decode(reader)? {
-            Stored::ResponsesGpt55(config) => Self::ResponsesGpt55(config),
-            Stored::ClaudeFable { effort } => Self::ClaudeFable { effort },
-            Stored::ClaudeOpus { effort } => Self::ClaudeOpus { effort },
-            Stored::ResponsesSol(config) | Stored::CoordinatorSol(config) => {
-                Self::ResponsesSol(config)
+            Stored::ResponsesGpt55(_)
+            | Stored::ResponsesSol(_)
+            | Stored::ResponsesTerra(_)
+            | Stored::CoordinatorTerra(_)
+            | Stored::CoordinatorSol(_)
+            | Stored::ResponsesSolPython(_)
+            | Stored::ResponsesSolCheap(_) => Self::ResponsesSol(deep(ReasoningEffort::High)),
+            Stored::ResponsesLuna(_) => Self::ResponsesLuna(deep(ReasoningEffort::Xhigh)),
+            Stored::ResponsesAstra(_) | Stored::ResponsesAstraNotes(_) => {
+                Self::ResponsesAstra(deep(ReasoningEffort::Medium))
             }
-            Stored::ResponsesLuna(config) => Self::ResponsesLuna(config),
-            Stored::ResponsesTerra(config) | Stored::CoordinatorTerra(config) => {
-                Self::ResponsesTerra(config)
+            Stored::AdvisorSol(_) => Self::AdvisorSol(deep(ReasoningEffort::Xhigh)),
+            Stored::AdvisorTerra(_) | Stored::AdvisorAstra(_) => {
+                Self::AdvisorAstra(deep(ReasoningEffort::Xhigh))
             }
-            Stored::ClaudeAdvisor { effort } => Self::ClaudeAdvisor { effort },
-            Stored::AdvisorSol(config) => Self::AdvisorSol(config),
-            Stored::AdvisorTerra(config) => Self::AdvisorTerra(config),
-            Stored::ResponsesAstra(config) => Self::ResponsesAstra(config),
-            Stored::ResponsesAstraNotes(config) => Self::ResponsesAstraNotes(config),
-            Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
-            Stored::ResponsesSolPython(config) => Self::ResponsesSol(config),
-            Stored::ClaudeFablePython { effort } => Self::ClaudeFable { effort },
+            Stored::ClaudeFable { .. } | Stored::ClaudeFablePython { .. } => Self::ClaudeFable {
+                effort: ClaudeEffort::Medium,
+            },
+            Stored::ClaudeOpus { .. } => Self::ClaudeOpus {
+                effort: ClaudeEffort::Medium,
+            },
+            Stored::ClaudeAdvisor { .. } => Self::ClaudeAdvisor {
+                effort: ClaudeEffort::Xhigh,
+            },
             Stored::AntigravityFlashLow(config) | Stored::LegacyGemini(config) => {
                 Self::LegacyGemini(config)
             }
@@ -526,129 +531,78 @@ impl AgentRoleSessionProfile for AgentRole {
             ),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
-            } => SessionBinding::ResponsesLuna(InferenceProfile {
-                fast_mode: true,
-                ..deep(ReasoningEffort::Xhigh)
-            }),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Low,
-            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Cheap,
-            } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::High)),
+            } => SessionBinding::ResponsesLuna(deep(ReasoningEffort::Xhigh)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
+            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::High)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
             } => SessionBinding::ResponsesAstra(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
-                intelligence: EngineerIntelligence::HighNotes,
-            } => SessionBinding::ResponsesAstraNotes(deep(ReasoningEffort::Medium)),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Ultra,
-            } => SessionBinding::ClaudeFable {
-                effort: ClaudeEffort::High,
-            },
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Alt,
+                intelligence: EngineerIntelligence::Medium1,
             } => SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::Medium,
             },
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High1,
+            } => SessionBinding::ClaudeFable {
+                effort: ClaudeEffort::Medium,
+            },
+            AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Low,
+            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
-            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::High)),
+            } => SessionBinding::AdvisorAstra(deep(ReasoningEffort::Xhigh)),
             AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Cheap,
-            } => SessionBinding::AdvisorTerra(deep(ReasoningEffort::Xhigh)),
-            AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::High,
-            } => SessionBinding::AdvisorAstra(deep(ReasoningEffort::Medium)),
+                intelligence: AdvisorIntelligence::Medium1,
+            } => SessionBinding::ClaudeAdvisor {
+                effort: ClaudeEffort::Xhigh,
+            },
         })
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum ClaudeEffort {
-    Medium,
-    Xhigh,
-    High,
-}
-
 impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
-        if matches!(self, Self::ResponsesAstraNotes(_)) {
-            return AgentRole::Engineer {
-                intelligence: EngineerIntelligence::HighNotes,
-            };
-        } else if matches!(self, Self::ResponsesAstra(_)) {
-            return AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High,
-            };
-        } else if matches!(self, Self::ClaudeAdvisor { .. } | Self::AdvisorAstra(_)) {
-            return AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::High,
-            };
-        } else if matches!(self, Self::AdvisorSol(_)) {
-            return AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Medium,
-            };
-        } else if matches!(self, Self::AdvisorTerra(_)) {
-            return AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::Cheap,
-            };
-        }
-        let intelligence = match self {
-            Self::LegacyGemini(_) => EngineerIntelligence::LegacyGemini,
-            Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
-            Self::ClaudeFable {
-                effort: ClaudeEffort::High,
-            }
-            | Self::ClaudeAdvisor {
-                effort: ClaudeEffort::High,
-            } => EngineerIntelligence::Ultra,
-            Self::ClaudeOpus {
-                effort: ClaudeEffort::High,
-            } => EngineerIntelligence::Alt,
-            Self::ResponsesSol(config) if config.effort == ReasoningEffort::Xhigh => {
-                EngineerIntelligence::High
-            }
-            Self::ResponsesTerra(config) if config.effort == ReasoningEffort::Low => {
-                EngineerIntelligence::Low
-            }
-            Self::ResponsesTerra(config) if config.effort == ReasoningEffort::High => {
-                EngineerIntelligence::Cheap
-            }
-            Self::ResponsesAstra(_) | Self::ResponsesAstraNotes(_) | Self::AdvisorAstra(_) => {
-                unreachable!("Astra role binding returned above")
-            }
-            Self::ResponsesGpt55(config)
-            | Self::ResponsesSol(config)
-            | Self::ResponsesTerra(config)
-            | Self::AdvisorSol(config)
-            | Self::AdvisorTerra(config) => match config.effort {
-                ReasoningEffort::Low => EngineerIntelligence::Low,
-                ReasoningEffort::Medium => EngineerIntelligence::Medium,
-                ReasoningEffort::High => EngineerIntelligence::High,
-                ReasoningEffort::Xhigh => EngineerIntelligence::High,
+        match self {
+            Self::ResponsesLuna(_) => AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Mini,
             },
-            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => EngineerIntelligence::Ultra,
-            Self::ClaudeOpus { .. } => EngineerIntelligence::Alt,
-        };
-        AgentRole::Engineer { intelligence }
+            Self::ResponsesSol(_) => AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Medium,
+            },
+            Self::ResponsesAstra(_) => AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High,
+            },
+            Self::ClaudeOpus { .. } => AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Medium1,
+            },
+            Self::ClaudeFable { .. } => AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High1,
+            },
+            Self::AdvisorSol(_) => AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Low,
+            },
+            Self::AdvisorAstra(_) => AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Medium,
+            },
+            Self::ClaudeAdvisor { .. } => AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Medium1,
+            },
+            Self::LegacyGemini(_) => AgentRole::Engineer {
+                intelligence: EngineerIntelligence::LegacyGemini,
+            },
+        }
     }
 
     pub fn deep_config(self) -> Option<InferenceProfile> {
         match self {
-            Self::ResponsesGpt55(config)
-            | Self::ResponsesSol(config)
+            Self::ResponsesSol(config)
             | Self::ResponsesLuna(config)
-            | Self::ResponsesTerra(config)
             | Self::ResponsesAstra(config)
-            | Self::ResponsesAstraNotes(config)
             | Self::AdvisorAstra(config)
-            | Self::AdvisorSol(config)
-            | Self::AdvisorTerra(config) => Some(config),
+            | Self::AdvisorSol(config) => Some(config),
             Self::ClaudeFable { .. }
             | Self::ClaudeOpus { .. }
             | Self::ClaudeAdvisor { .. }
@@ -658,13 +612,9 @@ impl SessionBinding {
 
     pub fn deep_model(self) -> Option<InferenceModel> {
         match self {
-            Self::ResponsesGpt55(_) => Some(InferenceModel::Gpt55),
-            Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt56Sol),
-            Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
-            Self::ResponsesTerra(_) | Self::AdvisorTerra(_) => Some(InferenceModel::Gpt56Terra),
-            Self::ResponsesAstra(_) | Self::ResponsesAstraNotes(_) | Self::AdvisorAstra(_) => {
-                Some(InferenceModel::Gpt6Astra)
-            }
+            Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt6Sol),
+            Self::ResponsesLuna(_) => Some(InferenceModel::Gpt6Luna),
+            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
             Self::ClaudeFable { .. }
             | Self::ClaudeOpus { .. }
             | Self::ClaudeAdvisor { .. }
@@ -676,15 +626,11 @@ impl SessionBinding {
         match self {
             Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => Some(rho_claude::Model::Fable),
             Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
-            Self::ResponsesGpt55(_)
-            | Self::ResponsesSol(_)
+            Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
-            | Self::ResponsesTerra(_)
             | Self::ResponsesAstra(_)
-            | Self::ResponsesAstraNotes(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
-            | Self::AdvisorTerra(_)
             | Self::LegacyGemini(_) => None,
         }
     }
@@ -695,18 +641,21 @@ impl SessionBinding {
                 Some(effort.to_claude_effort())
             }
             Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
-            Self::ResponsesGpt55(_)
-            | Self::ResponsesSol(_)
+            Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
-            | Self::ResponsesTerra(_)
             | Self::ResponsesAstra(_)
-            | Self::ResponsesAstraNotes(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
-            | Self::AdvisorTerra(_)
             | Self::LegacyGemini(_) => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum ClaudeEffort {
+    Medium,
+    Xhigh,
+    High,
 }
 
 impl ClaudeEffort {

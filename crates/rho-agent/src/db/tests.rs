@@ -5,69 +5,260 @@ use rho_inference::PromptCacheKey;
 
 use super::*;
 
+#[derive(Debug, Encode, Decode)]
+enum RetiredOpenAiBinding {
+    ResponsesGpt55(InferenceProfile),
+    ResponsesTerra(InferenceProfile),
+    AdvisorTerra(InferenceProfile),
+}
+
+#[derive(Clone, Copy, Debug, Encode, Decode)]
+enum RetiredEngineerIntelligence {
+    Cheap,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Encode, Decode)]
+enum RetiredAgentRole {
+    Engineer {
+        intelligence: RetiredEngineerIntelligence,
+    },
+}
+
+#[derive(Debug, Encode, Decode)]
+enum RetiredBindingAgentEvent {
+    Created {
+        role: RetiredAgentRole,
+        binding: RetiredOpenAiBinding,
+        runtime: AgentRuntime,
+        place: Place,
+        spawned_by: AgentSpawnedBy,
+        spawn_name: Option<String>,
+        created_at: UnixMs,
+        parent: Option<AgentId>,
+    },
+}
+
+#[derive(Debug)]
+struct AgentLogName;
+
+impl rho_db::RecordedTypeName for AgentLogName {
+    const NAME: &'static str = "rho-db::Sen<rho_agent::AgentEvent<'_>>";
+}
+
+const RETIRED_BINDING_LOG: redb::TableDefinition<
+    (AgentId, u64),
+    rho_db::SenAs<RetiredBindingAgentEvent, AgentLogName>,
+> = redb::TableDefinition::new("agent_log");
+
+#[tokio::test]
+async fn model_retirement_format_hop_rewrites_nested_bindings() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rho.redb");
+    let db = RhoDb::open(&path);
+    let (gpt55, terra, advisor_terra) = {
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let gpt55 = write.alloc_agent_id();
+        let terra = write.alloc_agent_id();
+        let advisor_terra = write.alloc_agent_id();
+        let event = |role, binding| RetiredBindingAgentEvent::Created {
+            role: RetiredAgentRole::Engineer { intelligence: role },
+            binding,
+            runtime: AgentRuntime::Rho {
+                prompt_cache_key: PromptCacheKey::generate(),
+            },
+            place: test_workspace(),
+            spawned_by: AgentSpawnedBy::Direct,
+            spawn_name: None,
+            created_at: UnixMs(1),
+            parent: None,
+        };
+        write.open_table(RETIRED_BINDING_LOG).insert(
+            &(gpt55, 0),
+            rho_db::SenValue::borrowed(&event(
+                RetiredEngineerIntelligence::Cheap,
+                RetiredOpenAiBinding::ResponsesGpt55(InferenceProfile {
+                    effort: ReasoningEffort::Xhigh,
+                    fast_mode: true,
+                }),
+            )),
+        );
+        write.open_table(RETIRED_BINDING_LOG).insert(
+            &(terra, 0),
+            rho_db::SenValue::borrowed(&event(
+                RetiredEngineerIntelligence::Cheap,
+                RetiredOpenAiBinding::ResponsesTerra(InferenceProfile {
+                    effort: ReasoningEffort::High,
+                    fast_mode: false,
+                }),
+            )),
+        );
+        write.open_table(RETIRED_BINDING_LOG).insert(
+            &(advisor_terra, 0),
+            rho_db::SenValue::borrowed(&event(
+                RetiredEngineerIntelligence::High,
+                RetiredOpenAiBinding::AdvisorTerra(InferenceProfile {
+                    effort: ReasoningEffort::Low,
+                    fast_mode: true,
+                }),
+            )),
+        );
+        write.open_table(FORMAT).insert(&(), &"7a2ecf91".to_owned());
+        write.commit();
+        (gpt55, terra, advisor_terra)
+    };
+    drop(db);
+
+    let db = RhoDb::open(&path);
+    prepare(&db).await;
+
+    let read = db.read();
+    assert_eq!(
+        read.open_table(FORMAT).get(&()).unwrap().value(),
+        CURRENT_AGENT_DB_FORMAT
+    );
+    let expected_engineer = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::Medium,
+    };
+    for id in [gpt55, terra] {
+        let config = read.get_agent(id).config;
+        assert_eq!(config.role, expected_engineer);
+        assert_eq!(
+            config.binding,
+            SessionBinding::ResponsesSol(InferenceProfile {
+                effort: ReasoningEffort::High,
+                fast_mode: false,
+            })
+        );
+    }
+    let advisor = read.get_agent(advisor_terra).config;
+    assert_eq!(
+        advisor.role,
+        AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Medium,
+        }
+    );
+    assert_eq!(
+        advisor.binding,
+        SessionBinding::AdvisorAstra(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+        })
+    );
+}
+
 #[test]
-fn astra_bindings_round_trip() {
+fn canonical_bindings_round_trip() {
     for binding in [
-        SessionBinding::ResponsesAstra(InferenceProfile::default()),
-        SessionBinding::ResponsesAstraNotes(InferenceProfile::default()),
-        SessionBinding::AdvisorAstra(InferenceProfile::default()),
+        SessionBinding::ResponsesLuna(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+        }),
+        SessionBinding::ResponsesSol(InferenceProfile {
+            effort: ReasoningEffort::High,
+            fast_mode: false,
+        }),
+        SessionBinding::ResponsesAstra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: false,
+        }),
+        SessionBinding::AdvisorSol(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+        }),
+        SessionBinding::AdvisorAstra(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+        }),
     ] {
         let mut encoded = bytes::BytesMut::new();
         senax_encoder::encode_to(&binding, &mut encoded).unwrap();
-        let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
-        assert_eq!(decoded, binding);
+        assert_eq!(
+            <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap(),
+            binding
+        );
     }
 }
 
 #[test]
-fn python_suffixed_bindings_fold_into_their_models() {
+fn retired_bindings_fold_into_current_roles() {
     #[derive(Encode)]
     #[allow(dead_code)]
     enum LegacySessionBinding {
+        ResponsesGpt55(InferenceProfile),
+        ResponsesTerra(InferenceProfile),
+        ResponsesSolCheap(InferenceProfile),
         ResponsesSolPython(InferenceProfile),
+        ResponsesAstraNotes(InferenceProfile),
+        AdvisorTerra(InferenceProfile),
         ClaudeFablePython { effort: ClaudeEffort },
     }
+
     let profile = InferenceProfile {
-        effort: ReasoningEffort::Medium,
-        fast_mode: false,
+        effort: ReasoningEffort::Low,
+        fast_mode: true,
     };
-    for (legacy, expected) in [
-        (
-            LegacySessionBinding::ResponsesSolPython(profile),
-            SessionBinding::ResponsesSol(profile),
-        ),
-        (
-            LegacySessionBinding::ClaudeFablePython {
-                effort: ClaudeEffort::High,
-            },
-            SessionBinding::ClaudeFable {
-                effort: ClaudeEffort::High,
-            },
-        ),
-    ] {
+    let decode = |legacy| {
         let mut encoded = bytes::BytesMut::new();
         senax_encoder::encode_to(&legacy, &mut encoded).unwrap();
-        let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
-        assert_eq!(decoded, expected);
-    }
+        <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap()
+    };
+    let med_eng = SessionBinding::ResponsesSol(InferenceProfile {
+        effort: ReasoningEffort::High,
+        fast_mode: false,
+    });
+    assert_eq!(
+        decode(LegacySessionBinding::ResponsesGpt55(profile)),
+        med_eng
+    );
+    assert_eq!(
+        decode(LegacySessionBinding::ResponsesTerra(profile)),
+        med_eng
+    );
+    assert_eq!(
+        decode(LegacySessionBinding::ResponsesSolCheap(profile)),
+        med_eng
+    );
+    assert_eq!(
+        decode(LegacySessionBinding::ResponsesSolPython(profile)),
+        med_eng
+    );
+    assert_eq!(
+        decode(LegacySessionBinding::ResponsesAstraNotes(profile)),
+        SessionBinding::ResponsesAstra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: false,
+        })
+    );
+    assert_eq!(
+        decode(LegacySessionBinding::AdvisorTerra(profile)),
+        SessionBinding::AdvisorAstra(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+        })
+    );
+    assert_eq!(
+        decode(LegacySessionBinding::ClaudeFablePython {
+            effort: ClaudeEffort::High,
+        }),
+        SessionBinding::ClaudeFable {
+            effort: ClaudeEffort::Medium,
+        }
+    );
 }
 
 #[test]
-fn legacy_high_engineer_binding_stays_on_sol() {
+fn sol_binding_is_the_medium_engineer() {
     let binding = SessionBinding::ResponsesSol(InferenceProfile {
-        effort: ReasoningEffort::Xhigh,
+        effort: ReasoningEffort::High,
         fast_mode: false,
     });
-    let mut encoded = bytes::BytesMut::new();
-    senax_encoder::encode_to(&binding, &mut encoded).unwrap();
-    let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
-
-    assert_eq!(decoded, binding);
-    assert_eq!(decoded.deep_model(), Some(InferenceModel::Gpt56Sol));
+    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt6Sol));
     assert_eq!(
-        decoded.agent_role(),
+        binding.agent_role(),
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
+            intelligence: EngineerIntelligence::Medium,
         }
     );
 }
@@ -172,21 +363,21 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
             ..first.clone()
         },
     );
-    let terra_id = write.alloc_agent_id();
+    let astra_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
-        terra_id,
+        astra_id,
         None,
         test_workspace(),
         AgentRole::default(),
-        SessionBinding::ResponsesTerra(InferenceProfile::default()),
+        SessionBinding::ResponsesAstra(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
         },
         None,
     );
     write.add_agent_usage(
-        terra_id,
+        astra_id,
         &AgentUsageBucket {
             model: AgentUsageModel::UNKNOWN,
             ..first.clone()
@@ -228,8 +419,8 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     assert_eq!(global[1].1.output_tokens, 40);
     assert_eq!(global[2].0, AgentUsageModel::OPUS);
     assert_eq!(global[2].1.output_tokens, 40);
-    assert_eq!(global[3].0, AgentUsageModel::TERRA);
-    assert_eq!(global[4].0, AgentUsageModel::LUNA);
+    assert_eq!(global[3].0, AgentUsageModel::LUNA);
+    assert_eq!(global[4].0, AgentUsageModel::ASTRA);
 }
 
 #[tokio::test]
@@ -318,99 +509,77 @@ async fn quota_history_deduplicates_unchanged_samples() {
 }
 
 #[test]
-fn agent_role_resolves_opinionated_bindings() {
+fn agent_roles_resolve_the_current_model_matrix() {
     let profile = |intelligence| {
         AgentRole::Engineer { intelligence }
             .session_profile()
             .unwrap()
     };
-    assert!(matches!(
+    assert_eq!(
         profile(EngineerIntelligence::Mini),
         SessionBinding::ResponsesLuna(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
-            fast_mode: true,
+            fast_mode: false,
         })
-    ));
-    assert!(matches!(
-        profile(EngineerIntelligence::Low),
-        SessionBinding::ResponsesTerra(InferenceProfile {
-            effort: ReasoningEffort::Low,
-            ..
-        })
-    ));
-    assert!(matches!(
-        profile(EngineerIntelligence::Cheap),
-        SessionBinding::ResponsesTerra(InferenceProfile {
-            effort: ReasoningEffort::High,
-            ..
-        })
-    ));
-    assert!(matches!(
+    );
+    assert_eq!(
         profile(EngineerIntelligence::Medium),
         SessionBinding::ResponsesSol(InferenceProfile {
-            effort: ReasoningEffort::Medium,
-            ..
+            effort: ReasoningEffort::High,
+            fast_mode: false,
         })
-    ));
-    assert!(matches!(
+    );
+    assert_eq!(
         profile(EngineerIntelligence::High),
         SessionBinding::ResponsesAstra(InferenceProfile {
             effort: ReasoningEffort::Medium,
-            ..
+            fast_mode: false,
         })
-    ));
-    assert_eq!(
-        profile(EngineerIntelligence::Ultra),
-        SessionBinding::ClaudeFable {
-            effort: ClaudeEffort::High
-        }
     );
     assert_eq!(
-        profile(EngineerIntelligence::Alt),
+        profile(EngineerIntelligence::Medium1),
         SessionBinding::ClaudeOpus {
-            effort: ClaudeEffort::Medium
+            effort: ClaudeEffort::Medium,
         }
     );
-    for intelligence in [EngineerIntelligence::Ultra, EngineerIntelligence::Alt] {
-        assert!(
-            profile(intelligence).claude_model().is_some(),
-            "every Claude engineer works in the Python notebook"
-        );
-    }
-    assert!(matches!(
+    assert_eq!(
+        profile(EngineerIntelligence::High1),
+        SessionBinding::ClaudeFable {
+            effort: ClaudeEffort::Medium,
+        }
+    );
+    assert_eq!(
         AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::High,
+            intelligence: AdvisorIntelligence::Low,
         }
         .session_profile()
         .unwrap(),
-        SessionBinding::AdvisorAstra(InferenceProfile {
-            effort: ReasoningEffort::Medium,
+        SessionBinding::AdvisorSol(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
             fast_mode: false,
         })
-    ));
-    assert!(matches!(
+    );
+    assert_eq!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         }
         .session_profile()
         .unwrap(),
-        SessionBinding::AdvisorSol(InferenceProfile {
-            effort: ReasoningEffort::High,
-            fast_mode: false,
-            ..
-        })
-    ));
-    assert!(matches!(
-        AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::Cheap,
-        }
-        .session_profile()
-        .unwrap(),
-        SessionBinding::AdvisorTerra(InferenceProfile {
+        SessionBinding::AdvisorAstra(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
         })
-    ));
+    );
+    assert_eq!(
+        AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Medium1,
+        }
+        .session_profile()
+        .unwrap(),
+        SessionBinding::ClaudeAdvisor {
+            effort: ClaudeEffort::Xhigh,
+        }
+    );
 }
 
 use crate::{InputKind, MessageDelivery, MessageSender, QueuedInput};
@@ -476,7 +645,7 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
         None,
         test_workspace(),
         AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
         AgentRuntime::Claude {
             session_id: source_session_id,
         },
@@ -582,8 +751,8 @@ async fn agent_spawned_by_is_stored_at_creation() {
 #[test]
 fn deep_default_uses_default_deep_config() {
     assert_eq!(
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default())
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
+        SessionBinding::ResponsesSol(InferenceProfile::default())
     );
 }
 
@@ -629,7 +798,7 @@ async fn agent_ids_allocate_before_records_exist() {
         None,
         test_workspace(),
         AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
@@ -674,7 +843,7 @@ pub(super) fn create(
         spawn_name.map(str::to_owned),
         test_workspace(),
         AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        SessionBinding::ResponsesSol(InferenceProfile::default()),
         test_agent_runtime(),
         parent,
     );
@@ -864,28 +1033,6 @@ async fn the_journal_names_every_row_in_write_order() {
             (4, second, 1),
             (5, first, 2)
         ]
-    );
-}
-
-#[test]
-fn notes_role_has_high_model_and_effort_but_a_distinct_binding() {
-    let high = AgentRole::Engineer {
-        intelligence: EngineerIntelligence::High,
-    };
-    let notes = AgentRole::Engineer {
-        intelligence: EngineerIntelligence::HighNotes,
-    };
-    let high_binding = high.session_profile().unwrap();
-    let notes_binding = notes.session_profile().unwrap();
-    assert_ne!(notes_binding, high_binding);
-    assert_eq!(notes_binding.deep_model(), high_binding.deep_model());
-    assert_eq!(notes_binding.deep_config(), high_binding.deep_config());
-    assert_eq!(notes_binding.agent_role(), notes);
-    assert_eq!(high_binding.agent_role(), high);
-    let mut packed = senax_encoder::pack(&notes_binding).unwrap();
-    assert_eq!(
-        senax_encoder::unpack::<SessionBinding>(&mut packed).unwrap(),
-        notes_binding
     );
 }
 

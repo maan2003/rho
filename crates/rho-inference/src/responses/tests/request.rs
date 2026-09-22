@@ -24,7 +24,7 @@ fn title_session_uses_luna_fast_profile() {
 
     assert_eq!(
         session.config.responses_config.model,
-        ResponsesModel::Gpt56Luna
+        ResponsesModel::Gpt6Luna
     );
     assert_eq!(
         session.config.responses_config.reasoning_context,
@@ -229,7 +229,7 @@ fn serializes_configured_reasoning_context() {
             effort: ReasoningEffort::High,
             fast_mode: false,
         },
-        InferenceModel::Gpt55,
+        InferenceModel::Gpt6Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     session.config.responses_config.model = ResponsesModel::Test("gpt-test".to_owned());
@@ -805,7 +805,7 @@ fn responses_lite_previous_response_skips_developer_prefix() {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
         },
-        InferenceModel::Gpt56Sol,
+        InferenceModel::Gpt6Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     let mut request = inference_request(vec![

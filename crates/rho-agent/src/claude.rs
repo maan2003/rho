@@ -896,23 +896,23 @@ impl ClaudeLoop {
 
         let requested = match requested {
             AgentRole::Engineer { intelligence } => intelligence,
-            _ => anyhow::bail!("role changes currently support only eng-ultra and eng-alt"),
+            _ => anyhow::bail!("role changes currently support only med1-eng and high1-eng"),
         };
         anyhow::ensure!(
             matches!(
                 requested,
-                EngineerIntelligence::Ultra | EngineerIntelligence::Alt
+                EngineerIntelligence::High1 | EngineerIntelligence::Medium1
             ),
-            "role changes currently support only eng-ultra and eng-alt"
+            "role changes currently support only med1-eng and high1-eng"
         );
 
         let role = match self.role {
             AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
+                intelligence: EngineerIntelligence::High1 | EngineerIntelligence::Medium1,
             } => AgentRole::Engineer {
                 intelligence: requested,
             },
-            _ => anyhow::bail!("role changes currently support only eng-ultra and eng-alt"),
+            _ => anyhow::bail!("role changes currently support only med1-eng and high1-eng"),
         };
         if role == self.role {
             return Ok(());

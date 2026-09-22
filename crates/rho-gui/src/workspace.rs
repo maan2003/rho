@@ -3019,15 +3019,13 @@ impl Workspace {
         let roles: &[&str] = match role {
             AgentRole::Engineer {
                 intelligence:
-                    EngineerIntelligence::Low
-                    | EngineerIntelligence::Cheap
+                    EngineerIntelligence::Mini
                     | EngineerIntelligence::Medium
-                    | EngineerIntelligence::High
-                    | EngineerIntelligence::HighNotes,
-            } => &["eng-low", "eng-cheap", "eng", "eng-high", "eng-high-notes"],
+                    | EngineerIntelligence::High,
+            } => &["mini-eng", "med-eng", "high-eng"],
             AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
-            } => &["eng-ultra", "eng-alt"],
+                intelligence: EngineerIntelligence::Medium1 | EngineerIntelligence::High1,
+            } => &["med1-eng", "high1-eng"],
             _ => {
                 self.notice_on(
                     Some(&agent_id),
@@ -3055,13 +3053,11 @@ impl Workspace {
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let intelligence = match input.trim().to_ascii_lowercase().as_str() {
-                    "eng-low" => Some(EngineerIntelligence::Low),
-                    "eng-cheap" => Some(EngineerIntelligence::Cheap),
-                    "eng" => Some(EngineerIntelligence::Medium),
-                    "eng-high" => Some(EngineerIntelligence::High),
-                    "eng-high-notes" => Some(EngineerIntelligence::HighNotes),
-                    "eng-ultra" => Some(EngineerIntelligence::Ultra),
-                    "eng-alt" => Some(EngineerIntelligence::Alt),
+                    "mini-eng" => Some(EngineerIntelligence::Mini),
+                    "med-eng" => Some(EngineerIntelligence::Medium),
+                    "high-eng" => Some(EngineerIntelligence::High),
+                    "med1-eng" => Some(EngineerIntelligence::Medium1),
+                    "high1-eng" => Some(EngineerIntelligence::High1),
                     _ => None,
                 };
                 match intelligence {
@@ -9144,19 +9140,16 @@ fn mode_label(mode: rho_ui_proto::WorksetMode) -> &'static str {
 fn agent_role_label(config: AgentRole) -> String {
     match config {
         AgentRole::Advisor { intelligence } => match intelligence {
-            AdvisorIntelligence::Medium => "advisor",
-            AdvisorIntelligence::High => "advisor-high",
-            AdvisorIntelligence::Cheap => "advisor-cheap",
+            AdvisorIntelligence::Low => "low-adv",
+            AdvisorIntelligence::Medium => "med-adv",
+            AdvisorIntelligence::Medium1 => "med1-adv",
         },
         AgentRole::Engineer { intelligence } => match intelligence {
-            EngineerIntelligence::Mini => "eng-mini",
-            EngineerIntelligence::Low => "eng-low",
-            EngineerIntelligence::Cheap => "eng-cheap",
-            EngineerIntelligence::Medium => "eng",
-            EngineerIntelligence::High => "eng-high",
-            EngineerIntelligence::HighNotes => "eng-high-notes",
-            EngineerIntelligence::Ultra => "eng-ultra",
-            EngineerIntelligence::Alt => "eng-alt",
+            EngineerIntelligence::Mini => "mini-eng",
+            EngineerIntelligence::Medium => "med-eng",
+            EngineerIntelligence::High => "high-eng",
+            EngineerIntelligence::Medium1 => "med1-eng",
+            EngineerIntelligence::High1 => "high1-eng",
             EngineerIntelligence::LegacyGemini => "legacy Gemini (unsupported)",
         },
     }
@@ -9816,8 +9809,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_agent_role() {
-        assert_eq!(agent_role_label(AgentRole::default()), "eng");
+    fn labels_current_agent_roles() {
+        for (role, expected) in [
+            (AgentRole::default(), "med-eng"),
+            (
+                AgentRole::Engineer {
+                    intelligence: EngineerIntelligence::Mini,
+                },
+                "mini-eng",
+            ),
+            (
+                AgentRole::Engineer {
+                    intelligence: EngineerIntelligence::High,
+                },
+                "high-eng",
+            ),
+            (
+                AgentRole::Engineer {
+                    intelligence: EngineerIntelligence::Medium1,
+                },
+                "med1-eng",
+            ),
+            (
+                AgentRole::Engineer {
+                    intelligence: EngineerIntelligence::High1,
+                },
+                "high1-eng",
+            ),
+            (
+                AgentRole::Advisor {
+                    intelligence: AdvisorIntelligence::Low,
+                },
+                "low-adv",
+            ),
+            (
+                AgentRole::Advisor {
+                    intelligence: AdvisorIntelligence::Medium,
+                },
+                "med-adv",
+            ),
+            (
+                AgentRole::Advisor {
+                    intelligence: AdvisorIntelligence::Medium1,
+                },
+                "med1-adv",
+            ),
+        ] {
+            assert_eq!(agent_role_label(role), expected);
+        }
     }
 
     #[test]

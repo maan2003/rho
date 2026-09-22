@@ -110,12 +110,8 @@ security, resource-isolation, or rollback boundary.
   mail and user input are pull-based sources it drains at that boundary; the
   model paces its own check-ins with the notebook's `set_checkin`. Its
   architecture and governing decisions are recorded under
-  `crates/rho-agent/specs/`. The opt-in `eng-high-notes` role persists an active suffix
-  boundary without deleting history, pauses ordinary drains for a dedicated
-  notes-preparation exchange, and resets provider continuation without replacing
-  Python or live jobs. Notes are shared workset files outside code checkouts; rotation
-  injects only a bounded metadata inventory, not their contents. See
-  [DESIGN-context-rotation](specs/DESIGN-context-rotation.md).
+  `crates/rho-agent/specs/`. Historical context-rotation records remain
+  replayable, but no current role opts into the retired notes mode.
   Native `NativeEvent` records are canonical; provider context is a disposable
   replay projection. Claude Code owns its own history and compaction instead.
   The two concrete runtimes share a pure boundary and `rho-agent-tools`' concrete
@@ -537,12 +533,14 @@ acceptance channel. Native Rho acknowledges after its event enters the ordered
 replication queue; a crash can lose an unflushed accepted message. Claude acknowledges after its process-local input queue accepts the message,
 which intentionally may be lost if the daemon restarts before Claude records
 it.
-The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning
-and fast mode. Engineers spawned by an
-`eng-mini` parent are also `eng-mini`; Engineers spawned by an `eng-alt`
-parent are `eng-cheap`. An `eng-cheap` parent spawns `eng-cheap` Engineers and
-`advisor-cheap` Advisors; `advisor-cheap` uses GPT-5.6 Terra with xhigh
-reasoning.
+The engineer modes are `mini-eng` (GPT-6 Luna, xhigh), `med-eng`
+(GPT-6 Sol, high), `high-eng` (GPT-6 Astra, medium), `med1-eng`
+(Claude Opus, medium), and `high1-eng` (Claude Fable, medium). All use the
+normal service tier. The advisor modes are `low-adv` (GPT-6 Sol, xhigh),
+`med-adv` (GPT-6 Astra, xhigh), and `med1-adv` (Claude Fable, xhigh).
+A `mini-eng` parent spawns `mini-eng`; every other parent spawns `med-eng`.
+A `mini-eng` asks `low-adv`, `high-eng` asks `med1-adv`, and every other
+engineer asks `med-adv`.
 
 The database also stores a global project registry, distinct from each agent's
 fixed place. Projects are keyed by what an agent is started on (a repository

@@ -217,7 +217,7 @@ mod tests {
                 None,
                 crate::db::tests::test_workspace(),
                 AgentRole::default(),
-                SessionBinding::ResponsesGpt55(Default::default()),
+                SessionBinding::ResponsesSol(Default::default()),
                 crate::db::tests::test_agent_runtime(),
                 None,
             );

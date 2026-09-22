@@ -64,9 +64,8 @@ enum DebugCommand {
     Context,
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
-        /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high,
-        /// eng-high-notes, eng-ultra, eng-alt, pm, advisor,
-        /// advisor-cheap, or advisor-high.
+        /// Role text: mini-eng, med-eng, high-eng, med1-eng, high1-eng,
+        /// low-adv, med-adv, or med1-adv.
         role: String,
     },
 }
@@ -165,39 +164,32 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
 
 fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
     Ok(match text {
-        "eng" => AgentRole::default(),
-        "eng-mini" => AgentRole::Engineer {
+        "mini-eng" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
         },
-        "eng-low" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Low,
+        "med-eng" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
         },
-        "eng-cheap" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-        },
-        "eng-high-notes" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::HighNotes,
-        },
-        "eng-high" => AgentRole::Engineer {
+        "high-eng" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         },
-        "eng-ultra" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Ultra,
+        "med1-eng" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium1,
         },
-        "eng-alt" => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Alt,
+        "high1-eng" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High1,
         },
-        "advisor" => AgentRole::Advisor {
+        "low-adv" => AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Low,
+        },
+        "med-adv" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         },
-        "advisor-cheap" => AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::Cheap,
-        },
-        "advisor-high" => AgentRole::Advisor {
-            intelligence: AdvisorIntelligence::High,
+        "med1-adv" => AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Medium1,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-high-notes, eng-ultra, eng-alt, pm, advisor, advisor-cheap, or advisor-high"
+            "unknown role `{text}`; use mini-eng, med-eng, high-eng, med1-eng, high1-eng, low-adv, med-adv, or med1-adv"
         ),
     })
 }
@@ -598,31 +590,23 @@ async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn config_name(config: rho_agent::db::AgentRole) -> String {
-    use rho_agent::db::{AgentRole, EngineerIntelligence};
+    use rho_agent::db::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
     match config {
-        AgentRole::Advisor { intelligence } => format!(
-            "advisor {}",
-            match intelligence {
-                rho_agent::db::AdvisorIntelligence::Medium => "medium",
-                rho_agent::db::AdvisorIntelligence::High => "high",
-                rho_agent::db::AdvisorIntelligence::Cheap => "cheap",
-            }
-        ),
-        AgentRole::Engineer { intelligence } => {
-            let intelligence = match intelligence {
-                EngineerIntelligence::Mini => "mini",
-                EngineerIntelligence::Low => "low",
-                EngineerIntelligence::Cheap => "cheap",
-                EngineerIntelligence::Medium => "medium",
-                EngineerIntelligence::High => "high",
-                EngineerIntelligence::HighNotes => "high-notes",
-                EngineerIntelligence::Ultra => "ultra",
-                EngineerIntelligence::Alt => "alt",
-                EngineerIntelligence::LegacyGemini => "legacy-gemini (unsupported)",
-            };
-            format!("engineer {intelligence}")
-        }
+        AgentRole::Advisor { intelligence } => match intelligence {
+            AdvisorIntelligence::Low => "low-adv",
+            AdvisorIntelligence::Medium => "med-adv",
+            AdvisorIntelligence::Medium1 => "med1-adv",
+        },
+        AgentRole::Engineer { intelligence } => match intelligence {
+            EngineerIntelligence::Mini => "mini-eng",
+            EngineerIntelligence::Medium => "med-eng",
+            EngineerIntelligence::High => "high-eng",
+            EngineerIntelligence::Medium1 => "med1-eng",
+            EngineerIntelligence::High1 => "high1-eng",
+            EngineerIntelligence::LegacyGemini => "legacy-gemini (unsupported)",
+        },
     }
+    .to_owned()
 }
 
 fn place_name(place: &rho_fs_view::Place) -> String {
@@ -635,15 +619,15 @@ mod render_prompt_tests {
 
     #[test]
     fn parses_render_prompt_roles() {
-        assert_eq!(parse_role("eng").unwrap(), AgentRole::default());
-        assert!(parse_role("eng-gemini").is_err());
+        assert_eq!(parse_role("med-eng").unwrap(), AgentRole::default());
         assert_eq!(
-            parse_role("advisor-high").unwrap(),
+            parse_role("med1-adv").unwrap(),
             AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::High
+                intelligence: AdvisorIntelligence::Medium1
             }
         );
-        assert!(parse_role("ultra").is_err());
+        assert!(parse_role("eng").is_err());
+        assert!(parse_role("advisor-high").is_err());
     }
 }
 

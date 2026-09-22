@@ -255,7 +255,7 @@ impl ResponsesConfig {
 
     fn title() -> Self {
         Self {
-            model: ResponsesModel::Gpt56Luna,
+            model: ResponsesModel::Gpt6Luna,
             auto_compaction: None,
             context_rotation: false,
             reasoning_context: ReasoningContext::AllTurns,
@@ -268,10 +268,8 @@ impl ResponsesConfig {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ResponsesModel {
-    Gpt55,
-    Gpt56Sol,
-    Gpt56Luna,
-    Gpt56Terra,
+    Gpt6Sol,
+    Gpt6Luna,
     Gpt6Astra,
     #[cfg(test)]
     Test(String),
@@ -286,10 +284,8 @@ struct ResponsesModelInfo {
 impl From<InferenceModel> for ResponsesModel {
     fn from(model: InferenceModel) -> Self {
         match model {
-            InferenceModel::Gpt55 => Self::Gpt55,
-            InferenceModel::Gpt56Sol => Self::Gpt56Sol,
-            InferenceModel::Gpt56Luna => Self::Gpt56Luna,
-            InferenceModel::Gpt56Terra => Self::Gpt56Terra,
+            InferenceModel::Gpt6Sol => Self::Gpt6Sol,
+            InferenceModel::Gpt6Luna => Self::Gpt6Luna,
             InferenceModel::Gpt6Astra => Self::Gpt6Astra,
         }
     }
@@ -298,10 +294,8 @@ impl From<InferenceModel> for ResponsesModel {
 impl ResponsesModel {
     pub(crate) fn as_str(&self) -> &str {
         match self {
-            Self::Gpt55 => "gpt-5.5",
-            Self::Gpt56Sol => "gpt-5.6-sol",
-            Self::Gpt56Luna => "gpt-5.6-luna",
-            Self::Gpt56Terra => "gpt-5.6-terra",
+            Self::Gpt6Sol => "gpt-6-sol",
+            Self::Gpt6Luna => "gpt-6-luna",
             Self::Gpt6Astra => "gpt-6-astra",
             #[cfg(test)]
             Self::Test(model) => model,
@@ -314,8 +308,7 @@ impl ResponsesModel {
     /// `client_metadata`.
     pub(crate) fn use_responses_lite(&self) -> bool {
         match self {
-            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra | Self::Gpt6Astra => true,
-            Self::Gpt55 => false,
+            Self::Gpt6Sol | Self::Gpt6Luna | Self::Gpt6Astra => true,
             #[cfg(test)]
             Self::Test(_) => false,
         }
@@ -323,11 +316,7 @@ impl ResponsesModel {
 
     fn info(&self) -> ResponsesModelInfo {
         match self {
-            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => ResponsesModelInfo {
-                context_window: 372_000,
-                auto_compact_token_limit: 280_000,
-            },
-            Self::Gpt55 | Self::Gpt6Astra => ResponsesModelInfo {
+            Self::Gpt6Sol | Self::Gpt6Luna | Self::Gpt6Astra => ResponsesModelInfo {
                 context_window: 272_000,
                 auto_compact_token_limit: 232_560,
             },

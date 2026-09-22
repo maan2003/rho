@@ -3,23 +3,12 @@ use rho_core::MessagePhase;
 use super::streaming::tests::agent as standard_agent;
 use super::*;
 
-async fn agent(directory: &std::path::Path) -> super::streaming::tests::TestAgent {
+async fn high_agent(directory: &std::path::Path) -> super::streaming::tests::TestAgent {
     let agent = standard_agent(directory).await;
     agent.head.write().unwrap().config.role = AgentRole::Engineer {
-        intelligence: EngineerIntelligence::HighNotes,
+        intelligence: EngineerIntelligence::High,
     };
     agent
-}
-
-fn input(text: &str, at: u64) -> QueuedInput {
-    QueuedInput {
-        source: MessageSender::User,
-        kind: InputKind::Message {
-            content: vec![ContentPart::Text { text: text.into() }],
-        },
-        delivery: MessageDelivery::NextRequest,
-        at: UnixMs(at),
-    }
 }
 
 fn message(text: &str) -> InferenceResponseItem {
@@ -153,11 +142,8 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
     .await;
 
     for (index, intelligence) in [
+        EngineerIntelligence::Mini,
         EngineerIntelligence::High,
-        EngineerIntelligence::HighNotes,
-        EngineerIntelligence::High,
-        EngineerIntelligence::Cheap,
-        EngineerIntelligence::Low,
         EngineerIntelligence::Medium,
     ]
     .into_iter()
@@ -219,145 +205,6 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
     }
     cell_returned(&agent).await;
     assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
-}
-
-#[tokio::test]
-async fn eviction_preserves_input_and_history_and_falls_back_when_needed() {
-    // The middle case can get below the compaction threshold but cannot reach
-    // 40k: it must compact without committing a partial eviction.
-    for (output_bytes, enough) in [(750000, true), (150000, false), (300, false)] {
-        let directory = tempfile::tempdir().unwrap();
-        let mut agent = agent(directory.path()).await;
-        agent.phase = Phase::Idle {
-            owed: Vec::new(),
-            standing: Standing::Asked,
-        };
-        let old_id = ToolCallId::try_from("old").unwrap();
-        let history = vec![
-            Arc::new(ContextBlock::InferenceResponse {
-                items: vec![exec("old", "print('old')")],
-                provider_response_id: None,
-            }),
-            Arc::new(ContextBlock::ToolResults {
-                results: vec![rho_core::ToolResult {
-                    call_id: old_id.clone(),
-                    tool_type: rho_core::ToolType::Custom,
-                    started_at: UnixMs(0),
-                    finished_at: UnixMs(1),
-                    metadata: None,
-                    body: ToolOutput {
-                        output: Arc::new("x".repeat(output_bytes)),
-                        full_output: None,
-                        images: Default::default(),
-                        status: ToolOutputStatus::Success,
-                    },
-                }],
-            }),
-            Arc::new(ContextBlock::DeveloperMessage {
-                text: "recent".repeat(25000),
-            }),
-        ];
-        agent.provider_history = Some(Vec::new());
-        for block in &history {
-            let event = if matches!(&**block, ContextBlock::InferenceResponse { .. }) {
-                NativeEvent::ResponseFinished {
-                    output: vec![(**block).clone()],
-                    context_used: None,
-                    usage: None,
-                    at: UnixMs(0),
-                }
-            } else {
-                NativeEvent::RequestStarted {
-                    input: vec![(**block).clone()],
-                    context: None,
-                    wake: None,
-                    at: UnixMs(0),
-                }
-            };
-            agent.persist(AgentEvent::Native(event)).await.unwrap();
-        }
-        let limit = agent.session.auto_compact_token_limit().unwrap();
-        agent.context_used = Some(limit + 1000);
-        agent
-            .handle_control(
-                Control::User(input("continue with this constraint", 1), None),
-                UnixMs(1),
-            )
-            .await
-            .unwrap();
-        agent.start_request(UnixMs(2), None).await.unwrap();
-        let (change, blocks) = latest_send(&agent).await;
-        assert_eq!(change, None);
-        assert_eq!(blocks.iter().any(|b| matches!(b, ContextBlock::ToolHistoryEvicted { call_ids } if call_ids == &vec![old_id.clone()])), enough);
-        assert_eq!(
-            blocks.iter().any(
-                |b| matches!(b, ContextBlock::DeveloperMessage { text } if text == context::EVICTED)
-            ),
-            enough
-        );
-        assert_eq!(blocks.contains(&ContextBlock::CompactionTrigger), !enough);
-        if enough {
-            assert!(agent.context_used.unwrap() <= 40000);
-        } else {
-            assert_eq!(agent.context_used, Some(limit + 1000));
-        }
-        assert!(blocks.iter().any(|b| matches!(b, ContextBlock::UserMessage { content, .. } if rho_core::text_content(content) == "continue with this constraint")));
-        assert!(agent.user.is_empty());
-        assert!(agent.context.preparation.is_none());
-        assert_eq!(
-            &agent.provider_input().await.unwrap()[..history.len()],
-            &history
-        );
-        let (_, events) = agent.db.read().agent_events(agent.agent_id);
-        let replayed = replay::replay(events);
-        assert_eq!(
-            replayed
-                .history
-                .iter()
-                .any(|b| matches!(&**b, ContextBlock::ToolHistoryEvicted { .. })),
-            enough
-        );
-        assert!(replayed.user.is_empty());
-        assert_eq!(&replayed.history[..history.len()], &history);
-        if !enough {
-            reply(
-                &mut agent,
-                vec![InferenceResponseItem::Compaction {
-                    provider_specific: Box::new(
-                        rho_inference::OpenAiResponsesProviderData::Compaction {
-                            item_id: rho_core::ProviderResponseItemId::try_from("compact").unwrap(),
-                            encrypted_content: "summary".into(),
-                        },
-                    ),
-                }],
-                100,
-            )
-            .await;
-            agent.start_request(UnixMs::now(), None).await.unwrap();
-        }
-        reply(&mut agent, vec![exec("recover-history", &format!(
-            "original = next(item for item in transcript if item.kind == 'tool_result' and item.call_id == 'old')\nassert original.text == 'x' * {}\nassert any(item.kind == 'tool_history_evicted' for item in transcript) == {}",
-            output_bytes, if enough { "True" } else { "False" }
-        ))], 100).await;
-        cell_returned(&agent).await;
-        assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
-    }
-}
-
-#[tokio::test]
-async fn notes_role_without_evictable_tools_compacts_without_preparing() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Asked,
-    };
-    agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await.unwrap();
-    let (change, blocks) = latest_send(&agent).await;
-    assert_eq!(change, None);
-    assert!(blocks.contains(&ContextBlock::CompactionTrigger));
-    assert!(agent.context.preparation.is_none());
 }
 
 #[test]
@@ -670,7 +517,7 @@ fn measured_output_budget_requires_comparable_successful_samples() {
 #[tokio::test]
 async fn live_and_replayed_output_caps_agree() {
     let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
+    let mut agent = high_agent(directory.path()).await;
     agent.provider_history = Some(Vec::new());
     for event in measured_output_events(801) {
         agent.persist(event).await.unwrap();
@@ -695,7 +542,7 @@ async fn live_and_replayed_output_caps_agree() {
     // Without the measured cap this output looks large enough to reach 40k.
     // The live request must instead compact, with no partial eviction.
     let directory = tempfile::tempdir().unwrap();
-    let mut agent = self::agent(directory.path()).await;
+    let mut agent = self::high_agent(directory.path()).await;
     agent.provider_history = Some(Vec::new());
     for mut event in measured_output_events(801) {
         if let AgentEvent::Native(NativeEvent::RequestStarted { input, .. }) = &mut event {

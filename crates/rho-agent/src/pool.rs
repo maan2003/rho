@@ -902,35 +902,14 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
     match (parent, child) {
         (
             AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Alt,
-            },
-            AgentRole::Engineer { .. },
-        ) => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-        },
-        (
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Cheap,
-            },
-            AgentRole::Engineer { .. },
-        ) => AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-        },
-        (
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Cheap,
-            },
-            AgentRole::Advisor { .. },
-        ) => AgentRole::Advisor {
-            intelligence: crate::db::AdvisorIntelligence::Cheap,
-        },
-        (
-            AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             },
             AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
+        },
+        (_, AgentRole::Engineer { .. }) => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
         },
         (_, child) => child,
     }
@@ -967,40 +946,26 @@ mod tests {
     }
 
     #[test]
-    fn alt_engineers_spawn_cheap_engineers() {
-        let cheap = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
+    fn every_non_mini_engineer_spawns_a_medium_engineer() {
+        let medium = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
         };
-
-        assert_eq!(
-            child_role(
-                AgentRole::Engineer {
-                    intelligence: EngineerIntelligence::Alt,
-                },
-                AgentRole::default(),
-            ),
-            cheap
-        );
-    }
-
-    #[test]
-    fn cheap_engineers_spawn_cheap_agents() {
-        let cheap = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-        };
-
-        assert_eq!(child_role(cheap, AgentRole::default()), cheap);
-        assert_eq!(
-            child_role(
-                cheap,
-                AgentRole::Advisor {
-                    intelligence: crate::db::AdvisorIntelligence::Medium,
-                },
-            ),
-            AgentRole::Advisor {
-                intelligence: crate::db::AdvisorIntelligence::Cheap,
-            }
-        );
+        for intelligence in [
+            EngineerIntelligence::Medium,
+            EngineerIntelligence::High,
+            EngineerIntelligence::Medium1,
+            EngineerIntelligence::High1,
+        ] {
+            assert_eq!(
+                child_role(
+                    AgentRole::Engineer { intelligence },
+                    AgentRole::Engineer {
+                        intelligence: EngineerIntelligence::High,
+                    },
+                ),
+                medium
+            );
+        }
     }
 
     async fn test_pool(root: &std::path::Path) -> (Arc<AgentPool>, Arc<View>) {
@@ -1164,7 +1129,7 @@ mod tests {
             for role in [
                 AgentRole::default(),
                 AgentRole::Advisor {
-                    intelligence: crate::db::AdvisorIntelligence::High,
+                    intelligence: crate::db::AdvisorIntelligence::Medium,
                 },
             ] {
                 let native = crate::prompt::prompt(&child_view, Some(&team), role);

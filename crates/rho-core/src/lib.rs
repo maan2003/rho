@@ -155,23 +155,17 @@ enum StoredAgentWorkflow {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum EngineerIntelligence {
-    Low,
+    Mini,
     Medium,
     High,
-    Ultra,
-    Mini,
-    Alt,
-    Cheap,
-    /// High engineer with shared-notes context rotation.
-    HighNotes,
+    Medium1,
+    High1,
     /// Historical Gemini agents: readable, but no longer executable.
     LegacyGemini,
 }
 
-/// The intelligence as rows wrote it while `eng-py` and `eng-ultra-py`
-/// existed. Every engineer has the Python notebook now, so those fold into
-/// the same model without the suffix. Retired Gemini rows instead become
-/// an explicitly unsupported tombstone, never a replacement provider.
+/// The intelligence names used by prior database formats. Retired modes fold
+/// into the nearest live role while a format migration rewrites their rows.
 #[allow(dead_code)]
 #[derive(Decode)]
 enum StoredEngineerIntelligence {
@@ -187,20 +181,19 @@ enum StoredEngineerIntelligence {
     HighNotes,
     Gemini,
     LegacyGemini,
+    Medium1,
+    High1,
 }
 
 impl senax_encoder::Decoder for EngineerIntelligence {
     fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
         use StoredEngineerIntelligence as Stored;
         Ok(match Stored::decode(reader)? {
-            Stored::Low => Self::Low,
-            Stored::Medium | Stored::Python => Self::Medium,
-            Stored::High => Self::High,
-            Stored::HighNotes => Self::HighNotes,
-            Stored::Ultra | Stored::UltraPython => Self::Ultra,
             Stored::Mini => Self::Mini,
-            Stored::Alt => Self::Alt,
-            Stored::Cheap => Self::Cheap,
+            Stored::Low | Stored::Cheap | Stored::Medium | Stored::Python => Self::Medium,
+            Stored::High | Stored::HighNotes => Self::High,
+            Stored::Alt | Stored::Medium1 => Self::Medium1,
+            Stored::Ultra | Stored::UltraPython | Stored::High1 => Self::High1,
             Stored::Gemini | Stored::LegacyGemini => Self::LegacyGemini,
         })
     }
@@ -208,20 +201,36 @@ impl senax_encoder::Decoder for EngineerIntelligence {
 
 impl AgentRole {
     pub fn uses_notes_rotation(self) -> bool {
-        matches!(
-            self,
-            Self::Engineer {
-                intelligence: EngineerIntelligence::HighNotes
-            }
-        )
+        false
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum AdvisorIntelligence {
+    Low,
+    Medium,
+    Medium1,
+}
+
+#[allow(dead_code)]
+#[derive(Decode)]
+enum StoredAdvisorIntelligence {
     Medium,
     High,
     Cheap,
+    Low,
+    Medium1,
+}
+
+impl senax_encoder::Decoder for AdvisorIntelligence {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        use StoredAdvisorIntelligence as Stored;
+        Ok(match Stored::decode(reader)? {
+            Stored::Cheap | Stored::Low => Self::Low,
+            Stored::Medium | Stored::High => Self::Medium,
+            Stored::Medium1 => Self::Medium1,
+        })
+    }
 }
 
 impl Default for AgentRole {
@@ -973,26 +982,19 @@ mod tests {
     }
 
     #[test]
-    fn notes_role_round_trips_and_is_opt_in() {
-        let role = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::HighNotes,
-        };
-        let mut encoded = bytes::BytesMut::new();
-        senax_encoder::encode_to(&role, &mut encoded).unwrap();
+    fn retired_notes_role_folds_into_high_engineer() {
+        #[derive(Encode)]
+        enum LegacyEngineerIntelligence {
+            HighNotes,
+        }
+        let mut encoded = senax_encoder::encode(&LegacyEngineerIntelligence::HighNotes).unwrap();
         assert_eq!(
-            senax_encoder::decode::<AgentRole>(&mut encoded).unwrap(),
-            role
+            senax_encoder::decode::<EngineerIntelligence>(&mut encoded).unwrap(),
+            EngineerIntelligence::High
         );
-        let mut packed = senax_encoder::pack(&role).unwrap();
-        assert_eq!(
-            senax_encoder::unpack::<AgentRole>(&mut packed).unwrap(),
-            role
-        );
-        assert!(role.uses_notes_rotation());
-        assert!(!AgentRole::default().uses_notes_rotation());
         assert!(
             !AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High
+                intelligence: EngineerIntelligence::High,
             }
             .uses_notes_rotation()
         );
@@ -1013,7 +1015,7 @@ mod tests {
             ),
             (
                 LegacyEngineerIntelligence::UltraPython,
-                EngineerIntelligence::Ultra,
+                EngineerIntelligence::High1,
             ),
         ] {
             let mut encoded = bytes::BytesMut::new();

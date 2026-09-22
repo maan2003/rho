@@ -147,7 +147,7 @@ impl RouteSelection {
         config: &ResponsesConfig,
         selected: Option<&SelectedAuth>,
     ) -> DialRoute {
-        if config.model == ResponsesModel::Gpt56Luna && config.service_tier == ServiceTier::Normal {
+        if config.model == ResponsesModel::Gpt6Luna && config.service_tier == ServiceTier::Normal {
             let route = self;
             if route.route == DialRoute::Dns
                 || selected.is_some_and(|selected| {
@@ -444,7 +444,7 @@ mod tests {
 
     fn luna_config(service_tier: ServiceTier) -> ResponsesConfig {
         ResponsesConfig {
-            model: ResponsesModel::Gpt56Luna,
+            model: ResponsesModel::Gpt6Luna,
             auto_compaction: None,
             context_rotation: false,
             reasoning_context: ReasoningContext::AllTurns,
@@ -466,7 +466,7 @@ mod tests {
     fn probe_is_luna_default_without_generation() {
         let body =
             serde_json::to_value(ResponsesRequest::luna_default_probe(uuid::Uuid::nil())).unwrap();
-        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["model"], "gpt-6-luna");
         assert_eq!(body["service_tier"], "default");
         assert_eq!(body["generate"], false);
     }
