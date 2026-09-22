@@ -1,0 +1,17 @@
+node_modules/
+target/
+dist/
+out/
+pkg/
+.direnv/
+.terraform/
+**/CHANGELOG.md
+
+# IETF drafts are kramdown-rfc markdown, not CommonMark; linted by `just
+# drafts check` (kramdown-rfc) instead. doc/draft/ is generated from them by
+# doc/.vitepress/drafts.ts.
+drafts/draft-*.md
+doc/draft/
+
+# Quests use a constrained Markdown dialect checked by the quest validator.
+quest/

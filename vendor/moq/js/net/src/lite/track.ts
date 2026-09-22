@@ -1,0 +1,129 @@
+import * as Path from "../path.ts";
+import type { Reader, Writer } from "../stream.ts";
+import { Timescale } from "../time.ts";
+import * as Message from "./message.ts";
+import { hasGroupOrder, Version } from "./version.ts";
+
+// The Track Stream (0x6) is draft-05+ only.
+function guardTrack(version: Version) {
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+			throw new Error("track stream not supported for this version");
+		default:
+			break;
+	}
+}
+
+/**
+ * TRACK request: the first (and only) subscriber message on a Track Stream (0x6).
+ * Asks for a track's immutable publisher properties without subscribing or fetching.
+ */
+export class Track {
+	broadcast: Path.Valid;
+	track: string;
+
+	constructor(broadcast: Path.Valid, track: string) {
+		this.broadcast = broadcast;
+		this.track = track;
+	}
+
+	async #encode(w: Writer) {
+		await w.string(Path.encode(this.broadcast));
+		await w.string(this.track);
+	}
+
+	static async #decode(r: Reader): Promise<Track> {
+		const broadcast = Path.decode(await r.string());
+		const track = await r.string();
+		return new Track(broadcast, track);
+	}
+
+	async encode(w: Writer, version: Version): Promise<void> {
+		guardTrack(version);
+		return Message.encode(w, (w) => this.#encode(w));
+	}
+
+	static async decode(r: Reader, version: Version): Promise<Track> {
+		guardTrack(version);
+		return Message.decode(r, (r) => Track.#decode(r));
+	}
+}
+
+/**
+ * TRACK_INFO reply: the publisher's sole message on a Track Stream, carrying the
+ * track's immutable properties. Fetched once and reused across every SUBSCRIBE and
+ * FETCH for the track.
+ */
+export class TrackInfo {
+	/** The publisher's tie-break priority for this track. */
+	priority: number;
+	/**
+	 * Publisher Max Age: an upper bound (milliseconds) on how long the publisher
+	 * caches a non-latest group past the arrival of a newer one.
+	 */
+	maxAge: number;
+	/**
+	 * Per-frame timestamp scale (units per second). Mandatory on Lite05: a real
+	 * (non-zero) scale, and every frame on the wire is prefixed with a zigzag-delta
+	 * timestamp at this scale.
+	 */
+	timescale: number;
+
+	constructor({
+		priority = 0,
+		maxAge = 0,
+		timescale = Timescale.MILLI,
+	}: {
+		priority?: number;
+		maxAge?: number;
+		timescale?: number;
+	}) {
+		if (!Number.isInteger(priority) || priority < 0 || priority > 255) {
+			throw new RangeError(`priority must be an integer in 0..=255: ${priority}`);
+		}
+		if (!Number.isSafeInteger(maxAge) || maxAge < 0) {
+			throw new RangeError(`maxAge must be a safe non-negative integer: ${maxAge}`);
+		}
+		this.priority = priority;
+		this.maxAge = maxAge;
+		this.timescale = Timescale(timescale);
+	}
+
+	async #encode(w: Writer, version: Version) {
+		await w.u8(this.priority);
+		// The retired `Ordered` byte: lite-05 keeps it in its layout, written as 0.
+		if (hasGroupOrder(version)) await w.bool(false);
+		await w.u53(this.maxAge);
+		await w.u53(this.timescale);
+	}
+
+	static async #decode(r: Reader, version: Version): Promise<TrackInfo> {
+		const priority = await r.u8();
+		if (hasGroupOrder(version)) await r.bool();
+		const maxAge = await r.u53();
+		const timescale = await r.u53();
+		return new TrackInfo({ priority, maxAge, timescale });
+	}
+
+	async encode(w: Writer, version: Version): Promise<void> {
+		guardTrack(version);
+		// Re-check after construction: fields are public, and a mutated value must not
+		// reach the length-prefixed writer.
+		if (!Number.isInteger(this.priority) || this.priority < 0 || this.priority > 255) {
+			throw new RangeError(`priority must be an integer in 0..=255: ${this.priority}`);
+		}
+		if (!Number.isSafeInteger(this.maxAge) || this.maxAge < 0) {
+			throw new RangeError(`maxAge must be a safe non-negative integer: ${this.maxAge}`);
+		}
+		Timescale(this.timescale);
+		return Message.encode(w, (w) => this.#encode(w, version));
+	}
+
+	static async decode(r: Reader, version: Version): Promise<TrackInfo> {
+		guardTrack(version);
+		return Message.decode(r, (r) => TrackInfo.#decode(r, version));
+	}
+}

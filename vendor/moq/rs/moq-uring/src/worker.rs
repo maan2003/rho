@@ -1,0 +1,1351 @@
+//! The per-thread worker: ring ownership, the drive loop, and parking.
+
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use io_uring::{EnterFlags, IoUring, opcode, types};
+
+use crate::metrics::Metrics;
+use crate::park::{FUTEX_BITSET_MATCH_ANY, FUTEX2_PRIVATE, FUTEX2_SIZE_U32, PARKED, RUNNING, Unpark};
+use crate::shared::{Cqe, Op, Shared, Task};
+use crate::{Error, timer, udp};
+
+/// Submission queue depth. The SQ only holds SQEs staged between submits,
+/// never in-flight operations, so it needs no relation to the socket pools;
+/// [`Shared::push`] submits inline whenever it fills.
+const SQ_ENTRIES: u32 = 256;
+
+/// Completion queue depth. Every in-flight operation can post a completion
+/// (one per send buffer with GSO on, one per provided receive buffer, the
+/// park futex, transient cancels), so this covers a few sockets at the
+/// default pool ceilings in [`udp::Config`]. Running past it is not fatal:
+/// the kernel backlogs completions (`IORING_FEAT_NODROP`) rather than drop
+/// them. But the backlog is an allocation-per-CQE slow path and it ends any
+/// armed multishot receive, so the CQ is sized to keep it out of steady
+/// state.
+const CQ_ENTRIES: u32 = 4096;
+
+/// Maximum completions copied at once while teardown is deadline-bounded.
+const TEARDOWN_CQE_BATCH: usize = 64;
+
+/// Extra mandatory submit attempts allowed after interrupted enters.
+const TEARDOWN_EINTR_RETRIES: usize = 8;
+
+/// Maximum time spent staging cancellations and draining completions.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_millis(3200);
+
+/// Worker construction knobs.
+///
+/// The worker sizes its ring internally, with a completion queue that
+/// comfortably covers the per-socket pool ceilings in [`udp::Config`].
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct Config {
+	/// Where the worker accumulates its counters.
+	///
+	/// Default gives it a fresh set, still readable through
+	/// [`Handle::metrics`]. Pass one in to hold a copy on the thread that
+	/// spawned the worker, which is how an ops surface scrapes a worker it
+	/// cannot otherwise reach. A [`Metrics`] clone shares one set of counters,
+	/// so give each worker its own. Cloning this config starts a fresh set for
+	/// the cloned worker.
+	pub metrics: Metrics,
+}
+
+impl Clone for Config {
+	fn clone(&self) -> Self {
+		// A cloned construction plan targets a new worker, so its counters must
+		// not be folded into the source worker's per-worker series.
+		Self {
+			metrics: Metrics::default(),
+		}
+	}
+}
+
+/// A thread-pinned io_uring executor: the ring, a timer heap, and a local
+/// (`!Send`) task set, driven by a caller-owned loop.
+///
+/// Create one per thread, keep it on that thread (`!Send`), and drive it with
+/// [`block_on`](Self::block_on). Everything else reaches the worker through
+/// [`Handle`]: UDP sockets, timers, spawned tasks. Wakes from other threads
+/// (any `Waker` this worker minted) are an atomic store plus, only while the
+/// worker is parked, one futex syscall.
+///
+/// Dropping the worker makes a bounded attempt to submit the SQEs its last
+/// turn staged and drain their completions. A datagram already handed to a
+/// [`udp::Socket`] is included in that submission attempt, while operation
+/// storage that the kernel might still access is safely leaked if teardown
+/// cannot finish. It runs no tasks, though, so work a task has merely been
+/// asked for is not performed: a QUIC close is queued on its connection and
+/// framed by the driver task, so keep driving until the close is published
+/// rather than stopping the worker on the call that asked for it.
+pub struct Worker {
+	shared: Rc<Shared>,
+	tasks: kio::Tasks<Task>,
+	park: kio::Park,
+	/// Reused while copying CQEs out of the ring before dispatch.
+	cqes: Vec<Cqe>,
+	/// Whether the park-word `FUTEX_WAIT` SQE is in flight.
+	futex_armed: bool,
+}
+
+impl Worker {
+	/// Set up the ring, refusing kernels below Linux 6.12.
+	///
+	/// The floor buys incremental provided-buffer consumption, the absolute
+	/// park timeout, and batched minimum waits with one code path; there is
+	/// deliberately no fallback (use the tokio stack instead).
+	pub fn new(config: Config) -> Result<Self, Error> {
+		let Config { metrics } = config;
+		let metrics = metrics.counters().clone();
+		let ring = IoUring::builder()
+			.setup_single_issuer()
+			.setup_defer_taskrun()
+			.setup_coop_taskrun()
+			.setup_cqsize(CQ_ENTRIES)
+			.build(SQ_ENTRIES)
+			.map_err(|err| match err.raw_os_error() {
+				// EINVAL from setup means the kernel predates one of the
+				// requested flags (the ring geometry is compile-time valid),
+				// so it never reaches the feature check below.
+				Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::EINVAL) => {
+					Error::Unsupported(format!(
+						"io_uring is unavailable ({err}); kernel {} (Linux 6.12+ required, and container seccomp \
+						 policies such as Docker's default commonly block io_uring)",
+						kernel_release()
+					))
+				}
+				_ => Error::Io(err),
+			})?;
+
+		// One feature bit gates the whole floor: MIN_TIMEOUT landed in 6.12
+		// alongside everything else this worker assumes.
+		if !ring.params().is_feature_min_timeout() {
+			return Err(Error::Unsupported(format!(
+				"kernel {} is too old: moq-uring requires Linux 6.12+ (io_uring MIN_TIMEOUT feature missing)",
+				kernel_release()
+			)));
+		}
+
+		Ok(Self {
+			shared: Rc::new(Shared {
+				ring: RefCell::new(ring),
+				ops: RefCell::new(slab::Slab::new()),
+				timers: Rc::new(RefCell::new(timer::Heap::new(metrics.clone()))),
+				spawns: RefCell::new(Vec::new()),
+				unpark: Unpark::new(metrics.clone()),
+				metrics,
+				next_bgid: std::cell::Cell::new(0),
+				stopped: std::cell::Cell::new(false),
+				spill: RefCell::new(std::collections::VecDeque::new()),
+			}),
+			tasks: kio::Tasks::new(),
+			park: kio::Park::default(),
+			cqes: Vec::new(),
+			futex_armed: false,
+		})
+	}
+
+	/// A cloneable handle for spawning, binding sockets, and minting timers.
+	pub fn handle(&self) -> Handle {
+		Handle {
+			shared: self.shared.clone(),
+		}
+	}
+
+	/// Drive the worker until `future` resolves.
+	///
+	/// Spawned tasks run alongside it and keep running across calls; they do
+	/// not keep `block_on` alive. An `Err` means the ring itself failed, which
+	/// is fatal to the worker.
+	pub fn block_on<F: Future>(&mut self, future: F) -> Result<F::Output, Error> {
+		let mut future = std::pin::pin!(future);
+		let waker = self.shared.unpark.waker();
+		loop {
+			// Adopt tasks spawned since the last turn (spawning wakes us).
+			let spawns = std::mem::take(&mut *self.shared.spawns.borrow_mut());
+			for task in spawns {
+				self.tasks.push(task);
+			}
+
+			let cx = Context::from_waker(&waker);
+			let waiter = self.park.hold(&cx);
+			if let Poll::Ready(value) = waiter.poll_future(future.as_mut()) {
+				return Ok(value);
+			}
+			// `Ready` just means the set is drained; the waiter stays
+			// registered for the next push.
+			let _ = self.tasks.poll(waiter);
+
+			self.shared.timers.borrow_mut().fire(Instant::now());
+			self.pump()?;
+			self.maybe_park()?;
+		}
+	}
+
+	/// Submit staged SQEs and dispatch every pending completion.
+	fn pump(&mut self) -> Result<(), Error> {
+		self.pump_inner(None)
+	}
+
+	/// Pump submission and completion batches until `deadline`.
+	fn pump_until(&mut self, deadline: Instant) -> Result<(), Error> {
+		self.pump_inner(Some(deadline))
+	}
+
+	fn pump_inner(&mut self, deadline: Option<Instant>) -> Result<(), Error> {
+		self.submit()?;
+		loop {
+			if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+				return Ok(());
+			}
+			// Copy the completions out so dispatch can borrow the ring (to
+			// re-arm receives, push cancels, and so on). Completions spilled
+			// by `Shared::push` predate the CQ's, so they dispatch first.
+			self.cqes.clear();
+			{
+				let mut ring = self.shared.ring.borrow_mut();
+				let mut spill = self.shared.spill.borrow_mut();
+				let limit = deadline.map_or(usize::MAX, |_| TEARDOWN_CQE_BATCH);
+				let spilled = spill.len().min(limit);
+				self.cqes.extend(spill.drain(..spilled));
+				self.cqes
+					.extend(ring.completion().take(limit - spilled).map(|entry| Cqe {
+						user_data: entry.user_data(),
+						result: entry.result(),
+						flags: entry.flags(),
+					}));
+			}
+			self.shared.metrics.completions.add(self.cqes.len() as u64);
+			if self.cqes.is_empty() || !self.dispatch_batch(deadline, Instant::now) {
+				return Ok(());
+			}
+		}
+	}
+
+	/// Dispatch the collected batch in `self.cqes` while its teardown budget
+	/// remains.
+	fn dispatch_batch(&mut self, deadline: Option<Instant>, mut now: impl FnMut() -> Instant) -> bool {
+		for index in 0..self.cqes.len() {
+			if deadline.is_some_and(|deadline| now() >= deadline) {
+				// Drop this batch's remaining CQEs. Worker::drop will leak their
+				// op state, which is safe even if the kernel already finished it.
+				return false;
+			}
+			let cqe = self.cqes[index];
+			self.dispatch(cqe);
+		}
+		true
+	}
+
+	fn submit(&mut self) -> Result<(), Error> {
+		let mut ring = self.shared.ring.borrow_mut();
+		if ring.submission().is_empty() {
+			return Ok(());
+		}
+		self.shared.metrics.enters.add(1);
+		match ring.submit() {
+			// A partial submit leaves the rest staged for the next pump.
+			Ok(count) => {
+				self.shared.metrics.submissions.add(count as u64);
+				Ok(())
+			}
+			// A signal interrupted the enter before it consumed anything. The
+			// next worker turn retries the same staged SQEs.
+			Err(err) if err.raw_os_error() == Some(libc::EINTR) => Ok(()),
+			// The completion queue overflowed; the caller reaps and retries.
+			Err(err) if err.raw_os_error() == Some(libc::EBUSY) => Ok(()),
+			Err(err) => Err(err.into()),
+		}
+	}
+
+	/// Submit every residual SQE without waiting for completions.
+	fn submit_teardown(&mut self) -> Result<(), Error> {
+		let mut ring = self.shared.ring.borrow_mut();
+		let mut interruptions = 0;
+		loop {
+			if ring.submission().is_empty() {
+				return Ok(());
+			}
+			self.shared.metrics.enters.add(1);
+			match ring.submit() {
+				// Keep submitting after partial progress. Returning zero while SQEs
+				// remain would otherwise spin forever.
+				Ok(0) => {
+					return Err(std::io::Error::other("io_uring teardown submission made no progress").into());
+				}
+				Ok(count) => self.shared.metrics.submissions.add(count as u64),
+				Err(err) => retry_teardown_submit(&mut interruptions, err)?,
+			}
+		}
+	}
+
+	/// Submit residual SQEs, then drain completions within `deadline`.
+	fn drain_teardown(&mut self, deadline: Instant) {
+		// Cancellation staging can consume the whole deadline. Existing SQEs,
+		// especially sends, must still reach the kernel before it gates draining.
+		let submission_failed = self.submit_teardown().is_err();
+		if !submission_failed {
+			loop {
+				if self.shared.ops.borrow().is_empty() {
+					return;
+				}
+				if Instant::now() >= deadline || self.pump_until(deadline).is_err() {
+					break;
+				}
+				let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+					break;
+				};
+				let ring = self.shared.ring.borrow_mut();
+				let wait = remaining.min(std::time::Duration::from_millis(50));
+				let ts = types::Timespec::from(wait);
+				let args = types::SubmitArgs::new().timespec(&ts);
+				self.shared.metrics.enters.add(1);
+				let _ = ring.submitter().submit_with_args(1, &args);
+			}
+		}
+		if !self.shared.ops.borrow().is_empty() {
+			// Leak the operations (and what they own) rather than free memory
+			// the kernel may still touch.
+			tracing::error!("dropping an io_uring worker with operations stuck in flight; leaking them");
+			std::mem::forget(std::mem::take(&mut *self.shared.ops.borrow_mut()));
+		}
+	}
+
+	/// Route one completion to its operation.
+	fn dispatch(&mut self, cqe: Cqe) {
+		let key = cqe.user_data as usize;
+
+		// Terminal completions take their op out of the slab, releasing what
+		// the kernel is now done with. A multishot receive with `more` set
+		// stays armed, so only its socket is borrowed. The kernel posts
+		// nothing for a key after its terminal CQE, so reusing the slot for
+		// an op armed during dispatch is sound.
+		enum Route {
+			Live(Rc<udp::SockShared>),
+			Done(Op),
+		}
+
+		let route = {
+			let mut ops = self.shared.ops.borrow_mut();
+			let Some(op) = ops.get(key) else {
+				tracing::error!(key, "completion for an unknown operation");
+				return;
+			};
+			let terminal = match op {
+				Op::Recv { .. } => cqe.result < 0 || !io_uring::cqueue::more(cqe.flags),
+				_ => true,
+			};
+			if terminal {
+				Route::Done(ops.remove(key))
+			} else {
+				match op {
+					Op::Recv { sock, .. } => Route::Live(sock.clone()),
+					_ => unreachable!("only receives are non-terminal"),
+				}
+			}
+		};
+
+		match route {
+			Route::Live(sock) => udp::on_recv(&self.shared, &sock, None, cqe, false),
+			Route::Done(Op::Recv { sock, one }) => udp::on_recv(&self.shared, &sock, one, cqe, true),
+			Route::Done(Op::Send(op)) => udp::on_send(op, cqe),
+			Route::Done(Op::FutexWait) => self.futex_armed = false,
+			Route::Done(Op::Cancel) => {}
+		}
+	}
+
+	/// Park in `io_uring_enter` until a completion, a timer deadline, or a
+	/// remote wake, unless a wake already arrived.
+	fn maybe_park(&mut self) -> Result<(), Error> {
+		let unpark = self.shared.unpark.clone();
+		if unpark
+			.word
+			.compare_exchange(RUNNING, PARKED, Ordering::AcqRel, Ordering::Acquire)
+			.is_err()
+		{
+			// Notified: consume it and poll again instead of parking.
+			unpark.word.store(RUNNING, Ordering::Release);
+			return Ok(());
+		}
+
+		// Keep exactly one FUTEX_WAIT armed. It waits while the word still
+		// holds PARKED; a remote unpark stores NOTIFIED and kicks the futex,
+		// and if the store lands before this submission the wait completes
+		// immediately with EAGAIN. Either way there is a CQE to wake us.
+		if !self.futex_armed {
+			let key = self.shared.insert(Op::FutexWait);
+			let entry = opcode::FutexWait::new(
+				unpark.word.as_ptr(),
+				PARKED as u64,
+				FUTEX_BITSET_MATCH_ANY,
+				FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
+			)
+			.build()
+			.user_data(key);
+			if let Err(err) = self.shared.push(&entry) {
+				self.shared.ops.borrow_mut().remove(key as usize);
+				unpark.word.store(RUNNING, Ordering::Release);
+				return Err(err.into());
+			}
+			self.futex_armed = true;
+		}
+
+		let deadline = self.shared.timers.borrow().next();
+		self.shared.metrics.parks.add(1);
+		self.shared.metrics.enters.add(1);
+		let result = {
+			let mut ring = self.shared.ring.borrow_mut();
+			let to_submit = ring.submission().len() as u32;
+			let submitter = ring.submitter();
+			match deadline {
+				None => submitter.submit_and_wait(1),
+				Some(at) => {
+					// Zero timeout SQEs: the earliest userspace deadline rides
+					// the enter call as an absolute CLOCK_MONOTONIC timeout.
+					let ts = abs_timespec(at);
+					let args = types::SubmitArgs::new().timespec(&ts);
+					let flags = EnterFlags::GETEVENTS | EnterFlags::EXT_ARG | EnterFlags::ABS_TIMER;
+					// SAFETY: `args` (and the timespec it references) outlive
+					// the call, and EXT_ARG matches its type.
+					unsafe { submitter.enter(to_submit, 1, flags.bits(), Some(&args)) }
+				}
+			}
+		};
+		unpark.word.store(RUNNING, Ordering::Release);
+
+		match result {
+			Ok(count) => {
+				self.shared.metrics.submissions.add(count as u64);
+				Ok(())
+			}
+			Err(err)
+				if matches!(
+					err.raw_os_error(),
+					Some(libc::ETIME) | Some(libc::EINTR) | Some(libc::EBUSY)
+				) =>
+			{
+				Ok(())
+			}
+			Err(err) => Err(err.into()),
+		}
+	}
+}
+
+impl Drop for Worker {
+	fn drop(&mut self) {
+		// Handles may outlive us; everything they try from here on fails
+		// instead of pending on a loop that will never run again.
+		self.shared.stopped.set(true);
+		// One deadline bounds cancellation staging and draining together.
+		let deadline = Instant::now() + TEARDOWN_TIMEOUT;
+		// The kernel may still write into provided buffers and read send
+		// headers owned by the ops slab. Queue cancels behind every staged
+		// receive and the futex, so partial submissions cannot strand an
+		// uncancelled operation. Sends are deliberately left alone: a datagram
+		// staged by the final worker turn still has to reach the wire.
+		let cancel: Vec<u64> = self
+			.shared
+			.ops
+			.borrow()
+			.iter()
+			.filter_map(|(key, op)| matches!(op, Op::Recv { .. } | Op::FutexWait).then_some(key as u64))
+			.collect();
+		let mut cancellation_failed = false;
+		for key in cancel {
+			if Instant::now() >= deadline {
+				cancellation_failed = true;
+				break;
+			}
+			cancellation_failed |= self.shared.cancel_until(key, deadline).is_err();
+		}
+		if cancellation_failed {
+			tracing::error!("failed to queue one or more io_uring teardown cancellations");
+		}
+		self.drain_teardown(deadline);
+	}
+}
+
+impl std::fmt::Debug for Worker {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Worker").field("tasks", &self.tasks.len()).finish()
+	}
+}
+
+/// A worker's cloneable, thread-local handle.
+///
+/// Everything that is not the drive loop goes through this:
+/// [`spawn`](Self::spawn), [`udp`](Self::udp), [`timer`](Self::timer), and
+/// [`run`](Self::run) for MoQ drivers. `!Send`, like everything the worker owns.
+pub struct Handle {
+	shared: Rc<Shared>,
+}
+
+impl Clone for Handle {
+	fn clone(&self) -> Self {
+		Self {
+			shared: self.shared.clone(),
+		}
+	}
+}
+
+impl Handle {
+	/// This worker's counters, readable from any thread.
+	pub fn metrics(&self) -> Metrics {
+		Metrics::from_counters(self.shared.metrics.clone())
+	}
+
+	/// Run a `!Send` future on this worker until completion.
+	///
+	/// If the worker has already been dropped the future is dropped instead of
+	/// running, like a task spawned on a shut-down runtime.
+	pub fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+		if self.shared.stopped.get() {
+			return;
+		}
+		let mut future = Box::pin(future);
+		self.shared
+			.spawns
+			.borrow_mut()
+			.push(Box::new(move |waiter: &kio::Waiter| {
+				waiter.poll_future(future.as_mut())
+			}));
+		// Spawning from another task (or before block_on) must reach the next
+		// turn's drain.
+		self.shared.unpark.unpark();
+	}
+
+	/// Drive `socket` through this worker's ring.
+	///
+	/// The caller configures and binds the socket (options, addresses); this
+	/// takes over receive and send. `config` picks the batching mechanisms.
+	///
+	/// The socket is what names this worker from here on: an
+	/// [`Endpoint`](crate::quic::Endpoint) built on it runs its tasks here,
+	/// whichever thread's handle built it. A member of a steered reuseport
+	/// group ([`moq_sock::shard::Socket`]) brings its slot along, so the
+	/// connection ids issued through it steer back to this socket.
+	pub fn udp(&self, socket: impl Into<udp::Bound>, config: udp::Config) -> Result<udp::Socket, Error> {
+		if self.shared.stopped.get() {
+			return Err(Shared::gone_error().into());
+		}
+		udp::Socket::bind(&self.shared, socket.into(), config)
+	}
+}
+
+/// The worker behind a socket, endpoint, or connection, held weakly.
+///
+/// I/O carries its owner so it cannot be driven through a different worker,
+/// but a handle to that I/O must not keep a dropped worker's ring alive, so
+/// this holds no strong reference. Once the worker is gone, spawning is a
+/// no-op (like [`Handle::spawn`]) and timers never fire, which is what the
+/// tasks that would have consumed them expect.
+#[derive(Clone)]
+pub(crate) struct Owner {
+	shared: Weak<Shared>,
+	/// Held directly: a timer on a dropped worker still has to exist, since
+	/// the driver that owns it is torn down by the same drop that would need
+	/// it.
+	timers: Rc<RefCell<timer::Heap>>,
+}
+
+impl Owner {
+	pub(crate) fn new(shared: &Rc<Shared>) -> Self {
+		Self {
+			shared: Rc::downgrade(shared),
+			timers: shared.timers.clone(),
+		}
+	}
+
+	/// The worker's core while it is still allocated, torn down or not.
+	pub fn upgrade(&self) -> Option<Rc<Shared>> {
+		self.shared.upgrade()
+	}
+
+	/// A strong handle, or `None` once the worker is dropped or torn down.
+	pub fn handle(&self) -> Option<Handle> {
+		let shared = self.shared.upgrade()?;
+		(!shared.stopped.get()).then_some(Handle { shared })
+	}
+
+	/// Run a `!Send` future on the worker, or drop it if the worker is gone.
+	pub fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+		if let Some(handle) = self.handle() {
+			handle.spawn(future);
+		}
+	}
+
+	/// A disarmed timer on the worker.
+	pub fn timer(&self) -> crate::Timer {
+		crate::Timer::from_heap(self.timers.clone())
+	}
+
+	/// A timer that expires after `duration`.
+	pub fn after(&self, duration: Duration) -> crate::Timer {
+		let mut timer = self.timer();
+		timer.set(Instant::now().checked_add(duration));
+		timer
+	}
+}
+
+impl std::fmt::Debug for Handle {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Handle").finish()
+	}
+}
+
+impl Handle {
+	/// Allocate a disarmed timer on this worker.
+	pub fn timer(&self) -> crate::Timer {
+		crate::Timer::from_heap(self.shared.timers.clone())
+	}
+
+	/// Run a MoQ driver with this worker's timer and monotonic clock, resolving
+	/// with its terminal error.
+	pub async fn run<D: moq_net::time::Driver>(&self, mut driver: D) -> moq_net::Error {
+		let mut timer = self.timer();
+		kio::wait(|waiter| {
+			loop {
+				match driver.poll(Instant::now(), waiter) {
+					Ok(at) => timer.set(at),
+					Err(err) => return Poll::Ready(err),
+				}
+				if timer.poll(waiter).is_pending() {
+					return Poll::Pending;
+				}
+			}
+		})
+		.await
+	}
+}
+
+/// The running kernel release, for error messages.
+fn kernel_release() -> String {
+	// SAFETY: all-zero is a valid utsname out-buffer.
+	let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+	// SAFETY: valid out-pointer.
+	if unsafe { libc::uname(&mut uts) } != 0 {
+		return "unknown".into();
+	}
+	// SAFETY: uname NUL-terminates the release field.
+	unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
+		.to_string_lossy()
+		.into_owned()
+}
+
+/// Convert a deadline into an absolute `CLOCK_MONOTONIC` timespec (what
+/// `IORING_ENTER_ABS_TIMER` expects).
+fn abs_timespec(at: Instant) -> types::Timespec {
+	// `std::time::Instant` is CLOCK_MONOTONIC on Linux but its origin is
+	// opaque, so anchor the difference on a raw clock read.
+	let delta = at.saturating_duration_since(Instant::now());
+	let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+	// SAFETY: valid out-pointer.
+	unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+	let nanos = now.tv_nsec as u64 + delta.subsec_nanos() as u64;
+	let secs = (now.tv_sec as u64)
+		.saturating_add(delta.as_secs())
+		.saturating_add(nanos / 1_000_000_000);
+	types::Timespec::new().sec(secs).nsec((nanos % 1_000_000_000) as u32)
+}
+
+/// Accept a bounded number of interrupted teardown submissions.
+fn retry_teardown_submit(interruptions: &mut usize, err: std::io::Error) -> std::io::Result<()> {
+	if err.raw_os_error() != Some(libc::EINTR) || *interruptions >= TEARDOWN_EINTR_RETRIES {
+		return Err(err);
+	}
+	*interruptions += 1;
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use crate::Timer as Deadline;
+	use std::time::Duration;
+
+	/// Kernel-gated: `None` (with a loud skip) below the 6.12 floor, so these
+	/// tests pass vacuously on older CI kernels and run everywhere else.
+	fn worker() -> Option<Worker> {
+		worker_with(Config::default())
+	}
+
+	fn worker_with(config: Config) -> Option<Worker> {
+		match Worker::new(config) {
+			Ok(worker) => Some(worker),
+			Err(Error::Unsupported(reason)) => {
+				eprintln!("skipping io_uring test: {reason}");
+				None
+			}
+			Err(err) => panic!("worker setup failed: {err}"),
+		}
+	}
+
+	#[test]
+	fn cloned_config_has_fresh_metrics() {
+		let config = Config::default();
+		let clone = config.clone();
+		assert!(!std::sync::Arc::ptr_eq(
+			config.metrics.counters(),
+			clone.metrics.counters()
+		));
+	}
+
+	#[test]
+	fn ready_future() {
+		let Some(mut worker) = worker() else { return };
+		let value = worker.block_on(async { 7 }).unwrap();
+		assert_eq!(value, 7);
+	}
+
+	#[test]
+	fn spawned_tasks_run() {
+		let Some(mut worker) = worker() else { return };
+		let handle = worker.handle();
+		let flag = Rc::new(std::cell::Cell::new(0));
+
+		for index in 0..3 {
+			let flag = flag.clone();
+			handle.spawn(async move {
+				flag.set(flag.get() + index + 1);
+			});
+		}
+		// Spawned tasks run even while the main future pends on a timer.
+		let handle2 = handle.clone();
+		worker
+			.block_on(async move {
+				Deadline::after(&handle2, Duration::from_millis(10)).wait().await;
+			})
+			.unwrap();
+		assert_eq!(flag.get(), 6);
+	}
+
+	#[test]
+	fn deadline_fires_at_park() {
+		let Some(mut worker) = worker() else { return };
+		let handle = worker.handle();
+		let start = Instant::now();
+		// Nothing else wakes this worker: the park's absolute timeout is the
+		// only thing that can fire the deadline.
+		worker
+			.block_on(async move {
+				Deadline::after(&handle, Duration::from_millis(50)).wait().await;
+			})
+			.unwrap();
+		let elapsed = start.elapsed();
+		assert!(elapsed >= Duration::from_millis(50), "woke early: {elapsed:?}");
+		assert!(elapsed < Duration::from_secs(5), "woke far too late: {elapsed:?}");
+	}
+
+	#[test]
+	fn timer_rearm_and_disarm() {
+		let Some(mut worker) = worker() else { return };
+		let handle = worker.handle();
+		let mut timer = handle.timer();
+
+		// Disarmed timers never fire.
+		assert!(timer.poll(&kio::Waiter::noop()).is_pending());
+
+		// An instant already in the past is immediately elapsed, and stays
+		// elapsed (fused) until re-armed.
+		timer.set(Some(Instant::now() - Duration::from_millis(1)));
+		assert!(timer.poll(&kio::Waiter::noop()).is_ready());
+		assert!(timer.poll(&kio::Waiter::noop()).is_ready());
+
+		// Re-arming to the future pends again; disarming stays pending.
+		timer.set(Some(Instant::now() + Duration::from_secs(60)));
+		assert!(timer.poll(&kio::Waiter::noop()).is_pending());
+		timer.set(None);
+		assert!(timer.poll(&kio::Waiter::noop()).is_pending());
+
+		// And a short re-arm actually fires through the worker.
+		let start = Instant::now();
+		worker
+			.block_on(async move {
+				timer.set(Some(Instant::now() + Duration::from_millis(20)));
+				kio::wait(|waiter| timer.poll(waiter)).await;
+			})
+			.unwrap();
+		assert!(start.elapsed() >= Duration::from_millis(20));
+	}
+
+	#[test]
+	fn dropped_worker_rejects_operations() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		let bind = || std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+		let sock = handle.udp(bind(), udp::Config::default()).expect("socket");
+		let shared = sock.downgrade();
+		let to = sock.local_addr().expect("addr");
+		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("no tx buffer");
+		};
+		drop(worker);
+
+		// Every path a retained handle can reach fails instead of pending on
+		// a loop that will never run again.
+		assert!(handle.udp(bind(), udp::Config::default()).is_err());
+		assert!(matches!(sock.poll_recv(&kio::Waiter::noop()), Poll::Ready(Err(_))));
+		assert!(matches!(sock.poll_acquire(&kio::Waiter::noop()), Poll::Ready(Err(_))));
+		assert!(
+			tx.send(udp::Transmit {
+				to,
+				len: 1200,
+				segment: 1200,
+				ecn: None,
+			})
+			.is_err()
+		);
+		// And a late spawn is dropped rather than parked forever.
+		handle.spawn(async {});
+		drop(sock);
+		assert!(shared.upgrade().is_none(), "the worker leaked its staged receive");
+	}
+
+	#[test]
+	fn teardown_stops_between_completions_at_the_deadline() {
+		let Some(mut worker) = worker() else { return };
+		let first = worker.shared.insert(Op::Cancel);
+		let second = worker.shared.insert(Op::Cancel);
+		let cqe = |user_data| Cqe {
+			user_data,
+			result: 0,
+			flags: 0,
+		};
+		let before = Instant::now();
+		let deadline = before + Duration::from_millis(1);
+		let mut now = [before, deadline].into_iter();
+
+		worker.cqes = vec![cqe(first), cqe(second)];
+		assert!(!worker.dispatch_batch(Some(deadline), || {
+			now.next().expect("one deadline check per completion")
+		}));
+		assert!(!worker.shared.ops.borrow().contains(first as usize));
+		assert!(worker.shared.ops.borrow().contains(second as usize));
+		worker.shared.ops.borrow_mut().remove(second as usize);
+	}
+
+	#[test]
+	fn expired_teardown_submits_residual_sqes() {
+		let Some(mut worker) = worker() else { return };
+		// A NOP needs no slab-owned memory, so it can observe the SQ directly.
+		for _ in 0..SQ_ENTRIES {
+			worker.shared.push(&opcode::Nop::new().build()).expect("stage NOP");
+		}
+		assert_eq!(worker.shared.ring.borrow_mut().submission().len(), SQ_ENTRIES as usize);
+
+		worker.drain_teardown(Instant::now());
+		assert!(worker.shared.ring.borrow_mut().submission().is_empty());
+	}
+
+	#[test]
+	fn teardown_submit_interrupt_budget_is_finite() {
+		let interrupted = || std::io::Error::from_raw_os_error(libc::EINTR);
+		let mut interruptions = 0;
+		for _ in 0..TEARDOWN_EINTR_RETRIES {
+			retry_teardown_submit(&mut interruptions, interrupted()).expect("retry interrupted submit");
+		}
+		assert_eq!(interruptions, TEARDOWN_EINTR_RETRIES);
+		assert_eq!(
+			retry_teardown_submit(&mut interruptions, interrupted())
+				.expect_err("interrupt budget must be finite")
+				.raw_os_error(),
+			Some(libc::EINTR)
+		);
+	}
+
+	#[test]
+	fn dropped_worker_drains_more_receives_than_the_submission_queue() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		let config = udp::Config {
+			gro: false,
+			gso: false,
+			multishot: false,
+			rx_buffers_max: 1,
+			rx_buffer_len: 2048,
+			tx_buffers_max: 1,
+			tx_buffer_len: 2048,
+		};
+		let mut sockets = Vec::new();
+		let mut shared = Vec::new();
+		for _ in 0..=SQ_ENTRIES {
+			let sock = handle
+				.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config.clone())
+				.expect("socket");
+			shared.push(sock.downgrade());
+			sockets.push(sock);
+		}
+
+		drop(worker);
+		drop(sockets);
+		assert!(
+			shared.iter().all(|shared| shared.upgrade().is_none()),
+			"the worker leaked a receive staged across submission batches"
+		);
+	}
+
+	#[test]
+	fn cq_covers_the_default_pool_ceilings() {
+		// The completion queue must cover at least two sockets at their
+		// default pool ceilings (plus the futex), or the kernel's overflow
+		// slow path becomes steady state for the workload the ceilings exist
+		// to serve. Fails when someone raises the udp defaults without
+		// revisiting CQ_ENTRIES.
+		let config = udp::Config::default();
+		let per_socket = u32::from(config.tx_buffers_max) + u32::from(config.rx_buffers_max);
+		assert!(CQ_ENTRIES > 2 * per_socket, "CQ_ENTRIES fell behind the pool defaults");
+	}
+
+	#[test]
+	fn the_ring_honors_the_requested_cq_depth() {
+		// The kernel-reported geometry, not the constant: dropping the
+		// `setup_cqsize` call would silently fall back to a CQ of twice the SQ
+		// (512), and the overflow test below cannot catch that because it
+		// expects overflow. This one pins the operative fix.
+		let Some(worker) = worker() else { return };
+		let cq = worker.shared.ring.borrow().params().cq_entries();
+		assert!(cq >= CQ_ENTRIES, "kernel granted a {cq}-entry CQ, wanted {CQ_ENTRIES}");
+	}
+
+	#[test]
+	fn completion_overflow_is_survivable() {
+		let Some(mut worker) = worker() else { return };
+		let handle = worker.handle();
+		// Twice the CQ's worth of sends, staged synchronously so nothing
+		// reaps while they complete: the kernel must backlog the completions
+		// (`IORING_FEAT_NODROP`) and the worker must drain them without any
+		// operation, socket, or the worker itself failing.
+		let ceiling = (CQ_ENTRIES * 2) as u16;
+		let config = udp::Config {
+			tx_buffers_max: ceiling,
+			tx_buffer_len: 2048,
+			..Default::default()
+		};
+		let sock = handle
+			.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config)
+			.expect("socket");
+		let to = sock.local_addr().expect("addr");
+
+		let mut held = Vec::new();
+		while let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) {
+			held.push(tx);
+		}
+		assert_eq!(held.len(), usize::from(ceiling));
+		for tx in held.drain(..) {
+			tx.send(udp::Transmit {
+				to,
+				len: 1200,
+				segment: 1200,
+				ecn: None,
+			})
+			.expect("send");
+		}
+
+		// The point of the test is the overflow, so prove it happened: the
+		// kernel raises this flag while completions sit in its backlog. It
+		// clears once the backlog flushes, so sample it before each sweep.
+		let saw_overflow = |worker: &Worker| worker.shared.ring.borrow_mut().submission().cq_overflow();
+		let mut overflowed = saw_overflow(&worker);
+
+		// Drive the worker until every completion, backlog included, has been
+		// reaped and released its buffer back to the pool.
+		let deadline = Instant::now() + Duration::from_secs(10);
+		loop {
+			overflowed = overflowed || saw_overflow(&worker);
+			let h = handle.clone();
+			worker
+				.block_on(async move {
+					Deadline::after(&h, Duration::from_millis(10)).wait().await;
+				})
+				.unwrap();
+			let mut free = Vec::new();
+			loop {
+				match sock.poll_acquire(&kio::Waiter::noop()) {
+					Poll::Ready(Ok(tx)) => free.push(tx),
+					Poll::Ready(Err(err)) => panic!("send path failed: {err}"),
+					Poll::Pending => break,
+				}
+			}
+			if free.len() == usize::from(ceiling) {
+				break;
+			}
+			assert!(
+				Instant::now() < deadline,
+				"buffers stuck in flight: {} of {ceiling} free",
+				free.len()
+			);
+		}
+		assert!(overflowed, "the burst never overflowed the CQ; it proves nothing");
+		// The receive side rode out the same storm: whatever the loopback
+		// delivered drains without a terminal error.
+		while let Poll::Ready(result) = sock.poll_recv(&kio::Waiter::noop()) {
+			result.expect("receive path failed");
+		}
+	}
+
+	#[test]
+	fn oversized_receive_pool_is_rejected() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		// Without validation the power-of-two rounding wraps to a zero-entry
+		// ring, which allocates nothing and underflows its mask.
+		let config = udp::Config {
+			rx_buffers_max: u16::MAX,
+			..Default::default()
+		};
+		let err = handle
+			.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config)
+			.expect_err("oversized pool");
+		assert!(matches!(err, Error::Io(err) if err.kind() == std::io::ErrorKind::InvalidInput));
+	}
+
+	#[test]
+	fn the_send_pool_grows_to_its_ceiling() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		// A ceiling is a bound, not a reservation: 65535 default-length buffers
+		// would be 4 GiB if the pool were allocated up front.
+		let config = udp::Config {
+			tx_buffers_max: u16::MAX,
+			..Default::default()
+		};
+		handle
+			.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config)
+			.expect("socket");
+
+		// Short buffers so the whole ceiling fits in a test.
+		let config = udp::Config {
+			tx_buffers_max: 200,
+			tx_buffer_len: 4096,
+			..Default::default()
+		};
+		let sock = handle
+			.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config)
+			.expect("socket");
+
+		// Holding every buffer starves the pool, which grows past its initial
+		// floor rather than serializing the caller behind it, and stops at the
+		// ceiling.
+		let mut held = Vec::new();
+		while let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) {
+			held.push(tx);
+		}
+		assert_eq!(held.len(), 200);
+		drop(worker);
+	}
+
+	#[test]
+	fn ungso_send_is_not_capped_at_a_train() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		// Without GSO each segment rides its own `sendmsg`, so the kernel's
+		// 64-segment train limit does not apply.
+		let config = udp::Config {
+			gso: false,
+			..Default::default()
+		};
+		let sock = handle
+			.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config)
+			.expect("socket");
+		let to = sock.local_addr().expect("addr");
+		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("no tx buffer");
+		};
+		tx.send(udp::Transmit {
+			to,
+			len: 64 * 1024,
+			segment: 1000,
+			ecn: None,
+		})
+		.expect("send 66 datagrams");
+		drop(worker);
+	}
+
+	#[test]
+	fn ungso_send_is_capped_by_the_ring() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		// Without GSO the segment count is the `sendmsg` count, and `push`
+		// submits inline without reaping once the queue is full, so one call
+		// must not outrun the ring.
+		let config = udp::Config {
+			gso: false,
+			..Default::default()
+		};
+		let sock = handle
+			.udp(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"), config)
+			.expect("socket");
+		let to = sock.local_addr().expect("addr");
+		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("no tx buffer");
+		};
+		let err = tx
+			.send(udp::Transmit {
+				to,
+				len: 64 * 1024,
+				segment: 1,
+				ecn: None,
+			})
+			.expect_err("65536 datagrams from one buffer");
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+		drop(worker);
+	}
+
+	#[test]
+	fn oversized_gso_segment_is_rejected() {
+		let Some(worker) = worker() else { return };
+		let handle = worker.handle();
+		let sock = handle
+			.udp(
+				std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"),
+				udp::Config::default(),
+			)
+			.expect("socket");
+		let to = sock.local_addr().expect("addr");
+		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("no tx buffer");
+		};
+		// `UDP_SEGMENT` is a u16: without validation this would truncate to a
+		// one-byte stride instead of one segment.
+		let err = tx
+			.send(udp::Transmit {
+				to,
+				len: 60_000,
+				segment: usize::from(u16::MAX) + 2,
+				ecn: None,
+			})
+			.expect_err("oversized segment");
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+		drop(worker);
+	}
+
+	/// The counters an ops scrape reads have to move for real work, and a
+	/// handed-in [`Metrics`] has to be the same set the worker writes: reading
+	/// zeros off a worker that is busy is indistinguishable from a healthy idle
+	/// one, which is the failure this whole surface exists to prevent.
+	#[test]
+	fn metrics_record_ring_and_socket_activity() {
+		let metrics = Metrics::default();
+		let config = Config {
+			metrics: metrics.clone(),
+			..Default::default()
+		};
+		let Some(mut worker) = worker_with(config) else { return };
+		let handle = worker.handle();
+		let sock = handle
+			.udp(
+				std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"),
+				udp::Config::default(),
+			)
+			.expect("socket");
+		let to = sock.local_addr().expect("addr");
+
+		// One GSO train of four datagrams: one `sendmsg`, four packets.
+		let Poll::Ready(Ok(mut tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("no tx buffer");
+		};
+		tx[..4 * 1200].fill(7);
+		tx.send(udp::Transmit {
+			to,
+			len: 4 * 1200,
+			segment: 1200,
+			ecn: None,
+		})
+		.expect("send");
+
+		// Drive the worker until the loopback delivers, parking on a timer each
+		// turn so the park and timer counters see traffic too.
+		let deadline = Instant::now() + Duration::from_secs(5);
+		let mut received = 0;
+		while received == 0 && Instant::now() < deadline {
+			let handle = handle.clone();
+			worker
+				.block_on(async move {
+					Deadline::after(&handle, Duration::from_millis(10)).wait().await;
+				})
+				.unwrap();
+			while let Poll::Ready(packet) = sock.poll_recv(&kio::Waiter::noop()) {
+				let packet = packet.expect("receive path failed");
+				received += packet.payload().len();
+			}
+		}
+		assert!(received > 0, "the loopback never delivered the send");
+
+		let snap = metrics.snapshot();
+		assert_eq!(snap.tx_sends, 1, "one GSO train is one sendmsg: {snap:?}");
+		assert_eq!(snap.tx_datagrams, 4, "four segments: {snap:?}");
+		assert!(snap.rx_receives > 0, "no receive completions: {snap:?}");
+		assert!(
+			snap.rx_datagrams >= snap.rx_receives,
+			"fewer datagrams than receives: {snap:?}"
+		);
+		assert!(snap.submissions > 0, "nothing was submitted: {snap:?}");
+		assert!(snap.completions > 0, "nothing completed: {snap:?}");
+		assert!(snap.enters > 0, "the ring was never entered: {snap:?}");
+		assert!(snap.parks > 0, "the worker never parked: {snap:?}");
+		assert!(snap.timers_fired > 0, "the park deadlines never fired: {snap:?}");
+		// The worker's own handle reads the same counters as the one passed in,
+		// rather than a private set the scraper would never see.
+		let own = handle.metrics().snapshot();
+		assert_eq!((own.tx_sends, own.tx_datagrams), (snap.tx_sends, snap.tx_datagrams));
+	}
+
+	/// The backpressure counters are the first thing to look at when throughput
+	/// sags, so both ends of it have to be recorded: a send that found the pool
+	/// drained, and a receive that could not be re-armed for want of a buffer.
+	#[test]
+	fn metrics_record_pool_backpressure() {
+		let metrics = Metrics::default();
+		let config = Config {
+			metrics: metrics.clone(),
+			..Default::default()
+		};
+		let Some(mut worker) = worker_with(config) else { return };
+		let handle = worker.handle();
+		// One buffer each way, so the pools are at their ceiling immediately.
+		// Oneshot receives claim a whole buffer, which is what lets a held
+		// packet leave the socket unarmed.
+		let sock = handle
+			.udp(
+				std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"),
+				udp::Config {
+					gro: false,
+					gso: false,
+					multishot: false,
+					rx_buffers_max: 1,
+					rx_buffer_len: 2048,
+					tx_buffers_max: 1,
+					tx_buffer_len: 2048,
+				},
+			)
+			.expect("socket");
+		let to = sock.local_addr().expect("addr");
+
+		let Poll::Ready(Ok(tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("no tx buffer");
+		};
+		// The pool is one buffer deep and that one is checked out.
+		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
+		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
+		assert_eq!(metrics.snapshot().tx_stalls, 1);
+		tx.send(udp::Transmit {
+			to,
+			len: 1200,
+			segment: 1200,
+			ecn: None,
+		})
+		.expect("send");
+
+		// Hold the received packet: its buffer is the pool, so the re-arm has
+		// nowhere to receive into.
+		let deadline = Instant::now() + Duration::from_secs(5);
+		let mut held = None;
+		while held.is_none() && Instant::now() < deadline {
+			let handle = handle.clone();
+			worker
+				.block_on(async move {
+					Deadline::after(&handle, Duration::from_millis(10)).wait().await;
+				})
+				.unwrap();
+			if let Poll::Ready(packet) = sock.poll_recv(&kio::Waiter::noop()) {
+				held = Some(packet.expect("receive path failed"));
+			}
+		}
+		assert!(held.is_some(), "the loopback never delivered the send");
+		assert!(
+			metrics.snapshot().rx_exhausted > 0,
+			"a re-arm with every buffer held went unreported: {:?}",
+			metrics.snapshot()
+		);
+
+		// A completed send ends the first stall. Draining the pool again starts
+		// exactly one new episode, however often its waiter is polled.
+		let Poll::Ready(Ok(_tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
+			panic!("completed tx buffer was not released");
+		};
+		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
+		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
+		assert_eq!(metrics.snapshot().tx_stalls, 2);
+	}
+
+	/// Timer churn is the thing #3122 needs a baseline for, so an arm, a
+	/// re-arm, and a drop each have to land in a different counter, and the
+	/// derived heap depth has to come back to zero.
+	#[test]
+	fn metrics_count_timer_churn() {
+		let metrics = Metrics::default();
+		let config = Config {
+			metrics: metrics.clone(),
+			..Default::default()
+		};
+		let Some(worker) = worker_with(config) else { return };
+		let handle = worker.handle();
+		let mut timer = handle.timer();
+
+		timer.set(Some(Instant::now() + Duration::from_secs(60)));
+		assert_eq!(metrics.snapshot().timers_active(), 1);
+
+		// A re-arm is a cancel plus an arm, which is exactly the churn signal.
+		timer.set(Some(Instant::now() + Duration::from_secs(60)));
+		let snap = metrics.snapshot();
+		assert_eq!((snap.timers_armed, snap.timers_cancelled, snap.timers_fired), (2, 1, 0));
+		assert_eq!(snap.timers_active(), 1);
+
+		// An eager poll past the deadline fires rather than cancels.
+		timer.set(Some(Instant::now() - Duration::from_millis(1)));
+		assert!(timer.poll(&kio::Waiter::noop()).is_ready());
+		let snap = metrics.snapshot();
+		assert_eq!((snap.timers_armed, snap.timers_cancelled, snap.timers_fired), (3, 2, 1));
+		assert_eq!(snap.timers_active(), 0);
+
+		// A dropped armed timer is a cancel, and the heap empties again.
+		timer.set(Some(Instant::now() + Duration::from_secs(60)));
+		assert_eq!(metrics.snapshot().timers_active(), 1);
+		drop(timer);
+		assert_eq!(metrics.snapshot().timers_active(), 0);
+	}
+
+	#[test]
+	fn remote_wake_unparks() {
+		let metrics = Metrics::default();
+		let config = Config {
+			metrics: metrics.clone(),
+			..Default::default()
+		};
+		let Some(mut worker) = worker_with(config) else { return };
+		let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+		let thread_flag = flag.clone();
+		let waker_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+		let thread_slot = waker_slot.clone();
+		let thread = std::thread::spawn(move || {
+			// Wait until the worker has parked on the future below.
+			std::thread::sleep(Duration::from_millis(50));
+			thread_flag.store(true, Ordering::Release);
+			if let Some(waker) = thread_slot.lock().unwrap().take() {
+				waker.wake();
+			}
+		});
+
+		let start = Instant::now();
+		worker
+			.block_on(std::future::poll_fn(move |cx| {
+				if flag.load(Ordering::Acquire) {
+					return Poll::Ready(());
+				}
+				*waker_slot.lock().unwrap() = Some(cx.waker().clone());
+				Poll::Pending
+			}))
+			.unwrap();
+		assert!(start.elapsed() >= Duration::from_millis(50));
+		thread.join().unwrap();
+		// The futex syscall the wake had to make is the expensive half, and the
+		// only counter written from off the worker's thread.
+		assert!(metrics.snapshot().wakes > 0, "the remote wake went unreported");
+	}
+}

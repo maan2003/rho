@@ -1,0 +1,20 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+button {
+	cursor: pointer;
+}
+
+body {
+	@apply bg-neutral-950 text-white;
+}
+
+/* Documentation-style content (the publish page, footers) opts into prose
+   typography. The app-style layouts (watch inspector, stats) use utility
+   classes instead, so prose's centered max-width doesn't fight their
+   multi-column layouts. */
+.prose-doc {
+	@apply prose dark:prose-invert lg:prose-xl mx-auto;
+}

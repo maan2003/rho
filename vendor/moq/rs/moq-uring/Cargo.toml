@@ -1,0 +1,82 @@
+[package]
+name = "moq-uring"
+description = "Experimental Linux io_uring support for Media over QUIC"
+authors = ["Luke Curley <kixelated@gmail.com>"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.0.1"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["quic", "io-uring", "networking", "linux"]
+categories = ["asynchronous", "network-programming", "os::linux-apis"]
+
+[features]
+default = ["noq"]
+# noq-proto, with TLS through rustls.
+noq = ["dep:noq-proto", "dep:rustls", "dep:rustls-platform-verifier"]
+# Capture qlog traces (`quic::Transport::qlog`). Off by default: it compiles the
+# qlog crate and its serde_json encoder into noq, which a production build has
+# no use for.
+qlog = ["noq-proto?/qlog"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bytes = "1"
+http = "1"
+io-uring = { workspace = true }
+kio = { workspace = true }
+libc = { workspace = true }
+moq-net = { workspace = true }
+moq-sock = { workspace = true }
+# default-features off so the crypto provider is ours to pick.
+noq-proto = { workspace = true, features = ["bloom", "tracing-log", "rustls-aws-lc-rs"], optional = true }
+rand = "0.10"
+rustc-hash = { workspace = true }
+rustls = { version = "0.23", optional = true }
+# OS-native server-cert verifier for the rustls backends. Version matched to
+# the copy moq-tokio pulls in, to avoid duplication.
+rustls-platform-verifier = { version = "0.7", optional = true }
+slab = "0.4"
+thiserror = "2"
+tracing = "0.1"
+url = "2"
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[dev-dependencies]
+anyhow = "1"
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring = { workspace = true }
+libc = { workspace = true }
+moq-tokio = { workspace = true, features = ["noq", "aws-lc-rs"] }
+nix = { workspace = true }
+noq-udp = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+rustls = "0.23"
+# The qlog test parses every record of a trace, which is what catches a
+# truncated or interleaved write.
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = "0.1"
+web-transport-noq = { workspace = true }
+
+[[bench]]
+name = "udp_tokio"
+harness = false
+
+[[bench]]
+name = "udp_uring"
+harness = false
+
+[[bench]]
+name = "echo_noq"
+path = "benches/echo_noq.rs"
+harness = false
+
+[[bench]]
+name = "session_lite"
+harness = false

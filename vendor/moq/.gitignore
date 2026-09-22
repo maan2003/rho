@@ -1,0 +1,69 @@
+# Local
+.DS_Store
+*.local
+*.log*
+
+# Ignore local Claude Code config
+*.local.json
+
+# Claude Code scratch space. These are untracked working directories, and
+# `just _changed` counts untracked files, so leaving them visible pushes the
+# changed-file list past its cap and silently turns every scoped `just check`
+# into `check --all`. The worktrees also carry their own biome.jsonc, which the
+# unscoped run then rejects as a nested root config.
+/.claude/cache/
+/.claude/tmp/
+/.claude/worktrees/
+
+# IDE
+.idea
+
+# Build stuff.
+target
+pkg
+dist
+out
+result
+*.tsbuildinfo
+node_modules
+/.direnv
+
+# Don't leak dev stuff
+*.mp4
+*.fmp4
+*.crt
+*.key
+*.hex
+*.jwk
+*.jwt
+*.m3u8
+*.m4s
+
+# Except these test fixtures, which are committed.
+!rs/moq-mux/src/container/fmp4/test_data/*.mp4
+
+# Cloudflare Wrangler
+.wrangler/
+
+# VitePress pages generated from drafts/ by doc/.vitepress/drafts.ts
+/doc/draft/
+
+# We're using bun
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# maturin develop drops uniffi bindings + cdylib here during editable
+# installs of the py/moq-ffi package.
+/py/moq-ffi/moq_ffi/_uniffi/
+
+# Generated JSR manifest (derived from package.json by js/common/package.ts)
+jsr.json
+
+# msys/cygwin crash dumps, from running the shell scripts on Windows.
+*.stackdump

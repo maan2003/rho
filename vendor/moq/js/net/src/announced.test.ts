@@ -1,0 +1,129 @@
+import { expect, test } from "bun:test";
+import * as Announce from "./announced.ts";
+import type { Producer as BroadcastProducer } from "./broadcast.ts";
+import { Route } from "./hop.ts";
+import { Producer as OriginProducer } from "./origin.ts";
+import * as Path from "./path.ts";
+import { wireOf } from "./wire.ts";
+
+function publish(origin: OriginProducer, path: Path.Valid): BroadcastProducer {
+	const broadcast = origin.createBroadcast(path);
+	broadcast.announce();
+	return broadcast;
+}
+
+const p = (s: string) => Path.from(s);
+
+test("next streams every appended event in order", async () => {
+	const producer = new Announce.Producer();
+	const consumer = producer.consume();
+
+	const route = Route.default;
+	producer.append({ prefix: p("a"), captures: undefined, kind: "announced", route });
+	producer.append({ prefix: p("a"), captures: undefined, kind: "retracted", route });
+
+	expect(await consumer.next()).toEqual({ prefix: p("a"), captures: undefined, kind: "announced", route });
+	expect(await consumer.next()).toEqual({ prefix: p("a"), captures: undefined, kind: "retracted", route });
+});
+
+test("the consumer is an async iterable of the same events", async () => {
+	const producer = new Announce.Producer();
+	const consumer = producer.consume();
+
+	const route = Route.default;
+	producer.append({ prefix: p("a"), captures: undefined, kind: "announced", route });
+	producer.append({ prefix: p("a"), captures: undefined, kind: "retracted", route });
+
+	const events = consumer[Symbol.asyncIterator]();
+	expect((await events.next()).value?.kind).toBe("announced");
+	expect((await events.next()).value?.kind).toBe("retracted");
+	// A close drops what was queued and ends the iteration.
+	producer.close();
+	expect((await events.next()).done).toBe(true);
+});
+
+test("a same-name re-announce is a distinct update", async () => {
+	const producer = new Announce.Producer();
+	const consumer = producer.consume();
+
+	// The stream is a log, not a set: it carries a redundant announce as its own update rather
+	// than collapsing it. Deciding what a repeat means belongs to the session layer, which resolves
+	// a restart into either nothing (a route change) or an end + start (a new publisher).
+	const route = Route.default;
+	producer.append({ prefix: p("a"), captures: undefined, kind: "announced", route });
+	producer.append({ prefix: p("a"), captures: undefined, kind: "announced", route });
+
+	expect(await consumer.next()).toEqual({ prefix: p("a"), captures: undefined, kind: "announced", route });
+	expect(await consumer.next()).toEqual({ prefix: p("a"), captures: undefined, kind: "announced", route });
+});
+
+test("closing resolves next with undefined", async () => {
+	const producer = new Announce.Producer();
+	const consumer = producer.consume();
+
+	producer.close();
+	expect(await consumer.next()).toBeUndefined();
+});
+
+test("aborting rejects next", async () => {
+	const producer = new Announce.Producer();
+	const consumer = producer.consume();
+
+	producer.close(new Error("boom"));
+	await expect(consumer.next()).rejects.toThrow("boom");
+});
+
+async function settle() {
+	await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+test("an origin handle resolves a local publish with no session attached", async () => {
+	const origin = new OriginProducer();
+	const path = p("loopback");
+
+	const watch = origin.request(path, { announced: true });
+	await settle();
+	expect(watch.active.peek()).toBeUndefined();
+
+	// Loopback needs no connection: the table routes the local publish directly, even
+	// though `discovery` is still undefined (nothing is attached).
+	const first = publish(origin, path);
+	await settle();
+	const held = watch.active.peek();
+	expect(held).toBeDefined();
+
+	// A republish swaps the handle to the new broadcast rather than clinging to the
+	// superseded one.
+	const second = publish(origin, path);
+	await settle();
+	expect(watch.active.peek()).toBeDefined();
+	expect(watch.active.peek()).not.toBe(held);
+
+	// Unpublishing takes it offline.
+	second.close();
+	first.close();
+	await settle();
+	expect(watch.active.peek()).toBeUndefined();
+
+	watch.close();
+	origin.close();
+});
+
+test("the local route wins over a blind request on a no-discovery origin", async () => {
+	const origin = new OriginProducer();
+	const path = p("local-first");
+
+	// A session without discovery is attached, so the handle stands a request; but the
+	// local publish must still resolve through the table, not wait on an answer.
+	const detach = wireOf(origin).attach(false);
+	const broadcast = publish(origin, path);
+
+	const watch = origin.request(path, { announced: true });
+	await settle();
+	expect(watch.active.peek()).toBeDefined();
+
+	watch.close();
+	detach();
+	broadcast.close();
+	origin.close();
+});

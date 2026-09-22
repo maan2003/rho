@@ -1,0 +1,130 @@
+#!/usr/bin/env just --justfile
+#
+# Language-specific recipes for the Python packages under py/. Invoked
+# from the repo root as `just py <recipe>` via the `mod py` import.
+#
+# Two workspace members:
+#   moq-ffi/  maturin project: rs/moq-ffi cdylib + uniffi bindings (dist `moq-ffi`)
+#   moq-rs/   pure-python ergonomic wrapper depending on moq-ffi (dist `moq-rs`,
+#             import `moq`)
+
+set working-directory := '.'
+
+# Paths a Python check depends on. `rs/moq-ffi` is in scope because maturin
+# bundles it into the moq-ffi wheel. `check`, `fix`, and `test` all skip
+# themselves when a diff misses this; no FILES at all means force-run.
+#
+# They also skip when uv is absent, matching the kt/swift/go check scripts: an
+# incomplete local toolchain should check less rather than fail. The root
+# `_tools` preflight makes uv a hard requirement under MOQ_STRICT.
+scope := '^(py/|pyproject\.toml$|uv\.lock$|rs/moq-ffi/)'
+
+default:
+    just check
+
+# Build moq-ffi (maturin cdylib + bindings) and install the pure-python moq-rs
+# wrapper, both editable into the workspace venv. `--no-deps` on the wrapper
+
+# keeps uv from fetching moq-ffi off PyPI; maturin just installed it locally.
+_develop:
+    cd moq-ffi && uv run --no-sync maturin develop --locked --uv
+    uv pip install --no-deps -e moq-rs
+
+# Lint + format + editable build + pyright + docs. `--no-install-workspace`
+# installs the root dev group (ruff, maturin, pyright, pytest) without trying to
+# pip-build the workspace members; `_develop` then installs them editable, which
+# is also what `build` does, so there is no separate build gate here.
+#
+# `docs` runs here because a broken autodoc reference otherwise surfaces on Read
+# the Docs after the fact. It mocks the native module, so it costs no Rust build.
+
+# Lint, type-check, editable-build, and render the docs.
+check $FILES="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "$FILES" ]] && ! grep -qE '{{ scope }}' <<< "$FILES"; then
+    	echo "py: no Python changes; skipping."
+    	exit 0
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+    	echo "py: uv not on PATH, skipping" >&2
+    	exit 0
+    fi
+    uv sync --locked --no-install-workspace
+    uv run --no-sync ruff check .
+    uv run --no-sync ruff format --check .
+    just _develop
+    uv run --no-sync pyright
+    just docs
+
+# Auto-fix lint and formatting issues. Skips on the same terms as `check`.
+fix $FILES="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "$FILES" ]] && ! grep -qE '{{ scope }}' <<< "$FILES"; then
+    	echo "py: no Python changes; skipping."
+    	exit 0
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+    	echo "py: uv not on PATH, skipping" >&2
+    	exit 0
+    fi
+    uv sync --no-install-workspace
+    uv run --no-sync ruff check --fix .
+    uv run --no-sync ruff format .
+
+# Run the unit tests. Skips on the same terms as `check`.
+test $FILES="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "$FILES" ]] && ! grep -qE '{{ scope }}' <<< "$FILES"; then
+    	echo "py: no Python changes; skipping tests."
+    	exit 0
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+    	echo "py: uv not on PATH, skipping" >&2
+    	exit 0
+    fi
+    uv sync --locked --no-install-workspace
+    just _develop
+    uv run --no-sync pytest moq-rs/tests/ moq-ffi/tests/
+
+# Local dev build: editable install of moq-ffi (with the cdylib + uniffi
+
+# bindings) and the moq-rs wrapper into the workspace venv.
+build:
+    uv sync --locked --no-install-workspace
+    just _develop
+
+# Remove the virtualenv, release dist, bytecode caches, and the uniffi
+# bindings maturin drops in during editable installs. The uv workspace venv
+
+# lives at the repo root, so reach up for it.
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf dist moq-ffi/moq_ffi/_uniffi
+    rm -rf ../.venv .venv
+    find . -name .claude -prune -o -type d -name __pycache__ -prune -exec rm -rf {} +
+    find . -name .claude -prune -o -type f -name '*.pyc' -exec rm -f {} +
+
+# Build the pure-python moq-rs wrapper sdist + wheel into py/dist (for release).
+# moq-ffi is built separately by maturin (see release-py.yml); the wrapper is
+
+# pure python so it needs no compilation, just a metadata-correct wheel.
+package:
+    # `uv build` has no --locked, and this is the recipe release-py.yml
+    # publishes from, so validate the lock explicitly rather than inheriting it
+    # from a sync that never runs here.
+    uv lock --check
+    rm -rf dist
+    uv build --package moq-rs --out-dir dist
+
+# Build the Sphinx API docs for the `moq` wrapper into py/dist/docs. Read the
+# Docs builds the same config (see .readthedocs.yaml) and hosts the result. The
+# native moq_ffi is mocked (autodoc_mock_imports in docs/conf.py), so this needs
+# no Rust build.
+docs:
+    rm -rf dist/docs
+    uv run --isolated --locked --only-group docs \
+        sphinx-build -b html moq-rs/docs dist/docs

@@ -1,0 +1,43 @@
+# Default moq-relay configuration installed by the moq-relay package.
+# Edit this file in place; your changes survive package upgrades because
+# /etc/moq-relay/relay.toml is registered as a conffile.
+#
+# See https://moq.dev/docs/auth and the example configs at
+# https://github.com/moq-dev/moq/tree/main/demo/relay for more.
+
+[listen]
+# Listen for QUIC connections on UDP:443.
+# This is the default port for WebTransport.
+bind = "[::]:443"
+
+[listen.tls]
+# Provide real certificates from Let's Encrypt or your CA of choice.
+# The default paths below are owned by the moq-relay service (DynamicUser)
+# via StateDirectory; drop your cert/key in /var/lib/moq-relay/.
+cert = "/var/lib/moq-relay/cert.pem"
+key = "/var/lib/moq-relay/key.pem"
+
+[web.https]
+# Listen for TCP/HTTPS/WSS connections on port 443.
+# Reuse the same certificate as the QUIC endpoint.
+listen = "[::]:443"
+cert = "/var/lib/moq-relay/cert.pem"
+key = "/var/lib/moq-relay/key.pem"
+
+# Uncomment to also serve plain HTTP/WebSocket on port 80.
+# [web.http]
+# listen = "[::]:80"
+
+# Who is admitted. The relay asks an auth server once per session event; the
+# policy (keys, public patterns, the grant for mTLS peers) lives there:
+#
+#   moq auth serve --listen 127.0.0.1:4440 --key /var/lib/moq-relay/root.jwk \
+#     --public-subscribe 'anon/**' --public-subscribe 'demo/**' \
+#     --public-publish 'anon/**' --public-publish 'demo/viewer/**'
+#
+# Generate the key with `moq auth generate`. See https://moq.dev/docs/auth.
+[auth]
+url = "http://127.0.0.1:4440/"
+
+# Or, with no server, a static anonymous grant:
+# public = "anon/**"

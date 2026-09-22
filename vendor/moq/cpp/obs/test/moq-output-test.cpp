@@ -1,0 +1,962 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Drives the real MoQOutput against stubbed libobs and libmoq, so the session
+// status callback's orderings can be forced instead of waited for. Everything
+// here is timing-sensitive in production: a terminal callback arrives on the
+// libmoq runtime thread at a moment we don't control, possibly during Start(),
+// during a restart, during destruction, or long after it.
+//
+// Run with `just obs test`. This is not part of the plugin build.
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <climits>
+#include <cstdio>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <obs.h>
+#include <obs-module.h>
+
+extern "C" {
+#include "moq.h"
+}
+
+#include "moq-settings.h"
+
+// ------------------------------------------------------------- libobs stubs
+
+namespace {
+struct RecordedSignal {
+	int code;
+	std::string last_error;
+	// How many times capture had begun when this was signalled, so a test can tell
+	// "committed the output, then reported" from "reported, then committed".
+	int begin_capture_at;
+};
+
+// The plugin serializes its own signalling, but the tests read these from a
+// different thread than the callback writes them, so the stubs carry their own
+// lock. Always go through the helpers below.
+std::mutex g_signals_mutex;
+std::vector<RecordedSignal> g_signals;
+std::string g_last_error;
+std::atomic<int> g_begin_capture{0};
+std::atomic<bool> g_settings_ok{true};
+std::string g_rate_control = "CBR";
+moq_video_hint g_video_hint{};
+// Lets a test run something inside obs_output_signal_stop, standing in for a
+// frontend that stops the output straight from the signal handler.
+std::function<void()> g_on_signal;
+// Released from inside Start(), just before it rewrites the members a stale
+// callback might read, so the two genuinely overlap.
+std::atomic<bool> *g_start_gate = nullptr;
+// obs_output_set_last_error sits between deciding to report a failure and
+// reporting it, so the stub announces that it is in that window and then holds
+// it open. A test can use this to drive a concurrent Stop() into the gap: with
+// signal_mutex held across the whole report the Stop() blocks, and without it
+// the stale report lands after the stop, which is the bug.
+std::atomic<bool> g_stall_last_error{false};
+std::atomic<bool> g_in_report_window{false};
+} // namespace
+
+extern "C" {
+
+// Deliberately silent: stdio locking would create happens-before edges between
+// the OBS and libmoq threads and mask exactly the races we're looking for.
+void blog(int, const char *, ...) {}
+
+obs_service_t *obs_output_get_service(const obs_output_t *)
+{
+	if (g_start_gate)
+		g_start_gate->store(true, std::memory_order_relaxed);
+	return reinterpret_cast<obs_service_t *>(0x1);
+}
+
+bool obs_output_can_begin_data_capture(const obs_output_t *, uint32_t)
+{
+	return true;
+}
+
+bool obs_output_initialize_encoders(obs_output_t *, uint32_t)
+{
+	return true;
+}
+
+const char *obs_service_get_connect_info(const obs_service_t *, uint32_t type)
+{
+	return type == OBS_SERVICE_CONNECT_INFO_SERVER_URL ? "https://relay.example/anon" : "room";
+}
+
+obs_data_t *obs_service_get_settings(const obs_service_t *)
+{
+	return reinterpret_cast<obs_data_t *>(0x3);
+}
+
+void obs_data_release(obs_data_t *) {}
+
+obs_encoder_t *obs_output_get_video_encoder2(const obs_output_t *, size_t idx)
+{
+	return idx == 0 ? reinterpret_cast<obs_encoder_t *>(0x2) : nullptr;
+}
+
+bool obs_output_begin_data_capture(obs_output_t *, uint32_t)
+{
+	g_begin_capture++;
+	return true;
+}
+
+void obs_output_set_last_error(obs_output_t *, const char *message)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_signals_mutex);
+		g_last_error = message ? message : "";
+	}
+	if (g_stall_last_error) {
+		g_in_report_window.store(true, std::memory_order_relaxed);
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+}
+
+void obs_output_signal_stop(obs_output_t *, int code)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_signals_mutex);
+		g_signals.push_back({code, g_last_error, g_begin_capture});
+	}
+	if (g_on_signal)
+		g_on_signal();
+}
+
+void obs_register_output_s(const struct obs_output_info *, size_t) {}
+
+bool obs_encoder_get_extra_data(const obs_encoder_t *, uint8_t **, size_t *)
+{
+	return false;
+}
+
+const char *obs_encoder_get_codec(const obs_encoder_t *)
+{
+	return "h264";
+}
+
+// VideoInit reads coded size and CBR from the encoder. Any new libobs call in
+// src/moq-output.cpp needs a stub here or `just obs ci` fails at link.
+obs_data_t *obs_encoder_get_settings(const obs_encoder_t *)
+{
+	return reinterpret_cast<obs_data_t *>(0x4);
+}
+
+uint32_t obs_encoder_get_width(const obs_encoder_t *)
+{
+	return 1920;
+}
+
+uint32_t obs_encoder_get_height(const obs_encoder_t *)
+{
+	return 1080;
+}
+
+const char *obs_data_get_string(obs_data_t *, const char *)
+{
+	return g_rate_control.c_str();
+}
+
+long long obs_data_get_int(obs_data_t *, const char *)
+{
+	return 8000;
+}
+
+} // extern "C"
+
+namespace MoQSettings {
+bool BuildConfig(obs_data_t *, Config *out)
+{
+	*out = Config{};
+	return g_settings_ok;
+}
+} // namespace MoQSettings
+
+// ------------------------------------------------------------- libmoq stubs
+
+namespace {
+void (*g_on_status)(void *, int32_t) = nullptr;
+void *g_user_data = nullptr;
+std::atomic<int> g_next_handle{10};
+std::atomic<int> g_last_handle{0};
+std::atomic<int> g_closed_handle{0};
+// libmoq is allowed to deliver the terminal before connect returns. "inline" is
+// the defensive case (same thread); "thread" is what libmoq actually does, from
+// its runtime thread, which is the ordering signal_mutex has to handle.
+std::atomic<bool> g_connect_fires_terminal{false};
+std::atomic<bool> g_connect_fires_terminal_threaded{false};
+// When true, moq_session_stats fails even for the live handle (reconnect gap).
+std::atomic<bool> g_stats_offline{false};
+// When true, only RTT is marked valid (dock must omit the rest).
+std::atomic<bool> g_stats_partial{false};
+std::function<void()> g_during_snapshot;
+std::atomic<bool> g_connect_rejected{false};
+std::thread g_connect_terminal_thread;
+const char *g_error = "unauthorized";
+} // namespace
+
+extern "C" {
+
+const char *moq_error(void)
+{
+	return g_error;
+}
+
+int32_t moq_origin_create(void)
+{
+	return 1;
+}
+
+int32_t moq_origin_close(uint32_t)
+{
+	return 0;
+}
+
+int32_t moq_origin_create_broadcast(uint32_t, const char *, size_t)
+{
+	return 5;
+}
+
+int32_t moq_publish_announce(uint32_t, const moq_route *)
+{
+	return 0;
+}
+
+int32_t moq_publish_finish(uint32_t)
+{
+	return 0;
+}
+
+int32_t moq_publish_video(uint32_t, const moq_video_init *config)
+{
+	g_video_hint = config->hint;
+	return 7;
+}
+
+int32_t moq_publish_audio(uint32_t, const moq_audio_init *)
+{
+	return 7;
+}
+
+int32_t moq_publish_media_finish(uint32_t)
+{
+	return 0;
+}
+
+int32_t moq_publish_media_frame(uint32_t, const uint8_t *, uintptr_t, uint64_t)
+{
+	return 0;
+}
+
+int32_t moq_publish_media_cut(uint32_t)
+{
+	return 0;
+}
+
+int32_t moq_session_connect(const char *, size_t, const moq_client_config *, uint32_t, uint32_t,
+			    void (*on_status)(void *, int32_t), void *user_data)
+{
+	if (g_connect_rejected)
+		return -34;
+	g_on_status = on_status;
+	g_user_data = user_data;
+	int handle = g_next_handle++;
+	g_last_handle = handle;
+	if (g_connect_fires_terminal) {
+		g_on_status(g_user_data, -34);
+		g_on_status = nullptr;
+	} else if (g_connect_fires_terminal_threaded) {
+		auto cb = g_on_status;
+		auto ud = g_user_data;
+		g_on_status = nullptr;
+		// One connect per test with this flag set: reset() joins between tests, and
+		// moving onto a still-joinable thread would call std::terminate. Joining
+		// here instead would deadlock, since Start() holds signal_mutex and the
+		// terminal callback needs it.
+		g_connect_terminal_thread = std::thread([cb, ud] { cb(ud, -34); });
+	}
+	return handle;
+}
+
+int32_t moq_session_close(uint32_t session)
+{
+	g_closed_handle = static_cast<int>(session);
+	return 0;
+}
+
+int32_t moq_session_stats(uint32_t session, moq_connection_stats *dst)
+{
+	if (!dst || static_cast<int>(session) != g_last_handle.load())
+		return -1;
+	if (g_stats_offline.load())
+		return -2;
+
+	*dst = {};
+	dst->rtt_us = 12500;
+	dst->rtt_valid = true;
+	if (g_stats_partial.load())
+		return 0;
+
+	dst->estimated_send_rate_bps = 2'500'000;
+	dst->estimated_send_rate_valid = true;
+	dst->estimated_recv_rate_bps = 120'000;
+	dst->estimated_recv_rate_valid = true;
+	dst->bytes_sent = 4'000'000;
+	dst->bytes_sent_valid = true;
+	dst->packets_sent = 100;
+	dst->packets_sent_valid = true;
+	dst->packets_lost = 1;
+	dst->packets_lost_valid = true;
+	return 0;
+}
+
+int32_t moq_session_snapshot(uint32_t session, moq_connection_snapshot *dst)
+{
+	const int32_t rc = moq_session_stats(session, &dst->stats);
+	if (rc != 0)
+		return rc;
+	static const char protocol[] = "moq-lite-04";
+	dst->protocol = {protocol, sizeof(protocol) - 1};
+	if (g_during_snapshot)
+		g_during_snapshot();
+	return 0;
+}
+
+} // extern "C"
+
+// -------------------------------------------------------------------- tests
+
+#include "moq-output.h"
+
+namespace {
+int g_failures = 0;
+
+// Spin until `ready`, giving up after a few seconds. A test that hangs reports
+// nothing; one that fails names the assertion.
+bool spinUntil(const std::atomic<bool> &ready)
+{
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!ready.load(std::memory_order_relaxed)) {
+		if (std::chrono::steady_clock::now() > deadline)
+			return false;
+		std::this_thread::yield();
+	}
+	return true;
+}
+
+// Indexing directly turns a missing signal into a segfault, which hides which
+// assertion actually regressed.
+RecordedSignal signalAt(size_t i)
+{
+	std::lock_guard<std::mutex> lock(g_signals_mutex);
+	return i < g_signals.size() ? g_signals[i] : RecordedSignal{INT_MIN, "<no signal>", -1};
+}
+
+size_t signalCount()
+{
+	std::lock_guard<std::mutex> lock(g_signals_mutex);
+	return g_signals.size();
+}
+
+std::vector<RecordedSignal> signalsSince(size_t from)
+{
+	std::lock_guard<std::mutex> lock(g_signals_mutex);
+	return {g_signals.begin() + static_cast<long>(from), g_signals.end()};
+}
+
+void fire(int code)
+{
+	auto cb = g_on_status;
+	auto ud = g_user_data;
+	if (!cb) {
+		fprintf(stderr, "FAIL: no status callback registered\n");
+		g_failures++;
+		return;
+	}
+	if (code <= 0)
+		g_on_status = nullptr;
+	cb(ud, code);
+}
+
+void reset()
+{
+	if (g_connect_terminal_thread.joinable())
+		g_connect_terminal_thread.join();
+	{
+		std::lock_guard<std::mutex> lock(g_signals_mutex);
+		g_signals.clear();
+		g_last_error.clear();
+	}
+	g_on_signal = nullptr;
+	g_on_status = nullptr;
+	g_closed_handle = 0;
+	g_begin_capture = 0;
+	g_settings_ok = true;
+	g_rate_control = "CBR";
+	g_video_hint = {};
+	g_start_gate = nullptr;
+	g_connect_fires_terminal = false;
+	g_connect_fires_terminal_threaded = false;
+	g_stats_offline = false;
+	g_stats_partial = false;
+	g_during_snapshot = nullptr;
+	g_connect_rejected = false;
+	g_stall_last_error = false;
+	g_in_report_window = false;
+}
+} // namespace
+
+#define CHECK(cond)                                                                 \
+	do {                                                                        \
+		if (!(cond)) {                                                      \
+			fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+			g_failures++;                                               \
+		}                                                                   \
+	} while (0)
+
+int main()
+{
+	auto out = reinterpret_cast<obs_output_t *>(0x9);
+	for (const char *mode : {"CBR", "CRF", "CQP", "VBR", ""}) {
+		reset();
+		g_rate_control = mode;
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		fire(1);
+		encoder_packet packet{};
+		packet.type = OBS_ENCODER_VIDEO;
+		packet.encoder = reinterpret_cast<obs_encoder_t *>(0x2);
+		packet.timebase_num = 1;
+		packet.timebase_den = 30;
+		o.Data(&packet);
+		CHECK(g_video_hint.has_coded);
+		CHECK(g_video_hint.has_bitrate == (g_rate_control == "CBR"));
+		if (g_video_hint.has_bitrate)
+			CHECK(g_video_hint.bitrate == 8'000'000);
+		o.Stop();
+		fire(0);
+	}
+	printf("only CBR publishes configured bitrate hints: ok\n");
+
+	// Invalid advanced settings stop before a session or capture is created.
+	{
+		reset();
+		g_settings_ok = false;
+		MoQOutput o(nullptr, out);
+		CHECK(!o.Start());
+		CHECK(g_on_status == nullptr);
+		CHECK(g_begin_capture == 0);
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+	}
+	printf("invalid advanced settings: ok\n");
+
+	// A synchronous connect rejection creates no callback to supply the error later.
+	{
+		reset();
+		g_connect_rejected = true;
+		MoQOutput o(nullptr, out);
+		CHECK(!o.Start());
+		CHECK(g_on_status == nullptr);
+		CHECK(g_begin_capture == 0);
+		CHECK(g_last_error == "unauthorized");
+	}
+	printf("synchronous connect error preserved: ok\n");
+
+	// Reconnection gave up after the session had been up: OBS must be told, with
+	// the libmoq reason attached, so it stops reporting a live stream.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		fire(1);
+		fire(-34);
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_DISCONNECTED);
+		CHECK(signalAt(0).last_error == "unauthorized");
+	}
+	printf("fatal after connect: ok\n");
+
+	// Never reached the server, so OBS should not retry the endpoint.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		fire(-34);
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+	}
+	printf("fatal before connect: ok\n");
+
+	// A clean close is the expected end of a stopped output, not a failure.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		fire(1);
+		o.Stop(false);
+		fire(0);
+		CHECK(signalCount() == 0);
+	}
+	printf("clean close: ok\n");
+
+	// A terminal belonging to an attempt that has already been torn down must
+	// not stop the stream that replaced it.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		auto stale_cb = g_on_status;
+		auto stale_ud = g_user_data;
+		o.Stop(false);
+		CHECK(o.Start());
+		stale_cb(stale_ud, -34);
+		CHECK(signalCount() == 0);
+		int live = g_last_handle;
+		g_closed_handle = 0;
+		o.Stop(false);
+		CHECK(g_closed_handle == live);
+		fire(0);
+	}
+	printf("superseded terminal ignored: ok\n");
+
+	// The terminal can beat moq_session_connect's return. Start() must refuse
+	// rather than capture into a session that is already gone, and the dead
+	// handle must never be closed.
+	{
+		reset();
+		g_connect_fires_terminal = true;
+		MoQOutput o(nullptr, out);
+		CHECK(!o.Start());
+		CHECK(g_begin_capture == 0);
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+		g_closed_handle = 0;
+		o.Stop(false);
+		CHECK(g_closed_handle == 0);
+	}
+	printf("terminal before connect returns: ok\n");
+
+	// A frontend that stops the output straight from the stop signal re-enters
+	// Stop() on the libmoq thread. It must not deadlock against the session state lock.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		bool reentered = false;
+		g_on_signal = [&o, &reentered] {
+			if (reentered)
+				return;
+			reentered = true;
+			o.Stop(true);
+		};
+		CHECK(o.Start());
+		fire(1);
+		fire(-34);
+		CHECK(signalCount() == 2);
+		CHECK(signalAt(0).code == OBS_OUTPUT_DISCONNECTED);
+		CHECK(signalAt(1).code == OBS_OUTPUT_SUCCESS);
+	}
+	printf("re-entrant Stop from the signal: ok\n");
+
+	// Teardown must not wait on the libmoq runtime at all. The callback holds its
+	// own reference to the shared state, so a terminal parked past any bound the
+	// destructor could have afforded lands on state that is still there.
+	{
+		reset();
+		auto o = new MoQOutput(nullptr, out);
+		CHECK(o->Start());
+		fire(1);
+		auto cb = g_on_status;
+		auto ud = g_user_data;
+		g_on_status = nullptr;
+
+		// Stands in for a libmoq runtime wedged for longer than teardown could ever
+		// wait: the terminal is not delivered until after the output is gone.
+		std::atomic<bool> parked{false};
+		std::atomic<bool> released{false};
+		std::thread late([cb, ud, &parked, &released] {
+			parked = true;
+			if (!spinUntil(released))
+				return;
+			cb(ud, -34);
+		});
+		CHECK(spinUntil(parked));
+
+		auto start = std::chrono::steady_clock::now();
+		delete o;
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		released = true;
+		late.join();
+
+		// Teardown used to block for a two-second bound and then free the output
+		// anyway, leaving this terminal to write through a dangling pointer.
+		CHECK(elapsed < std::chrono::milliseconds(500));
+		// The output is detached, so the terminal reports nothing; the only signal
+		// is the destructor's own stop.
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_SUCCESS);
+	}
+	printf("terminal held past destruction: ok\n");
+
+	// Teardown starting while a callback is already inside an OBS call. Detaching
+	// has to wait for that call to return, or the output is freed under it.
+	{
+		reset();
+		g_stall_last_error = true;
+		auto o = new MoQOutput(nullptr, out);
+		CHECK(o->Start());
+		fire(1); // connected, so the terminal reports a disconnect
+		auto cb = g_on_status;
+		auto ud = g_user_data;
+		g_on_status = nullptr;
+
+		std::thread terminal([cb, ud] { cb(ud, -34); });
+		CHECK(spinUntil(g_in_report_window));
+		delete o;
+		terminal.join();
+
+		CHECK(signalCount() == 2);
+		CHECK(signalAt(0).code == OBS_OUTPUT_DISCONNECTED);
+		CHECK(signalAt(1).code == OBS_OUTPUT_SUCCESS);
+	}
+	printf("teardown during an OBS call: ok\n");
+
+	// Superseded attempts whose terminals are still parked when the output is
+	// destroyed. Each keeps the shared state alive on its own, so releasing them
+	// after teardown, in any order, reaches nothing that is gone.
+	{
+		reset();
+		auto o = new MoQOutput(nullptr, out);
+		std::vector<std::pair<void (*)(void *, int32_t), void *>> parked;
+		for (int i = 0; i < 3; i++) {
+			CHECK(o->Start());
+			CHECK(g_on_status != nullptr);
+			parked.push_back({g_on_status, g_user_data});
+			g_on_status = nullptr;
+			o->Stop(false); // supersedes the attempt without delivering its terminal
+		}
+		delete o;
+		for (auto &[cb, ud] : parked)
+			cb(ud, -34);
+		// One SUCCESS from the destructor's own Stop(). Every parked terminal is
+		// superseded, so none of them reports.
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_SUCCESS);
+	}
+	printf("superseded terminals outliving the output: ok\n");
+
+	// A startup that failed on the libmoq thread, with the output destroyed before
+	// the terminal has run. Whichever order they land in, nothing reports after
+	// the destructor's stop.
+	{
+		reset();
+		g_connect_fires_terminal_threaded = true;
+		auto o = new MoQOutput(nullptr, out);
+		o->Start(); // races the terminal, so either answer is legitimate
+		delete o;
+		if (g_connect_terminal_thread.joinable())
+			g_connect_terminal_thread.join();
+		CHECK(signalCount() >= 1);
+		CHECK(signalAt(signalCount() - 1).code == OBS_OUTPUT_SUCCESS);
+	}
+	printf("failed startup outliving the output: ok\n");
+
+	// OBS restarts a reconnecting output by calling start again with no stop in
+	// between, so Start() has to drop the previous attempt itself.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		fire(1);
+		fire(-34);
+		CHECK(signalCount() == 1);
+		g_closed_handle = 0;
+		CHECK(o.Start());
+		CHECK(g_closed_handle == 0); // the dead handle is retired, not closed
+		fire(-34);
+		CHECK(signalCount() == 2);
+		CHECK(signalAt(1).code == OBS_OUTPUT_CONNECT_FAILED);
+	}
+	printf("OBS-driven restart: ok\n");
+
+	// libmoq delivers the terminal on its own thread while Start() is still
+	// committing. It must not report against a half-started output: signal_mutex
+	// parks it until capture has begun, so OBS sees a started-then-stopped output
+	// rather than an active one with no session.
+	{
+		reset();
+		g_connect_fires_terminal_threaded = true;
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		if (g_connect_terminal_thread.joinable())
+			g_connect_terminal_thread.join();
+		// Capture began before the report, so OBS's normal stop path applies.
+		// The report must land after capture began, so OBS sees an active output and
+		// runs its normal stop path instead of one that was never committed.
+		CHECK(signalAt(0).begin_capture_at == 1);
+		CHECK(signalCount() == 1);
+		CHECK(signalAt(0).code == OBS_OUTPUT_CONNECT_FAILED);
+		CHECK(signalAt(0).last_error == "unauthorized");
+	}
+	printf("terminal during startup commit: ok\n");
+
+	// A terminal racing a user-initiated Stop must not report afterwards: OBS
+	// turns a late OBS_OUTPUT_DISCONNECTED into a reconnect of a stopped stream,
+	// because obs_output_signal_stop never checks whether the output is active.
+	{
+		reset();
+		g_stall_last_error = true;
+		const int rounds = 50;
+		int reconnect_after_stop = 0;
+		for (int i = 0; i < rounds; i++) {
+			MoQOutput o(nullptr, out);
+			CHECK(o.Start());
+			fire(1); // connected, so a failure would ask OBS to reconnect
+			auto cb = g_on_status;
+			auto ud = g_user_data;
+			if (!cb)
+				break;
+			g_on_status = nullptr;
+
+			size_t before = signalCount();
+			g_in_report_window = false;
+			std::thread terminal([cb, ud] { cb(ud, -34); });
+
+			// Wait until the callback has committed to reporting a failure and is
+			// sitting in the window, then stop from underneath it.
+			CHECK(spinUntil(g_in_report_window));
+			o.Stop(true); // the user pressed stop
+			terminal.join();
+
+			// Whatever the interleaving, a DISCONNECTED must never follow the
+			// SUCCESS that reported the user's stop.
+			bool stopped = false;
+			for (const auto &s : signalsSince(before)) {
+				if (s.code == OBS_OUTPUT_SUCCESS)
+					stopped = true;
+				else if (stopped && s.code == OBS_OUTPUT_DISCONNECTED)
+					reconnect_after_stop++;
+			}
+		}
+		CHECK(reconnect_after_stop == 0);
+		printf("terminal racing user Stop: ok (%d late reconnect signals over %d rounds)\n",
+		       reconnect_after_stop, rounds);
+	}
+
+	// The dock reads the connect time as the live "connected" indicator, so it
+	// must not outlive the attempt it describes.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		CHECK(o.GetConnectTime() == 0);
+		fire(1);
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		fire(2); // a reconnect epoch, so the elapsed time is non-zero
+		CHECK(o.GetConnectTime() > 0);
+		fire(-34);
+		CHECK(o.GetConnectTime() == 0);
+		CHECK(o.Start());
+		CHECK(o.GetConnectTime() == 0);
+		fire(1);
+		o.Stop(false);
+		CHECK(o.GetConnectTime() == 0);
+		fire(0);
+	}
+	printf("connect time cleared on teardown: ok\n");
+
+	// Dock polls TryGetConnectionStats once a second. Cover reconnect epochs,
+	// exact field mapping, partial validity, and the offline gap mid-reconnect.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		MoQOutput::ConnectionStats stats;
+
+		CHECK(!o.TryGetConnectionStats(&stats));
+		CHECK(o.GetReconnectCount() == 0);
+
+		CHECK(o.Start());
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.rtt_valid);
+		CHECK(stats.rtt_ms > 12.4 && stats.rtt_ms < 12.6);
+		CHECK(stats.estimated_send_rate_valid);
+		CHECK(stats.estimated_send_rate_bps == 2'500'000.0);
+		CHECK(stats.estimated_recv_rate_valid);
+		CHECK(stats.estimated_recv_rate_bps == 120'000.0);
+		CHECK(stats.bytes_sent_valid);
+		CHECK(stats.bytes_sent == 4'000'000ULL);
+		CHECK(stats.loss_valid);
+		CHECK(stats.loss_pct > 0.9 && stats.loss_pct < 1.1);
+		CHECK(stats.reconnects == 0);
+		CHECK(stats.protocol == "moq-lite-04");
+		CHECK(o.GetReconnectCount() == 0);
+
+		fire(1);
+		CHECK(o.GetReconnectCount() == 0);
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.reconnects == 0);
+
+		fire(2);
+		CHECK(o.GetReconnectCount() == 1);
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.reconnects == 1);
+
+		fire(5);
+		CHECK(o.GetReconnectCount() == 4);
+
+		g_stats_offline = true;
+		CHECK(!o.TryGetConnectionStats(&stats));
+		CHECK(o.GetReconnectCount() == 4);
+		g_stats_offline = false;
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.reconnects == 4);
+
+		g_stats_partial = true;
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.rtt_valid);
+		CHECK(!stats.estimated_send_rate_valid);
+		CHECK(!stats.estimated_recv_rate_valid);
+		CHECK(!stats.bytes_sent_valid);
+		CHECK(!stats.loss_valid);
+		CHECK(stats.reconnects == 4);
+		g_stats_partial = false;
+
+		o.Stop(false);
+		fire(0);
+		CHECK(o.GetReconnectCount() == 0);
+		CHECK(!o.TryGetConnectionStats(&stats));
+	}
+	printf("connection stats snapshot: ok\n");
+
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		MoQOutput::ConnectionStats stats;
+		CHECK(o.Start());
+		fire(1);
+		fire(3);
+		CHECK(o.GetReconnectCount() == 2);
+		fire(-34);
+		CHECK(o.GetReconnectCount() == 0);
+		CHECK(!o.TryGetConnectionStats(&stats));
+	}
+	printf("reconnect count cleared on fatal: ok\n");
+
+	// Restart between reading metrics and committing the snapshot. Reject it
+	// without overwriting the caller's last accepted sample.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		CHECK(o.Start());
+		MoQOutput::ConnectionStats stats;
+		stats.rtt_ms = 99;
+		stats.dial = "previous";
+		g_during_snapshot = [&] {
+			o.Stop(false);
+			fire(0);
+			CHECK(o.Start());
+		};
+		CHECK(!o.TryGetConnectionStats(&stats));
+		CHECK(stats.rtt_ms == 99);
+		CHECK(stats.dial == "previous");
+		g_during_snapshot = nullptr;
+		CHECK(o.TryGetConnectionStats(&stats));
+		CHECK(stats.rtt_ms == 12.5);
+		o.Stop(false);
+		fire(0);
+	}
+	printf("restart rejects uncommitted stats: ok\n");
+
+	// The terminal callback racing a user-initiated stop, repeatedly. Whichever
+	// wins, the failure signal fires at most once per Start().
+	{
+		reset();
+		const int rounds = 200;
+		for (int i = 0; i < rounds; i++) {
+			MoQOutput o(nullptr, out);
+			CHECK(o.Start());
+			auto cb = g_on_status;
+			auto ud = g_user_data;
+			if (!cb)
+				break;
+			g_on_status = nullptr;
+			std::thread terminal([cb, ud] { cb(ud, -34); });
+			o.Stop(false);
+			terminal.join();
+		}
+		size_t fatal = 0, success = 0;
+		for (const auto &s : signalsSince(0)) {
+			if (s.code == OBS_OUTPUT_SUCCESS)
+				success++;
+			else if (s.code == OBS_OUTPUT_DISCONNECTED || s.code == OBS_OUTPUT_CONNECT_FAILED)
+				fatal++;
+			else
+				CHECK(false);
+		}
+		// Exactly one SUCCESS per round from the destructor's Stop(), plus a fatal
+		// only where the terminal beat Stop() to the attempt.
+		CHECK(success == static_cast<size_t>(rounds));
+		CHECK(signalCount() == success + fatal);
+		printf("terminal racing Stop: ok (%zu of %d rounds signalled)\n", fatal, rounds);
+	}
+
+	// A stale terminal callback overlapping the next Start(), which rewrites the
+	// members the callback used to read. Exercises the interleaving; note it is
+	// not a proven detector, since the session state lock tends to order the two in
+	// practice even when nothing guarantees it.
+	{
+		reset();
+		MoQOutput o(nullptr, out);
+		std::atomic<bool> stranded{false};
+		for (int i = 0; i < 500; i++) {
+			CHECK(o.Start());
+			auto cb = g_on_status;
+			auto ud = g_user_data;
+			if (!cb)
+				break;
+			g_on_status = nullptr;
+			std::atomic<bool> gate{false};
+			std::thread stale([cb, ud, &gate, &stranded] {
+				// The gate opens from inside the next Start(); if that never
+				// happens, give up rather than hanging the run.
+				if (!spinUntil(gate)) {
+					stranded = true;
+					return;
+				}
+				cb(ud, -34);
+			});
+			o.Stop(false);
+			g_start_gate = &gate;
+			bool restarted = o.Start();
+			g_start_gate = nullptr;
+			stale.join();
+			CHECK(restarted);
+
+			auto live = g_on_status;
+			auto live_ud = g_user_data;
+			if (!live)
+				break;
+			g_on_status = nullptr;
+			o.Stop(false);
+			live(live_ud, 0);
+		}
+		CHECK(!stranded);
+	}
+	printf("stale terminal racing restart: ok\n");
+
+	if (g_failures) {
+		printf("\nFAILURES: %d\n", g_failures);
+		return 1;
+	}
+	printf("\nall passed\n");
+	return 0;
+}

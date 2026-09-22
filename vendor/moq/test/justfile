@@ -1,0 +1,146 @@
+#!/usr/bin/env just --justfile
+#
+# Tests that span more than one language. Per-language unit tests live in each
+# language's own justfile; this module aggregates them.
+#
+# Shebang recipes read their arguments as $1..$n.
+set positional-arguments
+
+# Two cross-language interop smoke tests exist:
+#   - https://github.com/moq-dev/smoke installs each client from its PUBLIC
+#     package registry to catch packaging breakage in a release.
+#   - `just test smoke` (smoke/, below) builds every client from THIS checkout
+#     to catch interop regressions before anything is published.
+# Fall back to the root justfile so `just js test` (etc.) resolve from here.
+
+set fallback
+set working-directory := '.'
+# `smoke` reads its args as `$1`/`$@`; the `positional-arguments` setting above
+# is what lets a shebang recipe see them.
+
+# The `check` sibling: same diff scoping, same BASE resolution, and what CI runs
+# after `just check`. Only js/rs/py appear here. The kt, swift, and go wrappers
+# build, regenerate bindings, and test in a single script, so their tests run as
+# part of `just check` and there is nothing left to dispatch.
+#
+# `just _changed` resolves through `set fallback` to the root justfile, which is
+# also where it runs, so the paths it prints stay repo-relative.
+#
+# BASE has to be passed as `just test default origin/dev`. This is a module, so
+# a bare `just test origin/dev` makes just look for a recipe by that name rather
+# than reaching the default recipe's parameter.
+
+# Run unit tests for what the branch changed since BASE, plus its dependents.
+default $BASE="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    files=$(just _changed "$BASE")
+
+    # Mirrors the root `check`: too long for argv means test everything instead.
+    if [[ "$files" == ALL ]]; then
+    	just all
+    	exit 0
+    fi
+
+    just _tools "$files"
+
+    # Mirrors the root `check`: the dispatch below lives in these two files and
+    # matches no language scope, so a change to either has to run everything or
+    # it goes untested.
+    if grep -qE '^(justfile|test/justfile)$' <<< "$files"; then
+    	echo "test: root orchestration changed; testing everything." >&2
+    	just all
+    	exit 0
+    fi
+
+    # An empty list means "force-run" to the per-lang recipes, which is the
+    # wrong semantic here, so don't dispatch at all.
+    if [[ -n "$files" ]]; then
+    	just js test "$files"
+    	just rs test-changed "$files"
+    	just py test "$files"
+    else
+    	echo "test: nothing changed."
+    fi
+
+# Run every language's unit tests, unscoped.
+all:
+    just js test
+    just rs test --workspace --exclude moq-net-fuzz
+    just py test
+
+# Cross-language media interop smoke test, built from this checkout. Stands up a
+# relay and runs the publisher x subscriber matrix. Default: rust only (fast
+# sanity check). `smoke --all` runs the full matrix: rust + python + go +
+# browser publish; everyone subscribes (incl. native node/bun JS, the C libmoq
+# client, and the GStreamer moqsrc plugin). --timeout 30 gives headless Chromium
+# cold-start headroom. Other flags pass through, e.g.
+# `just test smoke --publishers rust,python --subscribers rust,c`.
+smoke *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "${1:-}" == --all ]]; then
+        shift
+        ./smoke/smoke.sh --publishers rust,python,go,js --subscribers rust,python,go,js,js-native-node,js-native-bun,c,gst --timeout 30 "$@"
+    else
+        ./smoke/smoke.sh "$@"
+    fi
+
+# Negative control: no publisher, every subscriber must time out (proves the
+
+# harness can actually report failure).
+smoke-negative *args:
+    ./smoke/smoke.sh --negative {{ args }}
+
+# Browser-to-browser media QA against a deterministic fixture: presented frame progress, audible
+# tone, audio/video skew, and the publication lifecycle (cold start, pause, rejoin, detach,
+# republish, late join). Ends with negative controls that inject a frozen picture, silence, a
+# shifted tone, and a leaked session; each must fail the assertion it names. --timeout 30 gives
+
+# headless Chromium cold-start headroom.
+smoke-media *args:
+    ./smoke/smoke.sh --media --timeout 30 {{ args }}
+
+# Disrupts a real relay over real QUIC three ways: cancel a stalled reader, kill
+# the relay mid-group, and republish an interrupted publisher's name. Ordinary
+# tests, so `just test` runs them whenever moq-relay is selected; this is the
+# focused loop. Takes a filter, e.g. `just test drill relay_killed`. Includes the
+# no-publisher negative control. See drill/README.md.
+
+# Transport and lifecycle failure drills.
+drill *args:
+    just rs test -p moq-relay --test drills {{ args }}
+
+# Removes one recovery behavior at a time in a disposable copy of the tree and
+# requires the drill covering it to fail, for the reason the mutation names. The
+# checkout is never modified. `--list` shows the mutations.
+
+# Prove the drills fail without the fixes they cover.
+drill-sensitivity *args:
+    ./drill/sensitivity.sh {{ args }}
+
+# Round-trips a PCR-paced TS through a relay and checks the subscriber's `export
+# ts` output with TSDuck plus a custom analyzer (PCR jitter/repetition,
+# burstiness, instantaneous bitrate, T-STD). Flags: `--analyze-only file.ts`
+# (skip the round-trip), `--strict` (fail on shape warnings), `--source file.ts`
+# (use a real capture), `--live` (grade PCR release timing and byte position off
+# the pipe instead, which a capture cannot carry; nightly runs this arm). See
+# ts/README.md.
+
+# Check the subscriber's MPEG-TS output for IRD compliance.
+ts *args:
+    ./ts/run.sh {{ args }}
+
+# Round-trip the EIT fixtures: the sparse schedule must survive and
+# pending-version sections must be dropped at import.
+ts-eit *args:
+    ./ts/eit-roundtrip.sh {{ args }}
+
+# Runs the @moq/wasm bindings in headless Chromium against a real relay, one per
+# protocol flavour. The crate is `#![cfg(target_arch = "wasm32")]`, so nothing in
+# `just check` or `just rs wasm` gets past compiling it. See wasm/README.md.
+
+# Browser coverage for the @moq/wasm bindings.
+wasm *args:
+    ./wasm/run.sh {{ args }}

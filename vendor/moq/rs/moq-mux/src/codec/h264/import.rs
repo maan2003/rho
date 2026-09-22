@@ -1,0 +1,519 @@
+//! H.264 importer.
+//!
+//! [`Import`] publishes already-split H.264 frames on a single moq track and
+//! resolves the catalog rendition. It is a pure frame publisher: byte parsing
+//! and framing live in [`Split`](super::Split), and whoever drives the import owns the split.
+//! Frames arrive via [`decode`](Import::decode).
+//!
+//! The codec config comes from exactly one of two places: an avcC handed to
+//! [`initialize`](Import::initialize) (the "avc1" shape), or the SPS the splitter
+//! packages into the first keyframe (the "avc3" shape, scanned out of the frame
+//! here). A keyframe that can't be configured from either is an error;
+//! non-keyframes before the first config are tolerated (mid-stream joins).
+
+use bytes::Bytes;
+
+use super::{Error, NAL_TYPE_SPS, Sps};
+use crate::Result;
+use crate::catalog::hang::CatalogExt;
+use crate::codec::annexb::NalIterator;
+use crate::container::Frame;
+
+/// H.264 importer: a pure frame publisher that resolves the catalog rendition.
+///
+/// Build it with [`new`](Self::new), passing the track producer and the
+/// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from.
+/// Feed it frames a [`Split`](super::Split) produced via [`decode`](Self::decode).
+/// The catalog rendition fills in lazily once the codec config is known (avcC via
+/// [`initialize`](Self::initialize) for avc1, the first SPS for avc3).
+pub struct Import {
+	/// True for the avc1 shape: the codec config is out-of-band (avcC), so
+	/// keyframes are not scanned for an inline SPS.
+	avc1: bool,
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
+	catalog: crate::codec::video::Catalog,
+	last_sps: Option<Bytes>,
+}
+
+impl Import {
+	/// Publish on an existing track producer, seeding the rendition from `hint` (pass
+	/// [`VideoHint::default`](crate::catalog::VideoHint) for none).
+	///
+	/// A hint carrying a codec publishes the catalog rendition up front (the SPS/PPS still refine it
+	/// in band on the first keyframe), so subscribers see the track without waiting for that frame.
+	pub fn new<E: CatalogExt>(
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		hint: crate::catalog::VideoHint,
+	) -> crate::Result<Self> {
+		// The hint names the container; the writer is built from that same value so the wire
+		// cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
+		let catalog = crate::codec::video::Catalog::new(hint);
+		let track = reserved.video(track, wire, None)?;
+		let mut import = Self {
+			avc1: false,
+			track,
+			catalog,
+			last_sps: None,
+		};
+		if let Some(config) = import.catalog.initial_config() {
+			import.apply_config(config)?;
+		}
+		Ok(import)
+	}
+
+	/// Resolve the codec config from the codec's leading bytes.
+	///
+	/// - **avc1** (no leading start code): parsed as an `AVCDecoderConfigurationRecord`,
+	///   which resolves the config and is stored as the catalog `description`. Required
+	///   for avc1.
+	/// - **avc3** (leading start code): parsed as Annex-B; any SPS resolves the config.
+	///   Optional, since avc3 also self-initializes from the first keyframe.
+	///
+	/// Takes a read-only slice: the dispatcher-owned [`Split`](super::Split) is what
+	/// consumes the stream (and reads the same avcC for the NALU length size). The
+	/// shape is detected from the leading bytes.
+	pub fn initialize(&mut self, buf: &[u8]) -> Result<()> {
+		if crate::codec::annexb::is_config_record(buf) {
+			self.initialize_avc1(buf)
+		} else {
+			self.initialize_avc3(buf)
+		}
+	}
+
+	fn initialize_avc1(&mut self, avcc_bytes: &[u8]) -> Result<()> {
+		// Only switch to avc1 mode once the avcC actually parses, so a parse failure leaves the
+		// importer in avc3 mode where inline-SPS keyframes still self-initialize.
+		let config = config_from_avcc(avcc_bytes)?;
+		self.avc1 = true;
+		self.apply_config(config)?;
+		Ok(())
+	}
+
+	fn initialize_avc3(&mut self, data: &[u8]) -> Result<()> {
+		// Resolve the config from any SPS in the seed buffer. Scan a clone so the
+		// caller's buffer is left intact for the splitter to consume.
+		let mut scan = Bytes::copy_from_slice(data);
+		let mut nals = NalIterator::new(&mut scan);
+		while let Some(nal) = nals.next().transpose()? {
+			if is_sps(&nal) {
+				self.configure_from_sps(&nal)?;
+			}
+		}
+		if let Some(nal) = nals.flush()?
+			&& is_sps(&nal)
+		{
+			self.configure_from_sps(&nal)?;
+		}
+		Ok(())
+	}
+
+	/// The MoQ track name this importer publishes on.
+	pub fn name(&self) -> &str {
+		self.track.name()
+	}
+
+	/// A watch-only handle to this track's subscriber demand.
+	pub fn demand(&self) -> moq_net::track::Demand {
+		self.track.track().demand()
+	}
+
+	/// Finish the track, flushing any buffered data.
+	pub fn finish(&mut self) -> Result<()> {
+		self.track.finish()?;
+		Ok(())
+	}
+
+	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
+	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes this importer.
+	pub fn abort(self, err: moq_net::Error) {
+		self.track.abort(err);
+	}
+
+	/// Cut the current group at `end` without finishing the track.
+	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
+		self.track.cut(end)?;
+		Ok(())
+	}
+
+	/// Mark a break in the timeline by publishing a marker group. To bound the closing
+	/// group's final frame first, [`cut(end)`](Self::cut) before this. See
+	/// [`Producer::discontinuity`](crate::container::Producer::discontinuity).
+	pub fn discontinuity(&mut self) -> Result<()> {
+		self.track.discontinuity()?;
+		Ok(())
+	}
+
+	/// Close the current group and open the next one at `sequence`.
+	pub fn seek(&mut self, sequence: u64) -> Result<()> {
+		self.track.seek(sequence)?;
+		Ok(())
+	}
+
+	/// Record a frame's reorder delay (`PTS - DTS`) so the catalog `jitter` reflects the
+	/// B-frame reorder depth (the decode buffer a transmuxer/player must hold). The
+	/// container supplies this since the elementary stream alone carries no decode time.
+	pub fn observe_reorder(&mut self, reorder: moq_net::Timestamp) -> crate::Result<()> {
+		self.track.reorder(reorder);
+		Ok(())
+	}
+
+	/// Resolve the avc3 config from an inline SPS, updating it in place.
+	///
+	/// avc3 carries SPS inline, so a resolution change just updates the config
+	/// (no new init segment, unlike avc1).
+	fn configure_from_sps(&mut self, sps_nal: &Bytes) -> Result<()> {
+		if self.last_sps.as_ref() == Some(sps_nal) {
+			return Ok(());
+		}
+		let config = config_from_sps(sps_nal)?;
+		self.last_sps = Some(sps_nal.clone());
+		self.apply_config(config)?;
+		Ok(())
+	}
+
+	/// Apply a resolved config, updating the catalog rendition in place.
+	///
+	/// A changed config (new avcC, or a new inline SPS) just re-mirrors the
+	/// rendition; there are no fixed tracks to reject a reconfiguration.
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.track, config)
+	}
+
+	/// Write split frames to the track, resolving the avc3 config from the first
+	/// keyframe's inline SPS and refining the catalog jitter as it goes.
+	fn write_frames(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
+		for frame in frames {
+			// avc1 config arrives out-of-band via initialize(); avc3 carries SPS
+			// inline on keyframes.
+			if !self.avc1
+				&& frame.keyframe
+				&& let Some(sps) = find_sps(&frame.payload)
+			{
+				self.configure_from_sps(&sps)?;
+			}
+
+			if !self.catalog.configured() {
+				// A keyframe we still can't configure is undecodable, so bail
+				// loudly. A non-keyframe before config is a mid-stream-join
+				// leftover: write it through, and the producer reports
+				// MissingKeyframe (which a mid-stream join skips).
+				if frame.keyframe {
+					return Err(Error::NotInitialized.into());
+				}
+			}
+
+			self.track.write(frame)?;
+			let demand = self.track.track().is_used();
+			self.catalog.on_frame(&mut self.track, demand)?;
+		}
+		Ok(())
+	}
+
+	/// Publish split frames, resolving the avc3 config from the first keyframe's
+	/// inline SPS and refining the catalog jitter as it goes.
+	pub fn decode(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
+		self.write_frames(frames)
+	}
+
+	/// Re-evaluate stall from source silence.
+	pub fn tick(&mut self) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.tick(&mut self.track, demand)
+	}
+
+	/// The source is gone; this rendition is never stalled while idle.
+	pub fn idle(&mut self) -> crate::Result<()> {
+		self.catalog.idle(&mut self.track)
+	}
+
+	/// Record the encode duration before publishing its frames so the catalog can report a stall.
+	pub fn observe_lag(&mut self, lag: std::time::Duration) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.observe_lag(&mut self.track, demand, lag)
+	}
+}
+
+/// The catalog config a stream's codec bytes describe, resolved without publishing anything: an
+/// `AVCDecoderConfigurationRecord` (the avc1 shape) or Annex-B carrying an inline SPS (avc3).
+///
+/// The video counterpart of [`opus::config`](crate::codec::opus::config), for a caller holding the
+/// bytes but no track: a publisher that wants its catalog rendition to say what its encoder really
+/// emits reads it out of one encoded keyframe rather than guessing.
+pub fn config(buf: &[u8]) -> Result<hang::catalog::VideoConfig> {
+	if crate::codec::annexb::is_config_record(buf) {
+		return config_from_avcc(buf);
+	}
+	let sps = find_sps(buf).ok_or(Error::NotInitialized)?;
+	config_from_sps(&sps)
+}
+
+/// The config an `AVCDecoderConfigurationRecord` describes, stored verbatim as the `description`
+/// (`inline: false`, the avc1 shape).
+fn config_from_avcc(avcc_bytes: &[u8]) -> Result<hang::catalog::VideoConfig> {
+	let avcc = super::Avcc::parse(avcc_bytes)?;
+
+	let mut config = hang::catalog::VideoConfig::new(hang::catalog::H264 {
+		profile: avcc.profile,
+		constraints: avcc.constraints,
+		level: avcc.level,
+		inline: false,
+	});
+	config.coded_width = avcc.coded_width;
+	config.coded_height = avcc.coded_height;
+	config.description = Some(Bytes::copy_from_slice(avcc_bytes));
+	Ok(config)
+}
+
+/// The config an inline SPS describes (`inline: true`, the avc3 shape). No `description`: the
+/// parameter sets ride with every keyframe.
+fn config_from_sps(sps_nal: &[u8]) -> Result<hang::catalog::VideoConfig> {
+	let sps = Sps::parse(sps_nal)?;
+
+	let mut config = hang::catalog::VideoConfig::new(hang::catalog::H264 {
+		profile: sps.profile,
+		constraints: sps.constraints,
+		level: sps.level,
+		inline: true,
+	});
+	config.coded_width = Some(sps.coded_width);
+	config.coded_height = Some(sps.coded_height);
+	Ok(config)
+}
+
+fn is_sps(nal: &[u8]) -> bool {
+	nal.first().is_some_and(|h| h & 0x1f == NAL_TYPE_SPS)
+}
+
+/// Find the first SPS NAL in an Annex-B payload, if any.
+fn find_sps(payload: &[u8]) -> Option<Bytes> {
+	let mut buf = Bytes::copy_from_slice(payload);
+	let mut nals = NalIterator::new(&mut buf);
+	while let Some(Ok(nal)) = nals.next() {
+		if is_sps(&nal) {
+			return Some(nal);
+		}
+	}
+	nals.flush().ok().flatten().filter(|nal| is_sps(nal))
+}
+
+#[cfg(test)]
+mod tests {
+	use bytes::BytesMut;
+
+	use super::*;
+	use crate::codec::h264::Split;
+
+	fn setup(name: &str) -> (moq_net::track::Producer, crate::catalog::Producer) {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track(name, hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		(track, catalog)
+	}
+
+	/// An avcC initializer resolves a config with the avcC stored as `description`.
+	#[tokio::test(start_paused = true)]
+	async fn initialize_avc1_lands_in_catalog() {
+		let sps_nal = [0x67, 0x42, 0xc0, 0x1f];
+		let mut avcc = vec![0x01, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0x00, sps_nal.len() as u8];
+		avcc.extend_from_slice(&sps_nal);
+		avcc.extend_from_slice(&[0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80]); // num_pps + pps
+
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		// initialize() must not consume the buffer (the split owns the consume).
+		let buf = bytes::BytesMut::from(avcc.as_slice());
+		import.initialize(&buf).expect("initialize avc1");
+		assert_eq!(buf.len(), avcc.len(), "initialize must not consume the buffer");
+
+		let snapshot = catalog.snapshot();
+		let cfg = snapshot.video.renditions.get("video").expect("rendition");
+		let hang::catalog::VideoCodec::H264(h264) = &cfg.codec else {
+			panic!("expected H.264 codec")
+		};
+		assert!(!h264.inline, "avc1 source should land as inline=false");
+		assert_eq!(h264.profile, 0x42);
+		assert_eq!(h264.level, 0x1f);
+		assert_eq!(cfg.description.as_ref().expect("description").as_ref(), avcc.as_slice());
+	}
+
+	/// An avc3 stream self-initializes: the config is resolved from the SPS the
+	/// splitter packages into the first keyframe.
+	#[tokio::test(start_paused = true)]
+	async fn avc3_self_initializes_from_first_keyframe() {
+		let sps: &[u8] = &[
+			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+			0x01, 0xd4, 0xc0, 0x80,
+		];
+		let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+
+		let mut annexb = BytesMut::new();
+		for nal in [sps, pps, idr] {
+			annexb.extend_from_slice(&[0, 0, 0, 1]);
+			annexb.extend_from_slice(nal);
+		}
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		assert!(
+			catalog.snapshot().video.renditions.is_empty(),
+			"no config before any frame"
+		);
+
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+		frames.extend(split.flush(pts).expect("flush keyframe"));
+		import.decode(frames).expect("decode keyframe");
+
+		let snapshot = catalog.snapshot();
+		let h264_cfg = snapshot.video.renditions.get("video").expect("rendition");
+		let hang::catalog::VideoCodec::H264(h264) = &h264_cfg.codec else {
+			panic!("expected H.264 codec")
+		};
+		assert!(h264.inline, "avc3 source should land as inline=true");
+		assert!(h264_cfg.description.is_none(), "avc3 has no out-of-band description");
+		assert_eq!(h264.profile, sps[1]);
+		assert_eq!(h264.level, sps[3]);
+	}
+
+	/// Open-GOP broadcast H.264 (no IDR, random access via recovery-point SEI)
+	/// self-initializes: the splitter flags the recovery-point I-slice AU as a
+	/// keyframe, so the importer resolves the rendition from its inline SPS.
+	#[tokio::test(start_paused = true)]
+	async fn open_gop_self_initializes_from_recovery_point() {
+		let sps: &[u8] = &[
+			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+			0x01, 0xd4, 0xc0, 0x80,
+		];
+		let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+		// recovery-point SEI (payload type 6), then a non-IDR I-slice (type 1).
+		let sei: &[u8] = &[0x06, 0x06, 0x02, 0x00, 0x40, 0x80];
+		let islice: &[u8] = &[0x61, 0xe0, 0x12, 0x34];
+
+		let mut annexb = BytesMut::new();
+		for nal in [sei, sps, pps, islice] {
+			annexb.extend_from_slice(&[0, 0, 0, 1]);
+			annexb.extend_from_slice(nal);
+		}
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split open-GOP AU");
+		frames.extend(split.flush(pts).expect("flush open-GOP AU"));
+		import.decode(frames).expect("decode open-GOP AU");
+
+		let snapshot = catalog.snapshot();
+		let h264_cfg = snapshot
+			.video
+			.renditions
+			.get("video")
+			.expect("open-GOP stream must resolve a video rendition");
+		let hang::catalog::VideoCodec::H264(h264) = &h264_cfg.codec else {
+			panic!("expected H.264 codec")
+		};
+		assert!(h264.inline, "avc3 source should land as inline=true");
+		assert_eq!(h264.profile, sps[1]);
+		assert_eq!(h264.level, sps[3]);
+	}
+
+	/// A keyframe that carries no SPS (and no avcC/seed to fall back on) is
+	/// undecodable, so it's a hard error rather than an uncatalogued frame.
+	#[tokio::test(start_paused = true)]
+	async fn keyframe_without_sps_errors() {
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21]; // IDR slice, no inline SPS
+		let mut annexb = BytesMut::new();
+		annexb.extend_from_slice(&[0, 0, 0, 1]);
+		annexb.extend_from_slice(idr);
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+		frames.extend(split.flush(pts).expect("flush keyframe"));
+		let err = import
+			.decode(frames)
+			.expect_err("an unconfigurable keyframe must error");
+		assert!(matches!(err, crate::Error::H264(Error::NotInitialized)), "got {err:?}");
+	}
+
+	/// A non-keyframe before the first keyframe has no group to anchor it, so the
+	/// producer surfaces MissingKeyframe (which a mid-stream join skips). It must
+	/// not silently abort the import.
+	#[tokio::test(start_paused = true)]
+	async fn delta_before_init_reports_missing_keyframe() {
+		let pslice: &[u8] = &[0x61, 0xe0, 0x12, 0x34]; // non-IDR slice
+		let mut annexb = BytesMut::new();
+		annexb.extend_from_slice(&[0, 0, 0, 1]);
+		annexb.extend_from_slice(pslice);
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split delta");
+		frames.extend(split.flush(pts).expect("flush delta"));
+		let err = import
+			.decode(frames)
+			.expect_err("a delta before any keyframe must report MissingKeyframe");
+		assert!(matches!(err, crate::Error::MissingKeyframe(_)), "got {err:?}");
+		assert!(
+			catalog.snapshot().video.renditions.is_empty(),
+			"no config yet, so no catalog"
+		);
+	}
+
+	/// Encode lag past a few frame intervals marks the rendition stalled, and
+	/// releasing the source clears it. Demand is required; an idle import is not stalled.
+	#[tokio::test(start_paused = true)]
+	async fn encode_lag_marks_the_rendition_stalled() {
+		let sps: &[u8] = &[
+			0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe9, 0xb8, 0x08, 0x08, 0x0a, 0x00, 0x00, 0x07, 0xd0, 0x00,
+			0x01, 0xd4, 0xc0, 0x80,
+		];
+		let pps: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+		let mut annexb = BytesMut::new();
+		for nal in [sps, pps, idr] {
+			annexb.extend_from_slice(&[0, 0, 0, 1]);
+			annexb.extend_from_slice(nal);
+		}
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let _demand = track.subscribe(None);
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+		frames.extend(split.flush(pts).expect("flush keyframe"));
+		import.decode(frames).expect("decode keyframe");
+		assert_eq!(
+			catalog.snapshot().video.renditions.get("video").and_then(|c| c.stalled),
+			None
+		);
+
+		import
+			.observe_lag(std::time::Duration::from_millis(200))
+			.expect("observe lag");
+		assert_eq!(
+			catalog.snapshot().video.renditions.get("video").and_then(|c| c.stalled),
+			Some(true)
+		);
+
+		import.idle().expect("idle");
+		assert_eq!(
+			catalog.snapshot().video.renditions.get("video").and_then(|c| c.stalled),
+			None
+		);
+	}
+}

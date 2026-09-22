@@ -1,0 +1,1361 @@
+use crate::origin;
+use crate::{
+	Error, Hop, SessionError, StreamError,
+	coding::{Decode, DecodeError, Encode, Reader, Stream, Writer},
+	ietf::{self, FetchHeader, RequestId},
+	setup,
+	util::{MaybeBoxedExt, MaybeSendBox, TaskSet, err_only},
+};
+
+use super::{
+	Control, Message, Publisher, Subscriber, Version, adapter::ControlStreamAdapter, cluster, peer, solicit,
+	subscriber::is_protocol_violation,
+};
+
+/// Everything one moq-transport session needs to start.
+pub struct Config<S: crate::transport::poll::Session> {
+	/// The runtime that arms the session's timers.
+	pub runtime: crate::time::Clock,
+
+	pub session: S,
+
+	/// The bidi SETUP stream (draft-14 through draft-16 only). Draft-17+ passes `None`
+	/// and exchanges SETUP on uni streams instead.
+	pub setup: Option<Stream<S, Version>>,
+
+	pub request_id_max: Option<RequestId>,
+
+	/// Whether we dialed, which sets the request-id parity.
+	pub client: bool,
+
+	/// Traffic stats are attributed through these origin handles: tag them with
+	/// `origin::{Consumer, Producer}::with_stats` before calling [`start`].
+	pub publish: Option<origin::Consumer>,
+	pub subscribe: Option<origin::Producer>,
+
+	/// The origin (hop) id to assign the peer when it declares none itself. See
+	/// `Client::with_peer_hop`; a peer that negotiates the MoQ Cluster extension
+	/// declares its own, which wins.
+	pub peer_hop: Option<Hop>,
+
+	/// What crossing this link costs. Declared in our SETUP (see
+	/// [`cluster::RELAY_COST`]) for the peer to charge, and charged locally on what the
+	/// peer sends us. `None` declares nothing and charges whatever the peer declared,
+	/// falling back to 1; that is what a server accepting a connection passes, since it
+	/// has no per-peer configuration of its own.
+	///
+	/// Only `moqt-17`+ negotiates the MoQ Cluster extension. Earlier drafts carry no
+	/// cost at all, so nothing is charged and their routes rank on hop count alone.
+	pub cost: Option<u64>,
+
+	pub version: Version,
+
+	/// The request path we advertise in our SETUP (draft-17+ clients on URL-less
+	/// transports). A server passes `None`.
+	pub path: Option<String>,
+
+	/// The peer's SETUP stream, when it was already read before [`start`] (a draft-17+
+	/// server that gated on the client's path via [`accept_setup`]). It becomes the
+	/// GOAWAY channel; `None` lets the uni loop read the SETUP itself.
+	pub peer_setup_stream: Option<Reader<S::RecvStream, crate::Version>>,
+
+	/// What that pre-read SETUP declared, so the session does not have to parse it
+	/// twice. `None` when [`Self::peer_setup_stream`] is.
+	pub peer_declared: Option<peer::Peer>,
+}
+
+pub fn start<S>(config: Config<S>) -> Result<(MaybeSendBox<'static, Result<(), Error>>, crate::goaway::Handle), Error>
+where
+	S: crate::transport::poll::Boxable,
+{
+	let Config {
+		runtime,
+		mut session,
+		setup,
+		request_id_max,
+		client,
+		publish,
+		subscribe,
+		peer_hop,
+		cost,
+		version,
+		path,
+		peer_setup_stream,
+		peer_declared,
+	} = config;
+
+	// GOAWAY wiring: the public Session holds one half (drain trigger, received
+	// signal), the protocol tasks below hold the other.
+	// A moq-transport client MUST send an empty New Session URI: it cannot tell a
+	// server to open connections (draft-19 sect 10.4).
+	let (goaway_handle, goaway) = crate::goaway::Handle::new(!client);
+
+	let driver = async move {
+		// Our own Hop ID, taken from whichever origin the caller actually supplied so
+		// every session out of this process stamps the same one and cross-session loop
+		// detection works. Read BEFORE the placeholders below: their ids are random and
+		// identify nothing, so declaring one would compare incoming paths against an
+		// identity no other session shares.
+		let self_origin = self_origin(publish.as_ref(), subscribe.as_ref());
+
+		// moq-transport threads concrete origins through the publisher/subscriber.
+		// An unset half gets an empty origin: an empty publish origin announces
+		// nothing, and an empty subscribe origin issues no SUBSCRIBE_NAMESPACE.
+		let publish = publish.unwrap_or_else(|| origin::Producer::empty(Hop::random()).consume());
+		let subscribe = subscribe.unwrap_or_else(|| origin::Producer::empty(Hop::random()));
+
+		// What the peer declared in its SETUP. Seeded now when that stream was already
+		// read (the legacy handshake, or a gated server accept), and filled by the uni
+		// loop otherwise.
+		let peer_setup = peer::PeerSetup::default();
+		let setup_read = peer_declared.is_some();
+		match peer_declared {
+			Some(declared) => peer_setup.set(declared),
+			// A legacy caller that passed nothing (our own tests, and the lite paths):
+			// settle the slot rather than leave the announce loops waiting on a value
+			// that is never coming.
+			None if !cluster::supported(version) => peer_setup.set(peer::Peer::default()),
+			None => {}
+		}
+
+		let res = match version {
+			Version::Draft14 | Version::Draft15 | Version::Draft16 => {
+				let Some(setup) = setup else {
+					let err = Error::ProtocolViolation;
+					session.close(SessionError::from(&err).to_code(), "setup stream required");
+					return Err(err);
+				};
+				let control = Control::new(request_id_max, client);
+				let adapter = ControlStreamAdapter::new(session.clone(), control.clone(), version);
+
+				let publisher = Publisher::new(
+					runtime.clone(),
+					adapter.clone(),
+					publish,
+					control.clone(),
+					peer_hop,
+					peer_setup.clone(),
+					version,
+				);
+				let (tasks, mut task_set) = TaskSet::new();
+				let subscriber = Subscriber::new(
+					runtime.clone(),
+					adapter.clone(),
+					subscribe,
+					control,
+					peer_hop,
+					peer_setup.clone(),
+					self_origin,
+					cost,
+					version,
+					tasks.clone(),
+					goaway.going_away.clone(),
+				);
+
+				// GOAWAY send task: draft-14-16 carry GOAWAY on the shared control
+				// stream. Parked on the drain trigger; races the transport close so
+				// a parked trigger never blocks the task set draining.
+				{
+					let mut session = session.clone();
+					let adapter = adapter.clone();
+					let goaway = goaway.clone();
+					let runtime = runtime.clone();
+					tasks.push(async move {
+						let payload = kio::wait(|waiter| {
+							let mut cx = std::task::Context::from_waker(waiter.waker());
+							if session.poll_closed(&mut cx).is_ready() {
+								return std::task::Poll::Ready(None);
+							}
+							goaway.poll_triggered(waiter)
+						})
+						.await;
+						let Some(payload) = payload else {
+							return;
+						};
+						let timeout_ms = payload.timeout.map(|d| d.as_millis() as u64).unwrap_or(0);
+						adapter.send_goaway(&payload.uri, timeout_ms, version);
+						crate::goaway::enforce(&runtime, &mut session, payload.timeout).await;
+					});
+				}
+				drop(tasks);
+
+				let dispatch_session = adapter.clone();
+				let sub_ns = subscriber.clone();
+				let sub_ns_adapter = adapter.clone();
+
+				// Every half only ends the session on error (err_only parks on clean
+				// completion); the task set draining is the one clean exit.
+				let mut adapter_run = std::pin::pin!(err_only(adapter.run(setup.reader, setup.writer, goaway.clone())));
+				let mut unis = std::pin::pin!(err_only(run_unis(
+					adapter.clone(),
+					subscriber.clone(),
+					None,
+					false,
+					version,
+					goaway,
+				)));
+				let mut dispatch = std::pin::pin!(err_only(run_dispatch(
+					dispatch_session,
+					publisher.clone(),
+					subscriber.clone(),
+					version
+				)));
+				// Unsolicited PUBLISH_NAMESPACE unless the peer requires solicitation;
+				// see `Publisher::run_publish_namespaces`.
+				let mut pub_ns_run = std::pin::pin!(err_only(publisher.clone().run_publish_namespaces()));
+				// One SUBSCRIBE_NAMESPACE per permitted prefix, like `lite::Subscriber`:
+				// the scope is what we may ask for, and it is not the origin's root.
+				let mut sub_ns_run = std::pin::pin!(err_only(async {
+					let mut prefixes = futures::stream::FuturesUnordered::new();
+					for prefix in sub_ns.subscribe_prefixes() {
+						let mut sub_ns = sub_ns.clone();
+						let sub_ns_adapter = sub_ns_adapter.clone();
+						prefixes.push(async move {
+							let stream = match version {
+								Version::Draft16 => {
+									let mut sub_ns_adapter = sub_ns_adapter;
+									let (send, recv) = sub_ns_adapter.open_native_bi().await?;
+									Stream {
+										writer: crate::coding::Writer::new(send, version),
+										reader: crate::coding::Reader::new(recv, version),
+									}
+								}
+								_ => Stream::open(&mut sub_ns_adapter.clone(), version).await?,
+							};
+							if let Err(err) = sub_ns.run_subscribe_namespace(stream, prefix).await {
+								// The peer breaking the protocol is fatal, and the driver
+								// below turns this into the session close the draft wants.
+								if is_protocol_violation(&err) {
+									return Err(err);
+								}
+								tracing::warn!(%err, "subscribe_namespace failed, continuing without");
+							}
+							Ok::<(), Error>(())
+						});
+					}
+					while let Some(result) = futures::StreamExt::next(&mut prefixes).await {
+						result?;
+					}
+					Ok(())
+				}));
+
+				kio::wait(|waiter| {
+					use std::task::Poll;
+					if let Poll::Ready(err) = waiter.poll_future(adapter_run.as_mut()) {
+						return Poll::Ready(Err::<(), Error>(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(unis.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(dispatch.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if task_set.poll(waiter).is_ready() {
+						return Poll::Ready(Ok(()));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(sub_ns_run.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(pub_ns_run.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					Poll::Pending
+				})
+				.await
+			}
+			_ => {
+				// Send SETUP and keep the stream alive: it is also our GOAWAY channel.
+				let setup = {
+					let runtime = runtime.clone();
+					let session = session.clone();
+					let goaway = goaway.clone();
+					async move {
+						if let Err(err) = run_setup(runtime, session, version, path, self_origin, cost, goaway).await {
+							tracing::warn!(%err, "setup send error");
+						}
+						std::future::pending::<()>().await;
+					}
+				};
+
+				let control = Control::new(None, client);
+				let publisher = Publisher::new(
+					runtime.clone(),
+					session.clone(),
+					publish,
+					control.clone(),
+					peer_hop,
+					peer_setup.clone(),
+					version,
+				);
+				let (tasks, mut task_set) = TaskSet::new();
+				let subscriber = Subscriber::new(
+					runtime.clone(),
+					session.clone(),
+					subscribe,
+					control,
+					peer_hop,
+					peer_setup.clone(),
+					self_origin,
+					cost,
+					version,
+					tasks,
+					goaway.going_away.clone(),
+				);
+
+				let sub_ns_session = session.clone();
+				let sub_ns = subscriber.clone();
+
+				// When the peer's SETUP was pre-read (a gated server accept), monitor
+				// GOAWAY on that stream here; otherwise `run_unis` does it when the SETUP
+				// arrives on the wire.
+				let goaway_recv = {
+					let goaway = goaway.clone();
+					async move {
+						match peer_setup_stream {
+							Some(reader) => run_goaway(reader.with_version(version), version, goaway).await,
+							None => std::future::pending().await,
+						}
+					}
+				};
+
+				// Every half only ends the session on error (err_only parks on clean
+				// completion); `setup` never resolves (it holds the stream open) and the
+				// task set draining is the one clean exit.
+				let mut unis = std::pin::pin!(err_only(run_unis(
+					session.clone(),
+					subscriber.clone(),
+					Some(peer_setup.clone()),
+					setup_read,
+					version,
+					goaway,
+				)));
+				let mut dispatch = std::pin::pin!(err_only(run_dispatch(
+					session.clone(),
+					publisher.clone(),
+					subscriber.clone(),
+					version
+				)));
+				let mut goaway_recv = std::pin::pin!(err_only(goaway_recv));
+				let mut setup = std::pin::pin!(setup);
+				// Unsolicited PUBLISH_NAMESPACE unless the peer requires solicitation;
+				// see `Publisher::run_publish_namespaces`.
+				let mut pub_ns_run = std::pin::pin!(err_only(publisher.clone().run_publish_namespaces()));
+				// One SUBSCRIBE_NAMESPACE per permitted prefix; see the draft-16 arm.
+				let mut sub_ns_run = std::pin::pin!(err_only(async {
+					let mut prefixes = futures::stream::FuturesUnordered::new();
+					for prefix in sub_ns.subscribe_prefixes() {
+						let mut sub_ns = sub_ns.clone();
+						let sub_ns_session = sub_ns_session.clone();
+						prefixes.push(async move {
+							let mut sub_ns_session = sub_ns_session;
+							let stream = Stream::open(&mut sub_ns_session, version).await?;
+							if let Err(err) = sub_ns.run_subscribe_namespace(stream, prefix).await {
+								// The peer breaking the protocol is fatal, and the driver
+								// below turns this into the session close the draft wants.
+								if is_protocol_violation(&err) {
+									return Err(err);
+								}
+								tracing::warn!(%err, "subscribe_namespace failed, continuing without");
+							}
+							Ok::<(), Error>(())
+						});
+					}
+					while let Some(result) = futures::StreamExt::next(&mut prefixes).await {
+						result?;
+					}
+					Ok(())
+				}));
+
+				kio::wait(|waiter| {
+					use std::task::Poll;
+					if let Poll::Ready(err) = waiter.poll_future(unis.as_mut()) {
+						return Poll::Ready(Err::<(), Error>(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(dispatch.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(goaway_recv.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if waiter.poll_future(setup.as_mut()).is_ready() {
+						return Poll::Ready(Ok(()));
+					}
+					if task_set.poll(waiter).is_ready() {
+						return Poll::Ready(Ok(()));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(sub_ns_run.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					if let Poll::Ready(err) = waiter.poll_future(pub_ns_run.as_mut()) {
+						return Poll::Ready(Err(err));
+					}
+					Poll::Pending
+				})
+				.await
+			}
+		};
+
+		match &res {
+			Err(Error::Transport(_)) => {
+				tracing::info!("session terminated");
+				session.close(SessionError::Internal.to_code(), "");
+			}
+			Err(err) => {
+				tracing::warn!(%err, "session error");
+				session.close(SessionError::from(err).to_code(), err.to_string().as_ref());
+			}
+			_ => {
+				tracing::info!("session closed");
+				session.close(SessionError::Cancel.to_code(), "");
+			}
+		}
+
+		res
+	}
+	.maybe_boxed();
+
+	Ok((driver, goaway_handle))
+}
+
+/// What a peer's SETUP told us, beyond the stream it arrived on.
+pub struct PeerSetup<S: crate::transport::poll::Session> {
+	/// The SETUP stream, which becomes the GOAWAY channel.
+	pub stream: Reader<S::RecvStream, crate::Version>,
+
+	/// The request path the peer advertised, for URL-less transports.
+	pub path: Option<String>,
+
+	/// The Setup Options it declared (see [`cluster`] and [`solicit`]).
+	pub declared: peer::Peer,
+}
+
+/// The Hop ID this session declares and detects loops against.
+///
+/// Both halves of a session share the process's origin identity, so either one names
+/// it; the publish half is just the usual one to be set. A session with neither half
+/// has no content to route, so a throwaway id is all it can offer.
+fn self_origin(publish: Option<&origin::Consumer>, subscribe: Option<&origin::Producer>) -> Hop {
+	publish
+		.map(|origin| origin.hop())
+		.or_else(|| subscribe.map(|origin| origin.hop()))
+		.unwrap_or_else(Hop::random)
+}
+
+/// Server (draft-17+): read the peer's SETUP off its uni stream before starting the
+/// session, returning that stream plus what it declared.
+///
+/// Blocks on the peer's Setup Stream; any other uni stream racing ahead of it is
+/// `STOP_SENDING`-ed and skipped (group data needs a prior subscribe, so nothing
+/// legitimate precedes the SETUP at connect). Pass the returned reader to [`start`]
+/// as its `peer_setup_stream` so GOAWAY monitoring continues without re-reading it.
+pub async fn accept_setup<S: crate::transport::poll::Session>(
+	session: &mut S,
+	version: Version,
+) -> Result<PeerSetup<S>, Error> {
+	let outer_version = crate::Version::Ietf(version);
+
+	loop {
+		let recv = session.accept_uni().await.map_err(Error::from_transport)?;
+		let mut reader: Reader<S::RecvStream, crate::Version> = Reader::new(recv, outer_version);
+
+		if reader.decode_peek::<u64>().await? != setup::SETUP_V17 {
+			// Not the SETUP (group data this early is unexpected). Reject and keep waiting.
+			reader.abort(&Error::UnexpectedStream);
+			continue;
+		}
+
+		let setup: setup::Setup = reader.decode().await?;
+		let mut bytes = setup.parameters.clone();
+		let params = ietf::Parameters::decode(&mut bytes, version)?;
+		let path = match params.get_bytes(ietf::ParameterBytes::Path) {
+			Some(bytes) => Some(
+				std::str::from_utf8(bytes)
+					.map_err(|_| Error::Decode(crate::DecodeError::InvalidValue))?
+					.to_owned(),
+			),
+			None => None,
+		};
+		let declared = peer_from_params(&params, version)?;
+
+		return Ok(PeerSetup {
+			stream: reader,
+			path,
+			declared,
+		});
+	}
+}
+
+/// Parse the Setup Options we act on out of a raw SETUP parameter block.
+fn decode_peer_setup(parameters: bytes::Bytes, version: Version) -> Result<peer::Peer, crate::DecodeError> {
+	let mut bytes = parameters;
+	let params = ietf::Parameters::decode(&mut bytes, version)?;
+	peer_from_params(&params, version)
+}
+
+/// The Setup Options we act on, out of an already-decoded parameter block. One place, so
+/// a future option reaches both the pre-read accept path and the uni loop.
+fn peer_from_params(params: &ietf::Parameters, version: Version) -> Result<peer::Peer, crate::DecodeError> {
+	Ok(peer::Peer {
+		cluster: cluster::peer_from_setup(params, version)?,
+		solicit: solicit::from_setup(params, version)?,
+	})
+}
+
+/// Send our SETUP on a uni stream and keep it alive: on draft-17+ this stream is
+/// also our GOAWAY channel, so a fired drain trigger encodes the GOAWAY here.
+///
+/// `path` is the request path we advertise (clients on URL-less transports); a
+/// server passes `None`. `self_origin` and `cost` are the MoQ Cluster options, which
+/// declare our identity and (client-only) what this link costs to cross. The MoQ Solicit
+/// declaration is unconditional, so it takes no argument.
+async fn run_setup<S: crate::transport::poll::Session>(
+	runtime: crate::time::Clock,
+	mut session: S,
+	version: Version,
+	path: Option<String>,
+	self_origin: Hop,
+	cost: Option<u64>,
+	goaway: crate::goaway::Protocol,
+) -> Result<(), Error> {
+	let outer_version = crate::Version::Ietf(version);
+
+	let send = session.open_uni().await.map_err(Error::from_transport)?;
+	let mut writer: Writer<S::SendStream, crate::Version> = Writer::new(send, outer_version);
+
+	let mut parameters = ietf::Parameters::default();
+	parameters.set_bytes(ietf::ParameterBytes::Implementation, b"moq-lite-rs".to_vec());
+	if let Some(path) = path {
+		parameters.set_bytes(ietf::ParameterBytes::Path, path.into_bytes());
+	}
+	cluster::peer_into_setup(&mut parameters, self_origin, cost, version);
+	solicit::into_setup(&mut parameters, version);
+	let parameters = parameters.encode_bytes(version)?;
+
+	writer.encode(&setup::Setup { parameters }).await?;
+
+	// Hold the writer alive until the session closes, sending a GOAWAY if the
+	// drain trigger fires meanwhile. The trigger resolves `None` when the session
+	// drops without draining; keep holding either way (closing this stream
+	// mid-session is a protocol violation on strict peers).
+	let payload = kio::wait(|waiter| {
+		let mut cx = std::task::Context::from_waker(waiter.waker());
+		if session.poll_closed(&mut cx).is_ready() {
+			return std::task::Poll::Ready(None);
+		}
+		goaway.poll_triggered(waiter)
+	})
+	.await;
+
+	if let Some(payload) = payload {
+		let timeout_ms = payload.timeout.map(|d| d.as_millis() as u64).unwrap_or(0);
+		let msg = ietf::GoAway {
+			new_session_uri: std::borrow::Cow::Borrowed(payload.uri.as_ref()),
+			timeout: timeout_ms,
+		};
+
+		// Frame as [type_id varint][size u16][body], the same shape as the
+		// control-stream messages this channel otherwise carries.
+		let mut body = bytes::BytesMut::new();
+		msg.encode_msg(&mut body, version)?;
+		let size: u16 = body
+			.len()
+			.try_into()
+			.map_err(|_| Error::BoundsExceeded(crate::coding::BoundsExceeded))?;
+
+		let mut writer = writer.with_version(version);
+		writer.encode(&ietf::GoAway::ID).await?;
+		writer.encode(&size).await?;
+		writer.write_all(&mut std::io::Cursor::new(body)).await?;
+
+		crate::goaway::enforce(&runtime, &mut session, payload.timeout).await;
+		session.closed().await;
+		writer.finish().ok();
+	} else {
+		writer.finish().ok();
+	}
+
+	Ok(())
+}
+
+/// Accept incoming uni streams and dispatch each to a handler.
+///
+/// For v17, this also handles the SETUP stream (0x2F00) and GOAWAY.
+/// For v14-16, all uni streams are group data.
+async fn run_unis<S>(
+	mut session: S,
+	subscriber: Subscriber<S>,
+	// Where to record the peer's MoQ Cluster options once its SETUP arrives. `None`
+	// for draft-14..16, whose SETUP rides the control stream instead.
+	peer_setup: Option<peer::PeerSetup>,
+	// Whether the peer's SETUP was already consumed before this loop started.
+	setup_read: bool,
+	version: Version,
+	goaway: crate::goaway::Protocol,
+) -> Result<(), Error>
+where
+	S: crate::transport::poll::Boxable,
+{
+	let outer_version = crate::Version::Ietf(version);
+	let mut tasks = TaskSet::owned();
+	// A gated server accept already read the peer's one SETUP off its own uni stream,
+	// so anything arriving here is a second one.
+	let mut seen_setup = setup_read;
+
+	loop {
+		let recv = tasks
+			.drive(|waiter| {
+				let mut cx = std::task::Context::from_waker(waiter.waker());
+				session.poll_accept_uni(&mut cx)
+			})
+			.await
+			.map_err(Error::from_transport)?;
+		let mut reader: Reader<S::RecvStream, crate::Version> = Reader::new(recv, outer_version);
+		// A stream that dies before its type varint is that stream's failure, not the
+		// session's. RESET_STREAM is how a peer drops a group, and QUIC does not order
+		// the reset behind the data, so one can beat the first byte even of a stream
+		// the peer wrote to. Failing the loop here would tear down the whole session
+		// over a single stream the peer had already given up on. Only death is
+		// tolerated: bytes that arrive and do not parse stay session-fatal.
+		let kind: u64 = match tasks
+			.drive(|waiter| {
+				let mut cx = std::task::Context::from_waker(waiter.waker());
+				reader.poll_decode_peek(&mut cx)
+			})
+			.await
+		{
+			Ok(kind) => kind,
+			Err(err @ (Error::Cancel | Error::Stream(_) | Error::Remote(_) | Error::Decode(DecodeError::Short))) => {
+				tracing::debug!(%err, "dropping uni stream that died before its type");
+				continue;
+			}
+			Err(err) => return Err(err),
+		};
+
+		// v17+: SETUP arrives on a uni stream, then becomes the GOAWAY channel.
+		// We accept it in the background without blocking; the one thing that does
+		// need it (the MoQ Cluster negotiation) waits on `peer_setup` instead, so a
+		// slow SETUP delays announcements rather than the whole session.
+		if kind == setup::SETUP_V17 {
+			// Exactly one SETUP per endpoint. A second would let a peer restate its
+			// declared identity mid-session, silently re-attributing every route
+			// already built from the first.
+			if std::mem::replace(&mut seen_setup, true) {
+				return Err(Error::ProtocolViolation);
+			}
+
+			let peer_setup = peer_setup.clone();
+			let mut session = session.clone();
+			let goaway = goaway.clone();
+			tasks.push(async move {
+				// The negotiation gates the announce and dispatch loops, so a SETUP we
+				// cannot read must end the session rather than leave them parked on a
+				// slot nothing will ever fill.
+				let msg = match reader.decode::<setup::Setup>().await {
+					Ok(msg) => msg,
+					Err(err) => {
+						tracing::warn!(%err, "setup decode error");
+						session.close(SessionError::ProtocolViolation.to_code(), "invalid setup");
+						return;
+					}
+				};
+
+				if let Some(peer_setup) = peer_setup {
+					let peer = match decode_peer_setup(msg.parameters, version) {
+						Ok(peer) => peer,
+						Err(err) => {
+							tracing::warn!(%err, "setup parameter decode error");
+							session.close(SessionError::ProtocolViolation.to_code(), "invalid setup parameters");
+							return;
+						}
+					};
+					peer_setup.set(peer);
+				}
+
+				// Monitor for GOAWAY after setup completes.
+				if let Err(err) = run_goaway(reader.with_version(version), version, goaway).await {
+					tracing::warn!(%err, "goaway error");
+				}
+			});
+
+			continue;
+		}
+
+		// Poll one child handler for each group stream.
+		let mut sub = subscriber.clone();
+		tasks.push(async move {
+			let mut reader = reader.with_version(version);
+			if let Err(err) = run_uni_group(&mut sub, &mut reader).await {
+				tracing::debug!(%err, "uni stream error");
+				// This handler stops only the stream, so it cannot claim the session closed.
+				let reset = match StreamError::from(&err) {
+					StreamError::Session(_) => StreamError::Internal,
+					reset => reset,
+				};
+				reader.abort(reset);
+			}
+		});
+	}
+}
+
+async fn run_uni_group<S>(
+	subscriber: &mut Subscriber<S>,
+	stream: &mut Reader<S::RecvStream, Version>,
+) -> Result<(), Error>
+where
+	S: crate::transport::poll::Boxable,
+{
+	let kind: u64 = stream.decode_peek().await?;
+
+	// SUBGROUP_HEADER type bytes match the form 0b0XX1XXXX (spec §11.4.2):
+	// draft-14-17 use 0x10-0x1D and 0x30-0x3D, draft-18 adds 0x40 (FIRST_OBJECT)
+	// extending the form to also cover 0x50-0x5D and 0x70-0x7D. Per-version and
+	// per-bit validation (e.g., FIRST_OBJECT must be 0 on draft-17) is done in
+	// `GroupFlags::decode`.
+	if kind <= 0xff && (kind & 0x90) == 0x10 {
+		return subscriber.recv_group(stream).await;
+	}
+
+	match kind {
+		// A fill fetch stream carries the head of the group a draft-20 subscription joined
+		// part way through. One answering no fill of ours is refused inside.
+		FetchHeader::TYPE => subscriber.recv_fill(stream).await,
+		_ => Err(Error::UnexpectedStream),
+	}
+}
+
+/// Accept incoming bidi streams and dispatch to the correct handler based on message type.
+async fn run_dispatch<S>(
+	session: S,
+	publisher: Publisher<S>,
+	mut subscriber: Subscriber<S>,
+	version: Version,
+) -> Result<(), Error>
+where
+	S: crate::transport::poll::Boxable,
+{
+	// PUBLISH_NAMESPACE decodes differently once the MoQ Cluster extension is
+	// negotiated, so the whole dispatch loop waits for the peer's SETUP first. The peer
+	// must send it before anything else, and `run_unis` reads it independently, so this
+	// costs a handshake round rather than blocking.
+	let peer = subscriber.peer().await;
+
+	// From the same slot, so this costs nothing extra: it decides whether an unsolicited
+	// advertisement is the peer ignoring our own SETUP (MoQ Solicit).
+	let declared = subscriber.solicit().await;
+
+	let mut tasks = TaskSet::owned();
+	let mut accept = session.clone();
+	loop {
+		let mut stream = tasks
+			.drive(|waiter| {
+				let mut cx = std::task::Context::from_waker(waiter.waker());
+				Stream::poll_accept(&mut accept, version, &mut cx)
+			})
+			.await?;
+
+		// The intermediate results live outside the poll closure, so a Pending
+		// mid-header resumes where it left off.
+		let mut hdr_id: Option<u64> = None;
+		let mut hdr_size: Option<u16> = None;
+		let header = tasks
+			.drive(|waiter| {
+				let mut cx = std::task::Context::from_waker(waiter.waker());
+				let id = match hdr_id {
+					Some(id) => id,
+					None => *hdr_id.insert(std::task::ready!(stream.reader.poll_decode(&mut cx))?),
+				};
+				let size = match hdr_size {
+					Some(size) => size,
+					None => *hdr_size.insert(std::task::ready!(stream.reader.poll_decode(&mut cx))?),
+				};
+				let data = std::task::ready!(stream.reader.poll_read_exact(&mut cx, size as usize))?;
+				std::task::Poll::Ready(Ok::<_, Error>((id, data)))
+			})
+			.await;
+		// Same tolerance as `run_unis`: a request stream that dies before its header
+		// is the peer abandoning that request, not the session. Anything else, a
+		// header that does not parse included, still fails the session.
+		let (id, data) = match header {
+			Ok(header) => header,
+			Err(err @ (Error::Cancel | Error::Stream(_) | Error::Remote(_) | Error::Decode(DecodeError::Short))) => {
+				tracing::debug!(%err, "dropping bidi stream that died before its header");
+				continue;
+			}
+			Err(err) => return Err(err),
+		};
+
+		match id {
+			// Publisher handles: Subscribe, Fetch, SubscribeNamespace (0x50 modern /
+			// 0x11 legacy), TrackStatus
+			ietf::Subscribe::ID
+			| ietf::Fetch::ID
+			| ietf::SubscribeNamespace::ID
+			| ietf::SubscribeNamespaceLegacy::ID
+			| ietf::TrackStatus::ID => {
+				tasks.push(publisher.handle_stream(id, data, stream)?);
+			}
+			// Subscriber handles: Publish, PublishNamespace
+			ietf::Publish::ID | ietf::PublishNamespace::ID => {
+				tasks.push(subscriber.handle_stream(id, data, stream, peer, declared)?);
+			}
+			_ => {
+				tracing::warn!(id, "unexpected bidi stream type");
+				return Err(Error::UnexpectedStream);
+			}
+		}
+	}
+}
+
+/// Monitor the peer's SETUP stream for a GOAWAY, surfacing it through
+/// [`crate::Session::goaway`], then hold the stream until it FINs.
+async fn run_goaway<R: crate::transport::poll::RecvStream>(
+	mut reader: Reader<R, Version>,
+	version: Version,
+	goaway: crate::goaway::Protocol,
+) -> Result<(), Error> {
+	let id: u64 = match reader.decode_maybe().await? {
+		Some(id) => id,
+		None => return Ok(()),
+	};
+
+	let size: u16 = reader.decode::<u16>().await?;
+	let mut data = reader.read_exact(size as usize).await?;
+
+	if id != ietf::GoAway::ID {
+		return Err(Error::UnexpectedMessage);
+	}
+
+	let msg = ietf::GoAway::decode_msg(&mut data, version)?;
+	tracing::info!(message = ?msg, "received GOAWAY");
+
+	let timeout = (msg.timeout > 0).then(|| std::time::Duration::from_millis(msg.timeout));
+	// A second GOAWAY is a protocol violation the draft requires we close over.
+	goaway.record(crate::goaway::Goaway {
+		uri: msg.new_session_uri.into_owned(),
+		timeout,
+	})?;
+
+	// Keep the reader alive until the peer FINs or the session closes. Dropping
+	// it here would STOP_SENDING the peer's SETUP uni stream, which draft-19
+	// sect 3.3 forbids closing at the transport layer mid-session, so a strict
+	// peer would tear the session down as a PROTOCOL_VIOLATION right in the
+	// middle of the drain we are trying to honor.
+	//
+	// Nothing else is expected on this stream: a peer sends at most one GOAWAY
+	// per session. A second one is the same protocol violation the shared
+	// control stream enforces, so close over it here too rather than logging;
+	// anything else is merely unexpected and discarded.
+	loop {
+		let id: u64 = match reader.decode_maybe().await? {
+			Some(id) => id,
+			None => return Ok(()),
+		};
+		let size: u16 = reader.decode::<u16>().await?;
+		let mut data = reader.read_exact(size as usize).await?;
+
+		if id == ietf::GoAway::ID {
+			let msg = ietf::GoAway::decode_msg(&mut data, version)?;
+			let timeout = (msg.timeout > 0).then(|| std::time::Duration::from_millis(msg.timeout));
+			goaway.record(crate::goaway::Goaway {
+				uri: msg.new_session_uri.into_owned(),
+				timeout,
+			})?;
+			continue;
+		}
+
+		tracing::warn!(id, "unexpected message after GOAWAY on the SETUP stream; ignoring");
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::model::ProduceTest;
+
+	fn occurrences(log: &crate::lite::test_transport::Log, needle: &[u8]) -> usize {
+		let writes = log.writes.lock().unwrap();
+		writes.windows(needle.len()).filter(|window| *window == needle).count()
+	}
+
+	/// The peer's REQUEST_OK followed by a NAMESPACE in the base form: no cluster
+	/// parameters, so no HOP_PATH. Built with the crate's own writer so the framing
+	/// can't drift from the encoder under test.
+	async fn namespace_without_hop_path(version: Version) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+
+		writer.encode(&ietf::RequestOk::ID).await.unwrap();
+		writer.encode(&ietf::RequestOk { request_id: None }).await.unwrap();
+		writer.encode(&ietf::Namespace::ID).await.unwrap();
+		writer
+			.encode(&ietf::Namespace {
+				suffix: crate::Path::new("cam"),
+				cluster: None,
+			})
+			.await
+			.unwrap();
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	/// A session that negotiated the MoQ Cluster extension requires HOP_PATH on every
+	/// NAMESPACE, and the draft answers a missing one by closing the session.
+	///
+	/// Driven through `start` rather than `run_subscribe_namespace` directly: the
+	/// stream surfaces the error either way, so only this loop's handling of it decides
+	/// between a close and a warning, and a test below the loop would pass regardless.
+	#[tokio::test]
+	async fn a_namespace_without_a_hop_path_closes_the_session() {
+		const VERSION: Version = Version::Draft19;
+
+		// A driver that swallows the violation parks forever instead of failing, so
+		// bound it: paused time makes the deadline fire the moment nothing else can run.
+		tokio::time::pause();
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let session = crate::lite::test_transport::ScriptedSession::new(namespace_without_hop_path(VERSION).await);
+		let log = session.log.clone();
+
+		let (driver, _goaway) = start(Config {
+			runtime: crate::time::Clock::tokio(),
+			session,
+			setup: None,
+			request_id_max: None,
+			client: true,
+			publish: None,
+			subscribe: Some(origin),
+			peer_hop: None,
+			cost: None,
+			version: VERSION,
+			path: None,
+			peer_setup_stream: None,
+			// A peer that declared its Hop ID negotiated the extension, which is what
+			// makes the cluster parameters mandatory in both directions.
+			peer_declared: Some(peer::Peer {
+				cluster: cluster::Peer {
+					hop: Some(crate::Hop::new(2).unwrap()),
+					cost: None,
+				},
+				..Default::default()
+			}),
+		})
+		.expect("start the session");
+
+		let err = tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+			.await
+			.expect("the session ended rather than carrying on")
+			.expect_err("a malformed NAMESPACE fails the session");
+
+		assert!(is_protocol_violation(&err), "not treated as the peer's fault: {err}");
+		// A session close carries a session code, so the peer is told PROTOCOL_VIOLATION
+		// rather than the local table's value for whichever decode error we hit.
+		let (code, reason) = log.closes().first().cloned().expect("the session was closed");
+		assert_eq!(code, SessionError::ProtocolViolation.to_code());
+		assert_eq!(reason, err.to_string());
+	}
+
+	/// A subscriber issues one SUBSCRIBE_NAMESPACE per PERMITTED PREFIX, and asks for
+	/// those prefixes rather than the root it mounts replies under. Driven through
+	/// `start` so the per-prefix fan-out is exercised, not just one stream in
+	/// isolation: a loop that opened a single stream would still satisfy a test that
+	/// called `run_subscribe_namespace` itself.
+	#[tokio::test]
+	async fn every_permitted_prefix_gets_its_own_subscribe_namespace() {
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let scope: crate::Patterns = ["cam", "mic"]
+			.into_iter()
+			.map(|prefix| crate::Pattern::subtree(prefix).unwrap())
+			.collect();
+		let scoped = origin
+			.scope("rootns", &scope)
+			.expect("scope the origin to two prefixes");
+
+		let gate = kio::Producer::new(true);
+		let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
+		let log = session.log.clone();
+
+		let (driver, _goaway) = start(Config {
+			runtime: crate::time::Clock::tokio(),
+			session,
+			setup: None,
+			request_id_max: None,
+			client: true,
+			publish: None,
+			subscribe: Some(scoped),
+			peer_hop: None,
+			cost: None,
+			version: Version::Draft18,
+			path: None,
+			peer_setup_stream: None,
+			peer_declared: None,
+		})
+		.expect("start the session");
+		let _driver = tokio::spawn(driver);
+
+		// Both requests are written before either peer response, which never comes.
+		for _ in 0..100 {
+			if occurrences(&log, b"cam") > 0 && occurrences(&log, b"mic") > 0 {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+		}
+
+		assert_eq!(occurrences(&log, b"cam"), 1, "one SUBSCRIBE_NAMESPACE for cam");
+		assert_eq!(occurrences(&log, b"mic"), 1, "one SUBSCRIBE_NAMESPACE for mic");
+		assert_eq!(occurrences(&log, b"rootns"), 0, "asked the peer for our local root");
+	}
+
+	/// How many scheduling turns an advertisement gets before the count is taken. Time is
+	/// paused in these tests, so each turn costs nothing and only runs the driver until it
+	/// parks again; a busy machine cannot turn a slow announce into a passing silence.
+	const ANNOUNCE_TURNS: usize = 100;
+
+	/// Run a publish-only session against a peer that declared `peer_declared`, returning
+	/// how many times the namespace reached the wire.
+	///
+	/// The scripted peer answers nothing, so an advertisement parks after writing. That is
+	/// enough: the question is only whether the bytes went out unasked.
+	async fn announce_occurrences(peer_declared: Option<peer::Peer>) -> usize {
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let _cam = origin.announce("solo-cam", crate::origin::Route::default()).unwrap();
+
+		// An open gate: an unsolicited PUBLISH_NAMESPACE can reach the wire.
+		let gate = kio::Producer::new(true);
+		let session = crate::lite::test_transport::SinkSession::gated_bi(gate.consume());
+		let log = session.log.clone();
+
+		let (driver, _goaway) = start(Config {
+			runtime: crate::time::Clock::tokio(),
+			session,
+			setup: None,
+			request_id_max: None,
+			client: true,
+			publish: Some(origin.consume()),
+			subscribe: None,
+			peer_hop: None,
+			cost: None,
+			version: Version::Draft18,
+			path: None,
+			peer_setup_stream: None,
+			peer_declared,
+		})
+		.expect("start the session");
+		let _driver = tokio::spawn(driver);
+
+		// Drive until the announce lands, rather than betting on one fixed window.
+		for _ in 0..ANNOUNCE_TURNS {
+			if occurrences(&log, b"solo-cam") > 0 {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		occurrences(&log, b"solo-cam")
+	}
+
+	/// The peer's SETUP decides whether an advertisement may go out unasked, so nothing
+	/// can be sent before it arrives.
+	#[tokio::test(start_paused = true)]
+	async fn no_announce_before_the_peer_setup() {
+		assert_eq!(
+			announce_occurrences(None).await,
+			0,
+			"advertised before knowing what the peer wants"
+		);
+	}
+
+	/// A peer that requires solicitation hears nothing until it asks, which is the
+	/// behavior the IETF draft describes for a relay.
+	#[tokio::test(start_paused = true)]
+	async fn a_peer_requiring_solicitation_is_not_told_unasked() {
+		let declared = peer::Peer {
+			solicit: Some(true),
+			..Default::default()
+		};
+
+		assert_eq!(
+			announce_occurrences(Some(declared)).await,
+			0,
+			"PUBLISH_NAMESPACE despite the peer asking to be told on request"
+		);
+	}
+
+	/// A peer that declared nothing is told without being asked. Every relay that never
+	/// sends SUBSCRIBE_NAMESPACE depends on this, and the session is what wires the
+	/// unsolicited loop up at all.
+	#[tokio::test(start_paused = true)]
+	async fn a_peer_declaring_nothing_is_told_unasked() {
+		assert_eq!(
+			announce_occurrences(Some(peer::Peer::default())).await,
+			1,
+			"no unsolicited PUBLISH_NAMESPACE"
+		);
+	}
+
+	/// The declared Hop ID must be the caller's own origin, whichever half carries it.
+	///
+	/// A subscribe-only session (an ingest that publishes nothing) still routes, so
+	/// declaring the placeholder's random id would compare incoming paths against an
+	/// identity no other session out of this process shares, and a route returning
+	/// here would never be recognized as a loop.
+	#[test]
+	fn the_hop_id_comes_from_whichever_origin_the_caller_set() {
+		let ours = crate::Hop::new(42).unwrap();
+
+		let publish = crate::origin::Config::new(ours).produce();
+		assert_eq!(self_origin(Some(&publish.consume()), None), ours, "the publish half");
+
+		let subscribe = crate::origin::Config::new(ours).produce();
+		assert_eq!(self_origin(None, Some(&subscribe)), ours, "the subscribe half alone");
+
+		// Neither half: nothing to route, so any id will do as long as it is ours.
+		let publish = crate::origin::Config::new(ours).produce();
+		assert_eq!(self_origin(Some(&publish.consume()), Some(&subscribe)), ours);
+	}
+
+	/// Drive `start` against a peer whose incoming streams die before their first
+	/// byte, and assert the session shrugs them off: the driver keeps running and
+	/// nothing closes the transport.
+	///
+	/// The dead stream is not exotic. RESET_STREAM is how a peer drops a group, and
+	/// QUIC does not order the reset behind the data, so it can beat the first byte
+	/// even when the peer wrote one. Erroring an accept loop on it tears down the
+	/// whole session over a single stream the peer had already given up on.
+	async fn a_dead_incoming_stream_is_not_fatal(session: crate::lite::test_transport::DeadStreamSession) {
+		const VERSION: Version = Version::Draft19;
+
+		// A driver that survives parks forever, so bound it: paused time makes the
+		// deadline fire the moment nothing else can run.
+		tokio::time::pause();
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let log = session.log.clone();
+
+		let (driver, _goaway) = start(Config {
+			runtime: crate::time::Clock::tokio(),
+			session,
+			setup: None,
+			request_id_max: None,
+			client: true,
+			publish: None,
+			subscribe: Some(origin),
+			peer_hop: None,
+			cost: None,
+			version: VERSION,
+			path: None,
+			peer_setup_stream: None,
+			// Pre-settled, so nothing waits on a SETUP the dead stream will never
+			// carry and the dispatch loop actually runs.
+			peer_declared: Some(peer::Peer::default()),
+		})
+		.expect("start the session");
+
+		tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+			.await
+			.expect_err("the session ended over one dead stream");
+
+		assert_eq!(log.closes(), vec![], "nothing may close the transport");
+	}
+
+	#[tokio::test]
+	async fn a_uni_stream_dead_before_its_type_does_not_end_the_session() {
+		a_dead_incoming_stream_is_not_fatal(crate::lite::test_transport::DeadStreamSession::unis(1)).await;
+	}
+
+	#[tokio::test]
+	async fn a_bidi_stream_dead_before_its_header_does_not_end_the_session() {
+		a_dead_incoming_stream_is_not_fatal(crate::lite::test_transport::DeadStreamSession::bis(1)).await;
+	}
+
+	/// The bytes a publisher writes at the head of a group's unidirectional stream. Built
+	/// with the crate's own encoder so the framing can't drift from the decoder the
+	/// dispatch loop runs.
+	async fn subgroup_header(version: Version, track_alias: u64) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+
+		writer
+			.encode(&ietf::GroupHeader {
+				track_alias,
+				group_id: 0,
+				sub_group_id: 0,
+				publisher_priority: 128,
+				flags: ietf::GroupFlags::default(),
+			})
+			.await
+			.unwrap();
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	async fn dispatch_uni(payload: Vec<u8>, retired_alias: Option<u64>) -> crate::lite::test_transport::Log {
+		const VERSION: Version = Version::Draft19;
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		// The peer opens one uni stream and then goes quiet, so
+		// the loop is still running when the assertion is taken.
+		let session = crate::lite::test_transport::ScriptedSession::new(Vec::new()).with_incoming_unis(vec![payload]);
+		let log = session.log.clone();
+
+		let (tasks, _task_set) = TaskSet::new();
+		let peer_setup = peer::PeerSetup::default();
+		let subscriber = Subscriber::new(
+			crate::time::Clock::tokio(),
+			session.clone(),
+			origin,
+			Control::new(None, true),
+			None,
+			peer_setup.clone(),
+			crate::Hop::new(1).unwrap(),
+			None,
+			VERSION,
+			tasks,
+			Default::default(),
+		);
+		if let Some(alias) = retired_alias {
+			subscriber.retire_alias(alias);
+		}
+
+		// Held so the trigger side stays alive for as long as the loop runs.
+		let (_goaway, goaway) = crate::goaway::Handle::new(false);
+		// The peer's SETUP has not arrived yet, which is the state a group stream racing
+		// ahead of it lands in.
+		let mut unis = std::pin::pin!(run_unis(session, subscriber, Some(peer_setup), false, VERSION, goaway));
+
+		for _ in 0..100 {
+			if let std::task::Poll::Ready(result) = futures::poll!(unis.as_mut()) {
+				panic!("the dispatch loop ended over one rejected stream: {result:?}");
+			}
+			if !log.stops().is_empty() {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		log
+	}
+
+	/// A late group must reach the dispatch loop and stop with CANCELLED.
+	#[tokio::test(start_paused = true)]
+	async fn a_group_for_a_retired_alias_is_stopped_with_cancelled() {
+		let log = dispatch_uni(subgroup_header(Version::Draft19, 7).await, Some(7)).await;
+
+		assert_eq!(
+			log.stops(),
+			vec![crate::ietf::error::CANCELLED],
+			"the group stream must be stopped with the cancelled code",
+		);
+		assert_eq!(log.closes(), vec![], "one dropped group may not close the session");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn unknown_uni_type_does_not_claim_the_session_closed() {
+		let log = dispatch_uni(vec![0], None).await;
+		assert_eq!(log.stops(), vec![crate::ietf::error::INTERNAL_ERROR]);
+		assert!(log.closes().is_empty());
+	}
+
+	/// A peer's advertisement of `room/host`, then two namespace-keyed withdrawals of it.
+	/// The second has no advertisement left to name.
+	async fn publish_namespace_then_two_withdrawals(version: Version) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(crate::lite::test_transport::SinkSend::new(log.clone()), version);
+
+		writer.encode(&ietf::PublishNamespace::ID).await.unwrap();
+		writer
+			.encode(&ietf::PublishNamespace {
+				request_id: RequestId(1),
+				track_namespace: crate::Path::new("room/host"),
+				cluster: None,
+			})
+			.await
+			.unwrap();
+
+		for _ in 0..2 {
+			writer.encode(&ietf::PublishNamespaceDone::ID).await.unwrap();
+			writer
+				.encode(&ietf::PublishNamespaceDone {
+					track_namespace: crate::Path::new("room/host"),
+					request_id: RequestId(0),
+				})
+				.await
+				.unwrap();
+		}
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	/// The acknowledgement draft-14 answers a PUBLISH_NAMESPACE with, as bytes to look
+	/// for in what we wrote.
+	async fn publish_namespace_ok(request_id: RequestId) -> Vec<u8> {
+		let log = crate::lite::test_transport::Log::default();
+		let mut writer = crate::coding::Writer::new(
+			crate::lite::test_transport::SinkSend::new(log.clone()),
+			Version::Draft14,
+		);
+
+		writer.encode(&ietf::PublishNamespaceOk::ID).await.unwrap();
+		writer.encode(&ietf::PublishNamespaceOk { request_id }).await.unwrap();
+
+		let writes = log.writes.lock().unwrap();
+		writes.clone()
+	}
+
+	/// draft-14 names its withdrawals rather than numbering them, so a repeat has no
+	/// advertisement left to resolve to. Dropping it is what keeps the session up: failing
+	/// the lookup takes the whole connection down over a message with nothing left to do.
+	///
+	/// Driven through `start` because only the full loop shows the consequence, the read
+	/// task propagating the classifier's error.
+	#[tokio::test(start_paused = true)]
+	async fn a_repeated_publish_namespace_done_does_not_end_the_session() {
+		const VERSION: Version = Version::Draft14;
+
+		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
+		let consumer = origin.consume();
+
+		let mut session =
+			crate::lite::test_transport::ScriptedSession::new(publish_namespace_then_two_withdrawals(VERSION).await);
+		let log = session.log.clone();
+		let setup = Stream::open(&mut session, VERSION)
+			.await
+			.expect("open the control stream");
+
+		let (driver, _goaway) = start(Config {
+			runtime: crate::time::Clock::tokio(),
+			session,
+			setup: Some(setup),
+			request_id_max: None,
+			client: true,
+			publish: None,
+			subscribe: Some(origin),
+			peer_hop: None,
+			cost: None,
+			version: VERSION,
+			path: None,
+			peer_setup_stream: None,
+			peer_declared: None,
+		})
+		.expect("start the session");
+		let driver = tokio::spawn(driver);
+
+		let accepted = publish_namespace_ok(RequestId(1)).await;
+		for _ in 0..ANNOUNCE_TURNS {
+			if occurrences(&log, &accepted) > 0 && consumer.get_broadcast("room/host").is_none() {
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+		}
+
+		assert_eq!(occurrences(&log, &accepted), 1, "the advertisement was not accepted");
+		assert!(
+			consumer.get_broadcast("room/host").is_none(),
+			"the withdrawal did not reach the request that advertised it"
+		);
+		assert!(!driver.is_finished(), "the repeated withdrawal ended the session");
+		assert!(log.closes().is_empty(), "closed the session: {:?}", log.closes());
+	}
+}

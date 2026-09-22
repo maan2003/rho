@@ -1,0 +1,161 @@
+.controls {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: var(--spacing-4);
+	padding: var(--spacing-8) var(--spacing-12) var(--spacing-12);
+}
+
+.controls-group {
+	display: flex;
+	align-items: center;
+	gap: var(--spacing-4);
+}
+
+.controls-spacer {
+	flex: 1;
+}
+
+/* Volume: the slider expands on hover/focus to stay compact by default. */
+.volume {
+	gap: var(--spacing-4);
+}
+
+.volume-track {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 0;
+	max-width: 0;
+	height: 0.25rem;
+	margin: 0;
+	border-radius: 999px;
+	background: linear-gradient(
+		to right,
+		var(--color-white) 0%,
+		var(--color-white) var(--fill, 50%),
+		var(--color-white-alpha-30) var(--fill, 50%)
+	);
+	outline: none;
+	cursor: pointer;
+	opacity: 0;
+	transition:
+		width 160ms var(--ease),
+		max-width 160ms var(--ease),
+		opacity 160ms var(--ease);
+}
+
+.volume:hover .volume-track,
+.volume:focus-within .volume-track {
+	width: 4.5rem;
+	max-width: 4.5rem;
+	opacity: 1;
+}
+
+.volume-track::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 0.75rem;
+	height: 0.75rem;
+	border-radius: 50%;
+	background: var(--color-white);
+	border: none;
+	cursor: pointer;
+}
+
+.volume-track::-moz-range-thumb {
+	width: 0.75rem;
+	height: 0.75rem;
+	border-radius: 50%;
+	background: var(--color-white);
+	border: none;
+	cursor: pointer;
+}
+
+/* Status / latency pill. */
+.badge {
+	gap: var(--spacing-8);
+	height: 2.25rem;
+	padding: 0 var(--spacing-12);
+	margin-left: var(--spacing-4);
+	font-size: 0.8125rem;
+	color: var(--color-white);
+	background: transparent;
+	border: none;
+	border-radius: var(--border-radius-sm);
+	cursor: pointer;
+	transition: background-color 120ms var(--ease);
+}
+
+.badge:hover {
+	background-color: var(--color-white-alpha-10);
+}
+
+.badge-dot {
+	width: 0.5rem;
+	height: 0.5rem;
+	border-radius: 50%;
+	flex-shrink: 0;
+	background: var(--color-gray-400);
+}
+
+.badge-text {
+	font-weight: 600;
+	letter-spacing: 0.04em;
+}
+
+/* Latency is secondary: reveal it only on hover/focus of the badge. */
+.badge-latency {
+	max-width: 0;
+	margin-left: calc(-1 * var(--spacing-8));
+	opacity: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	font-variant-numeric: tabular-nums;
+	color: var(--color-white-alpha-60);
+	transition:
+		max-width 160ms var(--ease),
+		margin-left 160ms var(--ease),
+		opacity 160ms var(--ease);
+}
+
+.badge:hover .badge-latency,
+.badge:focus-visible .badge-latency {
+	max-width: 9rem;
+	margin-left: 0;
+	opacity: 1;
+}
+
+.badge[data-variant="live"] .badge-dot {
+	background: var(--color-red-400);
+	box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.7);
+	animation: badge-pulse 2s var(--ease) infinite;
+}
+
+.badge[data-variant="live"] .badge-text {
+	color: var(--color-red-400);
+}
+
+.badge[data-variant="loading"] .badge-dot,
+.badge[data-variant="connecting"] .badge-dot {
+	background: var(--color-yellow-400);
+}
+
+.badge[data-variant="error"] .badge-dot {
+	background: var(--color-gray-400);
+}
+
+.badge[data-variant="error"] .badge-text {
+	color: var(--color-gray-100);
+}
+
+@keyframes badge-pulse {
+	0% {
+		box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.6);
+	}
+	70% {
+		box-shadow: 0 0 0 0.4rem rgba(248, 113, 113, 0);
+	}
+	100% {
+		box-shadow: 0 0 0 0 rgba(248, 113, 113, 0);
+	}
+}

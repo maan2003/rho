@@ -1,0 +1,62 @@
+[package]
+name = "moq-rtmp"
+description = "RTMP / enhanced-RTMP contribution ingest gateway for Media over QUIC"
+authors = ["Luke Curley <kixelated@gmail.com>"]
+repository = "https://github.com/moq-dev/moq"
+# Our own code is MIT OR Apache-2.0. The vendored `src/rml/` module is a fork of
+# rml_rtmp (MIT only, Copyright (c) 2017 Matthew Shapiro); its notice ships in
+# src/rml/LICENSE and applies to that module regardless of which option you pick.
+license = "MIT OR Apache-2.0"
+
+version = "0.2.11"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["rtmp", "moq", "media", "live", "flv"]
+categories = ["multimedia", "network-programming", "web-programming"]
+
+[features]
+default = ["tls"]
+# RTMPS (RTMP over TLS): the `Conn::Tls` variant, `Server::with_tls`,
+# `Config::tls`, and the `pub use rustls`. Plaintext RTMP needs none of this, so
+# an embedder can drop TLS with `default-features = false`.
+tls = ["dep:rustls", "dep:tokio-rustls"]
+
+# Pure library: the RTMP <-> MoQ gateway. The CLI lives in `moq-cli` (the `rtmp`
+# subcommand); a relay can also embed `moq_rtmp::run` / `Server` against its own
+# origin. Only rustls + tokio-rustls (RTMPS, the `tls` feature) are optional.
+[dependencies]
+anyhow = { workspace = true, features = ["backtrace"] }
+# Deps of the vendored `rml` module (our fork of the unmaintained rml_rtmp 0.8):
+# the RTMP handshake + chunk/message codec + session state machine, so no
+# librtmp / ffmpeg. RTMP carries FLV, demuxed by moq-mux.
+byteorder = "1"
+bytes = { workspace = true }
+futures = { workspace = true }
+hang = { workspace = true }
+hmac = "0.13"
+moq-mux = { workspace = true }
+moq-net = { workspace = true }
+rand = { workspace = true }
+rml_amf0 = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"], optional = true }
+sha2 = "0.11"
+# TCP keepalive on accepted sockets, so a half-open connection (a peer that
+# vanished without a FIN/RST) is reaped instead of pinning a broadcast and its
+# stream-key slot forever.
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
+# RTMPS: TLS-terminate accepted connections. Mirrors moq-relay's pinning so the
+# workspace shares one tokio-rustls; the crypto provider comes from the supplied
+# `rustls::ServerConfig`, so no default crypto feature is needed here.
+tokio-rustls = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The RTMPS test borrows moq-tokio's self-signed cert generation to build a
+# `rustls::ServerConfig`. No transport feature: a QUIC backend here would be
+# unified into every other crate a `--workspace` build selects, which is exactly
+# what hid moq-tokio's backend-less build from the nightly feature matrix.
+moq-tokio = { workspace = true, default-features = false, features = ["aws-lc-rs"] }
+tokio = { workspace = true, features = ["test-util"] }

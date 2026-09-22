@@ -1,0 +1,323 @@
+name: Nightly
+
+# The gates that don't belong on a pull request.
+#
+# `audit` is time-based, not diff-based: an advisory is published without this
+# repo changing, so a per-PR run both fires on PRs that can't affect it and
+# stays silent on the days nobody pushes. `features` is diff-independent for a
+# different reason: it compiles the workspace at feature sets that share almost
+# no artifacts with the default one, which is several minutes of duplicate work
+# that a PR gate can't justify for how rarely it catches something. `obs` is
+# diff-independent because its PR-time counterpart can't be: obs.yml has to
+# name the paths that can break an external link to libmoq.a, and no list of
+# paths covers every one of them (see the comment there). `windows` and `macos`
+# are diff-independent because what they catch is a whole target's worth of
+# `#[cfg(target_os = ...)]` code that no Linux job compiles at all, and those
+# runners are throttled too hard to gate every PR on.
+#
+# The `release-*` jobs are diff-independent because the release workflows only
+# ever run on a tag: a change that compiles under plain cargo can still break a
+# release artifact (crane vendors and stubs sources in ways cargo never does,
+# the wheel builds in a manylinux container, the Kotlin/Swift/Go/Dart packages
+# link the FFI on every platform) and nothing notices until the tag is pushed.
+#
+# A failure here lands on main rather than being caught in review, which is the
+# accepted trade. Anything that must block a merge belongs in check.yml.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    name: Nightly
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-on-failure: true
+
+      # Runs even if the audit fails: a fresh advisory shouldn't hide a
+      # compile break in the feature permutations.
+      - name: Features
+        run: nix develop --command just rs features
+        env:
+          NEXTEST_PROFILE: ci
+
+      - name: Audit
+        if: ${{ !cancelled() }}
+        run: nix develop --command just rs audit
+
+      # The OBS plugin and libmoq's C fixtures are the only things that link
+      # libmoq.a from outside cargo, so a stale `rs/libmoq/native-libs/*.txt`
+      # breaks them and nothing else. obs.yml lists the inputs that can do that,
+      # but a list of paths can't be complete: a build script emitting
+      # `cargo::rustc-link-lib` needs no manifest change, and widening that
+      # filter to `rs/**` would run a link on nearly every PR. Being
+      # diff-independent, this run covers whatever the filter misses, at the
+      # cost of surfacing a day late rather than in review.
+      - name: OBS
+        if: ${{ !cancelled() }}
+        run: nix develop --command just obs ci
+
+      - name: libmoq C fixtures
+        if: ${{ !cancelled() }}
+        run: nix develop --command just rs c-tests
+
+      # The TS exporter's PCR release timing. Everything else about the stream
+      # can be graded from a capture, but *when* the bytes were handed over
+      # cannot: the grader has to sit on the exporter's stdout for the length of
+      # the run, stamping each packet. That is a real-time window no per-PR gate
+      # should pay for, so it lives here (see test/ts/README.md).
+      #
+      # 120 s rather than the 20 s default, because the drift term needs it. The
+      # exporter builds its mux buffer once and holds it, and a window that ends
+      # while it is still filling cannot tell that from a pipe running slow: the
+      # lag reaches ~480 ms over the first ~48 s and is flat after. Nightly is the
+      # one arm with the wall-clock time to see the flat part.
+      - name: TS timing
+        if: ${{ !cancelled() }}
+        run: nix develop --command just test ts --live --duration 120
+
+  tests:
+    name: Tests (${{ matrix.recipe }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # `rs uring` is a separate feature compile (off the default set) and
+        # kernel-gated below 6.12. The embedding tests for io_uring live there.
+        recipe: ["rs doctest --workspace", "rs loom", "test drill-sensitivity", "rs uring"]
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
+      - name: Test
+        run: nix develop --command just ${{ matrix.recipe }}
+        env:
+          NEXTEST_PROFILE: ci
+          MOQ_STRICT: 1
+
+  # Every tag-driven release workflow, run against main with publishing skipped:
+  # the workflows gate their publish jobs on `github.ref_type == 'tag'`, and no
+  # secrets are passed, so a dry-run cannot publish even by accident.
+  #
+  # A caller has to grant every permission a nested job declares, skipped or
+  # not, so these carry the release-time grants. Nothing that runs here uses
+  # them.
+  release-py-ffi:
+    name: Release Py FFI
+    uses: ./.github/workflows/release-py-ffi.yml
+    permissions:
+      contents: read
+      id-token: write
+
+  release-kt-ffi:
+    name: Release Kotlin FFI
+    uses: ./.github/workflows/release-kt-ffi.yml
+    permissions:
+      contents: read
+
+  release-swift-ffi:
+    name: Release Swift FFI
+    uses: ./.github/workflows/release-swift-ffi.yml
+    permissions:
+      contents: write
+
+  release-go-ffi:
+    name: Release Go FFI
+    uses: ./.github/workflows/release-go-ffi.yml
+    permissions:
+      contents: read
+
+  release-dart-ffi:
+    name: Release Dart FFI
+    uses: ./.github/workflows/release-dart-ffi.yml
+    permissions:
+      contents: write
+      id-token: write
+
+  release-libmoq:
+    name: libmoq
+    uses: ./.github/workflows/libmoq.yml
+    permissions:
+      contents: write
+
+  release-moq-relay:
+    name: moq-relay
+    uses: ./.github/workflows/moq-relay.yml
+    permissions:
+      contents: write
+      actions: write
+
+  release-moq-cli:
+    name: moq-cli
+    uses: ./.github/workflows/moq-cli.yml
+    permissions:
+      contents: write
+      actions: write
+
+  release-moq-gst:
+    name: moq-gst
+    uses: ./.github/workflows/moq-gst.yml
+    permissions:
+      contents: write
+      actions: write
+
+  # The three Docker images share one Dockerfile, so one package covers it.
+  release-docker:
+    name: Docker
+    uses: ./.github/workflows/docker.yml
+    with:
+      package: moq-relay
+    permissions:
+      contents: read
+
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lite, ietf, varint, path, pattern]
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # main
+        with:
+          tool-cache: false
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Fuzz
+        run: nix develop --command just rs fuzz ${{ matrix.target }} -- -max_total_time=300
+      - name: Preserve failure inputs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: rs/moq-net/fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # `just rs windows` is the only thing that compiles moq-video's Media
+  # Foundation capture/encode/decode, its D3D11 frames, and every
+  # `#[cfg(target_os = "windows")]` test module. The Linux gate skips all of it,
+  # so without this the code compiles for the first time in a tag-triggered
+  # release build, and the test targets never compile at all.
+  #
+  # A separate job rather than a step because it needs a Windows host and the
+  # runner-native toolchain: Nix doesn't run here. No Swatinem cache either. The
+  # repository cache budget is 10 GB, cache.yml spends it warming the Linux
+  # target/ that every pull request restores, and a once-a-day job shouldn't
+  # evict that to save itself a few minutes.
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # aws-lc-rs assembles its x86_64 crypto with NASM on Windows.
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # Pinned: `--locked` fixes just's own dependencies, not which version of
+      # just cargo selects.
+      - name: Install just
+        shell: bash
+        run: cargo install --locked just@1.52.0
+
+      - name: Check
+        shell: bash
+        run: just rs windows
+
+  # `just rs macos` is the only thing that compiles moq-video's VideoToolbox
+  # encode/decode and its ScreenCaptureKit / AVFoundation capture, plus
+  # moq-audio's ScreenCaptureKit system audio and its TCC permission pre-check.
+  # The Linux gate skips all of it. moq-video has a release-time backstop, since
+  # libmoq's `libmoq-v*` tag build compiles it on Apple Silicon, but moq-audio
+  # has none: libmoq and moq-ffi take it codecs-only, so no release build ever
+  # compiles its capture backend.
+  #
+  # Same shape as `windows` and for the same reasons: a separate job because it
+  # needs an Apple host and the runner-native toolchain, and no Swatinem cache
+  # because a once-a-day job shouldn't evict the Linux `target/` that every pull
+  # request restores. swift.yml already compiles moq-ffi here, so this stays
+  # scoped to the two crates holding the Apple-gated code.
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Pinned: `--locked` fixes just's own dependencies, not which version of
+      # just cargo selects.
+      - name: Install just
+        run: cargo install --locked just@1.52.0
+
+      - name: Check
+        run: just rs macos

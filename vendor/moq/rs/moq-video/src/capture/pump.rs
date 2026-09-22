@@ -1,0 +1,130 @@
+//! Bridges a blocking, pull-style capture device (V4L2 on Linux, Media
+//! Foundation on Windows) to the async [`FrameChannel`].
+//!
+//! Those device reads are blocking syscalls with no async form, so they run on a
+//! dedicated thread that pushes frames into the channel; the encode loop awaits
+//! them like any other backend. The device is built on the thread (so a `!Send`
+//! handle such as `IMFSourceReader` is fine) and dropped when the thread exits.
+//! [`PumpGuard`] stops and joins the thread when the [`Stream`](super::Stream)
+//! drops, releasing the device. The stop flag is checked between reads, so on a
+//! live device (which delivers a frame per interval) shutdown is prompt; a read
+//! with no frame to hand back returns [`Read::Idle`] rather than blocking, which
+//! is what keeps a held capture (a minimized window) just as prompt. The join
+//! is what guarantees the device fd is closed before a subsequent reopen, so we
+//! don't race EBUSY. A wedged device that blocks a read forever would stall that
+//! join, the same as the original `spawn_blocking` path did, but that needs a
+//! driver that delivers neither a frame nor an error.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+
+use super::channel::FrameChannel;
+use crate::frame::Surface;
+use crate::{Error, Rate};
+
+/// The outcome of one device read.
+pub(super) enum Read {
+	/// A captured frame.
+	Frame(Surface),
+	/// A captured frame with a timestamp in the device's private timeline.
+	FrameAt(Surface, moq_net::Timestamp),
+	/// No frame this turn, but the source is still live: the pump re-checks its
+	/// stop flag and calls again. A backend uses this to hold a capture (a
+	/// minimized or mid-resize window) without ending the stream.
+	Idle,
+	/// The source stopped producing; the stream ends and the caller reopens.
+	Done,
+}
+
+/// The negotiated geometry a backend reports once its device is open.
+pub(super) struct Geometry {
+	pub width: u32,
+	pub height: u32,
+	pub framerate: Option<Rate>,
+	pub label: String,
+}
+
+/// Stops and joins the pump thread on drop, releasing the device.
+pub(super) struct PumpGuard {
+	stop: Arc<AtomicBool>,
+	handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for PumpGuard {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::SeqCst);
+		if let Some(handle) = self.handle.take() {
+			let _ = handle.join();
+		}
+	}
+}
+
+/// Run `init` then `read` on a dedicated thread, feeding `chan`.
+///
+/// `init` builds the blocking device and reports its [`Geometry`]; it runs on
+/// the thread, so the device handle never has to be `Send`. `read` pulls at most
+/// one frame per call (blocking, bounded). Returns once the device is open (or
+/// its init fails), so geometry is known before the first `read().await`.
+pub(super) async fn spawn<S, I, R>(
+	chan: Arc<FrameChannel>,
+	init: I,
+	mut read: R,
+) -> Result<(Geometry, PumpGuard), Error>
+where
+	I: FnOnce() -> Result<(S, Geometry), Error> + Send + 'static,
+	R: FnMut(&mut S) -> Result<Read, Error> + Send + 'static,
+{
+	let stop = Arc::new(AtomicBool::new(false));
+	let (geo_tx, geo_rx) = tokio::sync::oneshot::channel();
+
+	let handle = std::thread::spawn({
+		let stop = stop.clone();
+		let chan = chan.clone();
+		move || {
+			let (mut source, geometry) = match init() {
+				Ok(opened) => opened,
+				Err(err) => {
+					let _ = geo_tx.send(Err(err));
+					return;
+				}
+			};
+			// If the awaiting `open` was cancelled, give up before capturing.
+			if geo_tx.send(Ok(geometry)).is_err() {
+				return;
+			}
+
+			while !stop.load(Ordering::SeqCst) {
+				match read(&mut source) {
+					Ok(Read::Frame(frame)) => chan.push(frame),
+					Ok(Read::FrameAt(frame, timestamp)) => chan.push_native(frame, timestamp),
+					Ok(Read::Idle) => {}     // held: re-check the stop flag, then read again
+					Ok(Read::Done) => break, // device stopped producing frames
+					Err(err) => {
+						chan.fail(err);
+						break;
+					}
+				}
+			}
+
+			chan.close();
+			// `source` drops here, releasing the device.
+		}
+	});
+
+	// Own the thread from here on, so cancelling this `await` (dropping the
+	// `open` future before geometry arrives) still stops and joins it instead of
+	// detaching a thread that holds the device open with the camera LED lit.
+	let guard = PumpGuard {
+		stop,
+		handle: Some(handle),
+	};
+
+	match geo_rx.await {
+		Ok(Ok(geometry)) => Ok((geometry, guard)),
+		Ok(Err(err)) => Err(err),
+		Err(_) => Err(Error::Codec(anyhow::anyhow!(
+			"capture thread exited before reporting geometry"
+		))),
+	}
+}

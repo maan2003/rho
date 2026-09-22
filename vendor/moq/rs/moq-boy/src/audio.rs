@@ -1,0 +1,69 @@
+//! Audio: stereo signed-16-bit PCM (Game Boy APU) -> Opus -> MoQ.
+//!
+//! A thin wrapper over [`moq_audio::encode::Producer`], which resamples to
+//! 48 kHz, encodes Opus, and anchors timestamps to a wall clock so audio stays
+//! in sync with video. `push_samples` stamps each buffer with the shared
+//! emulator clock; `reset_epoch` re-anchors on pause/resume so the gap lands in
+//! the PTS.
+
+use std::time::Duration;
+
+use anyhow::Result;
+use bytes::Bytes;
+
+/// The Game Boy APU outputs stereo audio.
+/// 64 kbps is reasonable for stereo Game Boy audio (simple waveforms).
+const OPUS_BITRATE: moq_net::bandwidth::Rate = moq_net::bandwidth::Rate::from_kbps(64);
+
+pub struct AudioEncoder {
+	producer: moq_audio::encode::Producer,
+}
+
+impl AudioEncoder {
+	pub fn new(
+		mut broadcast: moq_net::broadcast::Producer,
+		catalog: moq_mux::catalog::Producer,
+		input_sample_rate: u32,
+	) -> Result<Self> {
+		let mut input = moq_audio::encode::Input::new(input_sample_rate, moq_audio::Layout::Stereo);
+		input.format = moq_audio::Format::S16;
+		let mut options = moq_audio::encode::Options::default();
+		options.track = Some("audio".to_string());
+		options.settings = moq_audio::encode::Settings::from_input(moq_audio::encode::Codec::Opus, &input);
+		options.settings.bitrate = Some(OPUS_BITRATE);
+
+		let producer = moq_audio::encode::Producer::new(&mut broadcast, catalog, input, &options)?;
+		Ok(Self { producer })
+	}
+
+	pub fn demand(&self) -> moq_net::track::Demand {
+		self.producer.demand()
+	}
+
+	/// Re-anchor the timeline so a pause gap shows up in the audio PTS.
+	pub fn reset_epoch(&mut self) {
+		self.producer.reset_epoch();
+	}
+
+	/// Publish a marker group marking the pause, so the gap the re-anchored epoch is about
+	/// to open reads as a break rather than one very long packet.
+	pub fn discontinuity(&mut self) -> Result<()> {
+		self.producer.discontinuity()?;
+		Ok(())
+	}
+
+	/// Push interleaved signed-16-bit stereo PCM captured at `elapsed` (since
+	/// the emulator started, shared with the video clock).
+	pub fn push_samples(&mut self, samples: &[i16], elapsed: Duration) -> Result<()> {
+		let mut data = Vec::with_capacity(samples.len() * 2);
+		for sample in samples {
+			data.extend_from_slice(&sample.to_le_bytes());
+		}
+		let frame = moq_audio::Frame::new(
+			Bytes::from(data),
+			moq_net::Timestamp::from_micros(elapsed.as_micros() as u64)?,
+		);
+		self.producer.write(&frame)?;
+		Ok(())
+	}
+}

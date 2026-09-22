@@ -1,0 +1,101 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- [**breaking**] Traffic and presence frames use `*_started` / `*_ended` (re-exported from moq-net) and still emit the previous `announced` / `*_closed` names for one release.
+
+## [0.1.11](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.10...moq-stats-v0.1.11) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.10](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.9...moq-stats-v0.1.10) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.9](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.8...moq-stats-v0.1.9) - 2026-09-09
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.8](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.7...moq-stats-v0.1.8) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-json
+
+## [0.1.7](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.6...moq-stats-v0.1.7) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.1.6](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.5...moq-stats-v0.1.6) - 2026-08-24
+
+### Other
+
+- updated the following local packages: moq-json
+
+## [0.1.5](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.4...moq-stats-v0.1.5) - 2026-08-20
+
+### Other
+
+- updated the following local packages: moq-json
+
+## [0.1.4](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.3...moq-stats-v0.1.4) - 2026-08-05
+
+### Fixed
+
+- *(moq-stats)* hold subscriptions for uncreated tier tracks open with zeros ([#2642](https://github.com/moq-dev/moq/pull/2642))
+
+### Other
+
+- *(rs)* clean up pedantic clippy warnings ([#2621](https://github.com/moq-dev/moq/pull/2621))
+
+## [0.1.3](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.2...moq-stats-v0.1.3) - 2026-07-27
+
+### Other
+
+- updated the following local packages: moq-json
+
+## [0.1.2](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.1...moq-stats-v0.1.2) - 2026-07-24
+
+### Added
+
+- *(moq-stats)* add aggregating Consumer folding per-node broadcasts ([#2476](https://github.com/moq-dev/moq/pull/2476))
+
+## [0.1.1](https://github.com/moq-dev/moq/compare/moq-stats-v0.1.0...moq-stats-v0.1.1) - 2026-07-23
+
+### Other
+
+- updated the following local packages: moq-json
+
+## [0.1.0](https://github.com/moq-dev/moq/releases/tag/moq-stats-v0.1.0) - 2026-07-22
+
+### Added
+
+- *(net)* unannounce as soon as the last route detaches ([#2419](https://github.com/moq-dev/moq/pull/2419))
+- *(net)* [**breaking**] extract stats publishing into moq-stats with compressed tracks ([#2380](https://github.com/moq-dev/moq/pull/2380))
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- *(stats)* [**breaking**] collect traffic counters in the model layer ([#2427](https://github.com/moq-dev/moq/pull/2427))
+- [**breaking**] pre-bump API polish across the release batch ([#2423](https://github.com/moq-dev/moq/pull/2423))
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- *(stats)* [**breaking**] remove internal tier defaults ([#2411](https://github.com/moq-dev/moq/pull/2411))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))

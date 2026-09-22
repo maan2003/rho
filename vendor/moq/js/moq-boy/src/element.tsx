@@ -1,0 +1,177 @@
+import * as Moq from "@moq/net";
+import { render } from "solid-js/web";
+import type { GameConfig } from "./game.ts";
+import { Game } from "./game.ts";
+import { BoyUI } from "./ui/element.tsx";
+
+const OBSERVED = ["url", "prefix", "prefix-game", "prefix-viewer"] as const;
+type Observed = (typeof OBSERVED)[number];
+
+const DEFAULT_PREFIX = "boy";
+
+const cleanup = new FinalizationRegistry<Moq.Signals.Effect>((signals) => signals.close());
+
+/**
+ * `<moq-boy>` web component — discovers and manages Game Boy streaming sessions,
+ * and renders the interactive UI in a Shadow DOM.
+ *
+ * Attributes:
+ *   - `url` — MoQ relay URL
+ *   - `prefix` — Base path prefix (default: "boy"). Derives prefix-game and prefix-viewer.
+ *   - `prefix-game` — Path prefix for game broadcasts (default: "{prefix}/game")
+ *   - `prefix-viewer` — Path prefix for viewer broadcasts (default: "{prefix}/viewer")
+ */
+export default class MoqBoy extends HTMLElement {
+	static observedAttributes = OBSERVED;
+
+	readonly connection: Moq.Connection;
+	/** The origin viewer broadcasts are published into, served across reconnects. */
+	readonly origin = new Moq.Origin.Producer();
+	readonly expanded = new Moq.Signals.Signal<string | undefined>(undefined);
+
+	/** Reactive map of active game sessions. Emits on add/remove. */
+	readonly games = new Moq.Signals.Signal<ReadonlyMap<string, Game>>(new Map());
+
+	readonly #signals = new Moq.Signals.Effect();
+	readonly #enabled = new Moq.Signals.Signal(false);
+	readonly #prefix = new Moq.Signals.Signal(DEFAULT_PREFIX);
+	readonly #gamePrefixOverride = new Moq.Signals.Signal<string | undefined>(undefined);
+	readonly #viewerPrefixOverride = new Moq.Signals.Signal<string | undefined>(undefined);
+	readonly #sessions = new Map<string, Game>();
+	#dispose?: () => void;
+
+	constructor() {
+		super();
+		cleanup.register(this, this.#signals);
+
+		// One origin, both directions: viewer broadcasts are published into it and the
+		// relay's announced games arrive in it, with no risk of echoing either back.
+		this.connection = new Moq.Connection({
+			enabled: this.#enabled,
+			publish: this.origin.consume(),
+			consume: this.origin,
+			share: false,
+		});
+		this.#signals.cleanup(() => this.connection.close());
+		this.#signals.cleanup(() => this.origin.close());
+
+		// Discover game sessions via announcements.
+		this.#signals.run(this.#runDiscovery.bind(this));
+	}
+
+	connectedCallback() {
+		this.#enabled.set(true);
+
+		// Render the UI into a Shadow DOM (reuse existing on reconnect).
+		const shadow = this.shadowRoot ?? this.attachShadow({ mode: "open" });
+		this.#dispose = render(() => <BoyUI boy={this} />, shadow);
+	}
+
+	disconnectedCallback() {
+		this.#enabled.set(false);
+		this.#dispose?.();
+		this.#dispose = undefined;
+	}
+
+	attributeChangedCallback(name: Observed, _oldValue: string | null, newValue: string | null) {
+		switch (name) {
+			case "url":
+				this.connection.url.set(newValue ? new URL(newValue) : undefined);
+				break;
+			case "prefix":
+				this.#prefix.set(newValue ?? DEFAULT_PREFIX);
+				break;
+			case "prefix-game":
+				this.#gamePrefixOverride.set(newValue ?? undefined);
+				break;
+			case "prefix-viewer":
+				this.#viewerPrefixOverride.set(newValue ?? undefined);
+				break;
+		}
+	}
+
+	get url(): URL | undefined {
+		return this.connection.url.peek();
+	}
+
+	set url(value: string | URL | undefined) {
+		this.connection.url.set(value ? new URL(value) : undefined);
+	}
+
+	get prefixPath(): string {
+		return this.#prefix.peek();
+	}
+
+	set prefixPath(value: string) {
+		this.#prefix.set(value);
+	}
+
+	get prefixGame(): string {
+		return this.#gamePrefixOverride.peek() ?? `${this.#prefix.peek()}/game`;
+	}
+
+	set prefixGame(value: string) {
+		this.#gamePrefixOverride.set(value);
+	}
+
+	get prefixViewer(): string {
+		return this.#viewerPrefixOverride.peek() ?? `${this.#prefix.peek()}/viewer`;
+	}
+
+	set prefixViewer(value: string) {
+		this.#viewerPrefixOverride.set(value);
+	}
+
+	#runDiscovery(effect: Moq.Signals.Effect) {
+		const base = effect.get(this.#prefix);
+		const gamePrefix = effect.get(this.#gamePrefixOverride) ?? `${base}/game`;
+		const viewerPrefix = effect.get(this.#viewerPrefixOverride) ?? `${base}/viewer`;
+		const prefix = Moq.Path.from(gamePrefix);
+
+		// The origin's stream spans reconnects: entries retract when the session dies and
+		// return when the next one re-announces them, so this loop never needs to restart.
+		const announced = this.origin.consume().announced(Moq.Path.Pattern.parse("*").rooted(prefix));
+		effect.cleanup(() => announced.close());
+
+		effect.spawn(async () => {
+			for (;;) {
+				const entry = await Promise.race([effect.cancel, announced.next()]);
+				if (!entry) break;
+
+				// A broad route that cannot pin the game id names nothing to open.
+				const capture = entry.captures?.[0];
+				if (!capture?.isLiteral) continue;
+
+				const id = capture.text;
+				if (Moq.Announce.isActive(entry.kind) && !this.#sessions.has(id)) {
+					const config: GameConfig = {
+						sessionId: id,
+						connection: this.connection,
+						origin: this.origin,
+						expanded: this.expanded,
+						gamePrefix,
+						viewerPrefix,
+					};
+					const game = new Game(config);
+					this.#sessions.set(id, game);
+					this.games.set(new Map(this.#sessions));
+				} else if (entry.kind === "retracted") {
+					const game = this.#sessions.get(id);
+					if (game) {
+						game.close();
+						this.#sessions.delete(id);
+						this.games.set(new Map(this.#sessions));
+					}
+				}
+			}
+		});
+	}
+}
+
+customElements.define("moq-boy", MoqBoy);
+
+declare global {
+	interface HTMLElementTagNameMap {
+		"moq-boy": MoqBoy;
+	}
+}

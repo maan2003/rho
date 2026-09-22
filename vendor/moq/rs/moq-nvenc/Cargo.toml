@@ -1,0 +1,22 @@
+[package]
+name = "moq-nvenc"
+version = "0.0.5"
+edition = "2021"
+license = "MIT"
+rust-version.workspace = true
+
+description = "NVENC hardware video encoder bindings, forked from ViliamVadocz/nvidia-video-codec-sdk with runtime dynamic loading (dlopen only)"
+repository = "https://github.com/moq-dev/moq"
+readme = "README.md"
+
+keywords = ["encoding", "nvidia", "nvenc", "cuda", "video"]
+categories = ["multimedia::encoding", "hardware-support"]
+
+[dependencies]
+# Only cudarc's `driver` API is used, always dlopen'd at runtime:
+# `fallback-dynamic-loading` loads libcuda, and `cuda-12020` pins the CUDA API
+# version so the build needs no CUDA toolkit or driver present.
+cudarc = { workspace = true }
+# dlopen libnvidia-encode at runtime (the two NVENC bootstrap symbols).
+libloading = { workspace = true }
+thiserror = { workspace = true }

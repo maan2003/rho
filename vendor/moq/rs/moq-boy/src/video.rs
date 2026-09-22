@@ -1,0 +1,180 @@
+//! Video encoding pipeline: RGBA framebuffer -> H.264 -> MoQ, via `moq-video`.
+//!
+//! Runs on a dedicated thread so the emulator's frame loop never blocks on the
+//! encoder. Frames arrive on a bounded channel; if the encoder falls behind,
+//! frames are dropped to keep latency low. moq-video does the RGBA -> H.264
+//! encode and the avc3 publish; this module keeps moq-boy's threading,
+//! frame-dropping, force-keyframe and timing-stats behavior.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+
+use crate::emulator::{HEIGHT, WIDTH};
+
+/// The Game Boy's 59.727 Hz, rounded: the encoder's time base and the framerate the catalog
+/// advertises.
+const FRAMERATE: u32 = 60;
+
+/// Handle to the video encoding thread.
+///
+/// Frames are submitted via `try_frame()` (non-blocking, drops if full).
+pub struct VideoEncoder {
+	tx: tokio::sync::mpsc::Sender<EncoderMsg>,
+	/// Watch-only handle to the video track, for monitoring used/unused.
+	pub demand: moq_net::track::Demand,
+	force_keyframe: Arc<AtomicBool>,
+	/// Latest encode duration in microseconds.
+	encode_duration: Arc<AtomicU64>,
+	_thread: std::thread::JoinHandle<()>,
+}
+
+enum EncoderMsg {
+	Frame {
+		rgba: Bytes,
+		ts: hang::container::Timestamp,
+	},
+	/// Publish the pause marker. Goes down the same channel as the frames so it lands
+	/// after the last one encoded, not racing ahead of it.
+	Discontinuity,
+}
+
+impl VideoEncoder {
+	/// Publish the catalog rendition, then hand the encoder to a worker thread that only runs while
+	/// someone is watching. The returned handle feeds it frames; the emulator never blocks on it.
+	pub async fn spawn(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Self {
+		let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+		// Game Boy is 160x144; force the openh264 software encoder since hardware
+		// encoders can reject such tiny resolutions.
+		let mut config = moq_video::encode::Config::new(WIDTH, HEIGHT, moq_video::Rate::new(FRAMERATE, 1).unwrap());
+		config.kind = moq_video::encode::Kind::Software;
+
+		// Probed from a throwaway encoder, before the emulator has run a frame, so a
+		// viewer can discover (and unpause) a moq-boy that has published nothing.
+		let rendition = config.probe().await.expect("failed to probe the H.264 encoder");
+		let producer =
+			moq_video::encode::Producer::new(broadcast, catalog, rendition).expect("failed to create avc3 producer");
+		let demand = producer.demand();
+
+		let force_keyframe = Arc::new(AtomicBool::new(false));
+		let encode_duration = Arc::new(AtomicU64::new(0));
+		let fk = force_keyframe.clone();
+		let ed = encode_duration.clone();
+		let thread = std::thread::Builder::new()
+			.name("video-encoder".into())
+			.spawn(move || encoder_thread(rx, producer, config, fk, ed))
+			.expect("failed to spawn video encoder thread");
+
+		Self {
+			tx,
+			demand,
+			force_keyframe,
+			encode_duration,
+			_thread: thread,
+		}
+	}
+
+	/// Send a frame to the encoder. Non-blocking: drops the frame if the
+	/// channel is full (capacity=4) to keep latency low.
+	pub fn try_frame(&self, rgba: Bytes, ts: hang::container::Timestamp) {
+		if self.tx.try_send(EncoderMsg::Frame { rgba, ts }).is_err() {
+			tracing::warn!("video frame dropped: encoder backpressure");
+		}
+	}
+
+	/// Publish a marker group marking a pause, so the PTS jump on resume reads as a break
+	/// rather than one very long frame, and a viewer arriving mid-pause isn't served the
+	/// pre-pause group as if it were live.
+	///
+	/// Blocks rather than dropping on a full channel: a dropped frame costs one frame, a
+	/// dropped marker silently reinstates the bug it exists to prevent.
+	pub fn discontinuity(&self) {
+		if self.tx.blocking_send(EncoderMsg::Discontinuity).is_err() {
+			tracing::warn!("video discontinuity dropped: encoder gone");
+		}
+	}
+
+	/// Force the next encoded frame to be a keyframe (I-frame).
+	/// Used on resume after pause so new viewers can start decoding.
+	pub fn force_keyframe(&self) {
+		self.force_keyframe.store(true, Ordering::Release);
+	}
+
+	/// Latest per-frame encode duration.
+	pub fn encode_duration(&self) -> Duration {
+		Duration::from_micros(self.encode_duration.load(Ordering::Relaxed))
+	}
+}
+
+fn encoder_thread(
+	mut rx: tokio::sync::mpsc::Receiver<EncoderMsg>,
+	mut producer: moq_video::encode::Producer,
+	config: moq_video::encode::Config,
+	force_keyframe: Arc<AtomicBool>,
+	encode_duration: Arc<AtomicU64>,
+) {
+	let mut encoder: Option<moq_video::encode::Encoder> = None;
+
+	while let Some(msg) = rx.blocking_recv() {
+		let msg = match msg {
+			EncoderMsg::Frame { rgba, ts } => (rgba, ts),
+			EncoderMsg::Discontinuity => {
+				if let Err(e) = producer.discontinuity() {
+					tracing::warn!(error = %e, "failed to mark the video discontinuity");
+				}
+				continue;
+			}
+		};
+		let (rgba, ts) = msg;
+		let enc = match encoder.as_mut() {
+			Some(enc) => enc,
+			None => {
+				// Opened on the first frame, so a paused emulator holds no encoder.
+				match moq_video::encode::Encoder::new(&config) {
+					Ok(enc) => encoder.insert(enc),
+					Err(e) => {
+						tracing::error!(error = %e, "H.264 encoder init failed");
+						return;
+					}
+				}
+			}
+		};
+
+		// Asked for before the conversion below, which can fail: the encoder holds the
+		// request until a frame actually arrives, so dropping this frame delays the
+		// keyframe rather than losing it. A viewer needs a decodable starting point;
+		// otherwise the encoder's own GOP keys the stream. A refusal is terminal:
+		// only a backend that cannot cut at all gives one, and this never selects one.
+		if force_keyframe.swap(false, Ordering::AcqRel)
+			&& let Err(e) = enc.cut()
+		{
+			tracing::error!(error = %e, "H.264 encoder cannot cut a group; stopping encoder");
+			return;
+		}
+		let start = Instant::now();
+		let surface = match moq_video::Surface::rgba(&rgba, moq_video::Size::new(WIDTH, HEIGHT)) {
+			Ok(surface) => surface,
+			// A single bad frame is tolerable; keep going.
+			Err(e) => {
+				tracing::error!(error = %e, "RGBA conversion error");
+				continue;
+			}
+		};
+		match enc.encode(&moq_video::Frame::new(surface, ts)) {
+			Ok(encoded) => {
+				if let Err(e) = producer.publish(&encoded) {
+					// Publish only fails once the track/broadcast is gone, which
+					// is terminal -- stop rather than flooding logs every frame.
+					tracing::error!(error = %e, "video publish failed; stopping encoder");
+					return;
+				}
+			}
+			// A single bad frame is tolerable; keep going.
+			Err(e) => tracing::error!(error = %e, "H.264 encode error"),
+		}
+		encode_duration.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+	}
+}

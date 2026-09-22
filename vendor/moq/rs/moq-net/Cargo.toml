@@ -1,0 +1,78 @@
+[package]
+name = "moq-net"
+description = "The networking layer for Media over QUIC: real-time pub/sub with built-in caching, fan-out, and prioritization."
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.2.22"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["quic", "http3", "webtransport", "media", "live"]
+categories = ["multimedia", "network-programming", "web-programming"]
+
+[package.metadata.cargo-shear]
+ignored = ["getrandom"]
+
+[features]
+# Exposes the wire codecs to the `fuzz/` harness through the hidden `fuzz` module.
+# Off by default and hidden from the docs; nothing depends on it but that harness.
+fuzz = []
+
+[dependencies]
+arrayvec = "0.7"
+bytes = { workspace = true }
+futures = { workspace = true }
+kio = { workspace = true }
+moq-pattern = { workspace = true, features = ["serde"] }
+num_enum = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+slab = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+web-async = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+# test-util (tokio::time::pause/advance) is test-only and is NOT supported on
+# wasm, so it must not leak into the normal dependency feature set.
+tokio = { workspace = true, features = ["macros", "io-util", "sync", "test-util", "time", "rt"] }
+
+# Model checks for the kio-backed model layer (tests/loom.rs). `cfg(loom)` is only
+# set by `just rs loom`, and the whole test file compiles away without it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
+# wasm model-layer tests (tests/wasm.rs). getrandom's wasm backend is enabled
+# only here (dev), so it isn't forced on downstream consumers. They select
+# their own backend in the leaf binary.
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+getrandom = { workspace = true }
+# Keep this in lockstep with rs/moq-wasm's pinned wasm-bindgen CLI schema.
+wasm-bindgen-test = "=0.3.77"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+# Writes the generated fuzzer corpus to disk. Needs the `fuzz` feature, so a default
+# `--all-targets` build skips it rather than failing to find the module.
+[[example]]
+name = "fuzz-seeds"
+path = "examples/fuzz-seeds.rs"
+required-features = ["fuzz"]
+
+[[bench]]
+name = "group"
+harness = false
+
+[[bench]]
+name = "track"
+harness = false
+
+[[bench]]
+name = "priority"
+harness = false

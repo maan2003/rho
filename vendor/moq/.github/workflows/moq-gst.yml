@@ -1,0 +1,224 @@
+name: moq-gst
+
+on:
+  push:
+    tags:
+      - "moq-gst-v*"
+  # Dry-run: build everything, publish nothing. Nightly calls every release
+  # workflow this way so a broken build surfaces before the tag is cut.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build tarball (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
+        with:
+          determinate: false
+
+      - name: Parse version
+        id: parse
+        shell: bash
+        run: .github/scripts/release.sh parse-version moq-gst
+
+      - name: Build and package (tarball)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          ./rs/moq-gst/build.sh \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --output dist
+
+      # Load the produced plugin against a system GStreamer the runner just
+      # installed (separate from the nix copy the build linked against).
+      # This is the customer-facing scenario: `nix build .#moq-gst` then
+      # `gst-inspect-1.0 moq`. If dyld/ld.so can't resolve the plugin's deps
+      # against the system GStreamer, this step fails.
+      - name: Install system GStreamer
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              gstreamer1.0-tools \
+              gstreamer1.0-plugins-base \
+              gstreamer1.0-plugins-good
+          else
+            brew install gstreamer
+          fi
+
+      - name: Smoke test (gst-inspect against system GStreamer)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/moq-gst-v${VERSION}-${TARGET}.tar.gz" -C dist/
+          ./rs/moq-gst/smoke.sh "dist/moq-gst-v${VERSION}-${TARGET}/lib/gstreamer-1.0"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: moq-gst-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  package:
+    name: Package .deb/.rpm (${{ matrix.target }})
+    runs-on: ${{ matrix.runs-on }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-24.04
+            deb-arch: amd64
+            deb-multiarch: x86_64-linux-gnu
+            rpm-arch: x86_64
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+            deb-arch: arm64
+            deb-multiarch: aarch64-linux-gnu
+            rpm-arch: aarch64
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up packaging tools
+        uses: ./.github/actions/setup-packaging
+
+      - name: Parse version
+        id: parse
+        shell: bash
+        run: .github/scripts/release.sh parse-version moq-gst
+
+      - name: Install GStreamer dev libraries
+        shell: bash
+        run: |
+          # Ubuntu 24.04 ships GStreamer 1.24, satisfying gstreamer-rs
+          # 0.23's 1.22+ headers requirement. Resulting .so dynamic-links
+          # to libgstreamer-1.0.so.0 (ABI-stable since 1.0).
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Build (release, glibc 2.34)
+        shell: bash
+        # Pin glibc to 2.34 so one .so covers Debian 12+/Ubuntu 22.04+
+        # (.deb) and AlmaLinux/RHEL/Rocky 9+ (.rpm).
+        #
+        # PKG_CONFIG_ALLOW_SYSTEM_LIBS keeps the `-L /usr/lib/<multiarch>` for
+        # glib in pkg-config's output. pkg-config strips system lib paths by
+        # default (the native linker searches them anyway), but zig's linker
+        # does not, and rustc fails the dylib lookup (strategy 'no_fallback')
+        # before linking. The explicit -L lets it resolve libglib-2.0.so /
+        # libgobject-2.0.so.
+        env:
+          PKG_CONFIG_ALLOW_SYSTEM_LIBS: "1"
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}.2.34 -p moq-gst
+
+      - name: Package .deb
+        shell: bash
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+          ARCH: ${{ matrix.deb-arch }}
+          PKG_NAME: gstreamer1.0-moq
+          PLUGIN_PATH: target/${{ matrix.target }}/release/libgstmoq.so
+          PLUGIN_DIR: /usr/lib/${{ matrix.deb-multiarch }}/gstreamer-1.0
+        run: |
+          mkdir -p dist
+          rs/scripts/package-nfpm.sh packaging/moq-gst/nfpm.yaml deb dist/
+
+      - name: Package .rpm
+        shell: bash
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+          ARCH: ${{ matrix.rpm-arch }}
+          PKG_NAME: gstreamer1-moq
+          PLUGIN_PATH: target/${{ matrix.target }}/release/libgstmoq.so
+          PLUGIN_DIR: /usr/lib64/gstreamer-1.0
+        run: |
+          mkdir -p dist
+          rs/scripts/package-nfpm.sh packaging/moq-gst/nfpm.yaml rpm dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: moq-gst-pkg-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Release
+    needs: [build, package]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Parse version
+        id: parse
+        run: .github/scripts/release.sh parse-version moq-gst
+
+      - name: Find previous tag
+        id: prev_tag
+        run: .github/scripts/release.sh prev-tag moq-gst
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TITLE: "moq-gst v${{ steps.parse.outputs.version }}"
+          RELEASE_PREV_TAG: ${{ steps.prev_tag.outputs.tag }}
+        run: .github/scripts/release.sh create artifacts
+
+      - name: Trigger apt/rpm repo publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: .github/scripts/trigger-repo-publish.sh

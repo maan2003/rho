@@ -1,0 +1,112 @@
+import MoqFFI
+
+// Plain data types (records + enums) and small objects (e.g. `AudioCodec`)
+// are re-exported under de-prefixed names.
+// These carry no behavior, so a typealias keeps them in lockstep with the
+// `moq-ffi` crate automatically. The stateful handle types are fully wrapped
+// instead (see Client.swift, Broadcast.swift, etc.), so MoqFFI's `Moq`-prefixed
+// classes never appear in the public API.
+
+/// A payload plus the presentation timestamp it should play at. The unit of
+/// every raw write and raw read.
+public typealias Frame = MoqFFI.MoqFrame
+/// A media frame whose keyframe flag marks a group start or video keyframe; audio flags only group starts.
+public typealias MediaFrame = MoqFFI.MoqMediaFrame
+/// The JSON manifest describing a broadcast's tracks: video and audio
+/// renditions, display geometry, and untyped application sections.
+public typealias Catalog = MoqFFI.MoqCatalog
+/// A video rendition in the catalog: codec, dimensions, bitrate, temporary
+/// avoidance recommendation, framerate, and container.
+public typealias Video = MoqFFI.MoqVideo
+/// Caller-provided catalog fields for a video track.
+public typealias VideoHint = MoqFFI.MoqVideoHint
+/// A single audio codec an importer can parse.
+public typealias AudioFormat = MoqFFI.MoqAudioFormat
+/// A single video codec an importer can parse.
+public typealias VideoFormat = MoqFFI.MoqVideoFormat
+/// A container that publishes its own tracks.
+public typealias ContainerFormat = MoqFFI.MoqContainerFormat
+/// Catalog properties shared by every video rendition. A `nil` field clears
+/// that property from the next catalog snapshot.
+public typealias VideoProperties = MoqFFI.MoqVideoProperties
+/// An audio rendition in the catalog: codec, sample rate, channel count,
+/// bitrate, and container.
+public typealias Audio = MoqFFI.MoqAudio
+/// One raw-audio frame: PCM samples in the configured layout plus a
+/// presentation timestamp.
+public typealias AudioFrame = MoqFFI.MoqAudioFrame
+/// A width and height in pixels.
+public typealias Dimensions = MoqFFI.MoqDimensions
+/// The PCM layout (format, sample rate, channels) written to an `AudioProducer`.
+public typealias AudioEncoderInput = MoqFFI.MoqAudioEncoderInput
+/// The encoder-side config for a published audio track: codec, rate, channels,
+/// bitrate, and frame duration.
+public typealias AudioEncoderOutput = MoqFFI.MoqAudioEncoderOutput
+/// What a `VideoConsumer` decodes to: an optional resize plus a max age.
+public typealias VideoDecoderOutput = MoqVideoDecoderOutput
+/// One decoded video frame: packed I420, its dimensions, and a timestamp.
+public typealias VideoDecodedFrame = MoqVideoDecodedFrame
+/// The PCM layout an `AudioConsumer` decodes to, plus its max age.
+public typealias AudioDecoderOutput = MoqFFI.MoqAudioDecoderOutput
+/// A raw PCM sample format, mirroring WebCodecs `AudioData.format`.
+public typealias AudioSampleFormat = MoqFFI.MoqAudioSampleFormat
+/// Selects the audio encoder codec. Build one with `AudioCodec.opus()`.
+public typealias AudioCodec = MoqFFI.MoqAudioCodec
+/// One raw video frame: pixels in the configured layout plus a presentation
+/// timestamp.
+public typealias VideoFrame = MoqFFI.MoqVideoFrame
+/// The pixel layout, resolution, and framerate written to a `VideoProducer`.
+public typealias VideoEncoderInput = MoqFFI.MoqVideoEncoderInput
+/// The encoder-side config for a published video track: name, codec, bitrate,
+/// keyframe interval, and backend preference.
+public typealias VideoEncoderOutput = MoqFFI.MoqVideoEncoderOutput
+/// A raw pixel layout (I420 or RGBA) fed to a `VideoProducer`.
+public typealias VideoPixelFormat = MoqFFI.MoqVideoPixelFormat
+/// A video codec identifier (H.264 or H.265).
+public typealias VideoCodec = MoqFFI.MoqVideoCodec
+/// Which encoder implementation to use: automatic, hardware, software, or one
+/// named backend.
+public typealias VideoEncoderKind = MoqFFI.MoqVideoEncoderKind
+/// How a track's frames are packaged (Legacy, CMAF, or LOC), as advertised in
+/// the catalog.
+public typealias Container = MoqFFI.MoqContainer
+/// A best-effort raw-track datagram as received: sequence, timestamp, and payload.
+public typealias Datagram = MoqFFI.MoqDatagram
+/// A path-prefix route: the prefix it covers, relay hop ids (oldest first),
+/// and the advertised costs: warm `cost`, lower wins, plus undiscounted `cold`
+/// (`nil` means the same as `cost`).
+public typealias Route = MoqFFI.MoqRoute
+/// Per-subscription delivery preferences: priority, group ordering, latency
+/// budget, and group range.
+public typealias Subscription = MoqFFI.MoqSubscription
+/// Options for fetching one complete group by sequence.
+public typealias FetchGroupOptions = MoqFFI.MoqFetchGroupOptions
+/// Publisher-side track properties: priority, group ordering, max age,
+/// and timescale.
+public typealias TrackInfo = MoqFFI.MoqTrackInfo
+
+/// A snapshot of connection statistics (RTT, bandwidth estimates, byte/packet
+/// counters). Fields are `nil` when the transport backend doesn't report them.
+public typealias ConnectionStats = MoqFFI.MoqConnectionStats
+
+/// Retry pacing for the automatic reconnect; see `Client.setBackoff`.
+public typealias Backoff = MoqFFI.MoqBackoff
+
+/// A connection lifecycle transition reported by `Session.status()`.
+public typealias ConnectionStatus = MoqFFI.MoqConnectionStatus
+
+/// The network transport carrying an incoming session.
+public typealias Transport = MoqFFI.MoqTransport
+
+/// The error thrown by every throwing call in this package. Already conforms to
+/// `Swift.Error` and `LocalizedError`; see `Errors.swift` for conveniences.
+public typealias MoqError = MoqFFI.MoqError
+
+/// Whether a protocol code is from the session or stream registry.
+public typealias ErrorScope = MoqFFI.MoqErrorScope
+
+/// A recognized protocol kind, or `app` / `unknown` when the code is not named.
+public typealias ProtocolKind = MoqFFI.MoqProtocolKind
+
+/// A protocol failure: scope, verbatim wire code, kind, and a diagnostic message.
+public typealias ProtocolError = MoqFFI.MoqProtocolError

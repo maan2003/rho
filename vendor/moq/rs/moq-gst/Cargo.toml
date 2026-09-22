@@ -1,0 +1,35 @@
+[package]
+name = "moq-gst"
+description = "Media over QUIC - GStreamer plugin"
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.3.12"
+edition = "2024"
+rust-version.workspace = true
+publish = true
+
+[lib]
+name = "gstmoq"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+anyhow = { workspace = true, features = ["backtrace"] }
+bytes = { workspace = true }
+gst = { package = "gstreamer", version = "0.23" }
+hang = { workspace = true }
+moq-mux = { workspace = true }
+moq-net = { workspace = true }
+moq-tokio = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

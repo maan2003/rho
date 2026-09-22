@@ -1,0 +1,189 @@
+name: Release Go
+
+# Publishes the ergonomic moq-go wrapper to the moq-dev/moq-go mirror, versioned
+# independently of the moq-ffi crate.
+#
+#   * MAJOR.MINOR is the human-owned API line in go/wrapper/VERSION.
+#   * PATCH is derived by publish-wrapper.sh from the mirror's existing tags
+#     (registry is the gate, like release-plz / the PyPI check in release.sh).
+#
+# Triggers:
+#   * push to main        — a wrapper API or VERSION change. The ffi require is
+#                           pinned to the current crate version, whose mirror tag
+#                           already exists in steady state. If it's missing (a
+#                           release is mid-flight), the job skips: the
+#                           workflow_run below republishes once the ffi lands.
+#   * Release Go FFI done  — a new ffi just published to the moq-go-ffi mirror.
+#                           Re-cut the wrapper so `moq.dev/moq@latest` floats to
+#                           the newest native core (Go MVS won't float on its own).
+#                           Chaining off the upstream run guarantees the mirror
+#                           tag is already present, so there is nothing to poll.
+#
+# Stray main pushes are harmless: publish-wrapper.sh skips when the staged tree
+# matches the mirror, so unchanged content never mints an empty patch release.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_run:
+    workflows: ["Release Go FFI"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+# One at a time: publish-wrapper.sh derives the next patch from the mirror's
+# tags, so two concurrent runs could race to the same tag.
+concurrency:
+  group: release-go
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build wrapper module
+    runs-on: ubuntu-latest
+    # Owner gate, plus: only react to a successful Release Go FFI run for a
+    # moq-ffi-v* tag. Require event == 'push' so a fork PR whose head branch is
+    # named `moq-ffi-v*` can't satisfy head_branch and reach the publish secrets
+    # (workflow_run runs in the base repo's privileged context). Pushes here are
+    # unconditional.
+    if: >-
+      github.repository_owner == 'moq-dev' &&
+      (github.event_name == 'push' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        startsWith(github.event.workflow_run.head_branch, 'moq-ffi-v')))
+    outputs:
+      skip: ${{ steps.gate.outputs.skip }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.23"
+
+      - name: Read wrapper version line
+        id: line
+        run: |
+          LINE=$(tr -d '[:space:]' < go/wrapper/VERSION)
+          if [[ ! "$LINE" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::go/wrapper/VERSION must be MAJOR.MINOR, got '$LINE'"
+            exit 1
+          fi
+          echo "line=$LINE" >> "$GITHUB_OUTPUT"
+          echo "wrapper line: $LINE"
+
+      # The ffi version the wrapper should require: the version of the ffi that
+      # just published (workflow_run), or the current crate version (main push).
+      - name: Resolve ffi version
+        id: ffi
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
+            # Upstream tag ref, e.g. moq-ffi-v0.3.1.
+            VERSION="${HEAD_BRANCH#moq-ffi-v}"
+            echo "Triggered by Release Go FFI: ffi v$VERSION"
+          else
+            VERSION=$(grep '^version' rs/moq-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "Using ffi version from Cargo.toml: $VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # On a main push the wrapper pins the current crate's ffi, whose mirror tag
+      # already exists in steady state. If it's missing, a release is mid-flight
+      # (release-plz merged but Release Go FFI hasn't published yet): skip, since
+      # the workflow_run trigger republishes once the ffi lands. One existence
+      # check, no polling. workflow_run runs are chained after that publish, so
+      # the tag is guaranteed present and this gate doesn't run for them.
+      - name: Gate on published ffi (push only)
+        id: gate
+        if: github.event_name == 'push'
+        env:
+          FFI_VERSION: ${{ steps.ffi.outputs.version }}
+        run: |
+          # Distinguish "tag absent" from a lookup failure: a network error must
+          # fail loudly, not masquerade as "defer" (nothing retries a wrapper-only
+          # push, so a silent skip would drop the release).
+          if ! TAGS=$(git ls-remote --tags https://github.com/moq-dev/moq-go-ffi "refs/tags/v${FFI_VERSION}"); then
+            echo "::error::failed to query the moq-go-ffi mirror for tags"
+            exit 1
+          fi
+          if [[ -z "$TAGS" ]]; then
+            echo "::warning::moq-go-ffi v${FFI_VERSION} not on the mirror yet; deferring to the Release Go FFI chain."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Existing is not the same as usable. The wrapper pins moq.dev/moq-ffi,
+          # so a tag published before the module was renamed still declares
+          # github.com/moq-dev/moq-go-ffi and `go mod tidy` below would abort on
+          # the path mismatch. Defer to the same chain: the next ffi release
+          # republishes the mirror under the new path and re-cuts the wrapper.
+          MOD_URL="https://raw.githubusercontent.com/moq-dev/moq-go-ffi/v${FFI_VERSION}/go.mod"
+          if ! MOD=$(curl -fsSL "$MOD_URL"); then
+            echo "::error::failed to read go.mod from the moq-go-ffi mirror at v${FFI_VERSION}"
+            exit 1
+          fi
+          if grep -qE '^module[[:space:]]+moq\.dev/moq-ffi$' <<< "$MOD"; then
+            echo "moq-go-ffi v${FFI_VERSION} is published and declares moq.dev/moq-ffi; proceeding."
+          else
+            echo "::warning::moq-go-ffi v${FFI_VERSION} predates the module rename; deferring to the Release Go FFI chain."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package wrapper
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          LINE: ${{ steps.line.outputs.line }}
+          FFI_VERSION: ${{ steps.ffi.outputs.version }}
+        run: |
+          ./go/scripts/package-wrapper.sh --line "$LINE" --ffi-version "$FFI_VERSION" --output release-out
+
+      - name: Upload wrapper module
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: go-wrapper-package
+          path: release-out/*
+
+  publish:
+    name: Publish to Go module mirror
+    needs: [build]
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate moq-bot token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: moq-dev
+          repositories: moq-go
+          # Narrow the minted token to only what publish-wrapper.sh needs.
+          permission-contents: write
+
+      - name: Download package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: go-wrapper-package
+          path: go-out
+
+      - name: Publish to moq-dev/moq-go mirror
+        env:
+          # Token is minted fresh per run, expires in 1 hour, never at rest.
+          GO_MIRROR_TOKEN: ${{ steps.token.outputs.token }}
+          GIT_AUTHOR_NAME: moq-bot
+          GIT_AUTHOR_EMAIL: moq-bot[bot]@users.noreply.github.com
+        run: ./go/scripts/publish-wrapper.sh

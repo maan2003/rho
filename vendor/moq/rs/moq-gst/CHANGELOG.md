@@ -1,0 +1,192 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- Track suffixes derive from the typed import format, so the suffix and the codec cannot disagree.
+- `Presence` fields used by the sessions structure are `sessions_started` / `sessions_ended`; the GStreamer properties stay `started` / `ended`.
+
+## [0.3.12](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.11...moq-gst-v0.3.12) - 2026-09-17
+
+### Added
+
+- *(moq-gst)* expose connection statistics ([#3679](https://github.com/moq-dev/moq/pull/3679))
+
+## [0.3.11](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.10...moq-gst-v0.3.11) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net, moq-native, hang, moq-mux
+
+## [0.3.10](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.9...moq-gst-v0.3.10) - 2026-09-09
+
+### Fixed
+
+- *(moq-net)* answer for a name the broadcast never served ([#3366](https://github.com/moq-dev/moq/pull/3366))
+
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.8...moq-gst-v0.3.9) - 2026-09-02
+
+### Fixed
+
+- *(packaging)* render nfpm environment variables ([#3340](https://github.com/moq-dev/moq/pull/3340))
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.7...moq-gst-v0.3.8) - 2026-09-01
+
+### Added
+
+- *(moq-gst)* expose sink-pad publication lifecycle ([#2998](https://github.com/moq-dev/moq/pull/2998))
+
+### Fixed
+
+- *(moq-gst)* keep one rendition's subscribe off the catalog loop ([#3130](https://github.com/moq-dev/moq/pull/3130))
+- *(moq-gst)* tie the session's lifetime to the state transition ([#3101](https://github.com/moq-dev/moq/pull/3101))
+- *(moq-gst)* let a flush restart a pad that already sent EOS ([#3104](https://github.com/moq-dev/moq/pull/3104))
+- *(moq-gst)* scope a terminal session error to the session that earned it ([#3102](https://github.com/moq-dev/moq/pull/3102))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.6...moq-gst-v0.3.7) - 2026-08-24
+
+### Added
+
+- *(moq-gst)* publish opaque application data tracks
+- *(moq-gst)* let sink pads name the track they publish ([#2983](https://github.com/moq-dev/moq/pull/2983))
+
+### Fixed
+
+- *(moq-gst)* make startup properties READY-only ([#2982](https://github.com/moq-dev/moq/pull/2982))
+
+### Other
+
+- name release archives after their tag and publish SHA256SUMS ([#2995](https://github.com/moq-dev/moq/pull/2995))
+
+## [0.3.6](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.5...moq-gst-v0.3.6) - 2026-08-20
+
+### Other
+
+- updated the following local packages: moq-mux
+
+## [0.3.5](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.4...moq-gst-v0.3.5) - 2026-08-07
+
+### Other
+
+- drop Intel macOS release targets ([#2715](https://github.com/moq-dev/moq/pull/2715))
+
+## [0.3.4](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.3...moq-gst-v0.3.4) - 2026-08-06
+
+### Added
+
+- fail-fast retries: jittered backoff bounded by time, not error type ([#2647](https://github.com/moq-dev/moq/pull/2647))
+
+## [0.3.3](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.2...moq-gst-v0.3.3) - 2026-07-25
+
+### Fixed
+
+- *(opus)* propagate pre-skip and encoder controls ([#2492](https://github.com/moq-dev/moq/pull/2492))
+
+## [0.3.2](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.1...moq-gst-v0.3.2) - 2026-07-24
+
+### Other
+
+- updated the following local packages: moq-mux
+
+## [0.3.1](https://github.com/moq-dev/moq/compare/moq-gst-v0.3.0...moq-gst-v0.3.1) - 2026-07-23
+
+### Other
+
+- *(rust)* pin the toolchain and correct the MSRV claims ([#2462](https://github.com/moq-dev/moq/pull/2462))
+
+## [0.3.0](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.12...moq-gst-v0.3.0) - 2026-07-22
+
+### Added
+
+- *(net)* unannounce as soon as the last route detaches ([#2419](https://github.com/moq-dev/moq/pull/2419))
+- *(moq-video)* [**breaking**] adapt the encoder bitrate to the congestion-control estimate ([#2303](https://github.com/moq-dev/moq/pull/2303))
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- [**breaking**] pre-bump API polish across the release batch ([#2423](https://github.com/moq-dev/moq/pull/2423))
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- *(hang)* [**breaking**] non_exhaustive catalog sections, shared container::track_info, hang draft catch-up ([#2341](https://github.com/moq-dev/moq/pull/2341))
+- Merge branch 'main' into dev
+- Merge branch 'main' into dev
+
+## [0.2.12](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.11...moq-gst-v0.2.12) - 2026-07-15
+
+### Fixed
+
+- *(moq-gst)* reconnect the moqsink publisher instead of dying on transport death ([#2240](https://github.com/moq-dev/moq/pull/2240))
+
+## [0.2.11](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.10...moq-gst-v0.2.11) - 2026-07-12
+
+### Other
+
+- updated the following local packages: moq-native
+
+## [0.2.10](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.9...moq-gst-v0.2.10) - 2026-07-04
+
+### Added
+
+- *(moq-mux,moq-gst)* MP3 support for MKV and GStreamer ([#1970](https://github.com/moq-dev/moq/pull/1970))
+
+## [0.2.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.8...moq-gst-v0.2.9) - 2026-06-30
+
+### Other
+
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+- moqsink on a bare Element with direct (no-channel) writes ([#1893](https://github.com/moq-dev/moq/pull/1893))
+
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.7...moq-gst-v0.2.8) - 2026-06-23
+
+### Fixed
+
+- *(moq-gst)* deterministic moqsrc pad names so CMAF playback works ([#1809](https://github.com/moq-dev/moq/pull/1809))
+
+### Other
+
+- split CLAUDE.md into per-directory guides ([#1846](https://github.com/moq-dev/moq/pull/1846))
+- fix plugin license + broadcast-aligned timestamps ([#1808](https://github.com/moq-dev/moq/pull/1808))
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.6...moq-gst-v0.2.7) - 2026-06-17
+
+### Added
+
+- *(hang)* add Catalog.Producer/Consumer wrapping @moq/json ([#1767](https://github.com/moq-dev/moq/pull/1767))
+
+## [0.2.6](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.5...moq-gst-v0.2.6) - 2026-06-16
+
+### Other
+
+- *(moq-gst)* moqsrc reconcile follow-ups ([#1647](https://github.com/moq-dev/moq/pull/1647)) ([#1683](https://github.com/moq-dev/moq/pull/1683))
+
+## [0.2.5](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.4...moq-gst-v0.2.5) - 2026-06-10
+
+### Added
+
+- *(hang,json,moq-mux)* generic catalog with application extensions ([#1658](https://github.com/moq-dev/moq/pull/1658))
+
+### Fixed
+
+- *(moq-relay)* classify malformed auth-API JSON as an upstream 502
+- *(moq-gst)* stop moqsrc panicking on backwards timestamps; globally unique pad ids ([#1646](https://github.com/moq-dev/moq/pull/1646))
+- *(moq-gst)* follow catalog updates dynamically in moqsrc ([#1627](https://github.com/moq-dev/moq/pull/1627))
+
+### Other
+
+- Revert accidental commit 24d25604 (moq-native connect/reconnect refactor)
+- *(moq-gst)* pump moqsrc pads directly instead of bridging to glib ([#1633](https://github.com/moq-dev/moq/pull/1633))
+- add VP8 and VP9 codec support ([#1632](https://github.com/moq-dev/moq/pull/1632))
+- cross-compile all x86_64-darwin release artifacts on Apple Silicon ([#1623](https://github.com/moq-dev/moq/pull/1623))

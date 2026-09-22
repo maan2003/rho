@@ -1,0 +1,244 @@
+import * as Ietf from "../ietf/index.ts";
+import * as Lite from "../lite/index.ts";
+import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
+import { Stream } from "../stream.ts";
+import type { Established } from "./established.ts";
+import { forwardAnnounced } from "./forward.ts";
+import { exchangeSetup } from "./handshake.ts";
+
+/** Options for {@link accept}. */
+export interface AcceptProps {
+	/** The accepted transport. */
+	transport: WebTransport;
+	/** The request URL associated with the transport. */
+	url: URL;
+
+	/** Version to select during SETUP negotiation (for non-ALPN paths). */
+	version?: number;
+
+	/**
+	 * Whether this server supports broadcast discovery; see {@link Established.discovery}.
+	 * Defaults to true.
+	 */
+	discovery?: boolean;
+
+	/**
+	 * The origin whose broadcasts the session announces and serves to the peer. Omit to
+	 * publish nothing. Borrowed, not owned: closing the session leaves its broadcasts alone.
+	 */
+	publish?: OriginConsumer;
+
+	/**
+	 * The origin the session feeds with the peer's announced broadcasts. Omit to discover
+	 * nothing. The entries retract when the session dies; see the `consume` connect option.
+	 */
+	consume?: OriginProducer;
+}
+
+/** The per-session wiring shared by every negotiated protocol path. */
+type SessionProps = {
+	discovery: boolean;
+	publish?: OriginConsumer;
+};
+
+/**
+ * Server-side handshake: accepts a transport and performs the server half of the SETUP exchange.
+ *
+ * @param transport - The WebTransport session to accept
+ * @param url - The URL of the connection
+ * @param props - Optional configuration
+ * @returns A promise that resolves to a Connection instance
+ */
+export async function accept({ transport, url, ...props }: AcceptProps): Promise<Established> {
+	const connection = await acceptInner(transport, url, props);
+	if (props.consume) forwardAnnounced(connection, props.consume);
+	return connection;
+}
+
+async function acceptInner(
+	transport: WebTransport,
+	url: URL,
+	props: Omit<AcceptProps, "transport" | "url">,
+): Promise<Established> {
+	// @ts-expect-error - TODO: add protocol to WebTransport
+	const protocol: string | undefined = transport.protocol;
+
+	const wiring: SessionProps = {
+		discovery: props.discovery ?? true,
+		publish: props.publish,
+	};
+
+	if (protocol === Ietf.ALPN.DRAFT_22) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_22, wiring);
+	}
+	if (protocol === Ietf.ALPN.DRAFT_21) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_21, wiring);
+	}
+	if (protocol === Ietf.ALPN.DRAFT_20) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_20, wiring);
+	}
+	if (protocol === Ietf.ALPN.DRAFT_19) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_19, wiring);
+	} else if (protocol === Ietf.ALPN.DRAFT_18) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_18, wiring);
+	} else if (protocol === Ietf.ALPN.DRAFT_17) {
+		return acceptAlpn(transport, url, Ietf.Version.DRAFT_17, wiring);
+	} else if (protocol === Ietf.ALPN.DRAFT_16) {
+		return acceptSetup(transport, url, Ietf.Version.DRAFT_16, wiring);
+	} else if (protocol === Ietf.ALPN.DRAFT_15) {
+		return acceptSetup(transport, url, Ietf.Version.DRAFT_15, wiring);
+	} else if (protocol === Lite.ALPN_06_WIP) {
+		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_06, ...wiring });
+	} else if (protocol === Lite.ALPN_05) {
+		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_05, ...wiring });
+	} else if (protocol === Lite.ALPN_04) {
+		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_04, ...wiring });
+	} else if (protocol === Lite.ALPN_03) {
+		return new Lite.Connection({ url, quic: transport, version: Lite.Version.DRAFT_03, ...wiring });
+	} else if (protocol === Lite.ALPN || protocol === "" || protocol === undefined) {
+		return acceptNegotiated(transport, url, wiring, props.version);
+	} else {
+		throw new Error(`unsupported WebTransport protocol: ${protocol}`);
+	}
+}
+
+/**
+ * Draft-17+ accept: ALPN already pinned the version. SETUP is exchanged over
+ * a pair of uni streams using stream type 0x2F00.
+ */
+async function acceptAlpn(
+	transport: WebTransport,
+	url: URL,
+	version: Ietf.IetfVersion,
+	wiring: SessionProps,
+): Promise<Established> {
+	const { control, solicit, cluster } = await exchangeSetup(transport, version, "moq-lite-js");
+
+	return new Ietf.Connection({
+		...wiring,
+		client: false,
+		url,
+		quic: transport,
+		control,
+		solicit,
+		cluster,
+		// v17+ uses NativeSession which manages its own request IDs; maxRequestId is unused.
+		maxRequestId: 0n,
+		version,
+	});
+}
+
+/**
+ * Legacy accept (draft-15/16): ALPN pinned the version, but the SETUP message
+ * is still exchanged over a bidi stream wrapped in the moq-lite compat envelope.
+ */
+async function acceptSetup(
+	transport: WebTransport,
+	url: URL,
+	version: Ietf.IetfVersion,
+	wiring: SessionProps,
+): Promise<Established> {
+	// Accept bidi, read ClientSetup, write ServerSetup
+	const stream = await Stream.accept(transport);
+	if (!stream) throw new Error("no incoming bidi stream for SETUP");
+
+	const clientCompat = await stream.reader.u53();
+	if (clientCompat !== Lite.StreamId.ClientCompat) {
+		throw new Error(`unexpected client message type: 0x${clientCompat.toString(16)}`);
+	}
+
+	const client = await Ietf.ClientSetup.decode(stream.reader, version);
+
+	await stream.writer.u53(Lite.StreamId.ServerCompat);
+
+	const encoder = new TextEncoder();
+	const params = new Ietf.SetupOptions();
+	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
+	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
+	Ietf.solicitIntoSetup(params);
+
+	const server = new Ietf.ServerSetup({ version, parameters: params });
+	await server.encode(stream.writer, version);
+
+	const maxRequestId = 42069n;
+
+	return new Ietf.Connection({
+		...wiring,
+		client: false,
+		url,
+		quic: transport,
+		control: stream,
+		maxRequestId,
+		version,
+		solicit: Ietf.solicitFromSetup(client.parameters),
+	});
+}
+
+async function acceptNegotiated(
+	transport: WebTransport,
+	url: URL,
+	wiring: SessionProps,
+	version?: number,
+): Promise<Established> {
+	const setupVersion = Ietf.Version.DRAFT_14;
+
+	const stream = await Stream.accept(transport);
+	if (!stream) throw new Error("no incoming bidi stream for SETUP");
+
+	const clientCompat = await stream.reader.u53();
+	if (clientCompat !== Lite.StreamId.ClientCompat) {
+		throw new Error(`unexpected client message type: 0x${clientCompat.toString(16)}`);
+	}
+
+	const client = await Ietf.ClientSetup.decode(stream.reader, setupVersion);
+
+	// Pick the requested version, or first matching version from client's list
+	const allVersions = [...Object.values(Lite.Version), ...Object.values(Ietf.Version)] as number[];
+	let selectedVersion: number;
+	if (version !== undefined) {
+		selectedVersion = version;
+	} else {
+		const match = client.versions.find((v) => allVersions.includes(v));
+		if (match === undefined) {
+			throw new Error(
+				`no common version found; client offered: ${client.versions.map((v) => v.toString(16)).join(", ")}`,
+			);
+		}
+		selectedVersion = match;
+	}
+
+	await stream.writer.u53(Lite.StreamId.ServerCompat);
+
+	const encoder = new TextEncoder();
+	const params = new Ietf.SetupOptions();
+	params.setVarint(Ietf.SetupOption.MaxRequestId, 42069n);
+	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
+	Ietf.solicitIntoSetup(params);
+
+	const server = new Ietf.ServerSetup({ version: selectedVersion, parameters: params });
+	await server.encode(stream.writer, setupVersion);
+
+	if (Object.values(Lite.Version).includes(selectedVersion as Lite.Version)) {
+		return new Lite.Connection({
+			url,
+			quic: transport,
+			version: selectedVersion as Lite.Version,
+			session: stream,
+			...wiring,
+		});
+	} else if (Object.values(Ietf.Version).includes(selectedVersion as Ietf.Version)) {
+		const maxRequestId = client.parameters.getVarint(Ietf.SetupOption.MaxRequestId) ?? 0n;
+		return new Ietf.Connection({
+			...wiring,
+			client: false,
+			url,
+			quic: transport,
+			control: stream,
+			maxRequestId,
+			version: selectedVersion as Ietf.IetfVersion,
+			solicit: Ietf.solicitFromSetup(client.parameters),
+		});
+	} else {
+		throw new Error(`unsupported version: ${selectedVersion.toString(16)}`);
+	}
+}

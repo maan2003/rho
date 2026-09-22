@@ -1,0 +1,43 @@
+//! AV1 bridge.
+//!
+//! str0m hands us complete AV1 temporal units (OBU-framed, with inline sequence
+//! headers). This feeds the moq-mux AV1 splitter/importer so catalog config and
+//! keyframe detection stay shared with the other ingest paths.
+
+use crate::{Result, codec};
+
+/// Bridges str0m AV1 temporal units into a MoQ AV1 track.
+pub struct Bridge {
+	split: moq_mux::codec::av1::Split,
+	import: moq_mux::codec::av1::Import,
+}
+
+impl Bridge {
+	/// Publish an `.av1` track on `broadcast`, adding the catalog rendition once config is known.
+	pub fn new(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Result<Self> {
+		let track = broadcast.unique_track(".av1", catalog.track_info(hang::catalog::PRIORITY.video))?;
+		let import = moq_mux::codec::av1::Import::new(track, catalog.reserve(), Default::default())?;
+		let split = moq_mux::codec::av1::Split::new();
+		Ok(Self { split, import })
+	}
+}
+
+impl codec::Bridge for Bridge {
+	fn push(&mut self, frame: codec::Frame) -> Result<()> {
+		let pts = moq_net::Timestamp::from_micros(frame.timestamp_us).map_err(moq_mux::Error::from)?;
+		// str0m hands over one whole temporal unit per frame, so flush to emit it.
+		let mut frames = self.split.decode(&frame.payload, Some(pts))?;
+		frames.extend(self.split.flush(Some(pts))?);
+		self.import.decode(frames)?;
+		Ok(())
+	}
+
+	fn tick(&mut self) -> Result<()> {
+		self.import.tick()?;
+		Ok(())
+	}
+
+	fn abort(self: Box<Self>, err: moq_net::Error) {
+		self.import.abort(err);
+	}
+}

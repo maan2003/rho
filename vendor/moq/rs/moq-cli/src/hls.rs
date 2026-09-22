@@ -1,0 +1,118 @@
+//! HLS endpoints: pull a remote playlist into MoQ (import), or serve HLS and
+//! DASH over HTTP from MoQ broadcasts (export), fetching media groups on demand.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use anyhow::Context;
+use axum::http::Method;
+use hang::moq_net;
+use url::Url;
+
+use crate::moq::{ImportTarget, notify_ready};
+
+/// HLS import (pull a remote playlist) args.
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+pub struct ImportArgs {
+	/// Playlist URL (http/https) or local file path.
+	#[usage(value_hint = usage::ValueHint::AnyPath, extensions("m3u8", "m3u"))]
+	pub playlist: String,
+}
+
+/// HLS export (serve over HTTP) args.
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+pub struct ExportArgs {
+	/// HTTP listener for the HLS endpoints.
+	#[usage(long, default = "[::]:8089")]
+	pub listen: SocketAddr,
+
+	/// TLS certificates, keys, self-signed generation, and optional mTLS roots.
+	#[usage(flatten)]
+	pub tls: moq_tokio::tls::Listen,
+
+	/// Minimum media listed in each rendition's playlist window. Keep it within the
+	/// relay's group-cache retention, since segments are fetched from there on request.
+	#[usage(long, default = "16s")]
+	pub window: crate::duration::Duration,
+
+	/// Browser CORS policy for the HLS listener.
+	#[usage(flatten)]
+	pub cors: crate::web::Cors,
+}
+
+/// Pull a remote HLS/LL-HLS playlist (URL or file path) into the Origin under `target.name`.
+pub async fn import(target: ImportTarget, playlist: String) -> anyhow::Result<()> {
+	let ImportTarget {
+		origin,
+		name,
+		max_age,
+		bandwidth,
+	} = target;
+	let mut producer = origin.create_broadcast(&name).context("failed to create broadcast")?;
+
+	// Create catalog tracks before announcing so a subscriber can consume the
+	// catalog as soon as it observes the announcement.
+	let config = moq_mux::catalog::Config::default()
+		.with_max_age(max_age)
+		.with_bandwidth(bandwidth);
+	let catalog = moq_mux::catalog::Producer::new(&mut producer, config)?;
+	producer
+		.announce(Default::default())
+		.context("failed to announce broadcast")?;
+
+	let playlist = playlist_url(&playlist)?;
+	let mut importer = moq_hls::import::Import::new(producer, catalog, moq_hls::import::Config::new(playlist))?;
+
+	tracing::info!(%name, "importing HLS");
+
+	importer.init().await?;
+	notify_ready();
+	Ok(importer.run().await?)
+}
+
+fn playlist_url(playlist: &str) -> anyhow::Result<Url> {
+	if playlist.starts_with("http://") || playlist.starts_with("https://") {
+		return Url::parse(playlist).context("invalid HLS playlist URL");
+	}
+
+	let path = PathBuf::from(playlist);
+	let absolute = if path.is_absolute() {
+		path
+	} else {
+		std::env::current_dir()?.join(path)
+	};
+	Url::from_file_path(&absolute).map_err(|_| anyhow::anyhow!("invalid HLS playlist path: {}", absolute.display()))
+}
+
+/// Serve HLS and DASH over HTTP for the single broadcast `name` (reached at
+/// `/<name>/master.m3u8` and `/<name>/manifest.mpd`); other broadcasts in the
+/// Origin are not served.
+pub async fn export(origin: moq_net::origin::Consumer, args: ExportArgs, name: String) -> anyhow::Result<()> {
+	let scope = moq_net::Patterns::from(
+		moq_net::Pattern::subtree(&name).with_context(|| format!("invalid broadcast name `{name}`"))?,
+	);
+	let scoped = origin
+		.scope("", &scope)
+		.with_context(|| format!("failed to scope origin to broadcast `{name}`"))?;
+
+	let mut config = moq_hls::export::Config::default();
+	config.window = args.window.into_std();
+	let server = moq_hls::Server::new(scoped, config);
+	let app = server.router().layer(args.cors.layer([Method::GET])?);
+
+	let tls = if args.tls.cert.is_empty() && args.tls.generate.is_empty() {
+		None
+	} else {
+		let alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+		Some(args.tls.server_config(alpn)?)
+	};
+
+	let listener = moq_tokio::bind::tcp(args.listen)?;
+
+	tracing::info!(listen = %args.listen, "serving HLS");
+	notify_ready();
+
+	crate::web::serve(listener, app, tls).await
+}
