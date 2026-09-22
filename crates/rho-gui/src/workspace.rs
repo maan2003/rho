@@ -479,14 +479,6 @@ pub struct Workspace {
     /// `Log` at a time, and the rebuild walks every agent.
     desk_sync_pending: HashMap<HostId, Option<BTreeSet<AgentId>>>,
     _dealer_signal_task: Task<()>,
-    /// Held so it lives as long as the workspace: it reads the desk from
-    /// the replica the moment the file is open, which is after this
-    /// constructor has run.
-    desk_replica_task: Option<Task<()>>,
-    /// Whether the replica has had its chance to open, either because it
-    /// did or because this session has no file to open. The first
-    /// handshake waits for this and nothing else does.
-    desk_replica_settled: bool,
     /// What the replica would hold, said by a test instead of a file.
     #[cfg(test)]
     pub(crate) desk_replica_for_test: HashMap<String, rho_mirror::desk::HeldDesk>,
@@ -1037,8 +1029,6 @@ impl Workspace {
             dealer_signal_eval_scheduled: false,
             desk_sync_pending: HashMap::new(),
             _dealer_signal_task: dealer_signal_task,
-            desk_replica_task: None,
-            desk_replica_settled: false,
             #[cfg(test)]
             desk_replica_for_test: HashMap::new(),
             lamp_on: false,
@@ -1084,47 +1074,18 @@ impl Workspace {
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
         };
+        let no_hosts = specs.is_empty();
         for spec in specs {
             this.attach_host(spec, cx);
         }
         // The desk is this client's and its replica is on this disk, so it
         // is read without a socket. Home's first draw then shows the
         // user's own verdicts instead of a list that waits to hear from a
-        // daemon and deals what they put away yesterday.
-        //
-        // Read again when the file opens, because it opens on the model
-        // thread this constructor has only just started: the read below
-        // finds nothing on a cold start, and waiting for it here would be
-        // a frame waiting on redb rebuilding an allocator. Nothing waits;
-        // the desk simply arrives, still long before any daemon answers.
+        // daemon and deals what they put away yesterday. The file was
+        // opened by `main` before any window, so the read finds it.
         for host in this.hosts.ids() {
             this.open_desk_from_replica(host, window, cx);
         }
-        let (opened, replica) = futures::channel::oneshot::channel();
-        rho_mirror::desk::on_open(move || {
-            let _ = opened.send(());
-        });
-        this.desk_replica_task = Some(cx.spawn(async move |this, cx| {
-            if replica.await.is_err() {
-                return;
-            }
-            this.update_in(cx, |this, window, cx| {
-                this.desk_replica_settled = true;
-                for host in this.hosts.ids() {
-                    this.open_desk_from_replica(host, window, cx);
-                    // The handshake that was held back, now that it can
-                    // say what this client holds. Asking before the file
-                    // was open asked for the whole desk, prose and all,
-                    // on every cold start.
-                    if this.hosts.is_online(host) {
-                        let sync = this.desk_cells.sync(host);
-                        this.send_to_host(host, sync);
-                    }
-                }
-                this.refresh_home(cx);
-            })
-            .ok();
-        }));
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
         let home = this.make_surface(SurfaceKey::Home, window, cx);
@@ -1144,6 +1105,17 @@ impl Workspace {
             // answer in.
             this.append_message(
                 "no slack workspace on this device".to_owned(),
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+        if no_hosts {
+            // Same place, same reason: a first start has nothing attached
+            // and nothing saved, and the reader needs to know what to do
+            // about it rather than watch an empty rail.
+            this.append_message(
+                "no hosts attached: `space h` attaches one, and what is attached is remembered"
+                    .to_owned(),
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -1173,7 +1145,26 @@ impl Workspace {
             ));
         self.registry.attach_host(host, spec.name);
         self.desk_cells.slack_owned_by(self.hosts.owner());
+        self.save_hosts();
         host
+    }
+
+    /// Writes the attached set down, so that the next start attaches the
+    /// same hosts in the same order. A session without a database — a
+    /// test — remembers nothing, which is what it wants.
+    fn save_hosts(&self) {
+        let Some(db) = rho_db::client::shared() else {
+            return;
+        };
+        let specs = self
+            .hosts
+            .iter()
+            .map(|host| HostSpec {
+                name: host.name.clone(),
+                target: host.target.clone(),
+            })
+            .collect::<Vec<_>>();
+        rho_hosts::saved::save(&db, &specs);
     }
 
     /// Forgets a daemon: its transcripts, surfaces, and cached projects go
@@ -1200,6 +1191,7 @@ impl Workspace {
         }
         self.hosts.detach(host);
         self.desk_cells.slack_owned_by(self.hosts.owner());
+        self.save_hosts();
         let _ = self
             .model
             .unbounded_send(rho_mirror::model::ToModel::Command(
@@ -2314,14 +2306,10 @@ impl Workspace {
                 // rather than from nothing.
                 self.open_desk_from_replica(host, window, cx);
                 // The Desk handshake belongs to the connection, not to the
-                // window: a reconnect asks only for what it is missing.
-                // Held back while the replica is still opening, because a
-                // handshake sent before it can only ask for everything;
-                // the task that opens it sends this one instead.
-                if self.desk_replica_settled {
-                    let sync = self.desk_cells.sync(host);
-                    self.send_to_host(host, sync);
-                }
+                // window: a reconnect asks only for what it is missing, and
+                // the replica it asks from was open before the window was.
+                let sync = self.desk_cells.sync(host);
+                self.send_to_host(host, sync);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,

@@ -733,7 +733,7 @@ pub struct Journal {
 impl Journal {
     /// Opens the client's database at `state_dir` and takes the journal's
     /// tables in it. For tests and tools; the session's own database is
-    /// opened once by the model thread and handed to [`Journal::open_on`].
+    /// opened once by `main` at startup and handed to [`Journal::open_on`].
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
         Self::open_on(rho_db::client::open(state_dir)?)
     }
@@ -829,8 +829,8 @@ fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
 
 static GLOBAL: OnceLock<Journal> = OnceLock::new();
 
-/// Takes the journal's tables in the client's database, which `main` has
-/// asked to be handed when the model thread opens it.
+/// Takes the journal's tables in the client's database, which `main` opens
+/// at startup and hands here before any window exists.
 pub fn init(db: RhoDb, dealer_policy: DealerPolicySnapshot) -> std::io::Result<()> {
     let journal = Journal::open_on(db)?;
     GLOBAL.set(journal).map_err(|_| {

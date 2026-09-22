@@ -10,6 +10,7 @@
 pub mod connection;
 pub mod hosts;
 pub mod realtime_client;
+pub mod saved;
 
 pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, spawn};
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};

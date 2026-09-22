@@ -2,25 +2,21 @@
 //!
 //! A rho client keeps several kinds of state: the agent mirror, the desk
 //! mirror, the Slack mirror and its cursors, the action journal, the
-//! inbox. Each was its own redb file, which is one file lock, one page
-//! cache and one allocator rebuild per kind, and five chances for a
-//! session to be half open. They are one file now, the way the daemon's
-//! store is one file. Every crate keeps its own tables and its own types;
-//! only the file is shared.
+//! inbox, the hosts it attaches. Each was its own redb file, which is one
+//! file lock, one page cache and one allocator rebuild per kind, and five
+//! chances for a session to be half open. They are one file now, the way
+//! the daemon's store is one file. Every crate keeps its own tables and
+//! its own types; only the file is shared.
 //!
-//! It is opened once, by the process that owns it, and handed to each
-//! crate. Nothing here resolves the state directory: that is `main`'s,
-//! and a library that guessed it would be guessing at the user's data.
-//!
-//! Opening is not free — after an unclean stop redb rebuilds its
-//! allocator from every page — so the open happens off the main thread,
-//! and things that must be told about it register with [`on_open`]
-//! before it happens rather than opening the file themselves.
+//! It is opened once, by `main` and before anything else happens, and
+//! handed to each crate. Nothing here resolves the state directory: that
+//! is `main`'s, and a library that guessed it would be guessing at the
+//! user's data.
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use crate::RhoDb;
 
@@ -35,89 +31,34 @@ pub fn path(state_dir: &Path) -> PathBuf {
 }
 
 static SHARED: OnceLock<RhoDb> = OnceLock::new();
-static LOCK: OnceLock<File> = OnceLock::new();
-#[expect(clippy::type_complexity)]
-static HOOKS: Mutex<Vec<Box<dyn FnOnce(&RhoDb) + Send>>> = Mutex::new(Vec::new());
-
-/// Takes the exclusive lock on the client's database, before anything has
-/// opened it. `main` calls this early and on the main thread: it is a
-/// `flock` on an empty file and costs nothing, and a second rho has to
-/// say so and stop rather than run on holding none of its own state.
-/// Opening the database afterwards reuses this lock.
-pub fn lock(state_dir: &Path) -> std::io::Result<()> {
-    if LOCK.get().is_some() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(state_dir)?;
-    let _ = LOCK.set(acquire_lock(state_dir)?);
-    Ok(())
-}
 
 /// Opens the client's database at `state_dir`, exclusively. For a tool
 /// that reads the file while no client holds it, and for tests.
 pub fn open(state_dir: &Path) -> std::io::Result<RhoDb> {
     std::fs::create_dir_all(state_dir)?;
-    let db = open_locked(state_dir)?;
+    // The lock is taken first: redb's own refusal is a panic, so the door
+    // has to be the one that answers.
+    let lock = acquire_lock(state_dir)?;
+    let db = RhoDb::open(path(state_dir)).holding(lock);
     own_the_file(state_dir)?;
     Ok(db)
 }
 
-/// The database, holding the lock unless this process already holds it.
-/// The lock is taken first: redb's own refusal is a panic, so the door has
-/// to be the one that answers.
-fn open_locked(state_dir: &Path) -> std::io::Result<RhoDb> {
-    let lock = match LOCK.get() {
-        Some(_) => None,
-        None => Some(acquire_lock(state_dir)?),
-    };
-    let db = RhoDb::open(path(state_dir));
-    Ok(match lock {
-        Some(lock) => db.holding(lock),
-        None => db,
-    })
-}
-
-/// Opens it once for this process and remembers it, then tells everything
-/// that asked to be told. A second call is the first one's answer: the
-/// file has one opener and this is it.
+/// Opens it once for this process and remembers it. A second call is the
+/// first one's answer: the file has one opener and this is it.
 pub fn open_shared(state_dir: &Path) -> std::io::Result<RhoDb> {
     if let Some(db) = SHARED.get() {
         return Ok(db.clone());
     }
-    std::fs::create_dir_all(state_dir)?;
-    let db = open_locked(state_dir)?;
-    own_the_file(state_dir)?;
-    let db = SHARED.get_or_init(|| db).clone();
-    let hooks = std::mem::take(
-        &mut *HOOKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
-    for hook in hooks {
-        hook(&db);
-    }
-    Ok(db)
+    let db = open(state_dir)?;
+    Ok(SHARED.get_or_init(|| db).clone())
 }
 
 /// The database this process opened, if it has. `None` is not an error:
-/// a test, or a rho told of no state directory, has no client database
-/// and every cache over it is simply absent.
+/// a test, or a tool that never opened one, has no client database and
+/// every cache over it is simply absent.
 pub fn shared() -> Option<RhoDb> {
     SHARED.get().cloned()
-}
-
-/// Runs `hook` when the database opens, or now if it already has. This is
-/// how `main` hands the file to a crate whose own open would otherwise
-/// have to happen on the main thread.
-pub fn on_open(hook: impl FnOnce(&RhoDb) + Send + 'static) {
-    if let Some(db) = SHARED.get() {
-        hook(db);
-        return;
-    }
-    HOOKS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(Box::new(hook));
 }
 
 /// The file holds the user's messages, their captures and every verdict

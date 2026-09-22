@@ -214,7 +214,7 @@ pub struct Mirror {
 impl Mirror {
     /// Opens the client's database at `state_dir` and takes the mirror's
     /// tables in it. For tests and tools; the session's own database is
-    /// opened once by the model thread and handed to [`Mirror::open_on`].
+    /// opened once by `main` at startup and handed to [`Mirror::open_on`].
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
         Self::open_on(rho_db::client::open(state_dir)?)
     }
@@ -517,9 +517,8 @@ fn global() -> std::sync::RwLockReadGuard<'static, Option<Mirror>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Where the session's mirror lives, said once by `main` before the model
-/// thread starts. `main` only names the file; opening it is the model
-/// thread's, so that no frame waits on it.
+/// Where the session's state lives, said once by `main` at startup, for
+/// the crates that keep files of their own beside the database.
 static STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 static CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -534,26 +533,9 @@ pub fn state_dir() -> Option<&'static Path> {
     STATE_DIR.get().map(PathBuf::as_path)
 }
 
-/// Takes the mirror's tables in the client's database, if this process
-/// opened one. Called from the model thread as its first act, after the
-/// database itself is open.
-pub fn open_stated(db: Option<RhoDb>) {
-    let Some(db) = db else {
-        return;
-    };
-    if let Err(error) = init(db) {
-        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
-    }
-}
-
-/// Opens the mirror for this session. Without it every write below is a
+/// Takes the mirror's tables in the client's database, which `main` opens
+/// at startup before anything reads. Without it every write below is a
 /// no-op and the GUI simply starts empty, which is what tests want.
-///
-/// Called on the model thread, never on the main one: opening a file this
-/// size is not free, and after a kill redb rebuilds its allocator from
-/// every page, which on the rig's 539 MB mirror was 17.1s in a debug
-/// build. Nothing on the main thread waits for it; a reader that arrives
-/// first reads an empty mirror and asks the daemon instead.
 pub fn init(db: RhoDb) -> std::io::Result<()> {
     let mirror = Mirror::open_on(db)?;
     let mut global = GLOBAL
@@ -578,7 +560,7 @@ pub fn init(db: RhoDb) -> std::io::Result<()> {
 
 /// Drains the writer and closes the file, so that the next start finds it
 /// shut cleanly and skips redb's rebuild. A session that ends without
-/// this pays that rebuild once, off the main thread.
+/// this pays that rebuild once, at the next start's open.
 pub fn close() {
     CLOSED.store(true, std::sync::atomic::Ordering::Release);
     let mirror = GLOBAL

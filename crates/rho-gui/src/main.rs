@@ -29,7 +29,9 @@ struct Args {
     /// Attach a daemon as `<name>=unix:<socket>` or
     /// `<name>=iroh:<endpoint-id>@<ssh-dest>`. Repeatable; the name labels
     /// the host's agents and projects once more than one is attached.
-    /// Defaults to the local daemon socket.
+    /// Without it, the hosts attached when rho-gui last ran are attached
+    /// again; with it, these replace them. Hosts attached or detached
+    /// while running are remembered the same way.
     #[arg(long, value_name = "NAME=TARGET")]
     attach: Vec<String>,
 
@@ -291,7 +293,25 @@ fn run() -> Result<()> {
     if let Some(profiler) = &profiler {
         install_profile_panic_hook(Arc::clone(&profiler.checkpoint));
     }
-    let specs = host_specs(&args)?;
+    // The client keeps one database, the way the daemon does, and it is
+    // opened here, before anything else: the hosts to attach are in it, and
+    // everything that keeps a cache is handed it now rather than told about
+    // it later. A second rho stops at the door rather than running on with
+    // none of its own state. After an unclean stop redb rebuilds its
+    // allocator from every page, which is paid here, before the window.
+    let db = rho_db::client::open_shared(&client_state_dir)
+        .context("open the client database; exit the other rho first")?;
+    if let Err(error) = rho_journal::init(db.clone(), rho_gui::dealer_policy_snapshot()) {
+        tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
+    }
+    if let Err(error) = rho_mirror::mirror::init(db.clone()) {
+        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
+    }
+    if let Err(error) = rho_mirror::desk::init(db.clone()) {
+        tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the daemon");
+    }
+    rho_mirror::mirror::set_state_dir(client_state_dir.clone());
+    let specs = host_specs(&args, &db)?;
     let local_socket = specs.iter().find_map(|spec| match &spec.target {
         AttachTarget::Unix(socket) => Some(socket),
         AttachTarget::Iroh { .. } => None,
@@ -301,25 +321,6 @@ fn run() -> Result<()> {
         None => rho_ui_proto::RuntimePaths::new(None::<PathBuf>)?,
     }
     .browser_socket();
-    // The client keeps one database, the way the daemon does, and `main`
-    // only names where it lives: the model thread opens it, because after
-    // an unclean stop redb rebuilds its allocator from every page and no
-    // frame may wait on that. Everything that would otherwise open a file
-    // of its own is handed this one when it opens. A session that cannot
-    // open it keeps nothing and asks the daemon for everything, which is
-    // the behaviour every one of these caches has always promised.
-    // Taken here, on the main thread, because it is a `flock` on an empty
-    // file and because a second rho must stop rather than run on with none
-    // of its own state. The database itself is opened later and elsewhere.
-    rho_db::client::lock(&client_state_dir)
-        .context("take the client database; exit the other rho first")?;
-    let dealer_policy = rho_gui::dealer_policy_snapshot();
-    rho_db::client::on_open(move |db| {
-        if let Err(error) = rho_journal::init(db.clone(), dealer_policy) {
-            tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
-        }
-    });
-    rho_mirror::mirror::set_state_dir(client_state_dir.clone());
     rho_gui::telemetry::enable();
     if profiler.is_none()
         && let Err(error) = rho_gui::telemetry::enable_passive_cpu_profile()
@@ -818,13 +819,12 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 }
 
 /// The daemons to attach at startup, in the order they should be numbered.
-/// With no `--attach`, the local daemon socket is the whole list.
-fn host_specs(args: &Args) -> Result<Vec<HostSpec>> {
+/// With no `--attach`, the hosts saved by the last run are the whole list,
+/// and a first run attaches nothing: `space h` attaches a host, and the
+/// set attached is what the next start finds.
+fn host_specs(args: &Args, db: &rho_db::RhoDb) -> Result<Vec<HostSpec>> {
     if args.attach.is_empty() {
-        return Ok(vec![HostSpec {
-            name: "local".to_owned(),
-            target: AttachTarget::Unix(rho_ui_proto::socket_path()?),
-        }]);
+        return Ok(rho_hosts::saved::load(db));
     }
     let mut specs = Vec::new();
     for host in &args.attach {

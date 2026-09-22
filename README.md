@@ -13,14 +13,17 @@ supervisor, protocol, and plugin runtime.
 
 `rho-gui` attaches one or more daemons at once and shows them in a single
 rail, each section headed by the host's name. With no arguments it attaches
-the local daemon socket; `--attach` is repeatable and names each host:
+the hosts that were attached when it last ran, so a launcher needs none; a
+first run attaches nothing and says so. `--attach` is repeatable, names each
+host, and replaces the remembered set:
 
 ```bash
 rho-gui --attach local=unix:/run/user/1000/rho/rho.sock \
         --attach fern=iroh:<endpoint-id>@fern
 ```
 
-`space h` attaches, detaches, or lists hosts while running. Agent labels stay
+`space h` attaches, detaches, or lists hosts while running; the set attached
+at any moment is what the next start attaches. Agent labels stay
 bare while one host is attached and gain a `host/` prefix once several are
 (`fern/eng-h6u7`), as do project names; raw daemon paths are written
 `<host>:<path>`.

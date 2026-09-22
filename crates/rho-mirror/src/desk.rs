@@ -148,7 +148,7 @@ pub struct DeskMirror {
 impl DeskMirror {
     /// Opens the client's database at `state_dir` and takes the replica's
     /// tables in it. For tests; the session's own database is opened once
-    /// by the model thread and handed to [`DeskMirror::open_on`].
+    /// by `main` at startup and handed to [`DeskMirror::open_on`].
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
         Self::open_on(rho_db::client::open(state_dir)?)
     }
@@ -427,8 +427,6 @@ fn apply(
 static GLOBAL: std::sync::OnceLock<std::sync::RwLock<Option<DeskMirror>>> =
     std::sync::OnceLock::new();
 static CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Who to tell when the replica is there to be read.
-static OPENED: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(Vec::new());
 
 fn global() -> std::sync::RwLockReadGuard<'static, Option<DeskMirror>> {
     GLOBAL
@@ -437,26 +435,11 @@ fn global() -> std::sync::RwLockReadGuard<'static, Option<DeskMirror>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Opens the replica in the state directory `main` named, if it named one.
-/// Called from the model thread, like the agent mirror's, so that no frame
-/// waits on the file being opened.
-pub fn open_stated(db: Option<RhoDb>) {
-    let Some(db) = db else {
-        // Nothing to open, and the readers waiting on it are told so;
-        // this session reads the desk from the daemon alone.
-        opened();
-        return;
-    };
-    if let Err(error) = init(db) {
-        tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the daemon");
-        opened();
-    }
-}
-
-/// Opens the replica for this session. Without it every call below is a
+/// Takes the replica's tables in the client's database, which `main` opens
+/// at startup before any window exists. Without it every call below is a
 /// no-op and the GUI starts with no desk until the daemon answers, which
 /// is exactly what it did before this existed — and what a test wants,
-/// since a test names no state directory.
+/// since a test opens no database.
 pub fn init(db: RhoDb) -> std::io::Result<()> {
     let mirror = DeskMirror::open_on(db)?;
     let mut global = GLOBAL
@@ -474,8 +457,6 @@ pub fn init(db: RhoDb) -> std::io::Result<()> {
         return Ok(());
     }
     *global = Some(mirror);
-    drop(global);
-    opened();
     Ok(())
 }
 
@@ -542,39 +523,6 @@ pub fn device_in(db: &RhoDb) -> DeviceId {
     })
 }
 
-/// Runs `hook` when the replica is open, or now if it already is.
-///
-/// The file opens on the model thread, after the window exists, so a
-/// reader that only looked at startup found nothing and drew a desk the
-/// user's verdicts were missing from until a daemon answered. This is
-/// how it is told to look again, and it costs no wait: the frame that
-/// asked goes on drawing.
-pub fn on_open(hook: impl FnOnce() + Send + 'static) {
-    // A session told of no state directory has no replica and never will,
-    // which is settled news rather than news that has not arrived: a test,
-    // and a client that could not be told where its files live, must not
-    // sit waiting for a file that is not coming.
-    if global().is_some() || crate::mirror::state_dir().is_none() {
-        hook();
-        return;
-    }
-    OPENED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(Box::new(hook));
-}
-
-fn opened() {
-    let hooks = std::mem::take(
-        &mut *OPENED
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
-    for hook in hooks {
-        hook();
-    }
-}
-
 pub fn load(host: &str) -> HeldDesk {
     global()
         .as_ref()
@@ -614,9 +562,6 @@ pub fn reset_host(host: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use rho_ui_proto::desk_tree::cells::{Property, Store, Uuid};
 
     use super::*;
@@ -626,53 +571,6 @@ mod tests {
 
     fn note(seed: u8) -> Id {
         Id::Note(Uuid([seed; 16]))
-    }
-
-    /// Who asked to be told is told when the file opens, and asking
-    /// after it has opened is answered at once. The replica opens on the
-    /// model thread, well after the window is up, so a reader that only
-    /// looked at startup drew a desk without the user's verdicts in it
-    /// until a daemon answered.
-    ///
-    /// This is the only test that installs the global replica, because
-    /// installing it is once per process.
-    #[test]
-    fn a_reader_is_told_when_the_replica_opens_and_told_at_once_if_it_already_has() {
-        let dir = tempfile::tempdir().unwrap();
-        // A session told of no state directory is told at once instead:
-        // there is no file coming, and a reader waiting for one would
-        // never draw. So this test names one, its own.
-        crate::mirror::set_state_dir(dir.path().to_owned());
-        let db = rho_db::client::open(dir.path()).unwrap();
-        let before = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&before);
-        on_open(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(
-            before.load(Ordering::SeqCst),
-            0,
-            "nothing is open yet, so nobody has been told"
-        );
-
-        init(db).expect("the replica installs once");
-        assert_eq!(
-            before.load(Ordering::SeqCst),
-            1,
-            "the open tells everyone who asked"
-        );
-
-        let after = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&after);
-        on_open(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(
-            after.load(Ordering::SeqCst),
-            1,
-            "asking after the open is answered where it stands"
-        );
-        close();
     }
 
     /// The replica builds a note's history up out of the pieces it is
