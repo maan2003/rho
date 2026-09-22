@@ -780,6 +780,11 @@ converts full-range BT.601 to RGB in the draw shader, bypassing the image atlas.
 Unchanged frames retain their upload identity. CPU BGRA conversion happens only
 when exporting a frozen annotation, which requires no GPU readback.
 
+The Linux Nix package includes a locked revision of the desktop branch in both
+the profile and agent base. `rho wayland` invokes that bundled binary by its
+build-time agent-base path, with no PATH lookup or runtime override. The desktop
+package supplies Mesa's headless EGL configuration when none is set.
+
 `rho wayland` forwards to `rho-agent-desktop wayland`. Desktops publish atomic
 advertisements containing their name and owning `RHO_AGENT_ID`, under the agent's
 runtime directory. Multiple named desktops can belong to one agent. The daemon

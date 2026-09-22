@@ -1,5 +1,27 @@
 {
   "nodes": {
+    "agent-desktop": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": "rust-overlay"
+      },
+      "locked": {
+        "lastModified": 1790084072,
+        "narHash": "sha256-0Xf/gM4QIX8mC/YK4YS3SgCnGWvKiy8y3TjyzMit254=",
+        "owner": "maan2003",
+        "repo": "niri",
+        "rev": "2f6a460e273a27f7bf3c2ff1e3d26a44973687c0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "maan2003",
+        "ref": "rho/agent-desktop",
+        "repo": "niri",
+        "type": "github"
+      }
+    },
     "android-nixpkgs": {
       "inputs": {
         "devshell": "devshell",
@@ -468,6 +490,7 @@
     },
     "root": {
       "inputs": {
+        "agent-desktop": "agent-desktop",
         "flake-utils": "flake-utils",
         "flakebox": "flakebox",
         "nixpkgs": "nixpkgs",
@@ -506,6 +529,27 @@
         "owner": "rust-lang",
         "ref": "nightly",
         "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "agent-desktop",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1757989933,
+        "narHash": "sha256-9cpKYWWPCFhgwQTww8S94rTXgg8Q8ydFv9fXM6I8xQM=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "8249aa3442fb9b45e615a35f39eca2fe5510d7c3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
         "type": "github"
       }
     },

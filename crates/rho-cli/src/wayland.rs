@@ -11,15 +11,13 @@ pub struct WaylandArgs {
     args: Vec<OsString>,
 }
 pub fn run(args: WaylandArgs) -> Result<()> {
-    let program =
-        std::env::var_os("RHO_AGENT_DESKTOP").unwrap_or_else(|| "rho-agent-desktop".into());
+    anyhow::ensure!(cfg!(target_os = "linux"), "agent desktops require Linux");
+    let program = concat!(env!("RHO_AGENT_BASE"), "/bin/rho-agent-desktop");
     let status = Command::new(program)
         .arg("wayland")
         .args(args.args)
         .status()
-        .context(
-            "start rho-agent-desktop; install the desktop companion or set RHO_AGENT_DESKTOP",
-        )?;
+        .context("start bundled rho-agent-desktop")?;
     anyhow::ensure!(status.success(), "rho-agent-desktop exited with {status}");
     Ok(())
 }

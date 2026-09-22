@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
+    agent-desktop = {
+      url = "github:maan2003/niri?ref=rho/agent-desktop";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     flake-utils.url = "github:numtide/flake-utils";
     flakebox = {
       url = "github:rustshop/flakebox?rev=cf89db7a3ac6b1431693d17276225ba352e48a5c";
@@ -27,6 +31,7 @@
       self,
       nixpkgs,
       flake-utils,
+      agent-desktop,
       flakebox,
       public-skills,
       selfci,
@@ -92,13 +97,36 @@
             ln -s bash "$out/bin/rho-bash"
           '';
         });
+        rhoAgentDesktop = (agent-desktop.packages.${system}.niri.override {
+          libdisplay-info = pkgs.libdisplay-info_0_3;
+          withDbus = false;
+          withSystemd = false;
+          withScreencastSupport = false;
+        }).overrideAttrs (old: {
+          pname = "rho-agent-desktop";
+          cargoBuildFlags = [ "--bin" "rho-agent-desktop" ];
+          nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+          # A headless agent may have no system EGL vendor configuration.
+          # Bundle Mesa rather than requiring the user to configure a driver path.
+          postInstall = ''
+            wrapProgram $out/bin/rho-agent-desktop \
+              --set-default __EGL_VENDOR_LIBRARY_FILENAMES "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+          '';
+          passthru = old.passthru // { providedSessions = [ ]; };
+          meta = old.meta // {
+            description = "Rho agent desktop companion";
+            mainProgram = "rho-agent-desktop";
+          };
+        });
         agentBase = pkgs.buildEnv {
           name = "rho-agent-base";
           # NixOS's core and default system packages (nixos/modules/config/
           # system-path.nix), minus what has no meaning in a view (acl,
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
           # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
-          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) ] ++ (with pkgs; [
+          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
+            ++ (with pkgs; [
             bashInteractive bzip2
             # Keep small commands from loading the multicall binary's unrelated
             # libraries (notably OpenSSL) on every exec.
@@ -247,21 +275,6 @@
           pkgs.wayland
         ];
         guiLibraryPath = pkgs.lib.makeLibraryPath guiBuildInputs;
-        zedSrc = ./vendor/zed;
-        zedVendorManifest = pkgs.writeText "zed-vendor-Cargo.toml" ''
-          [package]
-          name = "zed"
-          version = "1.11.0"
-          edition = "2024"
-
-          [lib]
-          path = "lib.rs"
-        '';
-        zedVendorLib = pkgs.writeText "zed-vendor-lib.rs" "";
-        zedVendorChecksum = pkgs.writeText "zed-vendor-checksum.json" ''
-          {"files":{},"package":null}
-        '';
-
         multiBuild = (flakeboxLib.craneMultiBuild { toolchains = muslToolchains; }) (
           craneLib':
           let
@@ -301,41 +314,8 @@
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
             };
-            cargoVendorDirBase = craneLibBase.vendorCargoDeps { };
-            cargoVendorDir = pkgs.runCommand "rho-cargo-vendor-deps" { } ''
-              cp -aL ${cargoVendorDirBase} $out
-              chmod -R u+w $out
-              substituteInPlace $out/config.toml \
-                --replace-fail ${cargoVendorDirBase} $out
-
-              # The Zed `assets` crate embeds files from `../../assets`. Crane's
-              # vendoring splits git workspaces into per-crate directories, so
-              # provide the full-repo asset directory at the relative path the
-              # crate expects.
-              ln -s ${zedSrc}/assets $out/assets
-
-              # `extension_host` likewise reads the sibling extension API WIT
-              # definitions from its build script. Git dependencies live one
-              # directory below their source hash in Crane's vendor tree.
-              for extensionHost in $out/*/extension_host-*; do
-                extensionApi="$(dirname "$extensionHost")/extension_api"
-                mkdir "$extensionApi"
-                ln -s ${zedSrc}/crates/extension_api/wit "$extensionApi/wit"
-              done
-
-              # `remote_server` embeds the Zed package version from the sibling
-              # `zed` manifest. Supply a standalone manifest so Cargo can also
-              # scan the reconstructed vendor source without workspace context.
-              for remoteServer in $out/*/remote_server-*; do
-                zedPackage="$(dirname "$remoteServer")/zed"
-                mkdir "$zedPackage"
-                ln -s ${zedVendorManifest} "$zedPackage/Cargo.toml"
-                ln -s ${zedVendorLib} "$zedPackage/lib.rs"
-                ln -s ${zedVendorChecksum} "$zedPackage/.cargo-checksum.json"
-              done
-            '';
             craneLib = craneLibBase.overrideArgs {
-              inherit cargoVendorDir;
+              cargoVendorDir = craneLibBase.vendorCargoDeps { };
             };
             packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-agent -p rho-shell -p git-remote-octo";
             extraDummyScript = ''
@@ -378,6 +358,8 @@
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
                 chmod -R u+w $out/share/rho/skills
+              '' + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                ln -s ${rhoAgentDesktop}/bin/rho-agent-desktop $out/bin/rho-agent-desktop
               '';
             };
 
@@ -443,6 +425,8 @@
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
           inherit findutils;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          rho-agent-desktop = rhoAgentDesktop;
         };
 
         ci = {
