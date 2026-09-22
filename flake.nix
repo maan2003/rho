@@ -320,11 +320,15 @@
             packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-agent -p rho-shell -p git-remote-octo";
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
-              # dependencies. The patched noq crates are dependencies of iroh,
-              # so they must retain their implementations in the dummy source.
+              # dependencies. Registry dependencies need the real APIs of
+              # local patches (including iroh and kio for web-transport-iroh),
+              # along with their local transitive dependencies.
               rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/tree-sitter-language
               cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/brush $out/vendor/brush
               cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
+              rm -rf $out/vendor/iroh $out/vendor/moq/rs/kio
+              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/iroh $out/vendor/iroh
+              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/moq/rs/kio $out/vendor/moq/rs/kio
               cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/tree-sitter-language \
                 $out/vendor/tree-sitter-language
             '';
