@@ -1,0 +1,766 @@
+//! Per-rung serving: just-in-time encoding of one output rendition.
+//!
+//! Nothing is encoded until someone asks, via the two demand paths moq-net
+//! exposes on the output track:
+//!
+//! - A live subscription (`used`) starts a live loop that subscribes to the
+//!   source track (mirroring the aggregate subscription) and transcodes group
+//!   for group until the track goes `unused` again.
+//! - A fetch of a specific group (`requested_group`) fetches that same group
+//!   from the source and transcodes just that group with a fresh encoder.
+//!
+//! Output groups mirror the source group sequence numbers 1:1, so a fetch for
+//! output group N maps to source group N and a player switching renditions
+//! lands on the same content.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use hang::catalog::VideoConfig;
+use moq_mux::container::Container as _;
+use tokio::sync::Semaphore;
+
+use crate::Error;
+use crate::catalog::Resolved;
+use crate::feed::{Feed, Item};
+
+/// Cap on transcode pipelines a single rung builds concurrently for on-demand
+/// group fetches. Each pipeline holds a decoder + encoder session, and hardware
+/// encoders expose only a few simultaneous sessions, so an unbounded fetch burst
+/// (a rendition-switching player requesting many past groups at once) would
+/// exhaust them and fail live viewers too. Global admission across rungs and
+/// nodes is the fleet's concern; this is the local backstop.
+const MAX_CONCURRENT_FETCHES: usize = 4;
+
+/// A rung's retirement signal: the receiving half of a flag the transcoder sets
+/// when the ladder no longer has room for this rung.
+///
+/// Retiring is a clean track end rather than a dropped task, so a subscriber
+/// sees the same thing it would on any other rendition going away and picks
+/// another one, instead of an abort it would read as a failure. The end waits
+/// on the fetches still in flight, since the track's final sequence has to sit
+/// above every group they are about to claim.
+#[derive(Clone)]
+pub(crate) struct Retire(tokio::sync::watch::Receiver<bool>);
+
+impl Retire {
+	/// The two halves of one rung's signal.
+	pub(crate) fn channel() -> (tokio::sync::watch::Sender<bool>, Self) {
+		let (sender, receiver) = tokio::sync::watch::channel(false);
+		(sender, Self(receiver))
+	}
+
+	/// Resolve once this rung is retired, immediately if it already was.
+	async fn fired(&mut self) {
+		// An error means the transcoder dropped the sending half, which only
+		// happens on its way out: retire rather than park here forever.
+		let _ = self.0.wait_for(|retired| *retired).await;
+	}
+}
+
+/// Everything a rung needs to build transcoding pipelines on demand.
+#[derive(Clone)]
+pub(crate) struct Rung {
+	pub info: Resolved,
+	/// The source media track, for group fetches (not yet subscribed).
+	pub source: moq_net::track::Consumer,
+	/// The shared live decode of the source, for the live path.
+	pub feed: Feed,
+	/// The source broadcast, to notice it closing while idle.
+	pub broadcast: moq_net::broadcast::Consumer,
+	/// The source rendition's catalog entry (codec + container).
+	pub config: VideoConfig,
+	/// Which encoder implementation to use.
+	pub encoder: moq_video::encode::Kind,
+	/// Which decoder implementation to use.
+	pub decoder: moq_video::decode::Kind,
+	/// How to resize decoded frames.
+	pub resize: moq_video::resize::Config,
+	/// Where to report that this rung is encoding.
+	pub active: crate::active::Producer,
+	/// Fires when the ladder resizes past this rung.
+	pub retire: Retire,
+}
+
+impl Rung {
+	async fn pipeline(&self) -> Result<Pipeline, Error> {
+		Pipeline::new(self).await
+	}
+
+	fn container(&self) -> Result<moq_mux::catalog::hang::Container, Error> {
+		Ok(moq_mux::catalog::hang::Container::try_from(&self.config)?)
+	}
+
+	/// An encoder producing this rung's rendition.
+	///
+	/// `color` is the space the frames reaching it are in, taken from the first
+	/// decoded frame where the decoder knows. A rung below 576 lines fed by an HD
+	/// source carries the source's space, not the one its own size implies, so
+	/// leaving this to the encoder's size guess would label the rung wrongly.
+	///
+	/// A [`Sink`](moq_video::encode::Sink) rather than a bare `Encoder`: both
+	/// callers hold it across `.await`, so on a multi-thread runtime the future
+	/// can migrate workers between opening the codec and dropping it. The Windows
+	/// backend's COM apartment is per-thread, so that would leak the opening
+	/// worker's initialization and uninitialize COM on one that never initialized
+	/// it. The sink owns a thread and stays on it.
+	async fn encode(&self, color: Option<moq_video::Color>) -> Result<moq_video::encode::Sink, Error> {
+		let framerate = self.info.framerate.unwrap_or(moq_video::Rate::new(30, 1).unwrap());
+		let mut config = moq_video::encode::Config::new(self.info.size.width, self.info.size.height, framerate);
+		config.bitrate = Some(self.info.bitrate);
+		config.kind = self.encoder.clone();
+		config.color = color;
+		// Every source group boundary is a cut; the keyframe interval is only a
+		// backstop against pathologically long source groups.
+		config.gop = moq_video::encode::Gop::keyframe_every(std::time::Duration::from_secs(8), framerate);
+		Ok(moq_video::encode::Sink::open(&config).await?)
+	}
+}
+
+/// What the live path leaves the output track in.
+enum Ended {
+	/// Still open: finish it once nothing else can add a group.
+	Open,
+	/// Already terminal (aborted), or closed under us.
+	Closed,
+}
+
+/// Serve one requested rung track until it closes or the source ends.
+pub(crate) async fn serve(rung: Rung, request: moq_net::track::Request) -> Result<(), Error> {
+	// Grab the group-request handle before accepting: a Request is dynamic from
+	// birth, so a fetch racing the acceptance queues instead of failing.
+	let dynamic = request.dynamic();
+	let info = hang::container::track_info(hang::catalog::PRIORITY.video);
+	let mut producer = request.accept(info);
+	let (finished, mut finishing) = tokio::sync::watch::channel(false);
+
+	let live = async {
+		let result = live(&rung, &mut producer).await;
+		let _ = finished.send(true);
+		result
+	};
+	let (live, fetches) = tokio::join!(live, fetches(&rung, dynamic, &mut finishing));
+
+	// Finished here rather than in `live`, because the boundary is only known once
+	// every fetch has claimed its group. `finish` sets the exclusive boundary one
+	// past the highest group produced so far (0 when none was), and a group at or
+	// above it is refused. A fetch still opening its decoder has produced nothing
+	// to count, so finishing then would reject the very fetch retirement drained
+	// the loop to keep.
+	let result = match (live, fetches) {
+		(Ok(Ended::Open), Ok(())) => producer.finish().map_err(Into::into),
+		(live, fetches) => live.map(|_| ()).and(fetches),
+	};
+	if result.is_err() {
+		// End the track so subscribers see an error rather than a stall.
+		let _ = producer.abort(moq_net::Error::Cancel);
+	}
+	result
+}
+
+/// The live path: wait for demand, attach to the shared decode [`Feed`], and
+/// resize + encode its frames group for group until demand goes away. The
+/// heavy lifting (subscription, decode) is shared with every other active rung
+/// of this source; only the per-rung resize and encode happen here.
+///
+/// Reports whether the track is still open rather than finishing it: [`serve`]
+/// owns that, once the fetches in flight can no longer add a group.
+async fn live(rung: &Rung, producer: &mut moq_net::track::Producer) -> Result<Ended, Error> {
+	let demand = producer.demand();
+	let mut retire = rung.retire.clone();
+	// Set once the ladder retires this rung. The track is finished at the next
+	// group boundary rather than mid-group, so the last thing a subscriber gets
+	// is a complete group and then a clean end.
+	let mut retiring = false;
+
+	loop {
+		if retiring {
+			return Ok(Ended::Open);
+		}
+
+		tokio::select! {
+			used = demand.used() => if used.is_err() {
+				// The output track closed; nothing more to serve.
+				return Ok(Ended::Closed);
+			},
+			err = rung.broadcast.closed() => {
+				// The source went away while idle; end the rung with it.
+				producer.clone().abort(err)?;
+				return Ok(Ended::Closed);
+			}
+			() = retire.fired() => {
+				// Retired while idle, which is the common case: the ladder is
+				// resized long before anyone asks for the rung it dropped.
+				retiring = true;
+				continue;
+			}
+		}
+
+		// Attach the meter here rather than at the first frame: it counts nothing
+		// until this pipeline encodes one, so a subscriber waiting on a stalled
+		// source is not billed for a session that produced nothing.
+		let active = rung.active.attach(&rung.info);
+
+		// One listener + encoder per demand session: rate control persists
+		// across groups, while every group still opens with a forced IDR.
+		// Dropping them on unused releases the shared decode (if last) and the
+		// encoder session until someone subscribes again.
+		let mut listener = rung.feed.listen();
+		// Built from the first frame: the encoder writes that frame's color space
+		// into the bitstream, so it cannot open before one has arrived. A cut
+		// asked for at a group boundary waits here until it exists.
+		let mut encoder: Option<moq_video::encode::Sink> = None;
+		let mut pending_cut = false;
+
+		// The output group currently being written, if the feed is mid-group.
+		let mut current: Option<moq_net::group::Producer> = None;
+
+		'session: loop {
+			let item = tokio::select! {
+				item = listener.recv() => item,
+				_ = demand.unused() => {
+					if let Some(output) = current.take() {
+						// Signal downstream that the group is incomplete.
+						output.abort(moq_net::Error::Cancel)?;
+					}
+					break 'session;
+				}
+				() = retire.fired(), if !retiring => {
+					retiring = true;
+					// Mid-group: ride it out and end the track when it closes.
+					// Nothing new is opened, so this costs at most one group.
+					if current.is_none() {
+						break 'session;
+					}
+					continue;
+				}
+			};
+
+			match item {
+				Some(Item::Group(sequence)) => {
+					if retiring {
+						// The group we were riding out never ended, so it is
+						// incomplete however long we wait.
+						if let Some(output) = current.take() {
+							output.abort(moq_net::Error::Cancel)?;
+						}
+						break 'session;
+					}
+					// Empty the codec before opening the next group even though this one
+					// is being abandoned: a pipelined encoder still holding the previous
+					// group's tail would otherwise emit it into the new group, ahead of
+					// the keyframe requested just below.
+					if let Some(encoder) = &mut encoder {
+						encoder.flush().await?;
+					}
+					if let Some(output) = current.take() {
+						// A group boundary without an end: treat as incomplete.
+						output.abort(moq_net::Error::Cancel)?;
+					}
+					// A subscriber has to be able to start at this group, so its first
+					// frame must be an IDR. The request waits for the next frame, so a
+					// rung that skips this group simply carries it forward. A backend
+					// that cannot cut fails the rung here: its groups could never
+					// mirror the source's, which is what this rung promises.
+					match &mut encoder {
+						Some(encoder) => encoder.cut().await?,
+						None => pending_cut = true,
+					}
+					// Mirror the source sequence so fetches and rendition
+					// switches map 1:1.
+					let info = moq_net::group::Info { sequence };
+					current = match producer.create_group(info) {
+						Ok(output) => Some(output),
+						// A fetch task is already serving this sequence (a consumer
+						// fetched a group at the live edge before the live loop
+						// reached it). The fetch is authoritative and its group
+						// reaches every subscriber through the shared track cache,
+						// so skip it here. Residual: if that fetch then fails and
+						// aborts the group, this rung skips one GOP until the next
+						// keyframe. Unifying live + fetch into one cache-backed
+						// serving loop (like the relay) would remove the two-writer
+						// race entirely; tracked as a follow-up.
+						Err(moq_net::Error::Duplicate) => None,
+						Err(err) => return Err(err.into()),
+					};
+				}
+				Some(Item::Frame(frame)) => {
+					// No open group: attached mid-group, skipped a duplicate, or
+					// recovering from a lag. Wait for the next boundary.
+					let Some(output) = &mut current else { continue };
+
+					// The feed decodes at the source's native size; size this rung's copy
+					// here. Supported GPU paths feed the encoder without touching the
+					// CPU. The resize carries the source's color space across, which is
+					// why the encoder is opened from the scaled frame rather than from
+					// this rung's size.
+					let frame: Arc<moq_video::Frame> = match frame.size() == rung.info.size {
+						true => frame,
+						false => Arc::new(frame.resize(rung.info.size, &rung.resize)?),
+					};
+					let encoder = match &mut encoder {
+						Some(encoder) => encoder,
+						None => {
+							let mut opened = rung.encode(frame.surface.color()).await?;
+							if std::mem::take(&mut pending_cut) {
+								opened.cut().await?;
+							}
+							encoder.insert(opened)
+						}
+					};
+					write(output, &active, encoder.encode(frame).await?)?;
+				}
+				Some(Item::End) => {
+					if let Some(mut output) = current.take() {
+						// The source group is complete, so this one has to be too: a
+						// hardware encoder is still holding its last frames.
+						if let Some(encoder) = &mut encoder {
+							write(&mut output, &active, encoder.flush().await?)?;
+						}
+						output.finish()?;
+					}
+					if retiring {
+						break 'session;
+					}
+				}
+				Some(Item::Lagged) => {
+					// Fell behind the feed: abandon the group and resume at the
+					// next boundary rather than stalling other rungs.
+					if let Some(output) = current.take() {
+						output.abort(moq_net::Error::Cancel)?;
+					}
+					if retiring {
+						break 'session;
+					}
+				}
+				Some(Item::Finished) => {
+					// The source track ended: the derivative ends with it.
+					if let Some(output) = current.take() {
+						output.abort(moq_net::Error::Cancel)?;
+					}
+					return Ok(Ended::Open);
+				}
+				None => {
+					// The feed died mid-stream (source or decode error).
+					if let Some(output) = current.take() {
+						let _ = output.abort(moq_net::Error::Cancel);
+					}
+					producer.clone().abort(moq_net::Error::Cancel)?;
+					return Ok(Ended::Closed);
+				}
+			}
+		}
+		// listener and encoder drop here, releasing the shared decode session
+		// (when this was the last rung) and the encoder.
+	}
+}
+
+/// The fetch path: serve requests for specific (past) groups.
+///
+/// Fetch tasks run under a local [`JoinSet`](tokio::task::JoinSet) rather than
+/// detached. Retirement takes whatever the handler already had queued, closes
+/// admission by dropping it, and drains every group below the track's final
+/// sequence. Other teardown aborts them, so no source subscription or encoder
+/// session survives a failed track. A semaphore bounds how many run at once.
+///
+/// Owns the handler rather than borrowing it, since closing admission is
+/// dropping it.
+async fn fetches(
+	rung: &Rung,
+	dynamic: moq_net::track::Dynamic,
+	finishing: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), Error> {
+	let limit = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+	let mut tasks = tokio::task::JoinSet::new();
+	let mut retire = rung.retire.clone();
+	let mut retired = false;
+
+	loop {
+		// Reap finished fetches so the set doesn't grow without bound.
+		while tasks.try_join_next().is_some() {}
+
+		// Take a slot before popping a request, so retirement never strands one in
+		// the handler while all slots are busy.
+		let permit = tokio::select! {
+			biased;
+			() = retire.fired() => {
+				retired = true;
+				break;
+			},
+			_ = finishing.wait_for(|finished| *finished) => break,
+			permit = limit.clone().acquire_owned() => permit.expect("the semaphore stays open"),
+		};
+
+		let request = tokio::select! {
+			biased;
+			() = retire.fired() => {
+				retired = true;
+				break;
+			},
+			_ = finishing.wait_for(|finished| *finished) => break,
+			request = dynamic.requested_group() => match request {
+				Ok(request) => request,
+				// The output track closed; nothing more to serve.
+				Err(_) => break,
+			},
+		};
+
+		spawn_fetch(&mut tasks, rung.clone(), request, permit);
+	}
+
+	if retired {
+		// A consumer that asked for a group before retirement is already waiting on
+		// it, whether or not this loop had reached it yet: the request queues on the
+		// dynamic handler the moment the fetch is made. Take what is queued now, so
+		// dropping the handler below does not cancel a fetch that beat retirement.
+		//
+		// Taken in one pass, before waiting on anything, and then the handler is
+		// dropped. A consumer holding the retired track can keep fetching, and the
+		// handler admits a cache miss for as long as it is alive, so a drain that
+		// waited for a slot with it still open would keep taking those in too and
+		// the rung would never finish. Dropping it closes admission and releases
+		// whatever arrived after the pass; the requests already popped are held
+		// here, so they are unaffected.
+		let mut queued = Vec::new();
+		loop {
+			tokio::select! {
+				biased;
+				request = dynamic.requested_group() => match request {
+					Ok(request) => queued.push(request),
+					// The output track closed; nothing left to serve.
+					Err(_) => break,
+				},
+				// Nothing queued: everything that beat retirement is spoken for.
+				() = std::future::ready(()) => break,
+			}
+		}
+		drop(dynamic);
+
+		for request in queued {
+			let permit = limit.clone().acquire_owned().await.expect("the semaphore stays open");
+			spawn_fetch(&mut tasks, rung.clone(), request, permit);
+		}
+
+		// Finish every group the handler accepted, or its producer stays open and
+		// the fetch stalls forever. Nothing has declared the track's final sequence
+		// yet: `serve` does that only once this returns, which is what leaves
+		// every one of these groups writable.
+		while let Some(result) = tasks.join_next().await {
+			if let Err(err) = result {
+				tracing::warn!(%err, "transcode fetch task panicked");
+			}
+		}
+	} else {
+		// A closed or failed track has no result left to preserve.
+		tasks.shutdown().await;
+	}
+
+	Ok(())
+}
+
+/// Spawn one fetch, holding its concurrency slot for the life of the task.
+fn spawn_fetch(
+	tasks: &mut tokio::task::JoinSet<()>,
+	rung: Rung,
+	request: moq_net::group::Request,
+	permit: tokio::sync::OwnedSemaphorePermit,
+) {
+	tasks.spawn(async move {
+		let _permit = permit;
+		let sequence = request.sequence();
+		if let Err(err) = fetch(rung, request).await {
+			tracing::warn!(%err, sequence, "transcode fetch failed");
+		}
+	});
+}
+
+/// Transcode one specifically requested group, fetching it from the source.
+///
+/// Every early exit rejects the request with a real error: dropping a
+/// `GroupRequest` auto-rejects with [`moq_net::Error::Dropped`], which reads as
+/// "the handler vanished" and hides the actual decode/encode/source failure from
+/// the waiting consumer.
+async fn fetch(rung: Rung, request: moq_net::group::Request) -> Result<(), Error> {
+	let options = moq_net::group::Fetch::default().with_priority(request.priority());
+	let mut source = match rung.source.fetch_group(request.sequence(), options).await {
+		Ok(source) => source,
+		Err(err) => {
+			request.reject(err.clone());
+			return Err(err.into());
+		}
+	};
+
+	// A fresh pipeline per fetched group: groups are independently decodable,
+	// so the encoder starts clean at the group's keyframe.
+	let (pipeline, container) = match rung.pipeline().await.and_then(|p| rung.container().map(|c| (p, c))) {
+		Ok(built) => built,
+		Err(err) => {
+			request.reject(moq_net::Error::Cancel);
+			return Err(err);
+		}
+	};
+
+	let output = match request.accept(None) {
+		Ok(output) => output,
+		Err(err) => return Err(err.into()),
+	};
+	// A fetch builds its own pipeline, so it is billable work even when the
+	// live path is idle. Reference counted, so overlapping the live session
+	// bills the rendition once rather than twice.
+	let active = rung.active.attach(&rung.info);
+	transcode_group(pipeline, &container, &mut source, output, &active).await?;
+	Ok(())
+}
+
+/// Transcode one fetched source group to completion into one output group,
+/// draining the decoder and encoder at the end. (The live path rides the shared
+/// feed instead; see [`live`].)
+async fn transcode_group(
+	pipeline: Pipeline,
+	container: &moq_mux::catalog::hang::Container,
+	source: &mut moq_net::group::Consumer,
+	mut output: moq_net::group::Producer,
+	active: &crate::active::Guard,
+) -> Result<(), Error> {
+	match transcode_group_inner(pipeline, container, source, &mut output, active).await {
+		Ok(()) => {
+			output.finish()?;
+			Ok(())
+		}
+		Err(err) => {
+			let _ = output.abort(moq_net::Error::Cancel);
+			Err(err)
+		}
+	}
+}
+
+async fn transcode_group_inner(
+	mut pipeline: Pipeline,
+	container: &moq_mux::catalog::hang::Container,
+	source: &mut moq_net::group::Consumer,
+	output: &mut moq_net::group::Producer,
+	active: &crate::active::Guard,
+) -> Result<(), Error> {
+	let mut first = true;
+
+	while let Some(frames) = container.read(source).await? {
+		for frame in frames {
+			let timestamp = frame.timestamp;
+
+			// A group opens on a keyframe by construction, so the first frame is
+			// an IDR. The low-level `Container::read` the transcoder uses does not
+			// reconstruct the keyframe bit for legacy sources (that lives in the
+			// higher-level container consumer), so `first` is the reliable signal;
+			// OR in the container's own flag so CMAF mid-group keyframes still
+			// force an output IDR. This flag drives both the decoder (keyframe
+			// gating + parameter-set injection) and the encoder (forced IDR).
+			let keyframe = frame.keyframe || first;
+			first = false;
+
+			write(
+				output,
+				active,
+				pipeline.process(frame.payload, timestamp, keyframe).await?,
+			)?;
+		}
+	}
+
+	// One-shot group: drain both codec stages. Each packet keeps the timestamp of
+	// the frame it was encoded from, so the tail stays in step.
+	write(output, active, pipeline.finish().await?)?;
+	Ok(())
+}
+
+/// Append encoded frames to the output group in the legacy hang framing, metering
+/// what reached the track.
+///
+/// The frames written before a failure are banked anyway: they are on the group
+/// and a consumer may already have read them, so dropping them from the meters
+/// would understate the bill exactly when something went wrong.
+fn write(
+	output: &mut moq_net::group::Producer,
+	active: &crate::active::Guard,
+	encoded: Vec<moq_video::encode::Encoded>,
+) -> Result<(), Error> {
+	let mut frames = 0;
+	let mut bytes = 0;
+
+	let result: Result<(), Error> = (|| {
+		for encoded in encoded {
+			let size = encoded.payload.len() as u64;
+			let frame = hang::container::Frame {
+				timestamp: encoded.timestamp,
+				payload: encoded.payload,
+			};
+			frame.write_to(output)?;
+			frames += 1;
+			bytes += size;
+		}
+		Ok(())
+	})();
+
+	active.produced(frames, bytes);
+	result
+}
+
+/// Decode -> resize -> encode for one fetched group of one rung.
+///
+/// Unless CPU output is forced, the decoder is asked to emit frames at the
+/// rung's resolution (`decode::Config::scale_hint`). A decoder with a hardware
+/// scaler (NVDEC) does, and its GPU frames feed the encoder in place: the NVDEC
+/// -> NVENC path never touches the CPU. Frames that come back at any other size
+/// get `Frame::resize` instead.
+struct Pipeline {
+	decoder: moq_video::decode::Sink,
+	/// Opened from the first decoded frame, whose color space it has to declare.
+	/// `None` until one arrives; a cut requested before then waits in
+	/// `pending_cut`.
+	encoder: Option<moq_video::encode::Sink>,
+	pending_cut: bool,
+	rung: Rung,
+	size: moq_video::Size,
+}
+
+impl Pipeline {
+	async fn new(rung: &Rung) -> Result<Self, Error> {
+		let mut decode = moq_video::decode::Config::new();
+		decode.kind = rung.decoder.clone();
+		decode.output = rung.resize.output;
+		decode.scale_hint = scale_hint(rung.info.size, rung.resize.output);
+		// A `Sink` for the same reason as the encoder above: a fetch task holds this
+		// pipeline across `Container::read`, so the codec must own its thread.
+		let decoder = moq_video::decode::Sink::open(&rung.config, &decode).await?;
+
+		Ok(Self {
+			decoder,
+			encoder: None,
+			pending_cut: false,
+			rung: rung.clone(),
+			size: rung.info.size,
+		})
+	}
+
+	/// Transcode one container payload into zero or more encoded frames, each
+	/// carrying the presentation time of the picture it came from.
+	async fn process(
+		&mut self,
+		payload: Bytes,
+		timestamp: moq_net::Timestamp,
+		keyframe: bool,
+	) -> Result<Vec<moq_video::encode::Encoded>, Error> {
+		// This group opens on an IDR. The encoder holds the request until a picture
+		// actually arrives, which matters because a decoder that buffers returns
+		// nothing for the access unit that asked for one.
+		if keyframe {
+			match &mut self.encoder {
+				Some(encoder) => encoder.cut().await?,
+				None => self.pending_cut = true,
+			}
+		}
+
+		let mut encoded = Vec::new();
+		for raw in self.decoder.decode(payload, timestamp, keyframe).await? {
+			encoded.extend(self.encode_frame(raw).await?);
+		}
+		Ok(encoded)
+	}
+
+	/// Resize and encode one decoded frame.
+	async fn encode_frame(&mut self, raw: moq_video::Frame) -> Result<Vec<moq_video::encode::Encoded>, Error> {
+		// Already at the rung size (the decoder scaled): feed the frame through
+		// as-is, keeping a GPU frame on the GPU.
+		let raw = match raw.size() == self.size {
+			true => raw,
+			false => raw.resize(self.size, &self.rung.resize)?,
+		};
+		if self.encoder.is_none() {
+			let mut opened = self.rung.encode(raw.surface.color()).await?;
+			if std::mem::take(&mut self.pending_cut) {
+				opened.cut().await?;
+			}
+			self.encoder = Some(opened);
+		}
+		let encoder = self.encoder.as_mut().expect("just opened");
+		Ok(encoder.encode(raw).await?)
+	}
+
+	/// Drain the decoder and then the encoder, keeping every frame's timestamp.
+	///
+	/// Consumes the pipeline, since finishing the encoder consumes it: a one-shot
+	/// group's pipeline is done once both codec stages are drained.
+	async fn finish(mut self) -> Result<Vec<moq_video::encode::Encoded>, Error> {
+		let mut encoded = Vec::new();
+		for raw in self.decoder.flush().await? {
+			encoded.extend(self.encode_frame(raw).await?);
+		}
+
+		if let Some(encoder) = self.encoder {
+			encoded.extend(encoder.finish().await?);
+		}
+		Ok(encoded)
+	}
+}
+
+/// Let a hardware decoder scale only when the caller has not forced the CPU.
+fn scale_hint(size: moq_video::Size, output: moq_video::Output) -> Option<moq_video::Size> {
+	(output != moq_video::Output::Cpu).then_some(size)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use moq_video::Output;
+
+	/// A fetched NVDEC group reaches `Frame::resize` at native size when
+	/// CPU output is forced, rather than being resized in the decoder first.
+	#[test]
+	fn forced_cpu_skips_the_decoder_scaler() {
+		let size = moq_video::Size::new(160, 120);
+
+		assert_eq!(scale_hint(size, Output::Cpu), None);
+		assert_eq!(scale_hint(size, Output::Native), Some(size));
+	}
+
+	/// A frame that reached the group is billable even when a later frame in the
+	/// same batch fails: it is on the track and a consumer may already have read
+	/// it, so the meters must not lose it with the error.
+	#[test]
+	fn write_banks_the_frames_that_reached_the_group() {
+		let rung = Resolved {
+			name: "video/120p".to_string(),
+			height: 120,
+			size: moq_video::Size::new(160, 120),
+			bitrate: moq_net::bandwidth::Rate::from_bps(100_000),
+			framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
+		};
+
+		let active = crate::active::Producer::default();
+		active.declare(std::slice::from_ref(&rung));
+		let mut cursor = active.consume();
+		let rendition = cursor.try_next().expect("ladder").rendition;
+
+		let broadcast = moq_net::broadcast::Info::default().produce();
+		let track = broadcast
+			.create_track("video/120p", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		let guard = active.attach(&rung);
+
+		// The second frame cannot be expressed in the container's timescale, so it
+		// fails to write while the first is already on the group.
+		let good = moq_video::encode::Encoded::new(
+			Bytes::from_static(b"hello"),
+			moq_net::Timestamp::from_micros(0).unwrap(),
+		);
+		let bad = moq_video::encode::Encoded::new(
+			Bytes::from_static(b"world"),
+			moq_net::Timestamp::from_secs(1 << 60).unwrap(),
+		);
+
+		assert!(write(&mut group, &guard, vec![good, bad]).is_err());
+		assert_eq!(rendition.frames(), 1);
+		assert_eq!(rendition.bytes(), 5);
+		// One frame is still a start, so the rendition reads as encoding.
+		assert!(cursor.try_next().expect("edge").encoding);
+	}
+}

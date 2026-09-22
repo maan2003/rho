@@ -1,0 +1,861 @@
+//! Tests for the FLV muxer.
+//!
+//! Round-trip: ingest a synthetic FLV via the importer, re-export via the
+//! exporter, and assert the bytes parse back into the same catalog shape.
+
+use std::time::Duration;
+
+use bytes::Bytes;
+use hang::catalog::{AudioCodec, VideoCodec};
+
+use super::{Export, Import};
+
+/// A drift budget no test timeline comes close to, so the exporter reads every group.
+///
+/// The media track's full retention window, so an exporter started after publishing
+/// can still read every retained group. These tests write or import a whole broadcast
+/// and only then export it, which the
+/// exporter's default [`Duration::ZERO`] collapses to the
+/// live edge: completeness has to be asked for, exactly as a real recorder does.
+const RECORDING_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// A minimal `AVCDecoderConfigurationRecord` (profile 0x42, level 0x1f, one SPS + PPS).
+fn avcc() -> Vec<u8> {
+	let sps = [0x67u8, 0x42, 0xc0, 0x1f];
+	let mut out = vec![0x01, 0x42, 0xc0, 0x1f, 0xff, 0xe1, 0x00, sps.len() as u8];
+	out.extend_from_slice(&sps);
+	out.extend_from_slice(&[0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80]);
+	out
+}
+
+/// AudioSpecificConfig for AAC-LC, 44100 Hz, stereo.
+const ASC: [u8; 2] = [0x12, 0x10];
+const AV1C: [u8; 4] = [0x81, 0x08, 0x0c, 0x00];
+const AC3_FRAME: [u8; 7] = [0x0B, 0x77, 0x00, 0x00, 0x1C, 0x40, 0xE1];
+const EAC3_FRAME: [u8; 6] = [0x0B, 0x77, 0x00, 0xFF, 0x3F, 0x80];
+
+fn flv_header(flags: u8) -> Vec<u8> {
+	let mut out = Vec::new();
+	out.extend_from_slice(b"FLV");
+	out.push(1);
+	out.push(flags);
+	out.extend_from_slice(&9u32.to_be_bytes());
+	out.extend_from_slice(&0u32.to_be_bytes());
+	out
+}
+
+fn write_tag(out: &mut Vec<u8>, tag_type: u8, timestamp: u32, body: &[u8]) {
+	out.push(tag_type);
+	out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+	out.extend_from_slice(&timestamp.to_be_bytes()[1..]);
+	out.push((timestamp >> 24) as u8);
+	out.extend_from_slice(&[0, 0, 0]);
+	out.extend_from_slice(body);
+	out.extend_from_slice(&(11 + body.len() as u32).to_be_bytes());
+}
+
+/// Build an FLV with AVC + AAC sequence headers and a couple of frames each.
+fn synth_flv() -> Vec<u8> {
+	let mut out = Vec::new();
+	out.extend_from_slice(b"FLV");
+	out.push(1);
+	out.push(0x05);
+	out.extend_from_slice(&9u32.to_be_bytes());
+	out.extend_from_slice(&0u32.to_be_bytes());
+
+	let mut vseq = vec![
+		(super::FRAME_TYPE_KEY << 4) | super::VIDEO_CODEC_AVC,
+		super::AVC_SEQUENCE_HEADER,
+		0,
+		0,
+		0,
+	];
+	vseq.extend_from_slice(&avcc());
+	write_tag(&mut out, super::TAG_VIDEO, 0, &vseq);
+
+	let mut aseq = vec![super::AAC_AUDIO_TAG_HEADER, super::AAC_SEQUENCE_HEADER];
+	aseq.extend_from_slice(&ASC);
+	write_tag(&mut out, super::TAG_AUDIO, 0, &aseq);
+
+	// Video keyframe at t=0, inter frame at t=33ms.
+	let idr = [0, 0, 0, 5, 0x65, 0x88, 0x84, 0x21, 0x00];
+	let mut vkey = vec![
+		(super::FRAME_TYPE_KEY << 4) | super::VIDEO_CODEC_AVC,
+		super::AVC_NALU,
+		0,
+		0,
+		0,
+	];
+	vkey.extend_from_slice(&idr);
+	write_tag(&mut out, super::TAG_VIDEO, 0, &vkey);
+
+	let p = [0, 0, 0, 4, 0x41, 0xe0, 0x12, 0x34];
+	let mut vinter = vec![
+		(super::FRAME_TYPE_INTER << 4) | super::VIDEO_CODEC_AVC,
+		super::AVC_NALU,
+		0,
+		0,
+		0,
+	];
+	vinter.extend_from_slice(&p);
+	write_tag(&mut out, super::TAG_VIDEO, 33, &vinter);
+
+	// Audio frames at t=0 and t=23ms.
+	let mut a0 = vec![super::AAC_AUDIO_TAG_HEADER, super::AAC_RAW];
+	a0.extend_from_slice(&[0xde, 0xad]);
+	write_tag(&mut out, super::TAG_AUDIO, 0, &a0);
+
+	let mut a1 = vec![super::AAC_AUDIO_TAG_HEADER, super::AAC_RAW];
+	a1.extend_from_slice(&[0xbe, 0xef]);
+	write_tag(&mut out, super::TAG_AUDIO, 23, &a1);
+
+	out
+}
+
+/// Drive the exporter to completion, dropping an already-finished importer to signal EOS.
+async fn drain_export(mut exporter: Export, importer: Import) -> Vec<u8> {
+	let mut exported = Vec::new();
+	let mut importer = Some(importer);
+	for _ in 0..64 {
+		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+			Ok(Ok(Some(chunk))) => exported.extend_from_slice(&chunk),
+			Ok(Ok(None)) => break,
+			Ok(Err(e)) => panic!("exporter error: {e}"),
+			Err(_) => importer = None, // close the broadcast so the exporter can EOS
+		}
+	}
+	drop(importer);
+	exported
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_roundtrips_through_import() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer.decode(&bytes::BytesMut::from(synth_flv().as_slice())).unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+
+	// The export must be a real FLV stream.
+	assert_eq!(&exported[0..3], b"FLV");
+
+	// Re-import the exported bytes and confirm the catalog rebuilds identically.
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+
+	let snap = cat2.snapshot();
+	assert_eq!(snap.video.renditions.len(), 1);
+	assert_eq!(snap.audio.renditions.len(), 1);
+
+	let v = snap.video.renditions.values().next().unwrap();
+	assert!(matches!(v.codec, VideoCodec::H264(_)));
+	assert_eq!(v.description.as_ref().map(|b| b.as_ref()), Some(avcc().as_slice()));
+
+	let a = snap.audio.renditions.values().next().unwrap();
+	assert!(matches!(a.codec, AudioCodec::AAC(_)));
+	assert_eq!(a.sample_rate, 44100);
+	assert_eq!(a.description.as_ref().map(|b| b.as_ref()), Some(&ASC[..]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_emits_sequence_headers_and_frames() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer.decode(&bytes::BytesMut::from(synth_flv().as_slice())).unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer))
+		.await
+		.unwrap()
+		.with_max_age(RECORDING_MAX_AGE);
+	let exported = drain_export(exporter, importer).await;
+
+	let tags = parse_tags(&exported);
+
+	// One AVC sequence header, one AAC sequence header.
+	let avc_seq = tags
+		.iter()
+		.filter(|t| t.tag_type == super::TAG_VIDEO && t.body[1] == super::AVC_SEQUENCE_HEADER)
+		.count();
+	let aac_seq = tags
+		.iter()
+		.filter(|t| t.tag_type == super::TAG_AUDIO && t.body[1] == super::AAC_SEQUENCE_HEADER)
+		.count();
+	assert_eq!(avc_seq, 1, "expected one AVC sequence header");
+	assert_eq!(aac_seq, 1, "expected one AAC sequence header");
+
+	// Two video NALU frames and two raw AAC frames.
+	let video_frames = tags
+		.iter()
+		.filter(|t| t.tag_type == super::TAG_VIDEO && t.body[1] == super::AVC_NALU)
+		.count();
+	let audio_frames = tags
+		.iter()
+		.filter(|t| t.tag_type == super::TAG_AUDIO && t.body[1] == super::AAC_RAW)
+		.count();
+	assert_eq!(video_frames, 2, "expected two video frames");
+	assert_eq!(audio_frames, 2, "expected two audio frames");
+}
+
+/// A real VP9 key frame (profile 0, 320x240) from the VP9 parser's test vector.
+const VP9_KEYFRAME: &[u8] = &[0x82, 0x49, 0x83, 0x42, 0x20, 0x13, 0xf0, 0x0e, 0xf0, 0x00];
+
+/// Build an enhanced-RTMP FLV: VP9 video + Opus audio via the FourCC payloads.
+fn synth_enhanced_flv() -> Vec<u8> {
+	let head = crate::codec::opus::Config::new(48_000, 2).encode().unwrap();
+
+	let mut out = Vec::new();
+	out.extend_from_slice(b"FLV");
+	out.push(1);
+	out.push(0x05);
+	out.extend_from_slice(&9u32.to_be_bytes());
+	out.extend_from_slice(&0u32.to_be_bytes());
+
+	// Opus sequence start.
+	let mut aseq = vec![(super::AUDIO_FORMAT_EX << 4) | super::AUDIO_PACKET_SEQUENCE_START];
+	aseq.extend_from_slice(b"Opus");
+	aseq.extend_from_slice(&head);
+	write_tag(&mut out, super::TAG_AUDIO, 0, &aseq);
+
+	// VP9 key frame (enhanced CodedFrames, no composition time).
+	let mut vkey = vec![super::VIDEO_EX_HEADER | (super::FRAME_TYPE_KEY << 4) | super::VIDEO_PACKET_CODED_FRAMES];
+	vkey.extend_from_slice(b"vp09");
+	vkey.extend_from_slice(VP9_KEYFRAME);
+	write_tag(&mut out, super::TAG_VIDEO, 0, &vkey);
+
+	// One Opus frame.
+	let mut a0 = vec![(super::AUDIO_FORMAT_EX << 4) | super::AUDIO_PACKET_CODED_FRAMES];
+	a0.extend_from_slice(b"Opus");
+	a0.extend_from_slice(&[0xfc, 0xff, 0xfe]);
+	write_tag(&mut out, super::TAG_AUDIO, 20, &a0);
+
+	out
+}
+
+/// Enhanced codecs (VP9 video, Opus audio) survive an import -> export -> import
+/// round trip as enhanced-RTMP FourCC payloads.
+#[tokio::test(start_paused = true)]
+async fn export_roundtrips_enhanced() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer
+		.decode(&bytes::BytesMut::from(synth_enhanced_flv().as_slice()))
+		.unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+
+	let tags = parse_tags(&exported);
+	// The video frame is an enhanced (FourCC) vp09 tag.
+	assert!(
+		tags.iter().any(|t| t.tag_type == super::TAG_VIDEO
+			&& t.body[0] & super::VIDEO_EX_HEADER != 0
+			&& &t.body[1..5] == b"vp09"),
+		"expected an enhanced vp09 video tag"
+	);
+	// The audio carries an enhanced Opus sequence header.
+	assert!(
+		tags.iter().any(|t| t.tag_type == super::TAG_AUDIO
+			&& (t.body[0] >> 4) == super::AUDIO_FORMAT_EX
+			&& &t.body[1..5] == b"Opus"),
+		"expected an enhanced Opus audio tag"
+	);
+
+	// Re-import the exported bytes and confirm the codecs rebuild.
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+
+	let snap = cat2.snapshot();
+	assert!(matches!(
+		snap.video.renditions.values().next().unwrap().codec,
+		VideoCodec::VP9(_)
+	));
+	assert!(matches!(
+		snap.audio.renditions.values().next().unwrap().codec,
+		AudioCodec::Opus
+	));
+}
+
+/// Legacy MP3 audio survives an import -> export -> import round trip, muxed back
+/// out as the legacy SoundFormat 2 tag with the config still in band.
+#[tokio::test(start_paused = true)]
+async fn export_roundtrips_mp3() {
+	// MPEG-1 Layer III, 44.1 kHz, joint stereo.
+	let mut mp3 = vec![0xFF, 0xFB, 0x90, 0x44];
+	mp3.resize(417, 0xAA);
+
+	let mut flv = Vec::new();
+	flv.extend_from_slice(b"FLV");
+	flv.push(1);
+	flv.push(0x04); // audio only
+	flv.extend_from_slice(&9u32.to_be_bytes());
+	flv.extend_from_slice(&0u32.to_be_bytes());
+	let mut tag = vec![super::MP3_AUDIO_TAG_HEADER];
+	tag.extend_from_slice(&mp3);
+	write_tag(&mut flv, super::TAG_AUDIO, 0, &tag);
+
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer.decode(&bytes::BytesMut::from(flv.as_slice())).unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+
+	// The audio is muxed as a legacy SoundFormat 2 (MP3) tag, no sequence header.
+	let tags = parse_tags(&exported);
+	assert!(
+		tags.iter()
+			.any(|t| t.tag_type == super::TAG_AUDIO && (t.body[0] >> 4) == super::AUDIO_FORMAT_MP3),
+		"expected a legacy MP3 audio tag"
+	);
+
+	// Re-import and confirm the codec rebuilds.
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+
+	let snap = cat2.snapshot();
+	let a = snap.audio.renditions.values().next().unwrap();
+	assert!(matches!(a.codec, AudioCodec::Mp3));
+	assert_eq!(a.sample_rate, 44100);
+	assert_eq!(a.channel_count, 2);
+}
+
+fn synth_av1_flv() -> Vec<u8> {
+	let mut out = flv_header(0x01);
+
+	let mut seq = vec![super::VIDEO_EX_HEADER | (super::FRAME_TYPE_KEY << 4) | super::VIDEO_PACKET_SEQUENCE_START];
+	seq.extend_from_slice(b"av01");
+	seq.extend_from_slice(&AV1C);
+	write_tag(&mut out, super::TAG_VIDEO, 0, &seq);
+
+	let mut frame = vec![super::VIDEO_EX_HEADER | (super::FRAME_TYPE_KEY << 4) | super::VIDEO_PACKET_CODED_FRAMES_X];
+	frame.extend_from_slice(b"av01");
+	frame.extend_from_slice(&[0x12, 0x00, 0x34, 0x56]);
+	write_tag(&mut out, super::TAG_VIDEO, 0, &frame);
+
+	out
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_roundtrips_av1() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer
+		.decode(&bytes::BytesMut::from(synth_av1_flv().as_slice()))
+		.unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+	let tags = parse_tags(&exported);
+
+	assert!(
+		tags.iter().any(|t| t.tag_type == super::TAG_VIDEO
+			&& t.body[0] & super::VIDEO_EX_HEADER != 0
+			&& (t.body[0] & 0x0f) == super::VIDEO_PACKET_SEQUENCE_START
+			&& &t.body[1..5] == b"av01"),
+		"expected an AV1 enhanced sequence header"
+	);
+	assert!(
+		tags.iter().any(|t| t.tag_type == super::TAG_VIDEO
+			&& t.body[0] & super::VIDEO_EX_HEADER != 0
+			&& (t.body[0] & 0x0f) == super::VIDEO_PACKET_CODED_FRAMES
+			&& &t.body[1..5] == b"av01"),
+		"expected an AV1 enhanced frame"
+	);
+
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+
+	let snap = cat2.snapshot();
+	assert!(matches!(
+		snap.video.renditions.values().next().unwrap().codec,
+		VideoCodec::AV1(_)
+	));
+}
+
+fn synth_enhanced_audio_flv(fourcc: &[u8; 4], frame: &[u8]) -> Vec<u8> {
+	let mut out = flv_header(0x04);
+	let mut tag = vec![(super::AUDIO_FORMAT_EX << 4) | super::AUDIO_PACKET_CODED_FRAMES];
+	tag.extend_from_slice(fourcc);
+	tag.extend_from_slice(frame);
+	write_tag(&mut out, super::TAG_AUDIO, 0, &tag);
+	out
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_roundtrips_ac3() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer
+		.decode(&bytes::BytesMut::from(
+			synth_enhanced_audio_flv(b"ac-3", &AC3_FRAME).as_slice(),
+		))
+		.unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+	let tags = parse_tags(&exported);
+	assert!(
+		tags.iter()
+			.any(|t| t.tag_type == super::TAG_AUDIO && &t.body[1..5] == b"ac-3"),
+		"expected an enhanced AC-3 audio tag"
+	);
+
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+	assert!(matches!(
+		cat2.snapshot().audio.renditions.values().next().unwrap().codec,
+		AudioCodec::Ac3
+	));
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_roundtrips_eac3() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer
+		.decode(&bytes::BytesMut::from(
+			synth_enhanced_audio_flv(b"ec-3", &EAC3_FRAME).as_slice(),
+		))
+		.unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+	let tags = parse_tags(&exported);
+	assert!(
+		tags.iter()
+			.any(|t| t.tag_type == super::TAG_AUDIO && &t.body[1..5] == b"ec-3"),
+		"expected an enhanced E-AC-3 audio tag"
+	);
+
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+	assert!(matches!(
+		cat2.snapshot().audio.renditions.values().next().unwrap().codec,
+		AudioCodec::Ec3
+	));
+}
+
+/// A minimal avcC like [`avcc`], but with a caller-chosen level byte so two video
+/// renditions carry distinct codec configs.
+fn avcc_level(level: u8) -> Vec<u8> {
+	let sps = [0x67u8, 0x42, 0xc0, level];
+	let mut out = vec![0x01, 0x42, 0xc0, level, 0xff, 0xe1, 0x00, sps.len() as u8];
+	out.extend_from_slice(&sps);
+	out.extend_from_slice(&[0x01, 0x00, 0x04, 0x68, 0xce, 0x3c, 0x80]);
+	out
+}
+
+/// Producer handles that keep a built broadcast open (and its finished tracks
+/// subscribable) until dropped, which then lets the exporter reach end-of-stream.
+type Keepalive = (
+	moq_net::broadcast::Producer,
+	crate::catalog::Producer,
+	Vec<crate::container::Producer<crate::catalog::hang::Container>>,
+);
+
+/// Build a broadcast with two H.264 video renditions plus one AAC audio rendition,
+/// each with a single keyframe, so multitrack export has several tracks to mux.
+fn build_multitrack_broadcast() -> (moq_net::broadcast::Consumer, Vec<Vec<u8>>, Keepalive) {
+	use hang::catalog::{AAC, AudioConfig, Container, H264, VideoConfig};
+	use moq_net::Timestamp;
+
+	use crate::container::Producer;
+
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+	// A finished track stays subscribable only while its producer is alive, so keep
+	// each one until the exporter has drained.
+	let mut tracks = Vec::new();
+
+	let descriptions: Vec<Vec<u8>> = vec![avcc_level(0x1f), avcc_level(0x1e)];
+	for description in &descriptions {
+		let track = producer.create_track(producer.unique_name(".avc1"), None).unwrap();
+		let mut config = VideoConfig::new(H264 {
+			profile: 0x42,
+			constraints: 0xc0,
+			level: description[3],
+			inline: false,
+		});
+		config.container = Container::Legacy;
+		config.description = Some(Bytes::from(description.clone()));
+		catalog
+			.modify()
+			.unwrap()
+			.video
+			.renditions
+			.insert(track.name().to_string(), config);
+
+		let mut video = Producer::new(
+			track,
+			crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+		);
+		video
+			.write(crate::container::Frame {
+				timestamp: Timestamp::from_millis(0).unwrap(),
+				duration: None,
+				payload: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+				keyframe: true,
+			})
+			.unwrap();
+		video.finish().unwrap();
+		tracks.push(video);
+	}
+
+	let audio_track = producer.create_track(producer.unique_name(".aac"), None).unwrap();
+	let mut audio_config = AudioConfig::new(AAC { profile: 2 }, 44100, 2);
+	audio_config.container = Container::Legacy;
+	audio_config.description = Some(Bytes::from_static(&ASC));
+	catalog
+		.modify()
+		.unwrap()
+		.audio
+		.renditions
+		.insert(audio_track.name().to_string(), audio_config);
+	let mut audio = crate::container::Producer::new(
+		audio_track,
+		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+	);
+	audio
+		.write(crate::container::Frame {
+			timestamp: Timestamp::from_millis(0).unwrap(),
+			duration: None,
+			payload: Bytes::from_static(&[0xde, 0xad]),
+			keyframe: true,
+		})
+		.unwrap();
+	audio.finish().unwrap();
+	tracks.push(audio);
+	catalog.finish().unwrap();
+
+	// Keep the broadcast, catalog, and track producers alive so the exporter can
+	// subscribe; the caller drops them mid-drain to signal end-of-stream.
+	(consumer, descriptions, (producer, catalog, tracks))
+}
+
+/// Drive the exporter to completion, dropping the producer handles on the first
+/// stall so it can reach end-of-stream (the already-published groups stay readable).
+async fn drain_to_end(mut exporter: Export, keepalive: Keepalive) -> Vec<u8> {
+	let mut exported = Vec::new();
+	let mut keepalive = Some(keepalive);
+	for _ in 0..64 {
+		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+			Ok(Ok(Some(chunk))) => exported.extend_from_slice(&chunk),
+			Ok(Ok(None)) => break,
+			Ok(Err(e)) => panic!("exporter error: {e}"),
+			Err(_) => keepalive = None, // close the broadcast so the exporter can EOS
+		}
+	}
+	drop(keepalive);
+	exported
+}
+
+/// With multitrack enabled, every rendition is muxed as an enhanced-RTMP
+/// multitrack track and survives an export -> import round trip. Without it, only
+/// the first video rendition is muxed.
+#[tokio::test(start_paused = true)]
+async fn export_multitrack_roundtrips_all_renditions() {
+	let (consumer, descriptions, keepalive) = build_multitrack_broadcast();
+
+	let exporter = Export::new(crate::source::announced(&consumer))
+		.await
+		.unwrap()
+		.with_multitrack(true);
+	let exported = drain_to_end(exporter, keepalive).await;
+
+	assert_eq!(&exported[0..3], b"FLV");
+
+	// Every video media tag uses the multitrack framing (packet type 5, OneTrack),
+	// and both track ids show up.
+	let tags = parse_tags(&exported);
+	let mut video_track_ids: Vec<u8> = tags
+		.iter()
+		.filter(|t| {
+			t.tag_type == super::TAG_VIDEO
+				&& t.body[0] & super::VIDEO_EX_HEADER != 0
+				&& t.body[0] & 0x0f == super::VIDEO_PACKET_MULTITRACK
+				&& t.body[1] & 0x0f == super::VIDEO_PACKET_CODED_FRAMES
+				&& &t.body[2..6] == b"avc1"
+		})
+		.map(|t| t.body[6])
+		.collect();
+	video_track_ids.sort_unstable();
+	video_track_ids.dedup();
+	assert_eq!(video_track_ids, vec![0, 1], "expected two multitrack video track ids");
+
+	// Re-import and confirm both video renditions plus the audio rebuild.
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+
+	let snap = cat2.snapshot();
+	assert_eq!(
+		snap.video.renditions.len(),
+		2,
+		"both video renditions should round-trip"
+	);
+	assert_eq!(snap.audio.renditions.len(), 1);
+
+	// Both distinct avcC descriptions survive.
+	let mut got: Vec<Vec<u8>> = snap
+		.video
+		.renditions
+		.values()
+		.filter_map(|c| c.description.as_ref().map(|b| b.to_vec()))
+		.collect();
+	got.sort();
+	let mut want = descriptions.clone();
+	want.sort();
+	assert_eq!(got, want, "each rendition should keep its own avcC");
+}
+
+/// Without multitrack, a multi-rendition broadcast exports only the first video
+/// rendition (the single-track fallback for a legacy player).
+#[tokio::test(start_paused = true)]
+async fn export_without_multitrack_keeps_first_rendition() {
+	let (consumer, _, keepalive) = build_multitrack_broadcast();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_to_end(exporter, keepalive).await;
+
+	// No multitrack framing: the single video track is a legacy AVC tag.
+	let tags = parse_tags(&exported);
+	assert!(
+		tags.iter()
+			.all(|t| !(t.tag_type == super::TAG_VIDEO && t.body[0] & 0x0f == super::VIDEO_PACKET_MULTITRACK)),
+		"single-track export must not use multitrack framing"
+	);
+
+	let mut bcast2 = moq_net::broadcast::Info::new().produce();
+	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
+	let mut imp2 = Import::new(bcast2, cat2.reserve());
+	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
+	imp2.finish().unwrap();
+
+	assert_eq!(
+		cat2.snapshot().video.renditions.len(),
+		1,
+		"only one rendition without multitrack"
+	);
+}
+
+struct ParsedTag {
+	tag_type: u8,
+	timestamp: u32,
+	body: Vec<u8>,
+}
+
+/// Parse an FLV byte stream into its tags (skipping the 9-byte file header and
+/// every `PreviousTagSize`).
+fn parse_tags(flv: &[u8]) -> Vec<ParsedTag> {
+	let mut tags = Vec::new();
+	let mut off = 9 + 4; // file header + PreviousTagSize0
+	while off + 11 <= flv.len() {
+		let tag_type = flv[off];
+		let size = super::read_u24(&flv[off + 1..off + 4]) as usize;
+		let timestamp = super::read_u24(&flv[off + 4..off + 7]) | ((flv[off + 7] as u32) << 24);
+		let body_start = off + 11;
+		if body_start + size + 4 > flv.len() {
+			break;
+		}
+		tags.push(ParsedTag {
+			tag_type,
+			timestamp,
+			body: flv[body_start..body_start + size].to_vec(),
+		});
+		off = body_start + size + 4;
+	}
+	tags
+}
+
+/// A frame's presentation timestamp must survive as DTS plus composition time.
+#[tokio::test(start_paused = true)]
+async fn export_preserves_timestamps() {
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+
+	let mut importer = Import::new(producer, catalog.reserve());
+	importer.decode(&bytes::BytesMut::from(synth_flv().as_slice())).unwrap();
+	importer.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_export(exporter, importer).await;
+
+	let tags = parse_tags(&exported);
+	let video_pts: Vec<i64> = tags
+		.iter()
+		.filter(|t| t.tag_type == super::TAG_VIDEO && t.body[1] == super::AVC_NALU)
+		.map(|t| i64::from(t.timestamp) + i64::from(super::read_i24(&t.body[2..5])))
+		.collect();
+	assert_eq!(video_pts, vec![0, 33]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn export_authors_dts_and_composition_time_for_reordered_avc() {
+	use hang::catalog::{AAC, AudioConfig, Container, H264, VideoConfig};
+	use moq_net::Timestamp;
+
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+	let video_track = producer.create_track(producer.unique_name(".avc1"), None).unwrap();
+	let audio_track = producer.create_track(producer.unique_name(".aac"), None).unwrap();
+
+	let mut video_config = VideoConfig::new(H264 {
+		profile: 0x42,
+		constraints: 0xc0,
+		level: 0x1f,
+		inline: false,
+	});
+	video_config.container = Container::Legacy;
+	video_config.description = Some(Bytes::from(avcc()));
+	video_config.jitter = Some(Duration::from_millis(80));
+	catalog
+		.modify()
+		.unwrap()
+		.video
+		.renditions
+		.insert(video_track.name().to_string(), video_config);
+
+	let mut audio_config = AudioConfig::new(AAC { profile: 2 }, 44100, 2);
+	audio_config.container = Container::Legacy;
+	audio_config.description = Some(Bytes::from_static(&ASC));
+	catalog
+		.modify()
+		.unwrap()
+		.audio
+		.renditions
+		.insert(audio_track.name().to_string(), audio_config);
+
+	let mut video = crate::container::Producer::new(
+		video_track,
+		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+	);
+	let video_frame = |timestamp_ms: u64, payload: &'static [u8], keyframe| crate::container::Frame {
+		timestamp: Timestamp::from_millis(timestamp_ms).unwrap(),
+		duration: None,
+		payload: Bytes::from_static(payload),
+		keyframe,
+	};
+	video.write(video_frame(0, &[0, 0, 0, 1, 0x65], true)).unwrap();
+	video.write(video_frame(80, &[0, 0, 0, 1, 0x41], false)).unwrap();
+	video.write(video_frame(40, &[0, 0, 0, 1, 0x01], false)).unwrap();
+	video.write(video_frame(120, &[0, 0, 0, 1, 0x41], false)).unwrap();
+	video.finish().unwrap();
+
+	let mut audio = crate::container::Producer::new(
+		audio_track,
+		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+	);
+	audio
+		.write(crate::container::Frame {
+			timestamp: Timestamp::from_millis(20).unwrap(),
+			duration: None,
+			payload: Bytes::from_static(&[0xde, 0xad]),
+			keyframe: true,
+		})
+		.unwrap();
+	audio.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let exporter = Export::new(crate::source::announced(&consumer)).await.unwrap();
+	let exported = drain_exporter_chunks(exporter, 6).await;
+	let tags = parse_tags(&exported);
+
+	let tag_timestamps: Vec<u32> = tags.iter().map(|tag| tag.timestamp).collect();
+	assert!(
+		tag_timestamps.windows(2).all(|pair| pair[1] >= pair[0]),
+		"FLV tag timestamps must not go backwards: {tag_timestamps:?}"
+	);
+
+	let video_frames: Vec<(u32, i32)> = tags
+		.iter()
+		.filter(|tag| tag.tag_type == super::TAG_VIDEO && tag.body[1] == super::AVC_NALU)
+		.map(|tag| (tag.timestamp, super::read_i24(&tag.body[2..5])))
+		.collect();
+	assert_eq!(
+		video_frames.iter().map(|(dts, _)| *dts).collect::<Vec<_>>(),
+		vec![0, 1, 2, 40],
+		"video tag timestamps should be authored DTS"
+	);
+	assert_eq!(
+		video_frames
+			.iter()
+			.map(|(dts, cts)| i64::from(*dts) + i64::from(*cts))
+			.collect::<Vec<_>>(),
+		vec![0, 80, 40, 120],
+		"composition time should recover the source PTS"
+	);
+}
+
+async fn drain_exporter_chunks(mut exporter: Export, chunks: usize) -> Vec<u8> {
+	let mut exported = Vec::new();
+	for _ in 0..chunks {
+		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+			Ok(Ok(Some(chunk))) => exported.extend_from_slice(&chunk),
+			Ok(Ok(None)) => panic!("exporter ended early"),
+			Ok(Err(e)) => panic!("exporter error: {e}"),
+			Err(_) => panic!("exporter timed out"),
+		}
+	}
+	exported
+}

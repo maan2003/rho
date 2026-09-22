@@ -1,0 +1,35 @@
+[log]
+# Enable debug logging for development.
+# The RUST_LOG environment variable will take precedence.
+level = "debug"
+
+[listen]
+# Listen for QUIC connections on UDP:4443
+# Sometimes IPv6 causes issues; try 127.0.0.1:4443 instead.
+bind = "[::]:4443"
+
+# Server certificate and key signed by the cluster CA so leaves can
+# verify via `tls.root`. `just cert root` generates these files.
+# For a standalone dev setup, use `tls.generate = ["localhost"]` instead.
+tls.cert = ["root.crt"]
+tls.key = ["root.key"]
+
+# Trust client certificates signed by this CA for mTLS peer auth. The
+# certificate is a fact for the auth source: `auth.public = "**"` below admits
+# the leaves, and an auth server would grant them through `--mtls-publish` /
+# `--mtls-subscribe`. `just ca` generates the CA.
+tls.root = ["ca.pem"]
+
+[web.http]
+# Listen for HTTP and WebSocket (TCP) connections on the given address.
+# Defaults to disabled if not provided.
+listen = "[::]:4443"
+
+[auth]
+# Local development: anonymous access to everything, so no JWT is needed.
+public = "**"
+
+# To exercise JWT + public-pattern auth instead, drop `public` above, run
+# `moq auth serve --key root.jwk --public-subscribe 'anon/**' --public-subscribe 'demo/**' --public-publish 'anon/**' --mtls-publish '**' --mtls-subscribe '**'`,
+# and point the relay at it:
+# url = "http://127.0.0.1:4440/"

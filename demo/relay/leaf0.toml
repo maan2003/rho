@@ -1,0 +1,52 @@
+[log]
+# Enable debug logging for development.
+# The RUST_LOG environment variable will take precedence.
+level = "debug"
+
+[listen]
+# Listen for QUIC connections on UDP:4444
+# Sometimes IPv6 causes issues; try 127.0.0.1:4444 instead.
+bind = "[::]:4444"
+
+# Serve the same cluster-signed certificate that we present as a client,
+# so other leaves can verify us against `ca.pem`.
+tls.cert = ["leaf0.crt"]
+tls.key = ["leaf0.key"]
+
+# Trust client certificates signed by this CA for mTLS peer auth. The
+# certificate is a fact for the auth source below; an auth server grants
+# peers through `--mtls-publish` / `--mtls-subscribe`.
+tls.root = ["ca.pem"]
+
+[connect]
+# Present this certificate and key on outbound cluster connections; the
+# root reports it to its auth source.
+tls.cert = "leaf0.crt"
+tls.key = "leaf0.key"
+
+# Verify the remote's server cert against the cluster CA. All cluster
+# nodes' server certs are signed by `ca.pem`, so no custom trust
+# store is required beyond this one file.
+tls.root = ["ca.pem"]
+
+[web.http]
+# Listen for HTTP and WebSocket (TCP) connections on the given address.
+listen = "[::]:4444"
+
+[cluster]
+# Connect only to the root. leaf1 will dial us directly, forming a loop
+# (leaf1 -> root, leaf1 -> leaf0, leaf0 -> root) to exercise cluster loop detection.
+connect = ["https://localhost:4443/"]
+
+[auth]
+# Local development: anonymous access to everything, so no JWT is needed.
+public = "**"
+
+# To exercise JWT + public-pattern auth instead, drop `public` above, run
+# `moq auth serve --key root.jwk --public-subscribe 'anon/**' --public-subscribe 'demo/**' --public-publish 'anon/**' --mtls-publish '**' --mtls-subscribe '**'`,
+# and point the relay at it:
+# url = "http://127.0.0.1:4440/"
+
+[stats]
+enabled = true
+node = "local/leaf0"

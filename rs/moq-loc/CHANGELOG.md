@@ -1,0 +1,70 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.7...moq-loc-v0.2.8) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.6...moq-loc-v0.2.7) - 2026-09-13
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.6](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.5...moq-loc-v0.2.6) - 2026-09-09
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.5](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.4...moq-loc-v0.2.5) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.4](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.3...moq-loc-v0.2.4) - 2026-09-01
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.3](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.2...moq-loc-v0.2.3) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.2.2](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.1...moq-loc-v0.2.2) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.2.1](https://github.com/moq-dev/moq/compare/moq-loc-v0.2.0...moq-loc-v0.2.1) - 2026-08-03
+
+### Fixed
+
+- *(loc)* adopt the draft-ietf-moq-loc-04 Timestamp code point, and align relay-hops with lite-06 ([#2581](https://github.com/moq-dev/moq/pull/2581))
+
+## [0.2.0](https://github.com/moq-dev/moq/compare/moq-loc-v0.1.0...moq-loc-v0.2.0) - 2026-07-22
+
+### Other
+
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- replace anyhow with thiserror ([#1495](https://github.com/moq-dev/moq/pull/1495))
+- runtime Timescale/Timestamp; container::Frame keeps source scale ([#1473](https://github.com/moq-dev/moq/pull/1473))
+
+## [0.1.0]
+
+### Added
+
+- Initial release. Encode and decode LOC frames per draft-ietf-moq-loc.

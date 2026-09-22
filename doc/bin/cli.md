@@ -1,0 +1,254 @@
+---
+title: moq-cli
+description: The moq media router, for publishing, playing, converting, and gatewaying
+---
+
+# moq-cli
+
+`moq` is a media router. One process connects to a relay (or hosts sessions
+itself) and moves media into MoQ from a source, out of MoQ to a sink, or plays
+it locally. Install it with `cargo install moq-cli`, brew, apt, dnf, winget,
+or Docker; see [Install](/setup/install).
+
+## What it does
+
+| Verb | Endpoint | |
+| --- | --- | --- |
+| `import` | `ts`, `fmp4`, `flv`, `avc3` | Read a container from stdin (usually FFmpeg). |
+| `import` | `capture` | Capture a camera, display, window, or app plus a microphone, and encode natively. |
+| `import` | `hls <url>` | Pull a remote HLS playlist. |
+| `import` | `rtmp`, `srt`, `rtc` | Accept pushes (`--listen`) or pull from a remote (`--connect`). |
+| `export` | `fmp4`, `mkv`, `ts`, `flv`, `h264`, `h265` | Write a container to stdout. |
+| `export` | `hls --listen` | Serve the broadcast as HLS over HTTP. |
+| `export` | `rtmp`, `srt`, `rtc` | Serve plays (`--listen`) or push to a remote (`--connect`). |
+| `play` | | Decode and play in a native window with sound. |
+| `transcode` | | Publish a just-in-time rendition ladder next to a broadcast. |
+| `token` | | Generate, sign, and verify relay JWTs. |
+| `devices` | | List capture sources and their ids. |
+
+## Grammar
+
+```text
+moq <MoQ side> import <source> [options]
+moq <MoQ side> export <sink> [options]
+moq <MoQ side> play [options]
+```
+
+The **MoQ side** goes first and attaches the process to the network:
+`--connect <url>` dials a relay (the path is the auth path, `?jwt=`
+carries a token), and `--broadcast <name>` names the broadcast. A process can
+instead host sessions with `--listen`, or both at once. `moq import --help` lists the sources and `moq import rtmp --help` a specific one.
+
+```bash
+# Publish a file (remux to MPEG-TS without re-encoding)
+ffmpeg -re -i video.mp4 -c copy -f mpegts -pes_payload_size 0 - | \
+    moq --connect https://relay.example.com/anon --broadcast my-stream.hang import ts
+
+# Pull it back out
+moq --connect https://relay.example.com/anon --broadcast my-stream.hang export ts | ffplay -
+
+# With a token
+moq --connect "https://relay.example.com/rooms/1?jwt=$TOKEN" --broadcast alice.hang import ts
+```
+
+MPEG-TS import carries H.264/H.265 and AAC/MP2/AC-3/E-AC-3, passes SCTE-35 and
+subtitle PIDs through as tracks, and round-trips the service tables. A
+`discontinuity_indicator` on the program's PCR PID is a system time-base reset,
+so it breaks every track's timeline and the exported clock declares the break in
+turn. The same flag on an elementary PID other than the program PCR PID, a
+continuity-counter gap, and the 33-bit timestamp rollover move no clock and
+declare nothing. FLV covers H.264 + AAC.
+
+MPEG-TS export restarts its clock and table cadence after a declared marker,
+discarding the old mux buffer. The first new clock packet signals the break and
+stdout pacing re-anchors. Every rendition joins the new program generation;
+no track is fenced across the marker.
+
+A constant-rate MPEG-TS source records its multiplex rate in the catalog
+(`mpegts.muxRate`, measured off the PCR clock, null stuffing included), and
+`export ts` pads its output with null packets back to that rate so an IRD or
+groomer receives a constant-rate stream. `--mux-rate 5000000` pads to an explicit
+rate instead, including for a broadcast that recorded none. Media is never delayed
+or dropped to fit: a source that sustains more than the rate overruns it, and a
+VBR source records nothing, so export without either stays unpadded.
+
+fMP4 export writes one fragment per publisher group on each track. Audio follows
+the publisher's cuts; video normally follows GOPs. Closing a group flushes it
+even when the live publisher pauses. `--fragment-duration 2s` caps
+the fragment span as frames arrive, including audio whose publisher never cuts.
+MKV uses the same flag to cap clusters, which otherwise follow video GOPs.
+
+## Play
+
+```bash
+moq --connect https://relay.example.com/anon --broadcast my-stream.hang play
+moq ... play --delay 500ms          # trade latency for a jittery link
+```
+
+Decodes H.264, H.265, and AV1 video and Opus, PCM, and AAC-LC audio using
+the platform hardware decoder where available. `--video-name` and
+`--audio-name` pick a rendition.
+
+Playback runs on a clock it owns. `--delay` (default 100 ms) is how far it
+trails the live edge, which is both the jitter a late frame may absorb and the
+point past which a stalled group is skipped. The speaker holds the delay, with a
+50 ms floor under it, and the picture is scheduled against where the speaker
+actually is. While video owns the clock, a frame arriving earlier than predicted
+pulls playback forward, so a late start catches up to live instead of staying
+behind it. Once the speaker owns the clock, video follows the speaker instead.
+
+Each role follows the catalog for as long as it lasts. Each decoder starts at
+the newest cached group, including when a rendition is reopened, so playback
+does not replay the retained backlog. A publisher that retires the rendition
+being played ends that track and the role picks a replacement. Playback is
+behind the `play` feature, since it pulls in windowing and audio-device
+dependencies:
+
+```bash
+cargo install moq-cli --no-default-features --features "iroh,noq,websocket,play"
+```
+
+## Capture
+
+```bash
+moq --connect https://relay.example.com/anon --broadcast cam.hang import capture
+moq ... import capture --display --system-audio          # share a screen with its sound (macOS)
+moq ... import capture --window 39193 --no-audio         # one window (macOS, Windows, X11)
+moq ... import capture --camera 0 --width 1280 --height 720 --fps 30 --bitrate 3000000 --codec h265
+```
+
+Video goes through the platform hardware encoder (VideoToolbox, Media
+Foundation, NVENC, and with the opt-in `vaapi` / `v4l2` features VAAPI and V4L2
+M2M) with a built-in H.264 software fallback;
+audio is Opus. The camera is opened only while someone is watching, and
+`--bitrate` is the opening ceiling. Backends with live bitrate control lower it
+to fit the connection's bandwidth estimate. `moq devices` prints every source
+id. Requires the `capture` feature; on Linux that needs libclang, V4L2, and
+ALSA headers, and `--display` also needs the `pipewire` feature (links
+libpipewire).
+
+## Transcode
+
+```bash
+moq --connect https://relay.example.com/anon --broadcast cam.hang transcode
+moq ... transcode --rung 720:2500000 --rung 360:600000 --encoder nvenc --decoder nvdec
+```
+
+Publishes `cam.hang/transcode.hang` whose catalog references the source's
+rendition and adds lower rungs that are decoded and encoded only while someone
+watches them. On NVIDIA the whole pipeline stays on the GPU; `--frames cpu`
+forces decoded frames into CPU memory instead of the default `native`.
+Requires the `transcode` feature.
+
+The ladder is sized against the source picture and follows it, so a source that
+changes resolution mid-stream (a window capture renegotiated by a resize, a
+publisher reconnecting at a new size) resolves the rungs again. Rungs that still
+fit keep serving. A rung the new picture has no room for finishes its track, as
+does one whose own picture moved, and the latter comes back under a new name
+(`video/360p.2`), so a viewer on either reselects as it would on any other
+rendition change.
+
+Custom `--rung` values may be supplied in any order. Heights round down to even;
+heights and bitrates must then increase strictly together. Duplicate heights or
+bitrates, inverted rankings, and zero-sized or zero-bitrate rungs are rejected
+before connecting.
+
+## Multiple stages
+
+Separate stages with `--` to bridge several broadcasts, or both directions,
+over one connection:
+
+```bash
+moq --connect https://relay.example.com/anon \
+    import --broadcast event.hang srt --listen 0.0.0.0:9000 \
+    -- export --broadcast event.hang hls --listen 0.0.0.0:8080
+```
+
+## Redundant publishers
+
+Two publishers that share a Hop ID (`--hop 42`) are treated as
+interchangeable sources: relays hold both routes and fail over at a group
+boundary. They must produce identical tracks with aligned groups. Everywhere
+else leave `--hop` unset: a fresh id per run is what makes a restarted
+encoder take over cleanly instead of splicing mid-stream.
+
+## Cluster
+
+The CLI reads the same `--cluster-*` flags as `moq-relay`, LAN and WAN alike,
+and publishes on the cluster origin. A `moq --cluster-lan` process and a
+`moq-relay` with `[cluster.lan]` on the same network mesh with each other.
+
+`--cluster-lan` advertises this process on the LAN over mDNS and meshes with
+every other participating MoQ process. It reuses `--listen`, filling in an
+ephemeral port and a generated certificate when those are unset. A LAN peer
+authenticates with its mDNS credential; `cluster.token` is for static and
+gossip peers only.
+
+```bash
+moq --cluster-lan import capture
+moq --cluster-lan --cluster-lan-secret /etc/moq/cluster.key import capture
+```
+
+`--cluster-lan-secret` restricts the mesh to peers holding the same key.
+Without it, anyone who can reach the listener joins, so leave it unset only
+on networks you trust. mDNS is still an open channel: the secret
+authenticates the record, it does not hide the credential or the node URL.
+
+`--cluster-lan-app` names the DNS-SD application this process advertises
+under. Peers using a different name never discover this one. It defaults to
+`default`, which moq-relay shares, so the two find each other with no
+configuration. An application built on the library picks its own name.
+
+The WAN flags (`--cluster-connect`, `--cluster-connect-api`, `--cluster-node`,
+`--cluster-mesh`, `--cluster-token`, `--cluster-id`, `--cluster-tier`) match
+the relay. `--cluster-connect` and `--cluster-connect-api` are a MoQ side on
+their own, so `moq --cluster-connect https://relay.example import ts` needs
+no `--connect`. See [Clustering](/bin/relay/cluster).
+
+## Auth
+
+```bash
+moq auth generate --algorithm ES256 --out private.jwk --public public.jwk
+moq auth sign --key private.jwk --root rooms/123 --publish 'alice/**' --subscribe '**' > alice.jwt
+moq auth verify --key public.jwk --in alice.jwt
+```
+
+`--publish` and `--subscribe` take patterns: `alice` is one broadcast,
+`alice/**` is a subtree, `**` is everything under `--root`.
+
+`moq auth serve` answers a relay's auth requests with the same keys, public
+rules, an explicit mTLS grant, tiers, and session limits; see
+[Auth server](/bin/relay/auth#auth-server).
+
+```bash
+moq auth serve --listen 127.0.0.1:4440 --key-dir keys/ --public-subscribe 'anon/**'
+```
+
+`moq auth sessions` and `moq auth revalidate` talk to a relay's internal
+listener. A push is a re-check: the auth server's reply is what kicks. An
+empty filter is every session on that node.
+
+```bash
+# Kick one session by id.
+moq auth revalidate --internal-url http://127.0.0.1:9101 --id 00ff
+
+# Re-check everyone under a path.
+moq auth revalidate --internal-url http://127.0.0.1:9101 --path 'rooms/123/**'
+moq auth sessions --internal-url http://127.0.0.1:9101 --path 'rooms/123/**'
+```
+
+See [Authentication](/bin/relay/auth).
+
+## Retention and latency
+
+`import --max-age` (default 30 s) tells relays how long to keep old
+groups fetchable, which the [HLS gateway](/bin/hls) depends on. `export --max-age` (default 500 ms) is how long *this* consumer waits for a
+stalled group before skipping. Raising the first never delays playback.
+
+## Debugging
+
+`RUST_LOG=debug` prints the negotiated version and every subscription.
+`curl http://relay:4443/announced/` confirms the relay is reachable and shows
+what it holds. Connection refused means UDP isn't getting through; certificate
+errors on a dev relay want `--connect-tls-insecure` or the `http://`
+fingerprint flow.

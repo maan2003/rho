@@ -1,0 +1,166 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- [**breaking**] Codec options are `Config` in snapshot and stream. Track-owning options are
+  `producer::Config` / `consumer::Config`. `compression` is a `Compression` enum (`None` / `Deflate`)
+  instead of a `bool`, and `with_compression` is gone.
+
+- [**breaking**] `window::Producer::finish` borrows (`&mut self`) instead of consuming, matching
+  snapshot and stream, so the handle stays usable after a clean end.
+- [**breaking**] `snapshot::Producer::lock` is now `modify` and returns a `Result`, refusing a closed
+  track. A guard that fails to publish on drop aborts the track with the error instead of logging a
+  warning, so consumers and the next `modify` both see it. `Guard::commit` is unchanged and leaves
+  the track open on failure. A panic while a guard is held discards the in-flight edit.
+
+### Added
+
+- `snapshot::Producer::abort` closes the track with an error, like `moq_net::track::Producer::abort`.
+
+## [0.3.12](https://github.com/moq-dev/moq/compare/moq-json-v0.3.11...moq-json-v0.3.12) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.3.11](https://github.com/moq-dev/moq/compare/moq-json-v0.3.10...moq-json-v0.3.11) - 2026-09-13
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.3.10](https://github.com/moq-dev/moq/compare/moq-json-v0.3.9...moq-json-v0.3.10) - 2026-09-09
+
+### Other
+
+- updated the following local packages: kio, moq-net
+
+## [0.3.9](https://github.com/moq-dev/moq/compare/moq-json-v0.3.8...moq-json-v0.3.9) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.3.8](https://github.com/moq-dev/moq/compare/moq-json-v0.3.7...moq-json-v0.3.8) - 2026-09-01
+
+### Other
+
+- *(rs)* simplify poll propagation ([#3307](https://github.com/moq-dev/moq/pull/3307))
+
+## [0.3.7](https://github.com/moq-dev/moq/compare/moq-json-v0.3.6...moq-json-v0.3.7) - 2026-09-01
+
+### Added
+
+- *(json)* add a sliding-window mode ([#3168](https://github.com/moq-dev/moq/pull/3168))
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.3.6](https://github.com/moq-dev/moq/compare/moq-json-v0.3.5...moq-json-v0.3.6) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net
+
+## [0.3.5](https://github.com/moq-dev/moq/compare/moq-json-v0.3.4...moq-json-v0.3.5) - 2026-08-24
+
+### Other
+
+- updated the following local packages: kio
+
+## [0.3.4](https://github.com/moq-dev/moq/compare/moq-json-v0.3.3...moq-json-v0.3.4) - 2026-08-20
+
+### Other
+
+- *(kio)* dedup waiter registration so Park can reuse a parked waiter ([#2905](https://github.com/moq-dev/moq/pull/2905))
+
+## [0.3.3](https://github.com/moq-dev/moq/compare/moq-json-v0.3.2...moq-json-v0.3.3) - 2026-08-05
+
+### Added
+
+- *(json)* split the codec out of the track for both modes ([#2636](https://github.com/moq-dev/moq/pull/2636))
+
+### Fixed
+
+- *(moq-stats)* hold subscriptions for uncreated tier tracks open with zeros ([#2642](https://github.com/moq-dev/moq/pull/2642))
+
+### Other
+
+- *(rs)* clean up pedantic clippy warnings ([#2621](https://github.com/moq-dev/moq/pull/2621))
+
+## [0.3.2](https://github.com/moq-dev/moq/compare/moq-json-v0.3.1...moq-json-v0.3.2) - 2026-07-27
+
+### Fixed
+
+- *(hang)* reject a non-hex catalog description instead of misreading it ([#2516](https://github.com/moq-dev/moq/pull/2516))
+
+## [0.3.1](https://github.com/moq-dev/moq/compare/moq-json-v0.3.0...moq-json-v0.3.1) - 2026-07-23
+
+### Other
+
+- *(rust)* pin the toolchain and correct the MSRV claims ([#2462](https://github.com/moq-dev/moq/pull/2462))
+
+## [0.3.0](https://github.com/moq-dev/moq/compare/moq-json-v0.2.0...moq-json-v0.3.0) - 2026-07-22
+
+### Added
+
+- *(net)* [**breaking**] extract stats publishing into moq-stats with compressed tracks ([#2380](https://github.com/moq-dev/moq/pull/2380))
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+
+### Other
+
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- *(net)* remove implicit frame timestamp helpers ([#2232](https://github.com/moq-dev/moq/pull/2232))
+- Merge origin/main into dev
+
+## [0.2.0](https://github.com/moq-dev/moq/compare/moq-json-v0.1.2...moq-json-v0.2.0) - 2026-07-12
+
+### Other
+
+- split into snapshot/stream modules and expose JSON tracks through moq-ffi/libmoq ([#2196](https://github.com/moq-dev/moq/pull/2196))
+
+## [0.1.2](https://github.com/moq-dev/moq/compare/moq-json-v0.1.1...moq-json-v0.1.2) - 2026-07-09
+
+### Other
+
+- Per-track timeline index for each media track ([#2109](https://github.com/moq-dev/moq/pull/2109))
+
+## [0.1.1](https://github.com/moq-dev/moq/compare/moq-json-v0.1.0...moq-json-v0.1.1) - 2026-06-30
+
+### Other
+
+- *(moq-json)* generate merge patches with a diffing serializer (+ benchmark) ([#1912](https://github.com/moq-dev/moq/pull/1912))
+- *(moq-json)* gate group rolls on already-written deltas ([#1909](https://github.com/moq-dev/moq/pull/1909))
+
+## [0.0.4](https://github.com/moq-dev/moq/compare/moq-json-v0.0.3...moq-json-v0.0.4) - 2026-06-17
+
+### Added
+
+- *(json)* default delta_ratio to 8, count only delta bytes ([#1765](https://github.com/moq-dev/moq/pull/1765))
+
+## [0.0.3](https://github.com/moq-dev/moq/compare/moq-json-v0.0.2...moq-json-v0.0.3) - 2026-06-16
+
+### Other
+
+- updated the following local packages: kio
+
+## [0.0.2](https://github.com/moq-dev/moq/compare/moq-json-v0.0.1...moq-json-v0.0.2) - 2026-06-10
+
+### Added
+
+- *(hang,json,moq-mux)* generic catalog with application extensions ([#1658](https://github.com/moq-dev/moq/pull/1658))
+
+### Fixed
+
+- *(moq-mux)* keep catalog Consumer Clone + stable FramedFormat discriminants ([#1661](https://github.com/moq-dev/moq/pull/1661))

@@ -1,0 +1,218 @@
+//! Legacy broadcast audio (MP2, AC-3, E-AC-3) carried verbatim.
+//!
+//! These codecs share one model: every frame is whole and self-describing
+//! (framing header included), never decoded. [`decode`](Import::decode) marks only the first frame of
+//! each group a keyframe (the rest extend it); the caller bounds groups via [`cut`](Import::cut) /
+//! [`seek`](Import::seek). Verbatim is byte-exact for complete, well-formed frames;
+//! malformed or out-of-scope input is rejected, never mis-described. Each
+//! codec contributes only a header parser and a [`Descriptor`]; this module
+//! owns the track lifecycle.
+
+use moq_net::Timestamp;
+
+use crate::catalog::hang::CatalogExt;
+use crate::container::Frame;
+
+/// Legacy audio (MP2 / AC-3 / E-AC-3) header parsing errors.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+	#[error("AC-3 header needs 7 bytes")]
+	Ac3HeaderTooShort,
+
+	#[error("missing AC-3 sync word")]
+	Ac3MissingSyncWord,
+
+	#[error("invalid AC-3 frame size code")]
+	Ac3InvalidFrameSizeCode,
+
+	#[error("unsupported AC-3 bsid {0}")]
+	Ac3UnsupportedBsid(u8),
+
+	#[error("reserved AC-3 sample-rate code")]
+	Ac3ReservedSampleRate,
+
+	#[error("E-AC-3 header needs 6 bytes")]
+	Eac3HeaderTooShort,
+
+	#[error("missing E-AC-3 sync word")]
+	Eac3MissingSyncWord,
+
+	#[error("not an E-AC-3 bitstream (bsid {0})")]
+	Eac3NotEac3Bsid(u8),
+
+	#[error("reserved E-AC-3 stream type")]
+	Eac3ReservedStreamType,
+
+	#[error("E-AC-3 dependent substream (7.1+ layout) is not supported; only a single independent substream")]
+	Eac3DependentSubstream,
+
+	#[error("E-AC-3 additional substream {0} is not supported; only a single independent substream")]
+	Eac3AdditionalSubstream(u8),
+
+	#[error("E-AC-3 frame length {0} shorter than its header")]
+	Eac3FrameShorterThanHeader(usize),
+
+	#[error("reserved E-AC-3 sample-rate code")]
+	Eac3ReservedSampleRate,
+
+	#[error("MP2 header needs 4 bytes")]
+	Mp2HeaderTooShort,
+
+	#[error("missing MP2 frame sync")]
+	Mp2MissingSync,
+
+	#[error("reserved or MPEG-2.5 audio version")]
+	Mp2ReservedVersion,
+
+	#[error("not MPEG Layer II")]
+	Mp2NotLayerII,
+
+	#[error("reserved MP2 sample-rate index")]
+	Mp2ReservedSampleRate,
+
+	#[error("free-format or invalid MP2 bitrate")]
+	Mp2InvalidBitrate,
+}
+
+/// A Result type alias for legacy audio header parsing.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// A parsed legacy-audio frame header.
+#[derive(Debug)]
+pub(crate) struct Header {
+	/// Whole-frame size in bytes (header included).
+	pub len: usize,
+	pub sample_rate: u32,
+	pub channel_count: u32,
+	/// Samples in this frame. Per-frame, not per-codec: E-AC-3 varies it
+	/// (256 x numblks) while MP2/AC-3 keep it constant.
+	pub samples: u64,
+}
+
+/// What distinguishes one legacy codec from another.
+pub(crate) struct Descriptor {
+	/// Track name suffix, e.g. ".mp2".
+	pub track_suffix: &'static str,
+	/// Catalog codec for the rendition.
+	pub codec: hang::catalog::AudioCodec,
+	/// Bytes needed to attempt a header parse.
+	pub min_header_len: usize,
+	/// First byte of the frame sync word, so a demuxer that lost sync can scan for the
+	/// next candidate instead of parsing at every offset.
+	pub sync_byte: u8,
+	/// Parse one frame header at the start of the slice.
+	pub parse: fn(&[u8]) -> Result<Header>,
+}
+
+/// Catalog config for a legacy audio track. Both fields come from the frame
+/// header, never the TS stream_type.
+pub(crate) struct Config {
+	pub sample_rate: u32,
+	pub channel_count: u32,
+	pub container: hang::catalog::Container,
+}
+
+/// Legacy audio importer.
+///
+/// Publishes each whole frame as one hang frame in its own group, so the relay
+/// forwards it immediately. The audio is never decoded; the catalog carries the
+/// codec, sample rate and channel count read from the frame header.
+pub(crate) struct Import {
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::AudioConfig>,
+}
+
+impl Import {
+	/// Publish on an existing track, reserving the rendition from `reserved`. Mint the track at
+	/// the descriptor's suffix with the catalog's
+	/// [`track_info`](crate::catalog::Producer::track_info).
+	pub fn new<E: CatalogExt>(
+		descriptor: &'static Descriptor,
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		config: Config,
+	) -> crate::Result<Self> {
+		let mut audio_config =
+			hang::catalog::AudioConfig::new(descriptor.codec.clone(), config.sample_rate, config.channel_count);
+		audio_config.container = config.container.clone();
+		// description stays None: legacy frames are self-describing and no in-repo
+		// consumer needs out-of-band config (TS export self-describes; WebCodecs
+		// cannot decode these codecs). Fill it only if a real consumer ever needs it.
+
+		tracing::debug!(name = ?track.name(), config = ?audio_config, "starting track");
+
+		// The caller's config names the container; the writer is built from that same value so the
+		// wire cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&audio_config)?;
+		// Build the writer before advertising the rendition: it is fallible (enrolling the track in
+		// the broadcast timeline can collide), and a rendition published for a track we then fail to
+		// produce would be advertised to consumers but never served.
+		let track = reserved.audio(track, wire, audio_config)?;
+
+		Ok(Self { track })
+	}
+
+	/// The MoQ track name.
+	pub fn name(&self) -> &str {
+		self.track.name()
+	}
+
+	/// The exclusive presentation end earlier groups have reached, if any.
+	pub fn live_edge(&self) -> Option<Timestamp> {
+		self.track.live_edge()
+	}
+
+	/// Finish the track, flushing the current group.
+	pub fn finish(&mut self) -> crate::Result<()> {
+		self.track.finish()?;
+		Ok(())
+	}
+
+	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
+	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes this importer.
+	pub fn abort(self, err: moq_net::Error) {
+		self.track.abort(err);
+	}
+
+	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
+	/// the fields its config didn't supply.
+	/// Cut the current group at `end` without finishing the track.
+	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		self.track.cut(end)?;
+		Ok(())
+	}
+
+	/// Mark a break in the timeline by publishing a marker group. To bound the closing
+	/// group's final frame first, [`cut(end)`](Self::cut) before this. See
+	/// [`Producer::discontinuity`](crate::container::Producer::discontinuity).
+	pub fn discontinuity(&mut self) -> crate::Result<()> {
+		self.track.discontinuity()?;
+		Ok(())
+	}
+
+	/// Close the current group and open the next one at `sequence`.
+	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
+		self.track.seek(sequence)?;
+		Ok(())
+	}
+
+	/// Publish one whole frame, stamping `pts` or a wall clock when absent.
+	///
+	/// Legacy frames are self-describing and independently decodable, so the frame is marked a
+	/// keyframe only when it starts a group (see
+	/// [`Producer::needs_keyframe`](crate::container::Producer::needs_keyframe)); otherwise it extends
+	/// the current group. The caller bounds groups via [`cut`](Self::cut) / [`seek`](Self::seek).
+	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<Timestamp>) -> crate::Result<()> {
+		let timestamp = self.track.timestamp(pts)?;
+		// Only the first frame of each group is a keyframe, so the group spans until the caller cuts
+		// instead of opening one group (one QUIC stream) per packet.
+		let keyframe = self.track.needs_keyframe();
+		self.track.write(Frame {
+			timestamp,
+			duration: None,
+			payload: frame.into_bytes(),
+			keyframe,
+		})?;
+		Ok(())
+	}
+}

@@ -1,0 +1,243 @@
+use crate::catalog::hang::CatalogExt;
+use crate::container::Frame;
+
+use super::FrameHeader;
+
+/// A frame-based importer for raw VP8.
+///
+/// A VP8 elementary stream isn't self-delimiting, so the caller must pass whole
+/// frames, one per [`decode`](Self::decode). The first key frame's header supplies
+/// the catalog dimensions, so the rendition isn't published until then. Build it
+/// with [`new`](Self::new), passing the track producer and the
+/// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from.
+pub struct Import {
+	// The track being produced.
+	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
+
+	catalog: crate::codec::video::Catalog,
+}
+
+impl Import {
+	/// Publish on an existing track producer, seeding the rendition from `hint` (pass
+	/// [`VideoHint::default`](crate::catalog::VideoHint) for none).
+	///
+	/// VP8 carries no out-of-band config, so a hint carrying a codec publishes the catalog rendition
+	/// up front instead of waiting for the first key frame.
+	pub fn new<E: CatalogExt>(
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		hint: crate::catalog::VideoHint,
+	) -> crate::Result<Self> {
+		// The hint names the container; the writer is built from that same value so the wire
+		// cannot disagree with what the rendition advertises.
+		let wire = crate::catalog::hang::Container::try_from(&hint)?;
+		let catalog = crate::codec::video::Catalog::new(hint);
+		let track = reserved.video(track, wire, None)?;
+		let mut import = Self { track, catalog };
+		if let Some(config) = import.catalog.initial_config() {
+			import.apply_config(config)?;
+		}
+		Ok(import)
+	}
+
+	/// Initialize the importer.
+	///
+	/// VP8 has no out-of-band configuration record, so this is normally called with
+	/// an empty slice (gstreamer / ffi pass `&[]`) and the catalog is filled from the
+	/// first key frame. If the caller does pass the first frame here, it's decoded so
+	/// nothing is dropped.
+	pub fn initialize(&mut self, buf: &[u8]) -> crate::Result<()> {
+		if !buf.is_empty() {
+			self.decode(buf, None)?;
+		}
+		Ok(())
+	}
+
+	fn init(&mut self, width: u16, height: u16) -> crate::Result<()> {
+		let mut config = hang::catalog::VideoConfig::new(hang::catalog::VideoCodec::VP8);
+		config.coded_width = Some(width as u32);
+		config.coded_height = Some(height as u32);
+
+		self.apply_config(config)?;
+		Ok(())
+	}
+
+	/// Apply a resolved config, updating the catalog rendition in place.
+	///
+	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
+	/// reconfiguration.
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
+		self.catalog.publish(&mut self.track, config)
+	}
+
+	/// Decode a single VP8 frame.
+	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		if frame.as_ref().is_empty() {
+			return Err(super::Error::EmptyFrame.into());
+		}
+
+		let header = FrameHeader::parse(frame.as_ref())?;
+		if let Some((width, height)) = header.dimensions {
+			self.init(width, height)?;
+		}
+
+		let pts = self.track.timestamp(pts)?;
+		self.track.write(Frame {
+			timestamp: pts,
+			payload: frame.into_bytes(),
+			keyframe: header.keyframe,
+			duration: None,
+		})?;
+		let demand = self.track.track().is_used();
+		self.catalog.on_frame(&mut self.track, demand)?;
+
+		Ok(())
+	}
+
+	/// Re-evaluate stall from source silence.
+	pub fn tick(&mut self) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.tick(&mut self.track, demand)
+	}
+
+	/// The source is gone; this rendition is never stalled while idle.
+	pub fn idle(&mut self) -> crate::Result<()> {
+		self.catalog.idle(&mut self.track)
+	}
+
+	/// Record the encode duration before publishing its frames so the catalog can report a stall.
+	pub fn observe_lag(&mut self, lag: std::time::Duration) -> crate::Result<()> {
+		let demand = self.track.track().is_used();
+		self.catalog.observe_lag(&mut self.track, demand, lag)
+	}
+
+	/// A watch-only handle to this track's subscriber demand.
+	pub fn demand(&self) -> moq_net::track::Demand {
+		self.track.track().demand()
+	}
+
+	/// Finish the track, flushing the current group.
+	pub fn finish(&mut self) -> crate::Result<()> {
+		self.track.finish()?;
+		Ok(())
+	}
+
+	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
+	/// see the real cause rather than [`moq_net::Error::Dropped`]. Consumes this importer.
+	pub fn abort(self, err: moq_net::Error) {
+		self.track.abort(err);
+	}
+
+	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
+	/// the fields its config didn't supply.
+	/// Cut the current group at `end` without finishing the track.
+	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		self.track.cut(end)?;
+		Ok(())
+	}
+
+	/// Close the current group and open the next one at `sequence`.
+	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
+		self.track.seek(sequence)?;
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use bytes::Bytes;
+
+	use moq_net::Timestamp;
+
+	fn setup() -> (moq_net::track::Producer, crate::catalog::Producer) {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let track = broadcast
+			.create_track("0.vp8", hang::container::track_info(hang::catalog::PRIORITY.video))
+			.unwrap();
+		(track, catalog)
+	}
+
+	/// A 320x240 key frame followed by an interframe should create a single VP8
+	/// rendition with the right dimensions and emit both frames.
+	#[tokio::test(start_paused = true)]
+	async fn imports_keyframe_then_interframe() {
+		let (track, catalog) = setup();
+		let mut import = super::Import::new(track, catalog.reserve(), Default::default()).unwrap();
+
+		// Empty init buffer: the catalog is filled on the first key frame.
+		import.initialize(&[]).unwrap();
+		assert!(catalog.snapshot().video.renditions.is_empty());
+
+		let keyframe = Bytes::from_static(&[0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01, 0xf0, 0x00]);
+		import
+			.decode(&keyframe, Some(Timestamp::from_micros(0).unwrap()))
+			.unwrap();
+
+		let snapshot = catalog.snapshot();
+		let config = snapshot.video.renditions.get("0.vp8").unwrap();
+		assert_eq!(config.codec, hang::catalog::VideoCodec::VP8);
+		assert_eq!(config.coded_width, Some(320));
+		assert_eq!(config.coded_height, Some(240));
+
+		// Interframe: no start code or dimensions, but still a valid frame.
+		let interframe = Bytes::from_static(&[0x31, 0x00, 0x00, 0xaa, 0xbb]);
+		import
+			.decode(&interframe, Some(Timestamp::from_micros(33_000).unwrap()))
+			.unwrap();
+
+		import.finish().unwrap();
+	}
+
+	/// A reservation that selected LOC makes the importer write LOC frames and advertise the
+	/// container, so the catalog names what is on the wire.
+	#[tokio::test(start_paused = true)]
+	async fn a_loc_reservation_reaches_the_wire_and_the_catalog() {
+		let (track, catalog) = setup();
+		let subscriber = track.subscribe(None);
+		let reserved = catalog.reserve();
+		let hint = crate::catalog::VideoHint {
+			codec: Some(hang::catalog::VideoCodec::VP8),
+			container: hang::catalog::Container::Loc,
+			..Default::default()
+		};
+		let mut import = super::Import::new(track, reserved, hint).unwrap();
+		import.initialize(&[]).unwrap();
+		let config = catalog.snapshot().video.renditions.get("0.vp8").cloned().unwrap();
+		assert_eq!(config.container, hang::catalog::Container::Loc);
+
+		let keyframe = Bytes::from_static(&[0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01, 0xf0, 0x00]);
+		import
+			.decode(&keyframe, Some(Timestamp::from_micros(0).unwrap()))
+			.unwrap();
+
+		let mut media = crate::container::Consumer::new(
+			subscriber,
+			crate::catalog::hang::Container::Loc(crate::container::Kind::Data),
+		);
+		let frame = tokio::time::timeout(std::time::Duration::from_secs(1), media.read())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(frame.payload, keyframe);
+		assert_eq!(frame.timestamp, Timestamp::from_micros(0).unwrap());
+
+		import.finish().unwrap();
+	}
+
+	/// An interframe before any key frame has no dimensions, so the Producer
+	/// rejects a non-keyframe as the first frame in a group.
+	#[tokio::test(start_paused = true)]
+	async fn rejects_interframe_first() {
+		let (track, catalog) = setup();
+		let mut import = super::Import::new(track, catalog.reserve(), Default::default()).unwrap();
+
+		let interframe = Bytes::from_static(&[0x31, 0x00, 0x00, 0xaa, 0xbb]);
+		assert!(
+			import
+				.decode(&interframe, Some(Timestamp::from_micros(0).unwrap()))
+				.is_err()
+		);
+	}
+}

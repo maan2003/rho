@@ -1,0 +1,28 @@
+[package]
+name = "moq-native"
+description = "Deprecated: use moq-tokio instead"
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.19.19"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["quic", "http3", "webtransport", "media", "live"]
+categories = ["multimedia", "network-programming", "web-programming"]
+
+[features]
+default = ["noq", "aws-lc-rs", "websocket", "tcp", "uds"]
+noq = []
+watch = []
+qlog = []
+aws-lc-rs = []
+iroh = []
+mdns = []
+jemalloc = []
+websocket = []
+tcp = []
+uds = []
+ring = []
+android-logcat = []

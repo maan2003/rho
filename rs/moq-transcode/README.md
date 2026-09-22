@@ -1,0 +1,82 @@
+# moq-transcode
+
+Just-in-time live transcoding for hang broadcasts.
+
+Consume a source broadcast, publish a derivative broadcast next to it: the
+derivative catalog advertises lower renditions (rungs) of the source video plus
+relative references back to the source renditions, so a player picks from the
+combined ladder and the transcoder never proxies what it doesn't re-encode.
+
+Nothing is encoded until someone asks, Cloudflare-style just-in-time per rung:
+
+- **Subscribe** to a rung and the transcoder decodes the source live, resizing
+  and re-encoding group for group until the last subscriber leaves. Every
+  active rung of a source shares one subscription and one decoder, so decode
+  cost scales with sources, not ladder depth.
+- **Fetch** a specific group and the transcoder fetches that same group from
+  the source and transcodes just that group. Output groups mirror source group
+  sequence numbers 1:1, so group N of every rung is the same content as source
+  group N and rendition switches land cleanly.
+
+The codec work is [`moq-video`](../moq-video): hardware where available (NVDEC +
+NVENC on Linux, VideoToolbox on macOS, Media Foundation on Windows), openh264 as
+the H.264 software fallback. H.264, H.265, and 8-bit 4:2:0 AV1 source renditions
+are eligible when a matching decoder is available. On an NVIDIA GPU the pipeline
+is fully GPU-resident: NVDEC decodes and scales in hardware and NVENC encodes the
+CUDA frame in place, with no CPU copies. macOS also resizes on the GPU. Windows
+uses the Direct3D11 video processor by default; set
+`Config::resize.output` to `Output::Cpu` to decode to CPU pixels and resize
+there.
+
+The default `openh264` and `nvidia` features mirror `moq-video`. A hardware-only
+Linux build can use `--no-default-features --features nvidia`; a software-only
+build can use `--no-default-features --features openh264`.
+
+## Library
+
+One entry point: `run(source, output, config)`. The caller owns session setup
+and where the derivative is announced; the transcoder only fills the output
+broadcast.
+
+```rust
+let mut config = moq_transcode::Config::default();
+// The derivative is announced at `<source>/transcode.hang`, so the source
+// renditions are referenced through its parent.
+config.source = Some(moq_net::path::RelativeOwned::from(".".to_string()));
+
+let output = origin.create_broadcast(format!("{path}/transcode.hang"))?;
+output.announce(Default::default())?;
+
+moq_transcode::run(source, output, config).await?;
+```
+
+Only renditions strictly below the source survive the ladder: a 480p source is
+never transcoded up to 720p, and a same-height rung is only offered when it
+undercuts a known source bitrate.
+
+`Config::ladder` is a `Ladder`, built from rungs in any order:
+
+```rust
+config.ladder = moq_transcode::Ladder::new([
+    moq_transcode::Rung::new(720, moq_net::bandwidth::Rate::from_bps(2_500_000)),
+    moq_transcode::Rung::new(360, moq_net::bandwidth::Rate::from_bps(600_000)),
+])?;
+```
+
+It ranks them by bitrate, lowest first, so every rung above the lowest has a next lower
+rendition. A ladder with no such ranking is an error rather than a guess: two
+rungs sharing a bitrate have no lower one, and a rung that costs more without
+being taller means bitrate and resolution disagree about which rendition is
+below which. Filtering against the source drops rungs but never reorders them.
+
+## Example
+
+Publish something first (e.g. `moq import capture` from
+[`moq-cli`](../moq-cli)), then:
+
+```bash
+cargo run -p moq-transcode --example transcode -- \
+    --url http://localhost:4443/anon --source my-broadcast
+```
+
+The derivative appears at `my-broadcast/transcode.hang`.

@@ -1,0 +1,75 @@
+"""Publish or subscribe to a clock track. Python twin of `rs/moq-tokio/examples/clock.rs`.
+
+Each minute is a new group; each second is a frame inside that group. The first
+frame of every group is the "YYYY-MM-DD HH:MM:" prefix, followed by one "SS"
+frame per second.
+
+    python py/moq-rs/examples/clock.py publish   --url https://relay.example.com --broadcast clock
+    python py/moq-rs/examples/clock.py subscribe --url https://relay.example.com --broadcast clock
+"""
+
+import argparse
+import asyncio
+from datetime import datetime, timezone
+
+import moq
+
+
+async def publish(url: str, broadcast_name: str, track_name: str, tls_verify: bool) -> None:
+    async with moq.Client(url, tls_verify=tls_verify) as client:
+        broadcast = client.create_broadcast(broadcast_name)
+        track = broadcast.publish_track(track_name)
+        broadcast.announce()
+        print(f"publishing {broadcast_name!r} track={track_name!r} at {url}")
+
+        while True:
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            timestamp_us = int(now.timestamp()) * 1_000_000
+            group = track.append_group()
+            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode(), timestamp_us)
+
+            current_minute = now.minute
+            while now.minute == current_minute:
+                timestamp_us = int(now.timestamp()) * 1_000_000
+                group.write_frame(now.strftime("%S").encode(), timestamp_us)
+                await asyncio.sleep(1 - datetime.now(timezone.utc).microsecond / 1_000_000)
+                now = datetime.now(timezone.utc).replace(microsecond=0)
+
+            group.finish()
+
+
+async def subscribe(url: str, broadcast_name: str, track_name: str, tls_verify: bool) -> None:
+    async with moq.Client(url, tls_verify=tls_verify) as client:
+        print(f"waiting for {broadcast_name!r} at {url}")
+        broadcast = await client.announced_broadcast(broadcast_name)
+
+        print(f"subscribed to {broadcast_name!r} track={track_name!r}")
+        track = await broadcast.subscribe_track(track_name)
+
+        async for group in track:
+            prefix: bytes | None = None
+            async for frame in group:
+                if prefix is None:
+                    prefix = frame.payload
+                    continue
+                print(f"{prefix.decode()}{frame.payload.decode()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("role", choices=["publish", "subscribe"], help="publish or subscribe")
+    parser.add_argument("--url", required=True, help="relay URL (https://...)")
+    parser.add_argument("--broadcast", default="clock", help="broadcast path (default: clock)")
+    parser.add_argument("--track", default="seconds", help="track name (default: seconds)")
+    parser.add_argument("--no-tls-verify", action="store_true", help="disable TLS verification (dev only)")
+    args = parser.parse_args()
+
+    runner = publish if args.role == "publish" else subscribe
+    try:
+        asyncio.run(runner(args.url, args.broadcast, args.track, tls_verify=not args.no_tls_verify))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

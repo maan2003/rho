@@ -1,0 +1,78 @@
+// This has to be in the root otherwise the VSCode plugin will not work out of the box.
+{
+	"$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"formatter": {
+		// We repeat the editorconfig settings here because biome has spotty mono-repo support.
+		// "useEditorconfig": true,
+		"lineWidth": 120,
+		"indentStyle": "tab",
+		"indentWidth": 4,
+		"lineEnding": "lf"
+	},
+	"files": {
+		// The project scanner (enabled by noImportCycles) tries to parse every file it
+		// indexes. Exclude two kinds it can't handle:
+		//   - MPEG transport-stream fixtures whose `.ts` extension collides with TypeScript.
+		//   - SVG assets, which Biome routes to its HTML parser and rejects.
+		"includes": ["**", "!rs/moq-mux/src/container/ts/test_data", "!**/*.svg"]
+	},
+	"linter": {
+		"rules": {
+			"a11y": {
+				// We mostly make headless <video> elements.
+				"useMediaCaption": "off"
+			},
+			"style": {
+				"useNodejsImportProtocol": "off"
+			},
+			"suspicious": {
+				// Some runtimes need ts-ignore
+				"noTsIgnore": "off",
+				// Catch runtime import cycles. Type-only cycles are erased at compile time
+				// and harmless, so ignoreTypes keeps them from failing the build.
+				"noImportCycles": {
+					"level": "error",
+					"options": {
+						"ignoreTypes": true
+					}
+				}
+			},
+			"nursery": {
+				// Type-aware promise safety: floating promises must be explicitly handled
+				// (await/void/catch), and a promise can't be used where a non-promise is
+				// expected (e.g. an `async` callback passed to a sync `() => void`).
+				"noFloatingPromises": "error",
+				"noMisusedPromises": "error"
+			}
+		}
+	},
+	"css": {
+		"parser": {
+			"cssModules": false,
+			"allowWrongLineComments": false,
+			"tailwindDirectives": true
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["doc/.vitepress/theme/custom.css"],
+			"linter": {
+				"rules": {
+					"complexity": {
+						"noImportantStyles": "off"
+					}
+				}
+			}
+		}
+	],
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double"
+		}
+	}
+}

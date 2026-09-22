@@ -1,0 +1,47 @@
+{
+	"compilerOptions": {
+		"lib": ["esnext", "dom", "dom.iterable"],
+		"target": "esnext",
+		"rewriteRelativeImportExtensions": true,
+
+		"declaration": true,
+		"declarationMap": true,
+		// `@internal` is how this workspace hides a symbol from the published surface, so the
+		// declarations have to actually drop it. Without this the tag is a comment: the symbol
+		// still ships, still type-checks for consumers, and reads as supported API.
+		"stripInternal": true,
+		"isolatedModules": true,
+		"sourceMap": true,
+		"inlineSources": true,
+
+		// https://www.typescriptlang.org/tsconfig/#Type_Checking_6248
+		"allowUnreachableCode": false,
+		"allowUnusedLabels": false,
+		"alwaysStrict": true,
+		"exactOptionalPropertyTypes": false, // makes ? less usable
+		"noFallthroughCasesInSwitch": true,
+		"noImplicitAny": true,
+		"noImplicitOverride": true,
+		"noImplicitReturns": true,
+		"noImplicitThis": true,
+		"noPropertyAccessFromIndexSignature": false, // Allows . notation
+		"noUncheckedIndexedAccess": false, // Allows [0] access to arrays
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"strict": true,
+		"strictBindCallApply": true,
+		"strictBuiltinIteratorReturn": true,
+		"strictFunctionTypes": true,
+		"strictNullChecks": true,
+		"strictPropertyInitialization": true,
+		"useUnknownInCatchVariables": true,
+
+		// Disable enums and weird Typescript features.
+		"erasableSyntaxOnly": true,
+
+		"skipLibCheck": true
+	},
+	// Include something just so TS doesn't complain about not matching files
+	"include": ["common"],
+	"exclude": ["**/node_modules", "**/dist", "**/target"]
+}

@@ -1,0 +1,53 @@
+{
+	"name": "moq",
+	"version": "0.0.0",
+	"devDependencies": {
+		"@babel/parser": "^8.0.4",
+		"@biomejs/biome": "^2.5.12",
+		"concurrently": "^10.0.5",
+		"markdown-extensions": "^2.0.0",
+		"publint": "^0.3.24",
+		"remark-cli": "^12.0.1",
+		"remark-frontmatter": "^5.0.0",
+		"remark-lint-list-item-indent": "^4.0.1",
+		"remark-lint-maximum-line-length": "^4.1.1",
+		"remark-lint-no-duplicate-headings": "^4.0.1",
+		"remark-lint-no-undefined-references": "^5.0.2",
+		"remark-preset-lint-consistent": "^6.0.1",
+		"remark-preset-lint-recommended": "^7.0.1",
+		"remark-stringify": "^11.0.0"
+	},
+	"private": true,
+	"scripts": {
+		"check": "bun run --filter='*' check",
+		"fix": "bun run --filter='*' fix"
+	},
+	"trustedDependencies": [
+		"@fails-components/webtransport-transport-http3-quiche"
+	],
+	"type": "module",
+	"workspaces": [
+		"doc",
+		"js/net",
+		"js/clock",
+		"js/pattern",
+		"js/auth",
+		"js/flate",
+		"js/binary",
+		"js/json",
+		"js/hang",
+		"js/loc",
+		"js/msf",
+		"js/watch",
+		"js/publish",
+		"js/room",
+		"js/signals",
+		"js/wasm",
+		"demo/boy",
+		"demo/web",
+		"js/moq-boy",
+		"test/smoke/clients/js",
+		"test/smoke/clients/js-native",
+		"test/wasm"
+	]
+}

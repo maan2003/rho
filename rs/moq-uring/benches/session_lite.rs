@@ -1,0 +1,222 @@
+//! The PR-4 ablation matrix at session level: a full moq-lite session pair on
+//! one worker, publisher to subscriber over loopback QUIC, toggling receive
+//! batching, GRO, and GSO exactly like the raw echo. Each iteration delivers
+//! one group of 32 x 32 KiB frames (1 MiB, matching `echo_noq`'s unit), so
+//! the two matrices are directly comparable: the difference is the moq-net
+//! machine and container framing on top of the same wire path.
+//!
+//! Run it with `just rs bench-session` on a Linux 6.12+ kernel.
+
+use criterion::{criterion_group, criterion_main};
+
+#[cfg(all(target_os = "linux", feature = "noq"))]
+#[path = "../tests/support.rs"]
+mod support;
+
+#[cfg(all(target_os = "linux", feature = "noq"))]
+mod linux {
+	use std::net::UdpSocket;
+	use std::time::Instant;
+
+	use criterion::{BenchmarkId, Criterion, Throughput};
+	use moq_net::origin;
+	use moq_uring::{Config, Error, Worker, quic, udp};
+
+	use super::support;
+
+	/// Frames per group and bytes per frame: 1 MiB per iteration, the same
+	/// unit as the echo matrix.
+	const FRAMES: usize = 32;
+	const FRAME_SIZE: usize = 32 * 1024;
+
+	const ALPN: &str = "moq-lite-05";
+
+	struct Ablation {
+		name: &'static str,
+		config: udp::Config,
+	}
+
+	fn ablations() -> Vec<Ablation> {
+		let all = udp::Config::default();
+		let mut no_gso = all.clone();
+		no_gso.gso = false;
+		let mut no_gro = all.clone();
+		no_gro.gro = false;
+		let mut oneshot = all.clone();
+		oneshot.multishot = false;
+		let mut none = all.clone();
+		none.gso = false;
+		none.gro = false;
+		none.multishot = false;
+		vec![
+			Ablation {
+				name: "all-on",
+				config: all,
+			},
+			Ablation {
+				name: "no-gso",
+				config: no_gso,
+			},
+			Ablation {
+				name: "no-gro",
+				config: no_gro,
+			},
+			Ablation {
+				name: "oneshot",
+				config: oneshot,
+			},
+			Ablation {
+				name: "all-off",
+				config: none,
+			},
+		]
+	}
+
+	pub fn benchmark(c: &mut Criterion) {
+		// Kernel-gated like the tests: skip loudly below the 6.12 floor.
+		let probe = match Worker::new(Config::default()) {
+			Ok(worker) => worker,
+			Err(Error::Unsupported(reason)) => {
+				eprintln!("skipping io_uring session benchmark: {reason}");
+				return;
+			}
+			Err(err) => panic!("worker setup failed: {err}"),
+		};
+		drop(probe);
+
+		let mut group = c.benchmark_group("session_lite");
+		group.throughput(Throughput::Bytes((FRAMES * FRAME_SIZE) as u64));
+
+		for ablation in ablations() {
+			let mut worker = Worker::new(Config::default()).expect("worker");
+			let handle = worker.handle();
+
+			let (pub_origin, pub_driver) = origin::Producer::new(origin::Config::default());
+			let (sub_origin, sub_driver) = origin::Producer::new(origin::Config::default());
+			let origins = std::thread::spawn(move || {
+				let rt = tokio::runtime::Builder::new_current_thread()
+					.enable_time()
+					.build()
+					.expect("tokio runtime");
+				rt.block_on(async move {
+					tokio::join!(moq_net::time::run(pub_driver), moq_net::time::run(sub_driver));
+				});
+			});
+
+			let broadcast = pub_origin.create_broadcast("bench").expect("create broadcast");
+			broadcast.announce(Default::default()).expect("create broadcast");
+			let track = broadcast.create_track("data", None).expect("create track");
+
+			let certs = support::certs().expect("certificates");
+			let mut server_config =
+				quic::server::Config::new(quic::Identity::open(&certs.cert, &certs.key).expect("identity"));
+			server_config.alpn = vec![ALPN.to_string()];
+
+			let server_sock = handle
+				.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), ablation.config.clone())
+				.expect("server socket");
+			let server_addr = server_sock.local_addr().expect("server addr");
+			let client_sock = handle
+				.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), ablation.config.clone())
+				.expect("client socket");
+			let mut dial = quic::client::Config::new(server_addr, "localhost");
+			dial.alpn = vec![ALPN.to_string()];
+			dial.verify = false;
+
+			let server_handle = handle.clone();
+			handle.spawn(async move {
+				let conn = quic::server::accept(server_sock, &server_config)
+					.await
+					.expect("quic accept");
+				let (session, driver) = moq_net::Server::new()
+					.with_publisher(&pub_origin)
+					.accept_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
+					.await
+					.expect("accept_lite");
+				let _ = server_handle.run(driver).await;
+				session.closed().await;
+			});
+
+			// Establish and subscribe once; iterations measure steady state.
+			let (_session, mut sub) = worker
+				.block_on(async {
+					let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
+					let (session, driver) = moq_net::Client::new()
+						.with_subscriber(sub_origin.clone())
+						.connect_lite(std::time::Instant::now(), quic::web::Session::raw(conn))
+						.await
+						.expect("connect_lite");
+					let task_handle = handle.clone();
+					handle.spawn(async move {
+						let _ = task_handle.run(driver).await;
+					});
+					let bc = {
+						let consumer = sub_origin.consume();
+						consumer.routed("bench").await.expect("broadcast announced");
+						consumer.request_broadcast("bench").await.expect("broadcast resolves")
+					};
+					let sub = bc
+						.track("data")
+						.expect("track")
+						.subscribe(None)
+						.await
+						.expect("subscribe");
+					(session, sub)
+				})
+				.expect("worker");
+
+			let frame = bytes::Bytes::from(vec![0x5au8; FRAME_SIZE]);
+
+			group.bench_with_input(BenchmarkId::from_parameter(ablation.name), &ablation.config, |b, _| {
+				b.iter_custom(|iterations| {
+					worker
+						.block_on(async {
+							let start = Instant::now();
+							for _ in 0..iterations {
+								let mut writer = track.append_group().expect("append group");
+								for _ in 0..FRAMES {
+									writer
+										.write_frame(moq_net::Timestamp::ZERO, frame.clone())
+										.expect("write frame");
+								}
+								writer.finish().expect("finish group");
+
+								let mut reader = sub
+									.recv_group()
+									.await
+									.expect("recv group")
+									.expect("track closed prematurely");
+								let mut frames = 0;
+								while let Some(frame) = reader.read_frame().await.expect("read frame") {
+									assert_eq!(frame.payload.len(), FRAME_SIZE, "frame size");
+									frames += 1;
+								}
+								assert_eq!(frames, FRAMES, "lost frames");
+							}
+							start.elapsed()
+						})
+						.expect("worker")
+				});
+			});
+
+			// The worker (and with it the publisher session task) drops first,
+			// releasing the last origin handles so the drivers resolve.
+			drop(worker);
+			drop(track);
+			drop(broadcast);
+			drop(sub_origin);
+			origins.join().expect("origin drivers");
+		}
+
+		group.finish();
+	}
+}
+
+#[cfg(all(target_os = "linux", feature = "noq"))]
+use linux::benchmark;
+
+#[cfg(not(all(target_os = "linux", feature = "noq")))]
+fn benchmark(_: &mut criterion::Criterion) {}
+
+criterion_group!(benches, benchmark);
+criterion_main!(benches);

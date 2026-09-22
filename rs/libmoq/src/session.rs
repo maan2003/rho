@@ -1,0 +1,245 @@
+use std::sync::Arc;
+
+use anyhow::Context;
+use tokio::sync::oneshot;
+use url::Url;
+
+use crate::{Error, Id, NonZeroSlab, State, ffi};
+
+/// A spawned task entry: `close` signals shutdown, `callback` delivers status.
+///
+/// `close` is an `Option` so `close()` can drop just the sender without
+/// removing the entry. The task delivers one final terminal callback and then
+/// removes itself, so `user_data` stays valid until that callback fires.
+struct TaskEntry {
+	close: Option<oneshot::Sender<()>>,
+	callback: ffi::OnStatus,
+	/// Reads live connection stats, reporting `None` while reconnecting.
+	stats: moq_tokio::connection::Monitor,
+	/// One allocator for the session. Every `moq_session_bandwidth` handle clones
+	/// it, so they share one reservation registry.
+	bandwidth: moq_net::bandwidth::Allocator,
+}
+
+/// Everything needed to prepare a session without holding the global state lock.
+pub(crate) struct Connect {
+	pub config: crate::client::Config,
+	pub url: Url,
+	pub publish: Option<moq_net::origin::Producer>,
+	pub consume: Option<moq_net::origin::Producer>,
+	pub callback: ffi::OnStatus,
+}
+
+impl Connect {
+	/// Resolve files and backend configuration before the session is inserted.
+	pub fn prepare(self) -> Result<PreparedConnect, Error> {
+		let mut client = self
+			.config
+			.connect
+			.clone()
+			.init(self.config.quic.clone())
+			.map_err(|err| Error::InvalidConfig(err.to_string()))?;
+		if let Some(publish) = &self.publish {
+			client = client.with_publisher(publish);
+		}
+		if let Some(consume) = &self.consume {
+			client = client.with_subscriber(consume.clone());
+		}
+
+		Ok(PreparedConnect {
+			client,
+			url: self.url,
+			publish: self.publish,
+			consume: self.consume,
+			callback: self.callback,
+		})
+	}
+}
+
+/// A validated session request ready for insertion into global state.
+pub(crate) struct PreparedConnect {
+	client: moq_tokio::Client,
+	url: Url,
+	publish: Option<moq_net::origin::Producer>,
+	consume: Option<moq_net::origin::Producer>,
+	callback: ffi::OnStatus,
+}
+
+#[derive(Default)]
+pub struct Session {
+	/// Session tasks. Close signals shutdown; the task delivers a final callback, then removes itself.
+	task: NonZeroSlab<Option<TaskEntry>>,
+}
+
+impl Session {
+	pub fn connect(&mut self, request: PreparedConnect) -> Result<Id, Error> {
+		let PreparedConnect {
+			client,
+			url,
+			publish,
+			consume,
+			callback,
+		} = request;
+
+		// Build the reconnect loop up front so we can grab a monitor for it
+		// before moving it into the spawned task.
+		let reconnect = client.connect(url);
+		let stats = reconnect.monitor();
+		let bandwidth = moq_net::bandwidth::Allocator::new(reconnect.send_bandwidth());
+
+		let closed = oneshot::channel();
+		let entry = TaskEntry {
+			close: Some(closed.0),
+			callback,
+			stats,
+			bandwidth,
+		};
+		let id = self.task.insert(Some(entry))?;
+
+		tokio::spawn(async move {
+			// Keep the origin producers alive for the lifetime of the reconnect loop:
+			// the session reads from the publish consumer and writes into the subscribe producer.
+			let _publish = publish;
+			let _consume = consume;
+
+			let res = tokio::select! {
+				// close() requested: a clean shutdown delivers a terminal 0.
+				_ = closed.1 => Ok(()),
+				res = Self::report(callback, reconnect) => res,
+			};
+
+			// Deliver one final terminal callback (0 = closed, < 0 = error), then
+			// drop the entry. Pull it out from under the lock so the callback never
+			// runs while held.
+			let entry = State::lock().session.task.remove(id).flatten();
+			if let Some(entry) = entry {
+				entry.callback.call(res);
+			}
+		});
+
+		Ok(id)
+	}
+
+	/// The session's bandwidth allocator. Clones share one reservation registry.
+	pub fn bandwidth(&self, id: Id) -> Result<moq_net::bandwidth::Allocator, Error> {
+		Ok(self
+			.task
+			.get(id)
+			.and_then(|entry| entry.as_ref())
+			.ok_or(Error::SessionNotFound)?
+			.bandwidth
+			.clone())
+	}
+
+	/// Snapshot the current connection's stats.
+	///
+	/// Errors with [`Error::SessionNotFound`] if the handle is unknown, or [`Error::Offline`]
+	/// if the session is currently between connections (reconnecting).
+	pub fn stats(&self, id: Id) -> Result<moq_net::session::Stats, Error> {
+		self.task
+			.get(id)
+			.and_then(|entry| entry.as_ref())
+			.ok_or(Error::SessionNotFound)?
+			.stats
+			.stats()
+			.ok_or(Error::Offline)
+	}
+
+	/// Statistics and protocol from the same live connection.
+	///
+	/// Errors with [`Error::SessionNotFound`] if the handle is unknown, or [`Error::Offline`]
+	/// if the session is currently between connections (reconnecting).
+	pub fn snapshot(&self, id: Id) -> Result<moq_tokio::connection::Snapshot, Error> {
+		self.task
+			.get(id)
+			.and_then(|entry| entry.as_ref())
+			.ok_or(Error::SessionNotFound)?
+			.stats
+			.snapshot()
+			.ok_or(Error::Offline)
+	}
+
+	/// Forward connection epochs to the status callback until the reconnect loop stops.
+	///
+	/// Returns the terminal error via `?`. Disconnects aren't reported: status 0 is reserved for a
+	/// clean close (delivered as the terminal callback once the task ends).
+	async fn report(callback: ffi::OnStatus, mut reconnect: moq_tokio::Connection) -> Result<(), Error> {
+		let mut connects: u64 = 0;
+		loop {
+			if let moq_tokio::Status::Connected = reconnect.status().await.map_err(map_connect_error)? {
+				connects += 1;
+				// Positive status carries the connection epoch, so callers can tell a
+				// reconnect (>1) from the first connect (1). No lock is held, so the C
+				// callback is free to re-enter libmoq.
+				let code = i32::try_from(connects)
+					.context("connection epoch exceeded i32::MAX")
+					.map_err(|err| Error::Connect(Arc::new(err)))?;
+				callback.call(code);
+			}
+		}
+	}
+
+	pub fn close(&mut self, id: Id) -> Result<(), Error> {
+		// Signal shutdown; the task delivers a final callback and removes itself.
+		self.task
+			.get_mut(id)
+			.and_then(|entry| entry.as_mut())
+			.ok_or(Error::SessionNotFound)?
+			.close
+			.take()
+			.ok_or(Error::SessionNotFound)?;
+		Ok(())
+	}
+}
+
+fn map_connect_error(err: moq_tokio::Error) -> Error {
+	match err {
+		// Local auth stays the dedicated C status. A scoped protocol close is `Error::Moq`
+		// so `moq_error_protocol` can recover the registry and code.
+		moq_tokio::Error::MoqNet(moq_net::Error::Unauthorized) => Error::Unauthorized,
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => Error::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => Error::Forbidden,
+			_ => Error::Connect(Arc::new(err.into())),
+		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ffi::ReturnCode;
+
+	#[test]
+	fn maps_native_auth_connect_errors() {
+		assert!(matches!(
+			map_connect_error(moq_tokio::ConnectError::Unauthorized.into()),
+			Error::Unauthorized
+		));
+		assert!(matches!(
+			map_connect_error(moq_tokio::ConnectError::Forbidden.into()),
+			Error::Forbidden
+		));
+		assert!(matches!(
+			map_connect_error(moq_net::Error::Unauthorized.into()),
+			Error::Unauthorized
+		));
+		assert!(matches!(
+			map_connect_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()),
+			Error::Moq(moq_net::Error::Session(moq_net::SessionError::Unauthorized))
+		));
+		assert!(matches!(
+			map_connect_error(moq_tokio::Error::ConnectFailed),
+			Error::Connect(_)
+		));
+		assert_eq!(Error::Unauthorized.code(), -34);
+		assert_eq!(Error::Forbidden.code(), -35);
+		assert_eq!(map_connect_error(moq_net::Error::Unauthorized.into()).code(), -34);
+		assert_eq!(
+			map_connect_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()).code(),
+			-2
+		);
+		assert_eq!(map_connect_error(moq_tokio::Error::ConnectFailed).code(), -5);
+	}
+}

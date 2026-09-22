@@ -1,0 +1,195 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- [**breaking**] Forward OpenH264 through the default `openh264` feature and
+  remove the deprecated `nvenc` and `nvdec` feature aliases.
+- Preserve a source catalog's `archive` entry on the derivative instead of
+  synthesizing a timeline for the transcode output.
+- [**breaking**] `Config::resize` is `moq_video::resize::Config` with a
+  native-or-CPU `output`, replacing the acceleration knob; `moq transcode
+  --resize-acceleration` becomes `--frames native|cpu`.
+- [**breaking**] Source frame rates are `Option<moq_video::Rate>`, unknown
+  when the source catalog carries none.
+
+## [0.0.19](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.18...moq-transcode-v0.0.19) - 2026-09-17
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, hang, moq-video
+
+## [0.0.18](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.17...moq-transcode-v0.0.18) - 2026-09-13
+
+### Other
+
+- updated the following local packages: kio, moq-net, moq-video, hang, moq-mux
+
+## [0.0.17](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.16...moq-transcode-v0.0.17) - 2026-09-09
+
+### Added
+
+- *(moq-video)* add the VAAPI H.264 decoder and import its pictures zero-copy ([#3331](https://github.com/moq-dev/moq/pull/3331))
+- *(moq-transcode)* [**breaking**] validate and order the output ladder ([#3447](https://github.com/moq-dev/moq/pull/3447))
+- *(moq-video)* add the V4L2 stateful M2M hardware encoder and decoder ([#3332](https://github.com/moq-dev/moq/pull/3332))
+- *(audio,video)* compile the device, render, and VAAPI code by default ([#3353](https://github.com/moq-dev/moq/pull/3353))
+
+### Fixed
+
+- *(moq-net)* a group consumer is one cursor, so an evicted group skips instead of ending the export ([#3515](https://github.com/moq-dev/moq/pull/3515))
+- *(transcode)* follow a source resolution change with the ladder ([#3381](https://github.com/moq-dev/moq/pull/3381))
+- *(moq-video)* stop openh264 leaking its picture pool, and survive a lost picture ([#3357](https://github.com/moq-dev/moq/pull/3357))
+
+### Other
+
+- *(transcode)* cover retirement while a fetch has not claimed its group ([#3522](https://github.com/moq-dev/moq/pull/3522))
+- take every feature that needs a library or libclang at build time off the defaults ([#3464](https://github.com/moq-dev/moq/pull/3464))
+- *(transcode)* correct the retirement comments and record what the test covers ([#3460](https://github.com/moq-dev/moq/pull/3460))
+
+## [0.0.16](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.15...moq-transcode-v0.0.16) - 2026-09-02
+
+### Other
+
+- updated the following local packages: moq-net, moq-video, hang, moq-mux
+
+## [0.0.15](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.14...moq-transcode-v0.0.15) - 2026-09-01
+
+### Other
+
+- *(rs)* point shared dependencies at [workspace.dependencies] ([#3098](https://github.com/moq-dev/moq/pull/3098))
+
+## [0.0.14](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.13...moq-transcode-v0.0.14) - 2026-08-26
+
+### Other
+
+- updated the following local packages: moq-net, moq-mux, moq-video, hang
+
+## [0.0.13](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.12...moq-transcode-v0.0.13) - 2026-08-24
+
+### Other
+
+- updated the following local packages: moq-video
+
+## [0.0.12](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.11...moq-transcode-v0.0.12) - 2026-08-20
+
+### Added
+
+- *(video)* give the bindings the NVIDIA codecs, and warn when Auto falls to software ([#2950](https://github.com/moq-dev/moq/pull/2950))
+- *(moq-net)* add Path::relative, replacing moq_transcode::source_reference ([#2906](https://github.com/moq-dev/moq/pull/2906))
+
+## [0.0.11](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.10...moq-transcode-v0.0.11) - 2026-08-14
+
+### Fixed
+
+- *(path)* resolve catalog references like URLs ([#2855](https://github.com/moq-dev/moq/pull/2855))
+- *(net)* stop blocking connect on the initial announce set ([#2856](https://github.com/moq-dev/moq/pull/2856))
+
+## [0.0.10](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.9...moq-transcode-v0.0.10) - 2026-08-13
+
+### Added
+
+- *(moq-video)* advertise the catalog rendition before the first keyframe ([#2768](https://github.com/moq-dev/moq/pull/2768))
+
+## [0.0.9](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.8...moq-transcode-v0.0.9) - 2026-08-07
+
+### Other
+
+- updated the following local packages: moq-video
+
+## [0.0.8](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.7...moq-transcode-v0.0.8) - 2026-08-06
+
+### Fixed
+
+- *(libmoq)* unbreak the Linux C link list, and make VAAPI opt-in ([#2669](https://github.com/moq-dev/moq/pull/2669))
+
+## [0.0.7](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.6...moq-transcode-v0.0.7) - 2026-08-05
+
+### Added
+
+- *(bindings)* publish raw video with a native encoder ([#2608](https://github.com/moq-dev/moq/pull/2608))
+- *(moq-video)* resize Direct3D11 textures on the GPU ([#2601](https://github.com/moq-dev/moq/pull/2601))
+
+## [0.0.6](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.5...moq-transcode-v0.0.6) - 2026-08-03
+
+### Fixed
+
+- *(moq-video)* keep Media Foundation decoded frames on the GPU, and stop losing frames at group boundaries ([#2584](https://github.com/moq-dev/moq/pull/2584))
+
+## [0.0.5](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.4...moq-transcode-v0.0.5) - 2026-07-29
+
+### Added
+
+- *(moq-video)* render decoded frames on the GPU, and carry color spaces end to end ([#2552](https://github.com/moq-dev/moq/pull/2552))
+
+## [0.0.4](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.3...moq-transcode-v0.0.4) - 2026-07-25
+
+### Other
+
+- *(moq-video)* [**breaking**] one raw Frame type, and carry timestamps through encode ([#2503](https://github.com/moq-dev/moq/pull/2503))
+
+## [0.0.3](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.2...moq-transcode-v0.0.3) - 2026-07-24
+
+### Other
+
+- *(moq-video)* bump moq-vaapi to 0.0.3 (dlopen libva) ([#2465](https://github.com/moq-dev/moq/pull/2465))
+
+## [0.0.2](https://github.com/moq-dev/moq/compare/moq-transcode-v0.0.1...moq-transcode-v0.0.2) - 2026-07-23
+
+### Other
+
+- updated the following local packages: moq-video
+
+## [0.0.1](https://github.com/moq-dev/moq/releases/tag/moq-transcode-v0.0.1) - 2026-07-22
+
+### Added
+
+- *(moq-net)* let finish_at declare a future exclusive end group ([#2219](https://github.com/moq-dev/moq/pull/2219)) ([#2234](https://github.com/moq-dev/moq/pull/2234))
+- *(moq-transcode)* decode once per source, GPU resize fanout, and a moq transcode verb ([#2158](https://github.com/moq-dev/moq/pull/2158))
+- *(moq-video)* NVDEC hardware decode, zero-copy NVDEC -> NVENC transcode ([#2145](https://github.com/moq-dev/moq/pull/2145))
+- moq-transcode, just-in-time transcoding for hang broadcasts (NVENC-capable) ([#2140](https://github.com/moq-dev/moq/pull/2140))
+
+### Fixed
+
+- [**breaking**] correct catalog, timeline, token, and teardown contracts found in API review ([#2439](https://github.com/moq-dev/moq/pull/2439))
+- *(moq-video)* mark the macOS Surface Sync so moq-transcode compiles ([#2225](https://github.com/moq-dev/moq/pull/2225))
+
+### Other
+
+- compile doc examples across the workspace ([#2421](https://github.com/moq-dev/moq/pull/2421))
+- *(net)* [**breaking**] route everything through create_broadcast, gate announce on Route.live ([#2396](https://github.com/moq-dev/moq/pull/2396))
+- *(audio)* [**breaking**] align the moq-audio capture/encode surface with moq-video ([#2350](https://github.com/moq-dev/moq/pull/2350))
+- *(hang)* [**breaking**] non_exhaustive catalog sections, shared container::track_info, hang draft catch-up ([#2341](https://github.com/moq-dev/moq/pull/2341))
+- moq-net + js/net: pre-merge API hardening for moq-lite-05 ([#2170](https://github.com/moq-dev/moq/pull/2170))
+- add NVDEC AV1 decode support ([#2178](https://github.com/moq-dev/moq/pull/2178))
+- carry moq-video decode timestamps as moq_net::Timestamp ([#2146](https://github.com/moq-dev/moq/pull/2146))
+
+### Added
+
+- Shared live decode: all rungs of a source with live demand now share one
+  subscription and one decoder (a broadcast feed of decoded frames), instead of
+  each rung decoding the source independently. NVDEC throughput and upstream
+  bandwidth now scale with source count, not ladder depth; each rung resizes
+  its copy on the GPU (`decode::Frame::resize`) and encodes it in place. Group
+  fetches keep their own one-shot pipeline.
+- `moq transcode`: the transcoder is now a moq-cli verb (behind the `transcode`
+  feature), publishing `<broadcast>/transcode.hang` with a configurable ladder
+  (`--rung height:bitrate`) and codec pins (`--encoder`, `--decoder`).
+
+- Initial release: just-in-time live transcoding of hang broadcasts.
+  `run(source, output, config)` publishes a derivative catalog (ladder rungs
+  strictly below the source, plus relative references to the source renditions)
+  and encodes each rung only while it is subscribed or fetched. Output groups
+  mirror source group sequence numbers, so specific-group fetches map 1:1 to
+  source groups. Encoding via `moq-video` (NVENC/VideoToolbox/Media Foundation
+  hardware, openh264 fallback). On an NVIDIA GPU the pipeline is zero-copy:
+  NVDEC decodes and scales in hardware and NVENC encodes the CUDA frame in
+  place; other decoders scale I420 on the CPU.
+- 8-bit 4:2:0 AV1 source renditions are eligible for transcoding when a native
+  decoder is available. On Linux with NVDEC, AV1 sources can feed existing
+  H.264/H.265 output rungs.

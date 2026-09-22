@@ -1,0 +1,86 @@
+import * as z from "@zod/mini";
+import { ContainerSchema } from "./container";
+import { hexSchema } from "./hex";
+import { u53Schema } from "./integers";
+import { RelativeBroadcastSchema } from "./path";
+
+// Backwards compatibility: old track schema
+const TrackSchema = z.object({
+	name: z.string(),
+});
+
+/**
+ * Schema for a single audio rendition's decoder config.
+ * Mirrors WebCodecs AudioDecoderConfig (https://w3c.github.io/webcodecs/#audio-decoder-config).
+ */
+export const AudioConfigSchema = z.object({
+	// Optional reference to another broadcast that publishes this track, expressed
+	// relative to the broadcast that served this catalog (e.g. "./source").
+	// If unset, the track lives in the same broadcast as the catalog.
+	broadcast: z.optional(RelativeBroadcastSchema),
+
+	// Human-readable rendition name for track pickers.
+	label: z.optional(z.string()),
+
+	// Registered WebCodecs codec string, or Hang's "pcm" extension for
+	// interleaved little-endian IEEE-754 binary32 samples.
+	codec: z.string(),
+
+	// The container format, used to decode the timestamp and more.
+	container: ContainerSchema,
+
+	// The description is used for some codecs.
+	// If provided, we can initialize the decoder based on the catalog alone.
+	// Otherwise, the initialization information is in-band.
+	description: z.optional(hexSchema),
+
+	// The sample rate of the audio in Hz
+	sampleRate: u53Schema,
+
+	// The number of channels in the audio
+	numberOfChannels: u53Schema,
+
+	// The bitrate of the audio in bits per second
+	// TODO: Support up to Number.MAX_SAFE_INTEGER
+	bitrate: z.optional(u53Schema),
+
+	// The maximum delay between a frame being ready and the publisher flushing it, in whole
+	// milliseconds rounded up. The player's jitter buffer should be larger than this value.
+	// If not provided, the player should assume each frame is flushed immediately.
+	//
+	// This is measured at the publisher (encoder latency, packet packing, reordering),
+	// never on the network a consumer sees. It only ever grows over the life of a stream.
+	//
+	// NOTE: The audio "frame" duration depends on the codec, sample rate, etc.
+	// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 24ms
+	jitter: z.optional(
+		z.pipe(
+			u53Schema,
+			z.transform((value) => (value === 0 ? undefined : value)),
+		),
+	),
+});
+
+/** Schema for the catalog audio section: a map of track name to rendition config. */
+export const AudioSchema = z.union([
+	z.object({
+		// A map of track name to rendition configuration.
+		// This is not an array so it will work with JSON Merge Patch.
+		renditions: z.record(z.string(), AudioConfigSchema),
+	}),
+	// Backwards compatibility: transform old {track, config} format to new object format
+	z.pipe(
+		z.object({
+			track: TrackSchema,
+			config: AudioConfigSchema,
+		}),
+		z.transform((old) => ({
+			renditions: { [old.track.name]: old.config },
+		})),
+	),
+]);
+
+/** The catalog audio section: renditions keyed by track name. */
+export type Audio = z.infer<typeof AudioSchema>;
+/** Decoder config for a single audio rendition. */
+export type AudioConfig = z.infer<typeof AudioConfigSchema>;

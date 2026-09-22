@@ -1,0 +1,177 @@
+//! The `transcode` verb: consume a source broadcast and publish a just-in-time
+//! transcoded ladder next to it.
+//!
+//! The derivative appears at `<broadcast>/transcode.hang` (or `--output`): its
+//! catalog references the source renditions directly and adds the lower rungs,
+//! which are only decoded and encoded while someone watches (or fetches) them.
+//! On an NVIDIA GPU the whole pipeline is GPU-resident (NVDEC -> CUDA resize ->
+//! NVENC); otherwise it falls back to software codecs.
+
+use anyhow::Context;
+
+use crate::Net;
+use crate::args::MoqSide;
+use hang::moq_net;
+
+/// Ladder and codec options for the `transcode` verb.
+#[derive(usage::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+pub struct Args {
+	/// The derivative broadcast path. Defaults to `<broadcast>/transcode.hang`.
+	#[usage(long)]
+	pub output: Option<String>,
+
+	/// A ladder rung as `height:bitrate` (pixels : bits per second), repeatable,
+	/// e.g. `--rung 720:2500000 --rung 360:600000`. Heights and bitrates must
+	/// increase together; input order does not matter. Rungs above the source
+	/// are dropped; a same-height rung needs a lower known bitrate.
+	/// Defaults to a 240p..1080p ladder.
+	#[usage(long = "rung")]
+	rungs: Vec<RungArg>,
+
+	/// The video encoder: `auto` (hardware first), `hardware`, `software`, or a
+	/// backend name like `nvenc`.
+	#[usage(long, default = "auto")]
+	pub encoder: String,
+
+	/// The video decoder: `auto` (hardware first), `hardware`, `software`, or a
+	/// backend name like `nvdec`.
+	#[usage(long, default = "auto")]
+	pub decoder: String,
+
+	/// Where decoded frames live: `native` (GPU-backed frames stay resident from
+	/// decode through encode) or `cpu` (decode to CPU pixels, resize on the CPU).
+	#[usage(long, default = "native")]
+	frames: OutputArg,
+}
+
+/// A `height:bitrate` rung, e.g. `720:2500000`.
+///
+/// A newtype because Usage builds a value through `FromStr`, and `Rung` is not ours.
+#[derive(Clone)]
+struct RungArg(moq_transcode::Rung);
+
+impl std::str::FromStr for RungArg {
+	type Err = String;
+
+	fn from_str(arg: &str) -> Result<Self, Self::Err> {
+		let (height, bitrate) = arg
+			.split_once(':')
+			.ok_or_else(|| format!("expected height:bitrate, got `{arg}`"))?;
+		let height: u32 = height.parse().map_err(|e| format!("invalid height `{height}`: {e}"))?;
+		let bitrate: u64 = bitrate
+			.parse()
+			.map_err(|e| format!("invalid bitrate `{bitrate}`: {e}"))?;
+		Ok(Self(moq_transcode::Rung::new(
+			height,
+			moq_net::bandwidth::Rate::from_bps(bitrate),
+		)))
+	}
+}
+
+#[derive(Clone, Copy)]
+struct OutputArg(moq_video::Output);
+
+impl std::str::FromStr for OutputArg {
+	type Err = String;
+
+	fn from_str(arg: &str) -> Result<Self, Self::Err> {
+		match arg {
+			"native" => Ok(Self(moq_video::Output::Native)),
+			"cpu" => Ok(Self(moq_video::Output::Cpu)),
+			_ => Err(format!("expected native or cpu, got `{arg}`")),
+		}
+	}
+}
+
+/// Run the transcoder: subscribe to the source through the relay, publish the
+/// derivative back through the same session, and serve rungs until either ends.
+pub async fn run(moq: MoqSide, args: Args, net: Net) -> anyhow::Result<()> {
+	let mut config = moq_transcode::Config::default();
+	if !args.rungs.is_empty() {
+		config.ladder =
+			moq_transcode::Ladder::new(args.rungs.iter().map(|rung| rung.0)).context("invalid --rung ladder")?;
+	}
+	config.encoder = match args.encoder.as_str() {
+		"auto" => moq_video::encode::Kind::Auto,
+		"hardware" => moq_video::encode::Kind::Hardware,
+		"software" => moq_video::encode::Kind::Software,
+		name => moq_video::encode::Kind::Named(name.to_string()),
+	};
+	config.decoder = match args.decoder.as_str() {
+		"auto" => moq_video::decode::Kind::Auto,
+		"hardware" => moq_video::decode::Kind::Hardware,
+		"software" => moq_video::decode::Kind::Software,
+		name => moq_video::decode::Kind::Named(name.to_string()),
+	};
+	config.resize.output = args.frames.0;
+
+	let source_path = moq_net::PathOwned::from(
+		moq.broadcast
+			.clone()
+			.context("`transcode` requires the source broadcast: pass --broadcast <name>")?,
+	);
+	if source_path.is_empty() {
+		anyhow::bail!("`transcode` requires the source broadcast: pass --broadcast <name>");
+	}
+	let output_path = moq_net::PathOwned::from(
+		args.output
+			.clone()
+			.unwrap_or_else(|| format!("{source_path}/transcode.hang")),
+	);
+
+	// Publish the derivative through one origin and consume the source through
+	// another, over a single auto-reconnecting session.
+	let url = moq
+		.client
+		.url
+		.clone()
+		.context("`transcode` requires a relay: pass --connect <url>")?;
+	let publish = moq_tokio::origin::spawn();
+	// A session drop closes the source broadcast and ends the run: the outage is
+	// surfaced rather than transcoded over. The reconnect loop covers the dial;
+	// restarting after a mid-run drop is the caller's call.
+	let remote = moq_tokio::origin::spawn();
+	let session = net
+		.client(moq.client.clone())?
+		.with_publisher(&publish)
+		.with_subscriber(remote.clone())
+		.connect(url);
+
+	// Wait for the source to be announced and resolve it: `request_broadcast` on its
+	// own answers on the spot, so asking the moment a session exists races the
+	// announcement that makes the path routable; `routed_broadcast` also rides out a
+	// covering route retracting mid-resolution (failover churn).
+	//
+	// Raced against the session ending, since the wait itself never fails: the origin
+	// outlives the session here, so a rejected token or an exhausted retry budget would
+	// otherwise leave us waiting for an announcement that can never arrive.
+	let consumer = remote.consume();
+	let source = tokio::select! {
+		source = consumer.routed_broadcast(&source_path) => {
+			source.context("source broadcast unavailable")?
+		}
+		closed = session.closed() => {
+			closed.context("session failed before the source broadcast was announced")?;
+			anyhow::bail!("session closed before the source broadcast was announced");
+		}
+	};
+
+	// Point the derivative catalog at the source renditions so players fetch them from the
+	// source directly. An empty reference would name the derivative broadcast itself, which
+	// publishes the rungs and nothing else.
+	config.source = source_path.relative(&output_path).filter(|rel| !rel.is_empty());
+
+	let output = publish
+		.create_broadcast(&output_path)
+		.context("failed to create the derivative broadcast")?;
+	output
+		.announce(Default::default())
+		.context("failed to announce the derivative broadcast")?;
+	tracing::info!(source = %source_path, output = %output_path, "transcoding");
+
+	tokio::select! {
+		res = moq_transcode::run(source, output, config) => Ok(res?),
+		res = session.closed() => Ok(res?),
+	}
+}

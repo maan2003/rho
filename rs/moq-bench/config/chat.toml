@@ -1,0 +1,19 @@
+# One active chat channel with 2,000 viewers. The first connection publishes the
+# named channel and every other connection subscribes to it, so this is one hot
+# 1:N broadcast in one process. Production announces a channel while it has seen
+# a message in the last 60 seconds; this channel stays active by sending steadily.
+
+startup = "60s"
+report = "5s"
+
+# A: one publisher plus 2,000 viewers
+connections = 2001
+# One named channel: connection 0 publishes it and the remaining connections subscribe.
+fanout = "chat"
+# D: messages per second in the channel
+fps = "1:10"
+# E: bytes per message. The floor sits above the JSON keyframe header (roughly
+# 170 bytes), so every rolled size is delivered exactly.
+frame_size = "200:400"
+# F: each group is a lone JSON keyframe
+group_size = 0

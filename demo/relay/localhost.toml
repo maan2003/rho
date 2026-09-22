@@ -1,0 +1,52 @@
+# A simple configuration for a local relay server.
+# This is used for local development and has authentication disabled.
+
+[log]
+# Enable debug logging for development.
+# The RUST_LOG environment variable will take precedence.
+level = "debug"
+
+[listen]
+# Listen for QUIC connections on UDP:4443
+# Sometimes IPv6 causes issues; try 127.0.0.1:4443 instead.
+bind = "[::]:4443"
+
+# Generate a self-signed certificate for the given hostnames.
+# This is used for local development, in conjunction with a fingerprint, or with TLS verification disabled.
+tls.generate = ["localhost"]
+
+[web.http]
+# Listen for HTTP and WebSocket connections on the given TCP address.
+# This is unfortunately required to serve certificate.sha256 for local development.
+# However, as a bonus, we can serve tracks via both HTTP and WebSocket fallbacks.
+listen = "[::]:4443"
+
+# See root.toml and leaf.toml for auth and clustering examples.
+[auth]
+# Allow anonymous access to everything.
+public = "**"
+
+# Publish a single per-node stats broadcast on the cluster origin:
+#
+#   .stats/node/local/host
+#
+# carrying publisher.json, subscriber.json, and sessions.json tracks. See
+# doc/bin/relay/config.md for the field semantics.
+[stats]
+enabled = true
+
+# `node` is the suffix that disambiguates per-relay broadcasts in a cluster.
+# It can be multi-segment (e.g. `sjc/1`, `sjc/2`) to nest multiple hosts under
+# a shared region key. Single-node setups can leave it unset.
+node = "local/host"
+
+[iroh]
+# You can optionally enable iroh support for P2P connections.
+# Clients can connect using --iroh-enabled and a `iroh://` URL.
+enabled = false
+
+# Path to persist the iroh secret key.
+# If the file does not exist, a random key will be generated and written to the path.
+# This gives the relay a persistent iroh endpoint id. The secret key can alternatively be set
+# via MOQ_IROH_SECRET environment variable.
+secret = "./iroh-secret.key"

@@ -1,0 +1,889 @@
+use std::sync::Arc;
+
+use url::Url;
+
+use crate::bandwidth::MoqBandwidth;
+use crate::error::MoqError;
+use crate::ffi::Task;
+use crate::origin::{MoqOriginConsumer, MoqOriginProducer};
+
+/// Native QUIC/WebTransport client configuration.
+#[cfg(not(target_arch = "wasm32"))]
+struct Client {
+	config: moq_tokio::connect::Config,
+	/// QUIC transport tuning the dial applies, e.g. `quic_max_streams`.
+	quic: moq_tokio::quic::Config,
+	publish: Option<Arc<MoqOriginProducer>>,
+	consume: Option<Arc<MoqOriginProducer>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Client {
+	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
+		let client = self.config.clone().init(self.quic.clone()).map_err(map_connect_error)?;
+
+		// Materialize both origin sides so the session can publish/subscribe and the FFI can
+		// always hand back a publish/consume origin.
+		let (publish, subscribe) = crate::origin::resolve_pair(self.publish.as_ref(), self.consume.as_ref());
+
+		let connection = client
+			.with_publisher(&publish)
+			.with_subscriber(subscribe.clone())
+			.connect(url);
+
+		// Wait for the first session so auth errors surface here; later drops are the
+		// connection's to ride out. `MoqClient::cancel` unblocks a dial stuck retrying.
+		// `established` hands the connection back, which is what keeps it reconnecting.
+		let connection = connection.established().await.map_err(map_connect_error)?;
+
+		Ok(Arc::new(MoqSession::connected(connection, publish, subscribe)))
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn map_connect_error(err: moq_tokio::Error) -> MoqError {
+	match err {
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => MoqError::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => MoqError::Forbidden,
+			_ => MoqError::Connect(format!("{err}")),
+		},
+	}
+}
+
+/// The terminal error of a connection that had already established a session.
+///
+/// Same auth rejections as [`map_connect_error`], but a session that ended carries
+/// a [`moq_net::Error`], and stringifying that into `Connect` would both lose the
+/// variant a caller can match on and claim the dial failed when it had succeeded.
+/// A server-accepted session reports its close the same way.
+///
+/// A local stop is not a failure at all, so it maps to `Closed`, which is what the
+/// bindings' `is_shutdown` recognizes. `status()` reaches this path whenever
+/// another handle shuts the connection down underneath it, and reporting that as a
+/// connect error would make every status watcher treat an expected teardown as a
+/// broken connection.
+#[cfg(not(target_arch = "wasm32"))]
+fn map_closed_error(err: moq_tokio::Error) -> MoqError {
+	match err {
+		moq_tokio::Error::Stopped => MoqError::Closed,
+		// A peer's session/stream code stays structured. HTTP 401/403 are a
+		// connect-time rejection, not a protocol code, and land below.
+		moq_tokio::Error::MoqNet(err) => err.into(),
+		err => match err.connect_error() {
+			Some(moq_tokio::ConnectError::Unauthorized) => MoqError::Unauthorized,
+			Some(moq_tokio::ConnectError::Forbidden) => MoqError::Forbidden,
+			_ => MoqError::Connect(format!("{err}")),
+		},
+	}
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use super::*;
+
+	const VALID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+	#[test]
+	fn decodes_a_sha256_fingerprint() {
+		let bytes = decode_hex(VALID).unwrap();
+		assert_eq!(bytes.len(), 32);
+		assert_eq!(bytes[0], 0x01);
+
+		// Colons are the other shape `MoqServer::cert_fingerprints` and openssl print.
+		let colons = VALID
+			.as_bytes()
+			.chunks(2)
+			.map(|c| std::str::from_utf8(c).unwrap())
+			.collect::<Vec<_>>()
+			.join(":");
+		assert_eq!(decode_hex(&colons).unwrap(), bytes);
+	}
+
+	/// Byte-index slicing used to land inside a multi-byte character and panic, which an
+	/// FFI caller could reach with any non-ASCII string of even byte length.
+	#[test]
+	fn rejects_non_ascii_instead_of_panicking() {
+		for input in ["aéa", "é", "ééééééééééééééééééééééééééééééé"] {
+			assert!(matches!(decode_hex(input), Err(MoqError::Connect(_))), "{input}");
+		}
+	}
+
+	#[test]
+	fn rejects_a_wrong_length_fingerprint() {
+		assert!(decode_hex("").is_err());
+		assert!(decode_hex("abcd").is_err());
+		assert!(decode_hex(&VALID[..62]).is_err());
+		assert!(decode_hex(&format!("{VALID}ab")).is_err());
+	}
+
+	#[test]
+	fn rejects_non_hex_digits() {
+		for bad in [
+			format!("zz{}", &VALID[2..]),
+			// `u8::from_str_radix` accepts a leading sign, so an unchecked chunk would
+			// decode "+a" to 10 and silently yield a fingerprint matching no certificate.
+			format!("+0{}", &VALID[2..]),
+			format!("{}+0", &VALID[..62]),
+			format!(" 0{}", &VALID[2..]),
+		] {
+			assert!(matches!(decode_hex(&bad), Err(MoqError::Connect(_))), "{bad}");
+		}
+	}
+
+	#[test]
+	fn maps_native_auth_connect_errors() {
+		assert!(matches!(
+			map_connect_error(moq_tokio::ConnectError::Unauthorized.into()),
+			MoqError::Unauthorized
+		));
+		assert!(matches!(
+			map_connect_error(moq_tokio::ConnectError::Forbidden.into()),
+			MoqError::Forbidden
+		));
+	}
+
+	/// A session that ended must report the close, not a dial failure. Auth
+	/// rejections keep their dedicated variants, which is what `is_auth` reads in
+	/// every binding, but everything else keeps the `moq_net::Error` a caller can
+	/// match on instead of being flattened into a `Connect` string.
+	#[test]
+	fn maps_closed_errors_without_flattening_the_reason() {
+		match map_closed_error(moq_net::Error::from(moq_net::SessionError::Unknown(7)).into()) {
+			MoqError::Protocol { details: protocol } => {
+				assert_eq!(protocol.scope, crate::error::MoqErrorScope::Session);
+				assert_eq!(protocol.code, 7);
+				assert_eq!(protocol.kind, crate::error::MoqProtocolKind::Unknown);
+			}
+			other => panic!("expected Protocol Unknown(7), got {other:?}"),
+		}
+		assert!(matches!(
+			map_closed_error(moq_net::Error::Cancel.into()),
+			MoqError::Cancelled
+		));
+
+		// A local stop is an expected teardown, not a failed connection: the bindings'
+		// `is_shutdown` reads `Closed`, and `Connect` would read as a broken dial.
+		assert!(matches!(map_closed_error(moq_tokio::Error::Stopped), MoqError::Closed));
+
+		// HTTP auth still wins. A protocol Unauthorized is a structured Protocol error
+		// (kind Unauthorized), not this HTTP 401 variant.
+		assert!(matches!(
+			map_closed_error(moq_tokio::ConnectError::Unauthorized.into()),
+			MoqError::Unauthorized
+		));
+		match map_closed_error(moq_net::Error::from(moq_net::SessionError::Unauthorized).into()) {
+			MoqError::Protocol { details: protocol } => {
+				assert_eq!(protocol.kind, crate::error::MoqProtocolKind::Unauthorized);
+				assert_eq!(protocol.code, 0x2);
+			}
+			other => panic!("expected Protocol Unauthorized, got {other:?}"),
+		}
+		assert!(matches!(
+			map_closed_error(moq_tokio::ConnectError::Forbidden.into()),
+			MoqError::Forbidden
+		));
+	}
+
+	#[test]
+	fn sets_tls_system_roots() {
+		let client = MoqClient::new();
+
+		client.set_tls_system_roots(true).unwrap();
+		{
+			let state = client.task.lock().expect("client state should be available");
+			assert_eq!(state.config.tls.system_roots, Some(true));
+		}
+
+		client.set_tls_system_roots(false).unwrap();
+		let state = client.task.lock().expect("client state should be available");
+		assert_eq!(state.config.tls.system_roots, Some(false));
+	}
+
+	#[test]
+	fn sets_tls_client_cert_and_key() {
+		let client = MoqClient::new();
+
+		client.set_tls_cert(Some("cert.pem".into())).unwrap();
+		client.set_tls_key(Some("key.pem".into())).unwrap();
+		{
+			let state = client.task.lock().expect("client state should be available");
+			assert_eq!(state.config.tls.cert.as_deref(), Some(std::path::Path::new("cert.pem")));
+			assert_eq!(state.config.tls.key.as_deref(), Some(std::path::Path::new("key.pem")));
+		}
+
+		client.set_tls_cert(None).unwrap();
+		client.set_tls_key(None).unwrap();
+		let state = client.task.lock().expect("client state should be available");
+		assert_eq!(state.config.tls.cert, None);
+		assert_eq!(state.config.tls.key, None);
+	}
+
+	#[test]
+	fn sets_the_quic_stream_cap() {
+		let client = MoqClient::new();
+		assert_eq!(client.task.lock().unwrap().quic.max_streams, None);
+
+		client.set_quic_max_streams(4096).unwrap();
+		assert_eq!(client.task.lock().unwrap().quic.max_streams, Some(4096));
+	}
+
+	#[test]
+	fn setters_fail_after_cancel() {
+		let client = MoqClient::new();
+		client.set_tls_verify(false).unwrap();
+		client.cancel();
+		assert!(matches!(client.set_tls_verify(true), Err(MoqError::Cancelled)));
+		assert!(matches!(
+			client.set_bind("127.0.0.1:0".into()),
+			Err(MoqError::Cancelled)
+		));
+		assert!(matches!(client.set_publish(None), Err(MoqError::Cancelled)));
+		assert!(matches!(client.set_consume(None), Err(MoqError::Cancelled)));
+	}
+}
+
+/// Retry pacing for the automatic reconnect (see [`MoqClient::set_backoff`]).
+///
+/// The delay starts at `initial_us`, multiplies by `multiplier` after each failed
+/// attempt, and caps at `max_us`. After `timeout_us` of consecutive failures the
+/// connection gives up for good (0 retries forever); the window resets whenever a
+/// session stays up past `initial_us`. The defaults mirror the native
+/// [`moq_tokio::Backoff`]: 1s, x2, 5s, and a 10s window.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MoqBackoff {
+	/// Delay before the first reconnect attempt, in microseconds.
+	#[uniffi(default = 1000000)]
+	pub initial_us: u64,
+	/// Multiplier applied to the delay after each failure.
+	#[uniffi(default = 2)]
+	pub multiplier: u32,
+	/// Maximum delay between reconnect attempts, in microseconds.
+	#[uniffi(default = 5000000)]
+	pub max_us: u64,
+	/// Time spent retrying before giving up, in microseconds. 0 retries forever.
+	#[uniffi(default = 10000000)]
+	pub timeout_us: u64,
+}
+
+/// Browser WebTransport client configuration.
+///
+/// The browser owns the socket and the trust store, so none of the native TLS knobs
+/// (roots, mTLS, bind address) have an equivalent. Certificate hashes are the one
+/// thing WebTransport does expose.
+#[cfg(target_arch = "wasm32")]
+struct Client {
+	fingerprints: Vec<Vec<u8>>,
+	publish: Option<Arc<MoqOriginProducer>>,
+	consume: Option<Arc<MoqOriginProducer>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Client {
+	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
+		let (publish, subscribe) = crate::origin::resolve_pair(self.publish.as_ref(), self.consume.as_ref());
+
+		let transport = match self.fingerprints.is_empty() {
+			true => crate::transport::connect(url).await,
+			false => crate::transport::connect_with_hashes(url, self.fingerprints.clone()).await,
+		}
+		.map_err(|err| MoqError::Connect(format!("{err}")))?;
+
+		// Run the driver on the microtask queue. The driver
+		// holds no session clone, so dropping the last handle still closes the
+		// transport and ends that task.
+		let (session, driver) = moq_net::Client::new()
+			.with_publisher(&publish)
+			.with_subscriber(subscribe.clone())
+			.connect(web_async::time::Instant::now(), transport)
+			.await?;
+
+		crate::ffi::spawn(async move {
+			moq_net::time::run(driver).await;
+		});
+
+		Ok(Arc::new(MoqSession::accepted(session, publish, subscribe)))
+	}
+}
+
+/// Decode a hex-encoded SHA-256 certificate fingerprint into raw bytes.
+///
+/// Not gated on wasm alone so the native test suite covers it: this parses a string an
+/// FFI caller controls, and nothing in this repo runs a wasm test.
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_hex(hex: &str) -> Result<Vec<u8>, MoqError> {
+	/// A sha-256 digest is 32 bytes, so 64 hex characters.
+	const LEN: usize = 64;
+
+	let hex = hex.replace(':', "");
+
+	// This string comes straight from the caller, and one check covers two hazards:
+	// non-ASCII would let a 2-byte chunk split a character, and `from_str_radix` accepts
+	// a leading sign, so an unchecked "+a" would decode to 10 rather than erroring.
+	if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+		return Err(MoqError::Connect(format!("fingerprint is not hex: {hex}")));
+	}
+
+	// WebTransport's `serverCertificateHashes` only accepts a 32-byte sha-256, so a
+	// different length can never match a certificate. Rejecting here beats failing
+	// opaquely inside the browser.
+	if hex.len() != LEN {
+		return Err(MoqError::Connect(format!(
+			"expected a {LEN}-character sha-256 fingerprint, got {}",
+			hex.len()
+		)));
+	}
+
+	hex.as_bytes()
+		.chunks(2)
+		.map(|pair| {
+			let pair = std::str::from_utf8(pair).expect("checked ascii above");
+			u8::from_str_radix(pair, 16).map_err(|err| MoqError::Connect(format!("{err}")))
+		})
+		.collect()
+}
+
+/// Builds a [`MoqSession`]: configure it, then [`connect`](Self::connect).
+///
+/// The configuration differs by target, because the transport does. Native builds expose
+/// the QUIC socket and TLS trust store; the browser owns both, so a wasm build exposes
+/// only the certificate hashes WebTransport accepts.
+///
+/// Setters write the configuration [`connect`](Self::connect) will snapshot. They fail
+/// with [`MoqError::Busy`] while a connect is in flight and [`MoqError::Cancelled`]
+/// after [`cancel`](Self::cancel). A finished connect does not freeze the handle: later
+/// setters apply to the next dial until cancel.
+#[derive(uniffi::Object)]
+pub struct MoqClient {
+	task: Task<Client>,
+}
+
+impl MoqClient {
+	fn configure<R>(&self, f: impl FnOnce(&mut Client) -> R) -> Result<R, MoqError> {
+		Ok(f(&mut *self.task.configure()?))
+	}
+}
+
+#[cfg(target_arch = "wasm32")]
+#[uniffi::export]
+impl MoqClient {
+	/// Create a new MoQ client with default configuration.
+	#[uniffi::constructor]
+	pub fn new() -> Arc<Self> {
+		Arc::new(Self {
+			task: Task::new(Client {
+				fingerprints: Vec::new(),
+				publish: None,
+				consume: None,
+			}),
+		})
+	}
+
+	/// Pin the peer to a certificate with one of these SHA-256 fingerprints, encoded as hex.
+	///
+	/// Passed through to WebTransport's `serverCertificateHashes`. An empty list restores
+	/// the browser's normal certificate verification.
+	pub fn set_tls_fingerprints(&self, fingerprints: Vec<String>) -> Result<(), MoqError> {
+		let parsed = fingerprints
+			.iter()
+			.map(|hex| decode_hex(hex))
+			.collect::<Result<Vec<_>, _>>()?;
+		self.configure(|state| {
+			state.fingerprints = parsed;
+		})
+	}
+
+	/// Set the origin to publish local broadcasts to the remote.
+	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.publish = origin;
+		})
+	}
+
+	/// Set the origin to consume remote broadcasts from the remote.
+	pub fn set_consume(&self, origin: Option<Arc<MoqOriginProducer>>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.consume = origin;
+		})
+	}
+
+	/// Connect to a MoQ server and wait for the session to be established.
+	///
+	/// Can be cancelled by calling `cancel()`.
+	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
+		let url = Url::parse(&url)?;
+		self.task.run(|state| async move { state.connect(url).await }).await
+	}
+
+	/// Cancel all current and future `connect()` calls.
+	pub fn cancel(&self) {
+		self.task.cancel();
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+impl MoqClient {
+	/// Create a new MoQ client with default configuration.
+	#[uniffi::constructor]
+	pub fn new() -> Arc<Self> {
+		let _guard = crate::ffi::enter();
+		Arc::new(Self {
+			task: Task::new(Client {
+				config: moq_tokio::connect::Config::default(),
+				quic: moq_tokio::quic::Config::default(),
+				publish: None,
+				consume: None,
+			}),
+		})
+	}
+
+	/// Enable or disable TLS certificate verification.
+	pub fn set_tls_verify(&self, verify: bool) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.tls.insecure = Some(!verify);
+		})
+	}
+
+	/// Trust these PEM root certificate file(s) instead of the system roots.
+	///
+	/// Pass the paths to PEM-encoded CA certificates. An empty list restores the
+	/// default behavior of using the platform's native root store.
+	pub fn set_tls_roots(&self, paths: Vec<String>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.tls.root = paths.into_iter().map(Into::into).collect();
+		})
+	}
+
+	/// Configure whether to also trust the platform's native root certificates.
+	///
+	/// By default, system roots are trusted only when no custom roots are configured.
+	/// Set this to `true` to trust system roots in addition to roots from
+	/// `set_tls_roots`, or `false` to trust only custom roots.
+	pub fn set_tls_system_roots(&self, system_roots: bool) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.tls.system_roots = Some(system_roots);
+		})
+	}
+
+	/// Pin the peer to a certificate with one of these SHA-256 fingerprints, encoded as hex.
+	///
+	/// This is the native equivalent of the browser's WebTransport `serverCertificateHashes`
+	/// and accepts the same values a server reports (see `MoqServer.cert_fingerprints`). Use it
+	/// to trust a self-signed certificate without disabling verification. An empty list clears
+	/// any pinned fingerprints.
+	pub fn set_tls_fingerprints(&self, fingerprints: Vec<String>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.tls.fingerprint = fingerprints;
+		})
+	}
+
+	/// Present this PEM certificate chain when the relay requires mTLS.
+	///
+	/// Only certificates are read from the file; any private keys are ignored. Must be
+	/// paired with `set_tls_key`, otherwise `connect` fails with an incomplete-auth error.
+	/// Pass `None` to clear a previously set path.
+	pub fn set_tls_cert(&self, path: Option<String>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.tls.cert = path.map(Into::into);
+		})
+	}
+
+	/// Present this PEM private key when the relay requires mTLS.
+	///
+	/// Only the private key is read from the file; any certificates are ignored. Must be
+	/// paired with `set_tls_cert`, otherwise `connect` fails with an incomplete-auth error.
+	/// Pass `None` to clear a previously set path.
+	pub fn set_tls_key(&self, path: Option<String>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.tls.key = path.map(Into::into);
+		})
+	}
+
+	/// Set the local UDP socket bind address. Defaults to `[::]:0`.
+	///
+	/// Returns an error if the address cannot be parsed, if a connect is in flight,
+	/// or after [`cancel`](Self::cancel).
+	pub fn set_bind(&self, addr: String) -> Result<(), MoqError> {
+		let parsed: std::net::SocketAddr = addr
+			.parse()
+			.map_err(|err| MoqError::Bind(format!("invalid bind address: {err}")))?;
+		self.configure(|state| {
+			state.config.bind = Some(parsed);
+		})
+	}
+
+	/// Cap the concurrent QUIC streams the peer may open toward this connection.
+	/// Defaults to 1024.
+	///
+	/// MoQ opens a stream per group, and for a subscriber those arrive from the relay,
+	/// so a client subscribing to many tracks wants this raised. A publisher's own
+	/// streams are bounded by the peer's advertised limit, not this one. Ignored by
+	/// the WebSocket fallback.
+	pub fn set_quic_max_streams(&self, max_streams: u64) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.quic.max_streams = Some(max_streams);
+		})
+	}
+
+	/// Enable or disable automatic reconnecting. Enabled by default.
+	///
+	/// When enabled, the session returned by [`connect`](Self::connect) redials with
+	/// backoff whenever the transport drops, and broadcasts consumed through it survive
+	/// the gap. Disable for a one-shot dial: the transport's close then ends the session
+	/// (surfaced via [`MoqSession::closed`]).
+	pub fn set_reconnect(&self, enabled: bool) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.config.once = Some(!enabled);
+		})
+	}
+
+	/// Configure retry pacing for the automatic reconnect (see [`MoqBackoff`]).
+	pub fn set_backoff(&self, backoff: MoqBackoff) -> Result<(), MoqError> {
+		self.configure(|state| {
+			let mut out = moq_tokio::Backoff::default();
+			out.initial = std::time::Duration::from_micros(backoff.initial_us);
+			out.multiplier = backoff.multiplier;
+			out.max = std::time::Duration::from_micros(backoff.max_us);
+			out.timeout = std::time::Duration::from_micros(backoff.timeout_us);
+			state.config.backoff = out;
+		})
+	}
+
+	/// Set the origin to publish local broadcasts to the remote.
+	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.publish = origin;
+		})
+	}
+
+	/// Set the origin to consume remote broadcasts from the remote.
+	pub fn set_consume(&self, origin: Option<Arc<MoqOriginProducer>>) -> Result<(), MoqError> {
+		self.configure(|state| {
+			state.consume = origin;
+		})
+	}
+
+	/// Connect to a MoQ server and wait for the session to be established.
+	///
+	/// The returned session automatically reconnects with backoff when the transport
+	/// drops (unless disabled via [`set_reconnect`](Self::set_reconnect)), and broadcasts
+	/// consumed through it ride out the gap. Watch [`MoqSession::status`] for the
+	/// connect/disconnect transitions, [`MoqSession::epoch`] for the reconnect count,
+	/// and [`MoqSession::closed`] for the connection giving up for good.
+	///
+	/// Both origin sides are always accessible via [`MoqSession::publish`] and
+	/// [`MoqSession::consume`], without the caller constructing a [`MoqOriginProducer`]
+	/// themselves. With neither [`set_publish`](Self::set_publish) nor
+	/// [`set_consume`](Self::set_consume) wired, the two sides share one origin, so a broadcast
+	/// announced on this session is also discoverable through it. Wiring either side opts out of
+	/// that and gives the other side its own fresh origin.
+	///
+	/// Can be cancelled by calling `cancel()`, including while the initial dial is retrying.
+	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
+		let url = Url::parse(&url)?;
+
+		self.task.run(|state| async move { state.connect(url).await }).await
+	}
+
+	/// Cancel all current and future `connect()` calls.
+	///
+	/// Terminal: the client's configuration and wired origins are released here, not when the
+	/// handle is, so this client can't dial again.
+	pub fn cancel(&self) {
+		self.task.cancel();
+	}
+}
+
+/// A snapshot of connection statistics for a [`MoqSession`].
+///
+/// Each field is `None` when the transport backend doesn't report that metric (native QUIC
+/// reports all of them; the browser WebTransport reports few or none), or when it isn't yet
+/// available (e.g. `estimated_send_rate_bps` before the congestion controller has a window). A `None` is
+/// not the same as a zero value.
+#[derive(uniffi::Record)]
+pub struct MoqConnectionStats {
+	/// Smoothed round-trip time, in microseconds.
+	pub rtt_us: Option<u64>,
+	/// Estimated send bandwidth from the congestion controller, in bits per second.
+	pub estimated_send_rate_bps: Option<u64>,
+	/// Estimated receive bandwidth from MoQ PROBE, in bits per second.
+	pub estimated_recv_rate_bps: Option<u64>,
+	/// Total bytes sent, including retransmissions and overhead.
+	pub bytes_sent: Option<u64>,
+	/// Total bytes received, including duplicates and overhead.
+	pub bytes_received: Option<u64>,
+	/// Total bytes lost (detected via retransmission or acknowledgement).
+	pub bytes_lost: Option<u64>,
+	/// Total datagrams sent.
+	pub packets_sent: Option<u64>,
+	/// Total datagrams received.
+	pub packets_received: Option<u64>,
+	/// Total datagrams detected as lost.
+	pub packets_lost: Option<u64>,
+}
+
+impl From<moq_net::session::Stats> for MoqConnectionStats {
+	fn from(stats: moq_net::session::Stats) -> Self {
+		Self {
+			rtt_us: stats.rtt.map(|d| d.as_micros() as u64),
+			estimated_send_rate_bps: stats.estimated_send_rate.map(moq_net::bandwidth::Rate::as_bps),
+			estimated_recv_rate_bps: stats.estimated_recv_rate.map(moq_net::bandwidth::Rate::as_bps),
+			bytes_sent: stats.bytes_sent,
+			bytes_received: stats.bytes_received,
+			bytes_lost: stats.bytes_lost,
+			packets_sent: stats.packets_sent,
+			packets_received: stats.packets_received,
+			packets_lost: stats.packets_lost,
+		}
+	}
+}
+
+/// A connection lifecycle transition reported by [`MoqSession::status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MoqConnectionStatus {
+	/// A session connected (the first connect, or a reconnect after a drop).
+	Connected,
+	/// The session dropped; a reconnect attempt follows.
+	Disconnected,
+	/// The peer sent a GOAWAY; the replacement is being dialed while the old
+	/// session keeps serving.
+	Migrating,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<moq_tokio::Status> for MoqConnectionStatus {
+	fn from(status: moq_tokio::Status) -> Self {
+		match status {
+			moq_tokio::Status::Connected => Self::Connected,
+			moq_tokio::Status::Disconnected => Self::Disconnected,
+			// A future unknown status means the loop is between the known states;
+			// Migrating is the "still served, in flux" bucket.
+			_ => Self::Migrating,
+		}
+	}
+}
+
+/// What backs a [`MoqSession`]: a client connection (a loop that may redial) or
+/// a server-accepted session (one transport; the peer redialing yields a fresh
+/// `accept()`).
+#[derive(Clone)]
+enum Inner {
+	#[cfg(not(target_arch = "wasm32"))]
+	Connection(moq_tokio::Connection),
+	Session(moq_net::Session),
+}
+
+#[derive(uniffi::Object)]
+pub struct MoqSession {
+	inner: Inner,
+	/// Serializes `closed()` calls onto the FFI runtime; holds its own `Inner` clone
+	/// so a parked `closed()` doesn't block the rest of the surface.
+	closed: Task<Inner>,
+	/// Serializes `status()` calls, which need `&mut` for per-handle change tracking.
+	status: Task<Inner>,
+	publisher: Arc<MoqOriginProducer>,
+	consumer: Arc<MoqOriginConsumer>,
+	/// One allocator for the session. Every [`bandwidth`](Self::bandwidth) handle
+	/// clones it, so they share one reservation registry.
+	bandwidth: Arc<MoqBandwidth>,
+}
+
+impl MoqSession {
+	/// Wrap a client connection (see [`MoqClient::connect`]).
+	#[cfg(not(target_arch = "wasm32"))]
+	pub(crate) fn connected(
+		connection: moq_tokio::Connection,
+		publish: moq_net::origin::Producer,
+		subscribe: moq_net::origin::Producer,
+	) -> Self {
+		Self::build(Inner::Connection(connection), publish, subscribe)
+	}
+
+	/// Wrap a server-accepted session (see `MoqServer::accept`).
+	pub(crate) fn accepted(
+		session: moq_net::Session,
+		publish: moq_net::origin::Producer,
+		subscribe: moq_net::origin::Producer,
+	) -> Self {
+		Self::build(Inner::Session(session), publish, subscribe)
+	}
+
+	fn mint_allocator(inner: &Inner) -> moq_net::bandwidth::Allocator {
+		match inner {
+			// Persistent across reconnects: `None` while disconnected, then a grant
+			// again on the next connection. Reservations survive the gap.
+			#[cfg(not(target_arch = "wasm32"))]
+			Inner::Connection(connection) => moq_net::bandwidth::Allocator::new(connection.send_bandwidth()),
+			Inner::Session(session) => session
+				.send_bandwidth()
+				.map(moq_net::bandwidth::Allocator::new)
+				.unwrap_or_else(moq_net::bandwidth::Allocator::unlimited),
+		}
+	}
+
+	fn build(inner: Inner, publish: moq_net::origin::Producer, subscribe: moq_net::origin::Producer) -> Self {
+		// Eagerly wrap the wired origin sides so each publish()/consume()
+		// call hands back the same Arc. `publish` is published into; `subscribe`
+		// is where the remote's broadcasts land (read via its consumer view).
+		let publisher = Arc::new(MoqOriginProducer::from_inner(publish));
+		let consumer = Arc::new(MoqOriginConsumer::from_inner(subscribe.consume()));
+		let bandwidth = Arc::new(MoqBandwidth::new(Self::mint_allocator(&inner)));
+		Self {
+			inner: inner.clone(),
+			closed: Task::new(inner.clone()),
+			status: Task::new(inner),
+			publisher,
+			consumer,
+			bandwidth,
+		}
+	}
+
+	/// Abort the live transport (if any) with `err` and stop any reconnect loop.
+	fn teardown(&self, err: moq_net::Error) {
+		match &self.inner {
+			#[cfg(not(target_arch = "wasm32"))]
+			Inner::Connection(connection) => connection.abort(err),
+			Inner::Session(session) => session.abort(err),
+		}
+	}
+}
+
+impl Drop for MoqSession {
+	fn drop(&mut self) {
+		let _guard = crate::ffi::enter();
+		// Close the transport while the runtime is entered. The backend spawns a
+		// lingering CLOSE task, which panics (aborting under panic=abort) if no reactor
+		// is in context. We can't leave this to the last `Session` clone's drop: clones
+		// live in the `closed`/`status` tasks and the connection state, released after
+		// this guard, off-runtime. Close-once dedup then makes those trailing drops no-ops.
+		self.teardown(moq_net::Error::Cancel);
+	}
+}
+
+#[uniffi::export]
+impl MoqSession {
+	/// Wait until the session is over.
+	///
+	/// A client session resolves when its connection stops for good: `Err` with the
+	/// terminal error when it gave up (retries exhausted, or the session's close reason
+	/// with reconnecting disabled), `Ok` after a local [`shutdown`](Self::shutdown) /
+	/// [`cancel`](Self::cancel). Transient drops the reconnect loop rides out do not
+	/// resolve this; watch [`status`](Self::status) for those. A server-accepted
+	/// session resolves with the session's close reason.
+	pub async fn closed(&self) -> Result<(), MoqError> {
+		// We have a task to run all of the closed calls juuuuust so they use the same tokio runtime.
+		self.closed
+			.run(|inner| async move {
+				match &*inner {
+					#[cfg(not(target_arch = "wasm32"))]
+					Inner::Connection(connection) => connection.closed().await.map_err(map_closed_error),
+					Inner::Session(session) => Err(session.closed().await.into()),
+				}
+			})
+			.await
+	}
+
+	/// Wait for the connection status to differ from the one this handle last reported.
+	///
+	/// A client session reports `Connected` first (the connect it was built from), then
+	/// follows the reconnect loop: `Disconnected` while redialing, `Connected` again on
+	/// success, `Migrating` during a GOAWAY handover. It returns an error once the
+	/// connection stops for good (same terminal result as [`closed`](Self::closed)).
+	/// A server-accepted session is a single transport, so its only transition is
+	/// terminal: this waits for the close and returns its reason.
+	///
+	/// This is the current status, not a queue of every edge: a drop that reconnects
+	/// before you ask again is coalesced away, so the outages it hides are the ones
+	/// that already healed. Don't count outages with it.
+	pub async fn status(&self) -> Result<MoqConnectionStatus, MoqError> {
+		self.status
+			.run(|mut inner| async move {
+				match &mut *inner {
+					#[cfg(not(target_arch = "wasm32"))]
+					Inner::Connection(connection) => Ok(connection.status().await.map_err(map_closed_error)?.into()),
+					Inner::Session(session) => Err(session.closed().await.into()),
+				}
+			})
+			.await
+	}
+
+	/// The connection epoch: 1 for the connect this session was built from, one more
+	/// on each reconnect. A server-accepted session is a single transport, so it stays 1.
+	///
+	/// The count pairs with [`status`](Self::status): a `Connected` transition whose
+	/// epoch grew is a reconnect, so a worker can log each one by number. Migrations
+	/// count too, since the replacement is a new session.
+	pub fn epoch(&self) -> u64 {
+		match &self.inner {
+			#[cfg(not(target_arch = "wasm32"))]
+			Inner::Connection(connection) => connection.epoch(),
+			Inner::Session(_) => 1,
+		}
+	}
+
+	/// Close the session with the given error code, stopping any reconnect loop.
+	pub fn cancel(&self, code: u32) {
+		let _guard = crate::ffi::enter();
+		self.teardown(moq_net::SessionError::from_code(code).into());
+		// NOTE: we don't abort the closed Task; the teardown above resolves it
+		// (with the close reason, or Ok once the connection loop stops).
+	}
+
+	/// Graceful shutdown. Equivalent to `cancel(0)`. Documents the
+	/// convention that code 0 means "no error" so callers don't have to
+	/// pick one. Named `shutdown` (not `close`) because UniFFI's Kotlin
+	/// generator already emits an `AutoCloseable.close()` that releases
+	/// the FFI handle, and shadowing it would silently mean a different
+	/// thing per binding.
+	pub fn shutdown(&self) {
+		self.cancel(0);
+	}
+
+	/// The publish-side origin: where local broadcasts get advertised
+	/// to the remote. Either the producer the caller wired via
+	/// `set_publish` / `set_consume` before connect/accept, or one
+	/// auto-created if neither was set.
+	pub fn publish(&self) -> Arc<MoqOriginProducer> {
+		self.publisher.clone()
+	}
+
+	/// The subscribe-side origin: a read handle for receiving
+	/// announcements pushed by the remote. Either derived from the
+	/// origin the caller wired via `set_consume`, or auto-created if
+	/// neither was set.
+	pub fn consume(&self) -> Arc<MoqOriginConsumer> {
+		self.consumer.clone()
+	}
+
+	/// The session's bandwidth allocator, used to divide the connection's send
+	/// estimate among tracks sharing it.
+	///
+	/// Every call returns a handle to the same registry, so reservations made
+	/// through one are visible to the others. A client handle survives
+	/// reconnects: the grant is `None` while disconnected and resumes on the
+	/// next connection. An accepted session with no congestion estimate mints
+	/// an unlimited allocator, which reports `None` for every reservation.
+	pub fn bandwidth(&self) -> Arc<MoqBandwidth> {
+		self.bandwidth.clone()
+	}
+
+	/// Snapshot the current connection statistics (RTT, bandwidth estimates,
+	/// byte/packet counters). Cheap to call; intended for periodic polling.
+	///
+	/// Individual fields are `None` when the transport backend doesn't report
+	/// them, or (on a client session) while the connection is between sessions;
+	/// see [`MoqConnectionStats`].
+	pub fn stats(&self) -> MoqConnectionStats {
+		let _guard = crate::ffi::enter();
+		match &self.inner {
+			#[cfg(not(target_arch = "wasm32"))]
+			Inner::Connection(connection) => connection.monitor().stats(),
+			Inner::Session(session) => Some(session.stats()),
+		}
+		.unwrap_or_default()
+		.into()
+	}
+}
