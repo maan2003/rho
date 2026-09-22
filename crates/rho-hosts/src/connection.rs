@@ -682,11 +682,16 @@ impl Connection {
         cx: &App,
     ) -> Task<anyhow::Result<crate::wayland::Viewer>> {
         let dialer = self.dialer.lock().unwrap().clone();
+        let started = std::time::Instant::now();
         let task = Tokio::spawn(cx, async move {
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "desktop IO task started"
+            );
             let Some(ChannelDialer::Iroh { connection, media }) = dialer else {
                 anyhow::bail!("the live Wayland viewer requires an Iroh host");
             };
-            open_wayland_stream(connection, media, agent, session).await
+            open_wayland_stream(connection, media, agent, session, started).await
         });
         cx.spawn(async move |_| {
             task.await
@@ -2382,10 +2387,20 @@ async fn open_wayland_stream(
     media: rho_rpc::media::Mux,
     agent: String,
     session: String,
+    started: std::time::Instant,
 ) -> anyhow::Result<crate::wayland::Viewer> {
-    let started = std::time::Instant::now();
     static NEXT_MEDIA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT_MEDIA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(desktop_id = id, %agent, %session, "desktop open requested");
+    for path in connection.paths().iter().filter(|path| path.is_selected()) {
+        tracing::info!(
+            desktop_id = id,
+            direct = path.is_ip(),
+            rtt_ms = path.rtt().as_millis(),
+            lost_packets = connection.stats().lost_packets,
+            "desktop selected network path"
+        );
+    }
     let transport = media.session(id)?;
     let (send, recv) = connection.open_bi().await?;
     send.set_priority(100)?;
@@ -2406,6 +2421,10 @@ async fn open_wayland_stream(
         ),
         "Wayland open refused"
     );
-    tracing::info!(elapsed_ms = started.elapsed().as_millis(), "desktop open acknowledged");
-    crate::wayland::open(transport, stream, started).await
+    tracing::info!(
+        desktop_id = id,
+        elapsed_ms = started.elapsed().as_millis(),
+        "desktop open acknowledged"
+    );
+    crate::wayland::open(transport, stream, started, id).await
 }

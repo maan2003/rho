@@ -32,6 +32,8 @@ impl gpui::Yuv444Data for VideoData {
     }
 }
 pub struct Viewer {
+    pub started_at: Instant,
+    pub desktop_id: u64,
     pub images: watch::Receiver<Option<Arc<Image>>>,
     pub errors: watch::Receiver<Option<String>>,
     pub input: mpsc::Sender<Input>,
@@ -53,6 +55,7 @@ pub(crate) async fn open(
     transport: rho_rpc::media::Session,
     stream: rho_rpc::Stream,
     started: Instant,
+    desktop_id: u64,
 ) -> Result<Viewer> {
     let (mut reader, mut writer) = stream.into_split();
     let origin = rho_desktop_media::media::origin();
@@ -70,12 +73,18 @@ pub(crate) async fn open(
     let decoded = images.clone();
     // Decode off GPUI and Tokio IO workers. GPUI samples the retained YUV planes.
     let decode_task = tokio::task::spawn_blocking(move || -> Result<()> {
+        tracing::info!(
+            desktop_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "desktop decoder task started"
+        );
         let mut decoder = Decoder::new()?;
         let mut first = true;
         while let Some(packet) = decode.blocking_recv() {
             if let Some(frame) = decoder.decode_planes(&packet)? {
                 if first {
                     tracing::info!(
+                        desktop_id,
                         elapsed_ms = started.elapsed().as_millis(),
                         "desktop first frame decoded"
                     );
@@ -114,6 +123,7 @@ pub(crate) async fn open(
                 }
             }
             tracing::info!(
+                desktop_id,
                 elapsed_ms = started.elapsed().as_millis(),
                 "desktop video announced"
             );
@@ -121,6 +131,7 @@ pub(crate) async fn open(
             let track = broadcast.track("video")?;
             let mut subscription = track.subscribe(None).await?.ordered();
             tracing::info!(
+                desktop_id,
                 elapsed_ms = started.elapsed().as_millis(),
                 "desktop video subscribed"
             );
@@ -128,6 +139,7 @@ pub(crate) async fn open(
             let mut sample = Instant::now();
             let mut baseline: Option<i128> = None;
             let clock = Instant::now();
+            let mut first_packet = true;
 
             while let Some(mut group) = subscription.next_group().await? {
                 // Every group begins with a keyframe, which resets references
@@ -147,6 +159,15 @@ pub(crate) async fn open(
                     .await;
                     let lag = match frame {
                         Ok(Some(frame)) => {
+                            if first_packet {
+                                tracing::info!(
+                                    desktop_id,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    bytes = frame.payload.len(),
+                                    "desktop first packet received"
+                                );
+                                first_packet = false;
+                            }
                             let offset = clock.elapsed().as_micros() as i128
                                 - frame.timestamp.as_micros() as i128;
                             let base = baseline.get_or_insert(offset);
@@ -232,6 +253,8 @@ pub(crate) async fn open(
         }
     });
     Ok(Viewer {
+        started_at: started,
+        desktop_id,
         images: receive,
         errors: error_receive,
         input,

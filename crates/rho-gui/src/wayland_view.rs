@@ -20,6 +20,7 @@ pub struct WaylandView {
     bounds: Rc<Cell<Bounds<Pixels>>>,
     focus: FocusHandle,
     error: Option<String>,
+    first_paint: Rc<Cell<bool>>,
     _updates: Task<()>,
     _activation: Subscription,
 }
@@ -29,6 +30,13 @@ impl WaylandView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let started = viewer.started_at;
+        let desktop_id = viewer.desktop_id;
+        tracing::info!(
+            desktop_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "desktop viewer attached to GUI"
+        );
         let mut images = viewer.images.clone();
         let mut errors = viewer.errors.clone();
         let updates = cx.spawn(async move |this, cx| {
@@ -49,6 +57,13 @@ impl WaylandView {
                 if this
                     .update(cx, |this, cx| {
                         if let Some(image) = image {
+                            if this.image.is_none() {
+                                tracing::info!(
+                                    desktop_id,
+                                    elapsed_ms = started.elapsed().as_millis(),
+                                    "desktop first frame delivered to GUI"
+                                );
+                            }
                             if this.frozen.is_none() {
                                 this.size = (image.width, image.height);
                             }
@@ -73,6 +88,7 @@ impl WaylandView {
             }
         });
         Self {
+            first_paint: Rc::new(Cell::new(true)),
             _activation: activation,
             viewer,
             image: None,
@@ -182,6 +198,9 @@ impl WaylandView {
 impl Render for WaylandView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.frozen.clone().or_else(|| self.image.clone());
+        let first_paint = self.first_paint.clone();
+        let started = self.viewer.started_at;
+        let desktop_id = self.viewer.desktop_id;
         let strokes = self.strokes.clone();
         let size = self.size;
         let bounds = self.bounds.clone();
@@ -205,6 +224,22 @@ impl Render for WaylandView {
                 if let Some(image) = image {
                     #[cfg(target_os = "linux")]
                     window.paint_video(bounds, image.render.clone());
+                    if first_paint.replace(false) {
+                        tracing::info!(
+                            desktop_id,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "desktop first frame paint queued"
+                        );
+                        // A paint callback only queues primitives. This next-frame
+                        // marker also exposes stalls in rendering/presentation.
+                        window.on_next_frame(move |_, _| {
+                            tracing::info!(
+                                desktop_id,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "desktop frame callback after first paint"
+                            );
+                        });
+                    }
                 }
                 let map = |(x, y): (u32, u32)| {
                     bounds.origin
