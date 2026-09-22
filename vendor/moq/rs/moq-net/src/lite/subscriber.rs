@@ -3564,3 +3564,42 @@ impl<S: crate::transport::poll::Session> kio::Task for FetchServeRun<S> {
 		}
 	}
 }
+
+/// Receive one out-of-band agreed lite-05 GROUP stream (subscription id zero).
+/// Each stream must start at the group head; cancellation aborts partial groups.
+pub async fn receive_fixed_group<R: crate::transport::poll::RecvStream>(
+	stream: R,
+	track: track::Producer,
+	timescale: Timescale,
+) -> Result<(), Error> {
+	let mut reader = Reader::new(stream, Version::Lite05);
+	if reader.decode::<lite::DataType>().await? != lite::DataType::Group {
+		return Err(Error::Cancel);
+	}
+	let header = reader.decode::<lite::Group>().await?;
+	if header.subscribe != 0 || header.frame_start != 0 {
+		return Err(Error::Cancel);
+	}
+	let mut group = crate::recv::Group::new(track.create_group(group::Info {
+		sequence: header.sequence,
+	})?);
+	// Fixed tracks always carry wire timestamps; the legacy receive clock is unused.
+	let mut ingest = FrameIngest::new(crate::time::Clock::new(std::time::Instant::now()), Some(timescale));
+	let result = kio::wait(|waiter| {
+		if let Poll::Ready(err) = track.poll_closed(waiter) {
+			return Poll::Ready(Err(err));
+		}
+		if let Poll::Ready(err) = group.poll_closed(waiter) {
+			return Poll::Ready(Err(err));
+		}
+		ingest.poll(&mut reader, &mut group, waiter)
+	})
+	.await;
+	match result {
+		Ok(()) => group.finish(),
+		Err(err) => {
+			let _ = group.abort(err.clone());
+			Err(err)
+		}
+	}
+}

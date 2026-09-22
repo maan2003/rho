@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_HEADER: u64 = 65536;
 pub const MAX_DIMENSION: u32 = 4096;
 pub const SOCKET_ENV: &str = "RHO_DESKTOP_SOCKET";
@@ -77,7 +77,7 @@ mod tests {
             r#"{"type":"capture","output":"headless-1"}"#
         );
         assert_eq!(
-            serde_json::from_str::<Request>(r#"{"type":"hello","version":2}"#).unwrap(),
+            serde_json::from_str::<Request>(r#"{"type":"hello","version":3}"#).unwrap(),
             Request::Hello { version: VERSION }
         );
     }

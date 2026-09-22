@@ -4356,7 +4356,7 @@ mod tests {
 }
 
 /// Authenticate before reading even the media-open request. No video capture
-/// exists until the remote subscribes to the track.
+/// exists until the authenticated desktop-open requests the fixed video track.
 async fn serve_wayland<R, W>(
     services: Arc<Services>,
     transport: rho_rpc::media::Session,
@@ -4388,6 +4388,20 @@ where
             };
             let desktop = rho_desktop_proto::local::Desktop::open(&socket).await?;
             let mut control = desktop.control;
+            // Desktop-open itself requests a fresh keyframe, including late joins
+            // to a static desktop whose cached keyframe has expired.
+            anyhow::ensure!(
+                matches!(
+                    rho_desktop_proto::local::request(
+                        &mut control,
+                        Request::Input {
+                            input: Input::Quality { bitrate: 2_000_000, keyframe: true },
+                        },
+                    ).await?,
+                    Response::Done
+                ),
+                "unexpected desktop quality reply"
+            );
             let from_gui = async {
                 loop {
                     let (input, _) =
@@ -4412,12 +4426,10 @@ where
                 let local = rho_desktop_media::media::SessionGuard(
                     rho_desktop_media::media::local_client(desktop.media, origin.clone()).await?,
                 );
-                let remote = rho_desktop_media::media::SessionGuard(
-                    rho_desktop_media::media::publish(transport, &origin).await?,
-                );
+                let remote = rho_desktop_media::media::publish(transport, &origin).await?;
                 tokio::select! {
                     error=local.0.closed()=>anyhow::bail!("desktop media closed: {error}"),
-                    _=remote.0.closed()=>Ok::<(),anyhow::Error>(()),
+                    _=remote.closed()=>Ok::<(),anyhow::Error>(()),
                 }
             };
             tokio::select! {result=from_gui=>result,result=media=>result}
