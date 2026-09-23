@@ -1454,9 +1454,6 @@ async fn run(
             ServerMessage::Pong
             | ServerMessage::ClaudeAccounts { .. }
             | ServerMessage::VisualizationRecorded { .. }
-            | ServerMessage::LandLeaseQueued { .. }
-            | ServerMessage::LandLeaseGranted { .. }
-            | ServerMessage::LandStatus { .. }
             | ServerMessage::PlatformStatus { .. }
             | ServerMessage::IrohApproved { .. }
             | ServerMessage::IrohRevoked { .. }

@@ -176,19 +176,6 @@ pub enum ClientMessage {
         name: String,
         enabled: bool,
     },
-    AcquireLandLease {
-        repo: Utf8PathBuf,
-        agent_id: Option<AgentId>,
-    },
-    LandStatus {
-        repo: Utf8PathBuf,
-        agent_id: Option<AgentId>,
-        status: LandStatus,
-    },
-    ReleaseLandLease {
-        repo: Utf8PathBuf,
-        agent_id: Option<AgentId>,
-    },
     /// Install platform secrets into the daemon's RAM-only store.
     PlatformSecretsSet {
         secrets: Vec<(String, String)>,
@@ -449,23 +436,6 @@ pub enum JoinTarget {
     User { repo: Utf8PathBuf },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum LandStatus {
-    Queued,
-    Preparing,
-    Checking,
-    Publishing,
-    Landed,
-    Bounced,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct LandLeaseHolder {
-    pub pid: Option<u32>,
-    pub uid: u32,
-    pub gid: u32,
-}
-
 /// Message sent from the rho daemon to a UI client.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
@@ -496,18 +466,6 @@ pub enum ServerMessage {
     },
     TurnCancelled {
         agent_id: AgentId,
-    },
-    LandLeaseQueued {
-        repo: Utf8PathBuf,
-        holder: Option<LandLeaseHolder>,
-    },
-    LandLeaseGranted {
-        repo: Utf8PathBuf,
-    },
-    LandStatus {
-        repo: Utf8PathBuf,
-        agent_id: Option<AgentId>,
-        status: LandStatus,
     },
     /// Reply to [`ClientMessage::Snapshot`]: where the copy is, in a
     /// directory of its own beside the database.

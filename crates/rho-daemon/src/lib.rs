@@ -16,13 +16,12 @@ use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
-    ClientMessage, ContentPart, JoinTarget, LandLeaseHolder, LandStatus, Place, QuotaPoint,
-    QuotaSeries, QuotaSummary, ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame,
-    write_frame,
+    ClientMessage, ContentPart, JoinTarget, Place, QuotaPoint, QuotaSeries, QuotaSummary,
+    ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
 
 pub mod debug;
 mod realtime;
@@ -690,15 +689,9 @@ async fn run_iroh_listener(
                                 .context("set iroh interactive stream priority")?;
                         }
                         let writer = rho_rpc::Writer::new(send);
-                        let result = serve_connection_io(
-                            services,
-                            iroh_auth,
-                            recv,
-                            writer,
-                            None,
-                            Some(first),
-                        )
-                        .await;
+                        let result =
+                            serve_connection_io(services, iroh_auth, recv, writer, Some(first))
+                                .await;
                         if control {
                             control_claimed.store(false, Ordering::Release);
                         }
@@ -892,9 +885,6 @@ struct Services {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
-    land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
-    land_statuses: Mutex<HashMap<Utf8PathBuf, (Option<AgentId>, LandStatus)>>,
     /// Stateless PR, CI, review, and comment operations.
     pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Sealed platform secret store used by Octo.
@@ -936,9 +926,6 @@ impl Services {
             visualizations,
             inference,
             machine_seed,
-            land_locks: Mutex::new(HashMap::new()),
-            land_holders: Mutex::new(HashMap::new()),
-            land_statuses: Mutex::new(HashMap::new()),
             pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
@@ -969,39 +956,6 @@ impl Services {
             machine_seed: self.machine_seed,
             agent_counter: read.last_agent_counter(),
         }
-    }
-
-    async fn land_lock(&self, repo: Utf8PathBuf) -> Arc<TokioMutex<()>> {
-        let mut locks = self.land_locks.lock().await;
-        Arc::clone(
-            locks
-                .entry(repo)
-                .or_insert_with(|| Arc::new(TokioMutex::new(()))),
-        )
-    }
-
-    async fn land_holder(&self, repo: &Utf8PathBuf) -> Option<LandLeaseHolder> {
-        self.land_holders.lock().await.get(repo).cloned()
-    }
-
-    async fn set_land_holder(&self, repo: Utf8PathBuf, holder: LandLeaseHolder) {
-        self.land_holders.lock().await.insert(repo, holder);
-    }
-
-    async fn clear_land_holder(&self, repo: &Utf8PathBuf) {
-        self.land_holders.lock().await.remove(repo);
-    }
-
-    async fn set_land_status(
-        &self,
-        repo: Utf8PathBuf,
-        agent_id: Option<AgentId>,
-        status: LandStatus,
-    ) {
-        self.land_statuses
-            .lock()
-            .await
-            .insert(repo, (agent_id, status));
     }
 
     /// `mode` is the agent's own: how it sees the filesystem around the
@@ -1114,14 +1068,9 @@ async fn serve_connection(
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     connection: ServerConnection,
 ) -> anyhow::Result<()> {
-    let land_holder = connection.peer_cred().ok().map(|cred| LandLeaseHolder {
-        pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
-        uid: cred.uid(),
-        gid: cred.gid(),
-    });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
-    serve_connection_io(services, iroh_auth, reader, writer, land_holder, None).await
+    serve_connection_io(services, iroh_auth, reader, writer, None).await
 }
 
 /// One UI protocol session over any framed byte stream (Unix socket or an
@@ -1131,7 +1080,6 @@ async fn serve_connection_io<R, W>(
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     reader: R,
     writer: W,
-    land_holder: Option<LandLeaseHolder>,
     first: Option<ClientMessage>,
 ) -> anyhow::Result<()>
 where
@@ -1373,7 +1321,6 @@ where
         })
     });
 
-    let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
     let mut first = Some(first);
     let result = loop {
         let message = match first.take() {
@@ -1383,31 +1330,12 @@ where
                     .await
                 {
                     Ok(Some(message)) => message,
-                    Ok(None) => {
-                        for (repo, _) in &land_leases {
-                            services.clear_land_holder(repo).await;
-                        }
-                        break Ok(());
-                    }
-                    Err(error) => {
-                        for (repo, _) in &land_leases {
-                            services.clear_land_holder(repo).await;
-                        }
-                        break Err(error);
-                    }
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
                 }
             }
         };
-        match handle_message(
-            &services,
-            iroh_auth.as_ref(),
-            &outgoing_tx,
-            &mut land_leases,
-            land_holder.clone(),
-            message,
-        )
-        .await
-        {
+        match handle_message(&services, iroh_auth.as_ref(), &outgoing_tx, message).await {
             Ok(Refresh::Ready) => {
                 // Registry changes show on every client (GUI rails and a
                 // waiting CLI), so the refreshed snapshot goes through
@@ -2097,8 +2025,6 @@ async fn handle_message(
     services: &Arc<Services>,
     iroh_auth: Option<&rho_iroh_auth::IrohAuth>,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
-    land_holder: Option<LandLeaseHolder>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -2350,54 +2276,6 @@ async fn handle_message(
                     .await?;
             }
             Ok(Refresh::Ready)
-        }
-        ClientMessage::AcquireLandLease { repo, agent_id } => {
-            let lock = services.land_lock(repo.clone()).await;
-            let lease = match lock.clone().try_lock_owned() {
-                Ok(lease) => lease,
-                Err(_) => {
-                    services
-                        .set_land_status(repo.clone(), agent_id, LandStatus::Queued)
-                        .await;
-                    let holder = services.land_holder(&repo).await;
-                    let _ = outgoing_tx.send(ServerMessage::LandLeaseQueued {
-                        repo: repo.clone(),
-                        holder,
-                    });
-                    lock.lock_owned().await
-                }
-            };
-            if let Some(holder) = land_holder {
-                services.set_land_holder(repo.clone(), holder).await;
-            }
-            land_leases.push((repo.clone(), lease));
-            let _ = outgoing_tx.send(ServerMessage::LandLeaseGranted { repo });
-            Ok(Refresh::None)
-        }
-        ClientMessage::LandStatus {
-            repo,
-            agent_id,
-            status,
-        } => {
-            services
-                .set_land_status(repo.clone(), agent_id, status.clone())
-                .await;
-            let _ = services.events.send(ServerMessage::LandStatus {
-                repo,
-                agent_id,
-                status,
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::ReleaseLandLease { repo, agent_id: _ } => {
-            if let Some(index) = land_leases
-                .iter()
-                .position(|(leased_repo, _)| *leased_repo == repo)
-            {
-                land_leases.swap_remove(index);
-                services.clear_land_holder(&repo).await;
-            }
-            Ok(Refresh::None)
         }
         // Only valid as a stream's first frame (`serve_agents`).
         ClientMessage::AgentsOpen => {
