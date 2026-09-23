@@ -262,7 +262,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoDraft > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
-        KeyBinding::new("ctrl-s", FileSave, Some("RhoDiffView")),
         // Preserve Vim's normal-mode Ctrl-V (visual block). Clipboard paste
         // is intercepted only while editing a prompt.
         KeyBinding::new(

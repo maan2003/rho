@@ -7,7 +7,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
-use camino::Utf8PathBuf;
 use futures::channel::mpsc as futures_mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, Task};
@@ -319,55 +318,6 @@ async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
     dialer.open(Some(50)).await
 }
 
-async fn dial_diff_snapshot(
-    dialer: ChannelDialer,
-    workspace: WorkspaceInfo,
-    known_commit_id: Option<String>,
-    include_paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<Option<rho_agent_host_proto::WorkspaceDiffSnapshot>> {
-    let mut stream = dial_bulk_stream(dialer).await?;
-    write_frame(
-        &mut stream,
-        &ClientMessage::DiffSnapshot {
-            workspace,
-            known_commit_id,
-            include_paths,
-        },
-    )
-    .await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::DiffSnapshot { snapshot } => Ok(Some(snapshot)),
-        ServerMessage::DiffUnchanged { .. } => Ok(None),
-        ServerMessage::DiffRefused { reason } => anyhow::bail!("{reason}"),
-        _ => anyhow::bail!("unexpected reply to DiffSnapshot"),
-    }
-}
-
-async fn dial_diff_base_contents(
-    dialer: ChannelDialer,
-    workspace: WorkspaceInfo,
-    operation_id: String,
-    commit_id: String,
-    paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<Vec<rho_agent_host_proto::WorkspaceDiffBaseContent>> {
-    let mut stream = dial_bulk_stream(dialer).await?;
-    write_frame(
-        &mut stream,
-        &ClientMessage::DiffBaseContents {
-            workspace,
-            operation_id,
-            commit_id,
-            paths,
-        },
-    )
-    .await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::DiffBaseContents { contents } => Ok(contents),
-        ServerMessage::DiffRefused { reason } => anyhow::bail!("{reason}"),
-        _ => anyhow::bail!("unexpected reply to DiffBaseContents"),
-    }
-}
-
 async fn dial_visualization(
     dialer: ChannelDialer,
     id: String,
@@ -631,50 +581,6 @@ impl VisualizationClient {
     }
 }
 
-#[derive(Clone)]
-pub struct DiffClient {
-    dialer: Arc<Mutex<Option<ChannelDialer>>>,
-}
-
-impl DiffClient {
-    pub fn snapshot(
-        &self,
-        workspace: WorkspaceInfo,
-        known_commit_id: Option<String>,
-        include_paths: Vec<Utf8PathBuf>,
-        cx: &App,
-    ) -> Task<anyhow::Result<Option<rho_agent_host_proto::WorkspaceDiffSnapshot>>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_diff_snapshot(dialer, workspace, known_commit_id, include_paths).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("diff snapshot task failed: {error}"))?
-        })
-    }
-
-    pub fn base_contents(
-        &self,
-        workspace: WorkspaceInfo,
-        operation_id: String,
-        commit_id: String,
-        paths: Vec<Utf8PathBuf>,
-        cx: &App,
-    ) -> Task<anyhow::Result<Vec<rho_agent_host_proto::WorkspaceDiffBaseContent>>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_diff_base_contents(dialer, workspace, operation_id, commit_id, paths).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("diff contents task failed: {error}"))?
-        })
-    }
-}
-
 impl Connection {
     pub fn open_wayland_task(
         &self,
@@ -799,11 +705,6 @@ impl Connection {
         }
     }
 
-    pub fn diff_client(&self) -> DiffClient {
-        DiffClient {
-            dialer: self.dialer.clone(),
-        }
-    }
     pub fn send(&self, message: ClientMessage) {
         self.commands().send(message);
     }
@@ -1461,10 +1362,6 @@ async fn run(
             | ServerMessage::TerminalList { .. }
             | ServerMessage::ShellOpened
             | ServerMessage::ShellAttachRefused { .. }
-            | ServerMessage::DiffSnapshot { .. }
-            | ServerMessage::DiffBaseContents { .. }
-            | ServerMessage::DiffUnchanged { .. }
-            | ServerMessage::DiffRefused { .. }
             | ServerMessage::GuiTelemetryStored { .. }
             | ServerMessage::GuiTelemetryRefused { .. }
             | ServerMessage::RealtimeOpened { .. }

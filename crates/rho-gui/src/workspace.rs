@@ -16,7 +16,6 @@ mod phone;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
@@ -146,7 +145,6 @@ pub(crate) enum SurfaceView {
         model: Entity<rho_shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
     },
-    Diff(Entity<rho_files::DiffView>),
     Terminal(Entity<rho_terminal::TerminalView>),
     Browser(Entity<rho_browser::PageView>),
     SlackList(Entity<rho_slack::ui::ListView>),
@@ -169,7 +167,6 @@ impl SurfaceView {
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
             Self::Shell { .. } => SurfaceKind::Shell,
-            Self::Diff(_) => SurfaceKind::Diff,
             Self::Terminal(_) => SurfaceKind::Terminal,
             Self::Browser(_) => SurfaceKind::Browser,
             Self::SlackList(_) => SurfaceKind::SlackList,
@@ -406,13 +403,12 @@ pub struct Workspace {
     models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by daemon-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
-    /// Artifact surfaces hold the strong references; when the last file/diff
+    /// Artifact surfaces hold the strong references; when the last file
     /// closes, the remote channel and cache entry naturally expire.
     remote_projects: HashMap<
         (HostId, rho_agent_host_proto::WorkspaceInfo),
         gpui::WeakEntity<rho_files::RemoteProjectState>,
     >,
-    pending_diff_loads: HashMap<AgentId, Task<()>>,
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
@@ -1013,7 +1009,6 @@ impl Workspace {
             selection: Selection::default(),
             models: HashMap::new(),
             remote_projects: HashMap::new(),
-            pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
             model: model_commands,
             draft_model,
@@ -1223,7 +1218,6 @@ impl Workspace {
             self.transcripts.forget(agent_id);
             self.models.remove(&agent_id);
             self.pending_syncs.remove(&agent_id);
-            self.pending_diff_loads.remove(&agent_id);
         }
         self.note_followed();
         self.forget_contexts(|context| !contexts.contains(context));
@@ -3608,25 +3602,6 @@ impl Workspace {
         self.refresh_dashboard(cx);
     }
 
-    pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.subject_agent_or_notice("diff", window, cx) else {
-            return;
-        };
-        if !self.require_agent_online(agent_id, cx) {
-            return;
-        }
-        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
-            self.notice_on(
-                None,
-                "diff: agent has no workspace",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        self.open_diff_surface(agent_id, workspace, cx);
-    }
-
     pub(crate) fn cmd_version(&mut self, cx: &mut Context<Self>) {
         self.notice_on(None, env!("CARGO_PKG_VERSION"), StyleClass::SystemInfo, cx);
     }
@@ -4381,9 +4356,6 @@ impl Workspace {
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_display_label(*agent_id))
             }
-            SurfaceKey::Diff { agent_id } => {
-                format!("changes {}", self.registry.agent_display_label(*agent_id))
-            }
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
@@ -4417,7 +4389,6 @@ impl Workspace {
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
-            SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
             SurfaceKey::Browser(_) => "browser",
             SurfaceKey::SlackList => "slack list",
@@ -4527,9 +4498,6 @@ impl Workspace {
             SurfaceKey::Shell(agent_id) => SurfaceIdentity::Shell {
                 agent_id: agent_id.into(),
             },
-            SurfaceKey::Diff { agent_id } => SurfaceIdentity::Diff {
-                agent_id: agent_id.into(),
-            },
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
@@ -4615,10 +4583,6 @@ impl Workspace {
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
                 SurfaceView::File(view) => {
-                    let editor = view.read(cx).editor().clone();
-                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
-                }
-                SurfaceView::Diff(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
@@ -4922,101 +4886,6 @@ impl Workspace {
         self.remote_projects
             .insert((host, workspace), opened.state.downgrade());
         opened
-    }
-
-    /// Persists the agent's working-copy snapshot, then projects its
-    /// parent-side manifest over the workspace's shared live buffers.
-    /// Reopening refreshes the existing shared model.
-    fn open_diff_surface(
-        &mut self,
-        agent_id: AgentId,
-        workspace: rho_agent_host_proto::WorkspaceInfo,
-        cx: &mut Context<Self>,
-    ) {
-        let key = SurfaceKey::Diff { agent_id };
-        if let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() {
-            if let SurfaceView::Diff(view) = &surface.view {
-                view.update(cx, |view, cx| {
-                    view.model().update(cx, |model, cx| model.refresh_now(cx));
-                });
-            }
-            self.display_surface(surface, cx);
-            cx.notify();
-            return;
-        }
-
-        let Some(host) = self.host_of(agent_id) else {
-            return;
-        };
-        let Some(diff_client) = self.connection_for(agent_id).map(Connection::diff_client) else {
-            return;
-        };
-        let cached = self.cached_remote_project(host, &workspace);
-        let project_task = cached.is_none().then(|| {
-            let connection = self.connection_for(agent_id).expect("host still attached");
-            rho_files::open_remote_project(connection, workspace.clone(), cx)
-        });
-        let task = cx.spawn(async move |this, cx| {
-            let result: anyhow::Result<(RemoteProject, rho_files::PreparedDiff)> = async {
-                let opened = match cached {
-                    Some(project) => project,
-                    None => project_task
-                        .expect("missing project task")
-                        .await
-                        .context("project dial task failed")?,
-                };
-                let project = this
-                    .update(cx, |this, _| {
-                        this.cache_remote_project(host, workspace.clone(), opened)
-                    })
-                    .map_err(|_| anyhow::anyhow!("GUI closed while loading diff"))?;
-                let live_paths = cx.update(|cx| rho_files::dirty_paths(&project, cx));
-                let snapshot_task = cx.update(|cx| {
-                    diff_client.snapshot(workspace.clone(), None, live_paths.clone(), cx)
-                });
-                let snapshot = snapshot_task
-                    .await?
-                    .context("initial diff snapshot unexpectedly unchanged")?;
-                let prepared = rho_files::PreparedDiff::load(
-                    &project,
-                    &diff_client,
-                    workspace.clone(),
-                    snapshot,
-                    live_paths,
-                    None,
-                    cx,
-                )
-                .await?;
-                Ok((project, prepared))
-            }
-            .await;
-
-            match result {
-                Ok((project, prepared)) => {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        let model = cx.new(|cx| {
-                            rho_files::DiffModel::new(project, diff_client, workspace, prepared, cx)
-                        });
-                        let view = cx.new(|cx| rho_files::DiffView::new(model, window, cx));
-                        let surface = Self::wrap_surface(key, SurfaceView::Diff(view));
-                        this.display_surface(surface, cx);
-                        this.focus_active_surface(window, cx);
-                        cx.notify();
-                    });
-                }
-                Err(error) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.notice_on(
-                            None,
-                            &format!("diff failed: {error:#}"),
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    });
-                }
-            }
-        });
-        self.pending_diff_loads.insert(agent_id, task);
     }
 
     /// `:term`: dials a dedicated terminal stream for the agent (attaching
@@ -6026,7 +5895,6 @@ impl Workspace {
             SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
             SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
-            | SurfaceKey::Diff { agent_id }
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => self.dashboard.agent_card_id(*agent_id),
             SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
@@ -6251,7 +6119,6 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
-            SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self.chrome_editor(),
             SurfaceView::Browser(_) => self.chrome_editor(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
@@ -6304,7 +6171,6 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
-            SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
             SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
             SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
@@ -6322,7 +6188,6 @@ impl Workspace {
             SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
-            | SurfaceKey::Diff { agent_id }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
             SurfaceKey::Draft
             | SurfaceKey::Home
@@ -6409,9 +6274,6 @@ impl Workspace {
             SurfaceKey::Shell(_) => {
                 unreachable!("shell surfaces are created by open_shell_surface")
             }
-            SurfaceKey::Diff { .. } => {
-                unreachable!("diff surfaces are created by open_diff_surface")
-            }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
             }
@@ -6455,10 +6317,6 @@ impl Workspace {
                 Some(agent_id)
             }
             SurfaceKey::Browser(_) => None,
-            SurfaceKey::Diff { agent_id } => {
-                self.selection.select_agent(agent_id);
-                Some(agent_id)
-            }
             SurfaceKey::Draft => {
                 self.selection.enter_draft();
                 None
@@ -7005,7 +6863,6 @@ impl Workspace {
             Command::Wayland => self.open_desktop(window, cx),
             Command::Shell => self.cmd_shell(window, cx),
             Command::ShellClose => self.cmd_shell_close(window, cx),
-            Command::Changes => self.cmd_diff(window, cx),
             Command::Terminal => self.cmd_term(false, window, cx),
             Command::NewTerminal => self.cmd_term(true, window, cx),
             Command::UndoVerdict => window.dispatch_action(Box::new(crate::UndoVerdict), cx),
@@ -8906,7 +8763,6 @@ impl Workspace {
             let focused_surface = self.active_surface().view.telemetry_kind();
             crate::telemetry::record_surfaces(focused_surface, focused_surface.bit());
         }
-        self.sync_diff_visibility(true, cx);
         let sidebar = if self.active_context == ContextId::Slack
             && !matches!(self.active_surface().view, SurfaceView::SlackList(_))
         {
@@ -8939,35 +8795,6 @@ impl Workspace {
     fn dashboard_mode(&self, _window: &Window, cx: &App) -> bool {
         let dashboard = self.dashboard.focus_handle(cx);
         self.overlay_focus.target() == Some(&dashboard)
-    }
-
-    /// Hidden surfaces stay alive as editor buffers, but they must not turn
-    /// worktree events into manifest traffic. Only the visible diff may
-    /// refresh.
-    fn sync_diff_visibility(&self, surface_visible: bool, cx: &mut Context<Self>) {
-        let visible = if surface_visible {
-            match &self.active_surface().view {
-                SurfaceView::Diff(view) => HashSet::from([view.read(cx).model().entity_id()]),
-                _ => HashSet::new(),
-            }
-        } else {
-            HashSet::new()
-        };
-        let models = self
-            .surfaces
-            .values()
-            .flatten()
-            .filter_map(|surface| match &surface.view {
-                SurfaceView::Diff(view) => Some(view.read(cx).model()),
-                _ => None,
-            })
-            .fold(HashMap::new(), |mut models, model| {
-                models.entry(model.entity_id()).or_insert(model);
-                models
-            });
-        for (id, model) in models {
-            model.update(cx, |model, cx| model.set_visible(visible.contains(&id), cx));
-        }
     }
 
     fn render_surface(&self, surface: &Surface) -> gpui::AnyElement {
@@ -9050,12 +8877,6 @@ impl Workspace {
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
-                .into_any_element(),
-            SurfaceView::Diff(view) => div()
-                .id("rho-surface-diff")
-                .size_full()
-                .overflow_hidden()
-                .child(view.clone())
                 .into_any_element(),
             SurfaceView::Terminal(view) => div()
                 .id("rho-surface-terminal")

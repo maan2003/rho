@@ -27,7 +27,6 @@ pub(crate) enum SurfaceKind {
     Transcript,
     File,
     Shell,
-    Diff,
     Terminal,
     Browser,
     SlackList,
@@ -50,7 +49,6 @@ impl SurfaceKind {
             Self::Transcript => "transcript",
             Self::File => "file",
             Self::Shell => "shell",
-            Self::Diff => "diff",
             Self::Terminal => "terminal",
             Self::Browser => "browser",
             Self::SlackList => "slack_list",
@@ -63,13 +61,12 @@ impl SurfaceKind {
     }
 }
 
-const SURFACE_KINDS: [SurfaceKind; 14] = [
+const SURFACE_KINDS: [SurfaceKind; 13] = [
     SurfaceKind::Dashboard,
     SurfaceKind::Draft,
     SurfaceKind::Transcript,
     SurfaceKind::File,
     SurfaceKind::Shell,
-    SurfaceKind::Diff,
     SurfaceKind::Terminal,
     SurfaceKind::Browser,
     SurfaceKind::SlackList,

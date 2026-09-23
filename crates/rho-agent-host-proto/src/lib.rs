@@ -35,9 +35,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/14";
+pub const IROH_ALPN: &[u8] = b"rho/ui/15";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP13";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP15";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,18 +375,6 @@ pub enum ClientMessage {
         request_id: u64,
         agent: String,
     },
-    /// One-shot request on a fresh stream for a persistent diff snapshot and
-    /// parent-side diff manifest. Current-side text remains in Zed buffers.
-    /// The daemon replies with
-    /// [`ServerMessage::DiffSnapshot`] or [`ServerMessage::DiffRefused`] and
-    /// closes the stream.
-    DiffSnapshot {
-        workspace: WorkspaceInfo,
-        known_commit_id: Option<String>,
-        /// Dirty Zed buffers whose paths may not yet exist in the daemon's disk
-        /// snapshot. The daemon supplies their immutable parent side.
-        include_paths: Vec<Utf8PathBuf>,
-    },
     /// One-shot request on a fresh stream. The daemon persists this bounded,
     /// client-produced performance snapshot under its state directory.
     GuiTelemetryUpload {
@@ -421,15 +409,6 @@ pub enum ClientMessage {
     /// requested artifact, if it exists, then closes the stream.
     VisualizationGet {
         id: String,
-    },
-    /// Loads parent-side contents from the immutable operation returned by
-    /// [`ClientMessage::DiffSnapshot`]. Replies are bounded and never
-    /// snapshot the live working copy.
-    DiffBaseContents {
-        workspace: WorkspaceInfo,
-        operation_id: String,
-        commit_id: String,
-        paths: Vec<Utf8PathBuf>,
     },
     /// Attach one live application over MoQ streams on this connection.
     WaylandOpen {
@@ -722,15 +701,6 @@ pub enum ServerMessage {
     ShellAttachRefused {
         reason: String,
     },
-    DiffSnapshot {
-        snapshot: WorkspaceDiffSnapshot,
-    },
-    DiffUnchanged {
-        commit_id: String,
-    },
-    DiffRefused {
-        reason: String,
-    },
     GuiTelemetryStored {
         path: String,
     },
@@ -767,9 +737,6 @@ pub enum ServerMessage {
     },
     VisualizationRefused {
         reason: String,
-    },
-    DiffBaseContents {
-        contents: Vec<WorkspaceDiffBaseContent>,
     },
     WaylandOpened,
     DesktopSessions {
@@ -1477,55 +1444,6 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(message, decoded);
-    }
-
-    #[test]
-    fn diff_manifest_messages_round_trip() {
-        let workspace = WorkspaceInfo::UserCheckout {
-            repo: Utf8PathBuf::from("/repo"),
-        };
-        let request = ClientMessage::DiffSnapshot {
-            workspace,
-            known_commit_id: Some("known".to_owned()),
-            include_paths: vec![Utf8PathBuf::from("src/live.rs")],
-        };
-        let bytes = senax_encoder::pack(&request).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(request, decoded);
-
-        let request = ClientMessage::DiffBaseContents {
-            workspace: WorkspaceInfo::UserCheckout {
-                repo: Utf8PathBuf::from("/repo"),
-            },
-            operation_id: "operation".to_owned(),
-            commit_id: "commit".to_owned(),
-            paths: vec![Utf8PathBuf::from("src/lib.rs")],
-        };
-        let bytes = senax_encoder::pack(&request).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(request, decoded);
-
-        let response = ServerMessage::DiffSnapshot {
-            snapshot: WorkspaceDiffSnapshot {
-                operation_id: "operation".to_owned(),
-                commit_id: "commit".to_owned(),
-                files: vec![WorkspaceDiffFile {
-                    path: Utf8PathBuf::from("src/lib.rs"),
-                    status: WorkspaceDiffStatus::Modified,
-                    base: WorkspaceDiffContent::Deferred,
-                    target: WorkspaceDiffTarget::Text { bytes: 3 },
-                    base_executable: Some(false),
-                    target_executable: Some(false),
-                }],
-                truncated: false,
-            },
-        };
-        let bytes = senax_encoder::pack(&response).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(response, decoded);
     }
 
     #[test]

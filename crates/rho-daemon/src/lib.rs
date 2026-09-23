@@ -649,7 +649,6 @@ async fn run_iroh_listener(
                             &first,
                             ClientMessage::ChannelOpen { .. }
                                 | ClientMessage::RealtimeOpen { .. }
-                                | ClientMessage::DiffSnapshot { .. }
                                 | ClientMessage::GuiTelemetryUpload { .. }
                                 | ClientMessage::VisualizationGet { .. }
                                 | ClientMessage::WaylandOpen { .. }
@@ -1190,32 +1189,6 @@ where
     }
     if let ClientMessage::RealtimeOpen { offer_sdp } = first {
         return realtime::serve(services, reader, writer, offer_sdp).await;
-    }
-    if let ClientMessage::DiffSnapshot {
-        workspace,
-        known_commit_id,
-        include_paths,
-    } = first
-    {
-        return serve_diff_snapshot(services, writer, workspace, known_commit_id, include_paths)
-            .await;
-    }
-    if let ClientMessage::DiffBaseContents {
-        workspace,
-        operation_id,
-        commit_id,
-        paths,
-    } = first
-    {
-        return serve_diff_base_contents(
-            services,
-            writer,
-            workspace,
-            operation_id,
-            commit_id,
-            paths,
-        )
-        .await;
     }
     if let ClientMessage::GuiTelemetryUpload { snapshot } = first {
         return serve_gui_telemetry_upload(writer, snapshot).await;
@@ -2737,9 +2710,7 @@ async fn handle_message(
         ClientMessage::RealtimeOpen { .. } => {
             anyhow::bail!("RealtimeOpen must be the first frame on a dedicated stream")
         }
-        ClientMessage::DiffSnapshot { .. }
-        | ClientMessage::DiffBaseContents { .. }
-        | ClientMessage::GuiTelemetryUpload { .. }
+        ClientMessage::GuiTelemetryUpload { .. }
         | ClientMessage::VisualizationGet { .. }
         | ClientMessage::WaylandOpen { .. }
         | ClientMessage::TerminalCreate { .. }
@@ -2875,46 +2846,6 @@ fn rho_pager_program() -> std::ffi::OsString {
     "rho-pager".into()
 }
 
-/// Loads one bounded parent-content batch from an already immutable diff
-/// operation. This intentionally does not snapshot the working copy.
-async fn serve_diff_base_contents<W>(
-    services: Arc<Services>,
-    mut writer: W,
-    workspace: WorkspaceInfo,
-    operation_id: String,
-    commit_id: String,
-    paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let (workset, checkout) = open_checkout(&services, &workspace).await?;
-        workset
-            .diff_base_contents(&checkout, &operation_id, &commit_id, &paths)
-            .await
-    })
-    .await
-    .context("deferred diff content timed out after 30 seconds")
-    .and_then(|result| result);
-    match result {
-        Ok(contents) => {
-            write_frame(&mut writer, &ServerMessage::DiffBaseContents { contents }).await
-        }
-        Err(error) => {
-            write_frame(
-                &mut writer,
-                &ServerMessage::DiffRefused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await
-        }
-    }
-}
-
 async fn serve_gui_telemetry_upload<W>(mut writer: W, snapshot: Vec<u8>) -> anyhow::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -2983,55 +2914,6 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
         }
     }
     anyhow::bail!("could not allocate a unique GUI telemetry filename")
-}
-
-/// Serves one working-copy diff snapshot and its bounded parent-side
-/// manifest on a dedicated stream, avoiding control-session head-of-line
-/// blocking. (Taking the snapshot itself is a TODO in `rho-fs-view`.)
-async fn serve_diff_snapshot<W>(
-    services: Arc<Services>,
-    mut writer: W,
-    workspace: WorkspaceInfo,
-    known_commit_id: Option<String>,
-    include_paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let (workset, checkout) = open_checkout(&services, &workspace).await?;
-        workset
-            .diff_snapshot(&checkout, known_commit_id.as_deref(), &include_paths)
-            .await
-    })
-    .await
-    .context("diff snapshot timed out after 30 seconds")
-    .and_then(|result| result);
-    match result {
-        Ok(Some(snapshot)) => {
-            write_frame(&mut writer, &ServerMessage::DiffSnapshot { snapshot }).await
-        }
-        Ok(None) => {
-            write_frame(
-                &mut writer,
-                &ServerMessage::DiffUnchanged {
-                    commit_id: known_commit_id.unwrap_or_default(),
-                },
-            )
-            .await
-        }
-        Err(error) => {
-            write_frame(
-                &mut writer,
-                &ServerMessage::DiffRefused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await
-        }
-    }
 }
 
 /// How a terminal stream's first frame opens its terminal.
@@ -4391,9 +4273,13 @@ where
                     rho_desktop_proto::local::request(
                         &mut control,
                         Request::Input {
-                            input: Input::Quality { bitrate: 2_000_000, keyframe: true },
+                            input: Input::Quality {
+                                bitrate: 2_000_000,
+                                keyframe: true
+                            },
                         },
-                    ).await?,
+                    )
+                    .await?,
                     Response::Done
                 ),
                 "unexpected desktop quality reply"

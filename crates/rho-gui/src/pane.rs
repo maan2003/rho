@@ -46,9 +46,6 @@ pub enum SurfaceKey {
         path: Utf8PathBuf,
     },
     Shell(AgentId),
-    Diff {
-        agent_id: AgentId,
-    },
     Terminal {
         agent_id: AgentId,
         terminal_id: u64,

@@ -53,10 +53,7 @@ pub fn git_dir() -> PathBuf {
         .and_then(|git| git.parent().map(Path::to_owned))
         .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
 }
-pub use rho_agent_host_proto::{
-    Place, WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
-    WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
-};
+pub use rho_agent_host_proto::{Place, WorksetMode, WorkspaceInfo};
 pub use rho_git_server::Refresh as StoreRefresh;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
@@ -579,35 +576,6 @@ impl Workset {
             command.arg(rev);
         }
         run(command, &format!("check out {rev}")).await
-    }
-
-    /// A live diff of the checkout containing `checkout` against its base.
-    ///
-    /// TODO: not ported to git yet.
-    pub async fn diff_snapshot(
-        &self,
-        checkout: &Utf8Path,
-        _known_commit_id: Option<&str>,
-        _include_paths: &[Utf8PathBuf],
-    ) -> anyhow::Result<Option<WorkspaceDiffSnapshot>> {
-        let (checkout, is_git) = resolve_workdir_root(checkout.as_std_path())?;
-        anyhow::ensure!(is_git, "diff view requires a git repository: {checkout}");
-        anyhow::bail!("the diff view is not available yet for git checkouts")
-    }
-
-    /// Base-side contents for paths of an earlier diff snapshot.
-    ///
-    /// TODO: not ported to git yet.
-    pub async fn diff_base_contents(
-        &self,
-        checkout: &Utf8Path,
-        _operation_id: &str,
-        _commit_id: &str,
-        _paths: &[Utf8PathBuf],
-    ) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
-        let (checkout, is_git) = resolve_workdir_root(checkout.as_std_path())?;
-        anyhow::ensure!(is_git, "diff view requires a git repository: {checkout}");
-        anyhow::bail!("the diff view is not available yet for git checkouts")
     }
 
     /// Clones `remote_url` into `<root>/<name>` from the mirror store,

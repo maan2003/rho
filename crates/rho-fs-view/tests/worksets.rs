@@ -137,14 +137,6 @@ async fn worksets_clone_through_the_mirror_store() {
     assert!(second_workset.checkout(&second, "nope").await.is_err());
     assert!(second_workset.checkout(&second, "--orphan").await.is_err());
 
-    // The diff view is not ported yet; it fails rather than lies.
-    assert!(
-        second_workset
-            .diff_snapshot(&second, None, &[])
-            .await
-            .is_err()
-    );
-
     // Discard removes the directory and nothing else; it is idempotent.
     let first_id = first_workset.id().to_owned();
     let first_root = first_workset.root().to_owned();

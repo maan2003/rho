@@ -269,6 +269,8 @@ pub enum SurfaceIdentity {
     Shell {
         agent_id: AgentIdentity,
     },
+    /// Retired: the diff view is gone and nothing writes these; they
+    /// stay so journals already on disk still decode.
     Diff {
         agent_id: AgentIdentity,
     },
