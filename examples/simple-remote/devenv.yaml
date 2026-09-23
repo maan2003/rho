@@ -1,0 +1,6 @@
+inputs:
+  simple:
+    url: github:cachix/devenv
+    flake: false
+imports:
+  - simple/examples/simple

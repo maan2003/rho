@@ -1,0 +1,10 @@
+[alias]
+xtask = "run --package xtask --"
+
+[build]
+# Allow using tracing's experimental support for Valuable
+rustflags = ["--cfg", "tracing_unstable"]
+
+[env]
+# Run tests single-threaded to avoid Boehm GC race conditions in nix-bindings FFI
+RUST_TEST_THREADS = "1"

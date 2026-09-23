@@ -1,0 +1,38 @@
+[package]
+name = "devenv-activity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Activity tracking system for devenv"
+
+[dependencies]
+arc-swap.workspace = true
+# Tracing integration
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"] }
+
+# Async runtime (for channels)
+tokio = { workspace = true, features = ["sync"] }
+
+# Serialization
+humantime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+strum.workspace = true
+valuable.workspace = true
+
+# Re-export macros
+devenv-activity-macros.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+valuable-serde.workspace = true
+
+[features]
+default = []
+# Exports `test_helpers` module with `ActivityEvent` builders used by
+# downstream test suites (devenv, devenv-tui). Always on under `cfg(test)`.
+test-helpers = []

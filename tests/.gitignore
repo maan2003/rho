@@ -1,0 +1,13 @@
+# devenv
+devenv.lock
+devenv.local.*
+
+# Nix
+flake.lock
+
+# Python
+poetry.lock
+uv.lock
+
+# Ruby
+Gemfile.lock

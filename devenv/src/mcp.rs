@@ -1,0 +1,910 @@
+#![allow(dead_code)]
+
+use crate::devenv::{Devenv, DevenvOptions};
+use devenv_activity::{Activity, activity};
+use devenv_core::BuildOptions;
+use miette::{Result, miette};
+use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::transport::streamable_http_server::StreamableHttpService;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt, tool, tool_router};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
+
+#[derive(Clone)]
+struct DevenvMcpServer {
+    options: DevenvOptions,
+    shutdown: Arc<tokio_shutdown::Shutdown>,
+    cache: Arc<RwLock<McpCache>>,
+    tool_router: ToolRouter<Self>,
+    /// Path to the native process manager API socket, if available.
+    process_socket_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Default)]
+struct McpCache {
+    packages: Option<Vec<PackageInfo>>,
+    options: Option<Vec<OptionInfo>>,
+}
+
+impl DevenvMcpServer {
+    fn new(options: DevenvOptions, shutdown: Arc<tokio_shutdown::Shutdown>) -> Self {
+        let process_socket_path = Self::compute_socket_path(&options);
+        Self {
+            options,
+            shutdown,
+            cache: Arc::new(RwLock::new(McpCache::default())),
+            tool_router: Self::tool_router(),
+            process_socket_path,
+        }
+    }
+
+    /// Compute the native process manager socket path from options.
+    fn compute_socket_path(options: &DevenvOptions) -> Option<std::path::PathBuf> {
+        let devenv_dotfile = options.resolve_dotfile()?;
+        Some(devenv_processes::native_socket_path(&devenv_dotfile))
+    }
+
+    /// Send an API request to the native process manager.
+    async fn process_api_request(
+        &self,
+        request: &devenv_processes::ApiRequest,
+    ) -> Result<devenv_processes::ApiResponse, String> {
+        let socket_path = self
+            .process_socket_path
+            .as_ref()
+            .ok_or_else(|| "Could not determine process socket path".to_string())?;
+
+        devenv_processes::NativeManagerClient::api_request(socket_path, request)
+            .await
+            .map_err(|e| {
+                if socket_path.exists() {
+                    format!("Failed to communicate with process manager: {}", e)
+                } else {
+                    "No native process manager running. Start processes with 'devenv up -d' first."
+                        .to_string()
+                }
+            })
+    }
+
+    /// Send a process API request and format the response as JSON.
+    /// The `on_success` closure extracts the value from a successful (non-error) response.
+    async fn process_request_json<F>(
+        &self,
+        request: &devenv_processes::ApiRequest,
+        on_success: F,
+    ) -> String
+    where
+        F: FnOnce(devenv_processes::ApiResponse) -> Option<Value>,
+    {
+        match self.process_api_request(request).await {
+            Ok(devenv_processes::ApiResponse::Error { message }) => {
+                serde_json::to_string(&serde_json::json!({"error": message})).unwrap_or_default()
+            }
+            Ok(resp) => match on_success(resp) {
+                Some(value) => serde_json::to_string(&value).unwrap_or_default(),
+                None => serde_json::to_string(&serde_json::json!({"error": "unexpected response"}))
+                    .unwrap_or_default(),
+            },
+            Err(e) => serde_json::to_string(&serde_json::json!({"error": e})).unwrap_or_default(),
+        }
+    }
+
+    async fn initialize(&self) -> Result<()> {
+        info!("Initializing MCP server cache...");
+
+        let devenv = Devenv::new(self.options.clone(), self.shutdown.clone()).await?;
+
+        // Fetch and cache packages
+        {
+            let _activity = activity!(INFO, operation, "Caching packages");
+            match self.fetch_packages_with_devenv(&devenv).await {
+                Ok(packages) => {
+                    let mut cache = self.cache.write().await;
+                    cache.packages = Some(packages);
+                    info!("Successfully cached packages");
+                }
+                Err(e) => {
+                    warn!("Failed to fetch packages during initialization: {}", e);
+                }
+            }
+        }
+
+        // Fetch and cache options
+        {
+            let _activity = activity!(INFO, operation, "Caching options");
+            match self.fetch_options_with_devenv(&devenv).await {
+                Ok(options) => {
+                    let mut cache = self.cache.write().await;
+                    cache.options = Some(options);
+                    info!("Successfully cached options");
+                }
+                Err(e) => {
+                    warn!("Failed to fetch options during initialization: {}", e);
+                }
+            }
+        }
+
+        info!("MCP server initialization completed successfully");
+        Ok(())
+    }
+
+    async fn fetch_packages_with_devenv(&self, devenv: &Devenv) -> Result<Vec<PackageInfo>> {
+        info!("Fetching available packages from nixpkgs...");
+
+        let search_results = devenv
+            .cnix()
+            .ok_or_else(|| miette!("search requires the C-Nix backend"))?
+            .search(".*", None)
+            .await?;
+
+        let packages: Vec<PackageInfo> = search_results
+            .into_iter()
+            .map(|(key, value)| {
+                // Format package name like in devenv.rs search function
+                let parts: Vec<&str> = key.split('.').collect();
+                let name = if parts.len() > 2 {
+                    format!("pkgs.{}", parts[2..].join("."))
+                } else {
+                    format!("pkgs.{key}")
+                };
+
+                PackageInfo {
+                    name,
+                    version: value.version,
+                    description: Some(value.description),
+                }
+            })
+            .collect();
+
+        Ok(packages)
+    }
+
+    async fn fetch_options_with_devenv(&self, devenv: &Devenv) -> Result<Vec<OptionInfo>> {
+        info!("Fetching available configuration options...");
+
+        let options_paths = devenv
+            .backend()
+            .build_devenv(&["optionsJSON"], BuildOptions::default())
+            .await?;
+
+        let options_json_path = options_paths[0]
+            .as_path()
+            .join("share")
+            .join("doc")
+            .join("nixos")
+            .join("options.json");
+
+        let options_content = tokio::fs::read_to_string(&options_json_path)
+            .await
+            .map_err(|e| miette!("Failed to read options.json: {}", e))?;
+
+        #[derive(Deserialize)]
+        struct OptionResults(BTreeMap<String, OptionResult>);
+
+        #[derive(Deserialize)]
+        struct OptionResult {
+            #[serde(rename = "type")]
+            type_: String,
+            default: Option<String>,
+            description: String,
+        }
+
+        let options_json: OptionResults = serde_json::from_str(&options_content)
+            .map_err(|e| miette!("Failed to parse options.json: {}", e))?;
+
+        let options: Vec<OptionInfo> = options_json
+            .0
+            .into_iter()
+            .map(|(name, value)| OptionInfo {
+                name,
+                value: parse_type_to_value(&value.type_),
+                description: Some(value.description),
+                default: value.default.map(|d| parse_default_value(&d, &value.type_)),
+            })
+            .collect();
+
+        Ok(options)
+    }
+}
+
+fn parse_type_to_value(type_str: &str) -> Value {
+    match type_str {
+        "bool" => Value::Bool(false),
+        "int" => Value::Number(serde_json::Number::from(0)),
+        "string" => Value::String("".to_string()),
+        "list" => Value::Array(vec![]),
+        "attrs" => Value::Object(serde_json::Map::new()),
+        "package" => Value::String("".to_string()),
+        _ => Value::Null,
+    }
+}
+
+fn parse_default_value(default_str: &str, type_str: &str) -> Value {
+    // The default values in options.json are Nix expressions as strings
+    // We need to parse them appropriately based on the type
+    match type_str {
+        "bool" => Value::Bool(default_str == "true"),
+        "int" => default_str
+            .parse::<i64>()
+            .ok()
+            .map(|n| Value::Number(n.into()))
+            .unwrap_or(Value::String(default_str.to_string())),
+        "string" => {
+            // Nix strings are often wrapped in quotes, remove them if present
+            let trimmed = default_str.trim();
+            if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+                Value::String(trimmed[1..trimmed.len() - 1].to_string())
+            } else {
+                Value::String(default_str.to_string())
+            }
+        }
+        "list" => {
+            // Try to parse as JSON array, otherwise return as string
+            serde_json::from_str(default_str).unwrap_or(Value::String(default_str.to_string()))
+        }
+        "attrs" => {
+            // Try to parse as JSON object, otherwise return as string
+            serde_json::from_str(default_str).unwrap_or(Value::String(default_str.to_string()))
+        }
+        _ => Value::String(default_str.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PackageInfo {
+    name: String,
+    version: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OptionInfo {
+    name: String,
+    value: Value,
+    description: Option<String>,
+    default: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchPackagesRequest {
+    #[schemars(description = "Search term to filter packages by name or description")]
+    query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProcessNameRequest {
+    #[schemars(description = "Name of the process")]
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProcessLogsRequest {
+    #[schemars(description = "Name of the process")]
+    name: String,
+    #[schemars(description = "Number of lines to return (default 100)")]
+    lines: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchOptionsRequest {
+    #[schemars(
+        description = "Search string to filter options by name or description (e.g., 'python' or 'languages.python')"
+    )]
+    query: String,
+}
+
+impl ServerHandler for DevenvMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Devenv MCP server - provides access to devenv packages and configuration options. Process-compose logs are available in $DEVENV_STATE/process-compose/process-compose.log")
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListToolsResult {
+            meta: None,
+            tools: self.tool_router.list_all(),
+            next_cursor: None,
+        }))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool_context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_context).await
+    }
+}
+
+#[tool_router]
+impl DevenvMcpServer {
+    #[tool(description = "Search available packages in devenv")]
+    async fn search_packages(&self, params: Parameters<SearchPackagesRequest>) -> String {
+        let request = params.0;
+
+        // Always use cached data
+        let cache = self.cache.read().await;
+        let packages = cache.packages.as_ref().cloned().unwrap_or_else(|| {
+            warn!("No cached packages available");
+            vec![]
+        });
+
+        // Filter packages based on search term
+        let search_lower = request.query.to_lowercase();
+        let filtered_packages: Vec<PackageInfo> = packages
+            .into_iter()
+            .filter(|p| {
+                p.name.to_lowercase().contains(&search_lower)
+                    || p.description
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains(&search_lower))
+            })
+            .collect();
+
+        serde_json::to_string(&filtered_packages).unwrap_or_default()
+    }
+
+    #[tool(description = "Search available configuration options")]
+    async fn search_options(&self, params: Parameters<SearchOptionsRequest>) -> String {
+        let request = params.0;
+
+        // Always use cached data
+        let cache = self.cache.read().await;
+        let options = cache.options.as_ref().cloned().unwrap_or_else(|| {
+            warn!("No cached options available");
+            vec![]
+        });
+
+        // Filter options based on search string (searches in both name and description)
+        let search_lower = request.query.to_lowercase();
+        let filtered_options: Vec<OptionInfo> = options
+            .into_iter()
+            .filter(|o| {
+                o.name.to_lowercase().contains(&search_lower)
+                    || o.description
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains(&search_lower))
+            })
+            .collect();
+
+        serde_json::to_string(&filtered_options).unwrap_or_default()
+    }
+
+    #[tool(description = "List all managed processes and their status")]
+    async fn list_processes(&self) -> String {
+        use devenv_processes::{ApiRequest, ApiResponse};
+        self.process_request_json(&ApiRequest::List, |resp| match resp {
+            ApiResponse::ProcessList { processes } => serde_json::to_value(&processes).ok(),
+            _ => None,
+        })
+        .await
+    }
+
+    #[tool(description = "Get the status of a specific process")]
+    async fn get_process_status(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::{ApiRequest, ApiResponse};
+        self.process_request_json(
+            &ApiRequest::Status {
+                name: params.0.name,
+            },
+            |resp| match resp {
+                ApiResponse::ProcessDetail { info } => serde_json::to_value(&info).ok(),
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Get stdout and stderr logs for a process")]
+    async fn get_process_logs(&self, params: Parameters<ProcessLogsRequest>) -> String {
+        use devenv_processes::{ApiRequest, ApiResponse};
+        self.process_request_json(
+            &ApiRequest::Logs {
+                name: params.0.name,
+                lines: params.0.lines,
+            },
+            |resp| match resp {
+                ApiResponse::ProcessLogs { stdout, stderr } => {
+                    Some(serde_json::json!({"stdout": stdout, "stderr": stderr}))
+                }
+                _ => None,
+            },
+        )
+        .await
+    }
+
+    #[tool(description = "Restart a running process")]
+    async fn restart_process(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::ApiRequest;
+        self.process_request_json(
+            &ApiRequest::Restart {
+                name: params.0.name,
+            },
+            ok_response,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Start a process, honoring its dependencies (works for processes with auto start disabled)"
+    )]
+    async fn start_process(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::ApiRequest;
+        self.process_request_json(
+            &ApiRequest::Start {
+                names: vec![params.0.name],
+            },
+            start_response,
+        )
+        .await
+    }
+
+    #[tool(description = "Stop a running process")]
+    async fn stop_process(&self, params: Parameters<ProcessNameRequest>) -> String {
+        use devenv_processes::ApiRequest;
+        self.process_request_json(
+            &ApiRequest::Stop {
+                name: params.0.name,
+            },
+            ok_response,
+        )
+        .await
+    }
+}
+
+/// Shared success extractor for process action responses (restart, stop).
+fn ok_response(resp: devenv_processes::ApiResponse) -> Option<Value> {
+    match resp {
+        devenv_processes::ApiResponse::Ok => Some(serde_json::json!({"status": "ok"})),
+        _ => None,
+    }
+}
+
+/// Success extractor for the scheduler-driven start: surface the truthful
+/// per-name classification instead of a bare ok.
+fn start_response(resp: devenv_processes::ApiResponse) -> Option<Value> {
+    match resp {
+        devenv_processes::ApiResponse::Start { outcome } => Some(serde_json::json!({
+            "scheduled": outcome.scheduled,
+            "skipped": outcome.skipped,
+            "unknown": outcome.unknown,
+            "failed": outcome.failed,
+        })),
+        _ => None,
+    }
+}
+
+/// Stdin as an `AsyncRead` fed by a dedicated reader thread.
+///
+/// `tokio::io::stdin()` reads on the runtime's blocking pool, and a blocking
+/// read of stdin cannot be cancelled: dropping the runtime would then wait
+/// until the next byte or EOF arrives. Reading on a detached thread keeps
+/// runtime shutdown independent of stdin; the thread stays parked in `read`
+/// until the process exits.
+struct ThreadedStdin {
+    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl ThreadedStdin {
+    fn spawn() -> std::io::Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        std::thread::Builder::new()
+            .name("mcp-stdin".into())
+            .spawn(move || {
+                use std::io::Read;
+                let mut stdin = std::io::stdin();
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            warn!(error = %e, "stdin read error");
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+        })
+    }
+}
+
+impl tokio::io::AsyncRead for ThreadedStdin {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.pos >= this.chunk.len() {
+            match this.rx.poll_recv(cx) {
+                std::task::Poll::Ready(Some(chunk)) => {
+                    this.chunk = chunk;
+                    this.pos = 0;
+                }
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        let n = buf.remaining().min(this.chunk.len() - this.pos);
+        buf.put_slice(&this.chunk[this.pos..this.pos + n]);
+        this.pos += n;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+pub async fn run_mcp_server(
+    options: DevenvOptions,
+    shutdown: Arc<tokio_shutdown::Shutdown>,
+    http_port: Option<u16>,
+) -> Result<()> {
+    info!("Starting devenv MCP server");
+
+    let server = DevenvMcpServer::new(options, shutdown.clone());
+
+    // Initialize cache in background thread (Nix FFI futures are not Send)
+    // Server starts immediately, tools return empty results until cache is ready
+    // Activities from the background thread are sent to TUI via global channel
+    let init_server = server.clone();
+    let init_handle = std::thread::Builder::new()
+        .name("mcp-cache-init".into())
+        .stack_size(devenv_nix_backend::NIX_STACK_SIZE)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for MCP cache");
+            rt.block_on(async move {
+                if let Err(e) = init_server.initialize().await {
+                    warn!("Failed to initialize MCP cache: {}", e);
+                }
+            });
+        })
+        .map_err(|e| miette!("Failed to spawn MCP cache init thread: {}", e))?;
+
+    // Errors are held until the init thread is joined, so no path detaches it.
+    let serve_result: Result<()> = async {
+        match http_port {
+            Some(port) => {
+                info!("Starting MCP server in HTTP mode on port {}", port);
+
+                let service = StreamableHttpService::new(
+                    move || Ok(server.clone()),
+                    LocalSessionManager::default().into(),
+                    Default::default(),
+                );
+
+                let router = axum::Router::new().fallback_service(service);
+                let addr = format!("0.0.0.0:{}", port);
+                let tcp_listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .map_err(|e| miette!("Failed to bind to {}: {}", addr, e))?;
+
+                info!("MCP server ready at http://{}/", addr);
+
+                // Show TUI progress for HTTP server
+                let _activity = devenv_activity::start!(
+                    Activity::operation("Running MCP server")
+                        .detail(format!("http://0.0.0.0:{}/", port))
+                );
+
+                // Signals (SIGTERM/SIGINT/SIGHUP) arrive as a cancellation of
+                // the CLI-wide shutdown token, not as raw signals here.
+                let shutdown_token = shutdown.cancellation_token();
+                axum::serve(tcp_listener, router)
+                    .with_graceful_shutdown(async move {
+                        shutdown_token.cancelled().await;
+                    })
+                    .await
+                    .map_err(|e| miette!("HTTP server error: {}", e))?;
+            }
+            None => {
+                info!("Starting MCP server in stdio mode");
+
+                // `serve` blocks reading the initialize handshake and
+                // `waiting` blocks until the client closes stdin, so both
+                // must race the CLI-wide shutdown (SIGTERM/SIGINT/SIGHUP)
+                // or a signalled process never exits. Dropping the service
+                // cancels its task via its drop guard.
+                let shutdown_token = shutdown.cancellation_token();
+                let stdin = ThreadedStdin::spawn()
+                    .map_err(|e| miette!("Failed to spawn stdin reader thread: {}", e))?;
+                let serve_and_wait = async {
+                    let service = server
+                        .serve((stdin, tokio::io::stdout()))
+                        .await
+                        .map_err(|e| miette!("Failed to start MCP server: {}", e))?;
+                    service
+                        .waiting()
+                        .await
+                        .map_err(|e| miette!("MCP server error: {}", e))?;
+                    Ok::<_, miette::Report>(())
+                };
+                tokio::select! {
+                    result = serve_and_wait => result?,
+                    _ = shutdown_token.cancelled() => {
+                        info!("Shutdown requested, stopping MCP server");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    devenv_nix_backend::trigger_interrupt();
+
+    let init_result = tokio::task::spawn_blocking(move || init_handle.join())
+        .await
+        .map_err(|e| miette!("Failed to join MCP cache init thread: {}", e))?;
+
+    serve_result?;
+    init_result.map_err(|e| miette!("MCP cache init thread panicked: {:?}", e))?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[cfg(feature = "test-mcp")]
+    use devenv_nix_backend_macros::nix_test;
+
+    #[cfg(feature = "test-mcp")]
+    async fn create_test_devenv_dir() -> std::io::Result<tempfile::TempDir> {
+        let temp_dir = tempfile::tempdir()?;
+
+        // Create minimal devenv.yaml with just nixpkgs input
+        let devenv_yaml = r#"inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable"#;
+
+        // Create minimal devenv.nix that enables the tests to work
+        let devenv_nix = r#"{ pkgs, ... }: {
+  # Minimal configuration for testing
+  packages = [ pkgs.git ];
+}"#;
+
+        tokio::fs::write(temp_dir.path().join("devenv.yaml"), devenv_yaml).await?;
+        tokio::fs::write(temp_dir.path().join("devenv.nix"), devenv_nix).await?;
+
+        Ok(temp_dir)
+    }
+
+    #[test]
+    fn test_package_info_serialization() {
+        let package = PackageInfo {
+            name: "nodejs".to_string(),
+            version: "latest".to_string(),
+            description: Some("JavaScript runtime".to_string()),
+        };
+
+        let json = serde_json::to_value(&package).unwrap();
+        assert_eq!(json["name"], "nodejs");
+        assert_eq!(json["version"], "latest");
+        assert_eq!(json["description"], "JavaScript runtime");
+    }
+
+    #[test]
+    fn test_option_info_serialization() {
+        let option = OptionInfo {
+            name: "languages.python.enable".to_string(),
+            value: json!(false),
+            description: Some("Enable Python language support".to_string()),
+            default: Some(json!(false)),
+        };
+
+        let json = serde_json::to_value(&option).unwrap();
+        assert_eq!(json["name"], "languages.python.enable");
+        assert_eq!(json["value"], false);
+        assert_eq!(json["description"], "Enable Python language support");
+        assert_eq!(json["default"], false);
+    }
+
+    #[test]
+    fn test_parse_type_to_value() {
+        assert_eq!(parse_type_to_value("bool"), json!(false));
+        assert_eq!(parse_type_to_value("int"), json!(0));
+        assert_eq!(parse_type_to_value("string"), json!(""));
+        assert_eq!(parse_type_to_value("list"), json!([]));
+        assert_eq!(parse_type_to_value("attrs"), json!({}));
+        assert_eq!(parse_type_to_value("package"), json!(""));
+        assert_eq!(parse_type_to_value("unknown"), json!(null));
+    }
+
+    #[tokio::test]
+    async fn test_search_packages_request_deserialization() {
+        let json = json!({
+            "query": "python"
+        });
+
+        let request: SearchPackagesRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.query, "python".to_string());
+    }
+
+    #[tokio::test]
+    async fn test_search_options_request_deserialization() {
+        let json = json!({
+            "query": "languages"
+        });
+
+        let request: SearchOptionsRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(request.query, "languages".to_string());
+    }
+
+    // Integration tests that use live Nix data
+    // Note: These tests require:
+    // 1. A working Nix installation
+    // 2. Being run from a devenv project root (with devenv.nix) for options test
+    // 3. Network access to fetch packages
+
+    #[nix_test]
+    #[cfg(feature = "test-mcp")]
+    #[cfg(not(target_os = "linux"))] // Disabled on Linux due to segfaults
+    async fn test_fetch_packages_live() {
+        use crate::devenv::{Devenv, DevenvOptions};
+
+        // Create temporary directory with test devenv configuration
+        let temp_dir = create_test_devenv_dir().await.unwrap();
+
+        let devenv_root = Some(temp_dir.path().to_path_buf());
+        let options = DevenvOptions {
+            devenv_root,
+            ..Default::default()
+        };
+        let shutdown = tokio_shutdown::Shutdown::new();
+        let server = DevenvMcpServer::new(options.clone(), shutdown.clone());
+
+        let devenv = Devenv::new(options, shutdown).await.unwrap();
+
+        let packages = server.fetch_packages_with_devenv(&devenv).await;
+
+        // Should be able to fetch packages without error
+        assert!(packages.is_ok(), "Failed to fetch packages: {packages:?}");
+
+        let packages = packages.unwrap();
+
+        // Should have some packages
+        assert!(!packages.is_empty(), "No packages were fetched");
+
+        // Check that packages have the expected format
+        for package in packages.iter().take(5) {
+            assert!(
+                package.name.starts_with("pkgs."),
+                "Package name should start with 'pkgs.': {}",
+                package.name
+            );
+            assert!(
+                !package.version.is_empty(),
+                "Package version should not be empty"
+            );
+            assert!(
+                package.description.is_some(),
+                "Package should have a description"
+            );
+        }
+
+        // Check for specific package: cachix
+        let cachix_package = packages.iter().find(|p| p.name == "pkgs.cachix");
+        assert!(
+            cachix_package.is_some(),
+            "Expected to find 'pkgs.cachix' package in the list"
+        );
+
+        let cachix = cachix_package.unwrap();
+        assert!(
+            !cachix.version.is_empty(),
+            "Cachix package should have a version"
+        );
+        assert!(
+            cachix.description.is_some(),
+            "Cachix package should have a description"
+        );
+
+        println!("Successfully fetched {} packages", packages.len());
+        println!("Found cachix package: {} ({})", cachix.name, cachix.version);
+        println!("Sample packages:");
+        for package in packages.iter().take(5) {
+            println!("  - {} ({})", package.name, package.version);
+        }
+
+        // Temporary directory will be automatically cleaned up when dropped
+    }
+
+    #[nix_test]
+    #[cfg(feature = "test-mcp")]
+    #[cfg(not(target_os = "linux"))] // Disabled on Linux due to segfaults
+    async fn test_fetch_options_live() {
+        use crate::devenv::{Devenv, DevenvOptions};
+
+        // Create temporary directory with test devenv configuration
+        let temp_dir = create_test_devenv_dir().await.unwrap();
+
+        let devenv_root = Some(temp_dir.path().to_path_buf());
+        let options = DevenvOptions {
+            devenv_root,
+            ..Default::default()
+        };
+        let shutdown = tokio_shutdown::Shutdown::new();
+        let server = DevenvMcpServer::new(options.clone(), shutdown.clone());
+
+        let devenv = Devenv::new(options, shutdown).await.unwrap();
+
+        let options = server.fetch_options_with_devenv(&devenv).await;
+
+        match options {
+            Ok(options) => {
+                // Should have some options
+                assert!(!options.is_empty(), "No options were fetched");
+
+                // Check for some known devenv options
+                let known_options = vec![
+                    "languages.python.enable",
+                    "languages.rust.enable",
+                    "services.postgres.enable",
+                    "packages",
+                ];
+
+                for known_option in known_options {
+                    assert!(
+                        options.iter().any(|opt| opt.name == known_option),
+                        "Expected option '{known_option}' not found"
+                    );
+                }
+
+                // Check that options have proper structure
+                for option in options.iter().take(5) {
+                    assert!(!option.name.is_empty(), "Option name should not be empty");
+                    assert!(
+                        option.description.is_some(),
+                        "Option should have a description"
+                    );
+                }
+
+                println!("Successfully fetched {} options", options.len());
+                println!("Sample options:");
+                for option in options.iter().take(5) {
+                    println!("  - {}", option.name);
+                }
+            }
+            Err(e) => {
+                // Expected to fail in test environment
+                eprintln!("Expected failure in test environment: {e:?}");
+                eprintln!(
+                    "This test requires running from a devenv project root with proper setup"
+                );
+            }
+        }
+
+        // Temporary directory will be automatically cleaned up when dropped
+    }
+}

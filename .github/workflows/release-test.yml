@@ -1,0 +1,82 @@
+name: "Release Test"
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (tag or branch) to test'
+        required: true
+        default: 'main'
+        type: string
+
+concurrency:
+  group: "release-test-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.event.workflow_run.head_branch }}"
+  cancel-in-progress: true
+
+jobs:
+  status:
+    if: >-
+      github.event_name != 'workflow_dispatch' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Link Release Test to commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ github.event.workflow_run.head_sha }} \
+            -f state=pending \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f context="Release Test" \
+            -f description="Tests are running"
+
+  pipeline:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    name: pipeline (${{ matrix.system }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: aarch64-linux
+            runs-on: '["self-hosted", "linux", "ARM64"]'
+          - system: x86_64-linux
+            runs-on: '["self-hosted", "linux", "X64"]'
+          - system: aarch64-darwin
+            runs-on: '["self-hosted", "macOS", "ARM64"]'
+
+    uses: ./.github/workflows/per-system-pipeline.yml
+    secrets: inherit
+    with:
+      system: ${{ matrix.system }}
+      runs-on: ${{ matrix.runs-on }}
+      ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.event.workflow_run.head_sha }}
+
+  report:
+    if: >-
+      always() &&
+      github.event_name != 'workflow_dispatch' &&
+      github.event.workflow_run.conclusion == 'success'
+    needs: pipeline
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Update commit status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ needs.pipeline.result == 'success' && 'success' || 'failure' }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ github.event.workflow_run.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f context="Release Test" \
+            -f description="Tests $STATE"

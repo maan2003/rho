@@ -1,0 +1,1097 @@
+//! Activity event types for the devenv activity tracking system.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::Timestamp;
+
+/// All activity events - activity-first design
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "activity_kind", rename_all = "lowercase")]
+pub enum ActivityEvent {
+    Build(Build),
+    Fetch(Fetch),
+    Evaluate(Evaluate),
+    Task(Task),
+    Command(Command),
+    Process(Process),
+    Operation(Operation),
+    Message(Message),
+    /// Aggregate expected counts announcement from Nix
+    SetExpected(SetExpected),
+    Shell(Shell),
+}
+
+/// Expected count announcement for aggregate activity tracking.
+/// Nix emits these events to announce how many items/bytes are expected
+/// before individual activities start (e.g., "expect 10 downloads").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetExpected {
+    /// The category of activity this expectation applies to
+    pub category: ExpectedCategory,
+    /// The expected count (items for builds, bytes for downloads)
+    pub expected: u64,
+    pub timestamp: Timestamp,
+}
+
+/// Categories for expected count tracking
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpectedCategory {
+    /// Build activities (derivations to build)
+    Build,
+    /// Download activities (store paths to download, bytes to transfer)
+    Download,
+}
+
+/// Build activity events - has Phase, Progress, Log
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Build {
+    /// Build is queued, waiting for a build slot
+    Queued {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        derivation_path: Option<String>,
+        timestamp: Timestamp,
+    },
+    /// Build has started running
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        derivation_path: Option<String>,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Phase {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        phase: String,
+        timestamp: Timestamp,
+    },
+    Progress {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        done: u64,
+        expected: u64,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
+}
+
+/// Fetch activity events - has FetchKind, byte Progress
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Fetch {
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        kind: FetchKind,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Progress {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        current: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+        timestamp: Timestamp,
+    },
+}
+
+/// Type of fetch operation
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FetchKind {
+    /// Downloading store paths from substituter
+    Download,
+    /// Querying path info from cache
+    Query,
+    /// Fetching git trees/flake inputs
+    Tree,
+    /// Copying local sources to the store (e.g., flake inputs)
+    Copy,
+}
+
+impl FetchKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FetchKind::Download => "download",
+            FetchKind::Query => "query",
+            FetchKind::Tree => "tree",
+            FetchKind::Copy => "copy",
+        }
+    }
+}
+
+/// A filesystem or environment operation observed during Nix evaluation.
+///
+/// These operations are logged during evaluation and can be used for
+/// cache invalidation and dependency tracking.
+///
+/// Note: Duplicated in `devenv_core::eval_op::EvalOp`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvalOp {
+    /// Copied a file to the Nix store.
+    CopiedSource {
+        source: std::path::PathBuf,
+        target: std::path::PathBuf,
+    },
+    /// Filtered a source tree and copied it to the store.
+    FilteredSource {
+        source: std::path::PathBuf,
+        target: std::path::PathBuf,
+    },
+    /// Evaluated a Nix file.
+    EvaluatedFile {
+        source: std::path::PathBuf,
+        #[serde(default)]
+        cached: bool,
+    },
+    /// Read a file's contents with `builtins.readFile`.
+    ReadFile { source: std::path::PathBuf },
+    /// List a directory's contents with `builtins.readDir`.
+    ReadDir { source: std::path::PathBuf },
+    /// Read a file type with `builtins.readFileType`.
+    ReadFileType { source: std::path::PathBuf },
+    /// Hashed a file with `builtins.hashFile`.
+    HashFile {
+        source: std::path::PathBuf,
+        algorithm: String,
+    },
+    /// Read an environment variable with `builtins.getEnv`.
+    GetEnv { name: String },
+    /// Check that a file exists with `builtins.pathExists`.
+    PathExists { source: std::path::PathBuf },
+}
+
+impl fmt::Display for EvalOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvalOp::CopiedSource { source, target } => write!(
+                f,
+                "copied source '{}' -> '{}'",
+                source.display(),
+                target.display()
+            ),
+            EvalOp::FilteredSource { source, target } => write!(
+                f,
+                "filtered source '{}' -> '{}'",
+                source.display(),
+                target.display()
+            ),
+            EvalOp::EvaluatedFile { source, cached } => {
+                let cached = if *cached { " (cached)" } else { "" };
+                write!(f, "evaluating file '{}'{cached}", source.display())
+            }
+            EvalOp::ReadFile { source } => write!(f, "readFile: '{}'", source.display()),
+            EvalOp::ReadDir { source } => write!(f, "readDir: '{}'", source.display()),
+            EvalOp::ReadFileType { source } => {
+                write!(f, "readFileType: '{}'", source.display())
+            }
+            EvalOp::HashFile { source, algorithm } => {
+                write!(f, "hashFile ({algorithm}): '{}'", source.display())
+            }
+            EvalOp::GetEnv { name } => write!(f, "getEnv: '{}'", name),
+            EvalOp::PathExists { source } => {
+                write!(f, "pathExists: '{}'", source.display())
+            }
+        }
+    }
+}
+
+/// Evaluate activity events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Evaluate {
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        level: ActivityLevel,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    /// Plain text log line from evaluation.
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        timestamp: Timestamp,
+    },
+    /// Structured evaluation operation (parsed from log).
+    Op {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        op: EvalOp,
+        timestamp: Timestamp,
+    },
+}
+
+/// Information about a task in the hierarchy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub show_output: bool,
+    #[serde(default)]
+    pub is_process: bool,
+}
+
+/// Task activity events - has Progress, Log
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Task {
+    /// Emit task hierarchy once upfront before execution
+    Hierarchy {
+        /// All tasks with their metadata
+        tasks: Vec<TaskInfo>,
+        /// Edges representing parent-child relationships: (parent_id, child_id)
+        /// A task appears under its dependents (i.e., tasks that depend on it)
+        edges: Vec<(u64, u64)>,
+        timestamp: Timestamp,
+    },
+    /// Task execution has started
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Progress {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        done: u64,
+        expected: u64,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
+}
+
+/// Command activity events - has Log only
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Command {
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
+}
+
+/// A named port a process listens on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PortBinding {
+    /// The port's name in the process configuration (e.g. `http`).
+    pub name: String,
+    pub port: u16,
+}
+
+impl fmt::Display for PortBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.name, self.port)
+    }
+}
+
+/// How a managed process signals that it is ready.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ReadyProbe {
+    /// A command that exits 0 once the process is ready.
+    Exec,
+    /// An HTTP GET that succeeds once the process is ready.
+    ///
+    /// Boxed so that `Process::Start` stays within the activity event size bound.
+    Http(Box<HttpProbe>),
+    /// The process reports readiness over the systemd notify protocol.
+    Notify,
+}
+
+/// Target of an HTTP readiness probe.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct HttpProbe {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+impl fmt::Display for ReadyProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadyProbe::Exec => f.write_str("exec"),
+            ReadyProbe::Http(http) => {
+                write!(f, "http: {}:{}{}", http.host, http.port, http.path)
+            }
+            ReadyProbe::Notify => f.write_str("notify"),
+        }
+    }
+}
+
+/// Process activity events - for long-running managed processes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Process {
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        /// The command being executed
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// Ports this process listens on
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ports: Vec<PortBinding>,
+        /// URLs registered for this process by the localhost proxy.
+        /// Boxed to keep every activity event within its size bound.
+        #[allow(clippy::box_collection)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        urls: Box<Vec<String>>,
+        /// How the process signals readiness, if a probe is configured
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_probe: Option<ReadyProbe>,
+        #[serde(default)]
+        level: ActivityLevel,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
+    Status {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        status: ProcessStatus,
+        timestamp: Timestamp,
+    },
+    /// The process exited. The supervisor decides afterwards whether to
+    /// restart it, which shows up as a `Restarted` event or a terminal status.
+    Exited {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Whether the process exited with status 0.
+        success: bool,
+        timestamp: Timestamp,
+    },
+    /// The supervisor restarted the process.
+    Restarted {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Restart count since the process was first started.
+        attempt: u64,
+        timestamp: Timestamp,
+    },
+}
+
+/// Status of a managed process
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcessStatus {
+    /// Process has `start.enable = false`; not started yet but can be started later.
+    NotStarted,
+    /// Waiting for dependencies before starting.
+    Waiting,
+    /// Spawned; readiness probe has not yet passed.
+    Starting,
+    /// Running without a readiness probe configured.
+    Running,
+    /// Readiness probe passed.
+    Ready,
+    /// Stop + start cycle in progress.
+    Restarting,
+    /// Graceful shutdown in progress (SIGTERM sent, waiting for exit and port release).
+    Stopping,
+    /// Explicitly stopped by the user or manager.
+    Stopped,
+    /// Exited without another restart being scheduled.
+    Exited,
+    /// Exhausted its restart budget after repeated failures.
+    #[serde(rename = "gave_up")]
+    GaveUp,
+}
+
+impl ProcessStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Waiting => "waiting",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Ready => "ready",
+            Self::Restarting => "restarting",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Exited => "exited",
+            Self::GaveUp => "gave_up",
+        }
+    }
+
+    /// Whether the process is in an active (non-terminal, non-idle) state.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Waiting
+                | Self::Starting
+                | Self::Running
+                | Self::Ready
+                | Self::Restarting
+                | Self::Stopping
+        )
+    }
+
+    /// Whether the process can be stopped by the user.
+    pub fn is_stoppable(&self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Ready | Self::Restarting
+        )
+    }
+
+    /// Whether the process can be (re)started by the user.
+    pub fn is_restartable(&self) -> bool {
+        !matches!(self, Self::Waiting | Self::Stopping)
+    }
+
+    /// Whether the status is itself a terminal failure.
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::GaveUp)
+    }
+}
+
+/// Operation activity events - generic devenv operations with log support
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Operation {
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default)]
+        level: ActivityLevel,
+        timestamp: Timestamp,
+    },
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    Progress {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        done: u64,
+        expected: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        timestamp: Timestamp,
+    },
+    Log {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        line: String,
+        #[serde(default)]
+        is_error: bool,
+        timestamp: Timestamp,
+    },
+}
+
+/// Message - standalone (not an activity)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: u64,
+    pub level: ActivityLevel,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    pub timestamp: Timestamp,
+}
+
+/// Shell activity events - interactive shell with hot-reload capability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+pub enum Shell {
+    /// Shell session started
+    Start {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Shell command being run (None for interactive)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        /// Files being watched for changes
+        watch_files: Vec<String>,
+        timestamp: Timestamp,
+    },
+    /// Shell session ended
+    Complete {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        outcome: ActivityOutcome,
+        timestamp: Timestamp,
+    },
+    /// Output from the shell (PTY output)
+    Output {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Raw bytes from PTY (may contain ANSI escape codes)
+        data: Vec<u8>,
+        timestamp: Timestamp,
+    },
+    /// Shell is reloading due to file changes
+    Reloading {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Files that changed and triggered the reload
+        changed_files: Vec<String>,
+        timestamp: Timestamp,
+    },
+    /// Shell reload completed successfully
+    Reloaded {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Files that were changed
+        changed_files: Vec<String>,
+        timestamp: Timestamp,
+    },
+    /// Shell reload failed
+    ReloadFailed {
+        #[serde(alias = "activity_id")]
+        id: u64,
+        /// Files that triggered the reload
+        changed_files: Vec<String>,
+        /// Error message
+        error: String,
+        timestamp: Timestamp,
+    },
+}
+
+/// Outcome of an activity
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityOutcome {
+    #[default]
+    Success,
+    Failed,
+    Cancelled,
+    /// Task output was already cached
+    Cached,
+    /// Task had no command to run
+    Skipped,
+    /// Task's dependency failed
+    DependencyFailed,
+}
+
+impl ActivityOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActivityOutcome::Success => "success",
+            ActivityOutcome::Failed => "failed",
+            ActivityOutcome::Cancelled => "cancelled",
+            ActivityOutcome::Cached => "cached",
+            ActivityOutcome::Skipped => "skipped",
+            ActivityOutcome::DependencyFailed => "dependency_failed",
+        }
+    }
+
+    /// Human-friendly suffix for completion lines (empty for plain success).
+    pub fn display_suffix(&self) -> &'static str {
+        match self {
+            ActivityOutcome::Success => "",
+            ActivityOutcome::Cached => " (cached)",
+            ActivityOutcome::Skipped => " (no command)",
+            ActivityOutcome::Cancelled => " (cancelled)",
+            ActivityOutcome::Failed => " (failed)",
+            ActivityOutcome::DependencyFailed => " (dependency failed)",
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            ActivityOutcome::Failed | ActivityOutcome::DependencyFailed
+        )
+    }
+}
+
+/// Activity level (maps to tracing::Level)
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    strum::EnumString,
+    strum::Display,
+    serde_with::DeserializeFromStr,
+    serde_with::SerializeDisplay,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum ActivityLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::*;
+
+    #[test]
+    fn test_build_event_serialization() {
+        let event = ActivityEvent::Build(Build::Start {
+            id: 123,
+            name: "test-package".to_string(),
+            parent: Some(456),
+            derivation_path: Some("/nix/store/abc-test.drv".to_string()),
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""activity_kind":"build"#));
+        assert!(json.contains(r#""event":"start"#));
+
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Build(Build::Start { id, name, .. }) => {
+                assert_eq!(id, 123);
+                assert_eq!(name, "test-package");
+            }
+            _ => panic!("Expected Build::Start event"),
+        }
+    }
+
+    #[test]
+    fn test_fetch_event_with_kind() {
+        let event = ActivityEvent::Fetch(Fetch::Start {
+            id: 456,
+            kind: FetchKind::Download,
+            name: "pkg".to_string(),
+            parent: None,
+            url: Some("https://cache.nixos.org".to_string()),
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""activity_kind":"fetch"#));
+        assert!(json.contains(r#""kind":"download"#));
+
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Fetch(Fetch::Start { kind, .. }) => {
+                assert_eq!(kind, FetchKind::Download);
+            }
+            _ => panic!("Expected Fetch::Start event"),
+        }
+    }
+
+    #[test]
+    fn test_fetch_kinds() {
+        let kinds = [
+            FetchKind::Download,
+            FetchKind::Query,
+            FetchKind::Tree,
+            FetchKind::Copy,
+        ];
+        for kind in kinds {
+            let event = ActivityEvent::Fetch(Fetch::Start {
+                id: 1,
+                kind,
+                name: "test".to_string(),
+                parent: None,
+                url: None,
+                timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+            });
+
+            let json = serde_json::to_string(&event).unwrap();
+            let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+            match parsed {
+                ActivityEvent::Fetch(Fetch::Start {
+                    kind: parsed_kind, ..
+                }) => {
+                    assert_eq!(parsed_kind, kind);
+                }
+                _ => panic!("Expected Fetch::Start"),
+            }
+        }
+    }
+
+    #[test]
+    fn evaluated_file_serialization_preserves_cache_state() {
+        let cached = EvalOp::EvaluatedFile {
+            source: "/project/default.nix".into(),
+            cached: true,
+        };
+        let json = serde_json::to_string(&cached).unwrap();
+        assert!(json.contains(r#""cached":true"#));
+        assert_eq!(serde_json::from_str::<EvalOp>(&json).unwrap(), cached);
+
+        let legacy = r#"{"kind":"evaluated_file","source":"/project/default.nix"}"#;
+        assert_eq!(
+            serde_json::from_str::<EvalOp>(legacy).unwrap(),
+            EvalOp::EvaluatedFile {
+                source: "/project/default.nix".into(),
+                cached: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_complete_event() {
+        let event = ActivityEvent::Build(Build::Complete {
+            id: 789,
+            outcome: ActivityOutcome::Success,
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""event":"complete"#));
+        assert!(json.contains(r#""outcome":"success"#));
+
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Build(Build::Complete { id, outcome, .. }) => {
+                assert_eq!(id, 789);
+                assert_eq!(outcome, ActivityOutcome::Success);
+            }
+            _ => panic!("Expected Build::Complete event"),
+        }
+    }
+
+    #[test]
+    fn test_build_phase_event() {
+        let event = ActivityEvent::Build(Build::Phase {
+            id: 111,
+            phase: "configure".to_string(),
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""event":"phase"#));
+
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Build(Build::Phase { phase, .. }) => {
+                assert_eq!(phase, "configure");
+            }
+            _ => panic!("Expected Build::Phase event"),
+        }
+    }
+
+    #[test]
+    fn test_fetch_progress_event() {
+        let event = ActivityEvent::Fetch(Fetch::Progress {
+            id: 999,
+            current: 50,
+            total: Some(100),
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""event":"progress"#));
+        assert!(json.contains(r#""current":50"#));
+        assert!(json.contains(r#""total":100"#));
+
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Fetch(Fetch::Progress { current, total, .. }) => {
+                assert_eq!(current, 50);
+                assert_eq!(total, Some(100));
+            }
+            _ => panic!("Expected Fetch::Progress event"),
+        }
+    }
+
+    #[test]
+    fn test_message_event() {
+        let event = ActivityEvent::Message(Message {
+            id: 1,
+            level: ActivityLevel::Info,
+            text: "Test message".to_string(),
+            details: None,
+            parent: None,
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""activity_kind":"message"#));
+        assert!(json.contains(r#""level":"info"#));
+
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Message(msg) => {
+                assert_eq!(msg.level, ActivityLevel::Info);
+                assert_eq!(msg.text, "Test message");
+            }
+            _ => panic!("Expected Message event"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_log_event() {
+        let event = ActivityEvent::Evaluate(Evaluate::Log {
+            id: 222,
+            line: "Evaluating file...".to_string(),
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Evaluate(Evaluate::Log { line, .. }) => {
+                assert_eq!(line, "Evaluating file...");
+            }
+            _ => panic!("Expected Evaluate::Log event"),
+        }
+    }
+
+    #[test]
+    fn test_task_progress_event() {
+        let event = ActivityEvent::Task(Task::Progress {
+            id: 333,
+            done: 5,
+            expected: 10,
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Task(Task::Progress { done, expected, .. }) => {
+                assert_eq!(done, 5);
+                assert_eq!(expected, 10);
+            }
+            _ => panic!("Expected Task::Progress event"),
+        }
+    }
+
+    #[test]
+    fn test_command_log_event() {
+        let event = ActivityEvent::Command(Command::Log {
+            id: 444,
+            line: "Running command...".to_string(),
+            is_error: false,
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Command(Command::Log { line, is_error, .. }) => {
+                assert_eq!(line, "Running command...");
+                assert!(!is_error);
+            }
+            _ => panic!("Expected Command::Log event"),
+        }
+    }
+
+    #[test]
+    fn test_operation_complete_event() {
+        let event = ActivityEvent::Operation(Operation::Complete {
+            id: 555,
+            outcome: ActivityOutcome::Failed,
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ActivityEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ActivityEvent::Operation(Operation::Complete { outcome, .. }) => {
+                assert_eq!(outcome, ActivityOutcome::Failed);
+            }
+            _ => panic!("Expected Operation::Complete event"),
+        }
+    }
+
+    #[test]
+    fn process_start_keeps_typed_ports_and_probe() {
+        let event = ActivityEvent::Process(Process::Start {
+            id: 7,
+            name: "web".to_string(),
+            parent: None,
+            command: Some("serve".to_string()),
+            ports: vec![PortBinding {
+                name: "http".to_string(),
+                port: 8080,
+            }],
+            urls: Box::default(),
+            ready_probe: Some(ReadyProbe::Http(Box::new(HttpProbe {
+                host: "localhost".to_string(),
+                port: 8080,
+                path: "/health".to_string(),
+            }))),
+            level: ActivityLevel::Info,
+            timestamp: Timestamp(SystemTime::UNIX_EPOCH),
+        });
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["ports"],
+            serde_json::json!([{ "name": "http", "port": 8080 }])
+        );
+        assert_eq!(
+            json["ready_probe"],
+            serde_json::json!({ "kind": "http", "host": "localhost", "port": 8080, "path": "/health" })
+        );
+
+        let parsed: ActivityEvent = serde_json::from_value(json).unwrap();
+        match parsed {
+            ActivityEvent::Process(Process::Start {
+                ports, ready_probe, ..
+            }) => {
+                assert_eq!(ports[0].to_string(), "http:8080");
+                assert_eq!(
+                    ready_probe.unwrap().to_string(),
+                    "http: localhost:8080/health"
+                );
+            }
+            _ => panic!("Expected Process::Start event"),
+        }
+
+        for (probe, text) in [
+            (ReadyProbe::Exec, r#"{"kind":"exec"}"#),
+            (ReadyProbe::Notify, r#"{"kind":"notify"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&probe).unwrap(), text);
+            assert_eq!(serde_json::from_str::<ReadyProbe>(text).unwrap(), probe);
+        }
+    }
+
+    #[test]
+    fn test_is_stoppable() {
+        assert!(!ProcessStatus::NotStarted.is_stoppable());
+        assert!(!ProcessStatus::Waiting.is_stoppable());
+        assert!(ProcessStatus::Starting.is_stoppable());
+        assert!(ProcessStatus::Running.is_stoppable());
+        assert!(ProcessStatus::Ready.is_stoppable());
+        assert!(ProcessStatus::Restarting.is_stoppable());
+        assert!(!ProcessStatus::Stopping.is_stoppable());
+        assert!(!ProcessStatus::Stopped.is_stoppable());
+        assert!(!ProcessStatus::Exited.is_stoppable());
+        assert!(!ProcessStatus::GaveUp.is_stoppable());
+
+        assert!(ProcessStatus::NotStarted.is_restartable());
+        assert!(!ProcessStatus::Waiting.is_restartable());
+        assert!(ProcessStatus::Starting.is_restartable());
+        assert!(ProcessStatus::Running.is_restartable());
+        assert!(ProcessStatus::Ready.is_restartable());
+        assert!(ProcessStatus::Restarting.is_restartable());
+        assert!(!ProcessStatus::Stopping.is_restartable());
+        assert!(ProcessStatus::Stopped.is_restartable());
+        assert!(ProcessStatus::Exited.is_restartable());
+        assert!(ProcessStatus::GaveUp.is_restartable());
+
+        assert!(!ProcessStatus::Exited.is_failed());
+        assert!(ProcessStatus::GaveUp.is_failed());
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    /// Every build log line moves one of these through the activity channel;
+    /// growing it taxes the hottest path in the pipeline. Raising the bound
+    /// must be a deliberate decision, not a side effect of adding a field.
+    #[test]
+    fn activity_event_stays_small() {
+        assert!(
+            std::mem::size_of::<super::ActivityEvent>() <= 144,
+            "ActivityEvent grew to {} bytes (bound: 144)",
+            std::mem::size_of::<super::ActivityEvent>()
+        );
+    }
+}

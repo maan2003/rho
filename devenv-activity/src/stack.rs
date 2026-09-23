@@ -1,0 +1,272 @@
+//! Task-local activity stack for parent tracking and event dispatch.
+//!
+//! This module provides a task-local stack that tracks the current activity hierarchy.
+//! Activities use this stack to automatically determine their parent when starting,
+//! enabling proper parent-child relationships in the activity tree.
+//!
+//! # Task-Local vs Thread-Local
+//!
+//! The stack uses Tokio's `task_local!` instead of `thread_local!` to properly support
+//! async code where tasks can migrate between threads via Tokio's work-stealing scheduler.
+//!
+//! # Cross-Spawn Propagation
+//!
+//! When spawning new tasks, activity context is not automatically propagated. Use
+//! [`ActivityInstrument::in_activity`](crate::ActivityInstrument::in_activity) to propagate
+//! activity context across spawn boundaries:
+//!
+//! ```rust,ignore
+//! use devenv_activity::{Activity, ActivityInstrument};
+//!
+//! let activity = Arc::new(Activity::task().start());
+//! let activity_clone = Arc::clone(&activity);
+//!
+//! tokio::spawn(move || {
+//!     async move {
+//!         // Activities created here will have `activity` as their parent
+//!         let child = Activity::task().start();
+//!     }.in_activity(&activity_clone)
+//! });
+//! ```
+
+use std::cell::RefCell;
+use std::panic::Location;
+use std::sync::LazyLock;
+
+use crate::Timestamp;
+use crate::builders::next_id;
+use crate::events::{ActivityEvent, ActivityLevel, ExpectedCategory, Message, SetExpected};
+use arc_swap::ArcSwapOption;
+use tokio::sync::mpsc;
+
+/// Global sender for activity events (installed by ActivityHandle::install()).
+/// It can be cleared when the receiver is dropped, allowing subsequent
+/// log/error calls to fall back to tracing. Reads are lock-free because every
+/// activity event passes through this path.
+pub(crate) static ACTIVITY_SENDER: LazyLock<ArcSwapOption<mpsc::UnboundedSender<ActivityEvent>>> =
+    LazyLock::new(ArcSwapOption::empty);
+
+pub(crate) fn activity_sender_installed() -> bool {
+    ACTIVITY_SENDER.load().is_some()
+}
+
+// Task-local stack for tracking current Activity IDs and levels (for parent detection and level inheritance).
+// Using task_local instead of thread_local to support async code where tasks
+// can migrate between threads via Tokio's work-stealing scheduler.
+tokio::task_local! {
+    pub(crate) static ACTIVITY_STACK: RefCell<Vec<(u64, ActivityLevel)>>;
+}
+
+/// Send an activity event to the first-party activity channel.
+///
+/// Tracing emission happens alongside each activity producer before this
+/// function is called. Keeping this function transport-only prevents internal
+/// consumers from paying tracing serialization costs.
+pub(crate) fn send_activity_event(event: ActivityEvent) {
+    let tx = ACTIVITY_SENDER.load();
+    if let Some(tx) = tx.as_ref() {
+        let _ = tx.send(event);
+    }
+}
+
+/// Emit a typed activity update into tracing when an exporter has enabled the
+/// dedicated activity target. The macro expands where the operation is
+/// implemented, while `source.file` and `source.line` carry the tracked public
+/// API caller.
+///
+/// The event is passed to tracing as a borrowed [`SerdeValuable`](crate::SerdeValuable).
+/// Nothing is serialized here: a layer that wants the payload walks the typed
+/// event itself when it visits the `event` field.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __trace_activity_event {
+    (parent: $parent:expr, $event:expr, $caller:expr) => {{
+        if tracing::enabled!(
+            target: "devenv_activity::events",
+            tracing::Level::DEBUG
+        ) {
+            let __event = $crate::SerdeValuable($event);
+            tracing::debug!(
+                target: "devenv_activity::events",
+                parent: $parent,
+                event = __event.as_tracing_value(),
+                source.file = $caller.file(),
+                source.line = $caller.line() as u64,
+                source.column = $caller.column() as u64,
+            );
+        }
+    }};
+    ($event:expr, $caller:expr) => {{
+        if tracing::enabled!(
+            target: "devenv_activity::events",
+            tracing::Level::DEBUG
+        ) {
+            let __event = $crate::SerdeValuable($event);
+            tracing::debug!(
+                target: "devenv_activity::events",
+                event = __event.as_tracing_value(),
+                source.file = $caller.file(),
+                source.line = $caller.line() as u64,
+                source.column = $caller.column() as u64,
+            );
+        }
+    }};
+}
+
+/// Get the activity ID from the current activity stack.
+/// Returns None if not in an activity scope or if the stack is empty.
+///
+/// Use this to capture the current activity ID before crossing thread/task boundaries,
+/// then pass it explicitly to activities created in other contexts.
+pub fn current_activity_id() -> Option<u64> {
+    ACTIVITY_STACK
+        .try_with(|stack| stack.borrow().last().map(|(id, _)| *id))
+        .ok()
+        .flatten()
+}
+
+/// Get the activity level from the current activity stack.
+/// Returns None if not in an activity scope or if the stack is empty.
+///
+/// Child activities use this to inherit their parent's level by default.
+pub fn current_activity_level() -> Option<ActivityLevel> {
+    ACTIVITY_STACK
+        .try_with(|stack| stack.borrow().last().map(|(_, level)| *level))
+        .ok()
+        .flatten()
+}
+
+/// Get a clone of the current activity stack.
+/// Returns empty vec if not in an activity scope.
+pub(crate) fn get_current_stack() -> Vec<(u64, ActivityLevel)> {
+    ACTIVITY_STACK
+        .try_with(|stack| stack.borrow().clone())
+        .unwrap_or_default()
+}
+
+/// Emit a standalone message, associated with the current activity if one exists.
+#[track_caller]
+pub fn message(level: ActivityLevel, text: impl Into<String>) {
+    message_with_details(level, text, None)
+}
+
+/// Emit a standalone message with optional details, associated with the current activity if one exists.
+#[track_caller]
+pub fn message_with_details(
+    level: ActivityLevel,
+    text: impl Into<String>,
+    details: Option<String>,
+) {
+    let parent = current_activity_id();
+    let event = ActivityEvent::Message(Message {
+        id: next_id(),
+        level,
+        text: text.into(),
+        details,
+        parent,
+        timestamp: Timestamp::now(),
+    });
+    crate::__trace_activity_event!(&event, Location::caller());
+    send_activity_event(event);
+}
+
+/// Emit a SetExpected event to announce aggregate expected counts.
+/// This is used by Nix to announce how many items/bytes are expected
+/// before individual activities start.
+#[track_caller]
+pub fn set_expected(category: ExpectedCategory, expected: u64) {
+    let event = ActivityEvent::SetExpected(SetExpected {
+        category,
+        expected,
+        timestamp: Timestamp::now(),
+    });
+    crate::__trace_activity_event!(&event, Location::caller());
+    send_activity_event(event);
+}
+
+/// Log a line to an Evaluate activity by ID.
+///
+/// Use this when you have the activity ID but not the Activity object,
+/// such as when logging from FFI callbacks where the Activity is owned elsewhere.
+#[track_caller]
+pub fn append_eval_log(id: u64, line: impl Into<String>) {
+    use crate::events::Evaluate;
+
+    let line = line.into();
+    if !activity_sender_installed() {
+        tracing::info!("{}", line);
+    }
+    let event = ActivityEvent::Evaluate(Evaluate::Log {
+        id,
+        line,
+        timestamp: Timestamp::now(),
+    });
+    crate::__trace_activity_event!(&event, Location::caller());
+    send_activity_event(event);
+}
+
+/// Log a structured eval operation to an Evaluate activity by ID.
+///
+/// Use this for parsed/structured evaluation operations (readDir, pathExists, etc.)
+/// that carry richer data than plain text log lines.
+#[track_caller]
+pub fn append_eval_op(id: u64, op: crate::events::EvalOp) {
+    use crate::events::Evaluate;
+
+    let event = ActivityEvent::Evaluate(Evaluate::Op {
+        id,
+        op,
+        timestamp: Timestamp::now(),
+    });
+    crate::__trace_activity_event!(&event, Location::caller());
+    send_activity_event(event);
+}
+
+/// Emit a task hierarchy event describing all tasks and their parent-child relationships.
+///
+/// This should be called once before task execution begins. The edges represent
+/// parent-child relationships where a task appears under its dependents in the TUI
+/// (i.e., the tasks that depend on it).
+///
+/// # Arguments
+/// * `tasks` - All tasks with their metadata
+/// * `edges` - Parent-child relationships as (parent_id, child_id) pairs
+#[track_caller]
+pub fn emit_task_hierarchy(tasks: Vec<crate::events::TaskInfo>, edges: Vec<(u64, u64)>) {
+    use crate::events::Task;
+
+    let event = ActivityEvent::Task(Task::Hierarchy {
+        tasks,
+        edges,
+        timestamp: Timestamp::now(),
+    });
+    crate::__trace_activity_event!(&event, Location::caller());
+    send_activity_event(event);
+}
+
+/// Log a line to a Task activity by ID.
+///
+/// Use this when you have the activity ID but not the Activity object,
+/// such as when logging from task execution where the Activity lifecycle
+/// is managed by the calling code.
+#[track_caller]
+pub fn log_to_task(id: u64, line: impl Into<String>, is_error: bool) {
+    use crate::events::Task;
+
+    let line = line.into();
+    if !activity_sender_installed() {
+        if is_error {
+            tracing::warn!("{}", line);
+        } else {
+            tracing::info!("{}", line);
+        }
+    }
+    let event = ActivityEvent::Task(Task::Log {
+        id,
+        line,
+        is_error,
+        timestamp: Timestamp::now(),
+    });
+    crate::__trace_activity_event!(&event, Location::caller());
+    send_activity_event(event);
+}

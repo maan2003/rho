@@ -1,0 +1,3 @@
+allow_unfree: true
+imports:
+  - /devenv/fixtures/config/import-order/d

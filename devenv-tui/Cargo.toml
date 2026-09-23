@@ -1,0 +1,81 @@
+[package]
+name = "devenv-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Core async runtime
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "signal",
+] }
+tokio-shutdown.workspace = true
+
+# TUI library
+iocraft.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+
+# Tracing integration
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Terminal state management
+libc.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+miette.workspace = true
+
+# CLI argument parsing
+clap.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+serde_yaml.workspace = true
+
+# Activity system
+devenv-activity.workspace = true
+
+# Frontend/backend control protocol
+devenv-mailbox.workspace = true
+
+# Shell session management (provides ShellSession, protocol types)
+devenv-shell.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Human-readable formatting
+human-repr.workspace = true
+unicode-width = "0.1"
+unicode-segmentation = "1.13"
+
+# URL parsing
+url.workspace = true
+
+# Base64 encoding (for OSC 52 clipboard)
+base64.workspace = true
+[[bin]]
+name = "tui-replay"
+path = "src/bin/tui-replay.rs"
+
+[dev-dependencies]
+insta.workspace = true
+devenv-activity = { workspace = true, features = ["test-helpers"] }
+tokio = { workspace = true, features = ["test-util"] }
+proptest.workspace = true
+
+[features]
+default = []
+deterministic-tui = []
+test-all = ["deterministic-tui"]

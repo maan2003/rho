@@ -1,0 +1,493 @@
+{ config
+, inputs ? { }
+, pkgs
+, lib
+, bootstrapPkgs ? null
+, ...
+}:
+let
+  types = lib.types;
+  # Returns a list of all the entries in a folder
+  listEntries = path: map (name: path + "/${name}") (builtins.attrNames (builtins.readDir path));
+
+  # Outputs `mkShell` exposes for a package: it selects `dev` (falling back to
+  # `out`), whose setup hook propagates `bin`, `include` and `lib`.
+  shellOutputs = [
+    "out"
+    "bin"
+    "lib"
+    "dev"
+    "include"
+  ];
+
+  # An explicitly selected output (`pkgs.foo.dev`) is linked into the profile
+  # as-is; otherwise `meta.outputsToInstall` plus `shellOutputs` are.
+  drvOrPackageToPaths =
+    drvOrPackage:
+    let
+      outputs =
+        if drvOrPackage.outputSpecified or false || !(drvOrPackage ? outputs) then
+          [ drvOrPackage ]
+        else
+          let
+            wanted = lib.unique ((drvOrPackage.meta.outputsToInstall or [ ]) ++ shellOutputs);
+            available = builtins.filter (output: builtins.elem output drvOrPackage.outputs) wanted;
+            # Keep the package's `meta` on the selected outputs so that `buildEnv`
+            # sees the `meta.priority` set with `lib.hiPrio` or `lib.lowPrio`.
+            withMeta = output: drvOrPackage.${output} // lib.optionalAttrs (drvOrPackage ? meta) { inherit (drvOrPackage) meta; };
+          in
+          if available == [ ] then
+            [ drvOrPackage ]
+          else
+            builtins.map withMeta available;
+      # Include transitive Python dependencies so they end up in the profile's
+      # site-packages. Without this, packages added via `packages = [ pkgs.python3Packages.foo ]`
+      # would be importable but their dependencies (propagatedBuildInputs) would not,
+      # since dontAddPythonPath prevents the setup hook from adding them to PYTHONPATH.
+      pythonDeps =
+        if drvOrPackage ? requiredPythonModules then drvOrPackage.requiredPythonModules else [ ];
+    in
+    outputs ++ pythonDeps;
+
+  profile = pkgs.buildEnv {
+    name = "devenv-profile";
+    paths = lib.flatten (builtins.map drvOrPackageToPaths config.packages);
+    ignoreCollisions = true;
+    ignoreSingleFileOutputs = true;
+  };
+
+  failedAssertions = builtins.map (x: x.message) (
+    builtins.filter (x: !x.assertion) config.assertions
+  );
+
+  performAssertions =
+    let
+      formatAssertionMessage =
+        message:
+        let
+          lines = lib.splitString "\n" message;
+        in
+        "- ${lib.concatStringsSep "\n  " lines}";
+    in
+    if failedAssertions != [ ] then
+      throw ''
+        Failed assertions:
+        ${lib.concatStringsSep "\n" (builtins.map formatAssertionMessage failedAssertions)}
+      ''
+    else
+      lib.trivial.showWarnings config.warnings;
+in
+{
+  options = {
+    env = lib.mkOption {
+      type = types.submodule {
+        freeformType = types.lazyAttrsOf types.anything;
+      };
+      description = "Environment variables to be exposed inside the developer environment.";
+      default = { };
+    };
+
+    name = lib.mkOption {
+      type = types.nullOr types.str;
+      description = "Name of the project.";
+      default = "devenv-shell";
+    };
+
+    enterShell = lib.mkOption {
+      type = types.lines;
+      description = "Bash code to execute when entering the shell.";
+      default = "";
+    };
+
+    overlays = lib.mkOption {
+      type = types.listOf (types.functionTo (types.functionTo types.attrs));
+      description = "List of overlays to apply to pkgs. Each overlay is a function that takes two arguments: final and prev. Supported by devenv 1.4.2 or newer.";
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          (final: prev: {
+            hello = prev.hello.overrideAttrs (oldAttrs: {
+              patches = (oldAttrs.patches or []) ++ [ ./hello-fix.patch ];
+            });
+          })
+        ]
+      '';
+    };
+
+    packages = lib.mkOption {
+      type = types.listOf types.package;
+      description = "A list of packages to expose inside the developer environment. Search available packages using ``devenv search NAME``.";
+      default = [ ];
+    };
+
+    inputsFrom = lib.mkOption {
+      type = types.listOf types.package;
+      description = "A list of derivations whose build inputs will be merged into the shell environment.";
+      default = [ ];
+      example = lib.literalExpression ''
+        [
+          pkgs.hello
+          (pkgs.python3.withPackages (ps: [ ps.numpy ps.pandas ]))
+        ]
+      '';
+    };
+
+    stdenv = lib.mkOption {
+      type = types.package;
+      description = "The stdenv to use for the developer environment.";
+      default = pkgs.stdenv;
+      defaultText = lib.literalExpression "pkgs.stdenv";
+
+      # Remove the default apple-sdk on macOS.
+      # Allow users to specify an optional SDK in `apple.sdk`.
+      apply =
+        stdenv:
+        if stdenv.hostPlatform.isDarwin then
+          stdenv.override
+            (prev: {
+              extraBuildInputs = builtins.filter (x: !(x ? sdkroot)) prev.extraBuildInputs;
+            })
+        else
+          stdenv;
+
+    };
+
+    apple = {
+      sdk = lib.mkOption {
+        type = types.nullOr types.package;
+        description = ''
+          The Apple SDK to add to the developer environment on macOS.
+
+          If set to `null`, the system SDK can be used if the shell allows access to external environment variables.
+        '';
+        default = if pkgs.stdenv.hostPlatform.isDarwin then pkgs.apple-sdk else null;
+        defaultText = lib.literalExpression "if pkgs.stdenv.hostPlatform.isDarwin then pkgs.apple-sdk else null";
+        example = lib.literalExpression "pkgs.apple-sdk_15";
+      };
+    };
+
+    unsetEnvVars = lib.mkOption {
+      type = types.listOf types.str;
+      description = "A list of removed environment variables to make the shell/direnv more lean.";
+      # manually determined with knowledge from https://wiki.nixos.org/wiki/C
+      default = [
+        "HOST_PATH"
+        "NIX_BUILD_CORES"
+        "__structuredAttrs"
+        "buildInputs"
+        "buildPhase"
+        "builder"
+        "depsBuildBuild"
+        "depsBuildBuildPropagated"
+        "depsBuildTarget"
+        "depsBuildTargetPropagated"
+        "depsHostHost"
+        "depsHostHostPropagated"
+        "depsTargetTarget"
+        "depsTargetTargetPropagated"
+        "dontAddDisableDepTrack"
+        "doCheck"
+        "doInstallCheck"
+        "nativeBuildInputs"
+        "out"
+        "outputs"
+        "patches"
+        "phases"
+        "preferLocalBuild"
+        "propagatedBuildInputs"
+        "propagatedNativeBuildInputs"
+        "shell"
+        "shellHook"
+        "stdenv"
+        "strictDeps"
+      ];
+    };
+
+    shell = lib.mkOption {
+      type = types.package;
+      internal = true;
+    };
+
+    ci = lib.mkOption {
+      type = types.listOf types.package;
+      internal = true;
+    };
+
+    ciDerivation = lib.mkOption {
+      type = types.package;
+      internal = true;
+    };
+
+    assertions = lib.mkOption {
+      type = types.listOf types.unspecified;
+      internal = true;
+      default = [ ];
+      example = [
+        {
+          assertion = false;
+          message = "you can't enable this for that reason";
+        }
+      ];
+      description = ''
+        This option allows modules to express conditions that must
+        hold for the evaluation of the configuration to succeed,
+        along with associated error messages for the user.
+      '';
+    };
+
+    hardeningDisable = lib.mkOption {
+      type = types.listOf types.str;
+      internal = true;
+      default = [ ];
+      example = [ "fortify" ];
+      description = ''
+        This options allows modules to disable selected hardening modules.
+        Currently used only for Go
+      '';
+    };
+
+    warnings = lib.mkOption {
+      type = types.listOf types.str;
+      internal = true;
+      default = [ ];
+      example = [ "you should fix this or that" ];
+      description = ''
+        This option allows modules to express warnings about the
+        configuration. For example, `lib.mkRenamedOptionModule` uses this to
+        display a warning message when a renamed option is used.
+      '';
+    };
+
+    devenv = {
+      root = lib.mkOption {
+        type = types.str;
+        internal = true;
+      };
+
+      dotfile = lib.mkOption {
+        type = types.str;
+        internal = true;
+      };
+
+      state = lib.mkOption {
+        type = types.str;
+        internal = true;
+      };
+
+      runtime = lib.mkOption {
+        type = types.str;
+        internal = true;
+        # The path has to be
+        # - unique to each DEVENV_DOTFILE to let multiple devenv environments coexist
+        # - deterministic so that it won't change constantly
+        # - short so that unix domain sockets won't hit the path length limit
+        # - free to create as an unprivileged user across OSes
+        default =
+          let
+            # Keep this in sync with resolve_runtime_dir in devenv-core. Profile
+            # dotfiles are distinct, so profiles retain separate runtime dirs.
+            hashedDotfile = builtins.hashString "sha256" config.devenv.dotfile;
+            # same length as git's abbreviated commit hashes
+            shortHash = builtins.substring 0 7 hashedDotfile;
+            # XDG_RUNTIME_DIR is the correct location for runtime files like sockets
+            # per the XDG Base Directory Specification
+            xdg = builtins.getEnv "XDG_RUNTIME_DIR";
+            # TMPDIR may differ between invocations that need to rendezvous on
+            # the same process-manager socket.
+            base = if xdg != "" then xdg else "/tmp";
+          in
+          "${base}/devenv-${shortHash}";
+      };
+
+      tmpdir = lib.mkOption {
+        type = types.str;
+        internal = true;
+      };
+
+      profile = lib.mkOption {
+        type = types.package;
+        internal = true;
+      };
+    };
+  };
+
+  imports = [
+    ./profiles.nix
+    ./info.nix
+    ./outputs.nix
+    ./files.nix
+    ./processes.nix
+    ./outputs.nix
+    ./scripts.nix
+    ./update-check.nix
+    ./containers.nix
+    ./debug.nix
+    ./lib.nix
+    ./machines.nix
+    ./tests.nix
+    ./cachix.nix
+    ./tasks.nix
+    ./changelogs.nix
+    ./flake-compat.nix
+  ]
+  ++ (listEntries ./languages)
+  ++ (listEntries ./services)
+  ++ (listEntries ./integrations)
+  ++ (listEntries ./process-managers);
+
+  config = {
+    # Expose versioned packages as `multiverse.<attr>."<version>"`, plus
+    # `multiverse.pins` for resolving several versions at once through the
+    # fewest nixpkgs revisions. Using a distinct input name keeps the raw flake
+    # available without shadowing this module argument.
+    _module.args.multiverse = import ./lib/multiverse.nix {
+      inherit inputs pkgs;
+      flakesIntegration = config.devenv.flakesIntegration;
+    };
+
+    changelogs = [
+      {
+        date = "2026-08-24";
+        title = "Packages with a higher `meta.priority` come first on `PATH`";
+        description = ''
+          The shell now orders `packages` by `meta.priority`, so `scripts` and packages wrapped with `lib.hiPrio` shadow other packages that ship a program with the same name.
+          Previously the raw package could win on `PATH` even though `$DEVENV_PROFILE/bin` linked the script.
+          Packages with the same priority keep their order.
+        '';
+      }
+      {
+        date = "2026-08-16";
+        title = "The profile only links the outputs a package installs and the shell exposes";
+        description = ''
+          `$DEVENV_PROFILE` used to link every output of each package in `packages`, including `doc`, `debug` and `static` outputs, and outputs that collide with each other, such as the individual certificate files of `pkgs.cacert`.
+          It now links the outputs in the package's `meta.outputsToInstall` (what `nix profile install` would pick) plus the `out`, `bin`, `lib`, `dev` and `include` outputs the shell already exposes.
+          Selecting an output explicitly, such as `pkgs.sqlite.dev`, links only that output.
+
+          If you relied on another output being in the profile, add it to `packages` explicitly, for example `pkgs.openssl.doc`.
+        '';
+      }
+    ];
+
+    assertions = [
+      {
+        assertion =
+          config.devenv.flakesIntegration
+          || config.overlays == [ ]
+          || (config.devenv.cli.version != null && lib.versionAtLeast config.devenv.cli.version "1.4.2");
+        message = ''
+          Using overlays requires devenv 1.4.2 or higher, while your current version is ${toString config.devenv.cli.version}.
+        '';
+      }
+    ];
+    # use builtins.toPath to normalize path if root is "/" (container)
+    devenv.state = lib.mkDefault (builtins.toPath (config.devenv.dotfile + "/state"));
+    devenv.dotfile = lib.mkDefault (builtins.toPath (config.devenv.root + "/.devenv"));
+    devenv.profile = profile;
+
+    env.DEVENV_PROFILE = config.devenv.profile;
+    env.DEVENV_STATE = config.devenv.state;
+    env.DEVENV_RUNTIME = config.devenv.runtime;
+    env.DEVENV_DOTFILE = config.devenv.dotfile;
+    env.DEVENV_ROOT = config.devenv.root;
+
+    packages = [
+      # needed to make sure we can load libs
+      pkgs.pkg-config
+    ]
+    ++ lib.optional (config.apple.sdk != null) config.apple.sdk;
+
+    enterShell = lib.mkBefore ''
+      ${lib.optionalString
+        (config.devenv.cli.version == null || !lib.versionAtLeast config.devenv.cli.version "2.1")
+        ''
+          export PS1="\[\e[0;34m\](devenv)\[\e[0m\] ''${PS1-}"
+        ''
+      }
+
+      # Override temp directories that stdenv set to NIX_BUILD_TOP.
+      # Only reset those that still point to the Nix build dir; leave
+      # any user/CI-supplied value intact.
+      for var in TMP TMPDIR TEMP TEMPDIR; do
+        if [ -n "''${!var-}" ] && [ "''${!var}" = "''${NIX_BUILD_TOP-}" ]; then
+          export "$var"=${config.devenv.tmpdir}
+        fi
+      done
+      if [ -n "''${NIX_BUILD_TOP-}" ]; then
+        unset NIX_BUILD_TOP
+      fi
+
+      # set path to locales on non-NixOS Linux hosts
+      ${lib.optionalString (pkgs.stdenv.hostPlatform.isLinux && (pkgs.glibcLocalesUtf8 != null)) ''
+        if [ -z "''${LOCALE_ARCHIVE-}" ]; then
+          export LOCALE_ARCHIVE=${pkgs.glibcLocalesUtf8}/lib/locale/locale-archive
+        fi
+      ''}
+
+      # Make `man <tool>` find the man pages of packages in the profile.
+      export MANPATH="$DEVENV_PROFILE/share/man:''${MANPATH:+$MANPATH:}"
+
+      # direnv helper
+      if [ ! type -p direnv &>/dev/null && -f .envrc ]; then
+        echo "An .envrc file was detected, but the direnv command is not installed."
+        echo "To use this configuration, please install direnv: https://direnv.net/docs/installation.html"
+      fi
+
+      mkdir -p "$DEVENV_STATE"
+      if [ ! -L "$DEVENV_DOTFILE/profile" ] || [ "$(${pkgs.coreutils}/bin/readlink $DEVENV_DOTFILE/profile)" != "${profile}" ]
+      then
+        ln -snf ${profile} "$DEVENV_DOTFILE/profile"
+      fi
+      unset ${lib.concatStringsSep " " config.unsetEnvVars}
+
+      mkdir -p ${lib.escapeShellArg config.devenv.runtime}
+      ln -snf ${lib.escapeShellArg config.devenv.runtime} ${lib.escapeShellArg config.devenv.dotfile}/run
+    '';
+
+    shell =
+      let
+        # `mkShell` merges `packages` into `nativeBuildInputs`.
+        # This distinction is generally not important for devShells, except when it comes to setup hooks and their run order.
+        # On macOS, route apple-sdk packages (identified by `passthru.sdkroot`) into `buildInputs`
+        # so they participate in the SDK version comparison done by stdenv's setup hooks.
+        # Order packages by `meta.priority` so that high-priority packages, such as
+        # `scripts` and packages wrapped with `lib.hiPrio`, come first on `PATH` and
+        # shadow packages that ship a program with the same name. The sort is stable,
+        # so packages with the same priority keep their order.
+        orderedPackages = lib.sortOn (pkg: pkg.meta.priority or lib.meta.defaultPriority) config.packages;
+        partitioned =
+          if pkgs.stdenv.hostPlatform.isDarwin then
+            builtins.partition (pkg: pkg ? sdkroot) orderedPackages
+          else
+            {
+              right = [ ];
+              wrong = orderedPackages;
+            };
+      in
+      performAssertions (
+        (pkgs.mkShell.override { stdenv = config.stdenv; }) (
+          {
+            inherit (config) hardeningDisable inputsFrom name;
+            buildInputs = partitioned.right;
+            nativeBuildInputs = partitioned.wrong;
+            shellHook = ''
+              ${lib.optionalString config.devenv.debug "set -x"}
+              ${config.enterShell}
+            '';
+          }
+          // config.env
+        )
+      );
+
+    infoSections."env" = lib.mapAttrsToList (name: value: "${name}: ${toString value}") config.env;
+    infoSections."packages" = builtins.map (package: package.name) (
+      builtins.filter
+        (
+          package: !(builtins.elem package.name (builtins.attrNames config.scripts))
+        )
+        config.packages
+    );
+
+    ci = [ config.shell ];
+    ciDerivation = pkgs.runCommand "ci" { } "echo ${toString config.ci} > $out";
+  };
+}
