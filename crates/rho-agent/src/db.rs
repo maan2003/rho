@@ -63,12 +63,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-mod migration;
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "7a2ecf91",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: migration::migrate,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -399,32 +394,14 @@ pub struct ClaudeRewind {
     pub resume_at: Option<Uuid>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub enum AgentSpawnedBy {
     #[default]
     Direct,
     Engineer,
 }
 
-/// `AgentSpawnedBy` as rows wrote it while the PM role existed; a PM
-/// parent reads as an Engineer parent now.
-#[derive(Decode)]
-enum StoredAgentSpawnedBy {
-    Direct,
-    PM,
-    Engineer,
-}
-
-impl senax_encoder::Decoder for AgentSpawnedBy {
-    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
-        Ok(match StoredAgentSpawnedBy::decode(reader)? {
-            StoredAgentSpawnedBy::Direct => Self::Direct,
-            StoredAgentSpawnedBy::PM | StoredAgentSpawnedBy::Engineer => Self::Engineer,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum SessionBinding {
     ClaudeFable {
         effort: ClaudeEffort,
@@ -445,72 +422,6 @@ pub enum SessionBinding {
     AdvisorAstra(InferenceProfile),
     /// Retained historical configuration, never a runnable provider binding.
     LegacyGemini(InferenceProfile),
-}
-
-/// Binding names used by prior database formats. Retired variants normalize
-/// into the exhaustive current role matrix while the temporary format
-/// migration rewrites every nested agent configuration.
-#[allow(dead_code)]
-#[derive(Decode)]
-enum StoredSessionBinding {
-    ResponsesGpt55(InferenceProfile),
-    ClaudeFable { effort: ClaudeEffort },
-    ClaudeOpus { effort: ClaudeEffort },
-    ResponsesSol(InferenceProfile),
-    ResponsesLuna(InferenceProfile),
-    ResponsesTerra(InferenceProfile),
-    CoordinatorTerra(InferenceProfile),
-    CoordinatorSol(InferenceProfile),
-    ClaudeAdvisor { effort: ClaudeEffort },
-    AdvisorSol(InferenceProfile),
-    AdvisorTerra(InferenceProfile),
-    ResponsesAstra(InferenceProfile),
-    AdvisorAstra(InferenceProfile),
-    ResponsesSolPython(InferenceProfile),
-    ClaudeFablePython { effort: ClaudeEffort },
-    ResponsesAstraNotes(InferenceProfile),
-    AntigravityFlashLow(InferenceProfile),
-    ResponsesSolCheap(InferenceProfile),
-    LegacyGemini(InferenceProfile),
-}
-
-impl senax_encoder::Decoder for SessionBinding {
-    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
-        use StoredSessionBinding as Stored;
-        let deep = |effort| InferenceProfile {
-            effort,
-            fast_mode: false,
-        };
-        Ok(match Stored::decode(reader)? {
-            Stored::ResponsesGpt55(_)
-            | Stored::ResponsesSol(_)
-            | Stored::ResponsesTerra(_)
-            | Stored::CoordinatorTerra(_)
-            | Stored::CoordinatorSol(_)
-            | Stored::ResponsesSolPython(_)
-            | Stored::ResponsesSolCheap(_) => Self::ResponsesSol(deep(ReasoningEffort::High)),
-            Stored::ResponsesLuna(_) => Self::ResponsesLuna(deep(ReasoningEffort::Xhigh)),
-            Stored::ResponsesAstra(_) | Stored::ResponsesAstraNotes(_) => {
-                Self::ResponsesAstra(deep(ReasoningEffort::Medium))
-            }
-            Stored::AdvisorSol(_) => Self::AdvisorSol(deep(ReasoningEffort::Xhigh)),
-            Stored::AdvisorTerra(_) | Stored::AdvisorAstra(_) => {
-                Self::AdvisorAstra(deep(ReasoningEffort::Xhigh))
-            }
-            Stored::ClaudeFable { .. } | Stored::ClaudeFablePython { .. } => Self::ClaudeFable {
-                effort: ClaudeEffort::Medium,
-            },
-            Stored::ClaudeOpus { .. } => Self::ClaudeOpus {
-                effort: ClaudeEffort::Medium,
-            },
-            Stored::ClaudeAdvisor { .. } => Self::ClaudeAdvisor {
-                effort: ClaudeEffort::Xhigh,
-            },
-            Stored::AntigravityFlashLow(config) | Stored::LegacyGemini(config) => {
-                Self::LegacyGemini(config)
-            }
-        })
-    }
 }
 
 pub(crate) trait AgentRoleSessionProfile {

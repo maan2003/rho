@@ -476,28 +476,6 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "agents decoded: {}", agents.len())?;
     writeln!(output, "events decoded: {events}")?;
-    // The fused migration drops the old layout; a migration check is the
-    // place that says whether any of it is still there.
-    for table in [
-        "projects",
-        "view_config",
-        "agent_heads",
-        "agent_events",
-        "lineage_parents",
-        "agent_story",
-        "agent_story_source",
-        "agent_attention_until_slice_b",
-    ] {
-        writeln!(
-            output,
-            "table {table}: {}",
-            if read.has_table(table) {
-                "present"
-            } else {
-                "dropped"
-            }
-        )?;
-    }
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }

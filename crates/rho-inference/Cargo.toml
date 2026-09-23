@@ -21,7 +21,6 @@ rpassword.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 redb.workspace = true
-redb-derive.workspace = true
 rustls.workspace = true
 senax-encoder.workspace = true
 serde.workspace = true

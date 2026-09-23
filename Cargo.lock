@@ -12772,7 +12772,6 @@ dependencies = [
  "notify",
  "rand 0.8.7",
  "redb",
- "redb-derive",
  "reqwest 0.12.28",
  "rho-core",
  "rho-db",

@@ -1,26 +1,21 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use bytes::BytesMut;
-use redb::{TableDefinition, TableHandle as _, Value as _};
-use redb_derive::{Key, Value as RedbValue};
+use redb::{TableDefinition, TableHandle as _};
 use rho_core::UnixMs;
 use rho_db::{RhoDb, Sen, SenValue};
-use senax_encoder::{Decode, Decoder as _, Encode, Encoder as _};
+use senax_encoder::{Decode, Encode};
 use tokio::sync::{Mutex, watch};
 
 use crate::auth_cli::{auth_namespaces, chatgpt_weekly_usage};
 use crate::responses::{InferenceAuth, QuotaUpdate};
 
 const FORMAT: TableDefinition<(), String> = TableDefinition::new("chatgpt_inference_format");
-const INITIAL_FORMAT: &str = "8c93d1e4";
 const CURRENT_FORMAT: &str = "75b4468b";
 const SETTINGS: TableDefinition<(), Sen<SettingsRecord>> =
     TableDefinition::new("chatgpt_inference_settings");
 const QUOTAS: TableDefinition<String, Sen<QuotaRecord>> =
     TableDefinition::new("chatgpt_quota_observations");
-const LEGACY_QUOTAS: TableDefinition<QuotaObservationKey, LegacyQuotaValue> =
-    TableDefinition::new("quota_observations_by_model_time");
 const HISTORY_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const RESET_SWITCH_THRESHOLD_SECONDS: i64 = 60 * 60;
 
@@ -67,65 +62,6 @@ pub struct SelectedAuth {
 struct SettingsRecord {
     current_namespace: Option<String>,
     disabled_namespaces: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
-struct QuotaModel(u8);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
-struct QuotaObservationKey {
-    model: QuotaModel,
-    observed_at: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-enum QuotaProvider {
-    ChatGpt,
-    Claude,
-}
-
-#[derive(Clone, Debug, Encode, Decode)]
-struct QuotaObservationRecord {
-    provider: QuotaProvider,
-    model: QuotaModel,
-    auth_namespace: Option<String>,
-    observed_at: UnixMs,
-    used_percent: u8,
-    reset_at_unix: Option<i64>,
-}
-
-#[derive(Debug)]
-struct LegacyQuotaValue;
-
-impl redb::Value for LegacyQuotaValue {
-    type SelfType<'a> = QuotaObservationRecord;
-    type AsBytes<'a> = BytesMut;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(mut data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        QuotaObservationRecord::decode(&mut data).expect("decode legacy quota observation")
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-    where
-        Self: 'b,
-    {
-        let mut bytes = BytesMut::new();
-        value
-            .encode(&mut bytes)
-            .expect("encode legacy quota observation");
-        bytes
-    }
-
-    fn type_name() -> redb::TypeName {
-        redb::TypeName::new("rho-db::Sen<rho_agent::db::QuotaObservationRecord>")
-    }
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -559,61 +495,27 @@ impl QuotaRecord {
 }
 
 pub(crate) async fn init(db: &RhoDb) -> anyhow::Result<()> {
-    let (current, has_legacy_quota) = {
+    let current = {
         let read = db.read();
-        (
-            read.has_table(FORMAT.name())
-                .then(|| read.open_table(FORMAT).get(&()).map(|value| value.value()))
-                .flatten(),
-            read.has_table(LEGACY_QUOTAS.name()),
-        )
+        read.has_table(FORMAT.name())
+            .then(|| read.open_table(FORMAT).get(&()).map(|value| value.value()))
+            .flatten()
     };
-    if current.as_deref() == Some(CURRENT_FORMAT) {
-        return Ok(());
+    match current.as_deref() {
+        Some(CURRENT_FORMAT) => return Ok(()),
+        None => {}
+        Some(other) => anyhow::bail!(
+            "unsupported ChatGPT inference database format {other}; expected {CURRENT_FORMAT}"
+        ),
     }
     let mut write = db.write().await;
     write.open_table(SETTINGS);
     write.open_table(QUOTAS);
-    let previous = current.unwrap_or_else(|| INITIAL_FORMAT.to_owned());
-    anyhow::ensure!(
-        previous == INITIAL_FORMAT,
-        "unsupported ChatGPT inference database format {previous}; expected {CURRENT_FORMAT}"
-    );
-    if has_legacy_quota {
-        migrate_legacy_chatgpt_quota(&mut write);
-    }
     write
         .open_table(FORMAT)
         .insert(&(), CURRENT_FORMAT.to_owned());
     write.commit();
     Ok(())
-}
-
-fn migrate_legacy_chatgpt_quota(write: &mut rho_db::WriteTxn) {
-    let legacy = write
-        .open_table(LEGACY_QUOTAS)
-        .iter()
-        .filter_map(|(_, value)| {
-            let record = value.value();
-            (record.provider == QuotaProvider::ChatGpt && record.model == QuotaModel(1))
-                .then_some(record)
-        })
-        .filter_map(|record| {
-            Some(QuotaRecord {
-                auth_namespace: record.auth_namespace?,
-                observed_at_ms: record.observed_at.0,
-                weekly_used_percent: record.used_percent,
-                weekly_reset_at_unix: record.reset_at_unix,
-                routing_used_percent: record.used_percent,
-                routing_reset_at_unix: record.reset_at_unix,
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut quotas = write.open_table(QUOTAS);
-    for record in legacy {
-        let key = format!("{:020}:{}", record.observed_at_ms, record.auth_namespace);
-        quotas.insert(&key, SenValue::borrowed(&record));
-    }
 }
 
 fn load_settings(db: &RhoDb) -> SettingsRecord {
@@ -968,40 +870,6 @@ mod tests {
             Some("available")
         );
         assert_eq!(manager.state().disabled_namespaces, ["missing"]);
-    }
-
-    #[tokio::test]
-    async fn migrates_scoped_legacy_chatgpt_quota_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-        let mut write = db.write().await;
-        write
-            .open_table(FORMAT)
-            .insert(&(), INITIAL_FORMAT.to_owned());
-        let record = QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel(1),
-            auth_namespace: Some("work".to_owned()),
-            observed_at: UnixMs(123),
-            used_percent: 42,
-            reset_at_unix: Some(456),
-        };
-        write.open_table(LEGACY_QUOTAS).insert(
-            &QuotaObservationKey {
-                model: QuotaModel(1),
-                observed_at: 123,
-            },
-            &record,
-        );
-        write.commit();
-        init(&db).await.unwrap();
-
-        let migrated = records(&db);
-        assert_eq!(migrated.len(), 1);
-        assert_eq!(migrated[0].auth_namespace, "work");
-        assert_eq!(migrated[0].weekly_used_percent, 42);
-        assert_eq!(migrated[0].routing_used_percent, 42);
-        assert_eq!(load_settings(&db).current_namespace, None);
     }
 
     #[test]
