@@ -34,7 +34,7 @@ use rho_core::{
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use rho_notebook::{PythonCell, ReplyState, SourceWaker};
+use rho_notebook::{PythonCell, SourceWaker};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::boundary::{
@@ -454,8 +454,17 @@ pub(crate) enum Phase {
     Requesting(InFlight),
 }
 
-/// The notebook takes one cell per model response, and there is nothing else
-/// to call.
+/// Whether a call or one of its nested sources has been drained. The core
+/// owns this bookkeeping; what the source is doing is the tool's to report.
+/// For the outer call this also selects the provider's result/update shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyState {
+    /// Still awaiting its first contribution at a request boundary.
+    Owed,
+    /// Already drained; subsequent output is an update.
+    Sent,
+}
+
 /// The core's bookkeeping for one call: which tool, how much of its story the
 /// model has, and since when it has been holding something. The output itself
 /// lives in the session, which is asked for it at every boundary.

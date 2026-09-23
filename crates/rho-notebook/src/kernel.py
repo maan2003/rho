@@ -47,6 +47,8 @@ class Owner:
         self.live = 1
         # Tasks and handles, for cancellation.
         self.work = set()
+        self.has_returned = False
+        # What failed after the code returned; the return reports its own.
         self.error = None
         self.done = False
 
@@ -70,15 +72,14 @@ class Owner:
         self.cell.finished(self.error)
 
     def returned(self, error):
-        if error is not None and self.error is None:
-            self.error = error
+        self.has_returned = True
         self.cell.returned(error)
         self.release()
 
     def cancel(self):
         with self.lock:
             work = list(self.work)
-        if work and self.error is None:
+        if work and self.has_returned and self.error is None:
             self.error = 'CancelledError'
         for item in work:
             # A task's scheduled step delivers the cancellation the task
@@ -624,15 +625,8 @@ def freeze(value):
     return value
 
 
-def history_item(raw):
-    fields = dict(zip(HISTORY_FIELDS, raw))
-    fields['content'] = tuple(HistoryContent(*part) for part in fields['content'])
-    fields['images'] = tuple(HistoryImage(*image) for image in fields['images'])
-    if fields['provider'] is not None:
-        fields['provider'] = HistoryProviderData(*fields['provider'])
-    if fields['metadata'] is not None:
-        fields['metadata'] = freeze(json.loads(fields['metadata']))
-    return HistoryItem(**fields)
+def frozen_json(text):
+    return freeze(json.loads(text))
 
 
 class Transcript(Sequence):
@@ -648,14 +642,14 @@ class Transcript(Sequence):
         cell = self._cell()
         length = cell.history_len()
         if isinstance(index, slice):
-            return tuple(history_item(cell.history_get(at)) for at in range(*index.indices(length)))
+            return tuple(cell.history_get(at) for at in range(*index.indices(length)))
         if not is_int(index):
             raise TypeError('transcript indices must be integers or slices')
         if index < 0:
             index += length
         if not 0 <= index < length:
             raise IndexError('transcript index out of range')
-        return history_item(cell.history_get(index))
+        return cell.history_get(index)
 
     def __iter__(self):
         """A snapshot: items appended while iterating are not included."""

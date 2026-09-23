@@ -6,85 +6,19 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use rho_core::UnixMs;
 use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::cell::current;
 use crate::notebook::{ExecState, Shared, operation, register};
 use crate::runtime::{Build, Message};
+use crate::source::{CommandExit, Log, Process, Source, session_id};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
 const OUTPUT_TOKEN_LIMIT: usize = 10000;
-
-/// The session ID a job is reported under, so the pieces of one background
-/// command correlate across replies. A display concern only: the scheduler
-/// reads facts, never this, and the model refers to a job by its Python handle.
-///
-/// Each modular shift is reversible by subtraction. Together they permute all
-/// 9,000 slots without a lookup table; labels repeat every 9,000 internal
-/// requests. Handles and output ordering always use the original internal ID.
-pub(crate) fn session_id(internal_id: u64) -> u32 {
-    let x = internal_id % 9_000;
-    let (mut left, mut right) = (x / 100, x % 100);
-    left = (left + right * right + 17 * right + 43) % 90;
-    right = (right + left * left + 29 * left + 71) % 100;
-    left = (left + right * right + 53 * right + 19) % 90;
-    right = (right + left * left + 11 * left + 37) % 100;
-    (1_000 + 100 * left + right) as u32
-}
-
-/// How a command ended, as awaiting its handle shows it.
-#[derive(Clone, Debug)]
-pub(crate) struct CommandExit {
-    pub(crate) id: u64,
-    pub(crate) exit_code: Option<i32>,
-}
-
-impl<'py> IntoPyObject<'py> for CommandExit {
-    type Target = PyDict;
-    type Output = Bound<'py, PyDict>;
-    type Error = PyErr;
-
-    fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let exit = PyDict::new(py);
-        exit.set_item("id", self.id)?;
-        exit.set_item("exit_code", self.exit_code)?;
-        Ok(exit)
-    }
-}
-
-pub(crate) struct Job {
-    pub(crate) id: u64,
-    pub(crate) name: String,
-    pub(crate) state: Mutex<JobState>,
-    pub(crate) stdin: tokio::sync::Mutex<Option<tokio::net::unix::pipe::Sender>>,
-    pub(crate) cancel: Notify,
-    pub(crate) budget: usize,
-    pub(crate) ready: tokio::sync::watch::Sender<bool>,
-    /// Flipped when the job ends, so a handle recovered from a session ID can
-    /// wait for it without holding the request that started it.
-    pub(crate) done: tokio::sync::watch::Sender<bool>,
-}
-pub(crate) struct JobState {
-    pub(crate) file: std::fs::File,
-    pub(crate) len: usize,
-    pub(crate) dropped: usize,
-    pub(crate) cursor: usize,
-    pub(crate) unsent: BoundedOutput,
-    pub(crate) registered_at: UnixMs,
-    /// Told to the model as running, so its end can name the same ID.
-    pub(crate) announced: bool,
-    /// Oldest unsent output.
-    pub(crate) since: Option<UnixMs>,
-    pub(crate) finished: Option<(UnixMs, Result<CommandExit, String>)>,
-    /// A non-zero or missing exit code, a spawn failure, or a cancellation.
-    pub(crate) failed: bool,
-    pub(crate) delivered: bool,
-}
 
 fn command_name(cmd: &str) -> String {
     let mut name = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -99,7 +33,7 @@ fn command_name(cmd: &str) -> String {
     name
 }
 
-fn new_job(shared: &Shared, cmd: &str, budget: usize) -> Result<Arc<Job>, String> {
+fn new_job(shared: &Shared, cmd: &str, budget: usize) -> Result<Arc<Source>, String> {
     let mut jobs = shared.jobs.lock().unwrap();
     if jobs.len() >= JOB_LIMIT {
         let old = jobs
@@ -114,33 +48,30 @@ fn new_job(shared: &Shared, cmd: &str, budget: usize) -> Result<Arc<Job>, String
         };
     }
     let id = shared.next_request.fetch_add(1, Ordering::Relaxed);
-    let job = Arc::new(Job {
+    let job = Arc::new(Source::new(
         id,
-        name: command_name(cmd),
-        state: Mutex::new(JobState {
+        command_name(cmd),
+        budget,
+        Some(Process {
+            budget,
+            stdin: tokio::sync::Mutex::new(None),
+            cancel: Notify::new(),
+            ready: watch::channel(false).0,
+            done: watch::channel(false).0,
+        }),
+        Some(Log {
             file: tempfile::tempfile().map_err(|e| e.to_string())?,
             len: 0,
             dropped: 0,
             cursor: 0,
-            unsent: BoundedOutput::for_tokens(Some(budget)),
-            registered_at: UnixMs::now(),
-            announced: false,
-            since: None,
-            finished: None,
-            failed: false,
-            delivered: false,
+            exit: None,
         }),
-        stdin: tokio::sync::Mutex::new(None),
-        cancel: Notify::new(),
-        budget,
-        ready: tokio::sync::watch::channel(false).0,
-        done: tokio::sync::watch::channel(false).0,
-    });
+    ));
     jobs.insert(id, Arc::clone(&job));
     Ok(job)
 }
 
-fn job(shared: &Shared, id: u64) -> PyResult<Arc<Job>> {
+fn job(shared: &Shared, id: u64) -> PyResult<Arc<Source>> {
     shared
         .jobs
         .lock()
@@ -184,12 +115,12 @@ pub(crate) fn command(
     let registered = register(
         shared,
         exec.cell,
-        None,
-        Some(Arc::clone(&job)),
-        move |link, _| async move {
+        Arc::clone(&job),
+        move |link| async move {
+            let process = job.process();
             let result = run_command(&shell, &job, &cmd, workdir.as_deref(), &link).await;
-            *job.stdin.lock().await = None;
-            job.ready.send_replace(true);
+            *process.stdin.lock().await = None;
+            process.ready.send_replace(true);
             // Failure is a fact of the process, computed here and nowhere
             // else: a non-zero exit, no exit code at all (a signal), a spawn
             // failure, or a cancellation.
@@ -201,10 +132,11 @@ pub(crate) fn command(
                 })
             );
             let mut state = job.state.lock().unwrap();
-            state.finished = Some((UnixMs::now(), result.clone()));
+            state.log.as_mut().expect("a command keeps a log").exit = Some(result.clone());
+            state.finished = Some(UnixMs::now());
             state.failed = failed;
             drop(state);
-            job.done.send_replace(true);
+            process.done.send_replace(true);
             result
         },
         move |result: Result<CommandExit, String>| {
@@ -239,12 +171,14 @@ pub(crate) fn write_stdin(
         if chars.is_empty() {
             return Ok(());
         }
-        job.ready
+        let process = job.process();
+        process
+            .ready
             .subscribe()
             .wait_for(|ready| *ready)
             .await
             .map_err(|e| e.to_string())?;
-        let mut stdin = job.stdin.lock().await;
+        let mut stdin = process.stdin.lock().await;
         let stdin = stdin.as_mut().ok_or("Command stdin not ready or closed")?;
         stdin
             .write_all(chars.as_bytes())
@@ -284,7 +218,7 @@ impl Command {
             .unwrap()
             .keys()
             .copied()
-            .filter(|id| u64::from(crate::commands::session_id(*id)) == session_id)
+            .filter(|id| u64::from(crate::source::session_id(*id)) == session_id)
             .collect();
         match found.as_slice() {
             [id] => Ok(Self {
@@ -307,10 +241,11 @@ impl Command {
             None => {
                 let job = job(&current(py, "Commands are available")?.shared, self.id)?;
                 let future = operation(py, "wait_command", move |_| async move {
-                    let mut done = job.done.subscribe();
+                    let mut done = job.process().done.subscribe();
                     loop {
-                        let finished = job.state.lock().unwrap().finished.clone();
-                        if let Some((_, result)) = finished {
+                        let exit = (job.state.lock().unwrap().log.as_ref())
+                            .and_then(|log| log.exit.clone());
+                        if let Some(result) = exit {
                             return result;
                         }
                         done.changed().await.map_err(|e| e.to_string())?;
@@ -340,7 +275,7 @@ impl Command {
     fn cancel(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let job = job(&current(py, "Commands are available")?.shared, self.id)?;
         operation(py, "cancel_command", move |_| async move {
-            job.cancel.notify_one();
+            job.process().cancel.notify_one();
             Ok(())
         })
     }
@@ -351,38 +286,35 @@ impl Command {
 }
 
 /// The next page of a command's log, in the shape its own output arrives in.
-pub(crate) fn read_page(job: &Job, max_tokens: usize) -> Result<String, String> {
+pub(crate) fn read_page(job: &Source, max_tokens: usize) -> Result<String, String> {
     let mut state = job.state.lock().unwrap();
-    let start = state.cursor;
-    let size = (state.len - start).min(max_tokens.clamp(1, 10000) * 4);
+    let finished = state.finished.is_some();
+    let log = state.log.as_mut().expect("a command keeps a log");
+    let start = log.cursor;
+    let size = (log.len - start).min(max_tokens * 4);
     let mut bytes = vec![0; size];
-    state
-        .file
+    log.file
         .seek(SeekFrom::Start(start as u64))
         .map_err(|e| e.to_string())?;
-    state
-        .file
-        .read_exact(&mut bytes)
-        .map_err(|e| e.to_string())?;
+    log.file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
     // Do not split a UTF-8 character merely because a page hit its budget.
     // Non-UTF-8 process output still follows the shell's lossy-text contract.
-    if size < state.len - start
+    if size < log.len - start
         && let Err(error) = std::str::from_utf8(&bytes)
         && error.error_len().is_none()
     {
         bytes.truncate(error.valid_up_to());
     }
-    state.cursor += bytes.len();
+    log.cursor += bytes.len();
+    let remaining = log.len - log.cursor;
+    let dropped = log.dropped;
     // Reading by hand takes over from the automatic report: whatever was
     // waiting to be reported is dropped, so the next reply does not say
     // again what this page just showed. The rest is paged the same way.
-    state.unsent = BoundedOutput::for_tokens(Some(job.budget));
+    state.unsent = BoundedOutput::for_tokens(Some(job.process().budget));
     state.since = None;
-    let page = String::from_utf8_lossy(&bytes).into_owned();
-    let remaining = state.len - state.cursor;
-    let finished = state.finished.is_some();
-    let dropped = state.dropped;
     drop(state);
+    let page = String::from_utf8_lossy(&bytes).into_owned();
     let mut parts = vec![format!("Session ID: {}", session_id(job.id))];
     if page.is_empty() {
         parts.push(
@@ -411,39 +343,38 @@ pub(crate) fn read_page(job: &Job, max_tokens: usize) -> Result<String, String> 
 
 pub(crate) async fn run_command(
     shell: &ShellTools,
-    job: &Job,
+    job: &Source,
     cmd: &str,
     workdir: Option<&str>,
     link: &Arc<Mutex<ExecState>>,
 ) -> Result<CommandExit, String> {
+    let control = job.process();
     let mut cancelled = link.lock().unwrap().cancelled.subscribe();
     let mut process = tokio::select! {
         biased;
         _ = cancelled.wait_for(|cancelled| *cancelled) => return Err("Command cancelled".into()),
-        _ = job.cancel.notified() => return Err("Command cancelled".into()),
+        _ = control.cancel.notified() => return Err("Command cancelled".into()),
         process = shell.spawn(cmd, workdir) => process.map_err(|e| e.to_string())?,
     };
     let work = async {
-        *job.stdin.lock().await = process.take_stdin();
-        job.ready.send_replace(true);
+        *control.stdin.lock().await = process.take_stdin();
+        control.ready.send_replace(true);
         let mut exit_code = None;
         loop {
             let event = process.next().await;
             match event {
                 ProcessEvent::Output(chunk) => {
                     let mut state = job.state.lock().unwrap();
-                    let keep = chunk.len().min(LOG_LIMIT - state.len);
-                    let end = state.len as u64;
-                    state
-                        .file
-                        .seek(SeekFrom::Start(end))
+                    let log = state.log.as_mut().expect("a command keeps a log");
+                    let keep = chunk.len().min(LOG_LIMIT - log.len);
+                    log.file
+                        .seek(SeekFrom::Start(log.len as u64))
                         .map_err(|e| e.to_string())?;
-                    state
-                        .file
+                    log.file
                         .write_all(&chunk[..keep])
                         .map_err(|e| e.to_string())?;
-                    state.len += keep;
-                    state.dropped = state.dropped.saturating_add(chunk.len() - keep);
+                    log.len += keep;
+                    log.dropped = log.dropped.saturating_add(chunk.len() - keep);
                     state.unsent.push(&chunk);
                     state.since.get_or_insert_with(UnixMs::now);
                 }
@@ -461,7 +392,7 @@ pub(crate) async fn run_command(
     let result = tokio::select! {
         biased;
         _ = cancelled.wait_for(|cancelled| *cancelled) => Err("Command cancelled".into()),
-        _ = job.cancel.notified() => Err("Command cancelled".into()),
+        _ = control.cancel.notified() => Err("Command cancelled".into()),
         result = work => result,
     };
     process
@@ -469,19 +400,4 @@ pub(crate) async fn run_command(
         .await
         .map_err(|error| error.to_string())?;
     result
-}
-
-#[cfg(test)]
-mod session_id_tests {
-    use super::session_id;
-
-    #[test]
-    fn labels_are_distinct_within_a_cycle_and_in_range() {
-        let labels = (0..9_000)
-            .map(session_id)
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(labels.len(), 9_000);
-        assert!(labels.iter().all(|label| (1_000..10_000).contains(label)));
-        assert_eq!(session_id(9_000), session_id(0));
-    }
 }

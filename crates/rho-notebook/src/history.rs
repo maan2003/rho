@@ -2,12 +2,12 @@
 //! sequence over a snapshot taken when the cell was admitted.
 use std::sync::Arc;
 
-use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::PyIndexError;
+use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple};
 use rho_core::{
-    ContentPart, ContextBlock, InferenceResponseItem, MessageSender, ToolOutputStatus, ToolType,
+    ContentPart, ContextBlock, InferenceResponseItem, MessageSender, ProviderSpecificData,
+    ToolOutputStatus, ToolType,
 };
 
 #[derive(Default)]
@@ -35,63 +35,14 @@ impl HistorySnapshot {
         self.locations.len()
     }
 
-    /// One item as a plain tuple in `HistoryItem` field order; the kernel
-    /// builds the named tuples.
-    pub(crate) fn get<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyTuple>> {
+    /// One item as the kernel's `HistoryItem`.
+    pub(crate) fn get<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyAny>> {
         let &(block, offset) = self
             .locations
             .get(index)
             .ok_or_else(|| PyIndexError::new_err("transcript index out of range"))?;
-        let item = history_item(&self.blocks[block], offset)
-            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-        history_tuple(py, item)
+        history_item(py, &self.blocks[block], offset)
     }
-}
-
-/// One transcript entry as the notebook's `transcript` shows it.
-#[derive(Clone, Debug, Default)]
-struct HistoryItem {
-    kind: &'static str,
-    role: Option<&'static str>,
-    sender: Option<String>,
-    text: Option<String>,
-    content: Vec<HistoryContent>,
-    name: Option<String>,
-    call_id: Option<String>,
-    summary: Vec<String>,
-    images: Vec<HistoryImage>,
-    provider: Option<HistoryProviderData>,
-    status: Option<&'static str>,
-    phase: Option<&'static str>,
-    tool_type: Option<&'static str>,
-    started_at: Option<i64>,
-    finished_at: Option<i64>,
-    at: Option<i64>,
-    retain_from: Option<u64>,
-    call_ids: Vec<String>,
-    response_id: Option<String>,
-    metadata: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug)]
-struct HistoryContent {
-    kind: &'static str,
-    text: Option<String>,
-    media_type: Option<String>,
-    data: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Debug)]
-struct HistoryImage {
-    media_type: String,
-    data: Vec<u8>,
-    detail: Option<&'static str>,
-}
-
-#[derive(Clone, Debug)]
-struct HistoryProviderData {
-    tag: String,
-    data: Vec<u8>,
 }
 
 fn history_block_len(block: &ContextBlock) -> usize {
@@ -102,59 +53,96 @@ fn history_block_len(block: &ContextBlock) -> usize {
     }
 }
 
-fn history_content(content: &[ContentPart]) -> Vec<HistoryContent> {
-    content
-        .iter()
-        .map(|part| match part {
-            ContentPart::Text { text } => HistoryContent {
-                kind: "text",
-                text: Some(text.clone()),
-                media_type: None,
-                data: None,
-            },
-            ContentPart::Image { media_type, data } => HistoryContent {
-                kind: "image",
-                text: None,
-                media_type: Some(media_type.clone()),
-                data: Some(data.clone()),
-            },
-        })
-        .collect()
+/// A transcript item under construction: the fields it has, by name. The
+/// kernel's named tuples supply the rest as defaults.
+struct Item<'py> {
+    kernel: Bound<'py, PyModule>,
+    fields: Bound<'py, PyDict>,
 }
 
-fn history_text(content: &[ContentPart]) -> String {
-    content
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } => None,
-        })
-        .collect()
-}
+impl<'py> Item<'py> {
+    fn new(py: Python<'py>, kind: &str) -> PyResult<Self> {
+        let item = Self {
+            kernel: crate::interpreter::kernel(py)?.clone(),
+            fields: PyDict::new(py),
+        };
+        item.set("kind", kind)
+    }
 
-fn history_images(images: &[rho_core::ImageContent]) -> Vec<HistoryImage> {
-    images
-        .iter()
-        .map(|image| HistoryImage {
-            media_type: image.media_type.clone(),
-            data: image.data.clone(),
-            detail: Some(match image.detail {
-                rho_core::ImageDetail::High => "high",
-                rho_core::ImageDetail::Original => "original",
-            }),
-        })
-        .collect()
-}
+    fn set(self, name: &str, value: impl IntoPyObject<'py>) -> PyResult<Self> {
+        self.fields.set_item(name, value)?;
+        Ok(self)
+    }
 
-fn provider_data(
-    provider: &dyn rho_core::ProviderSpecificData,
-) -> Result<Option<HistoryProviderData>, String> {
-    let encoded =
-        senax_encoder::encode(&provider.clone_box()).map_err(|error| error.to_string())?;
-    Ok(Some(HistoryProviderData {
-        tag: provider.tag().to_owned(),
-        data: encoded.to_vec(),
-    }))
+    fn py(&self) -> Python<'py> {
+        self.fields.py()
+    }
+
+    fn content(self, content: &[ContentPart]) -> PyResult<Self> {
+        let text: String = content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Image { .. } => None,
+            })
+            .collect();
+        let make = self.kernel.getattr("HistoryContent")?;
+        let parts = content
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => make.call1(("text", text)),
+                ContentPart::Image { media_type, data } => make.call1((
+                    "image",
+                    None::<&str>,
+                    media_type,
+                    PyBytes::new(self.py(), data),
+                )),
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let parts = PyTuple::new(self.py(), parts)?;
+        self.set("text", text)?.set("content", parts)
+    }
+
+    fn images(self, images: &[rho_core::ImageContent]) -> PyResult<Self> {
+        let make = self.kernel.getattr("HistoryImage")?;
+        let images = images
+            .iter()
+            .map(|image| {
+                let detail = match image.detail {
+                    rho_core::ImageDetail::High => "high",
+                    rho_core::ImageDetail::Original => "original",
+                };
+                make.call1((
+                    &image.media_type,
+                    PyBytes::new(self.py(), &image.data),
+                    detail,
+                ))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let images = PyTuple::new(self.py(), images)?;
+        self.set("images", images)
+    }
+
+    fn strings<'a>(self, name: &str, values: impl IntoIterator<Item = &'a str>) -> PyResult<Self> {
+        let values = PyTuple::new(self.py(), values.into_iter().collect::<Vec<_>>())?;
+        self.set(name, values)
+    }
+
+    fn provider(self, provider: &dyn ProviderSpecificData) -> PyResult<Self> {
+        let encoded = senax_encoder::encode(&provider.clone_box())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let data = self
+            .kernel
+            .getattr("HistoryProviderData")?
+            .call1((provider.tag(), PyBytes::new(self.py(), &encoded)))?;
+        self.set("provider", data)
+    }
+
+    fn build(self) -> PyResult<Bound<'py, PyAny>> {
+        self.kernel
+            .getattr("HistoryItem")?
+            .call((), Some(&self.fields))
+    }
 }
 
 fn tool_type(value: ToolType) -> &'static str {
@@ -172,196 +160,123 @@ fn output_status(value: ToolOutputStatus) -> &'static str {
     }
 }
 
-fn history_item(block: &ContextBlock, offset: usize) -> Result<HistoryItem, String> {
-    let item = match block {
+fn history_item<'py>(
+    py: Python<'py>,
+    block: &ContextBlock,
+    offset: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let item = |kind| Item::new(py, kind);
+    match block {
         ContextBlock::UserMessage { sender, content } => {
             let (role, sender) = match sender {
                 MessageSender::User => ("user", None),
-                MessageSender::Agent { id } => ("agent", Some(id.encoded().to_owned())),
+                MessageSender::Agent { id } => ("agent", Some(id.encoded())),
             };
-            HistoryItem {
-                kind: "message",
-                role: Some(role),
-                sender,
-                text: Some(history_text(content)),
-                content: history_content(content),
-                ..HistoryItem::default()
-            }
+            item("message")?
+                .set("role", role)?
+                .set("sender", sender)?
+                .content(content)?
+                .build()
         }
-        ContextBlock::DeveloperMessage { text } => HistoryItem {
-            kind: "message",
-            role: Some("developer"),
-            text: Some(text.clone()),
-            ..HistoryItem::default()
-        },
+        ContextBlock::DeveloperMessage { text } => item("message")?
+            .set("role", "developer")?
+            .set("text", text)?
+            .build(),
         ContextBlock::ToolResults { results } => {
             let result = &results[offset];
-            HistoryItem {
-                kind: "tool_result",
-                call_id: Some(result.call_id.as_str().to_owned()),
-                tool_type: Some(tool_type(result.tool_type)),
-                text: Some(result.body.output.as_str().to_owned()),
-                images: history_images(&result.body.images),
-                status: Some(output_status(result.body.status)),
-                started_at: Some(result.started_at.0 as i64),
-                finished_at: Some(result.finished_at.0 as i64),
-                metadata: result
-                    .metadata
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|error| error.to_string())?,
-                ..HistoryItem::default()
-            }
+            let metadata = match &result.metadata {
+                Some(metadata) => {
+                    let json = serde_json::to_string(metadata)
+                        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                    Some(crate::interpreter::kernel(py)?.call_method1("frozen_json", (json,))?)
+                }
+                None => None,
+            };
+            item("tool_result")?
+                .set("call_id", result.call_id.as_str())?
+                .set("tool_type", tool_type(result.tool_type))?
+                .set("text", result.body.output.as_str())?
+                .images(&result.body.images)?
+                .set("status", output_status(result.body.status))?
+                .set("started_at", result.started_at.0)?
+                .set("finished_at", result.finished_at.0)?
+                .set("metadata", metadata)?
+                .build()
         }
-        ContextBlock::ToolUpdate(update) => HistoryItem {
-            kind: "tool_update",
-            call_id: Some(update.call_id.as_str().to_owned()),
-            tool_type: Some(tool_type(update.tool_type)),
-            text: Some(update.output.as_str().to_owned()),
-            images: history_images(&update.images),
-            status: update.status.map(output_status),
-            at: Some(update.at.0 as i64),
-            ..HistoryItem::default()
-        },
+        ContextBlock::ToolUpdate(update) => item("tool_update")?
+            .set("call_id", update.call_id.as_str())?
+            .set("tool_type", tool_type(update.tool_type))?
+            .set("text", update.output.as_str())?
+            .images(&update.images)?
+            .set("status", update.status.map(output_status))?
+            .set("at", update.at.0)?
+            .build(),
         ContextBlock::InferenceResponse {
             items,
             provider_response_id,
         } => {
-            let response_id = provider_response_id
-                .as_ref()
-                .map(|id| id.as_str().to_owned());
+            let response = |kind, provider: &dyn ProviderSpecificData| {
+                item(kind)?.provider(provider)?.set(
+                    "response_id",
+                    provider_response_id.as_ref().map(|id| id.as_str()),
+                )
+            };
             match &items[offset] {
                 InferenceResponseItem::AssistantMessage {
                     provider_specific,
                     content,
                     phase,
-                } => HistoryItem {
-                    kind: "message",
-                    role: Some("assistant"),
-                    text: Some(history_text(content)),
-                    content: history_content(content),
-                    phase: phase.map(|phase| match phase {
-                        rho_core::MessagePhase::Commentary => "commentary",
-                        rho_core::MessagePhase::FinalAnswer => "final_answer",
-                    }),
-                    provider: provider_data(provider_specific.as_ref())?,
-                    response_id,
-                    ..HistoryItem::default()
-                },
+                } => response("message", provider_specific.as_ref())?
+                    .set("role", "assistant")?
+                    .content(content)?
+                    .set(
+                        "phase",
+                        phase.map(|phase| match phase {
+                            rho_core::MessagePhase::Commentary => "commentary",
+                            rho_core::MessagePhase::FinalAnswer => "final_answer",
+                        }),
+                    )?
+                    .build(),
                 InferenceResponseItem::ToolCall {
                     provider_specific,
                     id,
                     name,
                     tool_type: kind,
                     arguments,
-                } => HistoryItem {
-                    kind: "tool_call",
-                    name: Some(name.as_str().to_owned()),
-                    text: Some(arguments.clone()),
-                    call_id: Some(id.as_str().to_owned()),
-                    tool_type: Some(tool_type(*kind)),
-                    provider: provider_data(provider_specific.as_ref())?,
-                    response_id,
-                    ..HistoryItem::default()
-                },
+                } => response("tool_call", provider_specific.as_ref())?
+                    .set("name", name.as_str())?
+                    .set("text", arguments)?
+                    .set("call_id", id.as_str())?
+                    .set("tool_type", tool_type(*kind))?
+                    .build(),
                 InferenceResponseItem::EncryptedReasoning {
                     provider_specific,
                     summary,
-                } => HistoryItem {
-                    kind: "encrypted_reasoning",
-                    summary: summary.clone(),
-                    provider: provider_data(provider_specific.as_ref())?,
-                    response_id,
-                    ..HistoryItem::default()
-                },
+                } => response("encrypted_reasoning", provider_specific.as_ref())?
+                    .strings("summary", summary.iter().map(String::as_str))?
+                    .build(),
                 InferenceResponseItem::RawReasoning {
                     provider_specific,
                     content,
                     summary,
-                } => HistoryItem {
-                    kind: "reasoning",
-                    text: Some(content.clone()),
-                    summary: summary.clone(),
-                    provider: provider_data(provider_specific.as_ref())?,
-                    response_id,
-                    ..HistoryItem::default()
-                },
-                InferenceResponseItem::Compaction { provider_specific } => HistoryItem {
-                    kind: "compaction",
-                    provider: provider_data(provider_specific.as_ref())?,
-                    response_id,
-                    ..HistoryItem::default()
-                },
-                InferenceResponseItem::Unknown { provider_specific } => HistoryItem {
-                    kind: "unknown",
-                    provider: provider_data(provider_specific.as_ref())?,
-                    response_id,
-                    ..HistoryItem::default()
-                },
+                } => response("reasoning", provider_specific.as_ref())?
+                    .set("text", content)?
+                    .strings("summary", summary.iter().map(String::as_str))?
+                    .build(),
+                InferenceResponseItem::Compaction { provider_specific } => {
+                    response("compaction", provider_specific.as_ref())?.build()
+                }
+                InferenceResponseItem::Unknown { provider_specific } => {
+                    response("unknown", provider_specific.as_ref())?.build()
+                }
             }
         }
-        ContextBlock::CompactionTrigger => HistoryItem {
-            kind: "compaction_trigger",
-            ..HistoryItem::default()
-        },
-        ContextBlock::ContextRotation { retain_from } => HistoryItem {
-            kind: "context_rotation",
-            retain_from: Some(*retain_from),
-            ..HistoryItem::default()
-        },
-        ContextBlock::ToolHistoryEvicted { call_ids } => HistoryItem {
-            kind: "tool_history_evicted",
-            call_ids: call_ids.iter().map(|id| id.as_str().to_owned()).collect(),
-            ..HistoryItem::default()
-        },
-    };
-    Ok(item)
-}
-
-fn history_tuple(py: Python<'_>, item: HistoryItem) -> PyResult<Bound<'_, PyTuple>> {
-    let bytes = |data: &[u8]| PyBytes::new(py, data).into_any();
-    let content = item
-        .content
-        .into_iter()
-        .map(|part| {
-            let data = part.data.as_deref().map(bytes);
-            (part.kind, part.text, part.media_type, data).into_bound_py_any(py)
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    let images = item
-        .images
-        .into_iter()
-        .map(|image| (image.media_type, bytes(&image.data), image.detail).into_bound_py_any(py))
-        .collect::<PyResult<Vec<_>>>()?;
-    let provider = item
-        .provider
-        .map(|provider| (provider.tag, bytes(&provider.data)).into_bound_py_any(py))
-        .transpose()?;
-    let metadata = item.metadata.as_ref().map(serde_json::Value::to_string);
-    PyTuple::new(
-        py,
-        [
-            item.kind.into_bound_py_any(py)?,
-            item.role.into_bound_py_any(py)?,
-            item.sender.into_bound_py_any(py)?,
-            item.text.into_bound_py_any(py)?,
-            PyTuple::new(py, content)?.into_any(),
-            item.name.into_bound_py_any(py)?,
-            item.call_id.into_bound_py_any(py)?,
-            PyTuple::new(py, item.summary)?.into_any(),
-            PyTuple::new(py, images)?.into_any(),
-            provider.into_bound_py_any(py)?,
-            item.status.into_bound_py_any(py)?,
-            item.phase.into_bound_py_any(py)?,
-            item.tool_type.into_bound_py_any(py)?,
-            item.started_at.into_bound_py_any(py)?,
-            item.finished_at.into_bound_py_any(py)?,
-            item.at.into_bound_py_any(py)?,
-            item.retain_from.into_bound_py_any(py)?,
-            PyTuple::new(py, item.call_ids)?.into_any(),
-            item.response_id.into_bound_py_any(py)?,
-            metadata.into_bound_py_any(py)?,
-        ],
-    )
+        ContextBlock::CompactionTrigger => item("compaction_trigger")?.build(),
+        ContextBlock::ContextRotation { retain_from } => item("context_rotation")?
+            .set("retain_from", *retain_from)?
+            .build(),
+        ContextBlock::ToolHistoryEvicted { call_ids } => item("tool_history_evicted")?
+            .strings("call_ids", call_ids.iter().map(|id| id.as_str()))?
+            .build(),
+    }
 }

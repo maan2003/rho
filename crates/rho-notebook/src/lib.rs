@@ -28,6 +28,7 @@ mod notebook;
 mod runtime;
 #[cfg(test)]
 mod runtime_tests;
+mod source;
 #[cfg(test)]
 mod tests;
 mod tool;
@@ -37,7 +38,7 @@ use std::sync::Arc;
 pub use cell::{PythonCell, PythonExec};
 pub use notebook::{Export, PythonNotebook, PythonStreamProgress, ToolCx, detached, operation};
 use rho_core::{ToolOutput, ToolOutputStatus};
-pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, ReplyState, SourceFacts, SourceWaker};
+pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, SourceFacts, SourceWaker};
 
 pub(crate) fn output(text: impl Into<String>, status: ToolOutputStatus) -> ToolOutput {
     ToolOutput {

@@ -17,10 +17,11 @@ use rho_claude::mcp::{reply, text_item, tool_result};
 #[cfg(test)]
 use rho_core::ToolOutputStatus;
 use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
-use rho_notebook::{PythonCell, PythonExec, PythonNotebook, ReplyState, SourceWaker};
+use rho_notebook::{PythonCell, PythonExec, PythonNotebook, SourceWaker};
 use serde_json::Value;
 use tokio::sync::Notify;
 
+use crate::agent::ReplyState;
 use crate::boundary::{
     Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
 };

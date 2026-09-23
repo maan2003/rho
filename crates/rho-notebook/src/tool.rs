@@ -114,14 +114,3 @@ impl SourceWaker {
         self.0.notify_one();
     }
 }
-
-/// Whether a call or one of its nested sources has been drained. The core
-/// owns this bookkeeping; what the source is doing is the tool's to report.
-/// For the outer call this also selects the provider's result/update shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyState {
-    /// Still awaiting its first contribution at a request boundary.
-    Owed,
-    /// Already drained; subsequent output is an update.
-    Sent,
-}

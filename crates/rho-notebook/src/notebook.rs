@@ -15,9 +15,9 @@ use rho_tool_shell::{BoundedOutput, ShellTools};
 
 use crate::SourceWaker;
 use crate::cell::{PythonCell, PythonExec};
-use crate::commands::Job;
 use crate::history::HistorySnapshot;
 use crate::runtime::{Build, Inbox, Input, Message};
+use crate::source::Source;
 
 pub struct PythonNotebook {
     shared: Arc<Shared>,
@@ -37,7 +37,7 @@ pub(crate) struct Shared {
     pub(crate) next_request: AtomicU64,
     pub(crate) shell: ShellTools,
     pub(crate) cells: Mutex<HashMap<u64, Arc<Mutex<ExecState>>>>,
-    pub(crate) jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
+    pub(crate) jobs: Mutex<BTreeMap<u64, Arc<Source>>>,
     /// The newest cell that registered a job: where the foreground begins.
     /// Advanced by registration, never by a cell that only looks or waits.
     pub(crate) foreground_cell: AtomicU64,
@@ -65,7 +65,6 @@ pub struct PythonStreamProgress {
 }
 
 pub(crate) struct ExecState {
-    pub(crate) cell: u64,
     pub(crate) stream: PythonStreamProgress,
     pub(crate) waker: SourceWaker,
     pub(crate) output: BoundedOutput,
@@ -76,8 +75,6 @@ pub(crate) struct ExecState {
     pub(crate) finished: Option<UnixMs>,
     pub(crate) started: bool,
     pub(crate) returned: Option<UnixMs>,
-    pub(crate) returned_error: Option<String>,
-    pub(crate) operations: Vec<Arc<Mutex<Operation>>>,
     /// The cell raised, or the runtime stopped underneath it.
     pub(crate) failed: bool,
     /// Something went wrong in the cell, its own code or a job it awaited:
@@ -85,7 +82,9 @@ pub(crate) struct ExecState {
     pub(crate) error: bool,
     pub(crate) delivered: bool,
     pub(crate) checkin: Option<crate::PythonCheckin>,
-    pub(crate) jobs: Vec<Arc<Job>>,
+    /// Operations and commands, in the order they started, until each
+    /// has reported its end.
+    pub(crate) sources: Vec<Arc<Source>>,
     pub(crate) pending: usize,
     pub(crate) cancelled: tokio::sync::watch::Sender<bool>,
     pub(crate) images: Vec<rho_core::ImageContent>,
@@ -116,37 +115,15 @@ impl ExecState {
     pub(crate) fn closed(&self) -> bool {
         self.finished.is_some()
             && self.pending == 0
-            && self
-                .jobs
-                .iter()
-                .all(|j| j.state.lock().unwrap().finished.is_some())
+            && self.sources.iter().all(|source| source.finished())
     }
 
-    /// Whether the next `render` would say anything: unsent output, a job or
-    /// operation not yet announced as running, or one that ended and has not
-    /// been reported. Jobs and operations leave the lists once reported.
+    /// Whether the next `render` would say anything: unsent output, or a
+    /// source with something to report. Sources leave the list once their
+    /// end is reported.
     pub(crate) fn has_news(&self) -> bool {
-        !self.output.is_empty()
-            || self.operations.iter().any(|op| {
-                let op = op.lock().unwrap();
-                op.finished.is_some() || !op.announced
-            })
-            || self.jobs.iter().any(|job| {
-                let state = job.state.lock().unwrap();
-                !state.unsent.is_empty() || state.finished.is_some() || !state.announced
-            })
+        !self.output.is_empty() || self.sources.iter().any(|source| source.has_news())
     }
-}
-
-pub(crate) struct Operation {
-    pub(crate) id: u64,
-    pub(crate) name: String,
-    pub(crate) output: BoundedOutput,
-    pub(crate) registered_at: UnixMs,
-    /// Told to the model as running, so its end can name the same ID.
-    pub(crate) announced: bool,
-    pub(crate) finished: Option<UnixMs>,
-    pub(crate) failed: bool,
 }
 
 impl PythonNotebook {
@@ -187,14 +164,14 @@ impl PythonNotebook {
 
     fn stop(&self) {
         self.shared.tasks.lock().unwrap().closed = true;
-        for cell in self.shared.cells.lock().unwrap().values() {
+        for (id, cell) in self.shared.cells.lock().unwrap().iter() {
             let mut cell = cell.lock().unwrap();
-            let _ = self.shared.send(Input::Cancel { cell: cell.cell });
+            let _ = self.shared.send(Input::Cancel { cell: *id });
             cell.cancelled.send_replace(true);
             cell.fail("Python notebook closed");
         }
         for job in self.shared.jobs.lock().unwrap().values() {
-            job.cancel.notify_one();
+            job.process().cancel.notify_one();
         }
     }
 
@@ -229,7 +206,6 @@ impl PythonNotebook {
         let tasks = self.shared.tasks.lock().unwrap();
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
-            cell,
             stream: PythonStreamProgress::default(),
             waker,
             output: BoundedOutput::for_tokens(Some(10000)),
@@ -238,13 +214,11 @@ impl PythonNotebook {
             finished: None,
             started: false,
             returned: None,
-            returned_error: None,
-            operations: Vec::new(),
             failed: false,
             error: false,
             delivered: false,
             checkin: None,
-            jobs: Vec::new(),
+            sources: Vec::new(),
             pending: 0,
             cancelled: tokio::sync::watch::channel(false).0,
             images: Vec::new(),
@@ -384,17 +358,13 @@ where
     R: Send + 'static,
     Fut: Future<Output = Result<R, String>> + Send + 'static,
 {
+    let id = exec.shared.next_request.fetch_add(1, Ordering::Relaxed);
+    let source = Arc::new(Source::new(id, name.to_owned(), 10000, None, None));
     register(
         &exec.shared,
         exec.cell,
-        Some(name),
-        None,
-        |link, operation| {
-            work(ToolCx {
-                link,
-                operation: operation.expect("named work is an operation"),
-            })
-        },
+        Arc::clone(&source),
+        |link| work(ToolCx { link, source }),
         deliver,
     )
     .map_err(PyRuntimeError::new_err)
@@ -404,14 +374,19 @@ where
 /// images arrive with the cell's output.
 pub struct ToolCx {
     link: Arc<Mutex<ExecState>>,
-    operation: Arc<Mutex<Operation>>,
+    source: Arc<Source>,
 }
 
 impl ToolCx {
     /// Text the model sees in the cell's next report.
     pub fn report(&self, text: &str) {
         if !text.is_empty() {
-            self.operation.lock().unwrap().output.push(text.as_bytes());
+            self.source
+                .state
+                .lock()
+                .unwrap()
+                .unsent
+                .push(text.as_bytes());
         }
     }
 
@@ -434,9 +409,8 @@ impl ToolCx {
 pub(crate) fn register<R, Fut>(
     shared: &Arc<Shared>,
     cell: u64,
-    operation: Option<&str>,
-    job: Option<Arc<Job>>,
-    work: impl FnOnce(Arc<Mutex<ExecState>>, Option<Arc<Mutex<Operation>>>) -> Fut,
+    source: Arc<Source>,
+    work: impl FnOnce(Arc<Mutex<ExecState>>) -> Fut,
     deliver: impl FnOnce(Result<R, String>) + Send + 'static,
 ) -> Result<(), String>
 where
@@ -462,35 +436,19 @@ where
     if *link.lock().unwrap().cancelled.borrow() {
         return Err("Execution cancelled".into());
     }
-    let operation = operation.map(|name| {
-        Arc::new(Mutex::new(Operation {
-            id: shared.next_request.fetch_add(1, Ordering::Relaxed),
-            name: name.to_owned(),
-            output: BoundedOutput::for_tokens(Some(10000)),
-            registered_at: UnixMs::now(),
-            announced: false,
-            finished: None,
-            failed: false,
-        }))
-    });
     {
         let mut state = link.lock().unwrap();
         // Registering work is what moves the foreground: from here on, older
         // cells' jobs are background to this one's.
         shared.foreground_cell.fetch_max(cell, Ordering::Relaxed);
-        if let Some(operation) = &operation {
-            state.operations.push(Arc::clone(operation));
-        }
-        if let Some(job) = &job {
-            state.jobs.push(Arc::clone(job));
-        }
+        state.sources.push(Arc::clone(&source));
         state.pending += 1;
         state.waker.wake();
     }
-    let work = work(Arc::clone(&link), operation.clone());
+    let work = work(Arc::clone(&link));
     tasks.running.spawn_on(
         async move {
-            let result = if job.is_some() {
+            let result = if source.process.is_some() {
                 // A command stops its process and records how it ended
                 // itself; interrupting it here would skip that.
                 work.await
@@ -504,17 +462,19 @@ where
                     result = work => result,
                 }
             };
-            if let Some(operation) = &operation {
-                let mut operation = operation.lock().unwrap();
+            if source.process.is_none() {
+                let mut state = source.state.lock().unwrap();
                 if let Err(error) = &result {
-                    operation.output.push(error.as_bytes());
-                    operation.failed = true;
-                    link.lock().unwrap().error = true;
+                    state.unsent.push(error.as_bytes());
+                    state.failed = true;
                 }
-                operation.finished = Some(UnixMs::now());
+                state.finished = Some(UnixMs::now());
             }
             {
                 let mut state = link.lock().unwrap();
+                if source.process.is_none() && result.is_err() {
+                    state.error = true;
+                }
                 state.pending -= 1;
                 state.waker.wake();
             }
