@@ -14,9 +14,10 @@ use crate::default_db_path;
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DebugArgs {
-    /// Source database path. Defaults to rho's normal daemon database,
-    /// which the daemon must not be holding; a named one is taken to be
-    /// nobody's and is read or written without that check.
+    /// Source database path. Defaults to rho's normal daemon database: a
+    /// running daemon hands out a snapshot of it, and commands that write
+    /// it need the daemon stopped. A named one is taken to be nobody's and
+    /// is read or written without that check.
     #[arg(long = "db-path")]
     db_path: Option<PathBuf>,
 
@@ -90,9 +91,9 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     }
 }
 
-/// The daemon's lock, held for as long as the file lives; an error when
+/// The daemon's lock, held for as long as the file lives, or `None` while
 /// the daemon has it.
-fn hold_daemon_lock(daemon_lock: &Path, what: &str) -> anyhow::Result<std::fs::File> {
+fn try_daemon_lock(daemon_lock: &Path) -> anyhow::Result<Option<std::fs::File>> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -103,13 +104,11 @@ fn hold_daemon_lock(daemon_lock: &Path, what: &str) -> anyhow::Result<std::fs::F
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::WouldBlock {
-            anyhow::bail!(
-                "refusing to {what} while the rho daemon is running; stop the daemon first"
-            );
+            return Ok(None);
         }
         return Err(error).with_context(|| format!("lock {}", daemon_lock.display()));
     }
-    Ok(lock)
+    Ok(Some(lock))
 }
 
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
@@ -198,17 +197,77 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
 struct Snapshot {
     source: PathBuf,
     path: PathBuf,
-    _temp: tempfile::TempDir,
+    _dir: SnapshotDir,
 }
 
-fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
+/// A snapshot's own directory, removed when the run is done with it.
+#[derive(Debug)]
+struct SnapshotDir(PathBuf);
+
+impl Drop for SnapshotDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
     let source = match db_path {
         Some(source) => return copy_snapshot_unlocked(&source),
         None => default_db_path().context("resolve rho db path")?,
     };
     let paths = rho_ui_proto::RuntimePaths::from_env()?;
     std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
-    copy_snapshot_from(&source, &paths.daemon_lock())
+    match copy_snapshot_from(&source, &paths.daemon_lock())? {
+        Some(snapshot) => Ok(snapshot),
+        None => request_snapshot(paths.socket(), &source).await,
+    }
+}
+
+/// Ask the running daemon for a snapshot: it alone can copy the file
+/// between commits, in a state that opens without repair.
+async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
+    let mut client = rho_ui_proto::client::Client::connect(socket)
+        .await
+        .context("the daemon holds the database, and its socket does not answer")?;
+    client.send(&rho_ui_proto::ClientMessage::Snapshot).await?;
+    loop {
+        match client.recv().await? {
+            rho_ui_proto::ServerMessage::Snapshotted { path } => {
+                let path = path.into_std_path_buf();
+                let dir = path.parent().context("snapshot has no directory")?;
+                return Ok(Snapshot {
+                    source: source.to_owned(),
+                    _dir: SnapshotDir(dir.to_owned()),
+                    path,
+                });
+            }
+            rho_ui_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
+            // Ready and broadcasts come first; only the answer matters.
+            _ => {}
+        }
+    }
+}
+
+/// The daemon's half of
+/// [`ClientMessage::Snapshot`](rho_ui_proto::ClientMessage::Snapshot):
+/// a snapshot of `db` in a directory of its own beside it.
+pub(crate) async fn daemon_snapshot(db: &RhoDb) -> anyhow::Result<camino::Utf8PathBuf> {
+    let dir = new_snapshot_dir(db.path())?;
+    let path = dir.0.join("rho.redb");
+    db.snapshot(&path).await?;
+    let path = camino::Utf8PathBuf::from_path_buf(path)
+        .map_err(|path| anyhow::anyhow!("snapshot path is not UTF-8: {}", path.display()))?;
+    // Handed over: the directory is the caller's to delete now.
+    std::mem::forget(dir);
+    Ok(path)
+}
+
+fn new_snapshot_dir(source: &Path) -> anyhow::Result<SnapshotDir> {
+    let dir = tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempdir_in(snapshot_dir(source)?)
+        .context("create debug db snapshot directory")?;
+    Ok(SnapshotDir(dir.keep()))
 }
 
 /// The name every debug copy carries, so a stray one says who made it.
@@ -281,23 +340,23 @@ fn describe_age(age: std::time::Duration) -> String {
     }
 }
 
-fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Snapshot> {
-    let _lock = hold_daemon_lock(daemon_lock, &format!("copy {}", source.display()))?;
-    copy_snapshot_unlocked(source)
+/// A copy of the closed database, or `None` while the daemon has it open.
+fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Option<Snapshot>> {
+    let Some(_lock) = try_daemon_lock(daemon_lock)? else {
+        return Ok(None);
+    };
+    copy_snapshot_unlocked(source).map(Some)
 }
 
 fn copy_snapshot_unlocked(source: &Path) -> anyhow::Result<Snapshot> {
-    let temp = tempfile::Builder::new()
-        .prefix(SNAPSHOT_PREFIX)
-        .tempdir_in(snapshot_dir(source)?)
-        .context("create debug db snapshot directory")?;
-    let snapshot = temp.path().join("rho.redb");
-    std::fs::copy(source, &snapshot)
+    let dir = new_snapshot_dir(source)?;
+    let path = dir.0.join("rho.redb");
+    rho_db::clone_file(source, &path)
         .with_context(|| format!("copy rho db snapshot from {}", source.display()))?;
     Ok(Snapshot {
         source: source.to_owned(),
-        path: snapshot,
-        _temp: temp,
+        path,
+        _dir: dir,
     })
 }
 
@@ -305,7 +364,7 @@ async fn print_agents(
     db_path: Option<PathBuf>,
     claude: &rho_claude::accounts::ClaudePaths,
 ) -> anyhow::Result<()> {
-    let snapshot = copy_snapshot(db_path)?;
+    let snapshot = copy_snapshot(db_path).await?;
 
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
@@ -360,7 +419,7 @@ async fn print_context(
     db_path: Option<PathBuf>,
     claude: &rho_claude::accounts::ClaudePaths,
 ) -> anyhow::Result<()> {
-    let snapshot = copy_snapshot(db_path)?;
+    let snapshot = copy_snapshot(db_path).await?;
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
     let read = db.read();
@@ -459,7 +518,7 @@ async fn print_context(
 }
 
 async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let snapshot = copy_snapshot(db_path)?;
+    let snapshot = copy_snapshot(db_path).await?;
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
 
@@ -614,7 +673,7 @@ mod snapshot_tests {
     use super::*;
 
     #[test]
-    fn a_live_daemon_lock_refuses_the_redb_copy() {
+    fn a_live_daemon_lock_leaves_the_copy_to_the_daemon() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("rho.redb");
         drop(RhoDb::open(&source));
@@ -628,16 +687,11 @@ mod snapshot_tests {
             .unwrap();
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-        let error = copy_snapshot_from(&source, &lock_path).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("while the rho daemon is running")
-        );
+        assert!(copy_snapshot_from(&source, &lock_path).unwrap().is_none());
 
         assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
-        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
+        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap().unwrap();
         drop(RhoDb::open(&snapshot.path));
     }
 
@@ -652,7 +706,7 @@ mod snapshot_tests {
         drop(RhoDb::open(&source));
         let lock_path = directory.path().join("daemon.lock");
 
-        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
+        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap().unwrap();
         let held = snapshot.path.clone();
         assert!(
             held.starts_with(directory.path().join("debug-snapshots")),

@@ -216,6 +216,13 @@ lto = "off"
 
 # Thin LTO trims the enormous monomorphized .text sections (the six release
 # binaries total over 400MB without it) at a modest link-time cost.
+# Opening a real database in a dev build otherwise takes minutes: redb's
+# debug assertions walk every page on each open, and a repair verifies
+# checksums over the whole file, which is slow unoptimized.
+[profile.dev.package.redb]
+opt-level = 3
+debug-assertions = false
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"

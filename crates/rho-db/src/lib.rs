@@ -76,6 +76,7 @@ impl<T: Clone> SenValue<'_, T> {
 #[derive(Clone, Debug)]
 pub struct RhoDb {
     database: Arc<Database>,
+    path: Arc<Path>,
     write_lock: Arc<Mutex<()>>,
     /// One slot for the owning crate's observer of this database. Writers
     /// deep inside a transaction publish what they wrote through it, so no
@@ -86,6 +87,20 @@ pub struct RhoDb {
     /// does: the lock's whole purpose is to say the file is in use, and a
     /// lock dropped at the end of the call that took it says nothing.
     _lock: Option<Arc<std::fs::File>>,
+}
+
+/// A reflink of `source` where the filesystem shares extents, a plain copy
+/// where it cannot.
+pub fn clone_file(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let from = std::fs::File::open(source)?;
+    let to = std::fs::File::create_new(dest)?;
+    if unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    drop(to);
+    std::fs::remove_file(dest)?;
+    std::fs::copy(source, dest).map(drop)
 }
 
 /// Read transaction wrapper. Methods panic on local database errors.
@@ -324,10 +339,33 @@ impl RhoDb {
 
         Self {
             database: Arc::new(database),
+            path: path.into(),
             write_lock: Arc::new(Mutex::new(())),
             observer: Arc::new(OnceLock::new()),
             _lock: None,
         }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Copy the database to `dest` as it stands after its latest commit, in
+    /// a state that reopens at once. A copy of an open file otherwise reads
+    /// as a crash, and redb repairs one by walking every page to verify
+    /// checksums and rebuild its allocator: minutes on a large database.
+    /// Holding the write lock, an empty quick-repair commit records the
+    /// allocator state, and nothing commits after it until the file is
+    /// cloned.
+    pub async fn snapshot(&self, dest: &Path) -> anyhow::Result<()> {
+        let guard = Arc::clone(&self.write_lock).lock_owned().await;
+        let mut write = self.database.begin_write()?;
+        write.set_quick_repair(true);
+        write.commit()?;
+        let (source, dest) = (Arc::clone(&self.path), dest.to_owned());
+        tokio::task::spawn_blocking(move || clone_file(&source, &dest)).await??;
+        drop(guard);
+        Ok(())
     }
 
     /// The same database, holding `lock` for as long as it lives.
@@ -689,6 +727,44 @@ mod tests {
         name: String,
         #[senax(default)]
         tags: Vec<String>,
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_an_open_database_reopens_without_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.open_table(ITEMS).insert(
+            SenValue::owned(TestKey(1)),
+            SenValue::owned(TestRecord {
+                name: "kept".to_owned(),
+                tags: Vec::new(),
+            }),
+        );
+        write.commit();
+        let repaired = |path: &Path| {
+            let repaired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&repaired);
+            let database = Database::builder()
+                .set_repair_callback(move |_| {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed)
+                })
+                .open(path)
+                .unwrap();
+            let read = database.begin_read().unwrap();
+            let table = read.open_table(ITEMS).unwrap();
+            let record = table.get(SenValue::owned(TestKey(1))).unwrap().unwrap();
+            assert_eq!(record.value().into_owned().name, "kept");
+            repaired.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        // A plain copy of the open file needs the full repair.
+        let copied = temp.path().join("copied.redb");
+        std::fs::copy(temp.path().join("rho.redb"), &copied).unwrap();
+        assert!(repaired(&copied));
+
+        let snapshot = temp.path().join("snapshot.redb");
+        db.snapshot(&snapshot).await.unwrap();
+        assert!(!repaired(&snapshot));
     }
 
     #[tokio::test]

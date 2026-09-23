@@ -225,6 +225,10 @@ pub enum ClientMessage {
     IrohApprove {
         code: String,
     },
+    /// Copy the daemon's database for inspection, as of its latest commit
+    /// and ready to open without repair. Answered with
+    /// [`ServerMessage::Snapshotted`]; the copy is the caller's to delete.
+    Snapshot,
     /// Directly trust an iroh endpoint in daemon memory. This is a privileged
     /// local-control operation intended to be invoked through SSH.
     IrohTrustInMemory {
@@ -624,6 +628,11 @@ pub enum ServerMessage {
         repo: Utf8PathBuf,
         agent_id: Option<AgentId>,
         status: LandStatus,
+    },
+    /// Reply to [`ClientMessage::Snapshot`]: where the copy is, in a
+    /// directory of its own beside the database.
+    Snapshotted {
+        path: Utf8PathBuf,
     },
     /// Reply to [`ClientMessage::IrohApprove`]: the enrolled client's
     /// endpoint id.

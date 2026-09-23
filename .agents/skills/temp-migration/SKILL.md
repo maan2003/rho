@@ -170,9 +170,13 @@ cargo run -q -p rho-cli -- debug migrate
 cargo run -q -p rho-cli -- debug agents
 ```
 
-`rho debug migrate` is the safe dry-run path: it copies the user's DB to a
-tempfile, runs pending migrations on the copy, and then decodes the migrated
+`rho debug migrate` is the safe dry-run path: it copies the user's DB beside
+itself, runs pending migrations on the copy, and then decodes the migrated
 agent records. Use it before asking the user to run the real daemon/CLI.
+While the daemon runs, the copy is a snapshot the daemon takes between
+commits, which opens at once; a hand-made copy of the open file (`cp
+--reflink`) instead needs redb's full repair on open. Pass the copy with
+`--db-path` only when you mean that.
 
 ## Common mistakes
 

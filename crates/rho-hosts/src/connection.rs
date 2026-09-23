@@ -1447,6 +1447,7 @@ async fn run(
             | ServerMessage::PlatformStatus { .. }
             | ServerMessage::IrohApproved { .. }
             | ServerMessage::IrohRevoked { .. }
+            | ServerMessage::Snapshotted { .. }
             | ServerMessage::PrCommandResult { .. }
             | ServerMessage::GitTransportReady
             | ServerMessage::GitTransportRefused { .. }

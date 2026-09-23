@@ -2676,6 +2676,11 @@ async fn handle_message(
             agent.retry();
             Ok(Refresh::None)
         }
+        ClientMessage::Snapshot => {
+            let path = debug::daemon_snapshot(&services.db).await?;
+            let _ = outgoing_tx.send(ServerMessage::Snapshotted { path });
+            Ok(Refresh::None)
+        }
         ClientMessage::IrohApprove { code } => {
             let auth =
                 iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
