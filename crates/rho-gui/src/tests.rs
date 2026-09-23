@@ -11,6 +11,7 @@ use gpui::{
     point, px, size,
 };
 use language::InlayId;
+use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agent_host_proto::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
@@ -831,7 +832,7 @@ fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext)
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             assert_eq!(
                 workspace
                     .desk_cells
@@ -1028,7 +1029,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -1156,7 +1157,7 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -4346,7 +4347,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -4425,7 +4426,7 @@ fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -4547,7 +4548,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
             .update(cx, |workspace, window, cx| {
                 story::feed(workspace, HostId::default(), desk.synced(), window, cx);
                 workspace.pull_card(window, cx);
-                workspace.take_host_messages_for_test(HostId::default());
+                workspace.clear_sent_for_test(HostId::default());
             })
             .unwrap();
         cx.run_until_parked();
@@ -5026,7 +5027,7 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -5067,7 +5068,7 @@ fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestApp
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -5129,7 +5130,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -6523,7 +6524,7 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -6542,10 +6543,10 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace
-                .take_host_messages_for_test(HostId::default())
+                .take_desk_frames_for_test(HostId::default())
                 .into_iter()
-                .find_map(|message| match message {
-                    rho_agent_host_proto::ClientMessage::DeskCellsApply { cells } => Some(cells),
+                .find_map(|frame| match frame {
+                    DeskClientFrame::CellsApply { cells } => Some(cells),
                     _ => None,
                 })
         })
@@ -6594,7 +6595,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
             .update(cx, |workspace, window, cx| {
                 story::feed(workspace, HostId::default(), desk.synced(), window, cx);
                 workspace.pull_card(window, cx);
-                workspace.take_host_messages_for_test(HostId::default());
+                workspace.clear_sent_for_test(HostId::default());
             })
             .unwrap();
     }
@@ -6625,19 +6626,14 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::DeskCellsAvailable { frontier },
+                rho_hosts::DeskFrame::CellsAvailable { frontier },
                 window,
                 cx,
             );
             let sync = workspace
-                .take_host_messages_for_test(HostId::default())
+                .take_desk_frames_for_test(HostId::default())
                 .into_iter()
-                .any(|message| {
-                    matches!(
-                        message,
-                        rho_agent_host_proto::ClientMessage::DeskSync { .. }
-                    )
-                });
+                .any(|frame| matches!(frame, DeskClientFrame::Sync { .. }));
             assert!(sync, "a poke asks for the delta rather than carrying it");
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             assert_eq!(
@@ -7317,7 +7313,7 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
                 !areas.iter().any(|(path, _)| path == "the area in view"),
                 "a note is not an area a thing can be filed under: {areas:?}"
             );
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -7384,7 +7380,7 @@ fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut Te
             // message's own surface names the same node, which is what
             // `here` reads.
             workspace.open_note(HostId::default(), node.clone(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -8086,8 +8082,8 @@ impl DeskFixture {
         }
     }
 
-    pub(super) fn synced(&self) -> ConnEvent {
-        ConnEvent::DeskSynced {
+    pub(super) fn synced(&self) -> rho_hosts::DeskFrame {
+        rho_hosts::DeskFrame::Synced {
             store: Self::STORE,
             node_namespace: Self::NAMESPACE,
             delta: self.store.snapshot(),
@@ -8102,10 +8098,10 @@ fn take_desk_mutation(
     host: HostId,
 ) -> Option<rho_agent_host_proto::desk::cells::CellMutation> {
     workspace
-        .take_host_messages_for_test(host)
+        .take_desk_frames_for_test(host)
         .into_iter()
-        .find_map(|message| match message {
-            rho_agent_host_proto::ClientMessage::DeskMutationApply { mutation } => Some(mutation),
+        .find_map(|frame| match frame {
+            DeskClientFrame::MutationApply { mutation } => Some(mutation),
             _ => None,
         })
 }
@@ -8339,7 +8335,7 @@ fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppCo
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -9294,7 +9290,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
                 Some((HostId::default(), context.clone())),
                 "Enter alone is create-from-here: the thing in view, not a place picked for it"
             );
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -9784,7 +9780,7 @@ fn a_new_note_from_home_opens_the_note_itself(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
@@ -9868,7 +9864,7 @@ fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext)
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
         })
         .unwrap();
@@ -10005,7 +10001,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -10085,7 +10081,7 @@ fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppConte
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
         })
         .unwrap();
@@ -10120,7 +10116,7 @@ fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppConte
 
             // The shallower one again is a no-op: the thing is already
             // under it, and the picker says so instead of growing the set.
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho", window, cx);
         })
         .unwrap();
@@ -10188,7 +10184,7 @@ fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.label_card(HostId::default(), area.clone(), "rho", window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -10234,7 +10230,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -10727,7 +10723,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                 workspace.open_verdict_transient(window, cx),
                 "the tap opens over a thing the dealer has no card for"
             );
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -11021,7 +11017,7 @@ fn a_draft_wears_no_other_cards_label(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -11152,7 +11148,7 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -11725,7 +11721,7 @@ fn the_verdict_menu_names_the_card_in_view(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -11846,8 +11842,8 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
         )),
     );
     let held = match old.synced() {
-        ConnEvent::DeskSynced { delta, bodies, .. } => (delta, bodies),
-        _ => unreachable!("the fixture's sync is a DeskSynced"),
+        rho_hosts::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
+        _ => unreachable!("the fixture's sync is a Synced"),
     };
 
     // The store now answering has the same agent filed, and says nothing
@@ -11908,7 +11904,7 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
     // The daemon answers under a name the client has never counted in.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), now.synced(), window, cx);
+            workspace.handle_desk_event(HostId::default(), now.synced(), window, cx);
         })
         .unwrap();
     next_frame(cx, workspace);
@@ -11954,8 +11950,8 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
     // What the replica would have handed back: the cells of a previous
     // session, with no daemon behind them.
     let held = match desk.synced() {
-        ConnEvent::DeskSynced { delta, bodies, .. } => (delta, bodies),
-        _ => unreachable!("the fixture's sync is a DeskSynced"),
+        rho_hosts::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
+        _ => unreachable!("the fixture's sync is a Synced"),
     };
 
     let workspace = test_workspace(cx);
@@ -12153,8 +12149,8 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
         })
         .unwrap();
 
-    let rho_agent_host_proto::ClientMessage::DeskSync { bodies, .. } = sync else {
-        panic!("the handshake is a DeskSync");
+    let DeskClientFrame::Sync { bodies, .. } = sync else {
+        panic!("the handshake is a Sync");
     };
     assert_eq!(
         bodies.get(&note).and_then(|held| held.get(&7)).copied(),
@@ -12184,8 +12180,8 @@ fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppC
         })
         .unwrap();
 
-    let rho_agent_host_proto::ClientMessage::DeskSync { bodies, .. } = sync else {
-        panic!("the handshake is a DeskSync");
+    let DeskClientFrame::Sync { bodies, .. } = sync else {
+        panic!("the handshake is a Sync");
     };
     let held = bodies
         .get(&note)

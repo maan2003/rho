@@ -3,12 +3,12 @@ use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
-use rho_agent_host_proto::ClientMessage;
 use rho_agent_host_proto::desk::cells::{
     BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, Repository,
     SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
     Uuid, Verdict, VerdictEvent, Version,
 };
+use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agents_client::{Attention, HostId};
 use text::{BufferId, ReplicaId};
 
@@ -51,7 +51,7 @@ struct HostDeskCells {
     /// are not news about this desk; they are a different desk, and what
     /// this one holds is thrown away rather than merged.
     store: DeviceId,
-    /// A `DeskSync` is in flight; the daemon answers exactly one.
+    /// A `Sync` is in flight; the daemon answers exactly one.
     syncing: bool,
     /// The newest frontier poked while a sync was in flight. A poke that
     /// races its response must not be dropped, so it is answered after.
@@ -634,7 +634,7 @@ impl DeskCells {
 
     /// The handshake, sent on connect and after every poke. `known` is what
     /// this GUI already holds, so the daemon answers with the difference.
-    pub fn sync(&mut self, host: HostId) -> ClientMessage {
+    pub fn sync(&mut self, host: HostId) -> DeskClientFrame {
         let device = self.device();
         let (known, store, bodies) = match self.hosts.get_mut(&host) {
             Some(desk) => {
@@ -655,7 +655,7 @@ impl DeskCells {
             bodies = bodies.len(),
             "desk sync asked"
         );
-        ClientMessage::DeskSync {
+        DeskClientFrame::Sync {
             device,
             known,
             store,
@@ -672,7 +672,7 @@ impl DeskCells {
     /// would sit on this disk and reach no other device, since nothing
     /// replays a write that was never sent.
     ///
-    /// A further `DeskSync` comes back too when a poke arrived while this
+    /// A further `Sync` comes back too when a poke arrived while this
     /// one was in flight and the answer does not already cover it.
     pub fn synced(
         &mut self,
@@ -682,12 +682,12 @@ impl DeskCells {
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
         cx: &mut Context<Workspace>,
-    ) -> (Vec<ClientMessage>, DeskDelta) {
+    ) -> (Vec<DeskClientFrame>, DeskDelta) {
         let frontier = delta.version.clone();
         // The copy's own share of the delta, taken before the merges
         // consume it. `delta.version` is the daemon's frontier, which is
         // what `confirmed` holds once the merge lands, so what is written
-        // down and what the next `DeskSync` asks from are one number.
+        // down and what the next `Sync` asks from are one number.
         let held = delta.clone();
         let mut delta_ids = DeskDelta::default();
         for cell in &delta.cells {
@@ -795,7 +795,7 @@ impl DeskCells {
         if let Some(desk) = self.hosts.get(&host) {
             let catch_up = desk.view.since(&frontier);
             if !catch_up.cells.is_empty() || !catch_up.verdicts.is_empty() {
-                back.push(ClientMessage::DeskCellsApply { cells: catch_up });
+                back.push(DeskClientFrame::CellsApply { cells: catch_up });
             }
         }
         if let Some(poke) = self.hosts.get_mut(&host).and_then(|desk| desk.poked.take())
@@ -807,9 +807,9 @@ impl DeskCells {
         (back, delta_ids)
     }
 
-    /// `DeskCellsAvailable`: a poke, not a delta. One handshake is in flight
+    /// `CellsAvailable`: a poke, not a delta. One handshake is in flight
     /// at a time; a poke that arrives during one is answered after it.
-    pub fn cells_available(&mut self, host: HostId, frontier: Version) -> Option<ClientMessage> {
+    pub fn cells_available(&mut self, host: HostId, frontier: Version) -> Option<DeskClientFrame> {
         let desk = self.hosts.get_mut(&host)?;
         if covers(desk.confirmed.version(), &frontier) {
             return None;
@@ -822,7 +822,7 @@ impl DeskCells {
     }
 
     /// The daemon lost our place in its event stream: start over.
-    pub fn resync_required(&mut self, host: HostId) -> ClientMessage {
+    pub fn resync_required(&mut self, host: HostId) -> DeskClientFrame {
         if let Some(desk) = self.hosts.get_mut(&host) {
             desk.syncing = false;
             desk.poked = None;
@@ -1513,7 +1513,7 @@ impl DeskCells {
         host: HostId,
         writes: Vec<CellWrite>,
         verdict: Option<(Id, VerdictEvent)>,
-    ) -> Option<(ClientMessage, DeskDelta)> {
+    ) -> Option<(DeskClientFrame, DeskDelta)> {
         let device = self.device();
         let name = self.names.get(&host).cloned();
         let desk = self.hosts.get_mut(&host)?;
@@ -1564,7 +1564,7 @@ impl DeskCells {
             delta.touched.insert(id.clone());
         }
         self.apply_to_map(host, &delta);
-        Some((ClientMessage::DeskMutationApply { mutation }, delta))
+        Some((DeskClientFrame::MutationApply { mutation }, delta))
     }
 
     /// Rho mints ids for notes and labels and for nothing else.

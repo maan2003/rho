@@ -3729,7 +3729,7 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
                     .is_some_and(|facts| facts.defer_until.is_some()),
                 "it is in the owner's own replica while the owner is away"
             );
-            workspace.take_host_messages_for_test(host);
+            workspace.clear_sent_for_test(host);
 
             // The owner returns and says where it stands, which is before
             // the write.
@@ -3737,10 +3737,10 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
             crate::tests::story::feed(workspace, host, desk.synced(), window, cx);
             assert!(
                 workspace
-                    .take_host_messages_for_test(host)
+                    .take_desk_frames_for_test(host)
                     .iter()
-                    .any(|message| match message {
-                        rho_agent_host_proto::ClientMessage::DeskCellsApply { cells } =>
+                    .any(|frame| match frame {
+                        rho_agent_host_proto::desk::stream::ClientFrame::CellsApply { cells } =>
                             cells.cells.iter().any(|cell| cell.id == node),
                         _ => false,
                     }),

@@ -8,8 +8,8 @@ use rho_agent_host_proto::transcript::{
     AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
 };
 use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
-use rho_hosts::AgentFrame;
 use rho_hosts::connection::ConnEvent;
+use rho_hosts::{AgentFrame, DeskFrame};
 
 pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
 pub type UiSpawnedBy = rho_agent_host_proto::transcript::SpawnedBy;
@@ -248,10 +248,11 @@ thread_local! {
         RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
 }
 
-/// What a host says, on either of its streams.
+/// What a host says, on any of its streams.
 pub enum Frame {
     Control(ConnEvent),
     Agents(AgentFrame),
+    Desk(DeskFrame),
     Many(Vec<Frame>),
 }
 
@@ -267,8 +268,14 @@ impl From<AgentFrame> for Frame {
     }
 }
 
-/// One frame into the workspace: a control-stream event straight in, an
-/// agents-stream frame through the same `ingest` the model thread runs,
+impl From<DeskFrame> for Frame {
+    fn from(frame: DeskFrame) -> Self {
+        Self::Desk(frame)
+    }
+}
+
+/// One frame into the workspace: a control- or desk-stream event straight in,
+/// an agents-stream frame through the same `ingest` the model thread runs,
 /// called inline so a test stays in one thread and can assert in the frame
 /// it fed.
 pub fn feed(
@@ -280,6 +287,7 @@ pub fn feed(
 ) {
     match frame.into() {
         Frame::Control(event) => workspace.handle_event(host, event, window, cx),
+        Frame::Desk(frame) => workspace.handle_desk_event(host, frame, window, cx),
         Frame::Agents(frame) => {
             let followed = workspace.followed();
             let events = MODEL.with(|model| {

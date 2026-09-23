@@ -15,6 +15,9 @@ use rho_agent_host_proto::agents::{
     ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
 };
 use rho_agent_host_proto::client::Client;
+use rho_agent_host_proto::desk::stream::{
+    ClientFrame as DeskClientFrame, ServerFrame as DeskServerFrame,
+};
 use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
 use rho_agent_host_proto::{
     AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
@@ -67,7 +70,7 @@ fn shell_request_id(message: &ClientMessage) -> Option<u64> {
     }
 }
 
-use crate::{AgentSink, AttachTarget, HostId, Sinks};
+use crate::{AgentSink, AttachTarget, DeskSink, HostId, Sinks};
 
 /// Owns the transport pumps for a dedicated stream. Dropping it cancels both
 /// directions on every target.
@@ -104,6 +107,38 @@ pub struct AgentEvent {
     pub frame: AgentFrame,
 }
 
+/// What a host says on its desk stream.
+pub enum DeskFrame {
+    /// The stream is open. Every (re)opened stream starts here, and the
+    /// client's `Sync` goes after it: a stream that has not synced may not
+    /// write.
+    Opened,
+    /// The answer to `Sync`.
+    Synced {
+        store: rho_agent_host_proto::desk::cells::DeviceId,
+        node_namespace: u16,
+        delta: rho_agent_host_proto::desk::cells::Snapshot,
+        bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
+    },
+    /// The host's copy moved; sync if `frontier` is past what is held.
+    CellsAvailable {
+        frontier: rho_agent_host_proto::desk::cells::Version,
+    },
+    /// A body edit, from whichever device made it.
+    TextApplied {
+        id: rho_agent_host_proto::desk::cells::Id,
+        operation: rho_agent_host_proto::desk::TextOperation,
+    },
+    /// The stream missed some of the host's pokes; sync again.
+    ResyncRequired,
+}
+
+/// A desk-stream frame tagged with the host it came from.
+pub struct DeskEvent {
+    pub host: HostId,
+    pub frame: DeskFrame,
+}
+
 /// One host's end of the shared event channel. Every IO task holds a clone
 /// and stamps its own [`HostId`] on whatever it sends.
 #[derive(Clone)]
@@ -125,20 +160,6 @@ impl EventSink {
 
 pub enum ConnEvent {
     DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
-    DeskSynced {
-        store: rho_agent_host_proto::desk::cells::DeviceId,
-        node_namespace: u16,
-        delta: rho_agent_host_proto::desk::cells::Snapshot,
-        bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
-    },
-    DeskCellsAvailable {
-        frontier: rho_agent_host_proto::desk::cells::Version,
-    },
-    DeskTextApplied {
-        id: rho_agent_host_proto::desk::cells::Id,
-        operation: rho_agent_host_proto::desk::TextOperation,
-    },
-    DeskResyncRequired,
     Ready {
         auth: rho_agent_host_proto::AuthState,
         machine_seed: u64,
@@ -531,6 +552,7 @@ pub struct Connection {
     /// The focus last asked for, told again to every agents stream that
     /// opens: it is state, not a request.
     agent_focus: AgentFocus,
+    desk_commands: futures_mpsc::UnboundedSender<DeskClientFrame>,
     /// `None` until the IO task connects; channels cannot open earlier.
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
@@ -539,6 +561,27 @@ pub struct Connection {
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
     #[cfg(feature = "test-support")]
     sent: Arc<Mutex<Vec<ClientMessage>>>,
+    #[cfg(feature = "test-support")]
+    desk_sent: Arc<Mutex<Vec<DeskClientFrame>>>,
+}
+
+/// What the desk client says down one host's desk stream. Whatever is
+/// queued while the stream is down is dropped when it opens again: the
+/// handshake that follows [`DeskFrame::Opened`] carries whatever the host
+/// missed.
+#[derive(Clone)]
+pub struct DeskCommands {
+    commands: futures_mpsc::UnboundedSender<DeskClientFrame>,
+    #[cfg(feature = "test-support")]
+    sent: Arc<Mutex<Vec<DeskClientFrame>>>,
+}
+
+impl DeskCommands {
+    pub fn send(&self, frame: DeskClientFrame) {
+        #[cfg(feature = "test-support")]
+        self.sent.lock().unwrap().push(frame.clone());
+        let _ = self.commands.unbounded_send(frame);
+    }
 }
 
 /// What the agents client says down one host's agents stream. Clonable,
@@ -758,6 +801,21 @@ impl Connection {
         std::mem::take(&mut *self.sent.lock().unwrap())
     }
 
+    /// The desk stream's command channel.
+    pub fn desk(&self) -> DeskCommands {
+        DeskCommands {
+            commands: self.desk_commands.clone(),
+            #[cfg(feature = "test-support")]
+            sent: Arc::clone(&self.desk_sent),
+        }
+    }
+
+    /// Everything sent down the desk stream since it was last asked.
+    #[cfg(feature = "test-support")]
+    pub fn take_desk_sent_for_test(&self) -> Vec<DeskClientFrame> {
+        std::mem::take(&mut *self.desk_sent.lock().unwrap())
+    }
+
     /// The agents whose live frames this connection wants: every open
     /// pane, replaced wholesale. Everything durable is on the story
     /// regardless, so this only decides who streams.
@@ -911,6 +969,12 @@ pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Conn
     let (agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
     let agent_command_rx = Arc::new(tokio::sync::Mutex::new(agent_command_rx));
     let agent_focus = AgentFocus::default();
+    let desk = DeskStreamSink {
+        host,
+        desk: sinks.desk,
+    };
+    let (desk_command_tx, desk_command_rx) = futures_mpsc::unbounded();
+    let desk_command_rx = Arc::new(tokio::sync::Mutex::new(desk_command_rx));
     let pending_command = Arc::new(Mutex::new(None));
     let dialer = Arc::new(Mutex::new(None));
     let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
@@ -922,10 +986,16 @@ pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Conn
             supervise(
                 target,
                 event_tx,
-                AgentStream {
-                    sink: agents,
-                    commands: agent_command_rx,
-                    focus: Arc::clone(&agent_focus),
+                Streams {
+                    agents: AgentStream {
+                        sink: agents,
+                        commands: agent_command_rx,
+                        focus: Arc::clone(&agent_focus),
+                    },
+                    desk: DeskStream {
+                        sink: desk,
+                        commands: desk_command_rx,
+                    },
                 },
                 command_rx,
                 pending_command,
@@ -938,18 +1008,21 @@ pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Conn
         commands: command_tx,
         agent_commands: agent_command_tx,
         agent_focus,
+        desk_commands: desk_command_tx,
         dialer,
         shell_requests,
         _io_task: io_task,
         #[cfg(feature = "test-support")]
         sent: Arc::new(Mutex::new(Vec::new())),
+        #[cfg(feature = "test-support")]
+        desk_sent: Arc::new(Mutex::new(Vec::new())),
     }
 }
 
 async fn supervise(
     target: AttachTarget,
     events: EventSink,
-    agents: AgentStream,
+    streams: Streams,
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
@@ -965,7 +1038,7 @@ async fn supervise(
         let result = run(
             target.clone(),
             &events,
-            &agents,
+            &streams,
             Arc::clone(&commands),
             Arc::clone(&pending_command),
             &dialer,
@@ -1122,7 +1195,7 @@ async fn abort_tasks<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
 async fn run(
     target: AttachTarget,
     events: &EventSink,
-    agents: &AgentStream,
+    streams: &Streams,
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
@@ -1181,12 +1254,16 @@ async fn run(
         return Ok(());
     }
 
-    let agents_dialer = dialer
+    let streams_dialer = dialer
         .lock()
         .unwrap()
         .clone()
         .context("connected without a dialer")?;
-    let mut agents_task = tokio::spawn(run_agents_stream(agents_dialer, agents.clone()));
+    let mut agents_task = tokio::spawn(run_agents_stream(
+        streams_dialer.clone(),
+        streams.agents.clone(),
+    ));
+    let mut desk_task = tokio::spawn(run_desk_stream(streams_dialer, streams.desk.clone()));
 
     write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
 
@@ -1253,6 +1330,13 @@ async fn run(
                     Err(error) => anyhow::anyhow!("daemon agents stream task failed: {error}"),
                 });
             }
+            result = &mut desk_task => {
+                break Some(match result {
+                    Ok(Ok(())) => anyhow::anyhow!("daemon desk stream closed"),
+                    Ok(Err(error)) => error.context("daemon desk stream"),
+                    Err(error) => anyhow::anyhow!("daemon desk stream task failed: {error}"),
+                });
+            }
             result = &mut writer_task => {
                 writer_finished = true;
                 break Some(match result {
@@ -1270,26 +1354,6 @@ async fn run(
             ServerMessage::DesktopSessions { sessions } => {
                 Some(ConnEvent::DesktopSessions(sessions))
             }
-            ServerMessage::DeskSynced {
-                store,
-                node_namespace,
-                delta,
-                bodies,
-            } => Some(ConnEvent::DeskSynced {
-                store,
-                node_namespace,
-                delta,
-                bodies,
-            }),
-            ServerMessage::DeskCellsAvailable { frontier } => {
-                Some(ConnEvent::DeskCellsAvailable { frontier })
-            }
-            ServerMessage::DeskTextApplied {
-                id,
-                operation,
-                transaction: _,
-            } => Some(ConnEvent::DeskTextApplied { id, operation }),
-            ServerMessage::DeskResyncRequired => Some(ConnEvent::DeskResyncRequired),
             ServerMessage::Ready {
                 auth,
                 machine_seed,
@@ -1429,6 +1493,8 @@ async fn run(
     }
     agents_task.abort();
     let _ = agents_task.await;
+    desk_task.abort();
+    let _ = desk_task.await;
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
@@ -1443,6 +1509,91 @@ async fn run(
     match read_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// A connection's dedicated streams, as it keeps them across reconnects.
+struct Streams {
+    agents: AgentStream,
+    desk: DeskStream,
+}
+
+/// One host's desk stream, as the connection keeps it across reconnects.
+#[derive(Clone)]
+struct DeskStream {
+    sink: DeskStreamSink,
+    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<DeskClientFrame>>>,
+}
+
+/// One host's end of the desk sink, stamping its [`HostId`].
+#[derive(Clone)]
+struct DeskStreamSink {
+    host: HostId,
+    desk: std::sync::Arc<dyn DeskSink>,
+}
+
+/// A connection's desk stream, for as long as the connection lasts. Ends
+/// with an error when either direction does, or when a newer window takes
+/// this device, which takes the connection down with it.
+async fn run_desk_stream(dialer: ChannelDialer, stream: DeskStream) -> anyhow::Result<()> {
+    let mut socket = dial_stream(dialer).await?;
+    write_frame(&mut socket, &ClientMessage::DeskOpen).await?;
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let mut commands = stream.commands.lock().await;
+    // Written for the last stream; the handshake after `Opened` carries
+    // whatever they held.
+    while commands.try_recv().is_ok() {}
+    let sink = &stream.sink;
+    let send = |frame| {
+        sink.desk.send(DeskEvent {
+            host: sink.host,
+            frame,
+        })
+    };
+    if send(DeskFrame::Opened).is_err() {
+        return Ok(());
+    }
+    let read = async {
+        loop {
+            let frame = match read_frame::<_, DeskServerFrame>(&mut reader).await? {
+                DeskServerFrame::Synced {
+                    store,
+                    node_namespace,
+                    delta,
+                    bodies,
+                } => DeskFrame::Synced {
+                    store,
+                    node_namespace,
+                    delta,
+                    bodies,
+                },
+                DeskServerFrame::CellsAvailable { frontier } => {
+                    DeskFrame::CellsAvailable { frontier }
+                }
+                DeskServerFrame::TextApplied {
+                    id,
+                    operation,
+                    transaction: _,
+                } => DeskFrame::TextApplied { id, operation },
+                DeskServerFrame::ResyncRequired => DeskFrame::ResyncRequired,
+                DeskServerFrame::Displaced => {
+                    anyhow::bail!("the desk moved to a newer window on this device")
+                }
+            };
+            if send(frame).is_err() {
+                return Ok(());
+            }
+        }
+    };
+    let write = async {
+        while let Some(frame) = commands.next().await {
+            write_frame(&mut writer, &frame).await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        result = read => result,
+        result = write => result,
     }
 }
 
@@ -1941,6 +2092,12 @@ mod shutdown_tests {
         }
     }
 
+    impl crate::DeskSink for Listening {
+        fn send(&self, _event: crate::DeskEvent) -> Result<(), crate::SinkClosed> {
+            Ok(())
+        }
+    }
+
     /// Quit has to end the supervisor while the runtime is still there.
     /// A supervisor waiting out its reconnect delay is inside
     /// `tokio::time::sleep`, and a sleep polled after its runtime starts
@@ -1964,19 +2121,29 @@ mod shutdown_tests {
             events: Arc::new(Listening),
         };
         let (_agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
-        let agents = AgentStream {
-            sink: AgentStreamSink {
-                host: crate::HostId(0),
-                agents: Arc::new(Listening),
+        let (_desk_command_tx, desk_command_rx) = futures_mpsc::unbounded();
+        let streams = Streams {
+            agents: AgentStream {
+                sink: AgentStreamSink {
+                    host: crate::HostId(0),
+                    agents: Arc::new(Listening),
+                },
+                commands: Arc::new(tokio::sync::Mutex::new(agent_command_rx)),
+                focus: AgentFocus::default(),
             },
-            commands: Arc::new(tokio::sync::Mutex::new(agent_command_rx)),
-            focus: AgentFocus::default(),
+            desk: DeskStream {
+                sink: DeskStreamSink {
+                    host: crate::HostId(0),
+                    desk: Arc::new(Listening),
+                },
+                commands: Arc::new(tokio::sync::Mutex::new(desk_command_rx)),
+            },
         };
         let (_command_tx, command_rx) = futures_mpsc::unbounded();
         let supervisor = supervise(
             crate::AttachTarget::Unix(socket),
             events,
-            agents,
+            streams,
             Arc::new(tokio::sync::Mutex::new(command_rx)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),

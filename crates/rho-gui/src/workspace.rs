@@ -29,6 +29,7 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 #[cfg(test)]
 use rho_agent_host_proto::AdvisorIntelligence;
+use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agent_host_proto::{
     AgentId, AgentRole, ClientMessage, ContentPart, EngineerIntelligence, MessageDelivery,
 };
@@ -45,7 +46,7 @@ use rho_agents_client::{
     AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
     RoleCycleGroup, TranscriptFrame,
 };
-use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
+use rho_hosts::connection::{ConnEvent, Connection, DeskFrame, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
 use rho_window::selection::{ActivePane, Selection};
 use rho_window::style::StyleClass;
@@ -570,6 +571,7 @@ pub struct Workspace {
     voice: crate::voice::Voice,
     _event_task: Task<()>,
     _host_event_task: Task<()>,
+    _desk_event_task: Task<()>,
     _keystroke_subscription: gpui::Subscription,
     _transient_keystroke_interceptor: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
@@ -856,11 +858,13 @@ impl Workspace {
         #[cfg(test)]
         let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
         // Each stream of a host has its own reader: the agents stream goes
-        // to the agents client, the control stream comes here.
+        // to the agents client, the control and desk streams come here.
         let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_hosts::HostEvent>();
+        let (desk_events, desk_events_rx) = futures_mpsc::unbounded::<rho_hosts::DeskEvent>();
         let hosts = Hosts::new(rho_hosts::Sinks {
             client: std::sync::Arc::new(host_events),
             agents: agents_client.sink(),
+            desk: std::sync::Arc::new(desk_events),
         });
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
@@ -912,6 +916,23 @@ impl Workspace {
                 let updated = this.update_in(cx, |this, window, cx| {
                     for rho_hosts::HostEvent { host, event } in batch {
                         this.handle_event(host, event, window, cx);
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        let desk_event_task = cx.spawn(async move |this, cx| {
+            let mut events = desk_events_rx;
+            while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                let updated = this.update_in(cx, |this, window, cx| {
+                    for rho_hosts::DeskEvent { host, frame } in batch {
+                        this.handle_desk_event(host, frame, window, cx);
                     }
                 });
                 if updated.is_err() {
@@ -1075,6 +1096,7 @@ impl Workspace {
             voice: crate::voice::Voice::default(),
             _event_task: event_task,
             _host_event_task: host_event_task,
+            _desk_event_task: desk_event_task,
             _keystroke_subscription: keystroke_subscription,
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
@@ -1236,9 +1258,9 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn send_to_host(&self, host: HostId, message: ClientMessage) {
+    pub(crate) fn send_desk(&self, host: HostId, frame: DeskClientFrame) {
         if let Some(connection) = self.hosts.connection(host) {
-            connection.send(message);
+            connection.desk().send(frame);
         }
     }
 
@@ -1703,8 +1725,8 @@ impl Workspace {
             cells.bodies,
             cx,
         );
-        for message in back {
-            self.send_to_host(host, message);
+        for frame in back {
+            self.send_desk(host, frame);
         }
         self.sync_tree_delta(host, &delta, window, cx);
         // Both halves are here only when the cells are: the seed of rho's
@@ -2055,19 +2077,28 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn handle_event(
+    /// What a host says on its desk stream.
+    pub(crate) fn handle_desk_event(
         &mut self,
         host: HostId,
-        event: ConnEvent,
+        frame: DeskFrame,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            ConnEvent::DesktopSessions(sessions) => {
-                self.desktop_sessions.insert(host, sessions);
-                cx.notify();
+        match frame {
+            DeskFrame::Opened => {
+                // The copy comes first, so what the client already read is
+                // on screen before the daemon has said anything, and so
+                // that the handshake below asks from the version it holds
+                // rather than from nothing.
+                self.open_desk_from_replica(host, window, cx);
+                // The handshake belongs to the stream, not to the window:
+                // a reopened stream asks only for what it is missing, and
+                // the replica it asks from was open before the window was.
+                let sync = self.desk_cells.sync(host);
+                self.send_desk(host, sync);
             }
-            ConnEvent::DeskSynced {
+            DeskFrame::Synced {
                 store,
                 node_namespace,
                 delta,
@@ -2084,16 +2115,16 @@ impl Workspace {
                 window,
                 cx,
             ),
-            ConnEvent::DeskCellsAvailable { frontier } => {
+            DeskFrame::CellsAvailable { frontier } => {
                 if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
-                    self.send_to_host(host, sync);
+                    self.send_desk(host, sync);
                 }
             }
-            ConnEvent::DeskResyncRequired => {
+            DeskFrame::ResyncRequired => {
                 let sync = self.desk_cells.resync_required(host);
-                self.send_to_host(host, sync);
+                self.send_desk(host, sync);
             }
-            ConnEvent::DeskTextApplied { id, operation } => {
+            DeskFrame::TextApplied { id, operation } => {
                 // A body edit from another device moves that note's words
                 // and the breadcrumbs made of them, which is its subtree
                 // and nothing else. Where the rows sit does not move, so
@@ -2110,6 +2141,21 @@ impl Workspace {
                     shape: false,
                 };
                 self.sync_tree_delta(host, &delta, window, cx);
+            }
+        }
+    }
+
+    pub(crate) fn handle_event(
+        &mut self,
+        host: HostId,
+        event: ConnEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConnEvent::DesktopSessions(sessions) => {
+                self.desktop_sessions.insert(host, sessions);
+                cx.notify();
             }
             ConnEvent::Ready {
                 auth,
@@ -2279,16 +2325,6 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
-                // The copy comes first, so what the client already read is
-                // on screen before the daemon has said anything, and so
-                // that the handshake below asks from the version it holds
-                // rather than from nothing.
-                self.open_desk_from_replica(host, window, cx);
-                // The Desk handshake belongs to the connection, not to the
-                // window: a reconnect asks only for what it is missing, and
-                // the replica it asks from was open before the window was.
-                let sync = self.desk_cells.sync(host);
-                self.send_to_host(host, sync);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
@@ -5049,6 +5085,21 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    /// Forgets everything sent to the host so far, on every stream.
+    #[cfg(test)]
+    pub(crate) fn clear_sent_for_test(&self, host: HostId) {
+        self.take_host_messages_for_test(host);
+        self.take_desk_frames_for_test(host);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_desk_frames_for_test(&self, host: HostId) -> Vec<DeskClientFrame> {
+        self.hosts
+            .connection(host)
+            .map(Connection::take_desk_sent_for_test)
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub(crate) fn dashboard_deal_mode_for_test(&mut self, cx: &mut Context<Self>) -> bool {
         self.open_card_in_view(cx).is_some()
@@ -5904,9 +5955,9 @@ impl Workspace {
         transaction: rho_agent_host_proto::desk::TextTransaction,
         _cx: &mut Context<Self>,
     ) {
-        self.send_to_host(
+        self.send_desk(
             host,
-            ClientMessage::DeskTextApply {
+            DeskClientFrame::TextApply {
                 id,
                 operation,
                 transaction: Some(transaction),
@@ -5927,8 +5978,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<rho_agent_host_proto::desk::cells::Stamp> {
-        let (message, delta) = self.desk_cells.apply(host, writes, verdict)?;
-        let ClientMessage::DeskMutationApply { mutation } = &message else {
+        let (frame, delta) = self.desk_cells.apply(host, writes, verdict)?;
+        let DeskClientFrame::MutationApply { mutation } = &frame else {
             return None;
         };
         let stamp = mutation.stamp;
@@ -5936,7 +5987,7 @@ impl Workspace {
         // it, and the daemon's answer may be a frame away.
         self.desk_cells.give_buffers(host, &delta, cx);
         self.sync_tree_delta(host, &delta, window, cx);
-        self.send_to_host(host, message);
+        self.send_desk(host, frame);
         Some(stamp)
     }
 

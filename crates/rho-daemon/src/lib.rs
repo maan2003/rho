@@ -13,6 +13,9 @@ use rho_agent::db::{
     QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
+use rho_agent_host_proto::desk::stream::{
+    ClientFrame as DeskClientFrame, ServerFrame as DeskServerFrame,
+};
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
@@ -649,6 +652,7 @@ async fn run_iroh_listener(
                             &first,
                             ClientMessage::ChannelOpen { .. }
                                 | ClientMessage::AgentsOpen
+                                | ClientMessage::DeskOpen
                                 | ClientMessage::RealtimeOpen { .. }
                                 | ClientMessage::GuiTelemetryUpload { .. }
                                 | ClientMessage::VisualizationGet { .. }
@@ -886,21 +890,21 @@ impl GitTransportBroker {
 /// that died without closing leaves its hold behind, and the GUI the user
 /// just restarted must not be the one that is refused.
 struct DeskBinding {
-    /// Which connection holds it, so a connection ending only lets go of a
-    /// hold that is still its own.
+    /// Which stream holds it, so a stream ending only lets go of a hold
+    /// that is still its own.
     connection: u64,
-    /// The displaced connection's writer, to tell it why it is going.
-    outgoing: mpsc::UnboundedSender<ServerMessage>,
-    /// Set when a newer connection takes the device. A displaced connection
-    /// may not write: its mutations are refused from this moment, whether or
-    /// not its socket has noticed yet.
+    /// The displaced stream's writer, to tell it why it is going.
+    outgoing: mpsc::UnboundedSender<DeskServerFrame>,
+    /// Set when a newer stream takes the device. A displaced stream may not
+    /// write: its mutations are refused from this moment, whether or not
+    /// its socket has noticed yet.
     displaced: AtomicBool,
-    /// Wakes the displaced connection's read loop so it ends rather than
+    /// Wakes the displaced stream's read loop so it ends rather than
     /// sitting on a socket nobody is reading.
     closed: Notify,
 }
 
-/// What a connection holds after `DeskSync`.
+/// What a desk stream holds after `Sync`.
 struct DeskSession {
     device: rho_agent_host_proto::desk::cells::DeviceId,
     node_namespace: u16,
@@ -932,6 +936,9 @@ struct Services {
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
     events: broadcast::Sender<ServerMessage>,
+    /// The desk's fanout: every desk stream hears when the host's copy
+    /// moves, whichever stream moved it.
+    desk_events: broadcast::Sender<DeskServerFrame>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
     /// The Claude configuration this daemon runs against, resolved in `run`.
@@ -974,6 +981,7 @@ impl Services {
             pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
+            desk_events: broadcast::channel(1024).0,
             user_environment,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
@@ -1190,6 +1198,9 @@ where
     if let ClientMessage::AgentsOpen = first {
         return serve_agents(services, reader, writer).await;
     }
+    if let ClientMessage::DeskOpen = first {
+        return serve_desk(services, reader, writer).await;
+    }
     if let ClientMessage::RealtimeOpen { offer_sdp } = first {
         return realtime::serve(services, reader, writer, offer_sdp).await;
     }
@@ -1305,10 +1316,6 @@ where
     let mut created_rx = services.pool.subscribe_created();
     let mut events_rx = services.events.subscribe();
     let _ = outgoing_tx.send(services.ready_message().await);
-    // Names this connection's wants in the pool's live set, so they leave
-    // with it.
-    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    let mut desk_session = None;
 
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
@@ -1344,6 +1351,7 @@ where
     // whose action produced them; aborted on disconnect so the writer channel
     // can close.
     let events_tx = outgoing_tx.clone();
+    let events_services = Arc::clone(&services);
     let events_task = tokio::spawn(async move {
         loop {
             match events_rx.recv().await {
@@ -1352,8 +1360,13 @@ where
                         break;
                     }
                 }
+                // Most of what fans out is a piece of `Ready`; the whole of
+                // it stands in for whatever was missed.
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if events_tx.send(ServerMessage::DeskResyncRequired).is_err() {
+                    if events_tx
+                        .send(events_services.ready_message().await)
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1406,39 +1419,17 @@ where
         let message = match first.take() {
             Some(message) => message,
             None => {
-                // A displaced connection stops here rather than sitting on a
-                // socket nobody is reading: the GUI that held this device has
-                // been told, and the window that took it is the live one.
-                let displaced = desk_session
-                    .as_ref()
-                    .map(|session: &DeskSession| Arc::clone(&session.binding));
-                let frame =
-                    rho_agent_host_proto::read_frame_optional::<_, ClientMessage>(&mut reader);
-                let read = match displaced {
-                    Some(binding) => {
-                        tokio::select! {
-                            biased;
-                            () = binding.closed.notified() => None,
-                            read = frame => Some(read),
-                        }
-                    }
-                    None => Some(frame.await),
-                };
-                match read {
-                    None => {
+                match rho_agent_host_proto::read_frame_optional::<_, ClientMessage>(&mut reader)
+                    .await
+                {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
                         for (repo, _) in &land_leases {
                             services.clear_land_holder(repo).await;
                         }
                         break Ok(());
                     }
-                    Some(Ok(Some(message))) => message,
-                    Some(Ok(None)) => {
-                        for (repo, _) in &land_leases {
-                            services.clear_land_holder(repo).await;
-                        }
-                        break Ok(());
-                    }
-                    Some(Err(error)) => {
+                    Err(error) => {
                         for (repo, _) in &land_leases {
                             services.clear_land_holder(repo).await;
                         }
@@ -1453,8 +1444,6 @@ where
             &outgoing_tx,
             &mut land_leases,
             land_holder.clone(),
-            connection_id,
-            &mut desk_session,
             message,
         )
         .await
@@ -1477,17 +1466,6 @@ where
             }
         }
     };
-    // Let go of the device only if the hold is still this connection's: a
-    // newer window may have taken it, and ending must not unbind theirs.
-    if let Some(session) = desk_session {
-        let mut devices = services.desk_devices.lock().await;
-        if devices
-            .get(&session.device)
-            .is_some_and(|held| Arc::ptr_eq(held, &session.binding))
-        {
-            devices.remove(&session.device);
-        }
-    }
     events_task.abort();
     if let Some(task) = desktop_task {
         task.abort();
@@ -2025,6 +2003,268 @@ where
     result
 }
 
+/// A desk stream: one GUI's replica kept in step with the host's copy.
+///
+/// Every desk stream hears the host's pokes, synced or not; writing waits
+/// on `Sync`, which binds the stream to its device. An error ends the
+/// stream, and the client comes back and syncs again.
+async fn serve_desk<R, W>(services: Arc<Services>, mut reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DeskServerFrame>();
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(frame) = outgoing_rx.recv().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    // Forwarded by a task of its own rather than raced against the read
+    // below: a read cut off halfway through a frame loses it.
+    let mut events_rx = services.desk_events.subscribe();
+    let events_tx = outgoing_tx.clone();
+    let events_task = tokio::spawn(async move {
+        loop {
+            let frame = match events_rx.recv().await {
+                Ok(frame) => frame,
+                Err(broadcast::error::RecvError::Lagged(_)) => DeskServerFrame::ResyncRequired,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            if events_tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let stream_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut session: Option<DeskSession> = None;
+    let result = loop {
+        // A displaced stream stops here rather than sitting on a socket
+        // nobody is reading: the GUI that held this device has been told,
+        // and the window that took it is the live one.
+        let displaced = session.as_ref().map(|session| Arc::clone(&session.binding));
+        let frame = rho_agent_host_proto::read_frame_optional::<_, DeskClientFrame>(&mut reader);
+        let read = match displaced {
+            Some(binding) => {
+                tokio::select! {
+                    biased;
+                    () = binding.closed.notified() => break Ok(()),
+                    read = frame => read,
+                }
+            }
+            None => frame.await,
+        };
+        let frame = match read {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        };
+        if let Err(error) =
+            handle_desk_frame(&services, &outgoing_tx, stream_id, &mut session, frame).await
+        {
+            break Err(error);
+        }
+    };
+    // Let go of the device only if the hold is still this stream's: a newer
+    // window may have taken it, and ending must not unbind theirs.
+    if let Some(session) = session {
+        let mut devices = services.desk_devices.lock().await;
+        if devices
+            .get(&session.device)
+            .is_some_and(|held| Arc::ptr_eq(held, &session.binding))
+        {
+            devices.remove(&session.device);
+        }
+    }
+    events_task.abort();
+    let _ = events_task.await;
+    // The last frame, `Displaced` among them, still goes out: every sender
+    // is gone now, so the writer ends once it has written what it holds.
+    drop(outgoing_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer_task).await;
+    result
+}
+
+async fn handle_desk_frame(
+    services: &Arc<Services>,
+    outgoing_tx: &mpsc::UnboundedSender<DeskServerFrame>,
+    stream_id: u64,
+    session: &mut Option<DeskSession>,
+    frame: DeskClientFrame,
+) -> anyhow::Result<()> {
+    use rho_agent_host_proto::desk::stream::{ClientFrame, ServerFrame};
+    match frame {
+        ClientFrame::Sync {
+            device,
+            known,
+            store,
+            bodies,
+        } => {
+            if session
+                .as_ref()
+                .is_some_and(|session| session.device != device)
+            {
+                anyhow::bail!("Desk stream is already bound to another device");
+            }
+            let node_namespace = services
+                .desk_cells
+                .node_namespace(device)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            // The client says which store it counted `known` in. If that
+            // is not this store, the answer is the whole of this one: the
+            // client's numbers were counted elsewhere, and a difference
+            // taken from them would leave it holding a desk made of two
+            // stores at once.
+            let (store, delta) = services
+                .desk_cells
+                .sync_for(store, &known)
+                .map_err(anyhow::Error::msg)?;
+            let binding = match session.take() {
+                // This stream already holds the device: syncing again is a
+                // resync, not a second writer.
+                Some(session) => session.binding,
+                None => {
+                    let binding = Arc::new(DeskBinding {
+                        connection: stream_id,
+                        outgoing: outgoing_tx.clone(),
+                        displaced: AtomicBool::new(false),
+                        closed: Notify::new(),
+                    });
+                    // Newest wins. A device is one GUI, so a hold that is
+                    // still standing belongs to a GUI that has died or is
+                    // stale — the user has just restarted theirs, and
+                    // refusing it would leave them with no desk until the
+                    // transport gave up on the old connection, which over
+                    // iroh is the ten minutes of
+                    // `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`.
+                    if let Some(held) = services
+                        .desk_devices
+                        .lock()
+                        .await
+                        .insert(device, Arc::clone(&binding))
+                        && held.connection != stream_id
+                    {
+                        held.displaced.store(true, Ordering::SeqCst);
+                        let _ = held.outgoing.send(ServerFrame::Displaced);
+                        held.closed.notify_one();
+                    }
+                    binding
+                }
+            };
+            *session = Some(DeskSession {
+                device,
+                node_namespace,
+                binding,
+            });
+            let _ = outgoing_tx.send(ServerFrame::Synced {
+                store,
+                node_namespace,
+                delta,
+                bodies: services.desk_cells.bodies_since(&bodies),
+            });
+            Ok(())
+        }
+        ClientFrame::CellsApply { cells } => {
+            // The other half of the handshake. The same two conditions as a
+            // mutation, and for the same reason: they are about this
+            // stream, not about what the cells say.
+            let Some(session) = session.as_ref() else {
+                anyhow::bail!("Desk stream must sync before writing");
+            };
+            anyhow::ensure!(
+                !session.binding.displaced.load(Ordering::SeqCst),
+                "The desk moved to a newer window on this device"
+            );
+            match services.desk_cells.apply_cells(cells).await {
+                Ok(()) => {
+                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                    let _ = services
+                        .desk_events
+                        .send(ServerFrame::CellsAvailable { frontier });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, device = ?session.device,
+                        "a client's catch-up cells did not merge");
+                }
+            }
+            Ok(())
+        }
+        ClientFrame::MutationApply { mutation } => {
+            let stamp = mutation.stamp;
+            // Nothing here is a verdict on what the user wrote: the two
+            // conditions below are about this stream, and they end it the
+            // same way the text path does. The desk is the client's, and
+            // the daemon holds a copy so that clients can sync through it.
+            let Some(session) = session.as_ref() else {
+                anyhow::bail!("Desk stream must sync before writing");
+            };
+            // Displaced, so this stream's device id belongs to another
+            // window now: writing under it would put two authors in one
+            // CRDT namespace.
+            anyhow::ensure!(
+                !session.binding.displaced.load(Ordering::SeqCst),
+                "The desk moved to a newer window on this device"
+            );
+            let device = session.device;
+            match services.desk_cells.apply_mutation(device, mutation).await {
+                // No answer goes back. The write was done on the client
+                // when the client made it; what the other devices need is
+                // the poke that says there is something to sync.
+                Ok(()) => {
+                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                    let _ = services
+                        .desk_events
+                        .send(ServerFrame::CellsAvailable { frontier });
+                }
+                // What is left is a mutation that could not be decoded into
+                // the store at all. There is no answer for it any more, and
+                // the client is not waiting for one; the log is where it
+                // goes.
+                Err(error) => {
+                    tracing::warn!(%error, device = ?device, version = stamp.version,
+                        "a desk mutation did not merge");
+                }
+            }
+            Ok(())
+        }
+        ClientFrame::TextApply {
+            id,
+            operation,
+            transaction,
+        } => {
+            let Some(session) = session.as_ref() else {
+                anyhow::bail!("Desk stream must sync before writing text");
+            };
+            anyhow::ensure!(
+                !session.binding.displaced.load(Ordering::SeqCst),
+                "The desk moved to a newer window on this device"
+            );
+            let namespace = session.node_namespace;
+            if services
+                .desk_cells
+                .apply_body(
+                    namespace,
+                    id.clone(),
+                    operation.clone(),
+                    transaction.clone(),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?
+            {
+                let _ = services.desk_events.send(ServerFrame::TextApplied {
+                    id,
+                    operation,
+                    transaction,
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Contiguous by seq is the whole contract for rows. The daemon remembers
 /// the last seq it sent; an append that is not the next one, or a lagged
 /// subscription, sends it back to the journal from there. Rows the
@@ -2161,181 +2401,11 @@ async fn handle_message(
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     land_holder: Option<LandLeaseHolder>,
-    connection_id: u64,
-    desk_session: &mut Option<DeskSession>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
         ClientMessage::Ping => {
             let _ = outgoing_tx.send(ServerMessage::Pong);
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskSync {
-            device,
-            known,
-            store,
-            bodies,
-        } => {
-            if desk_session
-                .as_ref()
-                .is_some_and(|session| session.device != device)
-            {
-                anyhow::bail!("Desk connection is already bound to another device");
-            }
-            let node_namespace = services
-                .desk_cells
-                .node_namespace(device)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            // The client says which store it counted `known` in. If that
-            // is not this store, the answer is the whole of this one: the
-            // client's numbers were counted elsewhere, and a difference
-            // taken from them would leave it holding a desk made of two
-            // stores at once.
-            let (store, delta) = services
-                .desk_cells
-                .sync_for(store, &known)
-                .map_err(anyhow::Error::msg)?;
-            let binding = match desk_session.take() {
-                // This connection already holds the device: syncing again is
-                // a resync, not a second writer.
-                Some(session) => session.binding,
-                None => {
-                    let binding = Arc::new(DeskBinding {
-                        connection: connection_id,
-                        outgoing: outgoing_tx.clone(),
-                        displaced: AtomicBool::new(false),
-                        closed: Notify::new(),
-                    });
-                    // Newest wins. A device is one GUI, so a hold that is
-                    // still standing belongs to a GUI that has died or is
-                    // stale — the user has just restarted theirs, and
-                    // refusing it would leave them with no desk until the
-                    // transport gave up on the old connection, which over
-                    // iroh is the ten minutes of
-                    // `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`.
-                    if let Some(held) = services
-                        .desk_devices
-                        .lock()
-                        .await
-                        .insert(device, Arc::clone(&binding))
-                        && held.connection != connection_id
-                    {
-                        held.displaced.store(true, Ordering::SeqCst);
-                        let _ = held.outgoing.send(ServerMessage::Error {
-                            message: "The desk moved to a newer window on this device".into(),
-                        });
-                        held.closed.notify_one();
-                    }
-                    binding
-                }
-            };
-            *desk_session = Some(DeskSession {
-                device,
-                node_namespace,
-                binding,
-            });
-            let _ = outgoing_tx.send(ServerMessage::DeskSynced {
-                store,
-                node_namespace,
-                delta,
-                bodies: services.desk_cells.bodies_since(&bodies),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskCellsApply { cells } => {
-            // The other half of the handshake. The same two conditions as a
-            // mutation, and for the same reason: they are about this
-            // connection, not about what the cells say.
-            let Some(session) = desk_session.as_ref() else {
-                anyhow::bail!("Desk connection must sync before writing");
-            };
-            anyhow::ensure!(
-                !session.binding.displaced.load(Ordering::SeqCst),
-                "The desk moved to a newer window on this device"
-            );
-            match services.desk_cells.apply_cells(cells).await {
-                Ok(()) => {
-                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                    let _ = services
-                        .events
-                        .send(ServerMessage::DeskCellsAvailable { frontier });
-                }
-                Err(error) => {
-                    tracing::warn!(%error, device = ?session.device,
-                        "a client's catch-up cells did not merge");
-                }
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskMutationApply { mutation } => {
-            let stamp = mutation.stamp;
-            // Nothing here is a verdict on what the user wrote: the two
-            // conditions below are about this connection, and they break it
-            // the same way the text path does. The desk is the client's, and
-            // the daemon holds a copy so that clients can sync through it.
-            let Some(session) = desk_session.as_ref() else {
-                anyhow::bail!("Desk connection must sync before writing");
-            };
-            // Displaced, so this connection's device id belongs to another
-            // window now: writing under it would put two authors in one
-            // CRDT namespace.
-            anyhow::ensure!(
-                !session.binding.displaced.load(Ordering::SeqCst),
-                "The desk moved to a newer window on this device"
-            );
-            let device = session.device;
-            match services.desk_cells.apply_mutation(device, mutation).await {
-                // No answer goes back. The write was done on the client
-                // when the client made it; what the other devices need is
-                // the poke that says there is something to sync.
-                Ok(()) => {
-                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                    let _ = services
-                        .events
-                        .send(ServerMessage::DeskCellsAvailable { frontier });
-                }
-                // What is left is a mutation that could not be decoded into
-                // the store at all. There is no answer for it any more, and
-                // the client is not waiting for one; the log is where it
-                // goes.
-                Err(error) => {
-                    tracing::warn!(%error, device = ?device, version = stamp.version,
-                        "a desk mutation did not merge");
-                }
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTextApply {
-            id,
-            operation,
-            transaction,
-        } => {
-            let Some(session) = desk_session.as_ref() else {
-                anyhow::bail!("Desk connection must sync before writing text");
-            };
-            anyhow::ensure!(
-                !session.binding.displaced.load(Ordering::SeqCst),
-                "The desk moved to a newer window on this device"
-            );
-            let namespace = session.node_namespace;
-            if services
-                .desk_cells
-                .apply_body(
-                    namespace,
-                    id.clone(),
-                    operation.clone(),
-                    transaction.clone(),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?
-            {
-                let _ = services.events.send(ServerMessage::DeskTextApplied {
-                    id,
-                    operation,
-                    transaction,
-                });
-            }
             Ok(Refresh::None)
         }
         ClientMessage::ClaudeAccounts => {
@@ -2634,6 +2704,9 @@ async fn handle_message(
         // Only valid as a stream's first frame (`serve_agents`).
         ClientMessage::AgentsOpen => {
             anyhow::bail!("AgentsOpen must be the first frame on a dedicated stream")
+        }
+        ClientMessage::DeskOpen => {
+            anyhow::bail!("DeskOpen must be the first frame on a dedicated stream")
         }
         ClientMessage::SendUserMessage {
             agent_id,
@@ -3537,11 +3610,12 @@ mod tests {
     use rho_db::RhoDb;
 
     use super::{
-        AgentPool, AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim,
-        GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets, Services,
-        claude_quota_history, configure_octo_git_transport, hourly_global_usage_series,
-        merge_hourly_agent_cost_bucket, persist_gui_telemetry, prepare_image_content, quota_burn,
-        quota_summaries, start_runtime_sockets, validate_image_content,
+        AgentPool, AgentUsageModel, DeskClientFrame, DeskServerFrame, DeskSession,
+        GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
+        PlatformSecrets, Services, claude_quota_history, configure_octo_git_transport,
+        hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
+        prepare_image_content, quota_burn, quota_summaries, start_runtime_sockets,
+        validate_image_content,
     };
 
     #[test]
@@ -4147,7 +4221,7 @@ mod tests {
         let mut older: Option<DeskSession> = None;
         let mut newer: Option<DeskSession> = None;
 
-        let sync = |device| ClientMessage::DeskSync {
+        let sync = |device| DeskClientFrame::Sync {
             bodies: std::collections::BTreeMap::new(),
             device,
             known: Version::default(),
@@ -4160,17 +4234,11 @@ mod tests {
             .await
             .expect("and the window the user just restarted binds it too");
 
-        // The older connection is told why it is going, in words it can show.
-        let told = std::iter::from_fn(|| older_rx.try_recv().ok())
-            .filter_map(|message| match message {
-                ServerMessage::Error { message } => Some(message),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            told,
-            ["The desk moved to a newer window on this device"],
-            "the displaced window is told, and not left guessing"
+        // The older stream is told why it is going.
+        let told = std::iter::from_fn(|| older_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            matches!(told.last(), Some(DeskServerFrame::Displaced)),
+            "the displaced window is told, and not left guessing: {told:?}"
         );
 
         let mutation = CellMutation {
@@ -4183,7 +4251,7 @@ mod tests {
         };
         // The daemon no longer answers a write with a refusal, so the one
         // condition that is about the connection rather than about what the
-        // user wrote breaks the connection, the way the text path already
+        // user wrote ends the stream, the way the text path already
         // did. Two authors in one CRDT namespace is not a thing to carry on
         // through.
         let broken = desk_message(
@@ -4191,7 +4259,7 @@ mod tests {
             &older_tx,
             1,
             &mut older,
-            ClientMessage::DeskMutationApply {
+            DeskClientFrame::MutationApply {
                 mutation: mutation.clone(),
             },
         )
@@ -4208,7 +4276,7 @@ mod tests {
             &newer_tx,
             2,
             &mut newer,
-            ClientMessage::DeskMutationApply { mutation },
+            DeskClientFrame::MutationApply { mutation },
         )
         .await
         .unwrap();
@@ -4225,27 +4293,90 @@ mod tests {
         );
     }
 
-    /// One desk message through the daemon's own handler, with everything a
-    /// desk message does not use left empty.
+    /// The stream end to end, over pipes: a sync is answered, a write on
+    /// one stream pokes the other, and a newer window's sync ends the
+    /// older stream with `Displaced` as its last frame.
+    #[tokio::test]
+    async fn a_desk_stream_syncs_pokes_and_is_displaced() {
+        use rho_agent_host_proto::desk::cells::{
+            CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
+        };
+        use rho_agent_host_proto::{read_frame, write_frame};
+
+        let temp = tempfile::tempdir().unwrap();
+        let services = test_services(temp.path()).await;
+        let open = |services: &Arc<Services>| {
+            let (client, server) = tokio::io::duplex(1 << 20);
+            let (reader, writer) = tokio::io::split(server);
+            let task = tokio::spawn(super::serve_desk(Arc::clone(services), reader, writer));
+            (client, task)
+        };
+        let sync = |device| DeskClientFrame::Sync {
+            bodies: BTreeMap::new(),
+            device,
+            known: Version::default(),
+            store: None,
+        };
+        let device = DeviceId([7; 16]);
+
+        let (mut older, older_task) = open(&services);
+        write_frame(&mut older, &sync(device)).await.unwrap();
+        let answer: DeskServerFrame = read_frame(&mut older).await.unwrap();
+        assert!(
+            matches!(answer, DeskServerFrame::Synced { .. }),
+            "{answer:?}"
+        );
+
+        let (mut other, _other_task) = open(&services);
+        write_frame(&mut other, &sync(DeviceId([8; 16])))
+            .await
+            .unwrap();
+        let _: DeskServerFrame = read_frame(&mut other).await.unwrap();
+
+        let mutation = CellMutation {
+            stamp: Stamp { device, version: 1 },
+            writes: vec![CellWrite {
+                id: Id::Note(Uuid([9; 16])),
+                property: Property::State(State::Open),
+            }],
+            verdict: None,
+        };
+        write_frame(&mut older, &DeskClientFrame::MutationApply { mutation })
+            .await
+            .unwrap();
+        let poke: DeskServerFrame = read_frame(&mut other).await.unwrap();
+        assert_eq!(
+            poke,
+            DeskServerFrame::CellsAvailable {
+                frontier: Version::from([(device, 1)])
+            },
+            "the other device hears there is something to sync"
+        );
+
+        let (mut newer, _newer_task) = open(&services);
+        write_frame(&mut newer, &sync(device)).await.unwrap();
+        let _: DeskServerFrame = read_frame(&mut newer).await.unwrap();
+        let mut last = None;
+        while let Ok(frame) = read_frame::<_, DeskServerFrame>(&mut older).await {
+            last = Some(frame);
+        }
+        assert_eq!(
+            last,
+            Some(DeskServerFrame::Displaced),
+            "the older stream is told why, and then it ends"
+        );
+        older_task.await.unwrap().unwrap();
+    }
+
+    /// One desk frame through the daemon's own handler.
     async fn desk_message(
         services: &Arc<Services>,
-        outgoing: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
-        connection: u64,
+        outgoing: &tokio::sync::mpsc::UnboundedSender<DeskServerFrame>,
+        stream: u64,
         session: &mut Option<DeskSession>,
-        message: ClientMessage,
+        frame: DeskClientFrame,
     ) -> anyhow::Result<()> {
-        super::handle_message(
-            services,
-            None,
-            outgoing,
-            &mut Vec::new(),
-            None,
-            connection,
-            session,
-            message,
-        )
-        .await
-        .map(|_| ())
+        super::handle_desk_frame(services, outgoing, stream, session, frame).await
     }
 
     async fn test_services(root: &std::path::Path) -> Arc<Services> {

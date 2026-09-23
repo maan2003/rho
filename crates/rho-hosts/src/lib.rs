@@ -3,7 +3,7 @@
 //! One connection per attached daemon, the handshake that brings it up, and
 //! the streams it carries. Each stream has its own reader: the control
 //! stream's events go to the window, the agents stream's frames to the
-//! agents client (`Sinks`). The
+//! agents client, the desk stream's to the desk (`Sinks`). The
 //! crate holds no agent state, no desk state and no window state: what it
 //! knows is which machines exist, whether they are answering, and how to say
 //! something to one of them. Everything that has an opinion about what was
@@ -15,7 +15,8 @@ pub mod realtime_client;
 pub mod saved;
 
 pub use connection::{
-    AgentCommands, AgentEvent, AgentFrame, ChannelTask, ConnEvent, Connection, HostEvent, spawn,
+    AgentCommands, AgentEvent, AgentFrame, ChannelTask, ConnEvent, Connection, DeskCommands,
+    DeskEvent, DeskFrame, HostEvent, spawn,
 };
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
 
@@ -139,13 +140,27 @@ pub trait AgentSink: Send + Sync + 'static {
     fn send(&self, event: AgentEvent) -> Result<(), SinkClosed>;
 }
 
+/// Where a host's desk stream goes.
+pub trait DeskSink: Send + Sync + 'static {
+    fn send(&self, event: DeskEvent) -> Result<(), SinkClosed>;
+}
+
+/// A channel is a sink: its receiver is the reader.
+impl DeskSink for futures::channel::mpsc::UnboundedSender<DeskEvent> {
+    fn send(&self, event: DeskEvent) -> Result<(), SinkClosed> {
+        self.unbounded_send(event).map_err(|_| SinkClosed)
+    }
+}
+
 /// The readers of every attached host's streams.
 #[derive(Clone)]
 pub struct Sinks {
-    /// The control stream: the host's state, the desk, auth, usage.
+    /// The control stream: the host's state, auth, usage.
     pub client: std::sync::Arc<dyn HostSink>,
     /// The agents stream.
     pub agents: std::sync::Arc<dyn AgentSink>,
+    /// The desk stream.
+    pub desk: std::sync::Arc<dyn DeskSink>,
 }
 
 /// A sink with no reader: for a `Hosts` that stands in a test for the
@@ -172,11 +187,19 @@ impl AgentSink for DroppedSink {
 }
 
 #[cfg(feature = "test-support")]
+impl DeskSink for DroppedSink {
+    fn send(&self, _event: DeskEvent) -> Result<(), SinkClosed> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
 impl Sinks {
     pub fn dropped() -> Self {
         Self {
             client: std::sync::Arc::new(DroppedSink),
             agents: std::sync::Arc::new(DroppedSink),
+            desk: std::sync::Arc::new(DroppedSink),
         }
     }
 }

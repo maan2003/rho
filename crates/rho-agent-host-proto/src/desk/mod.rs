@@ -9,6 +9,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use text::{EditOperation, FullOffset, Operation, UndoOperation};
 
 pub mod cells;
+pub mod stream;
 
 /// Lamport timestamp used by structural operations.
 #[derive(

@@ -129,38 +129,9 @@ pub enum ClientMessage {
     /// The first frame of an agents stream ([`agents`]); every frame after
     /// it, both ways, is that module's.
     AgentsOpen,
-    DeskSync {
-        device: desk::cells::DeviceId,
-        known: desk::cells::Version,
-        /// Which store the client counted `known` in, when it holds a
-        /// replica at all. A version is a count of writes per device inside
-        /// one store; carried to another store the same numbers name writes
-        /// that never happened. So a client that comes back holding one
-        /// says whose numbers these are, and a daemon that does not
-        /// recognise the name answers with the whole store rather than a
-        /// difference from a number that was never its own.
-        store: Option<desk::cells::DeviceId>,
-        /// How much of each note's text the client already holds, by note.
-        /// The daemon answers with the operations these lack and leaves
-        /// out the bodies with nothing new in them; a note missing from
-        /// the map is one the client has never held, and comes whole.
-        bodies: std::collections::BTreeMap<desk::cells::Id, desk::cells::BodyVersion>,
-    },
-    /// The client's half of a sync: the cells it holds that the daemon's
-    /// frontier does not cover. The store is the client's, so the daemon
-    /// catches up from it the same way it is caught up from.
-    DeskCellsApply {
-        cells: desk::cells::Snapshot,
-    },
-    DeskMutationApply {
-        mutation: desk::cells::CellMutation,
-    },
-    /// An edit to a note's body, which is the only text the store holds.
-    DeskTextApply {
-        id: desk::cells::Id,
-        operation: desk::TextOperation,
-        transaction: Option<desk::TextTransaction>,
-    },
+    /// The first frame of a desk stream ([`desk::stream`]); every frame
+    /// after it, both ways, is that module's.
+    DeskOpen,
     NewAgent {
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
@@ -499,25 +470,6 @@ pub struct LandLeaseHolder {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
     Pong,
-    DeskSynced {
-        /// The store this delta was counted in, so a client holding a
-        /// replica can tell whether what it kept is behind this store or
-        /// about a different one. When it does not match what the client
-        /// holds, `delta` is the whole store, not a difference.
-        store: desk::cells::DeviceId,
-        node_namespace: u16,
-        delta: desk::cells::Snapshot,
-        bodies: Vec<desk::cells::BodySnapshot>,
-    },
-    DeskCellsAvailable {
-        frontier: desk::cells::Version,
-    },
-    DeskTextApplied {
-        id: desk::cells::Id,
-        operation: desk::TextOperation,
-        transaction: Option<desk::TextTransaction>,
-    },
-    DeskResyncRequired,
     Ready {
         auth: AuthState,
         /// The daemon database's machine seed; clients need it to encode
@@ -1061,79 +1013,6 @@ mod tests {
         // The previous epoch's magic followed by a record's worth of bytes.
         let mut old = &b"RUP9\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
-    }
-
-    #[test]
-    fn desk_cells_messages_round_trip() {
-        use desk::cells::{CellMutation, CellWrite, DeviceId, Id, Property, Stamp, Uuid, Version};
-
-        let device = DeviceId([7; 16]);
-        let id = Id::Note(Uuid([9; 16]));
-        let mutation = CellMutation {
-            stamp: Stamp {
-                device,
-                version: 12,
-            },
-            writes: vec![CellWrite {
-                id: id.clone(),
-                property: Property::Labeled {
-                    label: Id::Label(Uuid([3; 16])),
-                    present: true,
-                },
-            }],
-            verdict: None,
-        };
-        let text_operation = desk::TextOperation::Edit {
-            timestamp: desk::TreeClock {
-                value: 1,
-                replica_id: 4,
-            },
-            version: Vec::new(),
-            ranges: vec![(0, 0)],
-            new_text: vec!["note".into()],
-        };
-        for message in [
-            ClientMessage::DeskSync {
-                device,
-                known: Version::from([(device, 11)]),
-                store: Some(device),
-                bodies: std::collections::BTreeMap::from([(
-                    id.clone(),
-                    desk::cells::BodyVersion::from([(4, 1)]),
-                )]),
-            },
-            ClientMessage::DeskMutationApply { mutation },
-            ClientMessage::DeskTextApply {
-                id: id.clone(),
-                operation: text_operation.clone(),
-                transaction: None,
-            },
-        ] {
-            let bytes = senax_encoder::pack(&message).unwrap();
-            let mut slice: &[u8] = &bytes;
-            let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
-            assert_eq!(decoded, message);
-        }
-        let message = ServerMessage::DeskSynced {
-            store: device,
-            node_namespace: 4,
-            delta: desk::cells::Snapshot::default(),
-            bodies: Vec::new(),
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, message);
-
-        let message = ServerMessage::DeskTextApplied {
-            id,
-            operation: text_operation,
-            transaction: None,
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, message);
     }
 
     #[test]

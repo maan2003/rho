@@ -2,7 +2,7 @@
 //! holds.
 //!
 //! `DeskCells` is built empty at launch and filled by the first
-//! `DeskSynced`. Between those two moments the client holds a desk that
+//! `Synced`. Between those two moments the client holds a desk that
 //! says nothing, and an empty desk and a desk that has not arrived are the
 //! same value with opposite meanings: the first says the user has said
 //! nothing, the second says nobody has asked. Readers that could not tell
@@ -11,7 +11,7 @@
 //!
 //! This is the replica that removes the state instead of guarding it at
 //! each reader. The client opens from the file and asks the daemon only
-//! for what came after: `DeskSync` already carries the client's `Version`
+//! for what came after: `Sync` already carries the client's `Version`
 //! and the daemon already answers `Store::since`, so persisting the
 //! confirmed cells and their version is the whole of the client's half.
 //!
@@ -223,7 +223,7 @@ impl DeskMirror {
 
     /// What the daemon just told this client, written as it was merged.
     /// The version is the store's own after the merge, not the delta's, so
-    /// what is on disk and what the next `DeskSync` asks for are the same
+    /// what is on disk and what the next `Sync` asks for are the same
     /// number.
     pub fn write_delta(
         &self,
@@ -763,7 +763,7 @@ mod tests {
         );
         assert_eq!(
             held.snapshot.version, snapshot.version,
-            "the version is what the next DeskSync asks from"
+            "the version is what the next Sync asks from"
         );
         assert_eq!(
             held.store, DAEMON,
