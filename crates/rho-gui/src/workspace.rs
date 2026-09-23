@@ -46,6 +46,7 @@ use rho_agents_client::{
     AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
     RoleCycleGroup, TranscriptFrame,
 };
+use rho_desk_client::Desk;
 use rho_hosts::connection::{ConnEvent, Connection, DeskFrame, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
 use rho_window::selection::{ActivePane, Selection};
@@ -54,7 +55,7 @@ use settings::Settings as _;
 use theme::ActiveTheme as _;
 
 use crate::chime::Chime;
-use crate::desk_view::DeskCells;
+use crate::desk_view::DeskBuffers;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
 use crate::search;
@@ -316,7 +317,7 @@ pub(crate) fn snooze_target(
             };
             let date = now.date_naive() + chrono::Duration::days(days);
             (
-                crate::desk_view::day_timestamp(date),
+                rho_desk_client::desk::day_timestamp(date),
                 format!("snooze until {}", date.format("%a %-d %b")),
             )
         }
@@ -477,14 +478,15 @@ pub struct Workspace {
     /// Compact Helix-style key guide shown on deal entry and `?`.
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
-    pub(crate) desk_cells: DeskCells,
+    pub(crate) desk: Desk,
+    pub(crate) desk_buffers: DeskBuffers,
     /// One note surface per node the reader has opened, kept so the body's
     /// cursor and scroll survive leaving and coming back.
     note_views:
         HashMap<(HostId, rho_agent_host_proto::desk::cells::Id), crate::note_view::NoteView>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
-    desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
+    desk_semantic_clipboard: Option<rho_desk_client::desk::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
     desk_semantic_paste_target: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
@@ -652,7 +654,7 @@ impl Workspace {
     /// a `Project`.
     fn refresh_workdirs(&mut self, host: HostId) {
         let repositories = self
-            .desk_cells
+            .desk
             .repositories(host)
             .into_iter()
             .map(|(name, repository)| (name, repository.url.into()))
@@ -1062,7 +1064,8 @@ impl Workspace {
             chime_above_threshold: false,
             dashboard,
             mode_indicator,
-            desk_cells: DeskCells::new(),
+            desk: Desk::new(),
+            desk_buffers: DeskBuffers::new(),
             note_views: HashMap::new(),
             verdict_undo: Vec::new(),
             next_verdict_undo_sequence: 0,
@@ -1161,7 +1164,7 @@ impl Workspace {
         self.agents_client.attach_host(host, spec.name.clone());
         self.agents_client.host_commands(host, commands);
         self.registry.attach_host(host, spec.name);
-        self.desk_cells.slack_owned_by(self.hosts.owner());
+        self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
         host
     }
@@ -1207,7 +1210,7 @@ impl Workspace {
             self.voice.stop();
         }
         self.hosts.detach(host);
-        self.desk_cells.slack_owned_by(self.hosts.owner());
+        self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
         self.agents_client.detach_host(host);
         self.ready_hosts.remove(&host);
@@ -1717,18 +1720,24 @@ impl Workspace {
                 .sum::<usize>(),
             "desk arrived"
         );
-        let (back, delta) = self.desk_cells.synced(
+        let synced = self.desk.synced(
             host,
             cells.store,
             cells.node_namespace,
             cells.delta,
             cells.bodies,
-            cx,
         );
-        for frame in back {
+        for frame in synced.back {
             self.send_desk(host, frame);
         }
-        self.sync_tree_delta(host, &delta, window, cx);
+        if synced.reset {
+            self.desk_buffers.forget(host);
+        }
+        self.desk_buffers
+            .merge_bodies(host, &self.desk, &synced.bodies, cx);
+        self.desk_buffers
+            .give_buffers(host, &self.desk, &synced.delta, cx);
+        self.sync_tree_delta(host, &synced.delta, window, cx);
         // Both halves are here only when the cells are: the seed of rho's
         // Slack cursors from the store's old ones runs at the first sync
         // that has a session, once ever, and is a marker read afterwards.
@@ -1760,14 +1769,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.desk_cells.is_loaded(host) {
+        if self.desk.is_loaded(host) {
             return;
         }
         let name = self.hosts.host_label(host);
         if name.is_empty() {
             return;
         }
-        self.desk_cells.host_named(host, name.clone());
+        self.desk.host_named(host, name.clone());
         let held = self.held_desk(&name);
         if !held.known {
             return;
@@ -2095,7 +2104,7 @@ impl Workspace {
                 // The handshake belongs to the stream, not to the window:
                 // a reopened stream asks only for what it is missing, and
                 // the replica it asks from was open before the window was.
-                let sync = self.desk_cells.sync(host);
+                let sync = self.desk.sync(host);
                 self.send_desk(host, sync);
             }
             DeskFrame::Synced {
@@ -2116,12 +2125,12 @@ impl Workspace {
                 cx,
             ),
             DeskFrame::CellsAvailable { frontier } => {
-                if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
+                if let Some(sync) = self.desk.cells_available(host, frontier) {
                     self.send_desk(host, sync);
                 }
             }
             DeskFrame::ResyncRequired => {
-                let sync = self.desk_cells.resync_required(host);
+                let sync = self.desk.resync_required(host);
                 self.send_desk(host, sync);
             }
             DeskFrame::TextApplied { id, operation } => {
@@ -2129,14 +2138,13 @@ impl Workspace {
                 // and the breadcrumbs made of them, which is its subtree
                 // and nothing else. Where the rows sit does not move, so
                 // nothing is composed.
-                self.desk_cells
-                    .text_applied(host, id.clone(), operation, cx);
+                self.desk_buffers.text_applied(host, &id, operation, cx);
                 let touched = self
                     .dashboard
                     .subtree_ids(host, &id)
                     .into_iter()
                     .collect::<BTreeSet<_>>();
-                let delta = crate::desk_view::DeskDelta {
+                let delta = rho_desk_client::desk::DeskDelta {
                     touched,
                     shape: false,
                 };
@@ -3179,7 +3187,7 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Done,
+            rho_desk_client::desk::DeskVerdict::Done,
             crate::dashboard::DealerVerdict::Done,
             "done".to_owned(),
             window,
@@ -3197,7 +3205,7 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Mute,
+            rho_desk_client::desk::DeskVerdict::Mute,
             crate::dashboard::DealerVerdict::Mute,
             "mute".to_owned(),
             window,
@@ -3223,8 +3231,8 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Todo {
-                defer_until: crate::desk_view::day_timestamp(today),
+            rho_desk_client::desk::DeskVerdict::Todo {
+                defer_until: rho_desk_client::desk::day_timestamp(today),
                 pace: days,
             },
             crate::dashboard::DealerVerdict::Done,
@@ -3258,8 +3266,8 @@ impl Workspace {
         };
         if !self.submit_tree_verdict(
             Some(room_node),
-            crate::desk_view::DeskVerdict::Defer {
-                until: crate::desk_view::day_timestamp(today + chrono::Duration::days(days)),
+            rho_desk_client::desk::DeskVerdict::Defer {
+                until: rho_desk_client::desk::day_timestamp(today + chrono::Duration::days(days)),
             },
             crate::dashboard::DealerVerdict::Defer,
             format!("snooze {days}d"),
@@ -3314,7 +3322,7 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Defer { until },
+            rho_desk_client::desk::DeskVerdict::Defer { until },
             crate::dashboard::DealerVerdict::Defer,
             said,
             window,
@@ -3365,7 +3373,7 @@ impl Workspace {
                 .map(|name| name.strip_suffix(".git").unwrap_or(name).to_owned())
                 .unwrap_or_else(|| workdir.path.to_string())
         });
-        let Some(writes) = self.desk_cells.repository_writes(
+        let Some(writes) = self.desk.repository_writes(
             workdir.host,
             &path_name,
             Some(rho_agent_host_proto::desk::cells::Repository {
@@ -3400,8 +3408,7 @@ impl Workspace {
                 else {
                     return;
                 };
-                let Some(writes) = self.desk_cells.repository_writes(workdir.host, &name, None)
-                else {
+                let Some(writes) = self.desk.repository_writes(workdir.host, &name, None) else {
                     return;
                 };
                 self.apply_desk_writes(workdir.host, writes, None, window, cx);
@@ -3592,7 +3599,7 @@ impl Workspace {
         let writes = std::iter::once(rho_agent_host_proto::desk::cells::CellWrite {
             id: id.clone(),
             property: rho_agent_host_proto::desk::cells::Property::CreatedAt(
-                crate::desk_view::now_timestamp(),
+                rho_desk_client::desk::now_timestamp(),
             ),
         })
         .chain(filing)
@@ -4260,8 +4267,8 @@ impl Workspace {
     pub(crate) fn desk_cells_snapshot_for_test(
         &self,
         host: HostId,
-    ) -> Vec<crate::desk_view::DeskNode> {
-        self.desk_cells.nodes(host).to_vec()
+    ) -> Vec<rho_desk_client::desk::DeskNode> {
+        self.desk.nodes(host).to_vec()
     }
 
     #[cfg(test)]
@@ -5322,7 +5329,7 @@ impl Workspace {
     fn sync_tree_delta(
         &mut self,
         host: HostId,
-        delta: &crate::desk_view::DeskDelta,
+        delta: &rho_desk_client::desk::DeskDelta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5337,11 +5344,9 @@ impl Workspace {
             // every cell of a streaming turn takes.
             let patched = {
                 let Self {
-                    desk_cells,
-                    dashboard,
-                    ..
+                    desk, dashboard, ..
                 } = self;
-                let nodes = desk_cells.nodes(host);
+                let nodes = desk.nodes(host);
                 dashboard.deal_shape_held(host, nodes)
                     && dashboard.patch_deal_source(host, &delta.touched, nodes)
             };
@@ -5349,7 +5354,7 @@ impl Workspace {
                 // The user's own words about an agent — its name, its
                 // labels, whether it is put away — are on the rows this
                 // delta named, and a patch is the path they arrive by.
-                let filings = self.desk_cells.agent_filings_of(host, &delta.touched);
+                let filings = self.desk.agent_filings_of(host, &delta.touched);
                 self.registry.set_agent_filings(filings);
                 let touched = delta.touched.iter().cloned().collect::<Vec<_>>();
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Nodes(&touched), cx);
@@ -5407,14 +5412,14 @@ impl Workspace {
             self.refresh_desk_sources(host, moved, cx)
         });
         timed_desk_step("desk_sync/apply_source_change", work_units, || {
-            self.desk_cells.apply_source_change(host, change)
+            self.desk.apply_source_change(host, change)
         });
         // A row that exists only because a source says so — a tab the
         // browser has just opened, a unit the mirror has just raised — has
         // nothing written, so no store event will ever give it the buffer
         // the map draws it from. It gets one here.
         timed_desk_step("desk_sync/reconcile_buffers", work_units, || {
-            self.desk_cells.reconcile_buffers(host, cx)
+            self.desk_buffers.reconcile_buffers(host, &self.desk, cx)
         });
         // The desk's nodes are already to hand; asking the dealer whether
         // they sit where its source has them costs a walk of the ids and no
@@ -5431,11 +5436,9 @@ impl Workspace {
         let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
         let patched = timed_desk_step("desk_sync/deal_shape_and_patch", work_units, || {
             let Self {
-                desk_cells,
-                dashboard,
-                ..
+                desk, dashboard, ..
             } = self;
-            let nodes = desk_cells.nodes(host);
+            let nodes = desk.nodes(host);
             dashboard.deal_shape_held(host, nodes)
                 && moved.as_ref().is_some_and(|agents| {
                     let touched = agents
@@ -5461,7 +5464,12 @@ impl Workspace {
         // breadcrumb beneath it, so this reads the titles again; it is the
         // nodes and the indexes and no rope.
         timed_desk_step("desk_sync/set_deal_source", work_units, || {
-            let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
+            let source = crate::candidates::HostNodes::of_notes(
+                &self.desk,
+                &mut self.desk_buffers,
+                host,
+                cx,
+            );
             self.dashboard.set_deal_source(host, source);
         });
 
@@ -5482,7 +5490,11 @@ impl Workspace {
 
     /// What the desk knows of one agent, or nothing when the agent is not
     /// this host's or the user filed it away.
-    fn agent_source(&self, host: HostId, agent: AgentId) -> Option<crate::desk_view::AgentSource> {
+    fn agent_source(
+        &self,
+        host: HostId,
+        agent: AgentId,
+    ) -> Option<rho_desk_client::desk::AgentSource> {
         /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
         fn story_pos(
@@ -5495,7 +5507,7 @@ impl Workspace {
             return None;
         }
         let digest = self.registry.agent_digest(agent);
-        Some(crate::desk_view::AgentSource {
+        Some(rho_desk_client::desk::AgentSource {
             agent,
             spawned_by: self.registry.agent_parent(agent),
             workdir: self.registry.working_directory(agent),
@@ -5522,14 +5534,14 @@ impl Workspace {
         host: HostId,
         moved: Option<&BTreeSet<AgentId>>,
         cx: &Context<Self>,
-    ) -> crate::desk_view::SourceChange {
+    ) -> rho_desk_client::desk::SourceChange {
         // A filing that moved changes who is on the desk at all, so the
         // whole set is built again; otherwise only the agents named are.
         let filed = self
             .registry
-            .set_agent_filings(self.desk_cells.agent_filing(host));
+            .set_agent_filings(self.desk.agent_filing(host));
         let held = self
-            .desk_cells
+            .desk
             .sources(host)
             .map(|sources| sources.agents().to_vec());
         let agents = match (moved, held) {
@@ -5562,14 +5574,14 @@ impl Workspace {
         // not the same as saying every unit went quiet: the facts already
         // read from the mirror stand until a session replaces them.
         let slack = if !self.slack.started() {
-            self.desk_cells
+            self.desk
                 .sources(host)
                 .map(|sources| sources.slack().to_vec())
                 .unwrap_or_default()
         } else if self.hosts.owner() == Some(host) {
             self.slack_thread_facts(cx)
                 .into_iter()
-                .map(|(unit, facts)| crate::desk_view::SlackSource {
+                .map(|(unit, facts)| rho_desk_client::desk::SlackSource {
                     unit,
                     title: facts.title,
                     newest: rho_agent_host_proto::desk::cells::SlackTs(facts.latest),
@@ -5587,7 +5599,7 @@ impl Workspace {
         let pages = if self.hosts.primary() == Some(host) && rho_browser::is_configured(cx) {
             rho_browser::live_pages()
                 .into_iter()
-                .map(|(page, opened_from)| crate::desk_view::PageSource {
+                .map(|(page, opened_from)| rho_desk_client::desk::PageSource {
                     page: rho_agent_host_proto::desk::PageId(*page.0.as_bytes()),
                     opened_from: opened_from
                         .map(|id| rho_agent_host_proto::desk::PageId(*id.0.as_bytes())),
@@ -5596,17 +5608,17 @@ impl Workspace {
         } else {
             Vec::new()
         };
-        let sources = crate::desk_view::Sources::new(
+        let sources = rho_desk_client::desk::Sources::new(
             self.registry.host_machine_seed(host),
             agents,
             slack,
             pages,
         );
-        let change = self.desk_cells.set_sources(host, sources);
+        let change = self.desk.set_sources(host, sources);
         // The user's verdicts are the one thing attention needs that no
         // row carries; the registry derives it from them and the digest,
         // and the mirror keeps them so a restart ranks the same way.
-        for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
+        for (agent_id, verdict) in self.desk.agent_verdicts(host) {
             if self.registry.set_agent_verdict(agent_id, verdict) {
                 self.agents_client.set_verdict(agent_id, verdict);
             }
@@ -5635,11 +5647,11 @@ impl Workspace {
         &mut self,
         host: HostId,
         id: &rho_agent_host_proto::desk::cells::Id,
-        verdict: crate::desk_view::DeskVerdict,
+        verdict: rho_desk_client::desk::DeskVerdict,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((writes, event)) = self.desk_cells.verdict_writes(host, id, verdict) else {
+        let Some((writes, event)) = self.desk.verdict_writes(host, id, verdict) else {
             return false;
         };
         self.apply_desk_writes(host, writes, Some(event), window, cx)
@@ -5653,18 +5665,18 @@ impl Workspace {
     pub(crate) fn set_slack_sources_for_test(
         &mut self,
         host: HostId,
-        slack: Vec<crate::desk_view::SlackSource>,
+        slack: Vec<rho_desk_client::desk::SlackSource>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let sources = self
-            .desk_cells
+            .desk
             .sources(host)
             .cloned()
             .unwrap_or_default()
             .with_slack(slack);
-        let change = self.desk_cells.set_sources(host, sources);
-        self.desk_cells.apply_source_change(host, change);
+        let change = self.desk.set_sources(host, sources);
+        self.desk.apply_source_change(host, change);
         self.sync_tree_dashboard(host, window, cx);
     }
 
@@ -5674,7 +5686,9 @@ impl Workspace {
         if self.note_views.is_empty() {
             return;
         }
-        let Some((nodes, buffers, note_titles)) = self.desk_cells.tree_source(host, cx) else {
+        let Some((nodes, buffers, note_titles)) =
+            self.desk_buffers.tree_source(host, &self.desk, cx)
+        else {
             return;
         };
         // A note's title is the first line of its body, which the desk
@@ -5709,7 +5723,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&crate::note_view::NoteView> {
-        let body = self.desk_cells.buffer(host, &node_id)?.clone();
+        let body = self.desk_buffers.buffer(host, &node_id)?.clone();
         // A resync can hand out a fresh buffer for the same node; the old
         // surface is then over text nothing writes to any more.
         if self
@@ -5799,7 +5813,7 @@ impl Workspace {
             return;
         };
         if self
-            .desk_cells
+            .desk
             .node(host, &node_id)
             .is_some_and(|node| node.is_note())
         {
@@ -5807,15 +5821,15 @@ impl Workspace {
             return;
         }
         let notes = self
-            .desk_cells
-            .tree_source(host, cx)
+            .desk_buffers
+            .tree_source(host, &self.desk, cx)
             .into_iter()
             .flat_map(|(nodes, _, _)| nodes)
             .filter(|node| node.is_note())
             .map(|node| node.id)
             .collect::<Vec<_>>();
         let existing = notes.into_iter().find(|note| {
-            self.desk_cells
+            self.desk
                 .facts(host, note)
                 .is_some_and(|facts| facts.about.as_ref() == Some(&node_id))
         });
@@ -5826,7 +5840,7 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        let Some((created, mut writes)) = self.desk_cells.create_note_writes(host, None) else {
+        let Some((created, mut writes)) = self.desk.create_note_writes(host, None) else {
             return;
         };
         // Where the thing is, which is where its note belongs.
@@ -5902,7 +5916,7 @@ impl Workspace {
             node_id.clone(),
         )];
         cells.extend(
-            self.desk_cells
+            self.desk
                 .facts(host, node_id)
                 .into_iter()
                 .flat_map(|facts| facts.labels)
@@ -5978,14 +5992,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<rho_agent_host_proto::desk::cells::Stamp> {
-        let (frame, delta) = self.desk_cells.apply(host, writes, verdict)?;
+        let (frame, delta) = self.desk.apply(host, writes, verdict)?;
         let DeskClientFrame::MutationApply { mutation } = &frame else {
             return None;
         };
         let stamp = mutation.stamp;
         // A created note needs its buffer before anything can be typed into
         // it, and the daemon's answer may be a frame away.
-        self.desk_cells.give_buffers(host, &delta, cx);
+        self.desk_buffers.give_buffers(host, &self.desk, &delta, cx);
         self.sync_tree_delta(host, &delta, window, cx);
         self.send_desk(host, frame);
         Some(stamp)
@@ -6001,7 +6015,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         for (node_id, text) in bodies {
-            let Some(buffer) = self.desk_cells.buffer(host, &node_id).cloned() else {
+            let Some(buffer) = self.desk_buffers.buffer(host, &node_id).cloned() else {
                 continue;
             };
             buffer.update(cx, |buffer, cx| {
@@ -7418,12 +7432,12 @@ impl Workspace {
         }
         // The smallest set that says where the thing is: a label it already
         // carries a deeper one of says nothing, so it is not added.
-        if let Some(deeper) = self.desk_cells.label_deeper_than(host, &id, path) {
+        if let Some(deeper) = self.desk.label_deeper_than(host, &id, path) {
             let said = format!("already under {deeper}");
             self.echo(&said, StyleClass::SystemInfo, cx);
             return;
         }
-        let Some((writes, event)) = self.desk_cells.label_writes(host, &id, path) else {
+        let Some((writes, event)) = self.desk.label_writes(host, &id, path) else {
             self.echo("label: nothing to label", StyleClass::SystemInfo, cx);
             return;
         };
@@ -7497,12 +7511,12 @@ impl Workspace {
             return;
         };
         let carried = self
-            .desk_cells
+            .desk
             .facts(host, &target)
             .map(|facts| facts.labels)
             .unwrap_or_default();
         let destinations = self
-            .desk_cells
+            .desk
             .label_paths(host)
             .into_iter()
             .map(|(label, path)| {
@@ -7652,8 +7666,8 @@ impl Workspace {
             // batch back and the daemon checks each cursor against the one
             // that was there.
             let Some((writes, event)) =
-                self.desk_cells
-                    .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
+                self.desk
+                    .verdict_writes(host, &node, rho_desk_client::desk::DeskVerdict::Done)
             else {
                 continue;
             };
@@ -7691,8 +7705,7 @@ impl Workspace {
         let mut undone = entry.slack_cursors.len();
         self.restore_slack_cursors(&entry.slack_cursors.clone(), cx);
         for (node, at) in nodes {
-            let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
-            else {
+            let Some((writes, verdict)) = self.desk.undo_verdict_writes(host, &node, at) else {
                 continue;
             };
             if self
@@ -7759,8 +7772,7 @@ impl Workspace {
                 // Undo is the log's own inverse, and whether it can be made
                 // is asked here: a fact that has moved on since the verdict
                 // is nothing to put back.
-                let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
-                else {
+                let Some((writes, verdict)) = self.desk.undo_verdict_writes(host, &node, at) else {
                     self.restore_verdict_undo(entry);
                     self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
                     return;
@@ -7781,7 +7793,7 @@ impl Workspace {
     fn submit_tree_verdict(
         &mut self,
         target_node: Option<rho_agent_host_proto::desk::cells::Id>,
-        dealt: crate::desk_view::DeskVerdict,
+        dealt: rho_desk_client::desk::DeskVerdict,
         verdict: crate::dashboard::DealerVerdict,
         verb: String,
         window: &mut Window,
@@ -7807,18 +7819,18 @@ impl Workspace {
             .clone()
             .unwrap_or_else(|| card.identity.node_id.clone());
         let phone_verdict = self.phone.enabled.then_some(match dealt {
-            crate::desk_view::DeskVerdict::Done => rho_journal::PhoneVerdict::Done,
-            crate::desk_view::DeskVerdict::Mute => rho_journal::PhoneVerdict::Mute,
-            crate::desk_view::DeskVerdict::Defer { .. } => rho_journal::PhoneVerdict::Defer,
-            crate::desk_view::DeskVerdict::Todo { .. } => rho_journal::PhoneVerdict::Todo,
-            crate::desk_view::DeskVerdict::File { .. } => rho_journal::PhoneVerdict::File,
+            rho_desk_client::desk::DeskVerdict::Done => rho_journal::PhoneVerdict::Done,
+            rho_desk_client::desk::DeskVerdict::Mute => rho_journal::PhoneVerdict::Mute,
+            rho_desk_client::desk::DeskVerdict::Defer { .. } => rho_journal::PhoneVerdict::Defer,
+            rho_desk_client::desk::DeskVerdict::Todo { .. } => rho_journal::PhoneVerdict::Todo,
+            rho_desk_client::desk::DeskVerdict::File { .. } => rho_journal::PhoneVerdict::File,
         });
         // `x` on a Slack card is a mute in Slack and nothing here: a
         // thread is unfollowed, a channel or direct message is muted, and
         // the card closes because Slack has stopped asking. The room
         // snooze (`target_node`) is a verdict on the room and not on the
         // unit, so it is left alone.
-        if matches!(dealt, crate::desk_view::DeskVerdict::Mute)
+        if matches!(dealt, rho_desk_client::desk::DeskVerdict::Mute)
             && target_node.is_none()
             && let Some(unit) = self.dashboard.card_thread(card.identity.clone())
         {
@@ -7840,9 +7852,9 @@ impl Workspace {
         // filing do not, because neither says anything has been read.
         let moves_cursor = matches!(
             dealt,
-            crate::desk_view::DeskVerdict::Done
-                | crate::desk_view::DeskVerdict::Mute
-                | crate::desk_view::DeskVerdict::Todo { .. }
+            rho_desk_client::desk::DeskVerdict::Done
+                | rho_desk_client::desk::DeskVerdict::Mute
+                | rho_desk_client::desk::DeskVerdict::Todo { .. }
         );
         let slack_cursors = match (&node_id, moves_cursor) {
             (rho_agent_host_proto::desk::cells::Id::Slack(unit), true) => self
@@ -7857,7 +7869,7 @@ impl Workspace {
         // round trip later.
         if matches!(
             dealt,
-            crate::desk_view::DeskVerdict::Done | crate::desk_view::DeskVerdict::Mute
+            rho_desk_client::desk::DeskVerdict::Done | rho_desk_client::desk::DeskVerdict::Mute
         ) && matches!(node_id, rho_agent_host_proto::desk::cells::Id::Slack(_))
         {
             let mut undo = self.next_verdict_undo(
@@ -7879,8 +7891,7 @@ impl Workspace {
         }
         // The cursor moved above, so a verdict that cannot be written puts
         // it back: half a verdict is not one.
-        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, &node_id, dealt)
-        else {
+        let Some((writes, applied)) = self.desk.verdict_writes(card.host, &node_id, dealt) else {
             self.restore_slack_cursors(&slack_cursors, cx);
             return false;
         };
@@ -7979,13 +7990,13 @@ impl Workspace {
         host: HostId,
         node_id: rho_agent_host_proto::desk::cells::Id,
     ) -> Option<HostPath> {
-        if let Some(repository) = self.desk_cells.inherited_workdir(host, &node_id) {
+        if let Some(repository) = self.desk.inherited_workdir(host, &node_id) {
             return Some(HostPath {
                 host,
                 path: repository.url.into(),
             });
         }
-        let agent_id = self.desk_cells.nearest_agent(host, &node_id)?;
+        let agent_id = self.desk.nearest_agent(host, &node_id)?;
         self.agent_workdir(agent_id)
     }
 
@@ -8118,8 +8129,7 @@ impl Workspace {
         let Some(capture) = self.desk_semantic_clipboard.clone() else {
             return;
         };
-        let Some((_root, writes, texts)) = self.desk_cells.paste_writes(host, &node_id, &capture)
-        else {
+        let Some((_root, writes, texts)) = self.desk.paste_writes(host, &node_id, &capture) else {
             return;
         };
         if self

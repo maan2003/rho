@@ -7,13 +7,24 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Counters a caller's tests read.
+test-support = []
+
 [dependencies]
 bytes = { workspace = true }
+camino.workspace = true
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+] }
 futures.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 redb = { workspace = true }
 rho-agent-host-proto.workspace = true
+rho-agents-client = { workspace = true }
 rho-db = { workspace = true }
+rho-slack = { workspace = true }
 senax-encoder = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true

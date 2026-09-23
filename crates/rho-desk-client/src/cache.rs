@@ -1,7 +1,7 @@
 //! The client's own copy of the desk cells, resumable from the version it
 //! holds.
 //!
-//! `DeskCells` is built empty at launch and filled by the first
+//! `Desk` is built empty at launch and filled by the first
 //! `Synced`. Between those two moments the client holds a desk that
 //! says nothing, and an empty desk and a desk that has not arrived are the
 //! same value with opposite meanings: the first says the user has said

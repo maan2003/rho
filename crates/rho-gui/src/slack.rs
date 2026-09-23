@@ -771,7 +771,7 @@ impl Workspace {
         if session.read(cx).handled_seeded() {
             return;
         }
-        let cells = self.desk_cells.slack_handled_cells();
+        let cells = self.desk.slack_handled_cells();
         session.update(cx, |session, _| {
             for (unit, ts) in cells {
                 session.seed_handled(&model_unit(&unit), &Ts(ts.0));

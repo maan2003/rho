@@ -12500,11 +12500,15 @@ name = "rho-desk-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "camino",
+ "chrono",
  "futures",
  "prefix-id",
  "redb",
  "rho-agent-host-proto",
+ "rho-agents-client",
  "rho-db",
+ "rho-slack",
  "senax-encoder",
  "tempfile",
  "tokio",

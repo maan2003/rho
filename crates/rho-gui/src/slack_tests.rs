@@ -3340,7 +3340,7 @@ fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppCo
                 cx,
             );
             let rows = workspace
-                .desk_cells
+                .desk
                 .nodes(rho_agents_client::HostId::default())
                 .iter()
                 .map(|node| node.id.clone())
@@ -3657,7 +3657,7 @@ fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut Test
 
             let rows = |host| {
                 workspace
-                    .desk_cells
+                    .desk
                     .nodes(host)
                     .iter()
                     .filter(|node| {
@@ -3677,7 +3677,7 @@ fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut Test
             );
             assert_eq!(
                 workspace
-                    .desk_cells
+                    .desk
                     .facts_of_slack_unit(Some(owner), &unit)
                     .and_then(|facts| facts.name),
                 Some("the release".to_owned()),
@@ -3711,7 +3711,7 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
                 workspace.apply_verdict_for_test(
                     host,
                     &node,
-                    crate::desk_view::DeskVerdict::Defer {
+                    rho_desk_client::desk::DeskVerdict::Defer {
                         until: rho_agent_host_proto::desk::cells::Timestamp {
                             unix_ms: 4_000_000_000_000,
                             precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
@@ -3724,7 +3724,7 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
             );
             assert!(
                 workspace
-                    .desk_cells
+                    .desk
                     .facts_of_slack_unit(Some(host), &unit)
                     .is_some_and(|facts| facts.defer_until.is_some()),
                 "it is in the owner's own replica while the owner is away"

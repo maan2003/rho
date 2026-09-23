@@ -126,11 +126,11 @@ impl Workspace {
         }
         let carried = context
             .as_ref()
-            .and_then(|(host, node_id)| self.desk_cells.facts(*host, node_id))
+            .and_then(|(host, node_id)| self.desk.facts(*host, node_id))
             .map(|facts| facts.labels)
             .unwrap_or_default();
-        for host in self.desk_cells.hosts().collect::<Vec<_>>() {
-            for (label, path) in self.desk_cells.label_paths(host) {
+        for host in self.desk.hosts().collect::<Vec<_>>() {
+            for (label, path) in self.desk.label_paths(host) {
                 let recency = if carried.contains(&label) {
                     CONTEXT_RECENCY
                 } else {
@@ -282,7 +282,7 @@ impl Workspace {
         };
         // A note carries no parent either: the area is a label, and the
         // note is created at the root wearing it.
-        let Some((created, mut writes)) = self.desk_cells.create_note_writes(host, None) else {
+        let Some((created, mut writes)) = self.desk.create_note_writes(host, None) else {
             return;
         };
         writes.extend(

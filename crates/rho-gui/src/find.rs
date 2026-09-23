@@ -438,14 +438,14 @@ impl Workspace {
     /// carries, not the prompt.
     pub(crate) fn find_candidates(&self, cx: &App) -> Vec<FindCandidate> {
         let mut candidates =
-            crate::candidates::find_candidates(&self.desk_cells, &self.registry, cx);
+            crate::candidates::find_candidates(&self.desk, &self.desk_buffers, &self.registry, cx);
         let mut slack = self.slack_find_candidates(cx);
         // A Slack room is findable because Slack says it exists rather than
         // because the tree holds a row for it, so its labels are joined on
         // here instead of coming down with the node.
         if let Some(host) = self.hosts.owner() {
             let paths = self
-                .desk_cells
+                .desk
                 .label_paths(host)
                 .into_iter()
                 .collect::<std::collections::HashMap<_, _>>();
@@ -462,7 +462,7 @@ impl Workspace {
                 };
                 let unit = crate::slack::unit_of_source(name, source);
                 let Some(facts) = self
-                    .desk_cells
+                    .desk
                     .facts(host, &rho_agent_host_proto::desk::cells::Id::Slack(unit))
                 else {
                     continue;

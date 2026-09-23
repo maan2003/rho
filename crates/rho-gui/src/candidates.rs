@@ -6,7 +6,7 @@
 //! buffers and folds and inlays, standing between the store and a question
 //! about what is in it. The map is going; the question is not.
 //!
-//! So the candidates come from `DeskCells` — the store client — with the
+//! So the candidates come from `Desk` — the store client — with the
 //! agent registry and the Slack facts beside it. Nothing here draws
 //! anything, holds an editor, or needs one to have been drawn: the same
 //! answer comes back on a window that has never opened the map.
@@ -21,8 +21,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use gpui::App;
 use rho_agent_host_proto::desk::cells::Id;
 use rho_agents_client::{AgentMap, HostId};
+use rho_desk_client::Desk;
+use rho_desk_client::desk::DeskNode;
 
-use crate::desk_view::{DeskCells, DeskNode};
+use crate::desk_view::DeskBuffers;
 use crate::find::{FindCandidate, FindTarget};
 
 /// One host's nodes with the lookups a path needs, built once per question.
@@ -63,11 +65,11 @@ impl HostNodes {
     /// why this belongs to a keystroke and not to a sync, and why it takes
     /// the store client by shared reference: asking what there is must not
     /// be able to change anything.
-    pub(crate) fn of(desk: &DeskCells, host: HostId, cx: &App) -> Self {
+    pub(crate) fn of(desk: &Desk, buffers: &DeskBuffers, host: HostId, cx: &App) -> Self {
         let nodes = desk.nodes(host).to_vec();
         let mut titles = HashMap::with_capacity(nodes.len());
         for node in &nodes {
-            if let Some(buffer) = desk.buffer(host, &node.id) {
+            if let Some(buffer) = buffers.buffer(host, &node.id) {
                 titles.insert(
                     node.id.clone(),
                     crate::dashboard::note_title(&buffer.read(cx).text()).to_owned(),
@@ -90,10 +92,10 @@ impl HostNodes {
     /// never look at. The store client already keeps the note titles and
     /// refreshes them by comparing buffer versions, so this costs the
     /// nodes and the indexes and nothing else.
-    pub(crate) fn of_notes(desk: &mut DeskCells, host: HostId, cx: &App) -> Self {
+    pub(crate) fn of_notes(desk: &Desk, buffers: &mut DeskBuffers, host: HostId, cx: &App) -> Self {
         let nodes = desk.nodes(host).to_vec();
-        let titles = desk
-            .note_titles(host, cx)
+        let titles = buffers
+            .note_titles(host, desk, cx)
             .map(|titles| (*titles).clone())
             .unwrap_or_default();
         let desk_loaded = desk.is_loaded(host);
@@ -293,14 +295,15 @@ impl HostNodes {
 /// mirror it already reads, because what is findable about a conversation
 /// is its name in Slack and not where anyone filed it.
 pub(crate) fn find_candidates(
-    desk: &DeskCells,
+    desk: &Desk,
+    buffers: &DeskBuffers,
     registry: &AgentMap,
     cx: &App,
 ) -> Vec<FindCandidate> {
     let mut candidates = Vec::new();
     let mut filed = HashSet::new();
     for host in desk.hosts() {
-        let source = HostNodes::of(desk, host, cx);
+        let source = HostNodes::of(desk, buffers, host, cx);
         for node in &source.nodes {
             crate::find::charge_walk(1);
             if let Some(agent_id) = node.agent() {

@@ -128,7 +128,7 @@ impl NoteView {
     /// cursor and the scroll position.
     pub fn sync(
         &mut self,
-        nodes: &[crate::desk_view::DeskNode],
+        nodes: &[rho_desk_client::desk::DeskNode],
         titles: &std::collections::HashMap<rho_agent_host_proto::desk::cells::Id, String>,
         cx: &mut Context<Workspace>,
     ) {

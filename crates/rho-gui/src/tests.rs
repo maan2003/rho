@@ -834,9 +834,7 @@ fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext)
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.clear_sent_for_test(HostId::default());
             assert_eq!(
-                workspace
-                    .desk_cells
-                    .row_after_delete(HostId::default(), &first),
+                workspace.desk.row_after_delete(HostId::default(), &first),
                 Some(second)
             );
         })
@@ -1095,7 +1093,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     workspace
         .update(cx, |workspace, _, cx| {
             let buffer = workspace
-                .desk_cells
+                .desk_buffers
                 .buffer(HostId::default(), &created)
                 .expect("the todo note has a buffer")
                 .clone();
@@ -1789,7 +1787,7 @@ async fn a_burst_of_quiet_cells_costs_its_own_rows(cx: &mut TestAppContext) {
                 assert!(workspace.apply_verdict_for_test(
                     HostId::default(),
                     note,
-                    crate::desk_view::DeskVerdict::Done,
+                    rho_desk_client::desk::DeskVerdict::Done,
                     window,
                     cx,
                 ));
@@ -1847,7 +1845,7 @@ async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppCont
 
     workspace
         .update(cx, |workspace, _, _| {
-            let nodes = workspace.desk_cells.nodes(HostId::default()).to_vec();
+            let nodes = workspace.desk.nodes(HostId::default()).to_vec();
             let loop_node = nodes
                 .iter()
                 .find(|node| node.id == looped)
@@ -1896,7 +1894,7 @@ async fn filing_a_note_moves_the_shape_and_takes_the_source(cx: &mut TestAppCont
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &notes[3],
-                crate::desk_view::DeskVerdict::File {
+                rho_desk_client::desk::DeskVerdict::File {
                     parent: other.clone()
                 },
                 window,
@@ -1952,7 +1950,7 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &notes[7],
-                crate::desk_view::DeskVerdict::Done,
+                rho_desk_client::desk::DeskVerdict::Done,
                 window,
                 cx,
             ));
@@ -1977,7 +1975,7 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             let node = workspace
-                .desk_cells
+                .desk
                 .node(HostId::default(), &notes[7])
                 .expect("the note is still on the map");
             assert_eq!(
@@ -7249,7 +7247,7 @@ fn a_slack_unit_the_crate_has_stopped_asking_about_is_not_a_card(cx: &mut TestAp
                 .map(|source| match source.unit.thread.as_deref() {
                     // Dealt with: `d` here, or read on the phone. Either
                     // way the crate has stopped asking.
-                    Some("600.0") => crate::desk_view::SlackSource {
+                    Some("600.0") => rho_desk_client::desk::SlackSource {
                         reason: None,
                         ..source
                     },
@@ -7755,7 +7753,7 @@ fn notes_for_this_makes_a_note_about_the_surfaces_node(cx: &mut TestAppContext) 
                 panic!("notes for this opens the note surface");
             };
             let facts = workspace
-                .desk_cells
+                .desk
                 .facts(HostId::default(), &node_id)
                 .expect("the note the key just made");
             assert_eq!(
@@ -7942,10 +7940,10 @@ impl DeskFixture {
     /// What the mirror says about the rows `thread_row` made: every unit
     /// has one message from someone else and nothing handled yet, which is
     /// the state a card is dealt in.
-    pub(super) fn slack_sources(&self) -> Vec<crate::desk_view::SlackSource> {
+    pub(super) fn slack_sources(&self) -> Vec<rho_desk_client::desk::SlackSource> {
         self.slack_units
             .iter()
-            .map(|(unit, newest)| crate::desk_view::SlackSource {
+            .map(|(unit, newest)| rho_desk_client::desk::SlackSource {
                 unit: unit.clone(),
                 title: "any update?".to_owned(),
                 newest: rho_agent_host_proto::desk::cells::SlackTs(newest.clone()),
@@ -9426,7 +9424,7 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
         node_id: node.clone(),
     };
     let source = |from_other: &str| {
-        vec![crate::desk_view::SlackSource {
+        vec![rho_desk_client::desk::SlackSource {
             unit: unit.clone(),
             title: "any update?".to_owned(),
             newest: rho_agent_host_proto::desk::cells::SlackTs("600.0".to_owned()),
@@ -9445,7 +9443,7 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &node,
-                crate::desk_view::DeskVerdict::Defer {
+                rho_desk_client::desk::DeskVerdict::Defer {
                     until: rho_agent_host_proto::desk::cells::Timestamp {
                         unix_ms: 4_000_000_000_000,
                         precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
@@ -9455,7 +9453,7 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
                 cx,
             ));
             let facts = workspace
-                .desk_cells
+                .desk
                 .facts_of_slack_unit(Some(HostId::default()), &unit)
                 .unwrap();
             assert_eq!(
@@ -9607,7 +9605,7 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &identity.node_id,
-                crate::desk_view::DeskVerdict::Done,
+                rho_desk_client::desk::DeskVerdict::Done,
                 window,
                 cx,
             ));
@@ -9683,11 +9681,11 @@ fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
                 cx,
             );
             let (writes, (_, event)) = workspace
-                .desk_cells
+                .desk
                 .verdict_writes(
                     HostId::default(),
                     &node,
-                    crate::desk_view::DeskVerdict::Todo {
+                    rho_desk_client::desk::DeskVerdict::Todo {
                         defer_until: rho_agent_host_proto::desk::cells::Timestamp {
                             unix_ms: 1_000,
                             precision:
@@ -9743,7 +9741,7 @@ fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let body = |workspace: &Workspace, node_id, cx: &gpui::App| {
         workspace
-            .desk_cells
+            .desk_buffers
             .buffer(HostId::default(), node_id)
             .expect("the note has a body")
             .read(cx)
@@ -10017,7 +10015,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
             let agent = workspace
-                .desk_cells
+                .desk
                 .label_paths(HostId::default())
                 .into_iter()
                 .find(|(_, path)| path == "rho/agent")
@@ -10089,14 +10087,14 @@ fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppConte
 
     let carried = |workspace: &mut Workspace| {
         let mut paths = workspace
-            .desk_cells
+            .desk
             .facts(HostId::default(), &thing)
             .expect("the thing has facts")
             .labels
             .iter()
             .filter_map(|label| {
                 workspace
-                    .desk_cells
+                    .desk
                     .label_paths(HostId::default())
                     .into_iter()
                     .find(|(id, _)| id == label)
@@ -12136,7 +12134,7 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
                 ranges: vec![(0, 0)],
                 new_text: vec!["typed here".into()],
             };
-            workspace.desk_cells.keep_text(
+            workspace.desk.keep_text(
                 HostId::default(),
                 note.clone(),
                 &operation,
@@ -12145,7 +12143,7 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
                     edit_ids: vec![timestamp],
                 },
             );
-            workspace.desk_cells.sync(HostId::default())
+            workspace.desk.sync(HostId::default())
         })
         .unwrap();
 
@@ -12176,7 +12174,7 @@ fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppC
                 .desk_replica_for_test
                 .insert("local".to_owned(), desk.held());
             workspace.open_desk_from_replica(HostId::default(), window, cx);
-            workspace.desk_cells.sync(HostId::default())
+            workspace.desk.sync(HostId::default())
         })
         .unwrap();
 

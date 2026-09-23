@@ -537,7 +537,7 @@ impl Dashboard {
         &self,
         host: HostId,
         source: &crate::candidates::HostNodes,
-        heading: &crate::desk_view::DeskNode,
+        heading: &rho_desk_client::desk::DeskNode,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> Option<HeadingContext> {
         if heading.state != rho_agent_host_proto::desk::cells::State::Open {
@@ -573,7 +573,7 @@ impl Dashboard {
     fn desk_cards(
         &self,
         host: HostId,
-        heading: &crate::desk_view::DeskNode,
+        heading: &rho_desk_client::desk::DeskNode,
         context: &HeadingContext,
         order: usize,
         facts: &DealerFacts<'_>,
@@ -702,7 +702,7 @@ impl Dashboard {
     fn thread_card(
         &self,
         host: HostId,
-        node: &crate::desk_view::DeskNode,
+        node: &rho_desk_client::desk::DeskNode,
         order: usize,
         facts: &DealerFacts<'_>,
     ) -> Option<RankedDealCard> {
@@ -1139,7 +1139,7 @@ impl Dashboard {
     pub(crate) fn deal_shape_held(
         &self,
         host: HostId,
-        nodes: &[crate::desk_view::DeskNode],
+        nodes: &[rho_desk_client::desk::DeskNode],
     ) -> bool {
         self.deal_hosts
             .get(&host)
@@ -1153,7 +1153,7 @@ impl Dashboard {
         &mut self,
         host: HostId,
         touched: &BTreeSet<rho_agent_host_proto::desk::cells::Id>,
-        nodes: &[crate::desk_view::DeskNode],
+        nodes: &[rho_desk_client::desk::DeskNode],
     ) -> bool {
         #[cfg(test)]
         {
@@ -1285,7 +1285,7 @@ impl Dashboard {
 
     fn node_card(
         &self,
-        matches: impl Fn(&crate::desk_view::DeskNode) -> bool,
+        matches: impl Fn(&rho_desk_client::desk::DeskNode) -> bool,
     ) -> Option<DealCardId> {
         self.deal_hosts.iter().find_map(|(host, source)| {
             source
@@ -1954,7 +1954,7 @@ fn desk_elapsed(
 /// The dated marks a node carries. An Open node with neither is a note, not
 /// a card: the desk is where you write, and writing is not a queue.
 fn desk_marks(
-    node: &crate::desk_view::DeskNode,
+    node: &rho_desk_client::desk::DeskNode,
 ) -> Vec<(DeskMark, rho_agent_host_proto::desk::cells::Timestamp)> {
     if node.state != rho_agent_host_proto::desk::cells::State::Open {
         return Vec::new();
@@ -1974,7 +1974,7 @@ fn desk_marks(
 /// Whether the user has already dealt with a node: handled through what
 /// the story told, muted, or snoozed to a time still ahead.
 fn node_closed(
-    node: &crate::desk_view::DeskNode,
+    node: &rho_desk_client::desk::DeskNode,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> bool {
     node.state != rho_agent_host_proto::desk::cells::State::Open
@@ -1993,7 +1993,7 @@ fn agent_node_closed(
         .is_some_and(|node| node_closed(node, now))
 }
 
-fn desk_deferred(node: &crate::desk_view::DeskNode, now: chrono::NaiveDateTime) -> bool {
+fn desk_deferred(node: &rho_desk_client::desk::DeskNode, now: chrono::NaiveDateTime) -> bool {
     node.defer_until
         .and_then(|at| desk_elapsed(at, now))
         .is_some_and(|elapsed| elapsed < 0.0)
@@ -2041,16 +2041,16 @@ fn desk_mark_label(
 
 /// The agent an agent row is: the id is the agent, so there is nothing to
 /// look up.
-pub(crate) fn node_agent(node: &crate::desk_view::DeskNode) -> Option<AgentId> {
+pub(crate) fn node_agent(node: &rho_desk_client::desk::DeskNode) -> Option<AgentId> {
     node.agent()
 }
 
 /// The Slack unit a row stands for.
-pub(crate) fn node_unit(node: &crate::desk_view::DeskNode) -> Option<SlackUnit> {
+pub(crate) fn node_unit(node: &rho_desk_client::desk::DeskNode) -> Option<SlackUnit> {
     node.slack().cloned()
 }
 
-fn node_page(node: &crate::desk_view::DeskNode) -> Option<rho_browser::PageId> {
+fn node_page(node: &rho_desk_client::desk::DeskNode) -> Option<rho_browser::PageId> {
     node.page()
         .map(|page| rho_browser::PageId(uuid::Uuid::from_bytes(page.0)))
 }
