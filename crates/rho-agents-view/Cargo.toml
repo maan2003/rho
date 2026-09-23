@@ -20,7 +20,6 @@ language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 rho-agent-host-proto.workspace = true
 rho-agents-client = { workspace = true }
-rho-hosts = { workspace = true }
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
 settings = { path = "../../vendor/zed/crates/settings" }

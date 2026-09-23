@@ -1,9 +1,10 @@
 //! Wire vocabulary for workset-owned Comint-style shell sessions.
 //!
-//! A shell is started by [`crate::Request::ShellStart`] and a stream attached
-//! to it by [`crate::Open::Shell`]. The workset owns the process and its
-//! canonical structured state; clients project that state into a read-only
-//! buffer, keep their pending input locally, and submit complete commands.
+//! A shell is started by [`crate::agents::Request::ShellStart`] and a stream
+//! attached to it by [`crate::agents::Open::Shell`]. The workset owns the
+//! process and its canonical structured state; clients project that state into
+//! a read-only buffer, keep their pending input locally, and submit complete
+//! commands.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -46,7 +47,7 @@ pub struct ShellStyleSpan {
     pub style: ShellTextStyle,
 }
 
-/// One workset-owned shell returned by [`crate::Reply::ShellList`].
+/// One workset-owned shell returned by [`crate::agents::Reply::ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
     /// Encoded agent id ("eng-ht08").

@@ -8,14 +8,12 @@ use rho_agent::db::{
     AgentId, AgentReadTxnExt as _, AgentUsageModel, AgentWriteTxnExt as _, QuotaModel,
     QuotaObservationRecord, QuotaProvider,
 };
-use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 use rho_agent_host_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, QuotaPoint,
     QuotaSeries, QuotaSummary,
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use tokio::sync::broadcast;
 
 pub(crate) fn quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSummary> {
     let mut summaries = claude_quota_summaries(db);
@@ -328,8 +326,7 @@ pub(crate) fn spawn_claude_quota_recorder(
     mut updates: tokio::sync::mpsc::Receiver<anyhow::Result<rho_claude_usage::ClaudeUsage>>,
     account: String,
     db: RhoDb,
-    inference: Inference,
-    events: broadcast::Sender<ControlFrame>,
+    quota: tokio::sync::watch::Sender<()>,
 ) {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
@@ -360,9 +357,7 @@ pub(crate) fn spawn_claude_quota_recorder(
             });
             write.commit();
             if changed {
-                let _ = events.send(ControlFrame::QuotaUsage {
-                    summaries: quota_summaries(&db, &inference),
-                });
+                quota.send_replace(());
             }
         }
     });

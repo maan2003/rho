@@ -5,11 +5,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
+use rho_agent_host_proto::agents::{ClientFrame, Reply, Request, ServerFrame};
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 use rho_agent_host_proto::transcript::Seq;
-use rho_agent_host_proto::{AgentCommand, Open, Reply, Request, read_frame, write_frame};
+use rho_agent_host_proto::{AgentCommand, Open, agents, host, read_frame, write_frame};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
@@ -35,7 +35,7 @@ impl Streams {
     /// Opens `control` as the control stream, waits for `Ready`, and opens
     /// an agents stream beside it. Nothing is followed yet.
     pub async fn open(mut control: Client, socket: &Path) -> Result<Self> {
-        control.send(&Open::Control).await?;
+        control.send(&Open::Host(host::Open::Control)).await?;
         let ControlFrame::Ready { .. } = control.recv().await? else {
             bail!("the control stream did not open with Ready");
         };
@@ -43,7 +43,7 @@ impl Streams {
             .await
             .context("open an agents stream")?
             .into_stream();
-        write_frame(&mut agents, &Open::Agents).await?;
+        write_frame(&mut agents, &Open::Agents(agents::Open::Session)).await?;
         let ServerFrame::JournalHead { journal_head, .. } = read_frame(&mut agents).await? else {
             bail!("the agents stream did not open with its journal head");
         };
@@ -87,9 +87,19 @@ impl Streams {
         let socket = self.socket.clone();
         let tx = self.incoming_tx.clone();
         tokio::spawn(async move {
-            let reply = rho_agent_host_proto::client::request(&socket, Request::Agent(command))
-                .await
-                .map(Incoming::Reply);
+            // A refusal is a reply like any other here: the harness
+            // decides what it means.
+            let reply = async {
+                let mut client = Client::connect(&socket).await?;
+                client
+                    .send(&Open::Agents(agents::Open::Request(Request::Command(
+                        command,
+                    ))))
+                    .await?;
+                client.recv().await
+            }
+            .await
+            .map(Incoming::Reply);
             let _ = tx.send(reply);
         });
     }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use rho_agent_host_proto::control::ServerFrame as S;
-use rho_agent_host_proto::{AgentCommand, Open, Opened, Reply, Request, read_frame, write_frame};
+use rho_agent_host_proto::{AgentCommand, Open, Opened, agents, host, read_frame, write_frame};
 
 struct Child(std::process::Child);
 impl Drop for Child {
@@ -69,17 +69,17 @@ fn main() -> Result<()> {
             ensure!(tokio::time::Instant::now()<deadline,"daemon startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        write_frame(&mut local,&Open::Control).await?;
+        write_frame(&mut local,&Open::Host(host::Open::Control)).await?;
         ensure!(matches!(read_frame::<_,S>(&mut local).await?,S::Ready {..}),"missing Ready");
         let repo=temp.path().join("repo");
         std::fs::create_dir(&repo)?;
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
-        let agent=match rho_agent_host_proto::client::request(&socket,Request::Agent(AgentCommand::New {
+        let agent=match rho_agent_host_proto::client::agents(&socket,agents::Request::Command(AgentCommand::New {
             role:Default::default(), start:rho_agent_host_proto::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
             mode:rho_agent_host_proto::WorksetMode::Exposed,content:None,
         })).await? {
-            Reply::AgentCreated { agent_id }=>agent_id,
+            agents::Reply::AgentCreated { agent_id }=>agent_id,
             other=>anyhow::bail!("agent creation failed: {other:?}"),
         };
         let desktop_name = "preview".to_owned();
@@ -119,8 +119,8 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==(false,0,0),"video work exists without subscriber");
         let endpoint:iroh::EndpointId=endpoint.parse()?;
         let client=rho_rpc::bind_ephemeral_iroh_client().await?;
-        match rho_agent_host_proto::client::request(&socket,Request::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await? {
-            Reply::IrohApproved {..}=>{}
+        match rho_agent_host_proto::client::host(&socket,host::Request::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await? {
+            host::Reply::IrohApproved {..}=>{}
             other=>anyhow::bail!("trust: {other:?}"),
         }
         let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_agent_host_proto::IROH_ALPN)).await??;
@@ -131,7 +131,7 @@ layout { background-color "#315b97"; }
         let transport=mux.session(1)?;
         let (send,recv)=connection.open_bi().await?;
         let mut input=rho_rpc::Stream::new(recv,send);
-        write_frame(&mut input,&Open::Wayland {media_id:1,agent:agent.encoded(),session:desktop_name.clone()}).await?;
+        write_frame(&mut input,&Open::Host(host::Open::Wayland {media_id:1,agent:agent.encoded(),session:desktop_name.clone()})).await?;
         ensure!(matches!(read_frame::<_,Opened>(&mut input).await?,Opened::Ready),"open failed");
         let origin=rho_desktop_media::media::origin();
         let media=rho_desktop_media::media::subscribe(transport,origin.clone()).await.context("fixed video stream")?;
@@ -168,7 +168,7 @@ layout { background-color "#315b97"; }
         let transport2=mux.session(2)?;
         let (send2,recv2)=connection.open_bi().await?;
         let mut input2=rho_rpc::Stream::new(recv2,send2);
-        write_frame(&mut input2,&Open::Wayland {media_id:2,agent:agent.encoded(),session:desktop_name.clone()}).await?;
+        write_frame(&mut input2,&Open::Host(host::Open::Wayland {media_id:2,agent:agent.encoded(),session:desktop_name.clone()})).await?;
         ensure!(matches!(read_frame::<_,Opened>(&mut input2).await?,Opened::Ready),"second viewer open failed");
         let origin2=rho_desktop_media::media::origin();
         let media2=rho_desktop_media::media::subscribe(transport2,origin2.clone()).await?;
@@ -200,9 +200,9 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==stopped,"video work survived unsubscribe");
         let (send,recv)=connection.open_bi().await?;
         let mut rpc=rho_rpc::Stream::new(recv,send);
-        write_frame(&mut rpc,&Open::Request(Request::QuotaUsage)).await?;
-        match read_frame::<_,Reply>(&mut rpc).await? {
-            Reply::QuotaUsage {..}=>{}
+        write_frame(&mut rpc,&Open::Agents(agents::Open::Request(agents::Request::QuotaUsage))).await?;
+        match read_frame::<_,agents::Reply>(&mut rpc).await? {
+            agents::Reply::QuotaUsage {..}=>{}
             other=>anyhow::bail!("RPC failed after detach: {other:?}"),
         }
         uni.abort(); bi.abort();

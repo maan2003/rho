@@ -5,7 +5,7 @@
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-/// The answer to [`crate::Open::Realtime`].
+/// The answer to [`crate::host::Open::Realtime`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Opened {
     Answer {

@@ -1,6 +1,6 @@
 //! Wire vocabulary for workset-owned terminals.
 //!
-//! A terminal stream is opened by [`crate::Open::Terminal`]; after
+//! A terminal stream is opened by [`crate::agents::Open::Terminal`]; after
 //! [`crate::Opened::Ready`] an attached stream carries senax frames of
 //! [`TermClientFrame`] and [`TermServerFrame`].
 //!
@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-/// How [`crate::Open::Terminal`] reaches its terminal.
+/// How [`crate::agents::Open::Terminal`] reaches its terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum TerminalOpen {
     /// Spawns it, refused if `terminal_id` is already running. With
@@ -180,7 +180,7 @@ impl TermColor {
     pub const DEFAULT_BG: Self = Self::Background;
 }
 
-/// One running terminal in a [`crate::Reply::TerminalList`] reply.
+/// One running terminal in a [`crate::agents::Reply::TerminalList`] reply.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct TerminalInfo {
     /// Encoded agent id ("eng-ht08").

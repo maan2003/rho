@@ -1,16 +1,143 @@
-//! The agents stream: a host's journal and its agents' live tails.
+//! The agents part of a host, opened by [`crate::Open::Agents`].
 //!
-//! A stream of its own, opened by [`crate::Open::Agents`], so
-//! that a catch-up of thousands of pages never queues ahead of anything
-//! else the host says and its reader is the agents client alone. Every
-//! frame after the opening one is a [`ClientFrame`] or a [`ServerFrame`].
+//! Its session ([`Open::Session`]) carries the host's journal and its
+//! agents' live tails: a stream of its own, so a catch-up of thousands of
+//! pages never queues ahead of anything else, and its reader is the agents
+//! client alone. Every frame after the opening one is a [`ClientFrame`] or
+//! a [`ServerFrame`]. Whatever else is asked of the agents is a stream of
+//! its own: one [`Request`] answered with one [`Reply`], or a terminal,
+//! shell or workspace channel.
 
-use senax_encoder::{Pack, Unpack};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::AgentId;
 use crate::transcript::{AgentPos, DetailBody, Live, LogEntry, Seq};
+use crate::{
+    AgentCommand, AgentCostSeries, AgentId, AgentUsageSeries, QuotaSeries, QuotaSummary,
+    WorkspaceInfo, shell, term,
+};
 
-/// What a client says on its agents stream.
+/// What an agents stream is for.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Open {
+    /// The journal and the live tails, for as long as the client stays.
+    Session,
+    /// One request, answered with one [`Reply`]; then the stream closes.
+    Request(Request),
+    /// A daemon-owned terminal for an agent. Answered with
+    /// [`crate::Opened`]; an attached stream then carries
+    /// [`term::TermClientFrame`] and [`term::TermServerFrame`], the first of
+    /// them a snapshot of the screen preceded by history. Otherwise the
+    /// terminal runs headless and the stream closes.
+    Terminal {
+        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
+        agent: String,
+        /// Client-chosen id, unique among the agent's running terminals
+        /// ([`Request::TerminalList`] enumerates them).
+        terminal_id: u64,
+        open: term::TerminalOpen,
+        /// The client's viewport, applied to the PTY (last writer wins).
+        cols: u16,
+        rows: u16,
+    },
+    /// Attaches to an agent's running shell ([`Request::ShellStart`]).
+    /// Answered with [`crate::Opened`], then [`shell`] frames. Closing the
+    /// stream only detaches; the shell keeps running.
+    Shell { agent: String },
+    /// File access for one agent's workspace. Answered with
+    /// [`crate::Opened`]; after `Ready` the stream carries
+    /// [`crate::workspace::WorkspaceClientFrame`] and
+    /// [`crate::workspace::WorkspaceServerFrame`], and closing it closes the
+    /// channel and its filesystem watcher.
+    Workspace { workspace: WorkspaceInfo },
+}
+
+/// What a client can ask of a host's agents in one round trip.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Request {
+    /// Answered with [`Reply::AgentCreated`] for [`AgentCommand::New`] and
+    /// [`Reply::Done`] for the rest.
+    Command(AgentCommand),
+    /// Every running terminal, of one agent if it names one (display
+    /// handle or id prefix). Answered with [`Reply::TerminalList`].
+    TerminalList { agent: Option<String> },
+    /// Starts the daemon-owned Comint-style shell for an agent. Attaching
+    /// is [`Open::Shell`].
+    ShellStart { agent: String },
+    /// Running shells, of one agent if it names one. Answered with
+    /// [`Reply::ShellList`].
+    ShellList { agent: Option<String> },
+    /// Stops an agent's running shell gracefully.
+    ShellClose { agent: String },
+    /// A recorded visualization. Answered with [`Reply::Visualization`].
+    Visualization { id: String },
+    /// Stores an immutable visualization snapshot. Answered with
+    /// [`Reply::VisualizationRecorded`].
+    RecordVisualization { mime_type: String, content: Vec<u8> },
+    /// Answered with [`Reply::QuotaUsage`].
+    QuotaUsage,
+    /// Answered with [`Reply::QuotaHistory`].
+    QuotaHistory,
+    /// Answered with [`Reply::GlobalUsage`].
+    GlobalUsage { since_ms: u64 },
+    /// Raw per-agent usage needed to form cost distributions beginning at
+    /// `since_ms`, with the fixed trailing-window lookback. Answered with
+    /// [`Reply::AgentCostDistribution`].
+    AgentCostDistribution { since_ms: u64 },
+    /// Which Claude accounts exist and which one agents run on. Answered
+    /// with [`Reply::ClaudeAccounts`].
+    ClaudeAccounts,
+    /// Puts every agent on `name` from its next turn. Answered with
+    /// [`Reply::ClaudeAccounts`] as it stands after the switch.
+    SetClaudeAccount { name: String },
+    /// Enables or disables one provider account namespace on this host.
+    SetAuthAccountEnabled { name: String, enabled: bool },
+}
+
+/// The answer to a [`Request`].
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Reply {
+    /// Done, with nothing to say.
+    Done,
+    /// Not done, and why: the whole chain of causes.
+    Failed {
+        reason: String,
+    },
+    AgentCreated {
+        agent_id: AgentId,
+    },
+    TerminalList {
+        terminals: Vec<term::TerminalInfo>,
+    },
+    ShellList {
+        shells: Vec<shell::ShellInfo>,
+    },
+    Visualization {
+        id: String,
+        mime_type: String,
+        content: Vec<u8>,
+    },
+    VisualizationRecorded {
+        id: String,
+    },
+    QuotaUsage {
+        summaries: Vec<QuotaSummary>,
+    },
+    QuotaHistory {
+        series: Vec<QuotaSeries>,
+    },
+    GlobalUsage {
+        series: Vec<AgentUsageSeries>,
+    },
+    AgentCostDistribution {
+        series: Vec<AgentCostSeries>,
+    },
+    ClaudeAccounts {
+        accounts: Vec<String>,
+        current: String,
+    },
+}
+
+/// What a client says on its agents session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ClientFrame {
     /// After [`ServerFrame::JournalHead`]: the last journal entry this
@@ -40,7 +167,7 @@ pub enum ClientFrame {
     },
 }
 
-/// What a host says on an agents stream.
+/// What a host says on an agents session.
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ServerFrame {
     /// The first frame: whose journal this is and how far it runs, so a
@@ -63,6 +190,13 @@ pub enum ServerFrame {
         pos: AgentPos,
         body: DetailBody,
     },
+    /// An agent was created on the host, by any client or agent.
+    AgentCreated { agent_id: AgentId },
+    /// Every provider's quota as it stands: after the opening
+    /// [`ServerFrame::JournalHead`], whenever an observation changes it,
+    /// and every ten minutes besides, because burn and resets move with
+    /// time alone.
+    QuotaUsage { summaries: Vec<QuotaSummary> },
 }
 
 #[cfg(test)]

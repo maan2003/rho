@@ -17,7 +17,7 @@ futures.workspace = true
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
-rho-hosts = { workspace = true }
+rho-agents-client = { workspace = true }
 rho-terminal = { workspace = true }
 rho-agent-host-proto.workspace = true
 rho-window = { workspace = true }

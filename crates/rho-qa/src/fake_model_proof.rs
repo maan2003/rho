@@ -13,12 +13,12 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
+    ClientFrame as AgentsClientFrame, Reply, ServerFrame as AgentsServerFrame,
 };
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
 use rho_agent_host_proto::{
-    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, Reply, StartMode,
+    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, StartMode,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;

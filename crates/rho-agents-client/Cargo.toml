@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Requests a caller's tests record and answer.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
@@ -18,6 +22,7 @@ redb = { workspace = true }
 rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
 rho-hosts = { workspace = true }
+rho-rpc = { workspace = true }
 senax-encoder.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
 tracing.workspace = true

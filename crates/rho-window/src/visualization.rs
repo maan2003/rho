@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{Context, Render, RenderImage, Task, Window, div, img};
-use rho_hosts::connection::VisualizationClient;
+use rho_agents_client::remote::AgentsLink;
 use theme::ActiveTheme as _;
 
 enum State {
@@ -15,13 +15,13 @@ enum State {
 /// A lazily fetched and rasterized immutable visualization.
 pub struct Visualization {
     id: String,
-    client: VisualizationClient,
+    client: AgentsLink,
     state: State,
     task: Option<Task<()>>,
 }
 
 impl Visualization {
-    pub fn new(id: String, client: VisualizationClient) -> Self {
+    pub fn new(id: String, client: AgentsLink) -> Self {
         Self {
             id,
             client,
@@ -35,7 +35,7 @@ impl Visualization {
             return;
         }
         self.state = State::Loading;
-        let request = self.client.get(self.id.clone());
+        let request = self.client.visualization(self.id.clone());
         let renderer = cx.svg_renderer();
         let executor = cx.background_executor().clone();
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
