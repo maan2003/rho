@@ -12,7 +12,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, Task};
 use gpui_tokio::Tokio;
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::mirror::{AgentPos, DetailBody, Live, LogEntry, Seq};
+use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Live, LogEntry, Seq};
 use rho_agent_host_proto::{
     AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
     read_frame, write_frame,

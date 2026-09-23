@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::mirror::{Item, Live, QueuedItem};
+use rho_agent_host_proto::transcript::{Item, Live, QueuedItem};
 
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
-        use rho_agent_host_proto::mirror::{AgentPos, MirrorEvent};
+        use rho_agent_host_proto::transcript::{AgentPos, TranscriptEvent};
         use rho_agent_host_proto::{ExecMilestone, UnixMs};
 
         use crate::fold::TranscriptFold;
@@ -441,7 +441,7 @@ mod tests {
                     id: "exec-1".into(),
                     name: "exec".into(),
                     arguments: "print(1)".into(),
-                    format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+                    format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                 },
             },
         );
@@ -451,7 +451,7 @@ mod tests {
         ] {
             transcript.tell(
                 AgentPos(pos),
-                &MirrorEvent::ExecObserved {
+                &TranscriptEvent::ExecObserved {
                     id: "exec-1".into(),
                     milestone,
                     at: UnixMs(at),
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(tool.timing.arguments_finished_at, Some(UnixMs(20)));
         transcript.tell(
             AgentPos(2),
-            &MirrorEvent::Rewound {
+            &TranscriptEvent::Rewound {
                 to: AgentPos(1),
                 at: UnixMs(30),
             },

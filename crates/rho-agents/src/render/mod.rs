@@ -10,7 +10,7 @@ pub mod elision;
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_host_proto::mirror::ArgumentsFormat;
+use rho_agent_host_proto::transcript::ArgumentsFormat;
 use rho_agent_host_proto::{AgentId, MessageDelivery};
 use rho_window::style::StyleClass;
 

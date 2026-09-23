@@ -9,7 +9,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::mirror::{AgentPos, MirrorEvent};
+use rho_agent_host_proto::transcript::{AgentPos, TranscriptEvent};
 
 use crate::TranscriptFold;
 use crate::state::UiAgentState;
@@ -18,7 +18,7 @@ use crate::store::{AgentStore, FrameSummary};
 /// One change to an agent's transcript: a delta to the runtime's live
 /// tail, or the fold of its mirror made again.
 pub enum TranscriptFrame {
-    Live(rho_agent_host_proto::mirror::Live),
+    Live(rho_agent_host_proto::transcript::Live),
     /// The mirror's fold, whole. What an agent's first read hands, and
     /// nothing else: a transcript is handed once and appended to after.
     Fold(UiAgentState),
@@ -79,7 +79,7 @@ impl Transcripts {
     ///
     /// Answers whether it opened one; an agent already open, or one with
     /// nothing on disk, is left as it was.
-    pub fn seed(&mut self, agent_id: AgentId, events: &[(AgentPos, MirrorEvent)]) -> bool {
+    pub fn seed(&mut self, agent_id: AgentId, events: &[(AgentPos, TranscriptEvent)]) -> bool {
         if self.open.contains_key(&agent_id) || events.is_empty() {
             return false;
         }
@@ -99,7 +99,7 @@ impl Transcripts {
     pub fn refold(
         &mut self,
         agent_id: AgentId,
-        rows: &[(AgentPos, MirrorEvent)],
+        rows: &[(AgentPos, TranscriptEvent)],
     ) -> Option<crate::fold::FoldDelta> {
         let fold = self.open.get_mut(&agent_id)?;
         let mut refolded = false;
@@ -142,8 +142,8 @@ mod tests {
         AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn said(text: &str, at: u64) -> MirrorEvent {
-        MirrorEvent::Message {
+    fn said(text: &str, at: u64) -> TranscriptEvent {
+        TranscriptEvent::Message {
             from: None,
             text: text.to_owned(),
             delivery: MessageDelivery::Immediate,
@@ -151,15 +151,15 @@ mod tests {
         }
     }
 
-    fn sent(at: u64) -> MirrorEvent {
-        MirrorEvent::Sent {
+    fn sent(at: u64) -> TranscriptEvent {
+        TranscriptEvent::Sent {
             results: Vec::new(),
             compaction: false,
             at: UnixMs(at),
         }
     }
 
-    fn rows(events: Vec<MirrorEvent>, from: u64) -> Vec<(AgentPos, MirrorEvent)> {
+    fn rows(events: Vec<TranscriptEvent>, from: u64) -> Vec<(AgentPos, TranscriptEvent)> {
         events
             .into_iter()
             .enumerate()

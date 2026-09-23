@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_agent_host_proto::UnixMs;
-pub use rho_agent_host_proto::mirror::{AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome};
+pub use rho_agent_host_proto::transcript::{
+    AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome,
+};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_fs_view::{Place, WorksetMode};
 use rho_inference::PromptCacheKey;
@@ -19,7 +21,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
 use crate::AgentEvent;
-use crate::mirror::{Feed, Journal, LogAppended};
+use crate::transcript::{Feed, Journal, LogAppended};
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -289,14 +291,14 @@ impl AgentEventPos {
     }
 }
 
-impl From<AgentEventPos> for rho_agent_host_proto::mirror::AgentPos {
+impl From<AgentEventPos> for rho_agent_host_proto::transcript::AgentPos {
     fn from(pos: AgentEventPos) -> Self {
         Self(pos.pos)
     }
 }
 
-impl From<rho_agent_host_proto::mirror::AgentPos> for AgentEventPos {
-    fn from(pos: rho_agent_host_proto::mirror::AgentPos) -> Self {
+impl From<rho_agent_host_proto::transcript::AgentPos> for AgentEventPos {
+    fn from(pos: rho_agent_host_proto::transcript::AgentPos) -> Self {
         Self { pos: pos.0 }
     }
 }
@@ -1077,7 +1079,7 @@ impl AgentWriteTxnExt for WriteTxn {
                 seq: Seq(seq),
                 agent_id,
                 pos: pos.into(),
-                event: crate::mirror::strip(event),
+                event: crate::transcript::strip(event),
             };
             self.after_commit(move || {
                 let _ = appends.send(Feed::Appended(appended));

@@ -1,7 +1,7 @@
-//! The mirror: what a client keeps of an agent's raw log.
+//! Transcripts: what a client keeps of an agent's raw log.
 //!
-//! Every [`MirrorEvent`] is `strip` of exactly one raw event, in that
-//! event's position (`AGENT-LOG-DESIGN.md`, "the mirror is a pure function
+//! Every [`TranscriptEvent`] is `strip` of exactly one raw event, in that
+//! event's position (`AGENT-LOG-DESIGN.md`, "the transcript is a pure function
 //! of the raw log"). Bodies a person does not read at a glance (tool
 //! output, reasoning, the argument blob) are left behind; a client asks
 //! for them by position when it wants them.
@@ -132,7 +132,7 @@ pub enum ToolStatus {
 /// One raw event, stripped. Every variant says when, because "how long
 /// has it been?" is the reader's question and nothing else answers it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum MirrorEvent {
+pub enum TranscriptEvent {
     /// Position zero of every agent.
     Created {
         role: AgentRole,
@@ -247,7 +247,7 @@ pub enum MirrorEvent {
     },
 }
 
-impl MirrorEvent {
+impl TranscriptEvent {
     pub fn at(&self) -> UnixMs {
         match self {
             Self::Created { at, .. }
@@ -278,7 +278,7 @@ pub struct LogEntry {
     pub seq: Seq,
     pub agent_id: AgentId,
     pub pos: AgentPos,
-    pub event: MirrorEvent,
+    pub event: TranscriptEvent,
 }
 
 /// What a runtime has that the log does not yet, told as it changes:

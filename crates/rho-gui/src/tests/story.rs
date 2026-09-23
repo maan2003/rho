@@ -4,16 +4,16 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use rho_agent_host_proto::mirror::{
-    AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge,
+use rho_agent_host_proto::transcript::{
+    AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
 };
 use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
 use rho_hosts::connection::ConnEvent;
 
-pub type UiRuntimeKind = rho_agent_host_proto::mirror::RuntimeKind;
-pub type UiSpawnedBy = rho_agent_host_proto::mirror::SpawnedBy;
-pub type UiAgentWant = rho_agent_host_proto::mirror::AgentWant;
-pub type UiTurnOutcome = rho_agent_host_proto::mirror::TurnOutcome;
+pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
+pub type UiSpawnedBy = rho_agent_host_proto::transcript::SpawnedBy;
+pub type UiAgentWant = rho_agent_host_proto::transcript::AgentWant;
+pub type UiTurnOutcome = rho_agent_host_proto::transcript::TurnOutcome;
 
 /// A position in an agent's story, as the old `Ready` named it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,23 +59,23 @@ pub enum UiStoryEvent {
 }
 
 impl UiStoryEvent {
-    fn mirror(self) -> MirrorEvent {
+    fn mirror(self) -> TranscriptEvent {
         match self {
-            Self::UserMessage { text, at } => MirrorEvent::Message {
+            Self::UserMessage { text, at } => TranscriptEvent::Message {
                 from: None,
                 text,
                 delivery: MessageDelivery::Immediate,
                 at,
             },
-            Self::TurnStarted { at } => MirrorEvent::Turn {
+            Self::TurnStarted { at } => TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at,
             },
-            Self::TurnEnded { outcome, at } => MirrorEvent::Turn {
+            Self::TurnEnded { outcome, at } => TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(outcome),
                 at,
             },
-            Self::Wants { want, summary, at } => MirrorEvent::Wants { want, summary, at },
+            Self::Wants { want, summary, at } => TranscriptEvent::Wants { want, summary, at },
         }
     }
 }
@@ -97,7 +97,7 @@ fn known(agent_id: AgentId) -> bool {
     NEXT_POS.with(|next| next.borrow().contains_key(&agent_id))
 }
 
-fn entry(agent_id: AgentId, pos: u64, event: MirrorEvent) -> LogEntry {
+fn entry(agent_id: AgentId, pos: u64, event: TranscriptEvent) -> LogEntry {
     let seq = NEXT_SEQ.with(|next| {
         let seq = next.get();
         next.set(seq + 1);
@@ -125,7 +125,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
     if known(agent_id) {
         let mut events = Vec::new();
         if head.generated_title.is_some() || head.activity.is_some() {
-            events.push(MirrorEvent::Presented {
+            events.push(TranscriptEvent::Presented {
                 title: head
                     .generated_title
                     .map_or(PresentationField::Unchanged, PresentationField::Set),
@@ -136,7 +136,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
             });
         }
         if head.turn_running {
-            events.push(MirrorEvent::Turn {
+            events.push(TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: head.created_at,
             });
@@ -149,7 +149,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
             })
             .collect();
     }
-    let mut events = vec![MirrorEvent::Created {
+    let mut events = vec![TranscriptEvent::Created {
         role: head.role,
         runtime: head.runtime_kind,
         place: head.place,
@@ -160,7 +160,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         at: head.created_at,
     }];
     if head.generated_title.is_some() || head.activity.is_some() {
-        events.push(MirrorEvent::Presented {
+        events.push(TranscriptEvent::Presented {
             title: head
                 .generated_title
                 .map_or(PresentationField::Unchanged, PresentationField::Set),
@@ -171,7 +171,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         });
     }
     if head.turn_running {
-        events.push(MirrorEvent::Turn {
+        events.push(TranscriptEvent::Turn {
             edge: TurnEdge::Started,
             at: head.created_at,
         });
@@ -180,7 +180,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
     if head.story_pos.0 >= told {
         // The head stood past what these rows say; a row that changes
         // nothing carries the position.
-        events.push(MirrorEvent::Presented {
+        events.push(TranscriptEvent::Presented {
             title: PresentationField::Unchanged,
             activity: PresentationField::Unchanged,
             at: head.created_at,
@@ -237,8 +237,8 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
 thread_local! {
     /// The model this test drives. One per test thread, so a test's own
     /// fold and cursor are its own.
-    static MODEL: RefCell<(rho_mirror::model::Model, std::collections::HashSet<rho_agents::HostId>)> =
-        RefCell::new((rho_mirror::model::Model::new(), std::collections::HashSet::new()));
+    static MODEL: RefCell<(rho_sync::model::Model, std::collections::HashSet<rho_agents::HostId>)> =
+        RefCell::new((rho_sync::model::Model::new(), std::collections::HashSet::new()));
 }
 
 /// One frame, through the model and then into the workspace: the same
@@ -257,7 +257,7 @@ pub fn feed(
         if attached.insert(host) {
             model.attach(host, format!("host-{}", attached.len()));
         }
-        model.command(rho_mirror::model::ModelCommand::Follow(followed));
+        model.command(rho_sync::model::ModelCommand::Follow(followed));
         model.ingest(host, event)
     });
     workspace.handle_model_events(events, window, cx);

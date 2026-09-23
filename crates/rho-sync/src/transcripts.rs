@@ -1,6 +1,6 @@
 //! The client's own copy of what the daemon told it about every agent.
 //!
-//! The registry folds the mirror in memory, which is enough while the
+//! The registry folds transcripts in memory, which is enough while the
 //! daemon is up and nothing at all after a restart: the rails would be
 //! blank until the whole log arrived again. This keeps the same rows on
 //! disk - every `Log` entry, keyed by agent and position, one journal
@@ -12,7 +12,7 @@
 //! and read back whole. The rows themselves are read only for the few
 //! agents whose transcript is open.
 //!
-//! It is a mirror, never a source. Every row here came from the daemon or
+//! It is a copy, never a source. Every row here came from the daemon or
 //! from the view's own fold of it; anything doubted is thrown away and
 //! asked for again from the start.
 
@@ -21,7 +21,7 @@ use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
 use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
+use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
 use rho_agents::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 
@@ -50,7 +50,7 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// v5: ordered response items replace flattened text and calls.
 /// v6: nothing new in the fold; retired Gemini agents were deleted from
 /// the daemon, and rows naming their role no longer decode.
-const EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
+const EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
     TableDefinition::new("gui_mirror_events_v6");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
@@ -106,7 +106,7 @@ const RETIRED_TABLES: [&str; 19] = [
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
-struct StoredHost {
+pub(crate) struct StoredHost {
     machine_seed: u64,
     seq: Seq,
 }
@@ -189,7 +189,7 @@ enum Write {
 /// before the move refuse to open — the fault this crate already carries
 /// a pin for. A pin fixes one direction only: `StoredHost` and
 /// `AgentSnapshot` were written under `rho_gui::mirror` before 09-07 and
-/// under `rho_mirror::mirror` after it, and both are on disk in the
+/// under `rho_sync::transcripts` after it, and both are on disk in the
 /// wild, so no single name opens both. Every row in these four tables is
 /// a copy of something the daemon still has, and the crate's own rule is
 /// that anything doubted is thrown away and asked for again, so the
@@ -333,7 +333,7 @@ impl Mirror {
     }
 
     /// One agent's mirror, oldest first, for the transcript a reader opens.
-    pub fn read_events(&self, agent_id: AgentId) -> Vec<(AgentPos, MirrorEvent)> {
+    pub fn read_events(&self, agent_id: AgentId) -> Vec<(AgentPos, TranscriptEvent)> {
         self.db
             .read()
             .open_table(EVENTS)
@@ -582,7 +582,7 @@ pub fn load() -> Loaded {
     global().as_ref().map(Mirror::load).unwrap_or_default()
 }
 
-pub fn read_events(agent_id: AgentId) -> Vec<(AgentPos, MirrorEvent)> {
+pub fn read_events(agent_id: AgentId) -> Vec<(AgentPos, TranscriptEvent)> {
     global()
         .as_ref()
         .map(|mirror| mirror.read_events(agent_id))
@@ -621,7 +621,7 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::mirror::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
+    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
 
     use super::*;
 
@@ -631,7 +631,7 @@ mod tests {
 
     fn told(agent: AgentId, from_seq: u64) -> Vec<LogEntry> {
         [
-            MirrorEvent::Created {
+            TranscriptEvent::Created {
                 role: Default::default(),
                 runtime: RuntimeKind::Rho,
                 place: rho_agent_host_proto::Place {
@@ -646,13 +646,13 @@ mod tests {
                 model: "sol".to_owned(),
                 at: rho_agent_host_proto::UnixMs(1_000),
             },
-            MirrorEvent::Message {
+            TranscriptEvent::Message {
                 from: None,
                 text: "have a look".to_owned(),
                 delivery: rho_agent_host_proto::MessageDelivery::Immediate,
                 at: rho_agent_host_proto::UnixMs(1_000),
             },
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Completed),
                 at: rho_agent_host_proto::UnixMs(2_000),
             },
@@ -668,7 +668,7 @@ mod tests {
         .collect()
     }
 
-    fn events(entries: &[LogEntry]) -> Vec<(AgentPos, MirrorEvent)> {
+    fn events(entries: &[LogEntry]) -> Vec<(AgentPos, TranscriptEvent)> {
         entries
             .iter()
             .map(|entry| (entry.pos, entry.event.clone()))
@@ -858,7 +858,7 @@ mod tests {
     fn canonical_history_retires_all_old_projections_but_keeps_user_verdicts() {
         const OLD_HOSTS: TableDefinition<&str, Sen<StoredHost>> =
             TableDefinition::new("gui_mirror_host_v4");
-        const OLD_EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
+        const OLD_EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
             TableDefinition::new("gui_mirror_events_v4");
         const OLD_DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
             TableDefinition::new("gui_agent_digest_v2");

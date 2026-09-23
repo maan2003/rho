@@ -3,7 +3,7 @@
 //! place that knows what changed, so it says so here instead of a
 //! reader diffing snapshots.
 
-use rho_agent_host_proto::mirror::{Item, Live, QueuedItem, TextPhase};
+use rho_agent_host_proto::transcript::{Item, Live, QueuedItem, TextPhase};
 use rho_inference::types::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
 
 use crate::AgentStateKind;

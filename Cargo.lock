@@ -12668,12 +12668,12 @@ dependencies = [
  "rho-hosts",
  "rho-iroh-auth",
  "rho-journal",
- "rho-mirror",
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
  "rho-shell-view",
  "rho-slack",
+ "rho-sync",
  "rho-terminal",
  "rho-transcript",
  "rho-window",
@@ -12808,25 +12808,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-mirror"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "prefix-id",
- "redb",
- "rho-agent-host-proto",
- "rho-agents",
- "rho-db",
- "rho-hosts",
- "senax-encoder",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "rho-openai-realtime"
 version = "0.1.0"
 dependencies = [
@@ -12894,8 +12875,8 @@ dependencies = [
  "rho-db",
  "rho-fake-model",
  "rho-gui",
- "rho-mirror",
  "rho-slack",
+ "rho-sync",
  "rustls",
  "senax-encoder",
  "serde",
@@ -13004,6 +12985,25 @@ dependencies = [
  "tracing",
  "ui",
  "url",
+]
+
+[[package]]
+name = "rho-sync"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "prefix-id",
+ "redb",
+ "rho-agent-host-proto",
+ "rho-agents",
+ "rho-db",
+ "rho-hosts",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

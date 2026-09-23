@@ -2142,7 +2142,7 @@ fn tool(
         id: id.to_owned(),
         name: "shell_command".to_owned(),
         arguments: "echo ok".to_owned(),
-        format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
         preview: None,
         status,
         output: None,
@@ -2551,7 +2551,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     id: format!("t1.{}", blocks_count - 1),
                     name: "shell_command".to_owned(),
                     arguments: format!("echo {tick}"),
-                    format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+                    format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                     preview: None,
                     status: UiToolStatus::Running,
                     output: None,
@@ -3377,7 +3377,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 id: "tool-1".to_owned(),
                 name: "shell_command".to_owned(),
                 arguments: "echo".to_owned(),
-                format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -3459,7 +3459,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),
-                format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -6106,7 +6106,7 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: r#"{"command":"echo **bold** and _under_"}"#.to_owned(),
-        format: rho_agent_host_proto::mirror::ArgumentsFormat::Json,
+        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
         preview: None,
         status: UiToolStatus::Success,
         output: None,
@@ -8076,8 +8076,8 @@ impl DeskFixture {
 
     /// The same desk as the replica on disk holds it, for a client that
     /// opens with nothing to talk to.
-    pub(super) fn held(&self) -> rho_mirror::desk::HeldDesk {
-        rho_mirror::desk::HeldDesk {
+    pub(super) fn held(&self) -> rho_sync::desk::HeldDesk {
+        rho_sync::desk::HeldDesk {
             known: true,
             namespace: Self::NAMESPACE,
             store: Self::STORE,

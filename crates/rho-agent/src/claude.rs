@@ -2116,8 +2116,8 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
 }
 
 /// A queued input as the wire tells it.
-fn queued_item(input: &QueuedInput) -> rho_agent_host_proto::mirror::QueuedItem {
-    use rho_agent_host_proto::mirror::QueuedItem;
+fn queued_item(input: &QueuedInput) -> rho_agent_host_proto::transcript::QueuedItem {
+    use rho_agent_host_proto::transcript::QueuedItem;
     match &input.kind {
         InputKind::Message { content } => QueuedItem::Message {
             from: match input.source {

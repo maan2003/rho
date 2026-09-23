@@ -55,8 +55,8 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::mirror::{
-        AgentPos, MirrorEvent, RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome,
+    use rho_agent_host_proto::transcript::{
+        AgentPos, RuntimeKind, SpawnedBy, TranscriptEvent, TurnEdge, TurnOutcome,
     };
     use rho_agent_host_proto::{AgentIdDomain, MessageDelivery, UnixMs};
     use rho_hosts::HostId;
@@ -68,8 +68,8 @@ mod tests {
         AgentId::from_counter(1, &AgentIdDomain(0)).expect("an agent id")
     }
 
-    fn created(at: u64) -> MirrorEvent {
-        MirrorEvent::Created {
+    fn created(at: u64) -> TranscriptEvent {
+        TranscriptEvent::Created {
             role: rho_agent_host_proto::AgentRole::default(),
             runtime: RuntimeKind::Rho,
             place: rho_agent_host_proto::Place {
@@ -86,8 +86,8 @@ mod tests {
         }
     }
 
-    fn said(text: &str, at: u64) -> MirrorEvent {
-        MirrorEvent::Message {
+    fn said(text: &str, at: u64) -> TranscriptEvent {
+        TranscriptEvent::Message {
             from: None,
             text: text.to_owned(),
             delivery: MessageDelivery::Immediate,
@@ -97,7 +97,7 @@ mod tests {
 
     /// The agent as the model thread hands it up: its first row, then the
     /// rows after it folded into the same digest.
-    fn told(registry: &mut AgentMap, events: Vec<MirrorEvent>) {
+    fn told(registry: &mut AgentMap, events: Vec<TranscriptEvent>) {
         let host = HostId::default();
         registry.set_host_data(host, 0, 1);
         let mut rows = events.into_iter();
@@ -120,7 +120,7 @@ mod tests {
             vec![
                 created(1),
                 said("fix the flaky mirror test", 2),
-                MirrorEvent::Turn {
+                TranscriptEvent::Turn {
                     edge: TurnEdge::Ended(TurnOutcome::Completed),
                     at: UnixMs(3),
                 },

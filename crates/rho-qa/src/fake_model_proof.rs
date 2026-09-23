@@ -13,7 +13,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};
+use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
 use rho_agent_host_proto::{
     AgentId, AgentRole, ClientMessage, ContentPart, MessageDelivery, ServerMessage, StartMode,
 };
@@ -308,14 +308,14 @@ async fn run_async(args: Args) -> Result<()> {
                     );
                     *expected = entry.pos.next();
                     match entry.event {
-                        MirrorEvent::Created { runtime, .. } => {
+                        TranscriptEvent::Created { runtime, .. } => {
                             ensure!(
-                                runtime == rho_agent_host_proto::mirror::RuntimeKind::Rho,
+                                runtime == rho_agent_host_proto::transcript::RuntimeKind::Rho,
                                 "created a non-native agent"
                             );
                             agents.insert(entry.agent_id);
                         }
-                        MirrorEvent::Sent { results, at, .. } => {
+                        TranscriptEvent::Sent { results, at, .. } => {
                             for result in &results {
                                 tool_durations_ms.push(
                                     result
@@ -325,7 +325,7 @@ async fn run_async(args: Args) -> Result<()> {
                                 if args.scenario == Scenario::RealToolRounds {
                                     ensure!(
                                         result.status
-                                            == rho_agent_host_proto::mirror::ToolStatus::Success,
+                                            == rho_agent_host_proto::transcript::ToolStatus::Success,
                                         "real-tool-rounds tool failed"
                                     );
                                 }
@@ -345,7 +345,7 @@ async fn run_async(args: Args) -> Result<()> {
                                     .await?;
                             }
                         }
-                        MirrorEvent::Replied {
+                        TranscriptEvent::Replied {
                             items,
                             compacted: did_compact,
                             at,
@@ -361,7 +361,7 @@ async fn run_async(args: Args) -> Result<()> {
                                 .filter(|item| {
                                     matches!(
                                         item,
-                                        rho_agent_host_proto::mirror::Item::ToolCall { .. }
+                                        rho_agent_host_proto::transcript::Item::ToolCall { .. }
                                     )
                                 })
                                 .count();
@@ -371,8 +371,9 @@ async fn run_async(args: Args) -> Result<()> {
                                     .iter()
                                     .rev()
                                     .find_map(|item| match item {
-                                        rho_agent_host_proto::mirror::Item::Text {
-                                            text, ..
+                                        rho_agent_host_proto::transcript::Item::Text {
+                                            text,
+                                            ..
                                         } => Some(text),
                                         _ => None,
                                     })
@@ -390,20 +391,20 @@ async fn run_async(args: Args) -> Result<()> {
                                 })
                                 .await?;
                         }
-                        MirrorEvent::Failed {
+                        TranscriptEvent::Failed {
                             retrying: is_retrying,
                             ..
                         } => {
                             failed += 1;
                             retrying += u64::from(is_retrying);
                         }
-                        MirrorEvent::Turn {
+                        TranscriptEvent::Turn {
                             edge: TurnEdge::Started,
                             ..
                         } => {
                             open_turns.insert(entry.agent_id);
                         }
-                        MirrorEvent::Turn {
+                        TranscriptEvent::Turn {
                             edge: TurnEdge::Ended(_),
                             ..
                         } => {

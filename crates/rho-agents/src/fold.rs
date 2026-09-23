@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use rho_agent_host_proto::mirror::{
-    AgentPos, AgentWant, MirrorEvent, PresentationField, RuntimeKind, SpawnedBy, Speaker,
-    ToolOutcome, ToolStatus, TurnEdge, TurnOutcome,
+use rho_agent_host_proto::transcript::{
+    AgentPos, AgentWant, PresentationField, RuntimeKind, SpawnedBy, Speaker, ToolOutcome,
+    ToolStatus, TranscriptEvent, TurnEdge, TurnOutcome,
 };
 use rho_agent_host_proto::{AgentId, AgentRole, AgentUsageBucket, Place, UnixMs};
 
@@ -139,25 +139,25 @@ impl Digest {
 
     /// Folds one event. Positions already held are skipped, so a repeated
     /// run is harmless; returns whether anything was new.
-    pub fn tell(&mut self, pos: AgentPos, event: &MirrorEvent) -> bool {
+    pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
         if pos < self.newest {
             return false;
         }
         self.newest = pos.next();
         self.last_active = self.last_active.max(event.at());
         match event {
-            MirrorEvent::Message {
+            TranscriptEvent::Message {
                 from: None,
                 text,
                 at,
                 ..
             } => self.user_spoke(*at, text),
-            MirrorEvent::ClaudeMessage {
+            TranscriptEvent::ClaudeMessage {
                 speaker: Speaker::User,
                 text,
                 at,
             } => self.user_spoke(*at, text),
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at,
             } => {
@@ -166,7 +166,7 @@ impl Digest {
                 self.errored = None;
                 self.wants = None;
             }
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(outcome),
                 at,
             } => {
@@ -177,20 +177,20 @@ impl Digest {
                 self.activity = None;
                 self.errored = matches!(outcome, TurnOutcome::Errored { .. }).then_some(pos);
             }
-            MirrorEvent::Presented {
+            TranscriptEvent::Presented {
                 title, activity, ..
             } => {
                 apply(&mut self.title, title);
                 apply(&mut self.activity, activity);
             }
-            MirrorEvent::Wants { want, summary, .. } => {
+            TranscriptEvent::Wants { want, summary, .. } => {
                 self.wants = Some(Wants {
                     want: *want,
                     summary: summary.clone(),
                     at: pos,
                 });
             }
-            MirrorEvent::Replied {
+            TranscriptEvent::Replied {
                 usage: Some(usage), ..
             } => {
                 self.usage.input_tokens += usage.input_tokens;
@@ -202,7 +202,7 @@ impl Digest {
                 self.usage_model = usage.model.clone();
             }
             // History from `to` on is gone, and with it anything it said.
-            MirrorEvent::Rewound { to, .. } => {
+            TranscriptEvent::Rewound { to, .. } => {
                 if self.wants.as_ref().is_some_and(|wants| wants.at >= *to) {
                     self.wants = None;
                 }
@@ -210,19 +210,19 @@ impl Digest {
                     self.errored = None;
                 }
             }
-            MirrorEvent::Message { .. }
-            | MirrorEvent::ClaudeMessage { .. }
-            | MirrorEvent::Created { .. }
-            | MirrorEvent::RoleChanged { .. }
-            | MirrorEvent::ModeChanged { .. }
-            | MirrorEvent::Notice { .. }
-            | MirrorEvent::CompactionRequested { .. }
-            | MirrorEvent::QueueCleared { .. }
-            | MirrorEvent::Sent { .. }
-            | MirrorEvent::ExecObserved { .. }
-            | MirrorEvent::Results { .. }
-            | MirrorEvent::Replied { .. }
-            | MirrorEvent::Failed { .. } => {}
+            TranscriptEvent::Message { .. }
+            | TranscriptEvent::ClaudeMessage { .. }
+            | TranscriptEvent::Created { .. }
+            | TranscriptEvent::RoleChanged { .. }
+            | TranscriptEvent::ModeChanged { .. }
+            | TranscriptEvent::Notice { .. }
+            | TranscriptEvent::CompactionRequested { .. }
+            | TranscriptEvent::QueueCleared { .. }
+            | TranscriptEvent::Sent { .. }
+            | TranscriptEvent::ExecObserved { .. }
+            | TranscriptEvent::Results { .. }
+            | TranscriptEvent::Replied { .. }
+            | TranscriptEvent::Failed { .. } => {}
         }
         true
     }
@@ -254,8 +254,8 @@ pub struct MirroredAgent {
 
 impl MirroredAgent {
     /// From the agent's first row. `None` unless it is a `Created`.
-    pub fn new(host: HostId, agent_id: AgentId, event: &MirrorEvent) -> Option<Self> {
-        let MirrorEvent::Created {
+    pub fn new(host: HostId, agent_id: AgentId, event: &TranscriptEvent) -> Option<Self> {
+        let TranscriptEvent::Created {
             role,
             runtime,
             place,
@@ -301,17 +301,17 @@ impl MirroredAgent {
     }
 
     /// Folds one event; returns whether it was new.
-    pub fn tell(&mut self, pos: AgentPos, event: &MirrorEvent) -> bool {
+    pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
         if !self.digest.tell(pos, event) {
             return false;
         }
-        if let MirrorEvent::RoleChanged { role, model, .. } = event {
+        if let TranscriptEvent::RoleChanged { role, model, .. } = event {
             self.identity.role = *role;
             if let Some(model) = model {
                 self.identity.model = model.clone();
             }
         }
-        if let MirrorEvent::ModeChanged { mode, .. } = event {
+        if let TranscriptEvent::ModeChanged { mode, .. } = event {
             self.identity.place.mode = *mode;
         }
         true
@@ -332,7 +332,7 @@ pub fn one_line(text: &str) -> String {
 /// The transcript of one agent's mirror, oldest first. Nothing here is
 /// invented: a call is its name and its line, a reply is what was said,
 /// and a message waits as queued until a request carries it.
-pub fn transcript(events: &[(AgentPos, MirrorEvent)]) -> UiAgentState {
+pub fn transcript(events: &[(AgentPos, TranscriptEvent)]) -> UiAgentState {
     TranscriptFold::new(events).state()
 }
 
@@ -383,7 +383,7 @@ pub struct FoldDelta {
 }
 
 impl TranscriptFold {
-    pub fn new(events: &[(AgentPos, MirrorEvent)]) -> Self {
+    pub fn new(events: &[(AgentPos, TranscriptEvent)]) -> Self {
         let mut fold = Self::default();
         for (pos, event) in events {
             fold.tell(*pos, event);
@@ -466,14 +466,14 @@ impl TranscriptFold {
 
     /// Folds one row. Positions already held are skipped, so a repeated
     /// row is harmless; returns whether anything was new.
-    pub fn tell(&mut self, pos: AgentPos, event: &MirrorEvent) -> bool {
+    pub fn tell(&mut self, pos: AgentPos, event: &TranscriptEvent) -> bool {
         if pos < self.next {
             return false;
         }
         self.next = pos.next();
         self.digest.tell(pos, event);
         match event {
-            MirrorEvent::ExecObserved { id, milestone, at } => {
+            TranscriptEvent::ExecObserved { id, milestone, at } => {
                 self.timing_events.push((pos, id.clone(), *milestone, *at));
                 Arc::make_mut(&mut self.exec_timings)
                     .entry(id.clone())
@@ -491,7 +491,7 @@ impl TranscriptFold {
                 }
             }
 
-            MirrorEvent::Message {
+            TranscriptEvent::Message {
                 from,
                 text,
                 delivery,
@@ -508,7 +508,7 @@ impl TranscriptFold {
                     },
                 ));
             }
-            MirrorEvent::CompactionRequested { .. } => {
+            TranscriptEvent::CompactionRequested { .. } => {
                 self.touch(self.blocks.len() + self.queue.len());
                 self.queue.push((
                     pos,
@@ -517,11 +517,11 @@ impl TranscriptFold {
                     },
                 ));
             }
-            MirrorEvent::QueueCleared { .. } => {
+            TranscriptEvent::QueueCleared { .. } => {
                 self.touch(self.blocks.len());
                 self.queue.clear();
             }
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results,
                 compaction,
                 ..
@@ -539,8 +539,8 @@ impl TranscriptFold {
                 }
                 self.finish_calls(results);
             }
-            MirrorEvent::Results { results, .. } => self.finish_calls(results),
-            MirrorEvent::Replied {
+            TranscriptEvent::Results { results, .. } => self.finish_calls(results),
+            TranscriptEvent::Replied {
                 items,
                 compacted,
                 context_used,
@@ -569,7 +569,7 @@ impl TranscriptFold {
             }
             // Claude's transcript is mirrored message by message. Its queue
             // is live state (Claude Code never persists one), never rows.
-            MirrorEvent::ClaudeMessage { speaker, text, .. } => {
+            TranscriptEvent::ClaudeMessage { speaker, text, .. } => {
                 self.push(
                     pos,
                     match speaker {
@@ -583,14 +583,14 @@ impl TranscriptFold {
                     },
                 );
             }
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 ..
             } => {
                 self.turn_running = true;
                 self.errored = false;
             }
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(outcome),
                 ..
             } => {
@@ -617,7 +617,7 @@ impl TranscriptFold {
             // What the model said before its request failed stays
             // readable; a retry says so, a final failure is the turn's
             // ending right after.
-            MirrorEvent::Failed {
+            TranscriptEvent::Failed {
                 text,
                 error,
                 retrying,
@@ -643,7 +643,7 @@ impl TranscriptFold {
             }
             // A rewind is told rather than unwritten, so the reader is the
             // one that hides what it undid.
-            MirrorEvent::Rewound { to, .. } => {
+            TranscriptEvent::Rewound { to, .. } => {
                 self.timing_events.retain(|(pos, ..)| pos < to);
                 let timings = Arc::make_mut(&mut self.exec_timings);
                 timings.clear();
@@ -670,12 +670,12 @@ impl TranscriptFold {
                     self.context_used = None;
                 }
             }
-            MirrorEvent::Created { .. }
-            | MirrorEvent::RoleChanged { .. }
-            | MirrorEvent::ModeChanged { .. }
-            | MirrorEvent::Notice { .. }
-            | MirrorEvent::Presented { .. }
-            | MirrorEvent::Wants { .. } => {}
+            TranscriptEvent::Created { .. }
+            | TranscriptEvent::RoleChanged { .. }
+            | TranscriptEvent::ModeChanged { .. }
+            | TranscriptEvent::Notice { .. }
+            | TranscriptEvent::Presented { .. }
+            | TranscriptEvent::Wants { .. } => {}
         }
         true
     }
@@ -725,7 +725,7 @@ fn delivered(queued: UiBlock) -> UiBlock {
 #[cfg(test)]
 mod tests {
     use rho_agent_host_proto::MessageDelivery;
-    use rho_agent_host_proto::mirror::{ArgumentsFormat, Item, ToolOutcome, Usage};
+    use rho_agent_host_proto::transcript::{ArgumentsFormat, Item, ToolOutcome, Usage};
 
     use super::*;
     use crate::state::UiTool;
@@ -739,7 +739,7 @@ mod tests {
         }
     }
 
-    fn told(events: Vec<MirrorEvent>) -> UiAgentState {
+    fn told(events: Vec<TranscriptEvent>) -> UiAgentState {
         transcript(
             &events
                 .into_iter()
@@ -749,8 +749,8 @@ mod tests {
         )
     }
 
-    fn user(text: &str, at: u64) -> MirrorEvent {
-        MirrorEvent::Message {
+    fn user(text: &str, at: u64) -> TranscriptEvent {
+        TranscriptEvent::Message {
             from: None,
             text: text.to_owned(),
             delivery: MessageDelivery::Immediate,
@@ -763,7 +763,7 @@ mod tests {
     /// had. Handing the state whole made a row cost every row above it.
     #[test]
     fn committed_items_keep_live_order_and_phase_and_rewind_together() {
-        use rho_agent_host_proto::mirror::{ArgumentsFormat, Item, TextPhase};
+        use rho_agent_host_proto::transcript::{ArgumentsFormat, Item, TextPhase};
         let items = vec![
             Item::Text {
                 text: "before".into(),
@@ -783,7 +783,7 @@ mod tests {
                 phase: Some(TextPhase::FinalAnswer),
             },
         ];
-        let event = MirrorEvent::Replied {
+        let event = TranscriptEvent::Replied {
             items: items.clone(),
             compacted: false,
             usage: None,
@@ -793,7 +793,7 @@ mod tests {
         let mut fold = TranscriptFold::new(&[(AgentPos(0), user("question", 1))]);
         fold.tell(
             AgentPos(1),
-            &MirrorEvent::Sent {
+            &TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
                 at: UnixMs(2),
@@ -814,7 +814,7 @@ mod tests {
         }
         fold.tell(
             AgentPos(3),
-            &MirrorEvent::Rewound {
+            &TranscriptEvent::Rewound {
                 to: AgentPos(2),
                 at: UnixMs(20),
             },
@@ -826,7 +826,7 @@ mod tests {
     fn a_page_for_the_open_agent_costs_its_rows() {
         let mut fold = TranscriptFold::default();
         let mut pos = 0u64;
-        let mut tell = |fold: &mut TranscriptFold, event: MirrorEvent| {
+        let mut tell = |fold: &mut TranscriptFold, event: TranscriptEvent| {
             fold.tell(AgentPos(pos), &event);
             pos += 1;
         };
@@ -834,7 +834,7 @@ mod tests {
             tell(&mut fold, user(&format!("row {nth}"), nth as u64));
             tell(
                 &mut fold,
-                MirrorEvent::Sent {
+                TranscriptEvent::Sent {
                     results: Vec::new(),
                     compaction: false,
                     at: UnixMs(nth as u64),
@@ -851,7 +851,7 @@ mod tests {
         tell(&mut fold, user("one more", 100));
         tell(
             &mut fold,
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
                 at: UnixMs(100),
@@ -900,18 +900,18 @@ mod tests {
     fn a_running_turn_read_back_from_the_mirror_keeps_its_tail() {
         let mut events = vec![
             user("go", 1),
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(2),
             },
         ];
         for nth in 0..3 {
-            events.push(MirrorEvent::Sent {
+            events.push(TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
                 at: UnixMs(3 + nth),
             });
-            events.push(MirrorEvent::Replied {
+            events.push(TranscriptEvent::Replied {
                 items: vec![Item::ToolCall {
                     id: format!("call-{nth}"),
                     name: "shell".to_owned(),
@@ -968,16 +968,16 @@ mod tests {
         let code = "const files = await tools.exec_command({ cmd: 'ls' });\nconsole.log(files);\n";
         let state = told(vec![
             user("what is in there", 1),
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(2),
             },
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
                 at: UnixMs(2),
             },
-            MirrorEvent::Replied {
+            TranscriptEvent::Replied {
                 items: vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "exec".to_owned(),
@@ -1000,16 +1000,16 @@ mod tests {
     fn a_shell_call_still_labels_with_its_command() {
         let state = told(vec![
             user("build it", 1),
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(2),
             },
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
                 at: UnixMs(2),
             },
-            MirrorEvent::Replied {
+            TranscriptEvent::Replied {
                 items: vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "shell_command".to_owned(),
@@ -1031,16 +1031,16 @@ mod tests {
     fn a_told_turn_reads_as_a_transcript() {
         let state = told(vec![
             user("have a look", 1),
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(2),
             },
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results: Vec::new(),
                 compaction: false,
                 at: UnixMs(2),
             },
-            MirrorEvent::Replied {
+            TranscriptEvent::Replied {
                 items: vec![Item::ToolCall {
                     id: "call-1".to_owned(),
                     name: "Read".to_owned(),
@@ -1056,7 +1056,7 @@ mod tests {
                 context_used: Some(10),
                 at: UnixMs(3),
             },
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results: vec![ToolOutcome {
                     id: "call-1".to_owned(),
                     status: ToolStatus::Error,
@@ -1066,7 +1066,7 @@ mod tests {
                 compaction: false,
                 at: UnixMs(4),
             },
-            MirrorEvent::Replied {
+            TranscriptEvent::Replied {
                 items: vec![Item::Text {
                     text: "done looking".to_owned(),
                     phase: None,
@@ -1080,7 +1080,7 @@ mod tests {
                 context_used: Some(12),
                 at: UnixMs(5),
             },
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Completed),
                 at: UnixMs(6),
             },
@@ -1116,7 +1116,7 @@ mod tests {
         assert!(matches!(*state.blocks[0], UiBlock::QueuedMessage { .. }));
         let state = told(vec![
             user("later", 1),
-            MirrorEvent::QueueCleared { at: UnixMs(2) },
+            TranscriptEvent::QueueCleared { at: UnixMs(2) },
         ]);
         assert!(state.blocks.is_empty());
     }
@@ -1127,7 +1127,7 @@ mod tests {
     fn results_alone_leave_the_queue_where_it_is() {
         let state = told(vec![
             user("later", 1),
-            MirrorEvent::Results {
+            TranscriptEvent::Results {
                 results: Vec::new(),
                 at: UnixMs(2),
             },
@@ -1136,8 +1136,8 @@ mod tests {
         assert!(matches!(*state.blocks[0], UiBlock::QueuedMessage { .. }));
     }
 
-    fn replied_with_context(used: u64, at: u64) -> MirrorEvent {
-        MirrorEvent::Replied {
+    fn replied_with_context(used: u64, at: u64) -> TranscriptEvent {
+        TranscriptEvent::Replied {
             items: Vec::new(),
             compacted: false,
             usage: None,
@@ -1156,7 +1156,7 @@ mod tests {
         let state = told(vec![
             replied_with_context(10, 1),
             replied_with_context(12, 2),
-            MirrorEvent::Rewound {
+            TranscriptEvent::Rewound {
                 to: AgentPos(1),
                 at: UnixMs(3),
             },
@@ -1172,11 +1172,11 @@ mod tests {
     #[test]
     fn an_errored_turn_ends_in_a_notice() {
         let state = told(vec![
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(1),
             },
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Errored {
                     message: "the deploy script exited 1".to_owned(),
                 }),
@@ -1197,23 +1197,23 @@ mod tests {
     #[test]
     fn a_failed_request_keeps_what_was_said() {
         let state = told(vec![
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(1),
             },
-            MirrorEvent::Failed {
+            TranscriptEvent::Failed {
                 text: "half an answer".to_owned(),
                 error: "overloaded".to_owned(),
                 retrying: true,
                 at: UnixMs(2),
             },
-            MirrorEvent::Failed {
+            TranscriptEvent::Failed {
                 text: "another half".to_owned(),
                 error: "quota".to_owned(),
                 retrying: false,
                 at: UnixMs(3),
             },
-            MirrorEvent::Turn {
+            TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Errored {
                     message: "quota".to_owned(),
                 }),
@@ -1275,17 +1275,17 @@ mod tests {
     #[test]
     fn a_rewind_hides_what_it_undid() {
         let state = told(vec![
-            MirrorEvent::ClaudeMessage {
+            TranscriptEvent::ClaudeMessage {
                 speaker: Speaker::User,
                 text: "first".to_owned(),
                 at: UnixMs(1),
             },
-            MirrorEvent::ClaudeMessage {
+            TranscriptEvent::ClaudeMessage {
                 speaker: Speaker::Assistant,
                 text: "second".to_owned(),
                 at: UnixMs(2),
             },
-            MirrorEvent::Rewound {
+            TranscriptEvent::Rewound {
                 to: AgentPos(1),
                 at: UnixMs(3),
             },
@@ -1302,7 +1302,7 @@ mod tests {
     fn the_digest_reads_what_the_rails_need() {
         let host = HostId(1);
         let agent_id = AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).unwrap();
-        let created = MirrorEvent::Created {
+        let created = TranscriptEvent::Created {
             role: AgentRole::default(),
             runtime: RuntimeKind::Rho,
             place: test_place(),
@@ -1317,7 +1317,7 @@ mod tests {
         assert!(mirrored.tell(AgentPos(1), &user("do the thing\nand then some", 10)));
         assert!(mirrored.tell(
             AgentPos(2),
-            &MirrorEvent::Turn {
+            &TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: UnixMs(11),
             }
@@ -1326,7 +1326,7 @@ mod tests {
         assert_eq!(mirrored.digest.last_user_message_text, "do the thing");
         assert!(mirrored.tell(
             AgentPos(3),
-            &MirrorEvent::Wants {
+            &TranscriptEvent::Wants {
                 want: AgentWant::Ask,
                 summary: Some("needs a decision".to_owned()),
                 at: UnixMs(12),
@@ -1334,7 +1334,7 @@ mod tests {
         ));
         assert!(mirrored.tell(
             AgentPos(4),
-            &MirrorEvent::Turn {
+            &TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Completed),
                 at: UnixMs(13),
             }
@@ -1348,7 +1348,7 @@ mod tests {
         assert_eq!(mirrored.digest.last_active, UnixMs(13));
         assert!(mirrored.tell(
             AgentPos(5),
-            &MirrorEvent::Rewound {
+            &TranscriptEvent::Rewound {
                 to: AgentPos(3),
                 at: UnixMs(14),
             }
@@ -1357,7 +1357,7 @@ mod tests {
         // A mode change is the identity's place moving, and nothing else.
         assert!(mirrored.tell(
             AgentPos(6),
-            &MirrorEvent::ModeChanged {
+            &TranscriptEvent::ModeChanged {
                 mode: rho_agent_host_proto::WorksetMode::Exposed,
                 at: UnixMs(15),
             }
@@ -1375,7 +1375,7 @@ mod tests {
         let tell = |fold: &mut TranscriptFold, pos, milestone, at| {
             fold.tell(
                 AgentPos(pos),
-                &MirrorEvent::ExecObserved {
+                &TranscriptEvent::ExecObserved {
                     id: "exec-1".into(),
                     milestone,
                     at: UnixMs(at),
@@ -1400,7 +1400,7 @@ mod tests {
         );
         fold.tell(
             AgentPos(6),
-            &MirrorEvent::Rewound {
+            &TranscriptEvent::Rewound {
                 to: AgentPos(3),
                 at: UnixMs(60),
             },

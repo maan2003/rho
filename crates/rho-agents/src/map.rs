@@ -39,9 +39,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
 use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::mirror::AgentWant;
+use rho_agent_host_proto::transcript::AgentWant;
 #[cfg(test)]
-use rho_agent_host_proto::mirror::LogEntry;
+use rho_agent_host_proto::transcript::LogEntry;
 use rho_hosts::HostId;
 
 use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
@@ -844,19 +844,19 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::mirror::{
-        AgentPos, MirrorEvent, RuntimeKind, Seq, SpawnedBy, TurnEdge, TurnOutcome,
+    use rho_agent_host_proto::transcript::{
+        AgentPos, RuntimeKind, Seq, SpawnedBy, TranscriptEvent, TurnEdge, TurnOutcome,
     };
     use rho_agent_host_proto::{AgentIdDomain, UnixMs};
 
     use super::*;
 
-    fn created(at: u64) -> MirrorEvent {
+    fn created(at: u64) -> TranscriptEvent {
         child_of(None, at)
     }
 
-    fn child_of(parent: Option<AgentId>, at: u64) -> MirrorEvent {
-        MirrorEvent::Created {
+    fn child_of(parent: Option<AgentId>, at: u64) -> TranscriptEvent {
+        TranscriptEvent::Created {
             role: rho_agent_host_proto::AgentRole::default(),
             runtime: RuntimeKind::Rho,
             place: rho_agent_host_proto::Place {
@@ -877,7 +877,7 @@ mod tests {
         AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap()
     }
 
-    fn log(agent_id: AgentId, from: u64, events: Vec<MirrorEvent>) -> Vec<LogEntry> {
+    fn log(agent_id: AgentId, from: u64, events: Vec<TranscriptEvent>) -> Vec<LogEntry> {
         events
             .into_iter()
             .enumerate()
@@ -955,12 +955,12 @@ mod tests {
                 0,
                 vec![
                     created(1),
-                    MirrorEvent::Wants {
+                    TranscriptEvent::Wants {
                         want: AgentWant::Ask,
                         summary: None,
                         at: UnixMs(2),
                     },
-                    MirrorEvent::Turn {
+                    TranscriptEvent::Turn {
                         edge: TurnEdge::Ended(TurnOutcome::Completed),
                         at: UnixMs(3),
                     },
@@ -996,7 +996,7 @@ mod tests {
                     &log(
                         agent_id,
                         1,
-                        vec![MirrorEvent::Turn {
+                        vec![TranscriptEvent::Turn {
                             edge: TurnEdge::Started,
                             at: UnixMs(11),
                         }]
@@ -1012,13 +1012,13 @@ mod tests {
                     0,
                     vec![
                         created(1),
-                        MirrorEvent::Message {
+                        TranscriptEvent::Message {
                             from: None,
                             text: "do the thing\nand then some".to_owned(),
                             delivery: rho_agent_host_proto::MessageDelivery::Immediate,
                             at: UnixMs(10),
                         },
-                        MirrorEvent::Turn {
+                        TranscriptEvent::Turn {
                             edge: TurnEdge::Started,
                             at: UnixMs(11),
                         },
@@ -1041,12 +1041,12 @@ mod tests {
                 agent_id,
                 3,
                 vec![
-                    MirrorEvent::Wants {
+                    TranscriptEvent::Wants {
                         want: AgentWant::Ask,
                         summary: Some("needs a decision".to_owned()),
                         at: UnixMs(12),
                     },
-                    MirrorEvent::Turn {
+                    TranscriptEvent::Turn {
                         edge: TurnEdge::Ended(TurnOutcome::Completed),
                         at: UnixMs(13),
                     },
@@ -1068,7 +1068,7 @@ mod tests {
                     &log(
                         agent_id,
                         3,
-                        vec![MirrorEvent::Wants {
+                        vec![TranscriptEvent::Wants {
                             want: AgentWant::Ask,
                             summary: Some("needs a decision".to_owned()),
                             at: UnixMs(12),
@@ -1116,7 +1116,7 @@ mod tests {
             &log(
                 agent(1),
                 1,
-                vec![MirrorEvent::Turn {
+                vec![TranscriptEvent::Turn {
                     edge: TurnEdge::Started,
                     at: UnixMs(40),
                 }],

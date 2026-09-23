@@ -139,7 +139,7 @@ pub(super) enum Message<'a> {
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
-        queue: Option<Vec<rho_agent_host_proto::mirror::QueuedItem>>,
+        queue: Option<Vec<rho_agent_host_proto::transcript::QueuedItem>>,
         reset: bool,
     },
     HistoryBatch {
@@ -200,7 +200,7 @@ impl Drop for Pending {
 /// its existing status slot; the writer snapshots only when it can send.
 #[derive(Default)]
 struct Publication {
-    queue: Mutex<Option<Vec<rho_agent_host_proto::mirror::QueuedItem>>>,
+    queue: Mutex<Option<Vec<rho_agent_host_proto::transcript::QueuedItem>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
     full: std::sync::atomic::AtomicBool,
@@ -414,7 +414,7 @@ impl Host {
         self.tell_tail();
     }
 
-    pub(crate) fn publish_queue(&self, queue: Vec<rho_agent_host_proto::mirror::QueuedItem>) {
+    pub(crate) fn publish_queue(&self, queue: Vec<rho_agent_host_proto::transcript::QueuedItem>) {
         *self.publication.queue.lock().expect("poison") = Some(queue);
     }
 

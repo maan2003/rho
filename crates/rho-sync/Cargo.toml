@@ -5,7 +5,7 @@
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
-name = "rho-mirror"
+name = "rho-sync"
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true

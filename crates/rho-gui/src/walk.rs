@@ -967,7 +967,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         id: "generated-tool".to_owned(),
         name: "shell_command".to_owned(),
         arguments: "generated arguments ".repeat(32),
-        format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
         preview: None,
         status: UiToolStatus::Success,
         output: Some("generated result ".repeat(64)),

@@ -160,7 +160,7 @@ fn block_is_working(block: &UiBlock) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::mirror::ArgumentsFormat;
+    use rho_agent_host_proto::transcript::ArgumentsFormat;
 
     use super::*;
     use crate::state::{UiMessagePhase, UiTool, UiToolStatus};

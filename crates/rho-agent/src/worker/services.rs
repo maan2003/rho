@@ -87,7 +87,7 @@ impl Services {
             pool.settle_turn(self.agent).await;
             if pool.is_live(self.agent) {
                 for live in crate::live::Teller::default().tell(&status.kind) {
-                    crate::mirror::tell_live(&self.db, self.agent, live);
+                    crate::transcript::tell_live(&self.db, self.agent, live);
                 }
             }
         }
@@ -178,10 +178,10 @@ impl Services {
                                     if let Some(queue) = queue
                                         && let Some(live) = teller.tell_queue(&queue)
                                     {
-                                        crate::mirror::tell_live(&self.db, self.agent, live);
+                                        crate::transcript::tell_live(&self.db, self.agent, live);
                                     }
                                     for live in teller.tell(&status.kind) {
-                                        crate::mirror::tell_live(&self.db, self.agent, live);
+                                        crate::transcript::tell_live(&self.db, self.agent, live);
                                     }
                                 } else {
                                     teller.reset();

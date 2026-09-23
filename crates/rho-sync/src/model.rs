@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
+use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
 use rho_agent_host_proto::{AgentId, ClientMessage};
 use rho_agents::{HostId, Verdict};
 use rho_hosts::connection::{Commands, ConnEvent, HostEvent};
@@ -38,7 +38,7 @@ pub enum ModelMsg {
     /// transcript. Nothing else carries rows.
     Rows {
         agent_id: AgentId,
-        rows: Vec<(AgentPos, MirrorEvent)>,
+        rows: Vec<(AgentPos, TranscriptEvent)>,
     },
     /// A frame the model has no part in: desk deltas, auth, errors, and
     /// the live tail of an agent the main thread follows. Handed on
@@ -95,7 +95,7 @@ struct HostModel {
     /// Agents moved since the main thread last heard, and the rows of the
     /// followed ones. Empty except during a catch-up.
     pending: BTreeSet<AgentId>,
-    pending_rows: BTreeMap<AgentId, Vec<(AgentPos, MirrorEvent)>>,
+    pending_rows: BTreeMap<AgentId, Vec<(AgentPos, TranscriptEvent)>>,
 }
 
 impl HostModel {
@@ -120,7 +120,7 @@ pub struct Model {
     followed: BTreeSet<AgentId>,
     /// The disk copy, read once: hosts are attached one at a time and each
     /// takes the agents filed under its name.
-    stored: Option<crate::mirror::Loaded>,
+    stored: Option<crate::transcripts::Loaded>,
 }
 
 impl Default for Model {
@@ -174,7 +174,7 @@ impl Model {
     /// it: the cursor `Follow` will send, and the agents already folded.
     pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
-        let stored = self.stored.get_or_insert_with(crate::mirror::load);
+        let stored = self.stored.get_or_insert_with(crate::transcripts::load);
         if let Some(cursor) = stored.hosts.iter().find(|cursor| cursor.name == name) {
             slot.machine_seed = cursor.machine_seed;
             slot.seq = cursor.seq;
@@ -266,7 +266,7 @@ impl Model {
             slot.seq = Seq(0);
             slot.pending.clear();
             slot.pending_rows.clear();
-            crate::mirror::reset_host(&slot.name);
+            crate::transcripts::reset_host(&slot.name);
             self.agents.retain(|_, agent| agent.host != host);
             out.push(ModelEvent {
                 host,
@@ -302,7 +302,7 @@ impl Model {
             return Vec::new();
         }
         let mut changed = BTreeSet::new();
-        let mut rows: BTreeMap<AgentId, Vec<(AgentPos, MirrorEvent)>> = BTreeMap::new();
+        let mut rows: BTreeMap<AgentId, Vec<(AgentPos, TranscriptEvent)>> = BTreeMap::new();
         for entry in &entries {
             let told = match self.agents.get_mut(&entry.agent_id) {
                 Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
@@ -339,7 +339,7 @@ impl Model {
                 let mirrored = self.agents.get(agent_id)?;
                 Some((
                     *agent_id,
-                    crate::mirror::AgentSnapshot::new(
+                    crate::transcripts::AgentSnapshot::new(
                         mirrored.identity.clone(),
                         mirrored.digest.clone(),
                     ),
@@ -347,7 +347,7 @@ impl Model {
             })
             .collect();
         let slot = self.hosts.get_mut(&host).expect("the host was just here");
-        crate::mirror::write_log(&slot.name, slot.machine_seed, page_seq, kept, digests);
+        crate::transcripts::write_log(&slot.name, slot.machine_seed, page_seq, kept, digests);
         slot.seq = slot.seq.max(page_seq);
         slot.pending.extend(changed);
         for (agent_id, mut page) in rows {
@@ -434,7 +434,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::mirror::{PresentationField, RuntimeKind, SpawnedBy};
+    use rho_agent_host_proto::transcript::{PresentationField, RuntimeKind, SpawnedBy};
     use rho_agent_host_proto::{AgentRole, AuthState};
 
     use super::*;
@@ -450,7 +450,7 @@ mod tests {
             seq: Seq(seq),
             agent_id,
             pos: AgentPos::ZERO,
-            event: MirrorEvent::Created {
+            event: TranscriptEvent::Created {
                 role: AgentRole::default(),
                 runtime: RuntimeKind::Claude,
                 place: rho_agent_host_proto::Place {
@@ -473,7 +473,7 @@ mod tests {
             seq: Seq(seq),
             agent_id,
             pos: AgentPos(pos),
-            event: MirrorEvent::Presented {
+            event: TranscriptEvent::Presented {
                 title: PresentationField::Set(title.to_owned()),
                 activity: PresentationField::Unchanged,
                 at: rho_agent_host_proto::UnixMs(0),
@@ -497,7 +497,7 @@ mod tests {
     fn live(agent_id: AgentId) -> ConnEvent {
         ConnEvent::Live {
             agent_id,
-            live: rho_agent_host_proto::mirror::Live::Idle,
+            live: rho_agent_host_proto::transcript::Live::Idle,
         }
     }
 

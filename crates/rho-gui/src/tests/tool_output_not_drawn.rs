@@ -12,7 +12,7 @@
 
 use gpui::TestAppContext;
 use rho_agent_host_proto::ClientMessage;
-use rho_agent_host_proto::mirror::{AgentPos, DetailBody, DetailResult, ToolStatus};
+use rho_agent_host_proto::transcript::{AgentPos, DetailBody, DetailResult, ToolStatus};
 use rho_agents::HostId;
 use rho_hosts::connection::ConnEvent;
 

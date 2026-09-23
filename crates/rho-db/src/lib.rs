@@ -225,8 +225,23 @@ const MOVED: &[(&str, &str)] = &[
         "rho_desk::cells::DeviceId",
     ),
     (
-        "rho_agent_host_proto::mirror::MirrorEvent",
+        "rho_agent_host_proto::transcript::TranscriptEvent",
         "rho_ui_proto::mirror::MirrorEvent",
+    ),
+    (
+        "rho_sync::desk::StoredDeskHost",
+        "rho_mirror::desk::StoredDeskHost",
+    ),
+    ("rho_sync::desk::CellKey", "rho_mirror::desk::CellKey"),
+    ("rho_sync::desk::VerdictKey", "rho_mirror::desk::VerdictKey"),
+    ("rho_sync::desk::BodyKey", "rho_mirror::desk::BodyKey"),
+    (
+        "rho_sync::transcripts::StoredHost",
+        "rho_mirror::mirror::StoredHost",
+    ),
+    (
+        "rho_sync::transcripts::AgentSnapshot",
+        "rho_mirror::mirror::AgentSnapshot",
     ),
 ];
 

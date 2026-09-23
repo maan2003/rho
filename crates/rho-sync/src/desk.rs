@@ -20,7 +20,7 @@
 //! the daemon's to accept or refuse, and a replica that remembered one
 //! would show the user a verdict that was never taken.
 //!
-//! Like the agent mirror it is a copy, never a source. Anything doubted is
+//! Like the transcript cache it is a copy, never a source. Anything doubted is
 //! dropped and asked for again from the start.
 
 use std::path::Path;
@@ -563,7 +563,7 @@ pub fn reset_host(host: &str) {
 #[cfg(test)]
 mod recorded_names {
     use rho_agent_host_proto::desk::cells;
-    use rho_agent_host_proto::mirror::MirrorEvent;
+    use rho_agent_host_proto::transcript::TranscriptEvent;
     use rho_db::Sen;
 
     /// redb refuses a table whose recorded value type differs from the
@@ -601,8 +601,32 @@ mod recorded_names {
             "rho-db::Sen<rho_desk::cells::DeviceId>"
         );
         assert_eq!(
-            name::<MirrorEvent>(),
+            name::<TranscriptEvent>(),
             "rho-db::Sen<rho_ui_proto::mirror::MirrorEvent>"
+        );
+        assert_eq!(
+            name::<super::StoredDeskHost>(),
+            "rho-db::Sen<rho_mirror::desk::StoredDeskHost>"
+        );
+        assert_eq!(
+            name::<super::CellKey>(),
+            "rho-db::Sen<rho_mirror::desk::CellKey>"
+        );
+        assert_eq!(
+            name::<super::VerdictKey>(),
+            "rho-db::Sen<rho_mirror::desk::VerdictKey>"
+        );
+        assert_eq!(
+            name::<super::BodyKey>(),
+            "rho-db::Sen<rho_mirror::desk::BodyKey>"
+        );
+        assert_eq!(
+            name::<crate::transcripts::StoredHost>(),
+            "rho-db::Sen<rho_mirror::mirror::StoredHost>"
+        );
+        assert_eq!(
+            name::<crate::transcripts::AgentSnapshot>(),
+            "rho-db::Sen<rho_mirror::mirror::AgentSnapshot>"
         );
     }
 }

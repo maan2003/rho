@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::mirror::MirrorEvent;
+use rho_agent_host_proto::transcript::TranscriptEvent;
 use rho_agent_host_proto::{
     AgentRole, ClientMessage, ContentPart, JoinTarget, ServerMessage, StartMode,
 };
@@ -1186,9 +1186,9 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                     let completed_reply = matches!(
                         &entry.event,
-                        MirrorEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agent_host_proto::mirror::Item::ToolCall { .. }))
+                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agent_host_proto::transcript::Item::ToolCall { .. }))
                     );
-                    if matches!(&entry.event, MirrorEvent::Replied { .. }) {
+                    if matches!(&entry.event, TranscriptEvent::Replied { .. }) {
                         replies += 1;
                     }
                     if completed_reply {

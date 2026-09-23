@@ -304,13 +304,13 @@ fn run() -> Result<()> {
     if let Err(error) = rho_journal::init(db.clone(), rho_gui::dealer_policy_snapshot()) {
         tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
     }
-    if let Err(error) = rho_mirror::mirror::init(db.clone()) {
+    if let Err(error) = rho_sync::transcripts::init(db.clone()) {
         tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
     }
-    if let Err(error) = rho_mirror::desk::init(db.clone()) {
+    if let Err(error) = rho_sync::desk::init(db.clone()) {
         tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the daemon");
     }
-    rho_mirror::mirror::set_state_dir(client_state_dir.clone());
+    rho_sync::transcripts::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
     let local_socket = specs.iter().find_map(|spec| match &spec.target {
         AttachTarget::Unix(socket) => Some(socket),
@@ -379,8 +379,8 @@ fn run() -> Result<()> {
                 // Closing rather than flushing: a mirror left open is a
                 // file redb finds unclean, and the next start rebuilds its
                 // allocator from every page to be sure of it.
-                rho_mirror::mirror::close();
-                rho_mirror::desk::close();
+                rho_sync::transcripts::close();
+                rho_sync::desk::close();
                 std::future::ready(())
             })
             .detach();

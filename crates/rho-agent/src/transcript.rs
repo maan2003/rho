@@ -1,10 +1,10 @@
-//! The raw log's mirror side: `strip`, which takes one raw event to what
+//! The raw log's transcript side: `strip`, which takes one raw event to what
 //! a client keeps of it, and the journal observer that tells the daemon
 //! about every append after it commits (`AGENT-LOG-DESIGN.md`).
 
-use rho_agent_host_proto::mirror::{
-    AgentPos, Item, Live, LogEntry, MirrorEvent, RuntimeKind, Seq, SpawnedBy, ToolOutcome,
-    ToolStatus, Usage,
+use rho_agent_host_proto::transcript::{
+    AgentPos, Item, Live, LogEntry, RuntimeKind, Seq, SpawnedBy, ToolOutcome, ToolStatus,
+    TranscriptEvent, Usage,
 };
 use rho_agent_host_proto::{AgentId, UnixMs};
 use rho_db::RhoDb;
@@ -22,7 +22,7 @@ pub struct LogAppended {
     pub seq: Seq,
     pub agent_id: AgentId,
     pub pos: AgentPos,
-    pub event: Option<MirrorEvent>,
+    pub event: Option<TranscriptEvent>,
 }
 
 impl LogAppended {
@@ -111,7 +111,7 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
 /// What a client keeps of one raw event: the same fact with the bodies
 /// left behind. Pure, per event; the position is the raw event's own.
 /// `None` for rows that say nothing a client uses.
-pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
+pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
     // Rows copied before the file's `isCompactSummary` flag was read hold
     // Claude's post-compaction summary as a user line. The log is never
     // rewritten, so the reader is the one that leaves them out.
@@ -140,9 +140,9 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                     .collect();
                 Some(
                     if matches!(context, Some(crate::ContextChange::Preparing { .. })) {
-                        MirrorEvent::Results { results, at: *at }
+                        TranscriptEvent::Results { results, at: *at }
                     } else {
-                        MirrorEvent::Sent {
+                        TranscriptEvent::Sent {
                             results,
                             compaction: input.iter().any(|item| {
                                 matches!(
@@ -182,7 +182,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 error,
                 retrying,
                 at,
-            } => Some(MirrorEvent::Failed {
+            } => Some(TranscriptEvent::Failed {
                 text: partial_text(partial),
                 error: error.clone(),
                 retrying: *retrying,
@@ -192,7 +192,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
     }
     let message =
         |sender: &MessageSender, content: &[rho_agent_host_proto::ContentPart], delivery, at| {
-            MirrorEvent::Message {
+            TranscriptEvent::Message {
                 from: match sender {
                     MessageSender::User => None,
                     MessageSender::Agent { id } => Some(*id),
@@ -204,14 +204,14 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         };
     Some(match event {
         AgentEvent::TitleAttempted { .. } => return None,
-        AgentEvent::Titled { title, at } => MirrorEvent::Presented {
+        AgentEvent::Titled { title, at } => TranscriptEvent::Presented {
             title: title
                 .clone()
                 .map_or(PresentationField::Clear, PresentationField::Set),
             activity: PresentationField::Unchanged,
             at: *at,
         },
-        AgentEvent::ExecObserved { id, milestone, at } => MirrorEvent::ExecObserved {
+        AgentEvent::ExecObserved { id, milestone, at } => TranscriptEvent::ExecObserved {
             id: id.as_str().to_owned(),
             milestone: *milestone,
             at: *at,
@@ -223,7 +223,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             at,
         }) => match kind {
             InputKind::Message { content } => message(source, content, *delivery, *at),
-            InputKind::Compaction => MirrorEvent::CompactionRequested { at: *at },
+            InputKind::Compaction => TranscriptEvent::CompactionRequested { at: *at },
         },
         AgentEvent::Native(_) => unreachable!("normalized above"),
         AgentEvent::Failed {
@@ -231,13 +231,13 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             error,
             retrying,
             at,
-        } => MirrorEvent::Failed {
+        } => TranscriptEvent::Failed {
             text: partial_text(partial),
             error: error.to_string(),
             retrying: *retrying,
             at: *at,
         },
-        AgentEvent::Cleared { at } => MirrorEvent::QueueCleared { at: *at },
+        AgentEvent::Cleared { at } => TranscriptEvent::QueueCleared { at: *at },
         AgentEvent::RuntimeRebound { .. }
         | AgentEvent::ClaudeExecAdmitted { .. }
         | AgentEvent::ClaudeOutput { .. }
@@ -246,8 +246,8 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         // already knows: a person's line is a message, the model's a
         // reply, the results a request that carried them.
         AgentEvent::Transcript { line, at, .. } => match line {
-            crate::TranscriptLine::User { text } => MirrorEvent::ClaudeMessage {
-                speaker: rho_agent_host_proto::mirror::Speaker::User,
+            crate::TranscriptLine::User { text } => TranscriptEvent::ClaudeMessage {
+                speaker: rho_agent_host_proto::transcript::Speaker::User,
                 text: text.clone(),
                 at: *at,
             },
@@ -256,7 +256,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 calls,
                 usage: cost,
                 context_used,
-            } => MirrorEvent::Replied {
+            } => TranscriptEvent::Replied {
                 items: (!text.is_empty())
                     .then(|| Item::Text {
                         text: text.clone(),
@@ -269,7 +269,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                         arguments: call.arguments.clone(),
                         // A transcript call is Claude's, and Claude's tools
                         // are all schema'd: its arguments are always JSON.
-                        format: rho_agent_host_proto::mirror::ArgumentsFormat::Json,
+                        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
                     }))
                     .collect(),
                 compacted: false,
@@ -277,11 +277,11 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 context_used: *context_used,
                 at: *at,
             },
-            crate::TranscriptLine::ToolResults { results } => MirrorEvent::Results {
+            crate::TranscriptLine::ToolResults { results } => TranscriptEvent::Results {
                 results: results.iter().map(tool_outcome).collect(),
                 at: *at,
             },
-            crate::TranscriptLine::Compacted { context_used } => MirrorEvent::Replied {
+            crate::TranscriptLine::Compacted { context_used } => TranscriptEvent::Replied {
                 items: Vec::new(),
                 compacted: true,
                 usage: None,
@@ -298,7 +298,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             spawn_name,
             created_at,
             parent,
-        } => MirrorEvent::Created {
+        } => TranscriptEvent::Created {
             role: *role,
             runtime: runtime_kind(runtime),
             place: place.clone(),
@@ -308,7 +308,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             model: usage_model_of(runtime, *binding).name().to_owned(),
             at: *created_at,
         },
-        AgentEvent::RoleChanged { role, binding, at } => MirrorEvent::RoleChanged {
+        AgentEvent::RoleChanged { role, binding, at } => TranscriptEvent::RoleChanged {
             role: *role,
             // The runtime does not change with a role, so either kind
             // names the model the same way.
@@ -324,25 +324,25 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             }),
             at: *at,
         },
-        AgentEvent::ModeChanged { mode, at } => MirrorEvent::ModeChanged {
+        AgentEvent::ModeChanged { mode, at } => TranscriptEvent::ModeChanged {
             mode: *mode,
             at: *at,
         },
         AgentEvent::Notice { text, .. } if text.is_empty() => return None,
-        AgentEvent::Notice { text, at } => MirrorEvent::Notice {
+        AgentEvent::Notice { text, at } => TranscriptEvent::Notice {
             text: text.to_string(),
             at: *at,
         },
-        AgentEvent::Turn { edge, at } => MirrorEvent::Turn {
+        AgentEvent::Turn { edge, at } => TranscriptEvent::Turn {
             edge: edge.clone(),
             at: *at,
         },
-        AgentEvent::Wants { want, summary, at } => MirrorEvent::Wants {
+        AgentEvent::Wants { want, summary, at } => TranscriptEvent::Wants {
             want: *want,
             summary: summary.clone(),
             at: *at,
         },
-        AgentEvent::Rewound { to, at } => MirrorEvent::Rewound {
+        AgentEvent::Rewound { to, at } => TranscriptEvent::Rewound {
             to: (*to).into(),
             at: *at,
         },
@@ -390,8 +390,8 @@ fn replied(
     context_used: Option<u64>,
     usage: Option<Usage>,
     at: UnixMs,
-) -> MirrorEvent {
-    MirrorEvent::Replied {
+) -> TranscriptEvent {
+    TranscriptEvent::Replied {
         items: items.iter().filter_map(|value| item(value)).collect(),
         compacted: items
             .iter()
@@ -498,21 +498,21 @@ mod tests {
         );
         assert_eq!(
             event,
-            MirrorEvent::Replied {
+            TranscriptEvent::Replied {
                 items: vec![
                     Item::Text {
                         text: "before".into(),
-                        phase: Some(rho_agent_host_proto::mirror::TextPhase::Commentary)
+                        phase: Some(rho_agent_host_proto::transcript::TextPhase::Commentary)
                     },
                     Item::ToolCall {
                         id: "middle".into(),
                         name: "exec".into(),
                         arguments: "print(42)".into(),
-                        format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+                        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                     },
                     Item::Text {
                         text: "after".into(),
-                        phase: Some(rho_agent_host_proto::mirror::TextPhase::FinalAnswer)
+                        phase: Some(rho_agent_host_proto::transcript::TextPhase::FinalAnswer)
                     },
                 ],
                 compacted: false,
@@ -533,7 +533,7 @@ mod tests {
         };
         assert_eq!(
             strip(&event),
-            Some(MirrorEvent::Failed {
+            Some(TranscriptEvent::Failed {
                 text: String::new(),
                 error: "agent service connection closed".into(),
                 retrying: false,
@@ -567,7 +567,7 @@ mod tests {
         let stripped = strip(&event).unwrap();
         assert_eq!(
             stripped,
-            MirrorEvent::Sent {
+            TranscriptEvent::Sent {
                 results: vec![ToolOutcome {
                     id: "call-1".into(),
                     status: ToolStatus::Error,
@@ -600,7 +600,7 @@ mod tests {
 
         assert_eq!(
             strip(&event),
-            Some(MirrorEvent::Sent {
+            Some(TranscriptEvent::Sent {
                 results: vec![],
                 compaction: false,
                 at: UnixMs(3),
@@ -620,7 +620,7 @@ mod tests {
         });
         assert_eq!(
             strip(&event),
-            Some(MirrorEvent::Message {
+            Some(TranscriptEvent::Message {
                 from: None,
                 text: "hi".into(),
                 delivery: MessageDelivery::Immediate,

@@ -1955,13 +1955,13 @@ const LOG_PAGE: usize = 512;
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
-    since: rho_agent_host_proto::mirror::Seq,
+    since: rho_agent_host_proto::transcript::Seq,
 ) -> tokio::task::JoinHandle<()> {
-    use rho_agent::mirror::Feed;
+    use rho_agent::transcript::Feed;
     tokio::spawn(async move {
         // Subscribed before the catch-up read, so a row appended during it
         // is queued rather than lost; the seq drops the duplicates.
-        let mut feed = rho_agent::mirror::feed(&services.db);
+        let mut feed = rho_agent::transcript::feed(&services.db);
         let mut sent = since;
         if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
             return;
@@ -1977,8 +1977,8 @@ fn spawn_log_follow(
                     if !told {
                         told = !matches!(
                             live,
-                            rho_agent_host_proto::mirror::Live::Item { .. }
-                                | rho_agent_host_proto::mirror::Live::Appended { .. }
+                            rho_agent_host_proto::transcript::Live::Item { .. }
+                                | rho_agent_host_proto::transcript::Live::Appended { .. }
                         );
                         if !told {
                             continue;
@@ -2030,7 +2030,7 @@ fn spawn_log_follow(
 async fn send_journal_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    sent: &mut rho_agent_host_proto::mirror::Seq,
+    sent: &mut rho_agent_host_proto::transcript::Seq,
 ) -> bool {
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
@@ -2041,11 +2041,11 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
-                Some(rho_agent_host_proto::mirror::LogEntry {
+                Some(rho_agent_host_proto::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: rho_agent::mirror::strip(&event)?,
+                    event: rho_agent::transcript::strip(&event)?,
                 })
             })
             .collect::<Vec<_>>();
@@ -3210,9 +3210,9 @@ where
 fn agent_detail(
     db: &RhoDb,
     agent_id: AgentId,
-    pos: rho_agent_host_proto::mirror::AgentPos,
-) -> rho_agent_host_proto::mirror::DetailBody {
-    use rho_agent_host_proto::mirror::DetailBody;
+    pos: rho_agent_host_proto::transcript::AgentPos,
+) -> rho_agent_host_proto::transcript::DetailBody {
+    use rho_agent_host_proto::transcript::DetailBody;
     let event = db.read().agent_event(agent_id, pos.into());
     if let Some(native) = event.as_ref().and_then(rho_agent::AgentEvent::native_event) {
         use rho_agent::native::NativeEvent;
@@ -3241,7 +3241,7 @@ fn agent_detail(
                         _ => None,
                     })
                     .flatten()
-                    .filter_map(rho_agent::mirror::item)
+                    .filter_map(rho_agent::transcript::item)
                     .collect(),
             ),
             NativeEvent::RequestFailed { partial, .. } => DetailBody::Response(
@@ -3253,7 +3253,7 @@ fn agent_detail(
                         | rho_inference::types::StreamingContextItemState::Finished(item) => item
                             .to_context_item()
                             .ok()
-                            .and_then(|item| rho_agent::mirror::item(&item)),
+                            .and_then(|item| rho_agent::transcript::item(&item)),
                         _ => None,
                     })
                     .collect(),
@@ -3264,14 +3264,14 @@ fn agent_detail(
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
                 (!text.is_empty())
-                    .then_some(rho_agent_host_proto::mirror::Item::Text { text, phase: None })
+                    .then_some(rho_agent_host_proto::transcript::Item::Text { text, phase: None })
                     .into_iter()
                     .chain(calls.into_iter().map(|call| {
-                        rho_agent_host_proto::mirror::Item::ToolCall {
+                        rho_agent_host_proto::transcript::Item::ToolCall {
                             id: call.id,
                             name: call.name,
                             arguments: call.arguments,
-                            format: rho_agent_host_proto::mirror::ArgumentsFormat::Json,
+                            format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
                         }
                     }))
                     .collect(),
@@ -3301,9 +3301,9 @@ fn agent_detail(
 
 fn detail_result(
     result: &rho_inference::types::ToolResult,
-) -> rho_agent_host_proto::mirror::DetailResult {
-    use rho_agent_host_proto::mirror::ToolStatus;
-    rho_agent_host_proto::mirror::DetailResult {
+) -> rho_agent_host_proto::transcript::DetailResult {
+    use rho_agent_host_proto::transcript::ToolStatus;
+    rho_agent_host_proto::transcript::DetailResult {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
             rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
@@ -3317,10 +3317,10 @@ fn detail_result(
 
 fn detail_update(
     update: &rho_inference::types::ToolUpdate,
-) -> rho_agent_host_proto::mirror::DetailResult {
-    rho_agent_host_proto::mirror::DetailResult {
+) -> rho_agent_host_proto::transcript::DetailResult {
+    rho_agent_host_proto::transcript::DetailResult {
         id: update.call_id.as_str().to_owned(),
-        status: rho_agent_host_proto::mirror::ToolStatus::Success,
+        status: rho_agent_host_proto::transcript::ToolStatus::Success,
         output: update.recorded_output().to_owned(),
         error: None,
     }

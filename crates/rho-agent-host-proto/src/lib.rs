@@ -13,7 +13,6 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 #[cfg(not(target_family = "wasm"))]
 pub mod client;
 pub mod desk;
-pub mod mirror;
 mod place;
 pub mod realtime;
 #[cfg(not(target_family = "wasm"))]
@@ -21,6 +20,7 @@ pub mod server;
 pub mod shell;
 pub mod shell_kernel;
 pub mod term;
+pub mod transcript;
 mod vocab;
 pub mod workspace;
 pub use place::*;
@@ -274,7 +274,7 @@ pub enum ClientMessage {
     /// [`ServerMessage::Log`] pages for everything past it, then follows:
     /// every later append on any agent is pushed on this connection.
     Follow {
-        since: mirror::Seq,
+        since: transcript::Seq,
     },
     /// The bodies of raw events: tool output, a response whole.
     ///
@@ -290,9 +290,9 @@ pub enum ClientMessage {
     /// client draws the bodies it is given and leaves the rest folded.
     Detail {
         agent_id: AgentId,
-        pos: mirror::AgentPos,
+        pos: transcript::AgentPos,
         #[senax(default)]
-        more: Vec<mirror::AgentPos>,
+        more: Vec<transcript::AgentPos>,
     },
     /// Spawns a daemon-owned terminal for an agent: sent as the *first*
     /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
@@ -556,7 +556,7 @@ pub enum ServerMessage {
         agent_counter: u64,
         /// How far this host's journal runs, so a client knows how far
         /// behind it is before it follows.
-        journal_head: mirror::Seq,
+        journal_head: transcript::Seq,
     },
     Error {
         message: String,
@@ -574,7 +574,7 @@ pub enum ServerMessage {
     /// any client is looking at.
     Live {
         agent_id: AgentId,
-        live: mirror::Live,
+        live: transcript::Live,
     },
     AgentCreated {
         agent_id: AgentId,
@@ -586,13 +586,13 @@ pub enum ServerMessage {
     /// [`ClientMessage::Follow`], paged, and afterwards every append as it
     /// lands. Entries never repeat and never skip within one connection.
     Log {
-        entries: Vec<mirror::LogEntry>,
+        entries: Vec<transcript::LogEntry>,
     },
     /// The answer to [`ClientMessage::Detail`].
     Detail {
         agent_id: AgentId,
-        pos: mirror::AgentPos,
-        body: mirror::DetailBody,
+        pos: transcript::AgentPos,
+        body: transcript::DetailBody,
     },
     LandLeaseQueued {
         repo: Utf8PathBuf,
@@ -1303,12 +1303,12 @@ mod tests {
             },
             ClientMessage::AgentStreamFocus { agent_ids: vec![] },
             ClientMessage::Follow {
-                since: mirror::Seq(9),
+                since: transcript::Seq(9),
             },
             ClientMessage::Detail {
                 agent_id,
-                pos: mirror::AgentPos(3),
-                more: vec![mirror::AgentPos(4), mirror::AgentPos(9)],
+                pos: transcript::AgentPos(3),
+                more: vec![transcript::AgentPos(4), transcript::AgentPos(9)],
             },
         ] {
             let bytes = senax_encoder::pack(&message).unwrap();
@@ -1318,22 +1318,22 @@ mod tests {
         }
 
         for live in [
-            mirror::Live::Requesting,
-            mirror::Live::Item {
+            transcript::Live::Requesting,
+            transcript::Live::Item {
                 index: 0,
-                item: mirror::Item::Text {
+                item: transcript::Item::Text {
                     text: "hel".to_owned(),
-                    phase: Some(mirror::TextPhase::FinalAnswer),
+                    phase: Some(transcript::TextPhase::FinalAnswer),
                 },
             },
-            mirror::Live::Appended {
+            transcript::Live::Appended {
                 index: 0,
                 text: "lo".to_owned(),
             },
-            mirror::Live::Waiting {
+            transcript::Live::Waiting {
                 until: Some(crate::UnixMs(5)),
             },
-            mirror::Live::Idle,
+            transcript::Live::Idle,
         ] {
             let message = ServerMessage::Live { agent_id, live };
             let bytes = senax_encoder::pack(&message).unwrap();

@@ -1,7 +1,7 @@
 //! How a client draws an agent: the block list and status it folds from
 //! the mirror and the live tail. Nothing here crosses the wire.
 
-use rho_agent_host_proto::mirror::{ArgumentsFormat, TextPhase};
+use rho_agent_host_proto::transcript::{ArgumentsFormat, TextPhase};
 use rho_agent_host_proto::{MessageDelivery, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 

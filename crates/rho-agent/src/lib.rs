@@ -37,7 +37,6 @@ pub mod db;
 mod image_tool;
 mod lazy;
 pub mod live;
-pub mod mirror;
 pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
@@ -45,6 +44,7 @@ pub mod prompt;
 pub mod shell;
 pub mod terminal;
 mod title;
+pub mod transcript;
 mod worker;
 pub use worker::{
     Process as WorksetProcess, WorksetAction, WorksetAttach, WorksetClient, WorksetReply,

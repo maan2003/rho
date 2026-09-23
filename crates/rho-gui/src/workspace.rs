@@ -200,12 +200,12 @@ pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
 /// Where a host's events go from here: onto the model thread's queue, which
 /// is the one place that decides what a frame means. `rho-hosts` knows only
 /// that somebody is listening.
-struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_mirror::model::ToModel>);
+struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_sync::model::ToModel>);
 
 impl rho_hosts::HostSink for ModelSink {
     fn send(&self, event: rho_hosts::HostEvent) -> Result<(), rho_hosts::SinkClosed> {
         self.0
-            .unbounded_send(rho_mirror::model::ToModel::Event(event))
+            .unbounded_send(rho_sync::model::ToModel::Event(event))
             .map_err(|_| rho_hosts::SinkClosed)
     }
 
@@ -414,7 +414,7 @@ pub struct Workspace {
     pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
-    model: futures_mpsc::UnboundedSender<rho_mirror::model::ToModel>,
+    model: futures_mpsc::UnboundedSender<rho_sync::model::ToModel>,
     draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
@@ -481,7 +481,7 @@ pub struct Workspace {
     _dealer_signal_task: Task<()>,
     /// What the replica would hold, said by a test instead of a file.
     #[cfg(test)]
-    pub(crate) desk_replica_for_test: HashMap<String, rho_mirror::desk::HeldDesk>,
+    pub(crate) desk_replica_for_test: HashMap<String, rho_sync::desk::HeldDesk>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
     chime_above_threshold: bool,
@@ -711,11 +711,9 @@ impl Workspace {
     }
 
     fn note_followed(&self) {
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::Follow(self.followed()),
-            ));
+        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
+            rho_sync::model::ModelCommand::Follow(self.followed()),
+        ));
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
@@ -731,8 +729,8 @@ impl Workspace {
         }
         // The disk copy may trail the rows just heard by a queued write;
         // waiting for it is what makes the fold whole.
-        rho_mirror::mirror::flush();
-        let events = rho_mirror::mirror::read_events(agent_id);
+        rho_sync::transcripts::flush();
+        let events = rho_sync::transcripts::read_events(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
             return false;
         }
@@ -747,8 +745,8 @@ impl Workspace {
         &mut self,
         agent_id: AgentId,
         rows: &[(
-            rho_agent_host_proto::mirror::AgentPos,
-            rho_agent_host_proto::mirror::MirrorEvent,
+            rho_agent_host_proto::transcript::AgentPos,
+            rho_agent_host_proto::transcript::TranscriptEvent,
         )],
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -875,10 +873,10 @@ impl Workspace {
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let channels = rho_mirror::model::spawn();
+        let channels = rho_sync::model::spawn();
         #[cfg(test)]
-        let channels = rho_mirror::model::detached();
-        let rho_mirror::model::ModelChannels { incoming, changes } = channels;
+        let channels = rho_sync::model::detached();
+        let rho_sync::model::ModelChannels { incoming, changes } = channels;
         let model_commands = incoming.clone();
         let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
         let workspace = cx.entity().downgrade();
@@ -905,7 +903,7 @@ impl Workspace {
             });
         let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {
-            let mut changes: UnboundedReceiver<rho_mirror::model::ModelEvent> = changes;
+            let mut changes: UnboundedReceiver<rho_sync::model::ModelEvent> = changes;
             while let Some(change) = changes.next().await {
                 let mut batch = vec![change];
                 while let Ok(change) = changes.try_recv() {
@@ -1135,19 +1133,15 @@ impl Workspace {
         let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
         // The model is told the host exists, and how to speak to it, before
         // any frame from it can arrive.
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::AttachHost {
-                    host,
-                    name: spec.name.clone(),
-                },
-            ));
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::HostCommands { host, commands },
-            ));
+        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
+            rho_sync::model::ModelCommand::AttachHost {
+                host,
+                name: spec.name.clone(),
+            },
+        ));
+        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
+            rho_sync::model::ModelCommand::HostCommands { host, commands },
+        ));
         self.registry.attach_host(host, spec.name);
         self.desk_cells.slack_owned_by(self.hosts.owner());
         self.save_hosts();
@@ -1197,11 +1191,9 @@ impl Workspace {
         self.hosts.detach(host);
         self.desk_cells.slack_owned_by(self.hosts.owner());
         self.save_hosts();
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::DetachHost(host),
-            ));
+        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
+            rho_sync::model::ModelCommand::DetachHost(host),
+        ));
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.usage.forget_host(host);
@@ -1737,12 +1729,12 @@ impl Workspace {
     /// by the whole process, and a test that installed one would be
     /// writing every other test's verdicts into it.
     #[cfg(not(test))]
-    fn held_desk(&mut self, name: &str) -> rho_mirror::desk::HeldDesk {
-        rho_mirror::desk::load(name)
+    fn held_desk(&mut self, name: &str) -> rho_sync::desk::HeldDesk {
+        rho_sync::desk::load(name)
     }
 
     #[cfg(test)]
-    fn held_desk(&mut self, name: &str) -> rho_mirror::desk::HeldDesk {
+    fn held_desk(&mut self, name: &str) -> rho_sync::desk::HeldDesk {
         self.desk_replica_for_test.remove(name).unwrap_or_default()
     }
 
@@ -1943,7 +1935,7 @@ impl Workspace {
 
     pub(crate) fn handle_model_events(
         &mut self,
-        events: Vec<rho_mirror::model::ModelEvent>,
+        events: Vec<rho_sync::model::ModelEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1954,7 +1946,7 @@ impl Workspace {
         // be divided by the events it reconciled.
         let start = std::time::Instant::now();
         let count = events.len() as u64;
-        for rho_mirror::model::ModelEvent { host, msg } in events {
+        for rho_sync::model::ModelEvent { host, msg } in events {
             self.handle_model_event(host, msg, window, cx);
         }
         gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
@@ -1968,19 +1960,19 @@ impl Workspace {
     pub(crate) fn handle_model_event(
         &mut self,
         host: HostId,
-        msg: rho_mirror::model::ModelMsg,
+        msg: rho_sync::model::ModelMsg,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match msg {
-            rho_mirror::model::ModelMsg::Loaded { agents, verdicts } => {
+            rho_sync::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Whole, cx);
                 self.refresh_dashboard(cx);
                 self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
             }
-            rho_mirror::model::ModelMsg::Changed { agents } => {
+            rho_sync::model::ModelMsg::Changed { agents } => {
                 let changed = self.registry.told(agents);
                 if changed.is_empty() {
                     return;
@@ -1997,10 +1989,10 @@ impl Workspace {
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(&changed), cx);
                 self.schedule_desk_sync(host, Some(changed), window, cx);
             }
-            rho_mirror::model::ModelMsg::Rows { agent_id, rows } => {
+            rho_sync::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
             }
-            rho_mirror::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
+            rho_sync::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
         }
     }
 
@@ -5457,7 +5449,7 @@ impl Workspace {
         /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
         fn story_pos(
-            pos: rho_agent_host_proto::mirror::AgentPos,
+            pos: rho_agent_host_proto::transcript::AgentPos,
         ) -> rho_agent_host_proto::desk::cells::StoryPos {
             rho_agent_host_proto::desk::cells::StoryPos(pos.0)
         }
@@ -5579,7 +5571,7 @@ impl Workspace {
         // and the mirror keeps them so a restart ranks the same way.
         for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
             if self.registry.set_agent_verdict(agent_id, verdict) {
-                rho_mirror::mirror::write_verdict(agent_id, verdict);
+                rho_sync::transcripts::write_verdict(agent_id, verdict);
             }
         }
         change

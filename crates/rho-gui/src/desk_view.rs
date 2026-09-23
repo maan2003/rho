@@ -93,7 +93,7 @@ pub struct AgentSource {
     pub errored: Option<StoryPos>,
     /// What the last finished turn says it asks of the user, and where it
     /// said so.
-    pub wants: Option<(rho_agent_host_proto::mirror::AgentWant, StoryPos)>,
+    pub wants: Option<(rho_agent_host_proto::transcript::AgentWant, StoryPos)>,
 }
 
 impl AgentSource {
@@ -526,8 +526,8 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     })
 }
 
-fn agent_pos(pos: StoryPos) -> rho_agent_host_proto::mirror::AgentPos {
-    rho_agent_host_proto::mirror::AgentPos(pos.0)
+fn agent_pos(pos: StoryPos) -> rho_agent_host_proto::transcript::AgentPos {
+    rho_agent_host_proto::transcript::AgentPos(pos.0)
 }
 
 /// The user's verdict on an agent, as the store holds it.
@@ -627,7 +627,7 @@ impl DeskCells {
     }
 
     pub fn device(&mut self) -> DeviceId {
-        *self.device.get_or_insert_with(rho_mirror::desk::device)
+        *self.device.get_or_insert_with(rho_sync::desk::device)
     }
 
     /// The handshake, sent on connect and after every poke. `known` is what
@@ -710,7 +710,7 @@ impl DeskCells {
         {
             self.hosts.remove(&host);
             if let Some(name) = self.names.get(&host) {
-                rho_mirror::desk::reset_host(name);
+                rho_sync::desk::reset_host(name);
             }
             tracing::info!("Desk replica was counted in another store and was dropped");
         }
@@ -783,7 +783,7 @@ impl DeskCells {
         }
         self.merge_bodies(host, &bodies, cx);
         if let Some(name) = self.names.get(&host) {
-            rho_mirror::desk::write_delta(name, store, namespace, held, bodies);
+            rho_sync::desk::write_delta(name, store, namespace, held, bodies);
         }
         self.give_buffers(host, &delta_ids, cx);
         let mut back = Vec::new();
@@ -896,7 +896,7 @@ impl DeskCells {
         let Some(name) = self.names.get(&host) else {
             return;
         };
-        rho_mirror::desk::write_bodies(
+        rho_sync::desk::write_bodies(
             name,
             vec![BodySnapshot {
                 id,
@@ -1540,7 +1540,7 @@ impl DeskCells {
         // the reader has been shown is theirs, and a client that is closed
         // before the round trip finishes must open holding it.
         if let Some(name) = name {
-            rho_mirror::desk::write_delta(
+            rho_sync::desk::write_delta(
                 &name,
                 desk.store,
                 desk.namespace,

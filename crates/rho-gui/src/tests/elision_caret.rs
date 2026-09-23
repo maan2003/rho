@@ -27,7 +27,7 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
             id: format!("tool-{ix}"),
             name: "shell_command".to_owned(),
             arguments: format!("echo {ix}"),
-            format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
+            format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
             preview: None,
             status: UiToolStatus::Success,
             output: Some(format!("ok {ix}")),

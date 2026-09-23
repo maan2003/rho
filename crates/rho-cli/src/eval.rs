@@ -126,7 +126,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             _ => unreachable!("clap validates evaluation roles"),
         },
     };
-    let mut feed = rho_agent::mirror::feed(&db);
+    let mut feed = rho_agent::transcript::feed(&db);
     let (id, agent) = pool
         .create(
             role,
@@ -164,7 +164,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             event = feed.recv() => event,
         };
         let appended = match event {
-            Ok(rho_agent::mirror::Feed::Appended(event)) if event.agent_id == id => event,
+            Ok(rho_agent::transcript::Feed::Appended(event)) if event.agent_id == id => event,
             Ok(_) => continue,
             Err(error) => break Err(format!("Evaluation feed lost: {error}")),
         };
