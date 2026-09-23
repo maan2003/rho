@@ -171,32 +171,15 @@ pub struct Checkout {
 }
 
 impl Checkout {
-    /// Load the visibility rule for the source tree at `root`: one
-    /// `git ls-files` for git checkouts.
+    /// Load the visibility rule for the source tree at `root`: for git
+    /// checkouts, the paths in its index.
     pub fn new(root: &Path, scheme: FlakeScheme) -> io::Result<Self> {
         let tracked = match scheme {
             FlakeScheme::Path => None,
-            FlakeScheme::Git => {
-                let out = Command::new("git")
-                    .arg("-C")
-                    .arg(root)
-                    .args(["ls-files", "-z"])
-                    .output()?;
-                if !out.status.success() {
-                    return Err(io::Error::other(format!(
-                        "git ls-files in {} failed: {}",
-                        root.display(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    )));
-                }
-                Some(
-                    out.stdout
-                        .split(|b| *b == 0)
-                        .filter(|entry| !entry.is_empty())
-                        .map(<[u8]>::to_vec)
-                        .collect(),
-                )
-            }
+            FlakeScheme::Git => Some(match read_index(root)? {
+                Some(tracked) => tracked,
+                None => ls_files(root)?,
+            }),
         };
         Ok(Self {
             root: root.to_path_buf(),
@@ -280,6 +263,115 @@ impl Checkout {
             Err(e) => Err(e),
         }
     }
+}
+
+/// The paths in the git index of the checkout at `root`, read directly, or
+/// `None` if only git can tell: a split or sparse index, or a format this
+/// reader does not know.
+fn read_index(root: &Path) -> io::Result<Option<BTreeSet<Vec<u8>>>> {
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        // Worktrees and submodules: a `gitdir:` file.
+        let Ok(file) = std::fs::read(&dot_git) else { return Ok(None) };
+        let Some(dir) = file.strip_prefix(b"gitdir: ") else { return Ok(None) };
+        root.join(std::ffi::OsStr::from_bytes(dir.trim_ascii_end()))
+    };
+    let index = match std::fs::read(git_dir.join("index")) {
+        Ok(index) => index,
+        // No index yet: nothing is tracked.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(BTreeSet::new())),
+        Err(e) => return Err(e),
+    };
+    Ok(parse_index(&index))
+}
+
+/// The entry names of a version 2, 3 or 4 git index with SHA-1 object ids.
+fn parse_index(index: &[u8]) -> Option<BTreeSet<Vec<u8>>> {
+    const HASH: usize = 20;
+    let u32_at = |at: usize| Some(u32::from_be_bytes(index.get(at..at + 4)?.try_into().ok()?));
+    if index.get(..4)? != b"DIRC" {
+        return None;
+    }
+    let version = u32_at(4)?;
+    if !(2..=4).contains(&version) {
+        return None;
+    }
+    let count = u32_at(8)?;
+    let mut at = 12;
+    let mut name = Vec::new();
+    let mut tracked = BTreeSet::new();
+    for _ in 0..count {
+        let start = at;
+        // ctime, mtime, dev, ino, mode, uid, gid, size, object id, flags
+        let mode = u32_at(at + 24)?;
+        at += 40 + HASH;
+        let flags = u16::from_be_bytes(index.get(at..at + 2)?.try_into().ok()?);
+        at += 2;
+        if flags & 0x4000 != 0 {
+            if version < 3 {
+                return None;
+            }
+            at += 2;
+        }
+        if version == 4 {
+            // Strip a varint's worth of the previous name, then append.
+            let mut byte = *index.get(at)?;
+            at += 1;
+            let mut strip = usize::from(byte & 0x7f);
+            while byte & 0x80 != 0 {
+                byte = *index.get(at)?;
+                at += 1;
+                strip = ((strip + 1) << 7) | usize::from(byte & 0x7f);
+            }
+            name.truncate(name.len().checked_sub(strip)?);
+        } else {
+            name.clear();
+        }
+        let len = index.get(at..)?.iter().position(|b| *b == 0)?;
+        name.extend_from_slice(&index[at..at + len]);
+        at += len + 1;
+        if usize::from(flags & 0xfff) != name.len().min(0xfff) {
+            return None; // not SHA-1, or corrupt
+        }
+        if version < 4 {
+            // NUL padding to a multiple of 8 bytes.
+            at = start + (at - start).div_ceil(8) * 8;
+        }
+        // Directory entries only exist in sparse indexes.
+        if mode & 0o170000 == 0o040000 {
+            return None;
+        }
+        tracked.insert(name.clone());
+    }
+    // Entries of a split index live in its shared index too.
+    while at + 8 + HASH <= index.len() {
+        let signature = &index[at..at + 4];
+        if signature == b"link" || signature == b"sdir" {
+            return None;
+        }
+        at += 8 + usize::try_from(u32_at(at + 4)?).ok()?;
+    }
+    Some(tracked)
+}
+
+/// The paths in the git index of the checkout at `root`, as git lists them.
+fn ls_files(root: &Path) -> io::Result<BTreeSet<Vec<u8>>> {
+    let out = Command::new("git").arg("-C").arg(root).args(["ls-files", "-z"]).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "git ls-files in {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 /// Nix's `observed-dir` value for a directory with entries `names`.
@@ -393,6 +485,28 @@ mod tests {
             observe(&checkout, FlakeScheme::Path, "sub/untracked", ObservedKind::Stat),
             "regular"
         );
+    }
+
+    #[test]
+    fn test_index_reader_agrees_with_git() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        git(dir, &["init", "-q"]);
+        for name in ["a", "dir/b", "dir/sub/c", "dir/sub/cc", "long-name-shares-a-prefix", "x y"] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, name).unwrap();
+        }
+        git(dir, &["add", "."]);
+        git(dir, &["add", "-N", "--", "."]);
+        std::fs::write(dir.join("intent"), b"").unwrap();
+        git(dir, &["add", "-N", "intent"]);
+        for version in ["2", "3", "4"] {
+            git(dir, &["update-index", "--index-version", version]);
+            assert_eq!(read_index(dir).unwrap(), Some(ls_files(dir).unwrap()), "index v{version}");
+        }
+        git(dir, &["update-index", "--split-index"]);
+        assert_eq!(read_index(dir).unwrap(), None);
     }
 
     #[test]
