@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gpui::App;
 use rho_agent_host_proto::desk::cells::Id;
-use rho_agents::{AgentMap, HostId};
+use rho_agents_client::{AgentMap, HostId};
 
 use crate::desk_view::{DeskCells, DeskNode};
 use crate::find::{FindCandidate, FindTarget};
@@ -354,7 +354,7 @@ pub(crate) fn find_candidates(
                     };
                     // Which names an agent answers to is the agent crate's;
                     // where it sits in the tree is this node's.
-                    let hit = rho_agents::find::hit(
+                    let hit = rho_agents_client::find::hit(
                         registry,
                         agent_id,
                         source.shown_title(&node.id.clone()),
@@ -408,7 +408,7 @@ pub(crate) fn find_candidates(
         {
             continue;
         }
-        let hit = rho_agents::find::hit(registry, agent_id, None);
+        let hit = rho_agents_client::find::hit(registry, agent_id, None);
         candidates.push(FindCandidate {
             labels: Vec::new(),
             aka: hit.aka,

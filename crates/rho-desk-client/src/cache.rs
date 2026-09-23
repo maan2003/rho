@@ -563,12 +563,11 @@ pub fn reset_host(host: &str) {
 #[cfg(test)]
 mod recorded_names {
     use rho_agent_host_proto::desk::cells;
-    use rho_agent_host_proto::transcript::TranscriptEvent;
     use rho_db::Sen;
 
     /// redb refuses a table whose recorded value type differs from the
     /// one it is opened with, and `Sen` records the Rust path. These are
-    /// the paths the daemon's and every client's tables were written
+    /// the paths the client's desk tables were written
     /// under; a type that moves has to keep recording its old one.
     #[test]
     fn stored_types_keep_the_names_their_tables_recorded() {
@@ -601,10 +600,6 @@ mod recorded_names {
             "rho-db::Sen<rho_desk::cells::DeviceId>"
         );
         assert_eq!(
-            name::<TranscriptEvent>(),
-            "rho-db::Sen<rho_ui_proto::mirror::MirrorEvent>"
-        );
-        assert_eq!(
             name::<super::StoredDeskHost>(),
             "rho-db::Sen<rho_mirror::desk::StoredDeskHost>"
         );
@@ -619,14 +614,6 @@ mod recorded_names {
         assert_eq!(
             name::<super::BodyKey>(),
             "rho-db::Sen<rho_mirror::desk::BodyKey>"
-        );
-        assert_eq!(
-            name::<crate::transcripts::StoredHost>(),
-            "rho-db::Sen<rho_mirror::mirror::StoredHost>"
-        );
-        assert_eq!(
-            name::<crate::transcripts::AgentSnapshot>(),
-            "rho-db::Sen<rho_mirror::mirror::AgentSnapshot>"
         );
     }
 }

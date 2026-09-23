@@ -19,7 +19,7 @@ use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use rho_agent_host_proto::AgentId;
 pub use rho_agent_host_proto::desk::cells::SlackUnit;
-use rho_agents::{AgentMap, HostId};
+use rho_agents_client::{AgentMap, HostId};
 
 use crate::workspace::Workspace;
 
@@ -335,7 +335,7 @@ pub enum CardCursor {
     /// The newest message in the unit, which is what a Slack verdict writes.
     Slack(rho_agent_host_proto::desk::cells::SlackTs),
     /// The agent's own chronology and what it is asking for.
-    Agent(rho_agents::AgentFacts, rho_agents::Attention),
+    Agent(rho_agents_client::AgentFacts, rho_agents_client::Attention),
     /// The dated mark the card stands on.
     Desk(DeskMark, rho_agent_host_proto::desk::cells::Timestamp),
 }
@@ -1769,8 +1769,8 @@ pub struct DealAgentFacts {
     pub agent_id: AgentId,
     pub host: HostId,
     pub heading: String,
-    pub facts: rho_agents::AgentFacts,
-    pub attention: rho_agents::Attention,
+    pub facts: rho_agents_client::AgentFacts,
+    pub attention: rho_agents_client::Attention,
 }
 
 /// One agent's facts, for a remake that names exactly it. `None` for an
@@ -1833,7 +1833,7 @@ fn deal_agent_facts(registry: &AgentMap) -> Vec<DealAgentFacts> {
 /// The names an agent answers to besides its title: its tag, and the last
 /// thing the user said to it.
 fn agent_card_facts(
-    facts: &rho_agents::AgentFacts,
+    facts: &rho_agents_client::AgentFacts,
     agent_id: AgentId,
     now: chrono::DateTime<chrono::FixedOffset>,
     agent_interactions: &HashMap<AgentId, i64>,
@@ -1866,7 +1866,7 @@ fn agent_card_facts(
 /// Never a card's label; a card is the dealer's reason for showing the
 /// agent, and a running agent has no card at all.
 pub(crate) fn agent_state_label(
-    facts: &rho_agents::AgentFacts,
+    facts: &rho_agents_client::AgentFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> Option<String> {
     if facts.turn_running {
@@ -1885,7 +1885,7 @@ pub(crate) fn agent_state_label(
 }
 
 /// How the last finished turn ended, in the words Home's cards use.
-fn outcome_label(facts: &rho_agents::AgentFacts, wait_days: f64) -> String {
+fn outcome_label(facts: &rho_agents_client::AgentFacts, wait_days: f64) -> String {
     if facts.errored {
         format!("errored · {} ago", age_label(wait_days))
     } else if facts.needs_you_hint {

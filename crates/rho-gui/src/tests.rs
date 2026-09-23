@@ -12,10 +12,10 @@ use gpui::{
 };
 use language::InlayId;
 use rho_agent_host_proto::{AgentId, UnixMs};
-use rho_agents::state::{
+use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
+use rho_agents_client::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 use rho_hosts::connection::ConnEvent;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
@@ -47,7 +47,7 @@ mod syntax_parsed_in_frame;
 mod tool_output_not_drawn;
 mod wrap_rows;
 mod wrap_under_tab;
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
@@ -433,7 +433,7 @@ fn a_fold_placeholder_wears_the_buffer_s_face(cx: &mut TestAppContext) {
         let buffer_font = theme_settings::ThemeSettings::get_global(cx)
             .buffer_font
             .clone();
-        let mut row = rho_agents::transcript::elisions::elision_row("2 tools", cx);
+        let mut row = rho_agents_client::transcript::elisions::elision_row("2 tools", cx);
         let style = gpui::Styled::text_style(&mut row);
         assert_eq!(style.font_family, Some(buffer_font.family));
     });
@@ -3819,7 +3819,7 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
                     rho_window::style::StyleClass::SystemImportant,
                     "important".to_owned(),
                 ))
-                .chain((1..rho_agents::messages::LOG_CAP).map(|index| {
+                .chain((1..rho_agents_client::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("ordinary-{index}"),
@@ -3855,13 +3855,13 @@ fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..=rho_agents::messages::LOG_CAP {
+            for index in 0..=rho_agents_client::messages::LOG_CAP {
                 workspace.append_test_log_entry(format!("message-{index}"), cx);
             }
             let messages = workspace.message_log_texts(cx);
-            assert_eq!(messages.len(), rho_agents::messages::LOG_CAP);
+            assert_eq!(messages.len(), rho_agents_client::messages::LOG_CAP);
             assert_eq!(messages.first().map(String::as_str), Some("message-1"));
-            let expected_last = format!("message-{}", rho_agents::messages::LOG_CAP);
+            let expected_last = format!("message-{}", rho_agents_client::messages::LOG_CAP);
             assert_eq!(messages.last(), Some(&expected_last));
         })
         .expect("fill message log");
@@ -3873,7 +3873,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
     let original = workspace
         .update(cx, |workspace, _, cx| {
             workspace.seed_messages_for_test(
-                (0..rho_agents::messages::LOG_CAP).map(|index| {
+                (0..rho_agents_client::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("initial-{index}"),
@@ -3886,7 +3886,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
         .expect("seed capped messages");
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..rho_agents::messages::REBASE_EVICTIONS {
+            for index in 0..rho_agents_client::messages::REBASE_EVICTIONS {
                 workspace.append_test_message(
                     format!("replacement-{index}"),
                     rho_window::style::StyleClass::SystemInfo,
@@ -3901,7 +3901,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
             assert_ne!(workspace.messages_buffer_id(cx), original);
             assert_eq!(
                 workspace.message_log_texts(cx).len(),
-                rho_agents::messages::LOG_CAP
+                rho_agents_client::messages::LOG_CAP
             );
         })
         .expect("inspect rebased messages");
@@ -4183,7 +4183,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
         },
     );
     feed_edit(&workspace, cx, agent(1), |state| {
-        state.usage = rho_agents::state::UiAgentUsage {
+        state.usage = rho_agents_client::state::UiAgentUsage {
             provider: "fable".to_owned(),
             total: rho_agent_host_proto::AgentUsageBucket {
                 input_tokens: 1_000_000,
@@ -4245,7 +4245,7 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
-            usage: rho_agents::state::UiAgentUsage {
+            usage: rho_agents_client::state::UiAgentUsage {
                 provider: "fable".to_owned(),
                 total: rho_agent_host_proto::AgentUsageBucket {
                     input_tokens: 1_000_000,
@@ -8076,8 +8076,8 @@ impl DeskFixture {
 
     /// The same desk as the replica on disk holds it, for a client that
     /// opens with nothing to talk to.
-    pub(super) fn held(&self) -> rho_sync::desk::HeldDesk {
-        rho_sync::desk::HeldDesk {
+    pub(super) fn held(&self) -> rho_desk_client::cache::HeldDesk {
+        rho_desk_client::cache::HeldDesk {
             known: true,
             namespace: Self::NAMESPACE,
             store: Self::STORE,
@@ -10822,7 +10822,7 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
 /// running agent has no card.
 #[test]
 fn an_agents_state_comes_from_its_head() {
-    use rho_agents::AgentFacts;
+    use rho_agents_client::AgentFacts;
 
     let now = chrono::Local::now().fixed_offset();
     let running = AgentFacts {
@@ -10953,7 +10953,7 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
         })
         .expect("type the first message");
 
-    cx.dispatch_action(*workspace, rho_agents::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_client::RoleCycle);
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(
@@ -10989,19 +10989,19 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
 
     // From the body, backwards is the filesystem row, then the start row,
     // then the role row.
-    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_client::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_filesystem_field_for_test(cx));
         })
         .expect("filesystem row");
-    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_client::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_start_field_for_test(cx));
         })
         .expect("start row");
-    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_client::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_role_field_for_test(cx));
@@ -11099,8 +11099,8 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("seed the workdir row");
 
     cx.simulate_keystrokes(*workspace, "escape");
-    cx.dispatch_action(*workspace, rho_agents::RoleCycle);
-    cx.dispatch_action(*workspace, rho_agents::DraftFieldClear);
+    cx.dispatch_action(*workspace, rho_agents_client::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_client::DraftFieldClear);
     cx.simulate_keystrokes(*workspace, "o k");
     cx.run_until_parked();
 
@@ -11362,7 +11362,7 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
             cx.subscribe(&model, move |model, event, cx| {
                 if !matches!(
                     event,
-                    rho_agents::agent_view::AgentModelEvent::HistoryComposed(_)
+                    rho_agents_client::agent_view::AgentModelEvent::HistoryComposed(_)
                 ) {
                     return;
                 }

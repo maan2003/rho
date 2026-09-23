@@ -182,8 +182,8 @@ impl Workspace {
     /// a rho that has not said where its state lives — a test — has no
     /// Slack session rather than the user's.
     pub(crate) fn slack_paths(&self) -> anyhow::Result<rho_slack::config::Paths> {
-        let state_dir =
-            rho_sync::transcripts::state_dir().context("the client state directory is not set")?;
+        let state_dir = rho_agents_client::cache::state_dir()
+            .context("the client state directory is not set")?;
         let mut paths = rho_slack::config::Paths::under(state_dir);
         // The override exists so an isolated run (QA, a second profile)
         // cannot touch the real workspaces.
@@ -3201,7 +3201,7 @@ impl Workspace {
 fn cards_before(
     cards: Vec<(crate::dashboard::DealCardId, SlackUnit)>,
     model: &Model,
-    host: Option<rho_agents::HostId>,
+    host: Option<rho_agents_client::HostId>,
     before: f64,
 ) -> Vec<(
     rho_agent_host_proto::desk::cells::Id,
@@ -3477,7 +3477,7 @@ mod tests {
         for ts in ["100.0", "900.0"] {
             model.note_message(&message(ts, Some(ts), "U1", "any update?"), 0);
         }
-        let host = rho_agents::HostId::default();
+        let host = rho_agents_client::HostId::default();
         let node = |counter: u8| {
             rho_agent_host_proto::desk::cells::Id::Note(rho_agent_host_proto::desk::cells::Uuid(
                 [counter; 16],

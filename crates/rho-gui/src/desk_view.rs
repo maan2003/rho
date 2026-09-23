@@ -9,7 +9,7 @@ use rho_agent_host_proto::desk::cells::{
     SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
     Uuid, Verdict, VerdictEvent, Version,
 };
-use rho_agents::{Attention, HostId};
+use rho_agents_client::{Attention, HostId};
 use text::{BufferId, ReplicaId};
 
 use crate::workspace::Workspace;
@@ -504,8 +504,8 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     };
     let source = sources.agent(*agent)?;
     let cursor = facts.agent_handled_through.unwrap_or_default();
-    let attention = rho_agents::attention(
-        rho_agents::AttentionFacts {
+    let attention = rho_agents_client::attention(
+        rho_agents_client::AttentionFacts {
             turn_running: source.turn_running,
             errored: source.errored.map(agent_pos),
             wants_at: source.wants.map(|(_, at)| agent_pos(at)),
@@ -531,8 +531,8 @@ fn agent_pos(pos: StoryPos) -> rho_agent_host_proto::transcript::AgentPos {
 }
 
 /// The user's verdict on an agent, as the store holds it.
-fn verdict(facts: &Facts) -> rho_agents::Verdict {
-    rho_agents::Verdict {
+fn verdict(facts: &Facts) -> rho_agents_client::Verdict {
+    rho_agents_client::Verdict {
         handled_through: agent_pos(facts.agent_handled_through.unwrap_or_default()),
         muted: facts.state == State::Muted,
     }
@@ -627,7 +627,9 @@ impl DeskCells {
     }
 
     pub fn device(&mut self) -> DeviceId {
-        *self.device.get_or_insert_with(rho_sync::desk::device)
+        *self
+            .device
+            .get_or_insert_with(rho_desk_client::cache::device)
     }
 
     /// The handshake, sent on connect and after every poke. `known` is what
@@ -710,7 +712,7 @@ impl DeskCells {
         {
             self.hosts.remove(&host);
             if let Some(name) = self.names.get(&host) {
-                rho_sync::desk::reset_host(name);
+                rho_desk_client::cache::reset_host(name);
             }
             tracing::info!("Desk replica was counted in another store and was dropped");
         }
@@ -783,7 +785,7 @@ impl DeskCells {
         }
         self.merge_bodies(host, &bodies, cx);
         if let Some(name) = self.names.get(&host) {
-            rho_sync::desk::write_delta(name, store, namespace, held, bodies);
+            rho_desk_client::cache::write_delta(name, store, namespace, held, bodies);
         }
         self.give_buffers(host, &delta_ids, cx);
         let mut back = Vec::new();
@@ -896,7 +898,7 @@ impl DeskCells {
         let Some(name) = self.names.get(&host) else {
             return;
         };
-        rho_sync::desk::write_bodies(
+        rho_desk_client::cache::write_bodies(
             name,
             vec![BodySnapshot {
                 id,
@@ -1326,7 +1328,7 @@ impl DeskCells {
     pub fn agent_verdicts(
         &self,
         host: HostId,
-    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents::Verdict)> {
+    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents_client::Verdict)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1346,7 +1348,10 @@ impl DeskCells {
     pub fn agent_filing(
         &self,
         host: HostId,
-    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents::AgentFiling)> {
+    ) -> Vec<(
+        rho_agent_host_proto::AgentId,
+        rho_agents_client::AgentFiling,
+    )> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1364,7 +1369,7 @@ impl DeskCells {
                     .collect();
                 Some((
                     agent,
-                    rho_agents::AgentFiling {
+                    rho_agents_client::AgentFiling {
                         muted: facts.state == State::Muted,
                         labels,
                         name: facts.name,
@@ -1381,7 +1386,10 @@ impl DeskCells {
         &self,
         host: HostId,
         touched: &std::collections::BTreeSet<Id>,
-    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents::AgentFiling)> {
+    ) -> Vec<(
+        rho_agent_host_proto::AgentId,
+        rho_agents_client::AgentFiling,
+    )> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1399,7 +1407,7 @@ impl DeskCells {
                     .collect();
                 Some((
                     *agent,
-                    rho_agents::AgentFiling {
+                    rho_agents_client::AgentFiling {
                         muted: facts.state == State::Muted,
                         labels,
                         name: facts.name,
@@ -1540,7 +1548,7 @@ impl DeskCells {
         // the reader has been shown is theirs, and a client that is closed
         // before the round trip finishes must open holding it.
         if let Some(name) = name {
-            rho_sync::desk::write_delta(
+            rho_desk_client::cache::write_delta(
                 &name,
                 desk.store,
                 desk.namespace,

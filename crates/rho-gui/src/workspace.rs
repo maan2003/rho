@@ -32,16 +32,16 @@ use rho_agent_host_proto::AdvisorIntelligence;
 use rho_agent_host_proto::{
     AgentId, AgentRole, ClientMessage, ContentPart, EngineerIntelligence, MessageDelivery,
 };
-use rho_agents::agent_view::AgentModel;
-use rho_agents::create::{
+use rho_agents_client::agent_view::AgentModel;
+use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
 };
-use rho_agents::draft::DraftModel;
-use rho_agents::messages::MessageLog;
-use rho_agents::session::ActiveAgents;
-use rho_agents::store::FrameSummary;
-use rho_agents::{
+use rho_agents_client::draft::DraftModel;
+use rho_agents_client::messages::MessageLog;
+use rho_agents_client::session::ActiveAgents;
+use rho_agents_client::store::FrameSummary;
+use rho_agents_client::{
     AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
     RoleCycleGroup, TranscriptFrame,
 };
@@ -200,12 +200,12 @@ pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
 /// Where a host's events go from here: onto the model thread's queue, which
 /// is the one place that decides what a frame means. `rho-hosts` knows only
 /// that somebody is listening.
-struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_sync::model::ToModel>);
+struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_agents_client::model::ToModel>);
 
 impl rho_hosts::HostSink for ModelSink {
     fn send(&self, event: rho_hosts::HostEvent) -> Result<(), rho_hosts::SinkClosed> {
         self.0
-            .unbounded_send(rho_sync::model::ToModel::Event(event))
+            .unbounded_send(rho_agents_client::model::ToModel::Event(event))
             .map_err(|_| rho_hosts::SinkClosed)
     }
 
@@ -396,7 +396,7 @@ pub struct Workspace {
     /// Every transcript this client holds open, and the rendered state a
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
-    transcripts: rho_agents::Transcripts,
+    transcripts: rho_agents_client::Transcripts,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
@@ -414,7 +414,7 @@ pub struct Workspace {
     pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
-    model: futures_mpsc::UnboundedSender<rho_sync::model::ToModel>,
+    model: futures_mpsc::UnboundedSender<rho_agents_client::model::ToModel>,
     draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
@@ -481,7 +481,7 @@ pub struct Workspace {
     _dealer_signal_task: Task<()>,
     /// What the replica would hold, said by a test instead of a file.
     #[cfg(test)]
-    pub(crate) desk_replica_for_test: HashMap<String, rho_sync::desk::HeldDesk>,
+    pub(crate) desk_replica_for_test: HashMap<String, rho_desk_client::cache::HeldDesk>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
     chime_above_threshold: bool,
@@ -635,10 +635,10 @@ impl Workspace {
                 &model,
                 window,
                 |workspace, _, event, window, cx| match event {
-                    rho_agents::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                    rho_agents_client::agent_view::AgentModelEvent::Loaded(agent_id) => {
                         workspace.finish_initial_agent_load(*agent_id, cx);
                     }
-                    rho_agents::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
+                    rho_agents_client::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
                         workspace.finish_transcript_search(*agent_id, window, cx);
                     }
                 },
@@ -687,8 +687,8 @@ impl Workspace {
     fn loaded(
         &mut self,
         host: HostId,
-        agents: Vec<rho_agents::MirroredAgent>,
-        verdicts: Vec<(AgentId, rho_agents::Verdict)>,
+        agents: Vec<rho_agents_client::MirroredAgent>,
+        verdicts: Vec<(AgentId, rho_agents_client::Verdict)>,
     ) {
         for agent_id in self.registry.host_agents(host) {
             self.transcripts.forget(agent_id);
@@ -711,9 +711,11 @@ impl Workspace {
     }
 
     fn note_followed(&self) {
-        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
-            rho_sync::model::ModelCommand::Follow(self.followed()),
-        ));
+        let _ = self
+            .model
+            .unbounded_send(rho_agents_client::model::ToModel::Command(
+                rho_agents_client::model::ModelCommand::Follow(self.followed()),
+            ));
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
@@ -729,8 +731,8 @@ impl Workspace {
         }
         // The disk copy may trail the rows just heard by a queued write;
         // waiting for it is what makes the fold whole.
-        rho_sync::transcripts::flush();
-        let events = rho_sync::transcripts::read_events(agent_id);
+        rho_agents_client::cache::flush();
+        let events = rho_agents_client::cache::read_events(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
             return false;
         }
@@ -873,17 +875,17 @@ impl Workspace {
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let channels = rho_sync::model::spawn();
+        let channels = rho_agents_client::model::spawn();
         #[cfg(test)]
-        let channels = rho_sync::model::detached();
-        let rho_sync::model::ModelChannels { incoming, changes } = channels;
+        let channels = rho_agents_client::model::detached();
+        let rho_agents_client::model::ModelChannels { incoming, changes } = channels;
         let model_commands = incoming.clone();
         let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
             DraftModel::new(
-                rho_agents::draft::Hooks::new(move |editor, fields, _, _| {
+                rho_agents_client::draft::Hooks::new(move |editor, fields, _, _| {
                     editor.set_completion_provider(Some(
                         crate::commands::WorkspaceCompletionProvider::new(
                             workspace.clone(),
@@ -899,11 +901,13 @@ impl Workspace {
         });
         let draft_subscription =
             cx.subscribe(&draft_model, |workspace, _, event, cx| match event {
-                rho_agents::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
+                rho_agents_client::draft::Event::Edited => {
+                    workspace.mark_draft_active_from_edit(cx)
+                }
             });
         let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {
-            let mut changes: UnboundedReceiver<rho_sync::model::ModelEvent> = changes;
+            let mut changes: UnboundedReceiver<rho_agents_client::model::ModelEvent> = changes;
             while let Some(change) = changes.next().await {
                 let mut batch = vec![change];
                 while let Ok(change) = changes.try_recv() {
@@ -1002,7 +1006,7 @@ impl Workspace {
         let mut this = Self {
             hosts,
             active: ActiveAgents::default(),
-            transcripts: rho_agents::Transcripts::default(),
+            transcripts: rho_agents_client::Transcripts::default(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
@@ -1133,15 +1137,19 @@ impl Workspace {
         let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
         // The model is told the host exists, and how to speak to it, before
         // any frame from it can arrive.
-        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
-            rho_sync::model::ModelCommand::AttachHost {
-                host,
-                name: spec.name.clone(),
-            },
-        ));
-        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
-            rho_sync::model::ModelCommand::HostCommands { host, commands },
-        ));
+        let _ = self
+            .model
+            .unbounded_send(rho_agents_client::model::ToModel::Command(
+                rho_agents_client::model::ModelCommand::AttachHost {
+                    host,
+                    name: spec.name.clone(),
+                },
+            ));
+        let _ = self
+            .model
+            .unbounded_send(rho_agents_client::model::ToModel::Command(
+                rho_agents_client::model::ModelCommand::HostCommands { host, commands },
+            ));
         self.registry.attach_host(host, spec.name);
         self.desk_cells.slack_owned_by(self.hosts.owner());
         self.save_hosts();
@@ -1191,9 +1199,11 @@ impl Workspace {
         self.hosts.detach(host);
         self.desk_cells.slack_owned_by(self.hosts.owner());
         self.save_hosts();
-        let _ = self.model.unbounded_send(rho_sync::model::ToModel::Command(
-            rho_sync::model::ModelCommand::DetachHost(host),
-        ));
+        let _ = self
+            .model
+            .unbounded_send(rho_agents_client::model::ToModel::Command(
+                rho_agents_client::model::ModelCommand::DetachHost(host),
+            ));
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.usage.forget_host(host);
@@ -1729,12 +1739,12 @@ impl Workspace {
     /// by the whole process, and a test that installed one would be
     /// writing every other test's verdicts into it.
     #[cfg(not(test))]
-    fn held_desk(&mut self, name: &str) -> rho_sync::desk::HeldDesk {
-        rho_sync::desk::load(name)
+    fn held_desk(&mut self, name: &str) -> rho_desk_client::cache::HeldDesk {
+        rho_desk_client::cache::load(name)
     }
 
     #[cfg(test)]
-    fn held_desk(&mut self, name: &str) -> rho_sync::desk::HeldDesk {
+    fn held_desk(&mut self, name: &str) -> rho_desk_client::cache::HeldDesk {
         self.desk_replica_for_test.remove(name).unwrap_or_default()
     }
 
@@ -1935,7 +1945,7 @@ impl Workspace {
 
     pub(crate) fn handle_model_events(
         &mut self,
-        events: Vec<rho_sync::model::ModelEvent>,
+        events: Vec<rho_agents_client::model::ModelEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1946,7 +1956,7 @@ impl Workspace {
         // be divided by the events it reconciled.
         let start = std::time::Instant::now();
         let count = events.len() as u64;
-        for rho_sync::model::ModelEvent { host, msg } in events {
+        for rho_agents_client::model::ModelEvent { host, msg } in events {
             self.handle_model_event(host, msg, window, cx);
         }
         gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
@@ -1960,19 +1970,19 @@ impl Workspace {
     pub(crate) fn handle_model_event(
         &mut self,
         host: HostId,
-        msg: rho_sync::model::ModelMsg,
+        msg: rho_agents_client::model::ModelMsg,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match msg {
-            rho_sync::model::ModelMsg::Loaded { agents, verdicts } => {
+            rho_agents_client::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Whole, cx);
                 self.refresh_dashboard(cx);
                 self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
             }
-            rho_sync::model::ModelMsg::Changed { agents } => {
+            rho_agents_client::model::ModelMsg::Changed { agents } => {
                 let changed = self.registry.told(agents);
                 if changed.is_empty() {
                     return;
@@ -1989,10 +1999,12 @@ impl Workspace {
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(&changed), cx);
                 self.schedule_desk_sync(host, Some(changed), window, cx);
             }
-            rho_sync::model::ModelMsg::Rows { agent_id, rows } => {
+            rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
             }
-            rho_sync::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
+            rho_agents_client::model::ModelMsg::Event(event) => {
+                self.handle_event(host, event, window, cx)
+            }
         }
     }
 
@@ -2182,9 +2194,9 @@ impl Workspace {
                         view.set_body_text("", cx);
                         view.clear_attachments(cx);
                         view.set_workdir_text(&label, cx);
-                        view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
-                        view.set_start_text(rho_agents::create::DEFAULT_START, cx);
-                        view.set_filesystem_text(rho_agents::create::DEFAULT_FILESYSTEM, cx);
+                        view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+                        view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
+                        view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
                     });
                     self.select_agent(Some(agent_id), window, cx);
                 }
@@ -2651,7 +2663,7 @@ impl Workspace {
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
         } else {
-            match rho_agents::create::resolve_workdir(&self.hosts, &field) {
+            match rho_agents_client::create::resolve_workdir(&self.hosts, &field) {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
                     self.refuse_draft(&message, cx);
@@ -3323,12 +3335,12 @@ impl Workspace {
         // A project is a label carrying the URL the daemon clones. A path
         // would have the daemon read the user's checkout, which it no
         // longer does.
-        if !rho_agents::create::is_repository_url(&path) {
+        if !rho_agents_client::create::is_repository_url(&path) {
             let message = format!("a project is a repository URL, not a path: `{path}`");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
         }
-        let workdir = match rho_agents::create::resolve_workdir(&self.hosts, &path) {
+        let workdir = match rho_agents_client::create::resolve_workdir(&self.hosts, &path) {
             Ok(workdir) => workdir,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -3897,14 +3909,16 @@ impl Workspace {
     ) {
         match working_directory {
             Some(argument) => {
-                let workdir =
-                    match rho_agents::create::resolve_workdir(&self.hosts, argument.as_str()) {
-                        Ok(workdir) => workdir,
-                        Err(message) => {
-                            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                            return;
-                        }
-                    };
+                let workdir = match rho_agents_client::create::resolve_workdir(
+                    &self.hosts,
+                    argument.as_str(),
+                ) {
+                    Ok(workdir) => workdir,
+                    Err(message) => {
+                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                };
                 let label = self.hosts.workdir_label(&workdir);
                 let editor = self.focused_draft_editor();
                 self.draft_model.update(cx, |view, cx| {
@@ -5571,7 +5585,7 @@ impl Workspace {
         // and the mirror keeps them so a restart ranks the same way.
         for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
             if self.registry.set_agent_verdict(agent_id, verdict) {
-                rho_sync::transcripts::write_verdict(agent_id, verdict);
+                rho_agents_client::cache::write_verdict(agent_id, verdict);
             }
         }
         change
@@ -5584,7 +5598,7 @@ impl Workspace {
     pub(crate) fn seed_transcript_for_test(
         &mut self,
         agent_id: AgentId,
-        state: rho_agents::state::UiAgentState,
+        state: rho_agents_client::state::UiAgentState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6072,14 +6086,17 @@ impl Workspace {
     /// The transcript this workspace shows for an agent, for a test that
     /// feeds it back changed.
     #[cfg(test)]
-    pub(crate) fn transcript_for_test(&self, agent_id: AgentId) -> rho_agents::state::UiAgentState {
+    pub(crate) fn transcript_for_test(
+        &self,
+        agent_id: AgentId,
+    ) -> rho_agents_client::state::UiAgentState {
         self.transcripts
             .state(&agent_id)
             .cloned()
-            .unwrap_or_else(|| rho_agents::state::UiAgentState {
+            .unwrap_or_else(|| rho_agents_client::state::UiAgentState {
                 exec_timings: Default::default(),
                 blocks: Vec::new(),
-                status: rho_agents::state::UiAgentStatus::Idle,
+                status: rho_agents_client::state::UiAgentStatus::Idle,
                 context_used: None,
                 usage: Default::default(),
             })
@@ -7909,9 +7926,9 @@ impl Workspace {
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
-            view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
-            view.set_start_text(rho_agents::create::DEFAULT_START, cx);
-            view.set_filesystem_text(rho_agents::create::DEFAULT_FILESYSTEM, cx);
+            view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+            view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
+            view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
         // The draft exists to be written in, so it opens ready to type.
@@ -8118,7 +8135,7 @@ impl Workspace {
         model.update(cx, |model, cx| {
             model.go_to_store_point(
                 &editor,
-                rho_agents::transcript::StorePoint {
+                rho_agents_client::transcript::StorePoint {
                     block: 0,
                     offset: 0,
                 },
@@ -8212,7 +8229,7 @@ impl Workspace {
             // through is composed while they do.
             self.echo("composing history", StyleClass::SystemInfo, cx);
             model.update(cx, |model, cx| {
-                model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
+                model.request_history(rho_agents_client::agent_view::HistoryWant::All, window, cx);
             });
         }
         self.prompt_for_query(
@@ -8244,7 +8261,7 @@ impl Workspace {
                 query,
             });
             model.update(cx, |model, cx| {
-                model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
+                model.request_history(rho_agents_client::agent_view::HistoryWant::All, window, cx);
             });
             return;
         }

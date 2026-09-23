@@ -1,10 +1,7 @@
-# What the client knows about agents: their transcripts, the map of them
-# and the screens that show them. Cut out of `rho-gui` one piece at a
-# time (`GUI-CRATES-DESIGN.md`); the transcript came first.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
-name = "rho-agents"
+name = "rho-agents-client"
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -24,14 +21,18 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
-prefix-id = { workspace = true, default-features = false }
+prefix-id = { workspace = true, default-features = false, features = ["redb"] }
+redb = { workspace = true }
 rho-agent-host-proto.workspace = true
+rho-db = { workspace = true }
 rho-hosts = { workspace = true }
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
 senax-encoder.workspace = true
 settings = { path = "../../vendor/zed/crates/settings" }
 serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
@@ -40,4 +41,5 @@ tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-ma
 ui = { path = "../../vendor/zed/crates/ui" }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 rho-hosts = { workspace = true, features = ["test-support"] }

@@ -61,12 +61,12 @@ rho-browser = { workspace = true }
 rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
 rho-files = { workspace = true }
-rho-agents = { workspace = true }
+rho-agents-client = { workspace = true }
 rho-hosts = { workspace = true }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
-rho-sync = { workspace = true }
+rho-desk-client = { workspace = true }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true

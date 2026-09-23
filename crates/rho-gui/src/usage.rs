@@ -8,7 +8,7 @@
 //! is nothing special to work on.
 //!
 //! What this module does is paint. Every number it paints comes from
-//! `rho_agents::usage`, which reduces a series to the width of the chart
+//! `rho_agents_client::usage`, which reduces a series to the width of the chart
 //! once, when the series arrives. A frame walks the reduced points and
 //! nothing else: no percentiles, no smoothing, no per-sample arithmetic
 //! behind a pixel. When the window changes width the summary is built again,
@@ -23,8 +23,8 @@ use gpui::{
     canvas, div, point, px, rgb,
 };
 use rho_agent_host_proto::{AgentCostSeries, AgentUsageSeries};
-use rho_agents::HostId;
-use rho_agents::usage::{
+use rho_agents_client::HostId;
+use rho_agents_client::usage::{
     AgentCostSummary, ChartPoint, CostSummary, QuotaSummary, SeriesColor, ShareSummary,
 };
 use theme::ActiveTheme as _;
@@ -331,7 +331,7 @@ impl UsageView {
                     active_auth_namespaces,
                 },
                 Chart::RateLimit,
-            ) => Some(Summary::Quota(rho_agents::usage::quota_summary(
+            ) => Some(Summary::Quota(rho_agents_client::usage::quota_summary(
                 series,
                 active_auth_namespaces,
                 days,
@@ -339,13 +339,13 @@ impl UsageView {
                 columns,
             ))),
             (Series::Global(series), Chart::ModelCost) => Some(Summary::Cost(
-                rho_agents::usage::cost_summary(series, days, now, columns),
+                rho_agents_client::usage::cost_summary(series, days, now, columns),
             )),
             (Series::Global(series), Chart::UsageShare) => Some(Summary::Share(
-                rho_agents::usage::share_summary(series, days, now, columns),
+                rho_agents_client::usage::share_summary(series, days, now, columns),
             )),
             (Series::AgentCost(series), Chart::AgentCost) => Some(Summary::AgentCost(
-                rho_agents::usage::agent_cost_summary(series, days, now, columns),
+                rho_agents_client::usage::agent_cost_summary(series, days, now, columns),
             )),
             // The open chart and the series in hand disagree: a request went
             // out when the chart changed and its answer has not landed yet.
@@ -620,7 +620,7 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
         (SeriesColor::Terra, "terra", summary.latest[4]),
     ]
     .into_iter()
-    .map(|(color, model, share)| rho_agents::usage::Legend {
+    .map(|(color, model, share)| rho_agents_client::usage::Legend {
         color,
         label: format!("{model} {:.0}%", share * 100.0),
     })
@@ -721,7 +721,7 @@ fn render_agent_cost(summary: &AgentCostSummary, height: Pixels, cx: &App) -> An
 
 /// The legend: one coloured label per series, in the order the summary put
 /// them.
-fn legend_row(legend: &[rho_agents::usage::Legend], cx: &App) -> gpui::Div {
+fn legend_row(legend: &[rho_agents_client::usage::Legend], cx: &App) -> gpui::Div {
     div()
         .flex()
         .gap_4()

@@ -17,8 +17,9 @@ use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
 use rho_agent_host_proto::{AgentId, ClientMessage};
-use rho_agents::{HostId, Verdict};
 use rho_hosts::connection::{Commands, ConnEvent, HostEvent};
+
+use crate::{HostId, Verdict};
 
 /// What the main thread hears from the model.
 pub enum ModelMsg {
@@ -26,14 +27,12 @@ pub enum ModelMsg {
     /// after the copy started over. What the main thread had for the host
     /// is gone; this is what there is instead.
     Loaded {
-        agents: Vec<rho_agents::MirroredAgent>,
+        agents: Vec<crate::MirroredAgent>,
         verdicts: Vec<(AgentId, Verdict)>,
     },
     /// The agents a run of the log moved, as they now stand. One message
     /// per page once caught up, and one for a whole catch-up.
-    Changed {
-        agents: Vec<rho_agents::MirroredAgent>,
-    },
+    Changed { agents: Vec<crate::MirroredAgent> },
     /// Rows of an agent the main thread follows, for the fold behind its
     /// transcript. Nothing else carries rows.
     Rows {
@@ -116,11 +115,11 @@ impl HostModel {
 /// The fold of every agent, the cursors, and who is followed.
 pub struct Model {
     hosts: HashMap<HostId, HostModel>,
-    agents: BTreeMap<AgentId, rho_agents::MirroredAgent>,
+    agents: BTreeMap<AgentId, crate::MirroredAgent>,
     followed: BTreeSet<AgentId>,
     /// The disk copy, read once: hosts are attached one at a time and each
     /// takes the agents filed under its name.
-    stored: Option<crate::transcripts::Loaded>,
+    stored: Option<crate::cache::Loaded>,
 }
 
 impl Default for Model {
@@ -174,7 +173,7 @@ impl Model {
     /// it: the cursor `Follow` will send, and the agents already folded.
     pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
-        let stored = self.stored.get_or_insert_with(crate::transcripts::load);
+        let stored = self.stored.get_or_insert_with(crate::cache::load);
         if let Some(cursor) = stored.hosts.iter().find(|cursor| cursor.name == name) {
             slot.machine_seed = cursor.machine_seed;
             slot.seq = cursor.seq;
@@ -186,7 +185,7 @@ impl Model {
             if mirrored.host != name {
                 continue;
             }
-            agents.push(rho_agents::MirroredAgent {
+            agents.push(crate::MirroredAgent {
                 host,
                 identity: mirrored.snapshot.identity.clone(),
                 digest: mirrored.snapshot.digest.clone(),
@@ -266,7 +265,7 @@ impl Model {
             slot.seq = Seq(0);
             slot.pending.clear();
             slot.pending_rows.clear();
-            crate::transcripts::reset_host(&slot.name);
+            crate::cache::reset_host(&slot.name);
             self.agents.retain(|_, agent| agent.host != host);
             out.push(ModelEvent {
                 host,
@@ -308,7 +307,7 @@ impl Model {
                 Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
                 // A row for an agent whose creation this client never
                 // heard says nothing; without it nothing can be folded.
-                None => match rho_agents::MirroredAgent::new(host, entry.agent_id, &entry.event) {
+                None => match crate::MirroredAgent::new(host, entry.agent_id, &entry.event) {
                     Some(mirrored) => {
                         self.agents.insert(entry.agent_id, mirrored);
                         true
@@ -339,7 +338,7 @@ impl Model {
                 let mirrored = self.agents.get(agent_id)?;
                 Some((
                     *agent_id,
-                    crate::transcripts::AgentSnapshot::new(
+                    crate::cache::AgentSnapshot::new(
                         mirrored.identity.clone(),
                         mirrored.digest.clone(),
                     ),
@@ -347,7 +346,7 @@ impl Model {
             })
             .collect();
         let slot = self.hosts.get_mut(&host).expect("the host was just here");
-        crate::transcripts::write_log(&slot.name, slot.machine_seed, page_seq, kept, digests);
+        crate::cache::write_log(&slot.name, slot.machine_seed, page_seq, kept, digests);
         slot.seq = slot.seq.max(page_seq);
         slot.pending.extend(changed);
         for (agent_id, mut page) in rows {

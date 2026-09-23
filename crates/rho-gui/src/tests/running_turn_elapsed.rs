@@ -6,7 +6,7 @@
 //! messaged showed a turn running since the epoch, "20704.2d".
 
 use rho_agent_host_proto::UnixMs;
-use rho_agents::AgentFacts;
+use rho_agents_client::AgentFacts;
 
 use crate::home::running_elapsed_label;
 

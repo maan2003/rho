@@ -6,7 +6,7 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
-  "crates/rho-agents",
+  "crates/rho-agents-client",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
   "crates/rho-ci",
@@ -30,7 +30,7 @@ members = [
   "crates/rho-inference",
   "crates/rho-iroh-auth",
   "crates/rho-journal",
-  "crates/rho-sync",
+  "crates/rho-desk-client",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
@@ -114,7 +114,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "stream",
 ] }
 rho-agent = { path = "crates/rho-agent", default-features = false }
-rho-agents = { path = "crates/rho-agents" }
+rho-agents-client = { path = "crates/rho-agents-client" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }
 rho-ci = { path = "crates/rho-ci" }
@@ -134,7 +134,7 @@ rho-image = { path = "crates/rho-image" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
-rho-sync = { path = "crates/rho-sync" }
+rho-desk-client = { path = "crates/rho-desk-client" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }

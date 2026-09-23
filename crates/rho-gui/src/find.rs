@@ -27,7 +27,7 @@
 
 use gpui::{App, Context, Window};
 use rho_agent_host_proto::AgentId;
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 
 use crate::minibuffer::Candidate;
 use crate::workspace::Workspace;

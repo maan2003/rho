@@ -13,7 +13,7 @@
 use std::rc::Rc;
 
 use gpui::{App, Context, Window};
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 use rho_window::style::StyleClass;
 
 use crate::find::rank;

@@ -10,7 +10,7 @@ use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec, SectionSpec};
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 use text::{BufferId, ReplicaId};
 
 use crate::workspace::Workspace;

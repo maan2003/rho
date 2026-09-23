@@ -22,8 +22,9 @@ use std::sync::mpsc;
 use redb::{TableDefinition, TableHandle};
 use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
-use rho_agents::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
+
+use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 
 /// Where this client stands in a host's journal, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -189,7 +190,7 @@ enum Write {
 /// before the move refuse to open — the fault this crate already carries
 /// a pin for. A pin fixes one direction only: `StoredHost` and
 /// `AgentSnapshot` were written under `rho_gui::mirror` before 09-07 and
-/// under `rho_sync::transcripts` after it, and both are on disk in the
+/// under `crate::cache` after it, and both are on disk in the
 /// wild, so no single name opens both. Every row in these four tables is
 /// a copy of something the daemon still has, and the crate's own rule is
 /// that anything doubted is thrown away and asked for again, so the
@@ -271,11 +272,8 @@ impl Mirror {
                 }
                 let events = self.read_events(agent_id);
                 let (first, rest) = events.split_first()?;
-                let mut fold = rho_agents::MirroredAgent::new(
-                    rho_agents::HostId::default(),
-                    agent_id,
-                    &first.1,
-                )?;
+                let mut fold =
+                    crate::MirroredAgent::new(crate::HostId::default(), agent_id, &first.1)?;
                 for (pos, event) in rest {
                     fold.tell(*pos, event);
                 }
@@ -620,6 +618,38 @@ pub fn flush() {
 }
 
 #[cfg(test)]
+mod recorded_names {
+    use rho_agent_host_proto::transcript::TranscriptEvent;
+    use rho_db::Sen;
+
+    /// redb refuses a table whose recorded value type differs from the
+    /// one it is opened with, and `Sen` records the Rust path. These are
+    /// the paths the daemon's and every client's transcript tables were
+    /// written under; a type that moves has to keep recording its old one.
+    #[test]
+    fn stored_types_keep_the_names_their_tables_recorded() {
+        fn name<T>() -> String
+        where
+            Sen<T>: redb::Value,
+        {
+            <Sen<T> as redb::Value>::type_name().name().to_owned()
+        }
+        assert_eq!(
+            name::<TranscriptEvent>(),
+            "rho-db::Sen<rho_ui_proto::mirror::MirrorEvent>"
+        );
+        assert_eq!(
+            name::<super::StoredHost>(),
+            "rho-db::Sen<rho_mirror::mirror::StoredHost>"
+        );
+        assert_eq!(
+            name::<super::AgentSnapshot>(),
+            "rho-db::Sen<rho_mirror::mirror::AgentSnapshot>"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
 
@@ -677,8 +707,8 @@ mod tests {
 
     /// What the registry makes of a run of one agent's rows.
     fn snapshot(entries: &[LogEntry]) -> AgentSnapshot {
-        let mut mirrored = rho_agents::MirroredAgent::new(
-            rho_agents::HostId::default(),
+        let mut mirrored = crate::MirroredAgent::new(
+            crate::HostId::default(),
             entries[0].agent_id,
             &entries[0].event,
         )

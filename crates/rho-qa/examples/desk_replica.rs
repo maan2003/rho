@@ -22,7 +22,7 @@ fn main() {
         std::process::exit(2);
     }
     let host = args.next().unwrap_or_else(|| "local".to_owned());
-    let mirror = rho_sync::desk::DeskMirror::open(std::path::Path::new(&state_dir))
+    let mirror = rho_desk_client::cache::DeskMirror::open(std::path::Path::new(&state_dir))
         .expect("open the client database");
     let held = mirror.load(&host);
     println!("host {host}: known={}", held.known);

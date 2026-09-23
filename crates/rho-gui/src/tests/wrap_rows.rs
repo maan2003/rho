@@ -17,7 +17,7 @@
 //! document has, at a column that row reaches.
 
 use gpui::{TestAppContext, px, size};
-use rho_agents::state::UiMessagePhase;
+use rho_agents_client::state::UiMessagePhase;
 
 use crate::tests::{
     active_editor, agent, assistant, feed_frame, long_working_text, state, stream_text,

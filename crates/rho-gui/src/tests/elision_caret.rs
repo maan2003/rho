@@ -7,7 +7,7 @@
 
 use editor::display_map::{DisplayPoint, DisplayRow};
 use gpui::{Focusable as _, TestAppContext};
-use rho_agents::state::{UiBlock, UiTool, UiToolStatus};
+use rho_agents_client::state::{UiBlock, UiTool, UiToolStatus};
 
 use super::{
     active_editor, agent, bind_test_keymaps, display_text, feed_frame, has_display_elision, state,

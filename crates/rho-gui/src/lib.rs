@@ -30,7 +30,7 @@ pub mod walk;
 pub mod workspace;
 
 use gpui::{App, KeyBinding, actions};
-use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
+use rho_agents_client::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
 pub use rho_files::FileSave;
 pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{

@@ -35,6 +35,7 @@ tempfile.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 rho-db.workspace = true
-rho-sync.workspace = true
+rho-agents-client.workspace = true
+rho-desk-client.workspace = true
 senax-encoder.workspace = true
 text.workspace = true

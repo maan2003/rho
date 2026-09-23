@@ -3238,7 +3238,7 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
         .update(cx, |workspace, window, cx| {
             let cursor = |ts: &str| rho_agent_host_proto::desk::cells::SlackTs(ts.to_owned());
             workspace.mark_cards_done(
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 vec![
                     (
                         rho_agent_host_proto::desk::cells::Id::Slack(direct.clone()),
@@ -3328,20 +3328,20 @@ fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppCo
         .update(cx, |workspace, window, cx| {
             crate::tests::story::feed(
                 workspace,
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 desk.synced(),
                 window,
                 cx,
             );
             workspace.set_slack_sources_for_test(
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 desk.slack_sources(),
                 window,
                 cx,
             );
             let rows = workspace
                 .desk_cells
-                .nodes(rho_agents::HostId::default())
+                .nodes(rho_agents_client::HostId::default())
                 .iter()
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
@@ -3550,7 +3550,7 @@ async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
         .update(cx, |workspace, window, cx| {
             crate::tests::story::feed(
                 workspace,
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 desk.synced(),
                 window,
                 cx,
@@ -3633,8 +3633,8 @@ async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
 /// what the other host holds, and the second host draws no row of its own.
 #[gpui::test]
 fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut TestAppContext) {
-    let owner = rho_agents::HostId::default();
-    let other = rho_agents::HostId(1);
+    let owner = rho_agents_client::HostId::default();
+    let other = rho_agents_client::HostId(1);
     let unit = slack_unit("C1", None);
     let id = rho_agent_host_proto::desk::cells::Id::Slack(unit.clone());
 
@@ -3696,7 +3696,7 @@ fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut Test
 fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return(
     cx: &mut TestAppContext,
 ) {
-    let host = rho_agents::HostId::default();
+    let host = rho_agents_client::HostId::default();
     let mut desk = crate::tests::DeskFixture::new();
     let node = desk.thread_row(None, "C1", "500.0");
     let unit = slack_unit("C1", Some("500.0"));

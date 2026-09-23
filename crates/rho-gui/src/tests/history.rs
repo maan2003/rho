@@ -7,7 +7,7 @@
 //! that down at the newest entry reaches the dealer.
 
 use gpui::TestAppContext;
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 
 use super::{bind_test_keymaps, story, test_workspace};
 use crate::workspace::Workspace;

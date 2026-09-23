@@ -6,7 +6,7 @@
 
 use camino::Utf8PathBuf;
 use rho_agent_host_proto::AgentId;
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlackInventoryKind {

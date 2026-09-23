@@ -24,7 +24,7 @@
 //! happens or it does not, and the rows drawn again are counted, so this
 //! says the same thing on any machine.
 
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 use rho_hosts::connection::ConnEvent;
 use story::ready_with;
 

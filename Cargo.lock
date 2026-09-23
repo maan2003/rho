@@ -12270,7 +12270,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-agents"
+name = "rho-agents-client"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -12284,16 +12284,21 @@ dependencies = [
  "language",
  "multi_buffer",
  "prefix-id",
+ "redb",
  "rho-agent-host-proto",
+ "rho-db",
  "rho-hosts",
  "rho-window",
  "rustc-hash 2.1.3",
  "senax-encoder",
  "serde_json",
  "settings",
+ "tempfile",
  "text",
  "theme",
  "theme_settings",
+ "tokio",
+ "tracing",
  "tree-sitter",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
  "ui",
@@ -12491,6 +12496,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-desk-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "prefix-id",
+ "redb",
+ "rho-agent-host-proto",
+ "rho-db",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rho-desktop-media"
 version = "0.1.0"
 dependencies = [
@@ -12659,9 +12681,10 @@ dependencies = [
  "redb-derive",
  "release_channel",
  "rho-agent-host-proto",
- "rho-agents",
+ "rho-agents-client",
  "rho-browser",
  "rho-db",
+ "rho-desk-client",
  "rho-desktop-proto",
  "rho-fake-slack",
  "rho-files",
@@ -12673,7 +12696,6 @@ dependencies = [
  "rho-rtc",
  "rho-shell-view",
  "rho-slack",
- "rho-sync",
  "rho-terminal",
  "rho-transcript",
  "rho-window",
@@ -12872,11 +12894,12 @@ dependencies = [
  "redb",
  "reqwest 0.12.28",
  "rho-agent-host-proto",
+ "rho-agents-client",
  "rho-db",
+ "rho-desk-client",
  "rho-fake-model",
  "rho-gui",
  "rho-slack",
- "rho-sync",
  "rustls",
  "senax-encoder",
  "serde",
@@ -12985,25 +13008,6 @@ dependencies = [
  "tracing",
  "ui",
  "url",
-]
-
-[[package]]
-name = "rho-sync"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "prefix-id",
- "redb",
- "rho-agent-host-proto",
- "rho-agents",
- "rho-db",
- "rho-hosts",
- "senax-encoder",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
