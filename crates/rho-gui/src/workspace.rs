@@ -197,23 +197,6 @@ pub(crate) enum ContextId {
 
 pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
 
-/// Where a host's events go from here: onto the model thread's queue, which
-/// is the one place that decides what a frame means. `rho-hosts` knows only
-/// that somebody is listening.
-struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_agents_client::model::ToModel>);
-
-impl rho_hosts::HostSink for ModelSink {
-    fn send(&self, event: rho_hosts::HostEvent) -> Result<(), rho_hosts::SinkClosed> {
-        self.0
-            .unbounded_send(rho_agents_client::model::ToModel::Event(event))
-            .map_err(|_| rho_hosts::SinkClosed)
-    }
-
-    fn is_closed(&self) -> bool {
-        self.0.is_closed()
-    }
-}
-
 #[derive(Clone)]
 struct PendingTreeVerdict {
     event: crate::dashboard::DealerEvent,
@@ -414,7 +397,7 @@ pub struct Workspace {
     pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
-    model: futures_mpsc::UnboundedSender<rho_agents_client::model::ToModel>,
+    agents_client: rho_agents_client::model::AgentsClient,
     draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
@@ -586,6 +569,7 @@ pub struct Workspace {
     /// microphone is open: see [`crate::voice::Voice`].
     voice: crate::voice::Voice,
     _event_task: Task<()>,
+    _host_event_task: Task<()>,
     _keystroke_subscription: gpui::Subscription,
     _transient_keystroke_interceptor: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
@@ -711,11 +695,7 @@ impl Workspace {
     }
 
     fn note_followed(&self) {
-        let _ = self
-            .model
-            .unbounded_send(rho_agents_client::model::ToModel::Command(
-                rho_agents_client::model::ModelCommand::Follow(self.followed()),
-            ));
+        self.agents_client.follow(self.followed());
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
@@ -729,10 +709,7 @@ impl Workspace {
         if self.transcripts.is_open(&agent_id) {
             return false;
         }
-        // The disk copy may trail the rows just heard by a queued write;
-        // waiting for it is what makes the fold whole.
-        rho_agents_client::cache::flush();
-        let events = rho_agents_client::cache::read_events(agent_id);
+        let events = self.agents_client.read_rows(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
             return false;
         }
@@ -875,12 +852,16 @@ impl Workspace {
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let channels = rho_agents_client::model::spawn();
+        let (agents_client, changes) = rho_agents_client::model::AgentsClient::spawn();
         #[cfg(test)]
-        let channels = rho_agents_client::model::detached();
-        let rho_agents_client::model::ModelChannels { incoming, changes } = channels;
-        let model_commands = incoming.clone();
-        let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
+        let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
+        // Each stream of a host has its own reader: the agents stream goes
+        // to the agents client, the control stream comes here.
+        let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_hosts::HostEvent>();
+        let hosts = Hosts::new(rho_hosts::Sinks {
+            client: std::sync::Arc::new(host_events),
+            agents: agents_client.sink(),
+        });
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
@@ -915,6 +896,23 @@ impl Workspace {
                 }
                 let updated = this.update_in(cx, |this, window, cx| {
                     this.handle_model_events(batch, window, cx);
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        let host_event_task = cx.spawn(async move |this, cx| {
+            let mut events = host_events_rx;
+            while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                let updated = this.update_in(cx, |this, window, cx| {
+                    for rho_hosts::HostEvent { host, event } in batch {
+                        this.handle_event(host, event, window, cx);
+                    }
                 });
                 if updated.is_err() {
                     break;
@@ -1012,7 +1010,7 @@ impl Workspace {
             models: HashMap::new(),
             remote_projects: HashMap::new(),
             pending_syncs: HashMap::new(),
-            model: model_commands,
+            agents_client,
             draft_model,
             messages,
             draft_area: None,
@@ -1076,6 +1074,7 @@ impl Workspace {
             git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
             _event_task: event_task,
+            _host_event_task: host_event_task,
             _keystroke_subscription: keystroke_subscription,
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
@@ -1135,21 +1134,10 @@ impl Workspace {
     /// exists, not only once it answers.
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
         let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
-        // The model is told the host exists, and how to speak to it, before
-        // any frame from it can arrive.
-        let _ = self
-            .model
-            .unbounded_send(rho_agents_client::model::ToModel::Command(
-                rho_agents_client::model::ModelCommand::AttachHost {
-                    host,
-                    name: spec.name.clone(),
-                },
-            ));
-        let _ = self
-            .model
-            .unbounded_send(rho_agents_client::model::ToModel::Command(
-                rho_agents_client::model::ModelCommand::HostCommands { host, commands },
-            ));
+        // The agents client is told the host exists, and how to speak on
+        // its agents stream, before any frame from it can arrive.
+        self.agents_client.attach_host(host, spec.name.clone());
+        self.agents_client.host_commands(host, commands);
         self.registry.attach_host(host, spec.name);
         self.desk_cells.slack_owned_by(self.hosts.owner());
         self.save_hosts();
@@ -1199,11 +1187,7 @@ impl Workspace {
         self.hosts.detach(host);
         self.desk_cells.slack_owned_by(self.hosts.owner());
         self.save_hosts();
-        let _ = self
-            .model
-            .unbounded_send(rho_agents_client::model::ToModel::Command(
-                rho_agents_client::model::ModelCommand::DetachHost(host),
-            ));
+        self.agents_client.detach_host(host);
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.usage.forget_host(host);
@@ -2002,8 +1986,8 @@ impl Workspace {
             rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
             }
-            rho_agents_client::model::ModelMsg::Event(event) => {
-                self.handle_event(host, event, window, cx)
+            rho_agents_client::model::ModelMsg::Live { agent_id, live } => {
+                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
             }
         }
     }
@@ -2131,11 +2115,8 @@ impl Workspace {
                 auth,
                 machine_seed,
                 agent_counter,
-                journal_head: _,
             } => {
                 self.replay_hosts.remove(&host);
-                // The model asked for the journal this client lacks before
-                // this arrived: the cursor is its to keep.
                 let first_ready = self.apply_ready(host, machine_seed, agent_counter);
                 self.prune_contexts();
                 self.refresh_workdirs(host);
@@ -2202,21 +2183,11 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::Live { agent_id, live } => {
-                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
-            }
             ConnEvent::Many(events) => {
                 for event in events {
                     self.handle_event(host, event, window, cx);
                 }
             }
-            // Rows never reach the main thread as rows: the model folds
-            // them and says which agents moved.
-            ConnEvent::Log { .. } => {}
-            // Nothing here asks for a detail body: the transcript draws a
-            // call's line and never its output, so an answer can only be
-            // one nobody is waiting for.
-            ConnEvent::Detail { .. } => {}
             ConnEvent::ChatGptUsage {
                 used_percent,
                 reset_at_unix,
@@ -3974,8 +3945,9 @@ impl Workspace {
             .iter()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect();
-        self.hosts
-            .send(host, ClientMessage::AgentStreamFocus { agent_ids });
+        if let Some(connection) = self.hosts.connection(host) {
+            connection.focus_agents(agent_ids);
+        }
     }
 
     /// Lets go of everything held for an agent that left the active set:
@@ -5585,7 +5557,7 @@ impl Workspace {
         // and the mirror keeps them so a restart ranks the same way.
         for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
             if self.registry.set_agent_verdict(agent_id, verdict) {
-                rho_agents_client::cache::write_verdict(agent_id, verdict);
+                self.agents_client.set_verdict(agent_id, verdict);
             }
         }
         change

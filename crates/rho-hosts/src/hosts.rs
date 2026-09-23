@@ -13,7 +13,7 @@ use gpui::App;
 use rho_agent_host_proto::ClientMessage;
 
 use crate::connection::Connection;
-use crate::{AttachTarget, HostId, HostSink};
+use crate::{AttachTarget, HostId, Sinks};
 
 /// Where a host is in its connection lifecycle. Only `Online` accepts
 /// commands; the rest exist so the chrome can say which host is unwell
@@ -86,7 +86,7 @@ pub struct HostWorkdir {
 pub struct Hosts {
     hosts: Vec<Host>,
     next_id: u32,
-    events: std::sync::Arc<dyn HostSink>,
+    sinks: Sinks,
     /// Registered workdirs from every attached daemon. Fed by whoever reads
     /// the store; named and qualified here, because what a workdir is
     /// called depends on how many machines are attached.
@@ -96,13 +96,13 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    /// Nothing is attached yet. Every connection's frames go to the sink,
-    /// whatever the reader behind it makes of them.
-    pub fn new(events: std::sync::Arc<dyn HostSink>) -> Self {
+    /// Nothing is attached yet. Every connection's streams go to these
+    /// sinks, whatever the readers behind them make of them.
+    pub fn new(sinks: Sinks) -> Self {
         Self {
             hosts: Vec::new(),
             next_id: 0,
-            events,
+            sinks,
             workdirs: Vec::new(),
             quota_summaries: std::collections::HashMap::new(),
             quota_history: std::collections::HashMap::new(),
@@ -112,19 +112,19 @@ impl Hosts {
     /// Dials a daemon and starts feeding its events into the shared stream.
     /// Attaching is fire-and-forget: the host appears immediately as
     /// `Connecting` and reports its own progress through the stream.
-    /// The caller is handed the id and the connection's command channel, so
-    /// that whoever keeps a copy of a host's state can be told about it
-    /// before a frame arrives. This crate does not know who that is.
+    /// The caller is handed the id and the agents stream's command
+    /// channel, so that the agents client can be told about the host before
+    /// a frame arrives.
     pub fn attach(
         &mut self,
         name: String,
         target: AttachTarget,
         cx: &App,
-    ) -> (HostId, crate::connection::Commands) {
+    ) -> (HostId, crate::connection::AgentCommands) {
         let id = HostId(self.next_id);
         self.next_id += 1;
-        let connection = crate::connection::spawn(id, target.clone(), self.events.clone(), cx);
-        let commands = connection.commands();
+        let connection = crate::connection::spawn(id, target.clone(), self.sinks.clone(), cx);
+        let commands = connection.agent_commands();
         self.hosts.push(Host {
             id,
             name,

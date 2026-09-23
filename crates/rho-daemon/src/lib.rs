@@ -648,6 +648,7 @@ async fn run_iroh_listener(
                         let dedicated = matches!(
                             &first,
                             ClientMessage::ChannelOpen { .. }
+                                | ClientMessage::AgentsOpen
                                 | ClientMessage::RealtimeOpen { .. }
                                 | ClientMessage::GuiTelemetryUpload { .. }
                                 | ClientMessage::VisualizationGet { .. }
@@ -999,7 +1000,6 @@ impl Services {
             auth: self.auth_state(),
             machine_seed: self.machine_seed,
             agent_counter: read.last_agent_counter(),
-            journal_head: read.journal_head(),
         }
     }
 
@@ -1187,6 +1187,9 @@ where
     if let ClientMessage::ChannelOpen { workspace } = first {
         return serve_workspace_channel(services, reader, writer, workspace).await;
     }
+    if let ClientMessage::AgentsOpen = first {
+        return serve_agents(services, reader, writer).await;
+    }
     if let ClientMessage::RealtimeOpen { offer_sdp } = first {
         return realtime::serve(services, reader, writer, offer_sdp).await;
     }
@@ -1305,7 +1308,6 @@ where
     // Names this connection's wants in the pool's live set, so they leave
     // with it.
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    let mut log_follow: Option<tokio::task::JoinHandle<()>> = None;
     let mut desk_session = None;
 
     // Announce every agent created in the pool — by clients or by other
@@ -1452,7 +1454,6 @@ where
             &mut land_leases,
             land_holder.clone(),
             connection_id,
-            &mut log_follow,
             &mut desk_session,
             message,
         )
@@ -1491,13 +1492,6 @@ where
     if let Some(task) = desktop_task {
         task.abort();
     }
-    if let Some(log_follow) = log_follow {
-        log_follow.abort();
-    }
-    services
-        .pool
-        .set_live_wants(connection_id, HashSet::new())
-        .await;
     result
 }
 
@@ -1933,7 +1927,7 @@ fn spawn_claude_quota_recorder(
 /// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
 /// level. Harmless if the disposition changed meanwhile — it just sends the
 /// then-current level.
-/// How many journal entries travel in one [`ServerMessage::Log`] while a
+/// How many journal entries travel in one `ServerFrame::Log` while a
 /// client is catching up. A cold client's first copy is a whole history,
 /// so it goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
@@ -1942,6 +1936,95 @@ const LOG_PAGE: usize = 512;
 /// the feed: each new row as it is appended, on any agent, and every live
 /// delta any loop tells, in the order they happened.
 ///
+/// A connection's agents stream: whose journal this is and how far it
+/// runs, then the rows past wherever the client's copy stops, every append
+/// after them and the live tails, until the client goes. A stream of its
+/// own so that a catch-up of thousands of pages queues behind nothing and
+/// holds nothing up. A second `Follow` starts the follow again from its
+/// `since`.
+async fn serve_agents<R, W>(services: Arc<Services>, mut reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerFrame>();
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(frame) = outgoing_rx.recv().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let journal_head = services.db.read().journal_head();
+    let _ = outgoing_tx.send(ServerFrame::JournalHead {
+        machine_seed: services.machine_seed,
+        journal_head,
+    });
+    // Names this stream's focus in the pool's live set, so it leaves with
+    // the stream.
+    let stream_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut follow: Option<tokio::task::JoinHandle<()>> = None;
+    let result = loop {
+        let frame =
+            match rho_agent_host_proto::read_frame_optional::<_, ClientFrame>(&mut reader).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            };
+        match frame {
+            ClientFrame::Follow { since } => {
+                if let Some(previous) = follow.take() {
+                    previous.abort();
+                }
+                follow = Some(spawn_log_follow(
+                    Arc::clone(&services),
+                    outgoing_tx.clone(),
+                    since,
+                ));
+            }
+            ClientFrame::Focus { agent_ids } => {
+                if agent_ids.len() > 64 {
+                    break Err(anyhow::anyhow!("too many focused agents"));
+                }
+                // Focus is what this client is looking at, nothing more: it
+                // never loads an agent. The pool unions it across streams
+                // into the live set; a loaded agent in it tells its tail.
+                services
+                    .pool
+                    .set_live_wants(stream_id, agent_ids.into_iter().collect())
+                    .await;
+            }
+            ClientFrame::Detail {
+                agent_id,
+                pos,
+                more,
+            } => {
+                // One answer per position, each naming its own `pos`. A chunk
+                // asks once and is answered as many times as it asked for.
+                for pos in std::iter::once(pos).chain(more) {
+                    let body = agent_detail(&services.db, agent_id, pos);
+                    let _ = outgoing_tx.send(ServerFrame::Detail {
+                        agent_id,
+                        pos,
+                        body,
+                    });
+                }
+            }
+        }
+    };
+    if let Some(follow) = follow {
+        follow.abort();
+    }
+    services
+        .pool
+        .set_live_wants(stream_id, HashSet::new())
+        .await;
+    writer_task.abort();
+    result
+}
+
 /// Contiguous by seq is the whole contract for rows. The daemon remembers
 /// the last seq it sent; an append that is not the next one, or a lagged
 /// subscription, sends it back to the journal from there. Rows the
@@ -1954,7 +2037,7 @@ const LOG_PAGE: usize = 512;
 /// After a lag the same is done again, since deltas were lost.
 fn spawn_log_follow(
     services: Arc<Services>,
-    outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
+    outgoing_tx: mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
     since: rho_agent_host_proto::transcript::Seq,
 ) -> tokio::task::JoinHandle<()> {
     use rho_agent::transcript::Feed;
@@ -1985,7 +2068,7 @@ fn spawn_log_follow(
                         }
                     }
                     if outgoing_tx
-                        .send(ServerMessage::Live { agent_id, live })
+                        .send(rho_agent_host_proto::agents::ServerFrame::Live { agent_id, live })
                         .is_err()
                     {
                         return;
@@ -2004,7 +2087,7 @@ fn spawn_log_follow(
                     sent = appended.seq;
                     if let Some(entry) = appended.entry()
                         && outgoing_tx
-                            .send(ServerMessage::Log {
+                            .send(rho_agent_host_proto::agents::ServerFrame::Log {
                                 entries: vec![entry],
                             })
                             .is_err()
@@ -2029,7 +2112,7 @@ fn spawn_log_follow(
 /// when the connection is gone.
 async fn send_journal_from(
     db: &RhoDb,
-    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
+    outgoing_tx: &mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
     sent: &mut rho_agent_host_proto::transcript::Seq,
 ) -> bool {
     loop {
@@ -2049,7 +2132,11 @@ async fn send_journal_from(
                 })
             })
             .collect::<Vec<_>>();
-        if !entries.is_empty() && outgoing_tx.send(ServerMessage::Log { entries }).is_err() {
+        if !entries.is_empty()
+            && outgoing_tx
+                .send(rho_agent_host_proto::agents::ServerFrame::Log { entries })
+                .is_err()
+        {
             return false;
         }
         // Catching up must never starve the connection's own traffic.
@@ -2075,7 +2162,6 @@ async fn handle_message(
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     land_holder: Option<LandLeaseHolder>,
     connection_id: u64,
-    log_follow: &mut Option<tokio::task::JoinHandle<()>>,
     desk_session: &mut Option<DeskSession>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
@@ -2545,44 +2631,9 @@ async fn handle_message(
             }
             Ok(Refresh::None)
         }
-        ClientMessage::AgentStreamFocus { agent_ids } => {
-            anyhow::ensure!(agent_ids.len() <= 64, "too many focused agents");
-            // Focus is what this client is looking at, nothing more: it
-            // never loads an agent. The pool unions it across connections
-            // into the live set; a loaded agent in it tells its tail.
-            services
-                .pool
-                .set_live_wants(connection_id, agent_ids.into_iter().collect())
-                .await;
-            Ok(Refresh::None)
-        }
-        ClientMessage::Follow { since } => {
-            if let Some(previous) = log_follow.take() {
-                previous.abort();
-            }
-            *log_follow = Some(spawn_log_follow(
-                Arc::clone(services),
-                outgoing_tx.clone(),
-                since,
-            ));
-            Ok(Refresh::None)
-        }
-        ClientMessage::Detail {
-            agent_id,
-            pos,
-            more,
-        } => {
-            // One answer per position, each naming its own `pos`. A chunk
-            // asks once and is answered as many times as it asked for.
-            for pos in std::iter::once(pos).chain(more) {
-                let body = agent_detail(&services.db, agent_id, pos);
-                let _ = outgoing_tx.send(ServerMessage::Detail {
-                    agent_id,
-                    pos,
-                    body,
-                });
-            }
-            Ok(Refresh::None)
+        // Only valid as a stream's first frame (`serve_agents`).
+        ClientMessage::AgentsOpen => {
+            anyhow::bail!("AgentsOpen must be the first frame on a dedicated stream")
         }
         ClientMessage::SendUserMessage {
             agent_id,
@@ -4183,7 +4234,6 @@ mod tests {
         session: &mut Option<DeskSession>,
         message: ClientMessage,
     ) -> anyhow::Result<()> {
-        let mut log_follow = None;
         super::handle_message(
             services,
             None,
@@ -4191,7 +4241,6 @@ mod tests {
             &mut Vec::new(),
             None,
             connection,
-            &mut log_follow,
             session,
             message,
         )

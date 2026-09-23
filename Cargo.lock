@@ -12899,6 +12899,7 @@ dependencies = [
  "rho-desk-client",
  "rho-fake-model",
  "rho-gui",
+ "rho-rpc",
  "rho-slack",
  "rustls",
  "senax-encoder",

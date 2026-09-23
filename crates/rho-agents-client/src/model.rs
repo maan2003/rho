@@ -1,11 +1,13 @@
-//! The model: the fold, the journal cursor and the disk mirror, on their
-//! own thread.
+//! The model: the fold, the journal cursor and the disk cache, on their
+//! own thread, and [`AgentsClient`], the window's handle on it.
 //!
-//! The main thread draws. Everything between a daemon's frames and what is
-//! drawn happens here: rows are folded into agents, written to the agent
-//! mirror's tables, and announced to the main thread as changes. A
+//! The main thread draws. Everything between a host's agent frames and
+//! what is drawn happens here: rows are folded into agents, written to the
+//! cache's tables, and announced to the main thread as changes. A
 //! reconnect's catch-up is thousands of pages, and the main thread hears
-//! one message for the whole of it.
+//! one message for the whole of it. What comes here is each host's agents
+//! stream and nothing else; the desk and the host's other news go to the
+//! window on the control stream.
 //!
 //! The connection itself stays where it is, on the shared tokio runtime:
 //! the socket was never the cost, and the workspace-file, terminal, shell
@@ -15,9 +17,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
-use rho_agent_host_proto::{AgentId, ClientMessage};
-use rho_hosts::connection::{Commands, ConnEvent, HostEvent};
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::agents::ClientFrame;
+use rho_agent_host_proto::transcript::{AgentPos, Live, LogEntry, Seq, TranscriptEvent};
+use rho_hosts::{AgentCommands, AgentEvent, AgentFrame, AgentSink, SinkClosed};
 
 use crate::{HostId, Verdict};
 
@@ -39,10 +42,8 @@ pub enum ModelMsg {
         agent_id: AgentId,
         rows: Vec<(AgentPos, TranscriptEvent)>,
     },
-    /// A frame the model has no part in: desk deltas, auth, errors, and
-    /// the live tail of an agent the main thread follows. Handed on
-    /// unchanged.
-    Event(ConnEvent),
+    /// The live tail of an agent the main thread follows.
+    Live { agent_id: AgentId, live: Live },
 }
 
 pub struct ModelEvent {
@@ -61,7 +62,7 @@ pub enum ModelCommand {
     /// The way to send that daemon a command, once it has been dialled.
     HostCommands {
         host: HostId,
-        commands: Commands,
+        commands: AgentCommands,
     },
     DetachHost(HostId),
     /// The agents whose rows the main thread wants, replaced wholesale.
@@ -75,14 +76,14 @@ pub enum ModelCommand {
 // built, so nothing reads what the shell puts on this queue.
 #[cfg_attr(test, allow(dead_code))]
 pub enum ToModel {
-    Event(HostEvent),
+    Event(AgentEvent),
     Command(ModelCommand),
 }
 
 /// Where this client stands in one host's journal.
 struct HostModel {
     name: String,
-    commands: Option<Commands>,
+    commands: Option<AgentCommands>,
     /// A `Ready` answered before this client could speak back. The follow
     /// goes out the moment it can.
     follow_pending: bool,
@@ -150,7 +151,7 @@ impl Model {
                     slot.commands
                         .as_ref()
                         .expect("just set")
-                        .send(ClientMessage::Follow { since: slot.seq });
+                        .send(ClientFrame::Follow { since: slot.seq });
                 }
                 Vec::new()
             }
@@ -207,49 +208,35 @@ impl Model {
         }]
     }
 
-    /// One frame from a daemon. Rows are folded and written; everything
-    /// else is handed on.
-    pub fn ingest(&mut self, host: HostId, event: ConnEvent) -> Vec<ModelEvent> {
-        // A batch is its events, one at a time. Only a test feeds one
-        // (the connection hands frames over singly), and a test asserts
-        // per event, so the batch is opened here rather than at every
-        // caller.
-        if let ConnEvent::Many(events) = event {
-            return events
-                .into_iter()
-                .flat_map(|event| self.ingest(host, event))
-                .collect();
+    /// One frame from a host's agents stream. Rows are folded and
+    /// written; a live tail is handed on for the agents that are followed.
+    pub fn ingest(&mut self, host: HostId, frame: AgentFrame) -> Vec<ModelEvent> {
+        match frame {
+            AgentFrame::JournalHead {
+                machine_seed,
+                journal_head,
+            } => self.ready(host, machine_seed, journal_head),
+            AgentFrame::Log { entries } => self.told(host, entries),
+            // A live tell for an agent no screen is reading says nothing
+            // the digest does not: what a reader sees of it comes from the
+            // Turn rows the fold already folded. Dropping it here is what
+            // keeps a connect from costing the main thread one rebuild per
+            // agent.
+            AgentFrame::Live { agent_id, live } => {
+                if !self.followed.contains(&agent_id) {
+                    return Vec::new();
+                }
+                vec![ModelEvent {
+                    host,
+                    msg: ModelMsg::Live { agent_id, live },
+                }]
+            }
         }
-        if let ConnEvent::Log { entries } = event {
-            return self.told(host, entries);
-        }
-        // A live tell for an agent no screen is reading says nothing the
-        // digest does not: what a reader sees of it comes from the Turn
-        // rows the fold already folded. Dropping it here is what keeps a
-        // connect from costing the main thread one rebuild per agent.
-        if let ConnEvent::Live { agent_id, .. } = &event
-            && !self.followed.contains(agent_id)
-        {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        if let ConnEvent::Ready {
-            machine_seed,
-            journal_head,
-            ..
-        } = &event
-        {
-            out.extend(self.ready(host, *machine_seed, *journal_head));
-        }
-        out.push(ModelEvent {
-            host,
-            msg: ModelMsg::Event(event),
-        });
-        out
     }
 
-    /// A daemon that has answered: how far its journal runs, and whether
-    /// it is the database this copy counts in. Asks for the tail.
+    /// An agents stream that has opened: how far the host's journal runs,
+    /// and whether it is the database this copy counts in. Asks for the
+    /// tail.
     fn ready(&mut self, host: HostId, machine_seed: u64, journal_head: Seq) -> Vec<ModelEvent> {
         let slot = self
             .hosts
@@ -285,7 +272,7 @@ impl Model {
         );
         match &slot.commands {
             // Everything after the newest entry held.
-            Some(commands) => commands.send(ClientMessage::Follow { since: slot.seq }),
+            Some(commands) => commands.send(ClientFrame::Follow { since: slot.seq }),
             None => slot.follow_pending = true,
         }
         out
@@ -381,36 +368,91 @@ impl Model {
     }
 }
 
-/// The channels the workspace holds: frames in from every connection,
-/// commands in from the main thread, changes out to it.
-pub struct ModelChannels {
-    pub incoming: futures_mpsc::UnboundedSender<ToModel>,
-    pub changes: futures_mpsc::UnboundedReceiver<ModelEvent>,
+/// The window's handle on the agents: the model thread, what it is told,
+/// and the disk copy behind it.
+pub struct AgentsClient {
+    incoming: futures_mpsc::UnboundedSender<ToModel>,
 }
 
-/// Starts the model on its own thread. A std thread, not a background
-/// task: it must not take its turn behind the frames it feeds.
-pub fn spawn() -> ModelChannels {
-    let (incoming, incoming_rx) = futures_mpsc::unbounded();
-    let (changes_tx, changes) = futures_mpsc::unbounded();
-    std::thread::Builder::new()
-        .name("rho-model".to_owned())
-        .spawn(move || futures::executor::block_on(run(incoming_rx, changes_tx)))
-        .expect("spawn the model thread");
-    ModelChannels { incoming, changes }
+impl AgentsClient {
+    /// Starts the model on its own thread. A std thread, not a background
+    /// task: it must not take its turn behind the frames it feeds. The
+    /// receiver is what the window hears.
+    pub fn spawn() -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
+        let (incoming, incoming_rx) = futures_mpsc::unbounded();
+        let (changes_tx, changes) = futures_mpsc::unbounded();
+        std::thread::Builder::new()
+            .name("rho-model".to_owned())
+            .spawn(move || futures::executor::block_on(run(incoming_rx, changes_tx)))
+            .expect("spawn the model thread");
+        (Self { incoming }, changes)
+    }
+
+    /// A client with no model behind it, for a test that drives the model
+    /// inline on its own thread so that it can assert in the frame it fed.
+    /// A second thread would only wake the test scheduler from the wrong
+    /// place, which is exactly what it did while this choice was a
+    /// `cfg(test)` here: that cfg is the crate's own test build, not the
+    /// caller's. The caller decides, under its own `cfg(test)`.
+    pub fn detached() -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
+        let (incoming, _incoming_rx) = futures_mpsc::unbounded();
+        let (_changes_tx, changes) = futures_mpsc::unbounded();
+        (Self { incoming }, changes)
+    }
+
+    /// Where the hosts' agents streams go.
+    pub fn sink(&self) -> std::sync::Arc<dyn AgentSink> {
+        std::sync::Arc::new(ModelSink(self.incoming.clone()))
+    }
+
+    /// A host the window attached, named before it is dialled: the name is
+    /// how the disk copy knows it across restarts.
+    pub fn attach_host(&self, host: HostId, name: String) {
+        self.command(ModelCommand::AttachHost { host, name });
+    }
+
+    /// The way to speak on that host's agents stream.
+    pub fn host_commands(&self, host: HostId, commands: AgentCommands) {
+        self.command(ModelCommand::HostCommands { host, commands });
+    }
+
+    pub fn detach_host(&self, host: HostId) {
+        self.command(ModelCommand::DetachHost(host));
+    }
+
+    /// The agents whose rows the window wants, replaced wholesale.
+    pub fn follow(&self, agents: BTreeSet<AgentId>) {
+        self.command(ModelCommand::Follow(agents));
+    }
+
+    /// Every row the disk copy holds for an agent. The copy may trail the
+    /// rows just heard by a queued write; this waits for it, which is what
+    /// makes a fold of them whole.
+    pub fn read_rows(&self, agent_id: AgentId) -> Vec<(AgentPos, TranscriptEvent)> {
+        crate::cache::flush();
+        crate::cache::read_events(agent_id)
+    }
+
+    /// The user's verdict on an agent, kept with its digest.
+    pub fn set_verdict(&self, agent_id: AgentId, verdict: Verdict) {
+        crate::cache::write_verdict(agent_id, verdict);
+    }
+
+    fn command(&self, command: ModelCommand) {
+        // A model that has gone went with the window; nobody is left to
+        // tell.
+        let _ = self.incoming.unbounded_send(ToModel::Command(command));
+    }
 }
 
-/// Channels with no model behind them, for a test that drives the model
-/// inline on its own thread so that it can assert in the frame it fed. A
-/// second thread would only wake the test scheduler from the wrong place,
-/// which is exactly what it did while this choice was a `cfg(test)` here:
-/// that cfg is the crate's own test build, not the caller's, so every
-/// rho-gui test spawned a live model the moment the model left rho-gui.
-/// The caller decides, under its own `cfg(test)`.
-pub fn detached() -> ModelChannels {
-    let (incoming, _incoming_rx) = futures_mpsc::unbounded();
-    let (_changes_tx, changes) = futures_mpsc::unbounded();
-    ModelChannels { incoming, changes }
+struct ModelSink(futures_mpsc::UnboundedSender<ToModel>);
+
+impl AgentSink for ModelSink {
+    fn send(&self, event: AgentEvent) -> Result<(), SinkClosed> {
+        self.0
+            .unbounded_send(ToModel::Event(event))
+            .map_err(|_| SinkClosed)
+    }
 }
 
 async fn run(
@@ -420,7 +462,7 @@ async fn run(
     let mut model = Model::new();
     while let Some(item) = incoming.next().await {
         let out = match item {
-            ToModel::Event(HostEvent { host, event }) => model.ingest(host, event),
+            ToModel::Event(AgentEvent { host, frame }) => model.ingest(host, frame),
             ToModel::Command(command) => model.command(command),
         };
         for event in out {
@@ -433,8 +475,8 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_host_proto::AgentRole;
     use rho_agent_host_proto::transcript::{PresentationField, RuntimeKind, SpawnedBy};
-    use rho_agent_host_proto::{AgentRole, AuthState};
 
     use super::*;
 
@@ -480,21 +522,15 @@ mod tests {
         }
     }
 
-    fn ready(journal_head: u64) -> ConnEvent {
-        ConnEvent::Ready {
-            auth: AuthState {
-                namespaces: Vec::new(),
-                disabled_namespaces: Vec::new(),
-                active_namespace: None,
-            },
+    fn ready(journal_head: u64) -> AgentFrame {
+        AgentFrame::JournalHead {
             machine_seed: 7,
-            agent_counter: 0,
             journal_head: Seq(journal_head),
         }
     }
 
-    fn live(agent_id: AgentId) -> ConnEvent {
-        ConnEvent::Live {
+    fn live(agent_id: AgentId) -> AgentFrame {
+        AgentFrame::Live {
             agent_id,
             live: rho_agent_host_proto::transcript::Live::Idle,
         }
@@ -520,7 +556,7 @@ mod tests {
 
         let first = model.ingest(
             HOST,
-            ConnEvent::Log {
+            AgentFrame::Log {
                 entries: vec![created(1, agent(1)), created(2, agent(2))],
             },
         );
@@ -531,7 +567,7 @@ mod tests {
 
         let last = model.ingest(
             HOST,
-            ConnEvent::Log {
+            AgentFrame::Log {
                 entries: vec![presented(3, agent(1), 1, "a title")],
             },
         );
@@ -550,7 +586,7 @@ mod tests {
         // A row for an agent whose creation this client never heard.
         model.ingest(
             HOST,
-            ConnEvent::Log {
+            AgentFrame::Log {
                 entries: vec![presented(2, agent(9), 4, "a title")],
             },
         );
@@ -586,7 +622,7 @@ mod tests {
         model.command(ModelCommand::Follow(BTreeSet::from([agent(1)])));
         let out = model.ingest(
             HOST,
-            ConnEvent::Log {
+            AgentFrame::Log {
                 entries: vec![created(1, agent(1)), created(2, agent(2))],
             },
         );

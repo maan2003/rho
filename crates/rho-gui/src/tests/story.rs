@@ -8,6 +8,7 @@ use rho_agent_host_proto::transcript::{
     AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
 };
 use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
+use rho_hosts::AgentFrame;
 use rho_hosts::connection::ConnEvent;
 
 pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
@@ -201,13 +202,14 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         .collect()
 }
 
-/// `Ready` followed by the log rows these heads stand for.
-pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> ConnEvent {
+/// `Ready`, then an agents stream opening on the log rows these heads stand
+/// for.
+pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
     let entries = heads.into_iter().flat_map(head_entries).collect();
     // The head is the newest row handed out: a client that has heard every
     // row so far is caught up.
     let journal_head = NEXT_SEQ.with(|next| Seq(next.get() - 1));
-    ConnEvent::Many(vec![
+    Frame::Many(vec![
         ConnEvent::Ready {
             auth: rho_agent_host_proto::AuthState {
                 namespaces: Vec::new(),
@@ -216,14 +218,19 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> ConnEvent {
             },
             machine_seed: 0,
             agent_counter,
+        }
+        .into(),
+        AgentFrame::JournalHead {
+            machine_seed: 0,
             journal_head,
-        },
-        ConnEvent::Log { entries },
+        }
+        .into(),
+        AgentFrame::Log { entries }.into(),
     ])
 }
 
 /// A run of one agent's story, each row past the last one told.
-pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
+pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> AgentFrame {
     let entries = events
         .into_iter()
         .map(|event| {
@@ -231,7 +238,7 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
             entry(agent_id, pos, event.mirror())
         })
         .collect();
-    ConnEvent::Log { entries }
+    AgentFrame::Log { entries }
 }
 
 thread_local! {
@@ -241,24 +248,54 @@ thread_local! {
         RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
 }
 
-/// One frame, through the model and then into the workspace: the same
-/// `ingest` the model thread runs, called inline so a test stays in one
-/// thread and can assert in the frame it fed.
+/// What a host says, on either of its streams.
+pub enum Frame {
+    Control(ConnEvent),
+    Agents(AgentFrame),
+    Many(Vec<Frame>),
+}
+
+impl From<ConnEvent> for Frame {
+    fn from(event: ConnEvent) -> Self {
+        Self::Control(event)
+    }
+}
+
+impl From<AgentFrame> for Frame {
+    fn from(frame: AgentFrame) -> Self {
+        Self::Agents(frame)
+    }
+}
+
+/// One frame into the workspace: a control-stream event straight in, an
+/// agents-stream frame through the same `ingest` the model thread runs,
+/// called inline so a test stays in one thread and can assert in the frame
+/// it fed.
 pub fn feed(
     workspace: &mut crate::workspace::Workspace,
     host: rho_agents_client::HostId,
-    event: ConnEvent,
+    frame: impl Into<Frame>,
     window: &mut gpui::Window,
     cx: &mut gpui::Context<crate::workspace::Workspace>,
 ) {
-    let followed = workspace.followed();
-    let events = MODEL.with(|model| {
-        let (model, attached) = &mut *model.borrow_mut();
-        if attached.insert(host) {
-            model.attach(host, format!("host-{}", attached.len()));
+    match frame.into() {
+        Frame::Control(event) => workspace.handle_event(host, event, window, cx),
+        Frame::Agents(frame) => {
+            let followed = workspace.followed();
+            let events = MODEL.with(|model| {
+                let (model, attached) = &mut *model.borrow_mut();
+                if attached.insert(host) {
+                    model.attach(host, format!("host-{}", attached.len()));
+                }
+                model.command(rho_agents_client::model::ModelCommand::Follow(followed));
+                model.ingest(host, frame)
+            });
+            workspace.handle_model_events(events, window, cx);
         }
-        model.command(rho_agents_client::model::ModelCommand::Follow(followed));
-        model.ingest(host, event)
-    });
-    workspace.handle_model_events(events, window, cx);
+        Frame::Many(frames) => {
+            for frame in frames {
+                feed(workspace, host, frame, window, cx);
+            }
+        }
+    }
 }

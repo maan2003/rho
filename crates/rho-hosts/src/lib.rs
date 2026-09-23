@@ -1,7 +1,9 @@
 //! The machines this client can reach.
 //!
 //! One connection per attached daemon, the handshake that brings it up, and
-//! the events it produces, fanned out to whoever asked for that kind. The
+//! the streams it carries. Each stream has its own reader: the control
+//! stream's events go to the window, the agents stream's frames to the
+//! agents client (`Sinks`). The
 //! crate holds no agent state, no desk state and no window state: what it
 //! knows is which machines exist, whether they are answering, and how to say
 //! something to one of them. Everything that has an opinion about what was
@@ -12,7 +14,9 @@ pub mod hosts;
 pub mod realtime_client;
 pub mod saved;
 
-pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, spawn};
+pub use connection::{
+    AgentCommands, AgentEvent, AgentFrame, ChannelTask, ConnEvent, Connection, HostEvent, spawn,
+};
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
 
 /// Which attached daemon. Assigned in attachment order; agent ids are
@@ -119,6 +123,31 @@ pub trait HostSink: Send + Sync + 'static {
     fn is_closed(&self) -> bool;
 }
 
+/// A channel is a sink: its receiver is the reader.
+impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
+    fn send(&self, event: HostEvent) -> Result<(), SinkClosed> {
+        self.unbounded_send(event).map_err(|_| SinkClosed)
+    }
+
+    fn is_closed(&self) -> bool {
+        futures::channel::mpsc::UnboundedSender::is_closed(self)
+    }
+}
+
+/// Where a host's agents stream goes: the journal and the live tails.
+pub trait AgentSink: Send + Sync + 'static {
+    fn send(&self, event: AgentEvent) -> Result<(), SinkClosed>;
+}
+
+/// The readers of every attached host's streams.
+#[derive(Clone)]
+pub struct Sinks {
+    /// The control stream: the host's state, the desk, auth, usage.
+    pub client: std::sync::Arc<dyn HostSink>,
+    /// The agents stream.
+    pub agents: std::sync::Arc<dyn AgentSink>,
+}
+
 /// A sink with no reader: for a `Hosts` that stands in a test for the
 /// shape of an attachment, where nothing dials and nothing listens.
 #[cfg(feature = "test-support")]
@@ -132,6 +161,23 @@ impl HostSink for DroppedSink {
 
     fn is_closed(&self) -> bool {
         false
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl AgentSink for DroppedSink {
+    fn send(&self, _event: AgentEvent) -> Result<(), SinkClosed> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Sinks {
+    pub fn dropped() -> Self {
+        Self {
+            client: std::sync::Arc::new(DroppedSink),
+            agents: std::sync::Arc::new(DroppedSink),
+        }
     }
 }
 

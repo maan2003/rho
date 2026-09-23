@@ -11,6 +11,7 @@ use camino::Utf8PathBuf;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 #[cfg(not(target_family = "wasm"))]
+pub mod agents;
 pub mod client;
 pub mod desk;
 mod place;
@@ -35,9 +36,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/15";
+pub const IROH_ALPN: &[u8] = b"rho/ui/16";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP15";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP16";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +126,9 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
 pub enum ClientMessage {
     Ping,
     Subscribe,
+    /// The first frame of an agents stream ([`agents`]); every frame after
+    /// it, both ways, is that module's.
+    AgentsOpen,
     DeskSync {
         device: desk::cells::DeviceId,
         known: desk::cells::Version,
@@ -261,38 +265,6 @@ pub enum ClientMessage {
     /// [`realtime::RealtimeServerFrame`] values until either side closes it.
     RealtimeOpen {
         offer_sdp: String,
-    },
-    /// The agents whose live frames this connection wants: the ones on
-    /// screen. Everything durable arrives on the journal regardless, so
-    /// this only decides who streams partial text and tools in flight.
-    /// Replaces the set wholesale; an empty set asks for none.
-    AgentStreamFocus {
-        agent_ids: Vec<AgentId>,
-    },
-    /// Sent once after [`ServerMessage::Ready`]: the last journal entry
-    /// this client holds for this host (zero for none). The daemon answers
-    /// [`ServerMessage::Log`] pages for everything past it, then follows:
-    /// every later append on any agent is pushed on this connection.
-    Follow {
-        since: transcript::Seq,
-    },
-    /// The bodies of raw events: tool output, a response whole.
-    ///
-    /// One request per chunk of transcript rather than one per call: a
-    /// chunk's tool calls are one `Sent` each (measured at 1.01 results per
-    /// `Sent` over the whole corpus), so asking per call would ask the same
-    /// events over again. The daemon answers one [`ServerMessage::Detail`]
-    /// per position, each naming its own `pos`, so the answers need no order
-    /// and no correlation id.
-    ///
-    /// `pos` is the first position and `more` the rest. A daemon older than
-    /// `more` skips the field it does not know and answers `pos` alone; the
-    /// client draws the bodies it is given and leaves the rest folded.
-    Detail {
-        agent_id: AgentId,
-        pos: transcript::AgentPos,
-        #[senax(default)]
-        more: Vec<transcript::AgentPos>,
     },
     /// Spawns a daemon-owned terminal for an agent: sent as the *first*
     /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
@@ -554,9 +526,6 @@ pub enum ServerMessage {
         /// Last allocated agent-id counter; clients use it for uniform
         /// short-prefix rendering.
         agent_counter: u64,
-        /// How far this host's journal runs, so a client knows how far
-        /// behind it is before it follows.
-        journal_head: transcript::Seq,
     },
     Error {
         message: String,
@@ -570,29 +539,11 @@ pub enum ServerMessage {
         running: bool,
         detail: String,
     },
-    /// What a runtime has past the log, as it changes, for every agent
-    /// any client is looking at.
-    Live {
-        agent_id: AgentId,
-        live: transcript::Live,
-    },
     AgentCreated {
         agent_id: AgentId,
     },
     TurnCancelled {
         agent_id: AgentId,
-    },
-    /// A run of the host's journal in order: the answer to
-    /// [`ClientMessage::Follow`], paged, and afterwards every append as it
-    /// lands. Entries never repeat and never skip within one connection.
-    Log {
-        entries: Vec<transcript::LogEntry>,
-    },
-    /// The answer to [`ClientMessage::Detail`].
-    Detail {
-        agent_id: AgentId,
-        pos: transcript::AgentPos,
-        body: transcript::DetailBody,
     },
     LandLeaseQueued {
         repo: Utf8PathBuf,
@@ -1292,55 +1243,6 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(response, decoded);
-    }
-
-    #[test]
-    fn agent_stream_control_messages_round_trip() {
-        let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
-        for message in [
-            ClientMessage::AgentStreamFocus {
-                agent_ids: vec![agent_id],
-            },
-            ClientMessage::AgentStreamFocus { agent_ids: vec![] },
-            ClientMessage::Follow {
-                since: transcript::Seq(9),
-            },
-            ClientMessage::Detail {
-                agent_id,
-                pos: transcript::AgentPos(3),
-                more: vec![transcript::AgentPos(4), transcript::AgentPos(9)],
-            },
-        ] {
-            let bytes = senax_encoder::pack(&message).unwrap();
-            let mut slice: &[u8] = &bytes;
-            let decoded = senax_encoder::unpack(&mut slice).unwrap();
-            assert_eq!(message, decoded);
-        }
-
-        for live in [
-            transcript::Live::Requesting,
-            transcript::Live::Item {
-                index: 0,
-                item: transcript::Item::Text {
-                    text: "hel".to_owned(),
-                    phase: Some(transcript::TextPhase::FinalAnswer),
-                },
-            },
-            transcript::Live::Appended {
-                index: 0,
-                text: "lo".to_owned(),
-            },
-            transcript::Live::Waiting {
-                until: Some(crate::UnixMs(5)),
-            },
-            transcript::Live::Idle,
-        ] {
-            let message = ServerMessage::Live { agent_id, live };
-            let bytes = senax_encoder::pack(&message).unwrap();
-            let mut slice: &[u8] = &bytes;
-            let decoded = senax_encoder::unpack(&mut slice).unwrap();
-            assert_eq!(message, decoded);
-        }
     }
 
     #[test]

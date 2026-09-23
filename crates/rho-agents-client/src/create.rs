@@ -305,7 +305,7 @@ mod tests {
     /// refused in words, not resolved to whichever came last.
     #[test]
     fn a_base_and_a_workdir_on_two_hosts_is_refused() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(rho_hosts::Sinks::dropped());
         let refusal = parse_start(
             &hosts,
             StartFieldMode::NewOn,
@@ -328,7 +328,7 @@ mod tests {
     /// the revision it stands for.
     #[test]
     fn the_default_base_goes_out_as_its_revision() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(rho_hosts::Sinks::dropped());
         let (host, start) = parse_start(
             &hosts,
             StartFieldMode::NewOn,
@@ -355,7 +355,7 @@ mod tests {
     /// something went wrong.
     #[test]
     fn a_draft_with_no_workdir_says_what_to_type() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(rho_hosts::Sinks::dropped());
         let refusal = parse_start(
             &hosts,
             StartFieldMode::NewOn,

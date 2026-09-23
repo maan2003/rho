@@ -11,8 +11,11 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, Task};
 use gpui_tokio::Tokio;
+use rho_agent_host_proto::agents::{
+    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
+};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Live, LogEntry, Seq};
+use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
 use rho_agent_host_proto::{
     AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
     read_frame, write_frame,
@@ -64,7 +67,7 @@ fn shell_request_id(message: &ClientMessage) -> Option<u64> {
     }
 }
 
-use crate::{AttachTarget, HostId, HostSink};
+use crate::{AgentSink, AttachTarget, HostId, Sinks};
 
 /// Owns the transport pumps for a dedicated stream. Dropping it cancels both
 /// directions on every target.
@@ -78,12 +81,35 @@ pub struct HostEvent {
     pub event: ConnEvent,
 }
 
+/// What a host says on its agents stream.
+pub enum AgentFrame {
+    /// The stream is open: whose journal this is and how far it runs.
+    /// Every (re)opened stream starts with one, and a follow is asked for
+    /// only after it.
+    JournalHead {
+        machine_seed: u64,
+        journal_head: Seq,
+    },
+    /// A run of the host's journal, contiguous by seq: the answer to
+    /// `Follow` and everything appended since.
+    Log { entries: Vec<LogEntry> },
+    /// What changed in the runtime's tail past the log, for an agent some
+    /// client is looking at.
+    Live { agent_id: AgentId, live: Live },
+}
+
+/// An agents-stream frame tagged with the host it came from.
+pub struct AgentEvent {
+    pub host: HostId,
+    pub frame: AgentFrame,
+}
+
 /// One host's end of the shared event channel. Every IO task holds a clone
 /// and stamps its own [`HostId`] on whatever it sends.
 #[derive(Clone)]
 pub(crate) struct EventSink {
     host: HostId,
-    events: std::sync::Arc<dyn HostSink>,
+    events: std::sync::Arc<dyn crate::HostSink>,
 }
 
 impl EventSink {
@@ -117,35 +143,15 @@ pub enum ConnEvent {
         auth: rho_agent_host_proto::AuthState,
         machine_seed: u64,
         agent_counter: u64,
-        /// How far the daemon's journal runs, so a client holding more
-        /// knows its copy is of another database.
-        journal_head: Seq,
     },
     AuthState(rho_agent_host_proto::AuthState),
     AgentCreated {
         agent_id: AgentId,
     },
-    /// What changed in the runtime's tail past the log, for an agent
-    /// some client is looking at.
-    Live {
-        agent_id: AgentId,
-        live: Live,
-    },
     /// Several events in order, delivered as one. A daemon sends them
     /// separately; a test that stands for one stands for the batch.
     Many(Vec<ConnEvent>),
     TurnCancelled,
-    /// A run of the host's journal, contiguous by seq: the answer to
-    /// `Follow` and everything appended since.
-    Log {
-        entries: Vec<LogEntry>,
-    },
-    /// The bodies of one row, asked for by position.
-    Detail {
-        agent_id: AgentId,
-        pos: AgentPos,
-        body: DetailBody,
-    },
     ChatGptUsage {
         used_percent: f64,
         reset_at_unix: i64,
@@ -521,6 +527,10 @@ async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<Shel
 
 pub struct Connection {
     commands: futures_mpsc::UnboundedSender<ClientMessage>,
+    agent_commands: futures_mpsc::UnboundedSender<AgentsClientFrame>,
+    /// The focus last asked for, told again to every agents stream that
+    /// opens: it is state, not a request.
+    agent_focus: AgentFocus,
     /// `None` until the IO task connects; channels cannot open earlier.
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
@@ -530,6 +540,23 @@ pub struct Connection {
     #[cfg(feature = "test-support")]
     sent: Arc<Mutex<Vec<ClientMessage>>>,
 }
+
+/// What the agents client says down one host's agents stream. Clonable,
+/// `Send`, and carrying nothing of the GUI. Whatever is queued while the
+/// stream is down is dropped when it opens again: a follow was asked of
+/// the last stream's journal head, and the new stream says its own.
+#[derive(Clone)]
+pub struct AgentCommands {
+    commands: futures_mpsc::UnboundedSender<AgentsClientFrame>,
+}
+
+impl AgentCommands {
+    pub fn send(&self, frame: AgentsClientFrame) {
+        let _ = self.commands.unbounded_send(frame);
+    }
+}
+
+type AgentFocus = Arc<Mutex<Option<Vec<AgentId>>>>;
 
 /// A command channel to one daemon, on its own: clonable, `Send`, and
 /// carrying nothing of the GUI.
@@ -709,9 +736,14 @@ impl Connection {
         self.commands().send(message);
     }
 
-    /// The way to send this daemon a command without holding the
-    /// connection: the model thread asks for the journal itself.
-    pub(crate) fn commands(&self) -> Commands {
+    /// The agents stream's command channel, for the agents client.
+    pub(crate) fn agent_commands(&self) -> AgentCommands {
+        AgentCommands {
+            commands: self.agent_commands.clone(),
+        }
+    }
+
+    fn commands(&self) -> Commands {
         Commands {
             commands: self.commands.clone(),
             #[cfg(feature = "test-support")]
@@ -730,7 +762,10 @@ impl Connection {
     /// pane, replaced wholesale. Everything durable is on the story
     /// regardless, so this only decides who streams.
     pub fn focus_agents(&self, agent_ids: Vec<AgentId>) {
-        self.send(ClientMessage::AgentStreamFocus { agent_ids });
+        *self.agent_focus.lock().unwrap() = Some(agent_ids.clone());
+        let _ = self
+            .agent_commands
+            .unbounded_send(AgentsClientFrame::Focus { agent_ids });
     }
 
     /// Dials a dedicated terminal stream for an agent and runs the
@@ -862,15 +897,20 @@ pub fn supervises() -> bool {
 
 /// Attaches one daemon. Its events join `events`, tagged with `host`, so
 /// several daemons feed the workspace through a single ordered stream.
-pub fn spawn(
-    host: HostId,
-    target: AttachTarget,
-    events: std::sync::Arc<dyn HostSink>,
-    cx: &App,
-) -> Connection {
-    let event_tx = EventSink { host, events };
+pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Connection {
+    let event_tx = EventSink {
+        host,
+        events: sinks.client,
+    };
+    let agents = AgentStreamSink {
+        host,
+        agents: sinks.agents,
+    };
     let (command_tx, command_rx) = futures_mpsc::unbounded();
     let command_rx = Arc::new(tokio::sync::Mutex::new(command_rx));
+    let (agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
+    let agent_command_rx = Arc::new(tokio::sync::Mutex::new(agent_command_rx));
+    let agent_focus = AgentFocus::default();
     let pending_command = Arc::new(Mutex::new(None));
     let dialer = Arc::new(Mutex::new(None));
     let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
@@ -882,6 +922,11 @@ pub fn spawn(
             supervise(
                 target,
                 event_tx,
+                AgentStream {
+                    sink: agents,
+                    commands: agent_command_rx,
+                    focus: Arc::clone(&agent_focus),
+                },
                 command_rx,
                 pending_command,
                 dialer.clone(),
@@ -891,6 +936,8 @@ pub fn spawn(
     };
     Connection {
         commands: command_tx,
+        agent_commands: agent_command_tx,
+        agent_focus,
         dialer,
         shell_requests,
         _io_task: io_task,
@@ -902,6 +949,7 @@ pub fn spawn(
 async fn supervise(
     target: AttachTarget,
     events: EventSink,
+    agents: AgentStream,
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
@@ -917,6 +965,7 @@ async fn supervise(
         let result = run(
             target.clone(),
             &events,
+            &agents,
             Arc::clone(&commands),
             Arc::clone(&pending_command),
             &dialer,
@@ -1031,8 +1080,6 @@ fn replay_safe(message: &ClientMessage) -> bool {
         message,
         ClientMessage::Ping
             | ClientMessage::Subscribe
-            | ClientMessage::AgentStreamFocus { .. }
-            | ClientMessage::Follow { .. }
             | ClientMessage::GitTransportRegister
             | ClientMessage::ShellList { .. }
             | ClientMessage::ChatGptUsage
@@ -1075,6 +1122,7 @@ async fn abort_tasks<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
 async fn run(
     target: AttachTarget,
     events: &EventSink,
+    agents: &AgentStream,
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
@@ -1114,7 +1162,6 @@ async fn run(
         auth,
         machine_seed,
         agent_counter,
-        journal_head,
     } = message
     else {
         anyhow::bail!("rho daemon did not send ready message");
@@ -1124,7 +1171,6 @@ async fn run(
             auth,
             machine_seed,
             agent_counter,
-            journal_head,
         })
         .is_err()
     {
@@ -1134,6 +1180,13 @@ async fn run(
     if events.unbounded_send(ConnEvent::Recovered).is_err() {
         return Ok(());
     }
+
+    let agents_dialer = dialer
+        .lock()
+        .unwrap()
+        .clone()
+        .context("connected without a dialer")?;
+    let mut agents_task = tokio::spawn(run_agents_stream(agents_dialer, agents.clone()));
 
     write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
 
@@ -1193,6 +1246,13 @@ async fn run(
 
     let read_error = loop {
         let message: ServerMessage = tokio::select! {
+            result = &mut agents_task => {
+                break Some(match result {
+                    Ok(Ok(())) => anyhow::anyhow!("daemon agents stream closed"),
+                    Ok(Err(error)) => error.context("daemon agents stream"),
+                    Err(error) => anyhow::anyhow!("daemon agents stream task failed: {error}"),
+                });
+            }
             result = &mut writer_task => {
                 writer_finished = true;
                 break Some(match result {
@@ -1234,27 +1294,14 @@ async fn run(
                 auth,
                 machine_seed,
                 agent_counter,
-                journal_head,
             } => Some(ConnEvent::Ready {
                 auth,
                 machine_seed,
                 agent_counter,
-                journal_head,
             }),
             ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
             ServerMessage::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated { agent_id }),
-            ServerMessage::Live { agent_id, live } => Some(ConnEvent::Live { agent_id, live }),
             ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
-            ServerMessage::Log { entries } => Some(ConnEvent::Log { entries }),
-            ServerMessage::Detail {
-                agent_id,
-                pos,
-                body,
-            } => Some(ConnEvent::Detail {
-                agent_id,
-                pos,
-                body,
-            }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::ChatGptUsage {
                 used_percent,
@@ -1380,6 +1427,8 @@ async fn run(
         writer_task.abort();
         let _ = writer_task.await;
     }
+    agents_task.abort();
+    let _ = agents_task.await;
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
@@ -1394,6 +1443,78 @@ async fn run(
     match read_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// One host's agents stream, as the connection keeps it across reconnects:
+/// where its frames go, what the agents client queued for it, and the
+/// focus to tell each new one.
+#[derive(Clone)]
+struct AgentStream {
+    sink: AgentStreamSink,
+    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<AgentsClientFrame>>>,
+    focus: AgentFocus,
+}
+
+/// One host's end of the agents sink, stamping its [`HostId`].
+#[derive(Clone)]
+struct AgentStreamSink {
+    host: HostId,
+    agents: std::sync::Arc<dyn AgentSink>,
+}
+
+/// A connection's agents stream, for as long as the connection lasts: the
+/// daemon's frames to the agents sink, the agents client's frames to the
+/// daemon. Ends with an error when either direction does, which takes the
+/// connection down and brings both streams up again together.
+async fn run_agents_stream(dialer: ChannelDialer, stream: AgentStream) -> anyhow::Result<()> {
+    // Bulk priority: a catch-up must not hold up the control stream.
+    let mut socket = dial_bulk_stream(dialer).await?;
+    write_frame(&mut socket, &ClientMessage::AgentsOpen).await?;
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let mut commands = stream.commands.lock().await;
+    // A follow asked of the last stream's journal head; this stream says
+    // its own. The focus is state, so it is told again whole.
+    while commands.try_recv().is_ok() {}
+    let focus = stream.focus.lock().unwrap().clone();
+    if let Some(agent_ids) = focus {
+        write_frame(&mut writer, &AgentsClientFrame::Focus { agent_ids }).await?;
+    }
+    let sink = &stream.sink;
+    let read = async {
+        loop {
+            let frame = match read_frame::<_, AgentsServerFrame>(&mut reader).await? {
+                AgentsServerFrame::JournalHead {
+                    machine_seed,
+                    journal_head,
+                } => AgentFrame::JournalHead {
+                    machine_seed,
+                    journal_head,
+                },
+                AgentsServerFrame::Log { entries } => AgentFrame::Log { entries },
+                AgentsServerFrame::Live { agent_id, live } => AgentFrame::Live { agent_id, live },
+                // Nothing here asks for a detail body: the transcript draws
+                // a call's line and never its output.
+                AgentsServerFrame::Detail { .. } => continue,
+            };
+            let event = AgentEvent {
+                host: sink.host,
+                frame,
+            };
+            if sink.agents.send(event).is_err() {
+                return Ok(());
+            }
+        }
+    };
+    let write = async {
+        while let Some(frame) = commands.next().await {
+            write_frame(&mut writer, &frame).await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        result = read => result,
+        result = write => result,
     }
 }
 
@@ -1814,6 +1935,12 @@ mod shutdown_tests {
         }
     }
 
+    impl crate::AgentSink for Listening {
+        fn send(&self, _event: crate::AgentEvent) -> Result<(), crate::SinkClosed> {
+            Ok(())
+        }
+    }
+
     /// Quit has to end the supervisor while the runtime is still there.
     /// A supervisor waiting out its reconnect delay is inside
     /// `tokio::time::sleep`, and a sleep polled after its runtime starts
@@ -1836,10 +1963,20 @@ mod shutdown_tests {
             host: crate::HostId(0),
             events: Arc::new(Listening),
         };
+        let (_agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
+        let agents = AgentStream {
+            sink: AgentStreamSink {
+                host: crate::HostId(0),
+                agents: Arc::new(Listening),
+            },
+            commands: Arc::new(tokio::sync::Mutex::new(agent_command_rx)),
+            focus: AgentFocus::default(),
+        };
         let (_command_tx, command_rx) = futures_mpsc::unbounded();
         let supervisor = supervise(
             crate::AttachTarget::Unix(socket),
             events,
+            agents,
             Arc::new(tokio::sync::Mutex::new(command_rx)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),

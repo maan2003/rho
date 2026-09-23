@@ -25,7 +25,6 @@
 //! says the same thing on any machine.
 
 use rho_agents_client::HostId;
-use rho_hosts::connection::ConnEvent;
 use story::ready_with;
 
 use super::{DeskFixture, agent, next_frame, overview_workspace, story, ui_head};
@@ -116,7 +115,7 @@ fn cost_of_one_agent_s_news(
                 story::feed(
                     workspace,
                     HostId::default(),
-                    ConnEvent::Log {
+                    rho_hosts::AgentFrame::Log {
                         entries: story::head_entries(story::UiAgentHead {
                             generated_title: Some(format!("renamed {nth}")),
                             ..ui_head(agents[2])

@@ -1733,7 +1733,7 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::Log {
+                rho_hosts::AgentFrame::Log {
                     entries: story::head_entries(story::UiAgentHead {
                         generated_title: Some("renamed".to_owned()),
                         ..ui_head(agents[2])
@@ -2053,7 +2053,7 @@ fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::Log {
+                rho_hosts::AgentFrame::Log {
                     entries: story::head_entries(story::UiAgentHead {
                         generated_title: Some("renamed".to_owned()),
                         ..ui_head(agents[2])
@@ -7826,7 +7826,7 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
 
 /// The whole story of an agent that has finished a turn and asked for the
 /// user: the least a card needs to rank as waiting on a reply.
-fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
+fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_hosts::AgentFrame {
     use story::UiStoryEvent;
     story::story(
         agent_id,

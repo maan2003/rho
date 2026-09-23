@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
+use rho_agent_host_proto::agents::{
+    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
+};
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
 use rho_agent_host_proto::{
@@ -21,6 +24,8 @@ use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
+
+use crate::streams::{Incoming, Streams};
 
 const AGENTS: usize = 20;
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -174,9 +179,8 @@ async fn run_async(args: Args) -> Result<()> {
     children.0.push(daemon);
     let _children = children;
 
-    let mut client = connect(&socket).await?;
-    client.send(&ClientMessage::Subscribe).await?;
-    let initial_head = recv_ready(&mut client).await?;
+    let mut client = Streams::open(connect(&socket).await?, &socket).await?;
+    let initial_head = client.journal_head;
     ensure!(
         initial_head == Seq(0),
         "fresh isolated daemon journal was not empty"
@@ -190,7 +194,7 @@ async fn run_async(args: Args) -> Result<()> {
         args.seed
     );
     client
-        .send(&ClientMessage::Follow { since: Seq(0) })
+        .send_agents(&AgentsClientFrame::Follow { since: Seq(0) })
         .await?;
 
     let repo = Utf8PathBuf::try_from(workspace).context("workspace path is not UTF-8")?;
@@ -282,14 +286,14 @@ async fn run_async(args: Args) -> Result<()> {
                 )
             })??;
         match message {
-            ServerMessage::AgentCreated { agent_id } => {
+            Incoming::Control(ServerMessage::AgentCreated { agent_id }) => {
                 agents.insert(agent_id);
                 ensure!(
                     agents.len() <= agent_count,
                     "daemon created more than {agent_count} agents"
                 );
             }
-            ServerMessage::Log { entries } => {
+            Incoming::Agents(AgentsServerFrame::Log { entries }) => {
                 for entry in entries {
                     ensure!(
                         entry.seq > last_seq,
@@ -335,7 +339,7 @@ async fn run_async(args: Args) -> Result<()> {
                                 pending_details
                                     .insert((entry.agent_id, entry.pos), ExpectedDetail::Results);
                                 client
-                                    .send(&ClientMessage::Detail {
+                                    .send_agents(&AgentsClientFrame::Detail {
                                         agent_id: entry.agent_id,
                                         pos: entry.pos,
                                         // One position per request here; the
@@ -382,7 +386,7 @@ async fn run_async(args: Args) -> Result<()> {
                             pending_details
                                 .insert((entry.agent_id, entry.pos), ExpectedDetail::Response);
                             client
-                                .send(&ClientMessage::Detail {
+                                .send_agents(&AgentsClientFrame::Detail {
                                     agent_id: entry.agent_id,
                                     pos: entry.pos,
                                     // Exercise detail retrieval independently of the GUI,
@@ -425,11 +429,11 @@ async fn run_async(args: Args) -> Result<()> {
                     }
                 }
             }
-            ServerMessage::Detail {
+            Incoming::Agents(AgentsServerFrame::Detail {
                 agent_id,
                 pos,
                 body,
-            } => {
+            }) => {
                 let expected = pending_details
                     .remove(&(agent_id, pos))
                     .context("unexpected Detail response")?;
@@ -441,7 +445,9 @@ async fn run_async(args: Args) -> Result<()> {
                     _ => bail!("daemon Detail body did not match its journal event"),
                 }
             }
-            ServerMessage::Error { message } => bail!("daemon refused proof action: {message}"),
+            Incoming::Control(ServerMessage::Error { message }) => {
+                bail!("daemon refused proof action: {message}")
+            }
             _ => {}
         }
     }
@@ -453,9 +459,9 @@ async fn run_async(args: Args) -> Result<()> {
     );
     ensure!(!latencies.is_empty(), "no model replies completed");
 
-    let mut head_client = connect(&socket).await?;
-    head_client.send(&ClientMessage::Subscribe).await?;
-    let final_head = recv_ready(&mut head_client).await?;
+    let final_head = Streams::open(connect(&socket).await?, &socket)
+        .await?
+        .journal_head;
     // The wire projects only visible journal rows. Filtered rows advance
     // the durable head without a Log message, so gaps are valid and the final
     // visible row need not equal the durable head.
@@ -759,16 +765,6 @@ async fn connect(socket: &Path) -> Result<Client> {
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
             Err(error) => return Err(error).context("connect to rho-daemon"),
-        }
-    }
-}
-
-async fn recv_ready(client: &mut Client) -> Result<Seq> {
-    loop {
-        match client.recv().await? {
-            ServerMessage::Ready { journal_head, .. } => return Ok(journal_head),
-            ServerMessage::Error { message } => bail!("daemon readiness error: {message}"),
-            _ => {}
         }
     }
 }
