@@ -41,7 +41,7 @@ pub use cell::{INTERRUPTED, PythonExec};
 pub(crate) use cells::Cells;
 pub use notebook::{Export, PythonNotebook, PythonStreamProgress, ToolCx, detached, operation};
 use rho_core::{ToolOutput, ToolOutputStatus};
-pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, SourceWaker};
+pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 
 pub(crate) fn output(text: impl Into<String>, status: ToolOutputStatus) -> ToolOutput {
     ToolOutput {

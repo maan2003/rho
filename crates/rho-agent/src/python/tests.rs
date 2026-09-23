@@ -12,7 +12,7 @@ use rho_tool_shell::ShellTools;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::python::{Export, JobFacts, PythonExec, PythonNotebook, SourceWaker, ToolCx};
+use crate::python::{Export, JobFacts, PythonExec, PythonNotebook, ToolCx};
 
 pub(crate) fn shell() -> ShellTools {
     ShellTools::in_directory(
@@ -180,7 +180,7 @@ print(transcript[0].text, transcript[-1].call_ids[0])
 "#
             ),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
 
     // Refreshing the notebook while this execution sleeps must not alter its
@@ -201,7 +201,7 @@ print(transcript[0].text, transcript[-1].call_ids[0])
             "history-refresh",
             json!("assert len(transcript) == 1\nprint(transcript[0].role, transcript[0].text)"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &next, Signal::Ended).await;
     let output = next.first_output();
@@ -291,7 +291,7 @@ print(tool_call.name, result.text, update.text)
 "#
             ),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let output = cell.first_output();
@@ -309,7 +309,7 @@ async fn python_independent_commands_in_one_cell_run_concurrently() {
     // would deadlock, unlike merely placing sequential commands in one shell.
     let cell = tool.exec(call("parallel", json!(
         "command('while [ ! -f ready ]; do sleep 0.01; done; echo first')\ncommand('touch ready; echo second')"
-    )), SourceWaker::new(wake.clone()));
+    )), wake.clone());
     until(&wake, &cell, Signal::Ended).await;
     let output = cell.first_output();
     cell.acknowledge_output();
@@ -329,7 +329,7 @@ async fn a_finished_job_reports_its_exit_code_and_output_without_an_id() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("exit", json!("command('echo hi; exit 3')")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let job = &jobs(&cell)[0];
@@ -359,7 +359,7 @@ async fn a_running_job_is_announced_once_and_its_end_names_the_same_id() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("pieces", json!("command('echo a; sleep 0.5; echo b')")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while jobs(&cell)
@@ -394,7 +394,7 @@ async fn a_raising_cell_is_a_failed_cell() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("raise", json!("raise RuntimeError('boom')")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let facts = Arc::clone(&cell).facts();
@@ -418,7 +418,7 @@ async fn only_notify_marks_a_cell_notified() {
             "plain",
             json!("print('just output')\nawait asyncio.sleep(0.3)"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &plain, Signal::Output).await;
     assert!(Arc::clone(&plain).facts().notified_at.is_none());
@@ -428,7 +428,7 @@ async fn only_notify_marks_a_cell_notified() {
     until(&wake, &plain, Signal::Ended).await;
     let loud = tool.exec(
         call("loud", json!("notify('look')\nawait asyncio.sleep(0.3)")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &loud, Signal::Notified).await;
     assert!(loud.first_output().output.contains("look"));
@@ -440,18 +440,12 @@ async fn only_notify_marks_a_cell_notified() {
 async fn the_foreground_moves_only_when_a_cell_registers_work() {
     let tool = python(shell(), Vec::new());
     let wake = Arc::new(Notify::new());
-    let worker = tool.exec(
-        call("worker", json!("command('sleep 0.2')")),
-        SourceWaker::new(wake.clone()),
-    );
+    let worker = tool.exec(call("worker", json!("command('sleep 0.2')")), wake.clone());
     let worker_id = Arc::clone(&worker).facts().cell;
     until(&wake, &worker, Signal::Ended).await;
     worker.first_output();
     worker.acknowledge_output();
-    let looker = tool.exec(
-        call("looker", json!("print(1)")),
-        SourceWaker::new(wake.clone()),
-    );
+    let looker = tool.exec(call("looker", json!("print(1)")), wake.clone());
     until(&wake, &looker, Signal::Ended).await;
     let looking = Arc::clone(&looker).facts();
     assert!(looking.cell > worker_id);
@@ -459,10 +453,7 @@ async fn the_foreground_moves_only_when_a_cell_registers_work() {
         looking.foreground_cell, worker_id,
         "a cell that only looks does not move the foreground"
     );
-    let next = tool.exec(
-        call("next", json!("command('true')")),
-        SourceWaker::new(wake.clone()),
-    );
+    let next = tool.exec(call("next", json!("command('true')")), wake.clone());
     until(&wake, &next, Signal::Ended).await;
     let facts = Arc::clone(&next).facts();
     assert_eq!(facts.foreground_cell, facts.cell);
@@ -482,7 +473,7 @@ async fn python_commands_outlive_cells_and_retain_truncated_output() {
             "p1",
             json!("job = command(\"sleep 0.1; printf abcdefghijklmnopqrstuvwxyz\", max_tokens=1)"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let result = cell.first_output();
@@ -503,7 +494,7 @@ async fn python_commands_outlive_cells_and_retain_truncated_output() {
     cell.release();
     let read = tool.exec(
         call("p2", json!("job.more_output(max_tokens=100)")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &read, Signal::Ended).await;
     assert!(
@@ -521,7 +512,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     let wake = Arc::new(Notify::new());
     let monitor = tool.exec(call("monitor", json!(
         "progress = {'checks': 0}\nprint('monitor started')\nwhile not Path('results.json').exists():\n    progress['checks'] += 1\n    await asyncio.sleep(0.01)\nnotify(Path('results.json').read_text())"
-    )), SourceWaker::new(wake.clone()));
+    )), wake.clone());
     until(&wake, &monitor, Signal::Output).await;
     assert_eq!(monitor.first_output().output.trim(), "monitor started");
     monitor.acknowledge_output();
@@ -532,7 +523,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
             "inspect",
             json!("assert progress['checks'] > 0\nprint(progress)"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &inspect, Signal::Ended).await;
     let output = inspect.first_output();
@@ -541,10 +532,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     assert!(output.output.contains("checks"));
     assert!(!monitor.done());
 
-    let idle = tool.exec(
-        call("idle", json!("set_max_wait(300)")),
-        SourceWaker::new(wake.clone()),
-    );
+    let idle = tool.exec(call("idle", json!("set_max_wait(300)")), wake.clone());
     until(&wake, &idle, Signal::Ended).await;
     assert_eq!(
         Arc::clone(&idle)
@@ -562,7 +550,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
             "writer",
             json!("command(\"printf 'ready' > results.json\")"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &writer, Signal::Ended).await;
     let output = writer.first_output();
@@ -590,7 +578,7 @@ async fn python_immediate_stdin_and_checkin_controls() {
             "p1",
             json!("job = command('read line; echo $line')\nwrite_stdin(job, 'hello\\n')"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let result = cell.first_output();
@@ -602,10 +590,7 @@ async fn python_immediate_stdin_and_checkin_controls() {
         result.output
     );
     assert!(result.output.contains("hello"), "{}", result.output);
-    let control = tool.exec(
-        call("p2", json!("set_max_wait(seconds=300)")),
-        SourceWaker::new(wake.clone()),
-    );
+    let control = tool.exec(call("p2", json!("set_max_wait(seconds=300)")), wake.clone());
     until(&wake, &control, Signal::Ended).await;
     assert_eq!(
         Arc::clone(&control)
@@ -624,7 +609,7 @@ async fn python_asyncio_timeout_does_not_own_the_managed_command() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(call("timeout", json!(
         "job = command('sleep 0.1; echo completed')\ntry:\n    await asyncio.wait_for(job, 0.01)\nexcept TimeoutError:\n    pass\nelse:\n    raise AssertionError('expected timeout')\nassert (await job)['exit_code'] == 0"
-    )), SourceWaker::new(wake.clone()));
+    )), wake.clone());
     until(&wake, &cell, Signal::Ended).await;
     let output = cell.first_output();
     cell.acknowledge_output();
@@ -642,7 +627,7 @@ async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() 
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(call("echo", json!(
         "echo('unawaited output')\nresult = await echo('awaited output')\nassert isinstance(result, str)\nassert result == 'awaited output'"
-    )), SourceWaker::new(wake.clone()));
+    )), wake.clone());
     until(&wake, &cell, Signal::Ended).await;
     let output = cell.first_output();
     cell.acknowledge_output();
@@ -663,7 +648,7 @@ async fn python_registration_settles_startup_failure_and_preserves_exit_metadata
             "startup",
             json!("job = command('true', workdir='missing-directory')\nwrite_stdin(job, 'hello')"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &failed, Signal::Ended).await;
     assert!(
@@ -684,7 +669,7 @@ async fn python_registration_settles_startup_failure_and_preserves_exit_metadata
             "exit",
             json!("result = await command('exit 7')\nassert result['exit_code'] == 7"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &exit, Signal::Ended).await;
     let output = exit.first_output();
@@ -705,7 +690,7 @@ async fn python_registration_cancels_an_unawaited_command_and_blocked_stdin_toge
             "blocked",
             json!("job = command('sleep 60')\nwrite_stdin(job, 'x' * 262144)\nprint('registered')"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Output).await;
     assert!(cell.first_output().output.contains("registered"));
@@ -728,15 +713,12 @@ async fn old_execution_keeps_its_own_checkin_without_touching_new_execution() {
             "old",
             json!("notify('waiting')\nawait asyncio.sleep(0.2)\nset_max_wait(3600)\nsuppress_tool_wakeups()"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &old, Signal::Notified).await;
     old.first_output();
     old.acknowledge_output();
-    let new = tool.exec(
-        call("new", json!("set_max_wait(300)")),
-        SourceWaker::new(wake.clone()),
-    );
+    let new = tool.exec(call("new", json!("set_max_wait(300)")), wake.clone());
     until(&wake, &new, Signal::Ended).await;
     until(&wake, &old, Signal::Ended).await;
     let old_checkin = Arc::clone(&old).facts().checkin.unwrap();
@@ -777,7 +759,7 @@ async fn python_cancellation_owns_pending_host_calls() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("p1", json!("notify('starting'); await pending()")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Notified).await;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -794,10 +776,7 @@ async fn python_cancellation_owns_pending_host_calls() {
     assert!(cell.done());
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-    let second = tool.exec(
-        call("p2", json!("await pending()")),
-        SourceWaker::new(wake.clone()),
-    );
+    let second = tool.exec(call("p2", json!("await pending()")), wake.clone());
     tokio::time::timeout(Duration::from_secs(5), async {
         while count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -819,7 +798,7 @@ async fn python_session_id_recovers_a_handle_whose_python_name_was_lost() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("p1", json!("command('sleep 60')\nprint('started')")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Output).await;
     let announced = cell.first_output();
@@ -842,7 +821,7 @@ async fn python_session_id_recovers_a_handle_whose_python_name_was_lost() {
                 "job = Command.from_session_id({label})\njob.cancel()\nprint('recovered', isinstance(job.id, int))"
             )),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &second, Signal::Ended).await;
     let result = second.first_output();
@@ -866,7 +845,7 @@ async fn python_display_pages_on_from_the_automatic_report() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("p1", json!("job = command(\"printf alpha\")\nawait job")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let reported = cell.first_output();
@@ -876,10 +855,7 @@ async fn python_display_pages_on_from_the_automatic_report() {
     cell.release();
     // The report already showed everything, so a later read has nothing to
     // add rather than saying it a second time.
-    let read = tool.exec(
-        call("p2", json!("await job.more_output()")),
-        SourceWaker::new(wake.clone()),
-    );
+    let read = tool.exec(call("p2", json!("await job.more_output()")), wake.clone());
     until(&wake, &read, Signal::Ended).await;
     let page = read.first_output();
     assert!(!page.output.contains("alpha"), "{}", page.output);
@@ -898,7 +874,7 @@ async fn python_retained_pages_do_not_split_unicode_characters() {
                 "job = command(\"printf '☃☃'\")\nawait job\nawait job.more_output(max_tokens=1)\nawait job.more_output(max_tokens=1)"
             ),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let result = cell.first_output();
@@ -927,7 +903,7 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
         "set_max_wait(300)\ncommand('echo registered')\npending()\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
         marker.to_str().unwrap()
     );
-    let cell = tool.exec(call("sync", json!(source)), SourceWaker::new(wake.clone()));
+    let cell = tool.exec(call("sync", json!(source)), wake.clone());
     assert!(Arc::clone(&cell).facts().returned.is_none());
     // Don't let the Tokio executor run. Python's native callbacks must commit
     // registration and the check-in before the subsequent filesystem write.
@@ -966,10 +942,7 @@ async fn top_level_return_does_not_finish_detached_python_activity() {
         "async def monitor():\n    while not Path({:?}).exists():\n        await asyncio.sleep(0.01)\n    notify('detached finished')\nasyncio.create_task(monitor())",
         release.to_str().unwrap()
     );
-    let cell = tool.exec(
-        call("detached", json!(source)),
-        SourceWaker::new(wake.clone()),
-    );
+    let cell = tool.exec(call("detached", json!(source)), wake.clone());
     let exec = Arc::clone(&cell);
     tokio::time::timeout(Duration::from_secs(10), async {
         while exec.facts().returned.is_none() {
@@ -1001,16 +974,13 @@ async fn top_level_return_does_not_finish_detached_python_activity() {
 async fn a_silent_cell_says_nothing_when_an_older_cell_speaks_in_the_same_reply() {
     let tool = python(shell(), Vec::new());
     let wake = Arc::new(Notify::new());
-    let older = tool.exec(
-        call("older", json!("command('echo late')")),
-        SourceWaker::new(wake.clone()),
-    );
+    let older = tool.exec(call("older", json!("command('echo late')")), wake.clone());
     until(&wake, &older, Signal::Ended).await;
     // The older cell's finished job is unreported when the newer cell is
     // first answered, so "No output yet" would misdescribe the reply.
     let newer = tool.exec(
         call("newer", json!("await asyncio.sleep(0.2)")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     assert_eq!(newer.first_output().output.as_str(), "");
     newer.acknowledge_output();
@@ -1020,7 +990,7 @@ async fn a_silent_cell_says_nothing_when_an_older_cell_speaks_in_the_same_reply(
     // With nothing older left to say, silence is the whole reply.
     let newest = tool.exec(
         call("newest", json!("await asyncio.sleep(0.2)")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     assert_eq!(
         newest.first_output().output.as_str(),
@@ -1053,7 +1023,7 @@ async fn operation_output_does_not_change_exec_return_facts() {
     let wake = Arc::new(Notify::new());
     let cell = tool.exec(
         call("return-facts", json!("released()\npending()")),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     let exec = Arc::clone(&cell);
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1117,7 +1087,7 @@ print('unregistered callback rejected')
 "#
             ),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     let output = cell.first_output();
@@ -1140,10 +1110,7 @@ async fn python_announces_sources_once_in_registration_order_including_late_sour
         release.to_str().unwrap(),
         registered.to_str().unwrap()
     );
-    let cell = tool.exec(
-        call("source-order", json!(source)),
-        SourceWaker::new(wake.clone()),
-    );
+    let cell = tool.exec(call("source-order", json!(source)), wake.clone());
     let exec = Arc::clone(&cell);
     tokio::time::timeout(Duration::from_secs(10), async {
         while exec.facts().returned.is_none() {
@@ -1234,10 +1201,7 @@ async fn wait_controls_are_independent_and_reset_for_each_exec() {
         ("set_max_wait(seconds=3600)", Some((3600, true))),
         ("pass", None),
     ] {
-        let cell = tool.exec(
-            call("wait-controls", json!(source)),
-            SourceWaker::new(wake.clone()),
-        );
+        let cell = tool.exec(call("wait-controls", json!(source)), wake.clone());
         until(&wake, &cell, Signal::Ended).await;
         assert_eq!(
             Arc::clone(&cell)
@@ -1284,7 +1248,7 @@ await command("printf buffered-command")
 "#
             ),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     until(&wake, &cell, Signal::Ended).await;
     assert_eq!(
@@ -1308,10 +1272,7 @@ await command("printf buffered-command")
 async fn output_is_leased_until_its_owner_acknowledges_it() {
     let notebook = python(shell(), Vec::new());
     let wake = Arc::new(Notify::new());
-    let cell = notebook.exec(
-        call("lease", json!("print('retained')")),
-        SourceWaker::new(wake.clone()),
-    );
+    let cell = notebook.exec(call("lease", json!("print('retained')")), wake.clone());
     until(&wake, &cell, Signal::Ended).await;
     let first = cell.first_output();
     assert_eq!(first.output.as_str(), "retained\n");
@@ -1336,7 +1297,7 @@ async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
             "shutdown",
             json!("job = command('echo $$ > owned-pid; exec sleep 60')\npending()"),
         ),
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     let path = directory.path().join("owned-pid");
     let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1366,7 +1327,7 @@ async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
             "after-shutdown",
             json!("Path('wrong').write_text('must not run')"),
         ),
-        SourceWaker::new(wake),
+        wake,
     );
     assert!(
         rejected
@@ -1392,10 +1353,7 @@ async fn benchmark_awaited_command() {
         // Optional untimed Python setup supports same-binary profiling/A-B runs.
         if let Ok(source) = std::env::var("RHO_BENCH_SETUP") {
             let wake = Arc::new(Notify::new());
-            let cell = notebook.exec(
-                call("benchmark-setup", json!(source)),
-                SourceWaker::new(wake.clone()),
-            );
+            let cell = notebook.exec(call("benchmark-setup", json!(source)), wake.clone());
             until(&wake, &cell, Signal::Ended).await;
             let output = cell.first_output();
             cell.acknowledge_output();
@@ -1407,7 +1365,7 @@ async fn benchmark_awaited_command() {
             let wake = Arc::new(Notify::new());
             let call = call(&format!("bench-{n}"), json!("await command(\"true\")"));
             let start = std::time::Instant::now();
-            let cell = notebook.exec(call, SourceWaker::new(wake.clone()));
+            let cell = notebook.exec(call, wake.clone());
             until(&wake, &cell, Signal::Ended).await;
             let output = cell.first_output();
             cell.acknowledge_output();
@@ -1450,10 +1408,7 @@ async fn streaming_progress_settles_after_stop_without_agent_reconciliation() {
     let directory = tempfile::tempdir().unwrap();
     let notebook = python(shell_in(&directory), Vec::new());
     let wake = Arc::new(Notify::new());
-    let cell = notebook.start_stream(
-        ToolCallId::try_from("stream").unwrap(),
-        SourceWaker::new(wake.clone()),
-    );
+    let cell = notebook.start_stream(ToolCallId::try_from("stream").unwrap(), wake.clone());
     let setup = "gate = asyncio.Event()\n";
     let prefix = format!("{setup}await gate.wait()\n");
     cell.feed(
@@ -1477,10 +1432,7 @@ async fn streaming_progress_settles_after_stop_without_agent_reconciliation() {
     assert_eq!(cell.stream_progress().admitted, prefix.len());
     cell.stop_stream();
     cell.admit_stream_unit().unwrap();
-    let release = notebook.exec(
-        call("release", json!("gate.set()")),
-        SourceWaker::new(wake.clone()),
-    );
+    let release = notebook.exec(call("release", json!("gate.set()")), wake.clone());
     stream_until(&wake, &cell, |c| c.facts().returned.is_some()).await;
     let progress = cell.stream_progress();
     assert_eq!(progress.admitted, prefix.len());
@@ -1494,10 +1446,7 @@ async fn failed_stream_unit_stops_admission() {
     let directory = tempfile::tempdir().unwrap();
     let notebook = python(shell_in(&directory), Vec::new());
     let wake = Arc::new(Notify::new());
-    let cell = notebook.start_stream(
-        ToolCallId::try_from("stream").unwrap(),
-        SourceWaker::new(wake.clone()),
-    );
+    let cell = notebook.start_stream(ToolCallId::try_from("stream").unwrap(), wake.clone());
     let failed = "raise ValueError('failed unit')\n";
     cell.feed(
         format!("{failed}Path('wrong').write_text('suffix')\n"),
@@ -1523,10 +1472,7 @@ async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
         let directory = tempfile::tempdir().unwrap();
         let notebook = python(shell_in(&directory), Vec::new());
         let wake = Arc::new(Notify::new());
-        let cell = notebook.start_stream(
-            ToolCallId::try_from("stream").unwrap(),
-            SourceWaker::new(wake.clone()),
-        );
+        let cell = notebook.start_stream(ToolCallId::try_from("stream").unwrap(), wake.clone());
         cell.feed("await asyncio.Event().wait()\n".into(), false)
             .unwrap();
         stream_until(&wake, &cell, |c| c.stream_progress().ready.is_some()).await;

@@ -12,8 +12,8 @@ use pyo3::prelude::*;
 use pyo3::{IntoPyObjectExt, PyClass, PyClassInitializer};
 use rho_core::{ContextBlock, ExecCall, ExecId, UnixMs};
 use rho_tool_shell::{BoundedOutput, ShellTools};
+use tokio::sync::Notify;
 
-use crate::python::SourceWaker;
 use crate::python::cell::PythonExec;
 use crate::python::history::HistorySnapshot;
 use crate::python::runtime::{Build, Inbox, Input, Message};
@@ -70,7 +70,9 @@ pub(crate) struct ExecState {
     pub(crate) stream_stopped: bool,
     /// The response stopped mid-call; its first reply says so.
     pub(crate) interrupted: bool,
-    pub(crate) waker: SourceWaker,
+    /// Woken on any change; `notify_one` stores a permit, so a wake that
+    /// lands while the agent loop is busy is not lost.
+    pub(crate) wake: Arc<Notify>,
     pub(crate) output: BoundedOutput,
     /// Oldest unsent output.
     pub(crate) since: Option<UnixMs>,
@@ -109,7 +111,7 @@ impl ExecState {
         if notify {
             self.notified.get_or_insert_with(UnixMs::now);
         }
-        self.waker.wake();
+        self.wake.notify_one();
     }
     /// An error the cell ends in: output, and a failure the scheduler reads
     /// as such rather than as something the model asked to be told.
@@ -200,22 +202,22 @@ impl PythonNotebook {
         }
     }
 
-    pub fn exec(&self, call: ExecCall, waker: SourceWaker) -> Arc<PythonExec> {
-        self.start(call.id, Some(call.source), waker)
+    pub fn exec(&self, call: ExecCall, wake: Arc<Notify>) -> Arc<PythonExec> {
+        self.start(call.id, Some(call.source), wake)
     }
 
-    pub fn start_stream(&self, id: ExecId, waker: SourceWaker) -> Arc<PythonExec> {
-        self.start(id, None, waker)
+    pub fn start_stream(&self, id: ExecId, wake: Arc<Notify>) -> Arc<PythonExec> {
+        self.start(id, None, wake)
     }
 
-    fn start(&self, id: ExecId, source: Option<String>, waker: SourceWaker) -> Arc<PythonExec> {
+    fn start(&self, id: ExecId, source: Option<String>, wake: Arc<Notify>) -> Arc<PythonExec> {
         let tasks = self.shared.tasks.lock().unwrap();
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
             stream: PythonStreamProgress::default(),
             stream_stopped: false,
             interrupted: false,
-            waker,
+            wake,
             output: BoundedOutput::for_tokens(Some(10000)),
             since: None,
             notified: None,
@@ -289,7 +291,7 @@ impl Shared {
             state.finished = Some(UnixMs::now());
             state.returned = state.finished;
             state.cancelled.send_replace(true);
-            state.waker.wake();
+            state.wake.notify_one();
         }
     }
 }
@@ -452,7 +454,7 @@ where
         shared.foreground_cell.fetch_max(cell, Ordering::Relaxed);
         state.sources.push(Arc::clone(&source));
         state.pending += 1;
-        state.waker.wake();
+        state.wake.notify_one();
     }
     let work = work(Arc::clone(&link));
     tasks.running.spawn_on(
@@ -485,7 +487,7 @@ where
                     state.error = true;
                 }
                 state.pending -= 1;
-                state.waker.wake();
+                state.wake.notify_one();
             }
             deliver(result);
         },

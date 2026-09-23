@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent::python::{PythonNotebook, SourceWaker};
+use rho_agent::python::PythonNotebook;
 use rho_core::ExecCall;
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
@@ -30,7 +30,7 @@ fn main() {
         let cell = tool.exec(ExecCall {
             id: "view".try_into().unwrap(),
             source: "assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into(),
-        }, SourceWaker::new(wake.clone()));
+        }, wake.clone());
         tokio::time::timeout(Duration::from_secs(10), async {
             while !cell.quiescent() {
                 wake.notified().await;

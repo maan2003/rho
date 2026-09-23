@@ -246,7 +246,7 @@ mod tests {
     use rho_core::{AdvisorIntelligence, ExecCall, ToolOutputStatus};
 
     use super::*;
-    use crate::python::{PythonNotebook, SourceWaker};
+    use crate::python::PythonNotebook;
 
     /// A daemon that answers every call with the call itself.
     fn echo_daemon(calls: Arc<Mutex<Vec<String>>>) -> Daemon {
@@ -271,7 +271,7 @@ mod tests {
                 id: "agents".try_into().unwrap(),
                 source: source.into(),
             },
-            SourceWaker::new(wake.clone()),
+            wake.clone(),
         );
         let exec = Arc::clone(&cell);
         tokio::time::timeout(Duration::from_secs(10), async {

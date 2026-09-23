@@ -9,7 +9,7 @@ use rho_core::{ExecCall, ToolOutput, ToolOutputStatus};
 use tokio::sync::Notify;
 
 use crate::python::tests::{shell, shell_in};
-use crate::python::{Export, PythonExec, PythonNotebook, SourceWaker};
+use crate::python::{Export, PythonExec, PythonNotebook};
 
 fn notebook() -> PythonNotebook {
     PythonNotebook::new(shell(), Vec::new()).unwrap()
@@ -22,7 +22,7 @@ fn start(notebook: &PythonNotebook, source: &str) -> (Arc<PythonExec>, Arc<Notif
             id: "cell".try_into().unwrap(),
             source: source.into(),
         },
-        SourceWaker::new(wake.clone()),
+        wake.clone(),
     );
     (cell, wake)
 }
@@ -60,7 +60,7 @@ async fn run_ok(notebook: &PythonNotebook, source: &str) -> String {
 /// Stream `source` to a new cell, admitting each unit as it becomes ready.
 async fn stream(notebook: &PythonNotebook, source: &str) -> ToolOutput {
     let wake = Arc::new(Notify::new());
-    let cell = notebook.start_stream("stream".try_into().unwrap(), SourceWaker::new(wake.clone()));
+    let cell = notebook.start_stream("stream".try_into().unwrap(), wake.clone());
     let exec = Arc::clone(&cell);
     exec.feed(source.into(), true).unwrap();
     until(&wake, || {
@@ -197,10 +197,7 @@ assert repr(job) == f'<command {{job.id}}>'
 async fn input_backlog_crosses_multiple_drain_batches_without_refusing_a_cell() {
     let notebook = notebook();
     let wake = Arc::new(Notify::new());
-    let backlog = notebook.start_stream(
-        "backlog".try_into().unwrap(),
-        SourceWaker::new(wake.clone()),
-    );
+    let backlog = notebook.start_stream("backlog".try_into().unwrap(), wake.clone());
     for _ in 0..513 {
         backlog.stop_stream();
     }
@@ -214,10 +211,7 @@ async fn shutdown_bypasses_backlog_and_ends_waiting_cells() {
     let (cell, wake) = start(&notebook, "notify('waiting'); await asyncio.Event().wait()");
     let exec = Arc::clone(&cell);
     until(&wake, || exec.facts().notified_at.is_some()).await;
-    let backlog = notebook.start_stream(
-        "backlog".try_into().unwrap(),
-        SourceWaker::new(wake.clone()),
-    );
+    let backlog = notebook.start_stream("backlog".try_into().unwrap(), wake.clone());
     for _ in 0..513 {
         backlog.stop_stream();
     }
@@ -230,7 +224,7 @@ async fn shutdown_bypasses_backlog_and_ends_waiting_cells() {
 async fn streaming_requires_each_permit_and_stop_does_not_finish_the_suffix() {
     let notebook = notebook();
     let wake = Arc::new(Notify::new());
-    let cell = notebook.start_stream("stream".try_into().unwrap(), SourceWaker::new(wake.clone()));
+    let cell = notebook.start_stream("stream".try_into().unwrap(), wake.clone());
     let exec = Arc::clone(&cell);
     let first = "seen = ['first']\n";
     exec.feed(
@@ -273,7 +267,7 @@ async fn stream_loss_allows_admitted_await_to_settle_without_admitting_more() {
     )
     .await;
     let wake = Arc::new(Notify::new());
-    let cell = notebook.start_stream("stream".try_into().unwrap(), SourceWaker::new(wake.clone()));
+    let cell = notebook.start_stream("stream".try_into().unwrap(), wake.clone());
     let exec = Arc::clone(&cell);
     let first = "await gate.wait(); seen.append('settled')\n";
     exec.feed(format!("{first}seen.append('wrong')\n"), false)

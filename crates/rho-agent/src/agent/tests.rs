@@ -955,18 +955,6 @@ fn the_wake_records_the_room() {
 
 // -- tool plumbing ----------------------------------------------------------
 
-#[tokio::test]
-async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
-    let notify = Arc::new(Notify::new());
-    let waker = crate::python::SourceWaker::new(Arc::clone(&notify));
-
-    // The tool signals before anyone is listening.
-    waker.wake();
-
-    let woken = tokio::time::timeout(Duration::from_millis(50), notify.notified());
-    assert!(woken.await.is_ok(), "the permit survives until awaited");
-}
-
 fn python_tool(directory: &tempfile::TempDir) -> crate::python::PythonNotebook {
     crate::python::PythonNotebook::new(
         rho_tool_shell::ShellTools::in_directory(

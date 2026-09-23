@@ -161,14 +161,14 @@ impl Cell {
     fn started(&self) {
         if let Some(mut state) = self.state() {
             state.started = true;
-            state.waker.wake();
+            state.wake.notify_one();
         }
     }
 
     fn unit_ready(&self, end: usize) {
         if let Some(mut state) = self.state() {
             state.stream.ready = Some(end);
-            state.waker.wake();
+            state.wake.notify_one();
         }
     }
 
@@ -182,7 +182,7 @@ impl Cell {
                 state.stream_stopped = true;
             }
         }
-        state.waker.wake();
+        state.wake.notify_one();
         drop(state);
         if error.is_some() {
             self.exec.stop_stream();
@@ -197,7 +197,7 @@ impl Cell {
         if let Some(error) = &error {
             state.fail(error);
         }
-        state.waker.wake();
+        state.wake.notify_one();
     }
 
     /// Everything the cell started has ended; `error` is what failed after
@@ -213,7 +213,7 @@ impl Cell {
         if state.returned.is_none() {
             state.returned = state.finished;
         }
-        state.waker.wake();
+        state.wake.notify_one();
     }
 
     fn text(&self, text: &str, important: bool) {
@@ -225,14 +225,14 @@ impl Cell {
     fn max_wait(&self, seconds: u64) {
         if let Some(mut state) = self.state() {
             state.checkin.get_or_insert_default().after = std::time::Duration::from_secs(seconds);
-            state.waker.wake();
+            state.wake.notify_one();
         }
     }
 
     fn suppress_tool_wakeups(&self) {
         if let Some(mut state) = self.state() {
             state.checkin.get_or_insert_default().wake_on_tools = false;
-            state.waker.wake();
+            state.wake.notify_one();
         }
     }
 

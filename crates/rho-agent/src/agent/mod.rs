@@ -515,7 +515,7 @@ pub(crate) struct Agent {
     working: bool,
 
     /// Content-free signal that some tool changed. Tools hold a
-    /// [`SourceWaker`] over this; the core rescans rather than being told.
+    /// clone of this; the core rescans rather than being told.
     wake: Arc<Notify>,
 
     status: Arc<RwLock<AgentStatus>>,

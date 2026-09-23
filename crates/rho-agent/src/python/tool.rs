@@ -10,10 +10,7 @@
 //! answers at that moment in whatever shape it judges best.
 //! `DECISION-pull-based-sources`.
 
-use std::sync::Arc;
-
 use rho_core::UnixMs;
-use tokio::sync::Notify;
 
 /// What a cell's wait controls asked for: how long the model is left alone,
 /// and whether the notebook may wake it sooner.
@@ -83,28 +80,4 @@ pub struct JobEnd {
     /// a host operation that returned an error, whether or not the cell went
     /// on to catch it.
     pub failed: bool,
-}
-
-/// Tell the core that something changed.
-///
-/// Deliberately carries no payload: what changed is discovered by asking, at a
-/// moment the core picks. That is what lets several sources collapse into one
-/// request instead of each waking one.
-#[derive(Clone, Debug)]
-pub struct SourceWaker(Arc<Notify>);
-
-impl SourceWaker {
-    /// The core makes these for its tools; a test or an adapter may make its
-    /// own over any `Notify` it wants to watch.
-    pub fn new(notify: Arc<Notify>) -> Self {
-        Self(notify)
-    }
-
-    /// Signal new output, or an exit. Cheap, and safe to call as often as you
-    /// like — the core coalesces.
-    pub fn wake(&self) {
-        // `notify_one` stores a permit, so a wake that lands while the core is
-        // busy is not lost.
-        self.0.notify_one();
-    }
 }

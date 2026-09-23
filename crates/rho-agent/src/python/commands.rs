@@ -382,7 +382,7 @@ pub(crate) async fn run_command(
                 ProcessEvent::Failed(error) => return Err(error),
                 ProcessEvent::Closed => break,
             }
-            link.lock().unwrap().waker.wake();
+            link.lock().unwrap().wake.notify_one();
         }
         Ok(CommandExit {
             id: job.id,

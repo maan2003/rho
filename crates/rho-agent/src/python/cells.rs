@@ -11,7 +11,7 @@ use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
 use tokio::sync::Notify;
 
 use crate::boundary::SourceKind;
-use crate::python::{PythonExec, PythonNotebook, SourceWaker};
+use crate::python::{PythonExec, PythonNotebook};
 
 pub(crate) struct Cells {
     wake: Arc<Notify>,
@@ -56,7 +56,7 @@ impl Cells {
 
     /// Run `call` as the newest cell.
     pub(crate) fn exec(&mut self, notebook: &PythonNotebook, call: ExecCall, now: UnixMs) {
-        let exec = notebook.exec(call.clone(), self.waker());
+        let exec = notebook.exec(call.clone(), Arc::clone(&self.wake));
         self.hold(call, exec, now);
     }
 
@@ -67,13 +67,9 @@ impl Cells {
         call: ExecCall,
         now: UnixMs,
     ) -> Arc<PythonExec> {
-        let exec = notebook.start_stream(call.id.clone(), self.waker());
+        let exec = notebook.start_stream(call.id.clone(), Arc::clone(&self.wake));
         self.hold(call, Arc::clone(&exec), now);
         exec
-    }
-
-    fn waker(&self) -> SourceWaker {
-        SourceWaker::new(Arc::clone(&self.wake))
     }
 
     fn hold(&mut self, call: ExecCall, exec: Arc<PythonExec>, now: UnixMs) {
