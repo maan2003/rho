@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "devenv-activity",
   "devenv-activity-macros",
+  "devenv-cache-core",
   "devenv-core",
   "devenv-eval-cache",
   "devenv-nix-backend",
@@ -19,6 +20,7 @@ repository = "https://github.com/cachix/devenv/"
 arc-swap = "1.9.2"
 devenv-activity = { path = "devenv-activity" }
 devenv-activity-macros = { path = "devenv-activity-macros" }
+devenv-cache-core = { path = "devenv-cache-core" }
 devenv-core = { path = "devenv-core" }
 devenv-eval-cache = { path = "devenv-eval-cache" }
 devenv-nix-backend = { path = "devenv-nix-backend" }

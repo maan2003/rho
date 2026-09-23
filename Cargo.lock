@@ -3545,6 +3545,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "devenv-cache-core"
+version = "2.3.2"
+dependencies = [
+ "blake3",
+ "rusqlite",
+ "thiserror 2.0.19",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "devenv-core"
 version = "2.3.2"
 dependencies = [
@@ -3564,9 +3575,11 @@ name = "devenv-eval-cache"
 version = "2.3.2"
 dependencies = [
  "blake3",
+ "devenv-cache-core",
  "devenv-core",
  "rusqlite",
  "thiserror 2.0.19",
+ "tracing",
  "walkdir",
 ]
 

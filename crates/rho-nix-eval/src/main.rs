@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
-use devenv_eval_cache::{CacheKey, CachedShell, EnvCache, FlakeScheme, record_inputs};
+use devenv_eval_cache::{
+    CachingEvalService, Checkout, EvalCacheKey, FlakeScheme, any_input_modified_after,
+    ops_to_identities,
+};
 use devenv_nix_backend::{DevShellRequest, NIX_STACK_SIZE, NixRuntime};
 
 /// Changes whenever evaluation semantics change (evaluator, Nix fork patches).
@@ -62,6 +65,36 @@ fn main() -> Result<()> {
         .expect("evaluator thread panicked")
 }
 
+/// What rho keeps of an evaluated shell; cached as JSON.
+struct Shell {
+    drv_path: String,
+    env_store_path: String,
+    env_json: String,
+}
+
+impl Shell {
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "drv_path": self.drv_path,
+            "env_store_path": self.env_store_path,
+            "env_json": self.env_json,
+        })
+        .to_string()
+    }
+
+    fn from_json(json: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        let field = |name: &str| -> Result<String> {
+            Ok(value[name].as_str().context(format!("cached shell lacks {name}"))?.to_owned())
+        };
+        Ok(Self {
+            drv_path: field("drv_path")?,
+            env_store_path: field("env_store_path")?,
+            env_json: field("env_json")?,
+        })
+    }
+}
+
 fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let system = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
@@ -71,19 +104,30 @@ fn run(args: Args) -> Result<()> {
     } else {
         FlakeScheme::Path
     };
-    let key = CacheKey {
-        system: system.clone(),
-        shell: args.shell.clone(),
+    let lock = std::fs::read(args.flake_dir.join("flake.lock")).ok();
+    let key = EvalCacheKey::new(
+        &format!("devShells.{system}.{}", args.shell),
         scheme,
-        lock: std::fs::read(args.flake_dir.join("flake.lock")).ok(),
-        evaluator: EVALUATOR.into(),
-    };
+        &[EVALUATOR.as_bytes(), lock.as_deref().unwrap_or(b"\0no flake.lock")],
+    );
 
-    let mut cache = args.cache.as_deref().map(EnvCache::open).transpose()?;
+    // A broken cache must not stop evaluation.
+    let mut cache = args.cache.and_then(|path| {
+        CachingEvalService::open(path)
+            .inspect_err(|e| eprintln!("eval cache unavailable: {e}"))
+            .ok()
+    });
     if let Some(cache) = &cache {
-        if let Some(hit) = cache.lookup(&key, &args.flake_dir, &env)? {
-            report("hit", &hit, t0, None);
-            return Ok(());
+        let hit = Checkout::new(&args.flake_dir, scheme)
+            .map_err(anyhow::Error::from)
+            .and_then(|checkout| Ok(cache.get_cached(&key, &checkout, &env)?));
+        match hit {
+            Ok(Some(hit)) => {
+                report("hit", &Shell::from_json(&hit.json_output)?, t0, None);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("eval cache lookup failed, evaluating: {e}"),
         }
     }
     let lookup_done = t0.elapsed();
@@ -97,37 +141,43 @@ fn run(args: Args) -> Result<()> {
     let eval = nix
         .eval_dev_shell(&request)
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let shell = CachedShell {
+    let shell = Shell {
         drv_path: eval.shell.drv_path,
         env_store_path: eval.shell.env_store_path,
         env_json: eval.shell.env_json,
     };
     let eval_done = t0.elapsed();
 
-    match record_inputs(&eval.ops, &args.flake_dir, eval.started_at, &env) {
-        Ok(recorded) => {
-            if recorded.scheme != scheme {
-                bail!("flake was fetched as {:?}, expected {:?}", recorded.scheme, scheme);
-            }
-            for input in &recorded.inputs {
-                eprintln!("input {:?} {:?} {} = {}", input.id.root, input.id.kind, input.id.path, input.state);
-            }
-            if let Some(cache) = &mut cache {
-                cache.store(&key, &recorded.inputs, &shell)?;
-            }
-            report("miss", &shell, t0, Some((lookup_done, eval_done, recorded.inputs.len(), eval.ops.len())));
-        }
-        Err(e) => {
-            eprintln!("not caching: {e}");
-            report("uncacheable", &shell, t0, Some((lookup_done, eval_done, 0, eval.ops.len())));
+    let (fetched_as, identities) = ops_to_identities(&eval.ops, &args.flake_dir)?;
+    if fetched_as != scheme {
+        bail!("flake was fetched as {fetched_as:?}, expected {scheme:?}");
+    }
+    let checkout = Checkout::new(&args.flake_dir, scheme)?;
+    let inputs = match &cache {
+        Some(cache) => identities.to_inputs(&checkout, &mut cache.hashes(), &env)?,
+        None => identities.to_inputs(&checkout, &mut devenv_eval_cache::eval_inputs::Uncached, &env)?,
+    };
+    for input in &inputs {
+        eprintln!("input {input:?}");
+    }
+    let stats = Some((lookup_done, eval_done, inputs.len(), eval.ops.len()));
+    if let Some(changed) = any_input_modified_after(&inputs, &checkout, eval.started_at) {
+        eprintln!("not caching: {} changed during evaluation", changed.display());
+        report("uncacheable", &shell, t0, stats);
+        return Ok(());
+    }
+    if let Some(cache) = &mut cache {
+        if let Err(e) = cache.store(&key, &shell.to_json(), &inputs) {
+            eprintln!("failed to store eval result: {e}");
         }
     }
+    report("miss", &shell, t0, stats);
     Ok(())
 }
 
 fn report(
     outcome: &str,
-    shell: &CachedShell,
+    shell: &Shell,
     t0: Instant,
     eval: Option<(std::time::Duration, std::time::Duration, usize, usize)>,
 ) {
