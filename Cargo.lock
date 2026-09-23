@@ -3527,7 +3527,6 @@ dependencies = [
  "rusqlite",
  "thiserror 2.0.19",
  "tracing",
- "walkdir",
 ]
 
 [[package]]
@@ -3548,7 +3547,6 @@ dependencies = [
  "rusqlite",
  "thiserror 2.0.19",
  "tracing",
- "walkdir",
 ]
 
 [[package]]
@@ -12819,6 +12817,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-devshell-builder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "devenv-eval-cache",
+ "devenv-nix-backend",
+ "serde_json",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rho-fake-model"
 version = "0.1.0"
 dependencies = [
@@ -13129,17 +13138,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "rho-nix-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "devenv-eval-cache",
- "devenv-nix-backend",
- "serde_json",
- "tracing-subscriber",
 ]
 
 [[package]]

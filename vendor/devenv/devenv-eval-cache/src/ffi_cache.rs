@@ -1,14 +1,11 @@
-//! Cache keys and the mapping from evaluation effects to input identities.
+//! Cache keys and the mapping from evaluation effects to inputs.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
-use devenv_core::eval_op::EvalOp;
+use devenv_core::eval_op::{EvalOp, ObservedKind};
 
-use crate::eval_inputs::{
-    Anchor, Checkout, EnvInputDesc, FileHashes, FileInputDesc, FlakeScheme, Input, RevInputDesc,
-};
+use crate::eval_inputs::{FlakeScheme, Input, PathInput};
 
 /// Cache key for an evaluation operation.
 ///
@@ -43,158 +40,134 @@ impl EvalCacheKey {
     }
 }
 
-/// Distinct inputs observed during an evaluation, before their state is
-/// captured.
+/// The inputs of one evaluation, as Nix observed them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct EvalInputIdentities {
-    /// Path -> whether it was copied to the store (recursive observation wins).
-    pub paths: BTreeMap<(Anchor, PathBuf), bool>,
-    pub envs: BTreeSet<String>,
-    /// Whether the flake's own source-info metadata was forced.
+pub struct RecordedInputs {
+    pub paths: Vec<PathInput>,
+    /// Whether the flake's own source-info metadata was forced; its state is
+    /// captured separately, see [`crate::eval_inputs::RevInputDesc`].
     pub flake_rev: bool,
 }
 
-impl EvalInputIdentities {
-    fn insert_path(&mut self, anchor: Anchor, path: PathBuf, recursive: bool) {
-        self.paths
-            .entry((anchor, path))
-            .and_modify(|existing| *existing |= recursive)
-            .or_insert(recursive);
-    }
-
-    /// Capture the current state of every identity in `checkout`.
-    pub fn to_inputs(
-        &self,
-        checkout: &Checkout,
-        hashes: &mut dyn FileHashes,
-        env: &dyn Fn(&str) -> Option<String>,
-    ) -> io::Result<Vec<Input>> {
-        let mut inputs = Vec::with_capacity(self.paths.len() + self.envs.len() + 1);
-        for ((anchor, path), recursive) in &self.paths {
-            inputs.push(Input::File(FileInputDesc::new(
-                *anchor,
-                path.clone(),
-                *recursive,
-                checkout,
-                hashes,
-            )?));
-        }
-        for name in &self.envs {
-            inputs.push(Input::Env(EnvInputDesc::new(name.clone(), env)));
-        }
-        if self.flake_rev {
-            inputs.push(Input::FlakeRev(RevInputDesc::new(checkout)?));
-        }
-        Ok(inputs)
+impl RecordedInputs {
+    pub fn into_inputs(self) -> Vec<Input> {
+        self.paths.into_iter().map(Input::Path).collect()
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordError {
-    #[error("the evaluator never mounted the flake at {0}")]
+    #[error("the evaluator never mounted the flake source at {0}")]
     FlakeNotMounted(PathBuf),
+    #[error("the evaluator read local input {0}, which is outside the flake source at {1}")]
+    OutsideSource(String, PathBuf),
+    #[error("{0} changed while it was being evaluated")]
+    ChangedDuringEval(PathBuf),
 }
 
-/// Convert the effects of evaluating the flake at `flake_dir` into input
-/// identities, and report how the flake was fetched.
+/// Convert the effects of evaluating a flake whose source tree is at `root`
+/// into inputs, and report how the tree was fetched.
 ///
-/// Paths inside the flake (physically, or through the virtual store path Nix
-/// mounted it at) become [`Anchor::Flake`]-relative. Paths inside other
-/// mounted inputs are dropped: they are locked, and `flake.lock` is part of
-/// the cache key. The same holds for the rest of `/nix/store` (immutable) and
-/// Nix's built-in sources, which are not absolute paths.
-pub fn ops_to_identities(
-    ops: &[EvalOp],
-    flake_dir: &Path,
-) -> Result<(FlakeScheme, EvalInputIdentities), RecordError> {
-    let mounts = Mounts::new(ops, flake_dir)?;
-    let mut identities = EvalInputIdentities::default();
+/// Observations through the virtual store path Nix mounted the tree (or a
+/// local input inside it) at become `root`-relative. Observations of other
+/// mounted inputs never appear: Nix only records reads of local inputs, and
+/// everything else is locked by `flake.lock`, which is part of the cache key.
+pub fn record_inputs(ops: &[EvalOp], root: &Path) -> Result<(FlakeScheme, RecordedInputs), RecordError> {
+    let mounts = Mounts::new(ops, root)?;
+    let mut paths: BTreeMap<(ObservedKind, FlakeScheme, PathBuf), String> = BTreeMap::new();
+    let mut flake_rev = false;
 
     for op in ops {
-        let (source, recursive) = match op {
-            EvalOp::ReadFile { source }
-            | EvalOp::ReadDir { source }
-            | EvalOp::ReadFileType { source }
-            | EvalOp::HashFile { source, .. }
-            | EvalOp::PathExists { source }
-            | EvalOp::EvaluatedFile { source, .. } => (source, false),
-            EvalOp::CopiedSource { source, .. } | EvalOp::FilteredSource { source, .. } => {
-                (source, true)
+        match op {
+            EvalOp::MountedInput { .. } => {}
+            EvalOp::ForcedInputAttr { store_path, .. } => flake_rev |= mounts.is_root(store_path),
+            EvalOp::Observed { source, kind, value } => {
+                let Some((scheme, path)) = mounts.resolve(source)? else {
+                    continue;
+                };
+                let previous = paths.insert((*kind, scheme, path.clone()), value.clone());
+                if previous.is_some_and(|previous| previous != *value) {
+                    return Err(RecordError::ChangedDuringEval(root.join(path)));
+                }
             }
-            EvalOp::GetEnv { name } => {
-                identities.envs.insert(name.clone());
-                continue;
-            }
-            EvalOp::ForcedInputAttr { store_path, .. } => {
-                identities.flake_rev |= mounts.is_flake(store_path);
-                continue;
-            }
-            EvalOp::MountedInput { .. } => continue,
-        };
-        if let Some((anchor, path)) = mounts.resolve(source) {
-            identities.insert_path(anchor, path, recursive);
         }
     }
-    Ok((mounts.scheme, identities))
+    let paths = paths
+        .into_iter()
+        .map(|((kind, scheme, path), value)| PathInput { kind, scheme, path, value })
+        .collect();
+    Ok((mounts.scheme, RecordedInputs { paths, flake_rev }))
 }
 
-/// Virtual store mounts seen during evaluation, and which one is the flake.
+/// Virtual store mounts seen during evaluation, and which one is the flake's
+/// source tree.
 struct Mounts {
-    flake_dir: PathBuf,
+    root: PathBuf,
     scheme: FlakeScheme,
-    /// Mount point -> directory it mirrors, relative to the flake (`Some`) or
-    /// locked (`None`).
-    mounts: HashMap<PathBuf, Option<PathBuf>>,
+    mounts: HashMap<PathBuf, Mount>,
+}
+
+enum Mount {
+    /// A local tree at a `root`-relative directory.
+    Inside(FlakeScheme, PathBuf),
+    /// A local tree elsewhere, by URL.
+    Outside(String),
+    /// Locked.
+    Locked,
 }
 
 impl Mounts {
-    fn new(ops: &[EvalOp], flake_dir: &Path) -> Result<Self, RecordError> {
+    fn new(ops: &[EvalOp], root: &Path) -> Result<Self, RecordError> {
         let mut scheme = None;
         let mut mounts = HashMap::new();
         for op in ops {
             let EvalOp::MountedInput { store_path, url } = op else {
                 continue;
             };
-            let mapped = match local_url(url) {
-                Some((s, dir)) if dir == flake_dir => {
-                    scheme.get_or_insert(s);
-                    Some(PathBuf::new())
-                }
-                Some((_, dir)) => dir.strip_prefix(flake_dir).ok().map(Path::to_path_buf),
-                None => None,
+            let mount = match local_url(url) {
+                Some((s, dir)) => match dir.strip_prefix(root) {
+                    Ok(rel) => {
+                        if rel.as_os_str().is_empty() {
+                            scheme.get_or_insert(s);
+                        }
+                        Mount::Inside(s, rel.to_path_buf())
+                    }
+                    Err(_) => Mount::Outside(url.clone()),
+                },
+                None => Mount::Locked,
             };
-            mounts.insert(store_path.clone(), mapped);
+            mounts.insert(store_path.clone(), mount);
         }
         Ok(Self {
-            flake_dir: flake_dir.to_path_buf(),
-            scheme: scheme.ok_or_else(|| RecordError::FlakeNotMounted(flake_dir.to_path_buf()))?,
+            root: root.to_path_buf(),
+            scheme: scheme.ok_or_else(|| RecordError::FlakeNotMounted(root.to_path_buf()))?,
             mounts,
         })
     }
 
-    fn is_flake(&self, store_path: &Path) -> bool {
-        matches!(self.mounts.get(store_path), Some(Some(rel)) if rel.as_os_str().is_empty())
+    fn is_root(&self, store_path: &Path) -> bool {
+        matches!(self.mounts.get(store_path), Some(Mount::Inside(_, rel)) if rel.as_os_str().is_empty())
     }
 
-    fn resolve(&self, path: &Path) -> Option<(Anchor, PathBuf)> {
-        if let Ok(rest) = path.strip_prefix("/nix/store") {
-            let mut components = rest.components();
-            let mount = Path::new("/nix/store").join(components.next()?);
-            let base = self.mounts.get(&mount)?.as_ref()?;
-            return Some((Anchor::Flake, normalize(&base.join(components.as_path()))));
-        }
-        if !path.is_absolute() {
-            // Nix's built-in sources (`<nix/fetchurl.nix>`, `«nix-internal»/...`).
-            return None;
-        }
-        match path.strip_prefix(&self.flake_dir) {
-            Ok(rel) => Some((Anchor::Flake, normalize(rel))),
-            Err(_) => Some((Anchor::Absolute, path.to_path_buf())),
+    /// The scheme and `root`-relative path of an observed virtual store path.
+    fn resolve(&self, path: &Path) -> Result<Option<(FlakeScheme, PathBuf)>, RecordError> {
+        let Ok(rest) = path.strip_prefix("/nix/store") else {
+            return Ok(None);
+        };
+        let mut components = rest.components();
+        let Some(first) = components.next() else {
+            return Ok(None);
+        };
+        match self.mounts.get(&Path::new("/nix/store").join(first)) {
+            Some(Mount::Inside(scheme, base)) => Ok(Some((*scheme, normalize(&base.join(components.as_path()))))),
+            Some(Mount::Outside(url)) => Err(RecordError::OutsideSource(url.clone(), self.root.clone())),
+            Some(Mount::Locked) | None => Ok(None),
         }
     }
 }
 
-/// `git+file:///x?...` or `path:/x?...` -> scheme and directory.
+/// `git+file:///x?...` or `path:/x?...` -> scheme and directory of the
+/// fetched tree (the repository for git, even with `?dir=`).
 fn local_url(url: &str) -> Option<(FlakeScheme, PathBuf)> {
     let (scheme, rest) = if let Some(rest) = url.strip_prefix("git+file://") {
         (FlakeScheme::Git, rest)
@@ -219,59 +192,75 @@ fn normalize(rel: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    const FLAKE_MOUNT: &str = "/nix/store/00000000000000000000000000000000-source";
+    const ROOT_MOUNT: &str = "/nix/store/00000000000000000000000000000000-source";
     const NIXPKGS_MOUNT: &str = "/nix/store/11111111111111111111111111111111-source";
+    const SUB_MOUNT: &str = "/nix/store/22222222222222222222222222222222-source";
 
-    fn ops(flake: &Path) -> Vec<EvalOp> {
-        vec![
-            EvalOp::MountedInput {
-                store_path: FLAKE_MOUNT.into(),
-                url: format!("git+file://{}?dir=", flake.display()),
-            },
-            EvalOp::MountedInput {
-                store_path: NIXPKGS_MOUNT.into(),
-                url: "github:NixOS/nixpkgs/abc".into(),
-            },
-            EvalOp::EvaluatedFile { source: flake.join("flake.nix"), cached: false },
-            EvalOp::ReadFile { source: Path::new(FLAKE_MOUNT).join("nix/a.nix") },
-            EvalOp::CopiedSource {
-                source: Path::new(FLAKE_MOUNT).join("nix"),
-                target: "/nix/store/x-nix".into(),
-            },
-            EvalOp::ReadFile { source: Path::new(NIXPKGS_MOUNT).join("lib.nix") },
-            EvalOp::EvaluatedFile {
-                source: "«nix-internal»/derivation-internal.nix".into(),
-                cached: false,
-            },
-            EvalOp::PathExists { source: "/home/someone/.config/nixpkgs/config.nix".into() },
-            EvalOp::GetEnv { name: "HOME".into() },
-            EvalOp::ForcedInputAttr { store_path: NIXPKGS_MOUNT.into(), name: "rev".into() },
-        ]
+    fn mount(store_path: &str, url: String) -> EvalOp {
+        EvalOp::MountedInput { store_path: store_path.into(), url }
+    }
+
+    fn observed(source: &str, kind: ObservedKind, value: &str) -> EvalOp {
+        EvalOp::Observed { source: source.into(), kind, value: value.into() }
+    }
+
+    fn input(kind: ObservedKind, scheme: FlakeScheme, path: &str, value: &str) -> PathInput {
+        PathInput { kind, scheme, path: path.into(), value: value.into() }
     }
 
     #[test]
-    fn effects_become_flake_relative_identities() {
-        let flake = Path::new("/work/checkout");
-        let (scheme, ids) = ops_to_identities(&ops(flake), flake).unwrap();
+    fn observations_become_root_relative_inputs() {
+        let root = Path::new("/work/checkout");
+        let ops = vec![
+            mount(ROOT_MOUNT, format!("git+file://{}?dir=sub", root.display())),
+            mount(NIXPKGS_MOUNT, "github:NixOS/nixpkgs/abc".into()),
+            mount(SUB_MOUNT, format!("path:{}/sub/vendored?narHash=x", root.display())),
+            observed(&format!("{ROOT_MOUNT}/sub/flake.nix"), ObservedKind::File, "aa"),
+            observed(ROOT_MOUNT, ObservedKind::Dir, "bb"),
+            observed(&format!("{SUB_MOUNT}/a.nix"), ObservedKind::File, "cc"),
+            // Repeated identical observations collapse.
+            observed(&format!("{ROOT_MOUNT}/sub/flake.nix"), ObservedKind::File, "aa"),
+            EvalOp::ForcedInputAttr { store_path: NIXPKGS_MOUNT.into(), name: "rev".into() },
+        ];
+        let (scheme, recorded) = record_inputs(&ops, root).unwrap();
         assert_eq!(scheme, FlakeScheme::Git);
-        let paths: Vec<_> = ids.paths.into_iter().collect();
         assert_eq!(
-            paths,
+            recorded.paths,
             vec![
-                ((Anchor::Flake, "flake.nix".into()), false),
-                ((Anchor::Flake, "nix".into()), true),
-                ((Anchor::Flake, "nix/a.nix".into()), false),
-                ((Anchor::Absolute, "/home/someone/.config/nixpkgs/config.nix".into()), false),
+                input(ObservedKind::File, FlakeScheme::Git, "sub/flake.nix", "aa"),
+                input(ObservedKind::File, FlakeScheme::Path, "sub/vendored/a.nix", "cc"),
+                input(ObservedKind::Dir, FlakeScheme::Git, "", "bb"),
             ]
         );
-        assert_eq!(ids.envs.into_iter().collect::<Vec<_>>(), vec!["HOME".to_string()]);
         // Only the flake's own source-info is an input; other inputs' is locked.
-        assert!(!ids.flake_rev);
+        assert!(!recorded.flake_rev);
+    }
+
+    #[test]
+    fn conflicting_observations_are_not_recorded() {
+        let root = Path::new("/work/checkout");
+        let ops = vec![
+            mount(ROOT_MOUNT, format!("path:{}", root.display())),
+            observed(&format!("{ROOT_MOUNT}/a"), ObservedKind::File, "aa"),
+            observed(&format!("{ROOT_MOUNT}/a"), ObservedKind::File, "bb"),
+        ];
+        assert!(matches!(record_inputs(&ops, root), Err(RecordError::ChangedDuringEval(_))));
+    }
+
+    #[test]
+    fn local_inputs_outside_the_source_are_not_recorded() {
+        let root = Path::new("/work/checkout");
+        let ops = vec![
+            mount(ROOT_MOUNT, format!("path:{}", root.display())),
+            mount(SUB_MOUNT, "git+file:///elsewhere".into()),
+            observed(&format!("{SUB_MOUNT}/a"), ObservedKind::File, "aa"),
+        ];
+        assert!(matches!(record_inputs(&ops, root), Err(RecordError::OutsideSource(..))));
     }
 
     #[test]
     fn flake_must_be_mounted() {
-        let err = ops_to_identities(&[], Path::new("/work/checkout")).unwrap_err();
+        let err = record_inputs(&[], Path::new("/work/checkout")).unwrap_err();
         assert!(matches!(err, RecordError::FlakeNotMounted(_)));
     }
 

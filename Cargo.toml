@@ -33,7 +33,7 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-mirror",
-  "crates/rho-nix-eval",
+  "crates/rho-devshell-builder",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
   "crates/rho-profiling",

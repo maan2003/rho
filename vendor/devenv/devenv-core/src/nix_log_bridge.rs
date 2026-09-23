@@ -63,6 +63,7 @@ impl NixLogBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eval_op::ObservedKind;
     use std::sync::Mutex;
 
     /// Helper: create a mock observer that records ops in a shared Vec.
@@ -94,14 +95,15 @@ mod tests {
         let observer = MockObserver::new();
         bridge.add_observer(observer.clone());
 
-        bridge.process_eval_effect("evaluated-file", "/tmp/default.nix", Some("uncached"));
+        bridge.process_eval_effect("observed-file", "/tmp/default.nix", Some("ab"));
 
         assert_eq!(observer.collected_ops().len(), 1);
         assert_eq!(
             observer.collected_ops()[0],
-            EvalOp::EvaluatedFile {
+            EvalOp::Observed {
                 source: "/tmp/default.nix".into(),
-                cached: false,
+                kind: ObservedKind::File,
+                value: "ab".into(),
             }
         );
     }
@@ -114,7 +116,7 @@ mod tests {
         bridge.add_observer(obs1.clone());
         bridge.add_observer(obs2.clone());
 
-        bridge.process_eval_effect("evaluated-file", "/tmp/default.nix", Some("uncached"));
+        bridge.process_eval_effect("observed-file", "/tmp/default.nix", Some("ab"));
 
         assert_eq!(obs1.collected_ops().len(), 1);
         assert_eq!(obs2.collected_ops().len(), 1);
@@ -127,7 +129,7 @@ mod tests {
         bridge.add_observer(observer.clone());
         bridge.clear_observers();
 
-        bridge.process_eval_effect("evaluated-file", "/tmp/default.nix", Some("uncached"));
+        bridge.process_eval_effect("observed-file", "/tmp/default.nix", Some("ab"));
 
         assert_eq!(observer.collected_ops().len(), 0);
     }

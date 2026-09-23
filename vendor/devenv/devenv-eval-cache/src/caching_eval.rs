@@ -31,7 +31,7 @@ impl CachingEvalService {
         })
     }
 
-    /// File hashes backed by this cache, for capturing inputs to store.
+    /// File hashes backed by this cache.
     pub fn hashes(&self) -> StatCache<'_> {
         StatCache::new(self.db.conn())
     }
@@ -43,7 +43,6 @@ impl CachingEvalService {
         &self,
         key: &EvalCacheKey,
         checkout: &Checkout,
-        env: &dyn Fn(&str) -> Option<String>,
     ) -> CacheResult<Option<CachedEvalResult>> {
         let conn = self.db.conn();
         let evals = db::get_evals_by_key_hash(conn, &key.key_hash)?;
@@ -60,7 +59,7 @@ impl CachingEvalService {
             let valid = inputs.iter().all(|input| {
                 let now = current.entry(input.identity()).or_insert_with(|| {
                     input
-                        .recapture(checkout, &mut hashes, env)
+                        .recapture(checkout, &mut hashes)
                         .inspect_err(|e| trace!(error = %e, ?input, "error checking input"))
                         .ok()
                 });
@@ -144,27 +143,35 @@ impl CachingEvalService {
 mod tests {
     use super::*;
     use crate::eval_inputs::{FlakeScheme, Uncached};
-    use crate::ffi_cache::ops_to_identities;
-    use devenv_core::eval_op::EvalOp;
+    use crate::ffi_cache::record_inputs;
+    use devenv_core::eval_op::{EvalOp, ObservedKind};
     use std::path::Path;
     use tempfile::TempDir;
 
-    const FLAKE_MOUNT: &str = "/nix/store/00000000000000000000000000000000-source";
+    const ROOT_MOUNT: &str = "/nix/store/00000000000000000000000000000000-source";
 
-    fn ops(flake: &Path) -> Vec<EvalOp> {
-        vec![
-            EvalOp::MountedInput {
-                store_path: FLAKE_MOUNT.into(),
-                url: format!("path:{}?lastModified=1", flake.display()),
-            },
-            EvalOp::EvaluatedFile { source: flake.join("flake.nix"), cached: false },
-            EvalOp::ReadFile { source: Path::new(FLAKE_MOUNT).join("nix/a.nix") },
-            EvalOp::CopiedSource {
-                source: Path::new(FLAKE_MOUNT).join("src"),
-                target: "/nix/store/x-src".into(),
-            },
-            EvalOp::GetEnv { name: "RHO_TEST_VAR".into() },
-        ]
+    /// What Nix would report evaluating a flake that imports `nix/a.nix` and
+    /// copies `src`.
+    fn ops(root: &Path) -> Vec<EvalOp> {
+        let checkout = Checkout::new(root, FlakeScheme::Path).unwrap();
+        let mut ops = vec![EvalOp::MountedInput {
+            store_path: ROOT_MOUNT.into(),
+            url: format!("path:{}?lastModified=1", root.display()),
+        }];
+        for (path, kind) in [
+            ("flake.nix", ObservedKind::File),
+            ("nix/a.nix", ObservedKind::File),
+            ("src", ObservedKind::Dir),
+            ("src/main.rs", ObservedKind::Stat),
+            ("src/main.rs", ObservedKind::File),
+        ] {
+            ops.push(EvalOp::Observed {
+                source: Path::new(ROOT_MOUNT).join(path),
+                kind,
+                value: checkout.observe(FlakeScheme::Path, Path::new(path), kind, &mut Uncached).unwrap(),
+            });
+        }
+        ops
     }
 
     fn key() -> EvalCacheKey {
@@ -180,17 +187,12 @@ mod tests {
     }
 
     fn record(dir: &Path) -> Vec<Input> {
-        let (_, ids) = ops_to_identities(&ops(dir), dir).unwrap();
-        let checkout = Checkout::new(dir, FlakeScheme::Path).unwrap();
-        ids.to_inputs(&checkout, &mut Uncached, &|_| None).unwrap()
+        record_inputs(&ops(dir), dir).unwrap().1.into_inputs()
     }
 
     fn lookup(cache: &CachingEvalService, dir: &Path) -> Option<String> {
         let checkout = Checkout::new(dir, FlakeScheme::Path).unwrap();
-        cache
-            .get_cached(&key(), &checkout, &|_| None)
-            .unwrap()
-            .map(|hit| hit.json_output)
+        cache.get_cached(&key(), &checkout).unwrap().map(|hit| hit.json_output)
     }
 
     #[test]
@@ -210,13 +212,19 @@ mod tests {
         std::fs::write(two.join("nix/a.nix"), "1").unwrap();
         assert_eq!(lookup(&cache, &two).as_deref(), Some("one"));
 
-        // Nested edits in a copied tree invalidate.
+        // Files the evaluator never read do not matter.
+        std::fs::write(one.join("unread"), "x").unwrap();
+        assert_eq!(lookup(&cache, &one).as_deref(), Some("one"));
+
+        // Edits and new entries in a copied tree invalidate.
         std::fs::write(one.join("src/main.rs"), "fn main() { loop {} }").unwrap();
         assert_eq!(lookup(&cache, &one), None);
+        std::fs::write(two.join("src/lib.rs"), "").unwrap();
+        assert_eq!(lookup(&cache, &two), None);
 
         let other = EvalCacheKey::new("devShells.x86_64-linux.default", FlakeScheme::Path, &[b"{ }"]);
-        let checkout = Checkout::new(&two, FlakeScheme::Path).unwrap();
-        assert!(cache.get_cached(&other, &checkout, &|_| None).unwrap().is_none());
+        let checkout = Checkout::new(&one, FlakeScheme::Path).unwrap();
+        assert!(cache.get_cached(&other, &checkout).unwrap().is_none());
     }
 
     #[test]
@@ -234,19 +242,6 @@ mod tests {
             .query_row("SELECT count(*) FROM cached_eval", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 1);
-    }
-
-    #[test]
-    fn env_inputs_are_validated() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("one");
-        make_checkout(&dir, "1");
-        let mut cache = CachingEvalService::open(tmp.path().join("cache.sqlite")).unwrap();
-        cache.store(&key(), "unset", &record(&dir)).unwrap();
-        let checkout = Checkout::new(&dir, FlakeScheme::Path).unwrap();
-        let set = |name: &str| (name == "RHO_TEST_VAR").then(|| "x".to_string());
-        assert!(cache.get_cached(&key(), &checkout, &set).unwrap().is_none());
-        assert!(cache.get_cached(&key(), &checkout, &|_| None).unwrap().is_some());
     }
 
     #[test]

@@ -11,8 +11,5 @@ pub mod eval_inputs;
 pub mod ffi_cache;
 
 pub use caching_eval::{CachedEvalResult, CachingEvalService};
-pub use eval_inputs::{
-    Anchor, Checkout, EnvInputDesc, FileHashes, FileInputDesc, FlakeScheme, Input, RevInputDesc,
-    any_input_modified_after,
-};
-pub use ffi_cache::{EvalCacheKey, EvalInputIdentities, RecordError, ops_to_identities};
+pub use eval_inputs::{Checkout, FileHashes, FlakeScheme, Input, PathInput, RevInputDesc};
+pub use ffi_cache::{EvalCacheKey, RecordError, RecordedInputs, record_inputs};

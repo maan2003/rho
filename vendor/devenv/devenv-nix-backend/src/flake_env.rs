@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use devenv_core::eval_op::{EvalOp, OpObserver};
 use devenv_core::nix_log_bridge::NixLogBridge;
@@ -65,9 +64,6 @@ pub struct DevShellEval {
     pub shell: DevShell,
     /// Distinct effects, including input mounts, in no particular order.
     pub ops: Vec<EvalOp>,
-    /// Wall-clock time just before evaluation started. Inputs modified at
-    /// or after this instant may have changed while being read.
-    pub started_at: SystemTime,
 }
 
 /// Process-wide Nix state. Must be created and used on one thread with a
@@ -117,7 +113,6 @@ impl NixRuntime {
         let recorder = Arc::new(Recorder::default());
         let observer: Arc<dyn OpObserver> = recorder.clone();
         self.logger.bridge.add_observer(Arc::clone(&observer));
-        let started_at = SystemTime::now();
         let shell = self.eval_dev_shell_inner(request);
         self.logger.bridge.remove_observer(&observer);
         let ops = std::mem::take(&mut *recorder.ops.lock().unwrap())
@@ -126,7 +121,6 @@ impl NixRuntime {
         Ok(DevShellEval {
             shell: shell?,
             ops,
-            started_at,
         })
     }
 
@@ -135,10 +129,13 @@ impl NixRuntime {
             .flake_dir
             .to_str()
             .ok_or_else(|| miette!("flake directory is not UTF-8"))?;
-        let mut state = EvalStateBuilder::new(self.store.clone())
+        let builder = EvalStateBuilder::new(self.store.clone())
             .to_miette()?
             .flakes(&self.flake_settings)
             .to_miette()?
+            .skip_load_config();
+        configure_eval_settings(&builder)?;
+        let mut state = builder
             .build()
             .to_miette()
             .wrap_err("Failed to build eval state")?;
@@ -224,5 +221,39 @@ struct Recorder {
 impl OpObserver for Recorder {
     fn record(&self, op: EvalOp) {
         self.ops.lock().unwrap().insert(op);
+    }
+}
+
+/// Load nix.conf into `builder`, then force the settings evaluation caching
+/// depends on: pure evaluation, so the shell depends only on its flake as with
+/// `nix develop`, and read recording, so every read of the flake's sources is
+/// reported with what it observed.
+fn configure_eval_settings(builder: &EvalStateBuilder) -> Result<()> {
+    use nix_bindings_bindgen_raw as raw;
+    use nix_bindings_util::check_call;
+    use nix_bindings_util::context::Context;
+
+    let mut context = Context::new();
+    // SAFETY: the builder outlives the settings view, which is freed before
+    // returning.
+    unsafe {
+        check_call!(raw::eval_state_builder_load(&mut context, builder.raw_ptr())).to_miette()?;
+        let view = check_call!(raw::eval_state_builder_eval_settings_as_abstract_settings(
+            &mut context,
+            builder.raw_ptr()
+        ))
+        .to_miette()?;
+        let mut result = Ok(());
+        for (key, value) in [(c"pure-eval", c"true"), (c"record-input-reads", c"true")] {
+            result = check_call!(raw::abstract_settings_set(&mut context, view, key.as_ptr(), value.as_ptr()))
+                .map(drop)
+                .to_miette()
+                .wrap_err_with(|| format!("Failed to set {key:?}"));
+            if result.is_err() {
+                break;
+            }
+        }
+        raw::abstract_settings_free(view);
+        result
     }
 }

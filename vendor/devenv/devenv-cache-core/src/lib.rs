@@ -15,7 +15,4 @@ pub mod file;
 // Re-export common types for convenience
 pub use db::Database;
 pub use error::{CacheError, CacheResult};
-pub use file::{
-    compute_directory_content_hash, compute_directory_content_hash_with, compute_file_hash, compute_source_file_hash,
-    compute_string_hash,
-};
+pub use file::{compute_file_hash, compute_string_hash};

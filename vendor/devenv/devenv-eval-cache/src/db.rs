@@ -1,8 +1,7 @@
 //! Database schema and queries for the eval cache.
 
-use crate::eval_inputs::{
-    Anchor, EnvInputDesc, FileHashes, FileInputDesc, Input, RevInputDesc,
-};
+use crate::eval_inputs::{FileHashes, FlakeScheme, Input, PathInput, RevInputDesc};
+use devenv_core::ObservedKind;
 use devenv_cache_core::{CacheResult, compute_file_hash};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use std::ffi::OsStr;
@@ -31,25 +30,16 @@ CREATE TABLE cached_eval
 
 CREATE INDEX idx_cached_eval_key ON cached_eval(key_hash, updated_at);
 
--- File inputs of a cached eval. Paths are relative to the flake for anchor
--- 'flake', absolute for 'abs'. A NULL content hash means the path was absent.
-CREATE TABLE eval_file_input
+-- What the evaluator observed reading the flake's source tree; see
+-- `PathInput`. Paths are relative to the source root.
+CREATE TABLE eval_path_input
 (
   cached_eval_id  INTEGER NOT NULL REFERENCES cached_eval(id) ON DELETE CASCADE,
-  anchor          TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  scheme          TEXT NOT NULL,
   path            BLOB NOT NULL,
-  recursive       BOOLEAN NOT NULL,
-  is_directory    BOOLEAN NOT NULL,
-  content_hash    CHAR(64),
-  PRIMARY KEY (cached_eval_id, anchor, path)
-) WITHOUT ROWID;
-
-CREATE TABLE eval_env_input
-(
-  cached_eval_id  INTEGER NOT NULL REFERENCES cached_eval(id) ON DELETE CASCADE,
-  name            TEXT NOT NULL,
-  content_hash    CHAR(64),
-  PRIMARY KEY (cached_eval_id, name)
+  value           TEXT NOT NULL,
+  PRIMARY KEY (cached_eval_id, kind, scheme, path)
 ) WITHOUT ROWID;
 
 -- Content hashes of files on disk, valid while their stat is unchanged. This
@@ -105,42 +95,25 @@ pub fn get_evals_by_key_hash(conn: &Connection, key_hash: &str) -> rusqlite::Res
 /// The inputs of a cached eval.
 pub fn get_inputs(conn: &Connection, eval: &EvalRow) -> rusqlite::Result<Vec<Input>> {
     let mut inputs = Vec::new();
-    let mut files = conn.prepare_cached(
-        "SELECT anchor, path, recursive, is_directory, content_hash
-         FROM eval_file_input WHERE cached_eval_id = ?1",
+    let mut paths = conn.prepare_cached(
+        "SELECT kind, scheme, path, value FROM eval_path_input WHERE cached_eval_id = ?1",
     )?;
-    let rows = files.query_map([eval.id], |row| {
-        let anchor: String = row.get(0)?;
-        let path: Vec<u8> = row.get(1)?;
-        Ok((anchor, path, row.get(2)?, row.get(3)?, row.get(4)?))
+    let rows = paths.query_map([eval.id], |row| {
+        let invalid = |column, value: String| {
+            rusqlite::Error::InvalidColumnType(column, value, rusqlite::types::Type::Text)
+        };
+        let kind: String = row.get(0)?;
+        let scheme: String = row.get(1)?;
+        let path: Vec<u8> = row.get(2)?;
+        Ok(PathInput {
+            kind: ObservedKind::parse(&kind).ok_or_else(|| invalid(0, kind))?,
+            scheme: FlakeScheme::parse(&scheme).ok_or_else(|| invalid(1, scheme))?,
+            path: PathBuf::from(OsStr::from_bytes(&path)),
+            value: row.get(3)?,
+        })
     })?;
     for row in rows {
-        let (anchor, path, recursive, is_directory, content_hash) = row?;
-        let Some(anchor) = Anchor::parse(&anchor) else {
-            return Err(rusqlite::Error::InvalidColumnType(
-                0,
-                format!("anchor {anchor}"),
-                rusqlite::types::Type::Text,
-            ));
-        };
-        inputs.push(Input::File(FileInputDesc {
-            anchor,
-            path: PathBuf::from(OsStr::from_bytes(&path)),
-            recursive,
-            is_directory,
-            content_hash,
-        }));
-    }
-    let mut envs = conn.prepare_cached(
-        "SELECT name, content_hash FROM eval_env_input WHERE cached_eval_id = ?1",
-    )?;
-    for row in envs.query_map([eval.id], |row| {
-        Ok(EnvInputDesc {
-            name: row.get(0)?,
-            content_hash: row.get(1)?,
-        })
-    })? {
-        inputs.push(Input::Env(row?));
+        inputs.push(Input::Path(row?));
     }
     if let Some(content_hash) = &eval.flake_rev {
         inputs.push(Input::FlakeRev(RevInputDesc {
@@ -184,31 +157,19 @@ pub fn insert_eval_with_inputs(
     )?;
     let eval_id = tx.last_insert_rowid();
 
-    let mut files = tx.prepare_cached(
-        "INSERT OR REPLACE INTO eval_file_input
-           (cached_eval_id, anchor, path, recursive, is_directory, content_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    let mut envs = tx.prepare_cached(
-        "INSERT OR REPLACE INTO eval_env_input (cached_eval_id, name, content_hash)
-         VALUES (?1, ?2, ?3)",
+    let mut paths = tx.prepare_cached(
+        "INSERT OR REPLACE INTO eval_path_input (cached_eval_id, kind, scheme, path, value)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for input in inputs {
-        match input {
-            Input::File(f) => {
-                files.execute(params![
-                    eval_id,
-                    f.anchor.as_str(),
-                    f.path.as_os_str().as_bytes(),
-                    f.recursive,
-                    f.is_directory,
-                    f.content_hash
-                ])?;
-            }
-            Input::Env(e) => {
-                envs.execute(params![eval_id, e.name, e.content_hash])?;
-            }
-            Input::FlakeRev(_) => {}
+        if let Input::Path(p) = input {
+            paths.execute(params![
+                eval_id,
+                p.kind.as_str(),
+                p.scheme.as_str(),
+                p.path.as_os_str().as_bytes(),
+                p.value
+            ])?;
         }
     }
 

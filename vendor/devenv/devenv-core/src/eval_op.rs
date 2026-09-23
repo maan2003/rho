@@ -1,40 +1,65 @@
 //! Evaluation operation types and structured Nix effect parsing.
 //!
 //! Nix emits evaluation dependencies through a dedicated one-shot callback.
-//! This is the typed form of those effects that cache invalidation consumes.
+//! This is the typed form of the effects that cache invalidation consumes.
+//! The evaluator runs in pure mode with `record-input-reads`, so what it read
+//! from mutable local inputs is fully described by [`EvalOp::Observed`]; the
+//! per-builtin effects Nix also emits are ignored.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// A filesystem or environment operation observed during Nix evaluation.
-///
-/// These operations are used for cache invalidation and dependency tracking.
+/// An evaluator dependency reported by Nix.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EvalOp {
-    /// Copied a source path to the Nix store.
-    CopiedSource { source: PathBuf, target: PathBuf },
-    /// Filtered a source tree and copied it to the Nix store.
-    FilteredSource { source: PathBuf, target: PathBuf },
-    /// Evaluated a Nix file.
-    EvaluatedFile { source: PathBuf, cached: bool },
-    /// Read a file's contents with `builtins.readFile`.
-    ReadFile { source: PathBuf },
-    /// List a directory's contents with `builtins.readDir`.
-    ReadDir { source: PathBuf },
-    /// Read a file type with `builtins.readFileType`.
-    ReadFileType { source: PathBuf },
-    /// Hashed a file with `builtins.hashFile`.
-    HashFile { source: PathBuf, algorithm: String },
-    /// Read an environment variable with `builtins.getEnv`.
-    GetEnv { name: String },
-    /// Check that a file exists with `builtins.pathExists`.
-    PathExists { source: PathBuf },
     /// Mounted a fetched input at a virtual store path. Effects on paths
     /// below `store_path` observe that input's tree.
     MountedInput { store_path: PathBuf, url: String },
     /// Forced a source-info metadata attribute (`rev`, `lastModified`, ...)
     /// of the input mounted at `store_path`.
     ForcedInputAttr { store_path: PathBuf, name: String },
+    /// Read `source`, below a mounted local input, and saw `value`.
+    Observed {
+        source: PathBuf,
+        kind: ObservedKind,
+        value: String,
+    },
+}
+
+/// What a read of a mounted local input observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObservedKind {
+    /// The path's type: `regular`, `executable`, `directory`, `symlink`,
+    /// `other` or `missing`.
+    Stat,
+    /// BLAKE3 of the file's contents, base16.
+    File,
+    /// BLAKE3 of the directory's entry names, each followed by a NUL byte,
+    /// in byte order; base16.
+    Dir,
+    /// The symlink's target.
+    Link,
+}
+
+impl ObservedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObservedKind::Stat => "stat",
+            ObservedKind::File => "file",
+            ObservedKind::Dir => "dir",
+            ObservedKind::Link => "link",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stat" => Some(ObservedKind::Stat),
+            "file" => Some(ObservedKind::File),
+            "dir" => Some(ObservedKind::Dir),
+            "link" => Some(ObservedKind::Link),
+            _ => None,
+        }
+    }
 }
 
 impl EvalOp {
@@ -42,35 +67,15 @@ impl EvalOp {
     /// callback. This is the canonical wire conversion used by the Nix FFI.
     pub fn from_effect(kind: &str, subject: &str, detail: Option<&str>) -> Option<Self> {
         let path = || PathBuf::from(subject);
+        let observed = |kind| {
+            Some(EvalOp::Observed {
+                source: path(),
+                kind,
+                value: detail?.to_owned(),
+            })
+        };
 
         match (kind, detail) {
-            ("copy-source", Some(target)) => Some(EvalOp::CopiedSource {
-                source: path(),
-                target: PathBuf::from(target),
-            }),
-            ("filter-source", Some(target)) => Some(EvalOp::FilteredSource {
-                source: path(),
-                target: PathBuf::from(target),
-            }),
-            ("evaluated-file", Some("cached")) => Some(EvalOp::EvaluatedFile {
-                source: path(),
-                cached: true,
-            }),
-            ("evaluated-file", Some("uncached")) => Some(EvalOp::EvaluatedFile {
-                source: path(),
-                cached: false,
-            }),
-            ("read-file", None) => Some(EvalOp::ReadFile { source: path() }),
-            ("read-dir", None) => Some(EvalOp::ReadDir { source: path() }),
-            ("read-file-type", None) => Some(EvalOp::ReadFileType { source: path() }),
-            ("hash-file", Some(algorithm)) if !algorithm.is_empty() => Some(EvalOp::HashFile {
-                source: path(),
-                algorithm: algorithm.to_owned(),
-            }),
-            ("get-env", None) => Some(EvalOp::GetEnv {
-                name: subject.to_owned(),
-            }),
-            ("path-exists", None) => Some(EvalOp::PathExists { source: path() }),
             ("mount-input", Some(url)) => Some(EvalOp::MountedInput {
                 store_path: path(),
                 url: url.to_owned(),
@@ -79,6 +84,10 @@ impl EvalOp {
                 store_path: path(),
                 name: name.to_owned(),
             }),
+            ("observed-stat", _) => observed(ObservedKind::Stat),
+            ("observed-file", _) => observed(ObservedKind::File),
+            ("observed-dir", _) => observed(ObservedKind::Dir),
+            ("observed-link", _) => observed(ObservedKind::Link),
             _ => None,
         }
     }
@@ -86,8 +95,8 @@ impl EvalOp {
 
 /// Observer trait for receiving evaluation operations.
 ///
-/// Implementations can be registered with `NixLogBridge` to receive file and
-/// environment dependencies during evaluation.
+/// Implementations can be registered with `NixLogBridge` to receive the
+/// dependencies of an evaluation.
 pub trait OpObserver: Send + Sync + 'static {
     /// Called when an operation is observed during evaluation.
     fn record(&self, op: EvalOp);
@@ -105,93 +114,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_all_eval_effects() {
+    fn parses_eval_effects() {
+        let observed = |kind, value: &str| EvalOp::Observed {
+            source: "/nix/store/x-source/a".into(),
+            kind,
+            value: value.into(),
+        };
         let cases = [
             (
-                "copy-source",
-                "/source",
-                Some("/nix/store/source"),
-                EvalOp::CopiedSource {
-                    source: "/source".into(),
-                    target: "/nix/store/source".into(),
+                "mount-input",
+                "/nix/store/x-source",
+                Some("git+file:///src/x"),
+                EvalOp::MountedInput {
+                    store_path: "/nix/store/x-source".into(),
+                    url: "git+file:///src/x".into(),
                 },
             ),
             (
-                "filter-source",
-                "/source",
-                Some("/nix/store/source"),
-                EvalOp::FilteredSource {
-                    source: "/source".into(),
-                    target: "/nix/store/source".into(),
+                "input-attr",
+                "/nix/store/x-source",
+                Some("rev"),
+                EvalOp::ForcedInputAttr {
+                    store_path: "/nix/store/x-source".into(),
+                    name: "rev".into(),
                 },
             ),
-            (
-                "evaluated-file",
-                "/default.nix",
-                Some("cached"),
-                EvalOp::EvaluatedFile {
-                    source: "/default.nix".into(),
-                    cached: true,
-                },
-            ),
-            (
-                "evaluated-file",
-                "/default.nix",
-                Some("uncached"),
-                EvalOp::EvaluatedFile {
-                    source: "/default.nix".into(),
-                    cached: false,
-                },
-            ),
-            (
-                "read-file",
-                "/file",
-                None,
-                EvalOp::ReadFile {
-                    source: "/file".into(),
-                },
-            ),
-            (
-                "read-dir",
-                "/dir",
-                None,
-                EvalOp::ReadDir {
-                    source: "/dir".into(),
-                },
-            ),
-            (
-                "read-file-type",
-                "/file",
-                None,
-                EvalOp::ReadFileType {
-                    source: "/file".into(),
-                },
-            ),
-            (
-                "hash-file",
-                "/file",
-                Some("sha256"),
-                EvalOp::HashFile {
-                    source: "/file".into(),
-                    algorithm: "sha256".into(),
-                },
-            ),
-            (
-                "get-env",
-                "SOME_ENV",
-                None,
-                EvalOp::GetEnv {
-                    name: "SOME_ENV".into(),
-                },
-            ),
-            (
-                "path-exists",
-                "/file",
-                None,
-                EvalOp::PathExists {
-                    source: "/file".into(),
-                },
-            ),
+            ("observed-stat", "/nix/store/x-source/a", Some("regular"), observed(ObservedKind::Stat, "regular")),
+            ("observed-file", "/nix/store/x-source/a", Some("ab"), observed(ObservedKind::File, "ab")),
+            ("observed-dir", "/nix/store/x-source/a", Some("cd"), observed(ObservedKind::Dir, "cd")),
+            // A symlink may point at the empty string.
+            ("observed-link", "/nix/store/x-source/a", Some(""), observed(ObservedKind::Link, "")),
         ];
 
         for (kind, subject, detail, expected) in cases {
@@ -202,15 +154,11 @@ mod tests {
     #[test]
     fn rejects_unknown_or_malformed_effects() {
         assert_eq!(EvalOp::from_effect("unknown", "/file", None), None);
-        assert_eq!(
-            EvalOp::from_effect("read-file", "/file", Some("unexpected")),
-            None
-        );
-        assert_eq!(EvalOp::from_effect("copy-source", "/source", None), None);
-        assert_eq!(
-            EvalOp::from_effect("evaluated-file", "/file", Some("old")),
-            None
-        );
-        assert_eq!(EvalOp::from_effect("hash-file", "/file", Some("")), None);
+        assert_eq!(EvalOp::from_effect("read-file", "/file", None), None);
+        assert_eq!(EvalOp::from_effect("mount-input", "/nix/store/x", None), None);
+        assert_eq!(EvalOp::from_effect("observed-file", "/file", None), None);
+        for kind in [ObservedKind::Stat, ObservedKind::File, ObservedKind::Dir, ObservedKind::Link] {
+            assert_eq!(ObservedKind::parse(kind.as_str()), Some(kind));
+        }
     }
 }

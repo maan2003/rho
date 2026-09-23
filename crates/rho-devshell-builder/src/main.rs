@@ -1,23 +1,25 @@
-//! Evaluates flake development shells for rho through the Nix C API.
+//! Builds flake development shells for rho through the Nix C API, and caches
+//! the built environment against exactly what evaluation read.
 //!
-//! This binary links libnix and therefore runs apart from the (musl) rho
-//! processes. For now it only has a command-line mode used to exercise the
-//! evaluator and cache:
+//! Evaluation is pure, and the Nix fork reports every read of the flake's
+//! sources with what it observed, so a cached shell stays valid while those
+//! observations still hold. This binary links libnix and therefore runs apart
+//! from the (musl) rho processes. For now it only has a command-line mode used
+//! to exercise the builder and cache:
 //!
-//!     rho-nix-eval shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
+//!     rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
 use devenv_eval_cache::{
-    CachingEvalService, Checkout, EvalCacheKey, FlakeScheme, any_input_modified_after,
-    ops_to_identities,
+    CachingEvalService, Checkout, EvalCacheKey, FlakeScheme, Input, RevInputDesc, record_inputs,
 };
 use devenv_nix_backend::{DevShellRequest, NIX_STACK_SIZE, NixRuntime};
 
 /// Changes whenever evaluation semantics change (evaluator, Nix fork patches).
-const EVALUATOR: &str = concat!("rho-nix-eval/", env!("CARGO_PKG_VERSION"), " nix-2.35-rho");
+const EVALUATOR: &str = concat!("rho-devshell-builder/", env!("CARGO_PKG_VERSION"), " nix-2.35-rho2");
 
 struct Args {
     flake_dir: PathBuf,
@@ -28,7 +30,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some("shell") {
-        bail!("usage: rho-nix-eval shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]");
+        bail!("usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]");
     }
     let flake_dir = args.next().context("missing flake directory")?;
     let flake_dir = std::fs::canonicalize(&flake_dir).with_context(|| flake_dir.clone())?;
@@ -52,7 +54,7 @@ fn default_cache_path() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
-    base.join("rho/nix-eval.sqlite")
+    base.join("rho/devshell-cache.sqlite")
 }
 
 fn main() -> Result<()> {
@@ -102,20 +104,48 @@ impl Shell {
     }
 }
 
+/// Where the flake's source tree is fetched from, as Nix does for a local
+/// flake: the enclosing git repository (with the flake in a subdirectory of
+/// it), or the flake directory itself.
+struct Source {
+    scheme: FlakeScheme,
+    root: PathBuf,
+    /// The flake directory relative to `root`.
+    subdir: PathBuf,
+}
+
+impl Source {
+    fn find(flake_dir: &Path) -> Self {
+        for dir in flake_dir.ancestors() {
+            if dir.join(".git").exists() {
+                return Self {
+                    scheme: FlakeScheme::Git,
+                    root: dir.to_path_buf(),
+                    subdir: flake_dir.strip_prefix(dir).unwrap_or(Path::new("")).to_path_buf(),
+                };
+            }
+        }
+        Self {
+            scheme: FlakeScheme::Path,
+            root: flake_dir.to_path_buf(),
+            subdir: PathBuf::new(),
+        }
+    }
+}
+
 fn run(args: Args) -> Result<()> {
     let t0 = Instant::now();
     let system = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
-    let env = |name: &str| std::env::var(name).ok();
-    let scheme = if args.flake_dir.join(".git").exists() {
-        FlakeScheme::Git
-    } else {
-        FlakeScheme::Path
-    };
+    let source = Source::find(&args.flake_dir);
     let lock = std::fs::read(args.flake_dir.join("flake.lock")).ok();
     let key = EvalCacheKey::new(
         &format!("devShells.{system}.{}", args.shell),
-        scheme,
-        &[EVALUATOR.as_bytes(), lock.as_deref().unwrap_or(b"\0no flake.lock")],
+        source.scheme,
+        &[
+            EVALUATOR.as_bytes(),
+            source.subdir.as_os_str().as_encoded_bytes(),
+            lock.as_deref().unwrap_or(b"\0no flake.lock"),
+        ],
     );
 
     // A broken cache must not stop evaluation.
@@ -125,7 +155,7 @@ fn run(args: Args) -> Result<()> {
             .ok()
     });
     if let Some(cache) = &cache {
-        match lookup(cache, &key, &args.flake_dir, &env) {
+        match lookup(cache, &key, &source) {
             Ok(Some(shell)) => {
                 report("hit", &shell, t0, None);
                 return Ok(());
@@ -152,21 +182,24 @@ fn run(args: Args) -> Result<()> {
     };
     let eval_done = t0.elapsed();
 
-    let (fetched_as, identities) = ops_to_identities(&eval.ops, &args.flake_dir)?;
-    if fetched_as != scheme {
-        bail!("flake was fetched as {fetched_as:?}, expected {scheme:?}");
-    }
-    let checkout = Checkout::new(&args.flake_dir, scheme)?;
-    let inputs = match &cache {
-        Some(cache) => identities.to_inputs(&checkout, &mut cache.hashes(), &env)?,
-        None => identities.to_inputs(&checkout, &mut devenv_eval_cache::eval_inputs::Uncached, &env)?,
+    let recorded = match record_inputs(&eval.ops, &source.root) {
+        Ok((fetched_as, _)) if fetched_as != source.scheme => {
+            bail!("flake was fetched as {fetched_as:?}, expected {:?}", source.scheme)
+        }
+        Ok((_, recorded)) => recorded,
+        Err(e) => {
+            eprintln!("not caching: {e}");
+            report("uncacheable", &shell, t0, Some((lookup_done, eval_done, 0, eval.ops.len())));
+            return Ok(());
+        }
     };
-    let stats = Some((lookup_done, eval_done, inputs.len(), eval.ops.len()));
-    if let Some(changed) = any_input_modified_after(&inputs, &checkout, eval.started_at) {
-        eprintln!("not caching: {} changed during evaluation", changed.display());
-        report("uncacheable", &shell, t0, stats);
-        return Ok(());
+    let flake_rev = recorded.flake_rev;
+    let mut inputs = recorded.into_inputs();
+    if flake_rev {
+        let checkout = Checkout::new(&source.root, source.scheme)?;
+        inputs.push(Input::FlakeRev(RevInputDesc::new(&checkout)?));
     }
+    let stats = Some((lookup_done, eval_done, inputs.len(), eval.ops.len()));
     if let (Some(cache), Some(cache_path)) = (&mut cache, &args.cache) {
         let stored = cache.store(&key, &shell.to_json(), &inputs).and_then(|eval_id| {
             Ok((eval_id, cache.eval_ids()?))
@@ -187,14 +220,9 @@ fn run(args: Args) -> Result<()> {
 
 /// A valid cached shell for `key`, dropping candidates whose store paths were
 /// garbage collected (as devenv does) and trying the next.
-fn lookup(
-    cache: &CachingEvalService,
-    key: &EvalCacheKey,
-    flake_dir: &Path,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Result<Option<Shell>> {
-    let checkout = Checkout::new(flake_dir, key.scheme)?;
-    while let Some(hit) = cache.get_cached(key, &checkout, env)? {
+fn lookup(cache: &CachingEvalService, key: &EvalCacheKey, source: &Source) -> Result<Option<Shell>> {
+    let checkout = Checkout::new(&source.root, source.scheme)?;
+    while let Some(hit) = cache.get_cached(key, &checkout)? {
         let shell = Shell::from_json(&hit.json_output)?;
         // Only the environment is used; its GC root keeps its closure alive.
         if Path::new(&shell.env_store_path).exists() {

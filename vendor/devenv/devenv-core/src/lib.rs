@@ -4,5 +4,5 @@
 pub mod eval_op;
 pub mod nix_log_bridge;
 
-pub use eval_op::{EvalOp, OpObserver};
+pub use eval_op::{EvalOp, ObservedKind, OpObserver};
 pub use nix_log_bridge::NixLogBridge;
