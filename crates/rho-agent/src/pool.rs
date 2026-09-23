@@ -1052,12 +1052,13 @@ mod tests {
         let tools =
             crate::multi_agent_tools::MultiAgentTools::new(Arc::downgrade(&pool), parent_id, None);
         let spawn = |workdir: Option<&str>| {
-            let mut args =
-                serde_json::json!({"task_name": "child", "prompt": "No work is required."});
-            if let Some(workdir) = workdir {
-                args["workdir"] = workdir.into();
-            }
-            crate::multi_agent_tools::AgentCall::SpawnEngineer(serde_json::from_value(args).unwrap())
+            crate::multi_agent_tools::AgentCall::SpawnEngineer(
+                crate::multi_agent_tools::SpawnArgs {
+                    task_name: "child".into(),
+                    prompt: "No work is required.".into(),
+                    workdir: workdir.map(str::to_owned),
+                },
+            )
         };
         for (workdir, expected) in [
             (Some("/src/checkout"), "/src/checkout"),
@@ -1139,7 +1140,9 @@ mod tests {
             crate::multi_agent_tools::call_agent_tool(
                 tools.clone(),
                 crate::multi_agent_tools::AgentCall::Cancel(
-                    serde_json::from_value(serde_json::json!({"agent_id": team.agent})).unwrap(),
+                    crate::multi_agent_tools::InterruptArgs {
+                        agent_id: team.agent.to_string(),
+                    },
                 ),
             )
             .await

@@ -2,8 +2,8 @@
 //!
 //! These are ordinary fast tools (codex-v2 style): asynchrony lives in the
 //! per-agent message queue, not in tool execution. `spawn_new_engineer` returns
-//! the child id immediately; results come back as mail, and the loop's own `wait`
-//! tool is how an agent waits for them.
+//! the child id immediately; results come back as mail, and the loop's own
+//! `wait` tool is how an agent waits for them.
 //!
 //! The tools are injected into the core agent as a [`MultiAgentTools`]
 //! handle holding a `Weak<AgentPool>`; the agent loop itself knows nothing
@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use senax_encoder::{Decode, Encode};
-use serde::Deserialize;
 
 use crate::MessageDelivery;
 use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
@@ -90,7 +89,10 @@ impl AgentCall {
     }
 }
 
-pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: AgentCall) -> anyhow::Result<String> {
+pub(crate) async fn call_agent_tool(
+    tools: MultiAgentTools,
+    call: AgentCall,
+) -> anyhow::Result<String> {
     match call {
         AgentCall::SpawnEngineer(args) => spawn_engineer(&tools, args).await,
         AgentCall::Message(args) => message_agent(&tools, args).await,
@@ -99,11 +101,9 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: AgentCall) -> 
     }
 }
 
-#[derive(Debug, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Encode, Decode)]
 pub(crate) struct AdvisorArgs {
-    #[serde(rename = "msg")]
-    message: String,
+    pub(crate) message: String,
 }
 
 async fn ask_advisor(tools: &MultiAgentTools, args: AdvisorArgs) -> anyhow::Result<String> {
@@ -141,13 +141,11 @@ fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligen
     }
 }
 
-#[derive(Debug, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Encode, Decode)]
 pub(crate) struct SpawnArgs {
-    task_name: String,
-    prompt: String,
-    #[serde(default)]
-    workdir: Option<String>,
+    pub(crate) task_name: String,
+    pub(crate) prompt: String,
+    pub(crate) workdir: Option<String>,
 }
 
 pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
@@ -181,11 +179,10 @@ async fn spawn_engineer(tools: &MultiAgentTools, args: SpawnArgs) -> anyhow::Res
     ))
 }
 
-#[derive(Debug, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Encode, Decode)]
 pub(crate) struct SendArgs {
-    agent_id: String,
-    message: String,
+    pub(crate) agent_id: String,
+    pub(crate) message: String,
 }
 
 async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Result<String> {
@@ -233,13 +230,15 @@ async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Resul
     Ok(format!("Message sent to {}.", pool.agent_handle(recipient)))
 }
 
-#[derive(Debug, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Encode, Decode)]
 pub(crate) struct InterruptArgs {
-    agent_id: String,
+    pub(crate) agent_id: String,
 }
 
-async fn interrupt_engineer(tools: &MultiAgentTools, args: InterruptArgs) -> anyhow::Result<String> {
+async fn interrupt_engineer(
+    tools: &MultiAgentTools,
+    args: InterruptArgs,
+) -> anyhow::Result<String> {
     let pool = tools.pool()?;
     let raw_agent_id = args
         .agent_id

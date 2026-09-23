@@ -4,7 +4,6 @@ use redb::TableDefinition;
 use rho_core::{AgentId, UnixMs};
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
-use serde::Deserialize;
 
 const PAPERCUTS: TableDefinition<u64, Sen<Papercut>> = TableDefinition::new("papercuts");
 const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
@@ -17,8 +16,7 @@ struct Papercut {
 }
 
 /// The arguments of the notebook's `papercut()`.
-#[derive(Debug, Deserialize, Encode, Decode)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Encode, Decode)]
 pub(crate) struct PapercutArgs {
     pub description: String,
 }
@@ -106,13 +104,7 @@ mod tests {
                 .iter()
                 .any(|report| report.description == "Unicode: café")
         );
-        assert_eq!(
-            tool(db)
-                .record(args("Third report"))
-                .await
-                .unwrap(),
-            3
-        );
+        assert_eq!(tool(db).record(args("Third report")).await.unwrap(), 3);
     }
 
     #[tokio::test]
@@ -124,9 +116,5 @@ mod tests {
         }
         assert_eq!(tool.record(args("A useful report")).await.unwrap(), 1);
         assert_eq!(tool.db.read().open_table(PAPERCUTS).iter().count(), 1);
-        assert!(
-            serde_json::from_str::<PapercutArgs>(r#"{"description":"ok","unknown":true}"#)
-                .is_err()
-        );
     }
 }

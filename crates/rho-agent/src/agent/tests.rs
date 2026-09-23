@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use rho_agent_tools::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 use rho_core::ToolType;
+use rho_notebook::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 
 use super::*;
 use crate::boundary::{
@@ -967,8 +967,8 @@ async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
     assert!(woken.await.is_ok(), "the permit survives until awaited");
 }
 
-fn python_tool(directory: &tempfile::TempDir) -> rho_agent_tools::PythonNotebook {
-    rho_agent_tools::PythonNotebook::new(
+fn python_tool(directory: &tempfile::TempDir) -> rho_notebook::PythonNotebook {
+    rho_notebook::PythonNotebook::new(
         rho_tool_shell::ShellTools::in_directory(
             Duration::from_secs(20),
             directory.path().to_str().unwrap().into(),
@@ -1000,7 +1000,7 @@ async fn until_jobs_registered(running: &RunningExec, wake: &Arc<Notify>, count:
                 .session
                 .sources()
                 .into_iter()
-                .filter(|(_, facts)| matches!(facts, rho_agent_tools::SourceFacts::Job(_)))
+                .filter(|(_, facts)| matches!(facts, rho_notebook::SourceFacts::Job(_)))
                 .count();
             if jobs >= count {
                 break;
@@ -1024,8 +1024,8 @@ async fn until_job_ends(
                 .sources()
                 .into_iter()
                 .filter_map(|(_, facts)| match facts {
-                    rho_agent_tools::SourceFacts::Job(job) => Some(job),
-                    rho_agent_tools::SourceFacts::Cell(_) => None,
+                    rho_notebook::SourceFacts::Job(job) => Some(job),
+                    rho_notebook::SourceFacts::Cell(_) => None,
                 })
                 .collect::<Vec<_>>();
             if let Some(end) = jobs.get(registered_index).and_then(|job| job.finished) {

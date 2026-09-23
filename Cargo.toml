@@ -6,7 +6,6 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
-  "crates/rho-agent-tools",
   "crates/rho-agents",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
@@ -34,9 +33,9 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-mirror",
+  "crates/rho-notebook",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
-  "crates/rho-python",
   "crates/rho-profiling",
   "crates/rho-qa",
   "crates/rho-rpc",
@@ -107,6 +106,8 @@ octo-server = { path = "crates/octo-server" }
 octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
+pyo3 = "0.29"
+pythonize = "0.29"
 rand = "0.8"
 redb = "4.2.0"
 redb-derive = "0.1.0"
@@ -125,7 +126,6 @@ rho-ci = { path = "crates/rho-ci" }
 rho-claude = { path = "crates/rho-claude" }
 rho-claude-usage = { path = "crates/rho-claude-usage" }
 rho-cli = { path = "crates/rho-cli" }
-rho-agent-tools = { path = "crates/rho-agent-tools" }
 rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
@@ -142,9 +142,9 @@ rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-mirror = { path = "crates/rho-mirror" }
+rho-notebook = { path = "crates/rho-notebook" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
-rho-python = { path = "crates/rho-python" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-hosts = { path = "crates/rho-hosts" }
 rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }

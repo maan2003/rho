@@ -114,7 +114,7 @@ security, resource-isolation, or rollback boundary.
   replayable, but no current role opts into the retired notes mode.
   Native `NativeEvent` records are canonical; provider context is a disposable
   replay projection. Claude Code owns its own history and compaction instead.
-  The two concrete runtimes share a pure boundary and `rho-agent-tools`' concrete
+  The two concrete runtimes share a pure boundary and `rho-notebook`'s concrete
   notebook, jobs, and leased output—not a universal runtime or tool-session trait.
   `PythonExec` owns streaming-unit progress; the agent chooses admission and
   validates provider identity/source without maintaining a second progress ledger.
@@ -437,7 +437,7 @@ security, resource-isolation, or rollback boundary.
   `rho-agent` assembles it as a built-in tool and supplies the configured model,
   recent transcript, and output budget; the tool resolves the same ChatGPT
   OAuth credentials as inference and calls the first-party search endpoint.
-- `rho-python` embeds CPython (PyO3) inside the agent worker, not the daemon:
+- `rho-notebook` embeds CPython (PyO3) inside the agent worker, not the daemon:
   one interpreter per worker, and per notebook its own globals, a dedicated
   thread and a stock asyncio selector loop that wakes on an inbox eventfd.
   `kernel.py` owns notebook semantics: a cell is a context variable that
@@ -445,18 +445,20 @@ security, resource-isolation, or rollback boundary.
   subclass counts each cell's tasks, callbacks, timers, watchers and threads,
   and the cell settles when its code has returned and nothing it started is
   live. It also splits streamed source into top-level units and provides the
-  notebook builtins. The Rust side owns transport, events and typed host
-  functions, which decode Python arguments directly into serde types and run
-  on the worker's Tokio runtime; no JSON crosses the boundary and no Python
+  notebook builtins. The Rust side owns transport and the tool boundary. Host
+  tools are PyO3 classes and functions with ordinary Python argument handling;
+  what they start is an operation of the running cell, registered before
+  Python continues, run to completion on the worker's Tokio runtime whether or
+  not Python awaits it, and reported with the cell's output. Managed commands
+  are the same kind of source. No JSON crosses the boundary and no Python
   object crosses threads. Synchronous Python is never interrupted; a stuck
   notebook is recovered by restarting the worker.
   Python runs with private cwd state inside the agent's workset view;
   this is path mapping, not a sandbox.
-
-- `rho-agent-tools` owns each `PythonExec` and its independently registered host
-  operations. The submitted code returning, remaining Python activity stopping,
-  operations finishing, and transcript delivery are separate facts. Async task
-  and callback tracking exists for attribution and cleanup, not wake policy.
+  `rho-notebook` owns each `PythonExec` and its operations. The submitted code
+  returning, remaining Python activity stopping, operations finishing, and
+  transcript delivery are separate facts. Async task and callback tracking
+  exists for attribution and cleanup, not wake policy.
   `rho-agent`'s boundary consumes explicit `PythonExec` and `PythonOperation`
   sources, without adapting them into generic tool urgency. It reads patience
   directly from the latest response's execution handle, retained even after a

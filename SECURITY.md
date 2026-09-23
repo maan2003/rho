@@ -737,7 +737,7 @@ after the database commit. Cancellation before acquiring the write lock leaves
 no report; once writing starts, the short transaction completes atomically.
 Tests cover validation, concurrent appends, and reopening the database.
 
-## Python code mode (`rho-python`, `rho-agent-tools`)
+## Python code mode (`rho-notebook`)
 
 Every role works in the Python notebook: native agents have it as their only
 tool, and all Claude roles get it as an in-process MCP server with Claude's
@@ -802,7 +802,7 @@ own tools denied.
   Python `chdir` therefore affects that notebook, not the daemon or sibling
   notebooks; it remains shared between its live cells. Imported modules and
   other interpreter-wide state (`sys.path`, logging, warnings) are shared by every
-  notebook in the worker; host modules such as `agents` are per notebook.
+  notebook in the worker; host objects such as `agents` are per notebook.
 - Python is explicitly **not a sandbox**. Workspace mount mapping provides path
   correctness, not capability isolation. Unlike managed shell commands, native
   Python file operations are not Landlock-restricted. Process-global environment
@@ -822,17 +822,21 @@ own tools denied.
   ownership is a context variable that asyncio copies into its tasks and
   callbacks and that threads inherit; the loop counts each cell's live tasks,
   callbacks, timers, descriptor watchers and threads, and the cell finishes
-  when its code has returned and that count is zero. Host functions are typed:
-  arguments are decoded directly from Python objects, host work runs on the
-  worker's Tokio runtime, and cancelling the awaitable aborts it.
+  when its code has returned and that count is zero. Host tools are PyO3
+  classes and functions that check Python arguments themselves. What a tool
+  starts is an operation of the running cell: registered before Python
+  continues and run on the worker's Tokio runtime to completion. Awaiting it
+  is optional and cancelling the awaitable does not stop it; cancelling the
+  cell does.
   Asyncio networking and subprocesses have ordinary unsandboxed Python access,
   not the managed lifecycle of `command()`.
   Real Python threads are enabled and share one interpreter lock with every
   notebook in the worker. Notebook-created threads inherit cell context unless
   the caller supplies an explicit context; executor workers belong to the pool,
   and submitted work keeps its cell alive through the task awaiting it.
-  Cancelling an asyncio future does not imply its thread has stopped. Host-function
-  registration must run on the notebook event loop, not a worker thread.
+  Cancelling an asyncio future does not imply its thread has stopped. A host
+  call that returns an awaitable, including `command()`, must be made on the
+  notebook event loop, not a worker thread.
   PyYAML and HTTPX are supplied from the Nix-pinned package closure alongside
   the pinned CPython.
   Cancelling a cell cancels its asyncio tasks and callbacks only. Synchronous

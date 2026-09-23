@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rho_core::{ImageContent, ImageDetail};
-use serde::Deserialize;
 
 use crate::View;
 
@@ -12,12 +11,9 @@ pub(crate) struct ImageTools {
 }
 
 /// The arguments of the notebook's `view_image()`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct ViewImageArgs {
-    path: PathBuf,
-    #[serde(default)]
-    detail: ImageDetail,
+    pub(crate) path: PathBuf,
+    pub(crate) detail: ImageDetail,
 }
 
 impl ImageTools {
@@ -39,7 +35,10 @@ impl ImageTools {
         ))
     }
 
-    async fn load(&self, args: ViewImageArgs) -> anyhow::Result<(PathBuf, rho_image::PreparedImage)> {
+    async fn load(
+        &self,
+        args: ViewImageArgs,
+    ) -> anyhow::Result<(PathBuf, rho_image::PreparedImage)> {
         let visible = if args.path.is_absolute() {
             args.path
         } else {
@@ -57,6 +56,7 @@ impl ImageTools {
 #[cfg(test)]
 mod tests {
     use image::{DynamicImage, ImageBuffer, Rgba};
+
     use super::*;
 
     #[tokio::test]
@@ -86,7 +86,10 @@ mod tests {
                 camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
             )
             .unwrap();
-        let args = serde_json::from_str(r#"{"path":"image.png","detail":"original"}"#).unwrap();
+        let args = ViewImageArgs {
+            path: "image.png".into(),
+            detail: ImageDetail::Original,
+        };
         let (_, image) = ImageTools::new(view).view(args).await.unwrap();
 
         assert_eq!(image.media_type, "image/png");

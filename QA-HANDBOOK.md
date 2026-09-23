@@ -221,7 +221,7 @@ snapshot is what frees the 43 GB, and only once no rig points into it.
 
 Three more things a run trips over, from the desk-parents deletion on 10 Sep.
 
-- **rho-daemon does not build outside the devshell.** `rho-python` reads
+- **rho-daemon does not build outside the devshell.** `rho-notebook` reads
   `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-daemon`
   fails to compile before it ever reaches the daemon. `direnv exec . cargo …`
   is the fix, and it is the fix for every crate that pulls the daemon in.

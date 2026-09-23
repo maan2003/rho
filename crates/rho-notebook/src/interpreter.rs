@@ -64,7 +64,7 @@ pub(crate) fn initialize() -> Result<(), String> {
 unsafe fn start() -> Result<(), String> {
     unsafe {
         if pyo3::ffi::Py_IsInitialized() != 0 {
-            return Err("Python was initialized outside rho-python".into());
+            return Err("Python was initialized outside rho-notebook".into());
         }
         let config = PyInitConfig_Create();
         if config.is_null() {
@@ -82,7 +82,10 @@ unsafe fn start() -> Result<(), String> {
             Err(if message.is_null() {
                 "Python initialization failed".into()
             } else {
-                format!("Python initialization: {}", CStr::from_ptr(message).to_string_lossy())
+                format!(
+                    "Python initialization: {}",
+                    CStr::from_ptr(message).to_string_lossy()
+                )
             })
         };
         PyInitConfig_Free(config);

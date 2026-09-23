@@ -1178,7 +1178,7 @@ impl ClaudeLoop {
             team.as_ref(),
             Some(&self.host),
         );
-        let tool = rho_agent_tools::PythonNotebook::new(shell, others)
+        let tool = rho_notebook::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
         self.python = Some(python_host::PythonHost::new(tool));
         Ok(())

@@ -1,19 +1,20 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pyo3::prelude::*;
 use rho_core::{
     ContentPart, ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem,
-    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate,
-    UnixMs,
+    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate, UnixMs,
 };
 use rho_fs_view::PathOverrides;
 use rho_tool_shell::ShellTools;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::{HostFunction, JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker, ToolCx};
+use crate::{Export, JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker, ToolCx};
 
-fn shell() -> ShellTools {
+pub(crate) fn shell() -> ShellTools {
     ShellTools::in_directory(
         Duration::from_secs(5),
         "/tmp".into(),
@@ -21,7 +22,7 @@ fn shell() -> ShellTools {
     )
 }
 
-fn shell_in(directory: &tempfile::TempDir) -> ShellTools {
+pub(crate) fn shell_in(directory: &tempfile::TempDir) -> ShellTools {
     ShellTools::in_directory(
         Duration::from_secs(5),
         directory.path().to_str().unwrap().into(),
@@ -29,14 +30,49 @@ fn shell_in(directory: &tempfile::TempDir) -> ShellTools {
     )
 }
 
-fn python(shell: ShellTools, functions: Vec<HostFunction>) -> Arc<PythonNotebook> {
-    Arc::new(PythonNotebook::new(shell, functions).unwrap())
+fn python(shell: ShellTools, exports: Vec<Export>) -> Arc<PythonNotebook> {
+    Arc::new(PythonNotebook::new(shell, exports).unwrap())
 }
 
-/// A host function that takes no arguments.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NoArgs {}
+type Work = dyn Fn(
+        ToolCx,
+        Vec<String>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+    + Send
+    + Sync;
+
+/// A test tool: calling it with string arguments starts `work` as an
+/// operation named after it.
+#[pyclass(frozen)]
+struct Tool {
+    name: &'static str,
+    work: Arc<Work>,
+}
+
+#[pymethods]
+impl Tool {
+    #[pyo3(signature = (*args))]
+    fn __call__(&self, py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyAny>> {
+        let work = Arc::clone(&self.work);
+        crate::operation(py, self.name, move |cx| work(cx, args))
+    }
+}
+
+fn tool<Fut>(
+    name: &'static str,
+    work: impl Fn(ToolCx, Vec<String>) -> Fut + Send + Sync + 'static,
+) -> Export
+where
+    Fut: Future<Output = Result<String, String>> + Send + 'static,
+{
+    Export::new(
+        name,
+        Tool {
+            name,
+            work: Arc::new(move |cx, args| Box::pin(work(cx, args))),
+        },
+    )
+}
 
 fn call(id: &str, arguments: serde_json::Value) -> ExecCall {
     ExecCall {
@@ -600,13 +636,9 @@ async fn python_asyncio_timeout_does_not_own_the_managed_command() {
 
 #[tokio::test]
 async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() {
-    #[derive(serde::Deserialize)]
-    struct Text {
-        text: String,
-    }
-    let echo = HostFunction::new("echo", &["text"], |cx: ToolCx, args: Text| async move {
-        cx.report(&args.text);
-        Ok(args.text)
+    let echo = tool("echo", |cx, args| async move {
+        cx.report(&args[0]);
+        Ok(args[0].clone())
     });
     let tool = python(shell(), vec![echo]);
     let wake = Arc::new(Notify::new());
@@ -725,19 +757,19 @@ async fn old_execution_keeps_its_own_checkin_without_touching_new_execution() {
 }
 
 /// `pending()`: never finishes; `count` is how many are running.
-fn pending_tool(count: Arc<std::sync::atomic::AtomicUsize>) -> HostFunction {
+fn pending_tool(count: Arc<std::sync::atomic::AtomicUsize>) -> Export {
     struct Guard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for Guard {
         fn drop(&mut self) {
             self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    HostFunction::new("pending", &[], move |_: ToolCx, _: NoArgs| {
+    tool("pending", move |_, _| {
         let count = count.clone();
         async move {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _guard = Guard(count);
-            std::future::pending::<Result<(), String>>().await
+            std::future::pending().await
         }
     })
 }
@@ -1016,12 +1048,12 @@ async fn operation_output_does_not_change_exec_return_facts() {
     let release = Arc::new(Notify::new());
     let released = {
         let release = release.clone();
-        HostFunction::new("released", &[], move |cx: ToolCx, _: NoArgs| {
+        tool("released", move |cx, _| {
             let release = release.clone();
             async move {
                 release.notified().await;
                 cx.report("nested result");
-                Ok(())
+                Ok(String::new())
             }
         })
     };
@@ -1072,76 +1104,6 @@ async fn operation_output_does_not_change_exec_return_facts() {
     cell.acknowledge_output();
     assert!(output.contains("Operation pending completed"), "{output}");
     assert_eq!(exec.facts().returned, returned.returned);
-}
-
-#[tokio::test]
-async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
-    // Each function answers with its path and the arguments it received.
-    let others: Vec<HostFunction> = [
-        ("agents.spawn_new_engineer", &[][..]),
-        ("agents.cancel", &[]),
-        ("agents.message", &[]),
-        ("agents.spawn_new_advisor", &["msg"]),
-        ("web.run", &[]),
-    ]
-    .into_iter()
-    .map(|(path, positional)| {
-        HostFunction::new(
-            path,
-            positional,
-            move |cx: ToolCx, args: serde_json::Map<String, serde_json::Value>| async move {
-                let text = format!("{path}:{}", serde_json::Value::Object(args));
-                cx.report(&text);
-                Ok(text)
-            },
-        )
-    })
-    .chain([HostFunction::new("view_image", &["path"], |cx: ToolCx, _: serde_json::Value| async move {
-        cx.report("viewed");
-        Ok(())
-    })
-    .detached()])
-    .collect();
-    let tool = PythonNotebook::new(shell(), others).unwrap();
-    let wake = Arc::new(Notify::new());
-    let mut cell = tool.exec(
-        call(
-            "agents-api",
-            json!(
-                r#"
-import types
-import json
-assert isinstance(agents, types.ModuleType)
-assert not hasattr(agents, "delegate_engineer")
-assert "tools" not in globals()
-assert "spawn_engineer" not in globals()
-assert "ask_advisor" not in globals()
-assert "message_agent" not in globals()
-assert "interrupt_engineer" not in globals()
-result = await agents.spawn_new_engineer(task_name="test", prompt="work")
-assert result.startswith("agents.spawn_new_engineer:")
-assert json.loads(result.split(":", 1)[1]) == {"task_name": "test", "prompt": "work"}
-result = await agents.spawn_new_engineer(task_name="test", prompt="work", workdir="/src/checkout")
-assert json.loads(result.split(":", 1)[1]) == {
-    "task_name": "test", "prompt": "work", "workdir": "/src/checkout",
-}
-assert (await agents.message(agent_id="eng-test", message="hello")).startswith("agents.message:")
-cancelled = await agents.cancel(agent_id="eng-test")
-assert json.loads(cancelled.split(":", 1)[1]) == {"agent_id": "eng-test"}
-agents.spawn_new_advisor("background review")
-assert (await web.run(search_query=[])).startswith("web.run:")
-assert view_image("test.png") is None
-"#
-            ),
-        ),
-        SourceWaker::new(wake.clone()),
-    );
-    until(&wake, &*cell, Signal::Ended).await;
-    let output = cell.first_output();
-    cell.acknowledge_output();
-    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
-    assert!(output.output.contains("background review"), "{output:?}");
-    assert!(output.output.contains("agents.cancel:"), "{output:?}");
 }
 
 #[tokio::test]
@@ -1375,10 +1337,7 @@ async fn output_is_leased_until_its_owner_acknowledges_it() {
 async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
     let directory = tempfile::tempdir().unwrap();
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let tool = python(
-        shell_in(&directory),
-        vec![pending_tool(count.clone())],
-    );
+    let tool = python(shell_in(&directory), vec![pending_tool(count.clone())]);
     let wake = Arc::new(Notify::new());
     let _cell = tool.exec(
         call(
@@ -1613,4 +1572,3 @@ async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
         }
     }
 }
-

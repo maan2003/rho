@@ -8,7 +8,7 @@ use rho_inference::exec::set_source;
 use super::*;
 
 pub(super) struct Stream {
-    pub exec: Arc<rho_agent_tools::PythonExec>,
+    pub exec: Arc<rho_notebook::PythonExec>,
     item: InferenceResponseItem,
     index: usize,
     source: String,
@@ -328,7 +328,7 @@ pub(in crate::agent) mod tests {
         write.commit();
         let head = db.read().get_agent(id);
         let notebook = Arc::new(
-            rho_agent_tools::PythonNotebook::new(
+            rho_notebook::PythonNotebook::new(
                 ShellTools::in_directory(
                     Duration::from_secs(5),
                     directory.to_str().unwrap().into(),
@@ -614,7 +614,7 @@ pub(in crate::agent) mod tests {
         assert!(matches!(agent.phase, Phase::Requesting(_)));
         until(&mut agent, |agent| {
             agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-            matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
+            matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
         )
         })
         .await;
@@ -707,10 +707,13 @@ pub(in crate::agent) mod tests {
                 ..
             }
         ));
-        until(&mut agent, |agent| agent.streams.values().next().unwrap().exec.stream_progress().returned
+        until(&mut agent, |agent| {
+            agent.streams.values().next().unwrap().exec.stream_progress().returned
             && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-                matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
-            )).await;
+                matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
+            )
+        })
+        .await;
         agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
@@ -1121,7 +1124,7 @@ pub(in crate::agent) mod tests {
                 until(&mut agent, |agent| {
                     agent.streams.values().next().unwrap().exec.stream_progress().returned
                         && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
-                            matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
+                            matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
                         })
                 }).await;
                 let decision = agent.decide(UnixMs::now());

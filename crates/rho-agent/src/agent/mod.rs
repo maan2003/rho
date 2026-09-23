@@ -25,7 +25,6 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_tools::{PythonCell, ReplyState, SourceWaker};
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageDelivery, MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall,
@@ -35,6 +34,7 @@ use rho_core::{
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
+use rho_notebook::{PythonCell, ReplyState, SourceWaker};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::boundary::{
@@ -81,7 +81,7 @@ pub(crate) struct MailItem {
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
-    notebook: Arc<rho_agent_tools::PythonNotebook>,
+    notebook: Arc<rho_notebook::PythonNotebook>,
     prompt: PromptInputs,
 }
 
@@ -476,11 +476,11 @@ impl RunningExec {
             .sources()
             .into_iter()
             .map(|(_, facts)| match facts {
-                rho_agent_tools::SourceFacts::Cell(facts) => SourceKind::Cell {
+                rho_notebook::SourceFacts::Cell(facts) => SourceKind::Cell {
                     facts,
                     latest: false,
                 },
-                rho_agent_tools::SourceFacts::Job(facts) => SourceKind::Job { facts },
+                rho_notebook::SourceFacts::Job(facts) => SourceKind::Job { facts },
             })
     }
 }
@@ -539,7 +539,7 @@ pub(crate) struct Agent {
     /// until it has spoken once — after a restart included, which is safe
     /// because no tool survives one.
     turn: Option<ModelTurn>,
-    latest_python_exec: Option<(ToolCallId, Arc<rho_agent_tools::PythonExec>)>,
+    latest_python_exec: Option<(ToolCallId, Arc<rho_notebook::PythonExec>)>,
     /// Cumulative provider-reported usage across this agent's requests.
     total_usage: AgentUsageBucket,
     name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
@@ -1877,7 +1877,7 @@ fn surface(
 ) -> anyhow::Result<Surface> {
     let (shell, others) = host_tools(&view, role, agent_id, inference, team, host);
     let notebook = Arc::new(
-        rho_agent_tools::PythonNotebook::new(shell, others)
+        rho_notebook::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
     );
     Ok(Surface {

@@ -81,7 +81,10 @@ class Owner:
         if work and self.error is None:
             self.error = 'CancelledError'
         for item in work:
-            item.cancel()
+            # A task's scheduled step delivers the cancellation the task
+            # itself receives; cancelling the step would strand the task.
+            if not isinstance(getattr(getattr(item, '_callback', None), '__self__', None), asyncio.Task):
+                item.cancel()
 
 
 def fileno(fd):
@@ -169,14 +172,13 @@ class NotebookEventLoop(asyncio.SelectorEventLoop):
         return task
 
     def call_exception_handler(self, context):
-        """Report a failure to the cell whose task or callback failed: asyncio
-        runs only custom handlers in the failing work's context."""
+        """Report a failure to the cell whose task or callback failed, and
+        only to it: asyncio runs only custom handlers in the failing work's
+        context, and a task can be destroyed on any thread."""
         source = context.get('future') or context.get('handle')
         get_context = getattr(source, 'get_context', None)
         source_context = get_context() if get_context else getattr(source, '_context', None)
         owner = source_context.get(CELL) if source_context is not None else None
-        if owner is None or CELL.get() is not None:
-            return super().call_exception_handler(context)
         token = CELL.set(owner)
         try:
             return super().call_exception_handler(context)
@@ -535,7 +537,7 @@ def render(text, max_tokens):
 def emit(text, max_tokens, important):
     owner = CELL.get()
     if owner is not None:
-        owner.cell.text(text, max_tokens, important)
+        owner.cell.text(text, important)
 
 
 class Output:
@@ -588,78 +590,6 @@ def suppress_tool_wakeups():
     owner = CELL.get()
     if owner is not None:
         owner.cell.suppress_tool_wakeups()
-
-
-def quiet(future):
-    if not future.cancelled():
-        future.exception()
-
-
-def host_function(path, detached):
-    def call(*args, **kwargs):
-        future = current_cell('Host functions are available').call(path, args, kwargs)
-        if detached:
-            # Nobody awaits it: take the outcome here so asyncio stays quiet.
-            future.add_done_callback(quiet)
-            return None
-        return future
-    call.__name__ = call.__qualname__ = path.rpartition('.')[2]
-    return call
-
-
-class Command:
-    """A managed command. Awaiting it waits for the command to end."""
-
-    def __init__(self, id, result=None):
-        self._id = id
-        self._result = result
-
-    @property
-    def id(self):
-        return self._id
-
-    @staticmethod
-    def from_session_id(session_id):
-        return Command(commands().command_find(int(session_id)))
-
-    def __await__(self):
-        if self._result is None:
-            self._result = commands().command_wait(self._id)
-        return asyncio.shield(self._result).__await__()
-
-    def more_output(self, *, max_tokens=None):
-        return commands().command_more_output(self._id, budget(max_tokens))
-
-    def cancel(self):
-        return commands().command_cancel(self._id)
-
-    def __repr__(self):
-        return f'<command {self._id}>'
-
-
-Command.__module__ = '__main__'
-
-
-def commands():
-    return current_cell('Commands are available')
-
-
-def command(cmd, *, workdir=None, max_tokens=None):
-    tokens = budget(max_tokens)
-    if not isinstance(cmd, str):
-        raise TypeError('command must be a string')
-    if workdir is not None and not isinstance(workdir, str):
-        raise TypeError('workdir must be a string')
-    id, result = commands().command_start(cmd, workdir, tokens)
-    return Command(id, result)
-
-
-def write_stdin(handle, chars):
-    if not isinstance(handle, Command):
-        raise TypeError('write_stdin() requires a Command handle')
-    if not isinstance(chars, str):
-        raise TypeError('chars must be a string')
-    return commands().command_write_stdin(handle.id, chars)
 
 
 HISTORY_FIELDS = (
@@ -736,40 +666,28 @@ class Transcript(Sequence):
 
 
 def namespace(exports):
-    """A notebook's globals, with the host functions it was given. Host
-    modules are importable from the notebook's code only."""
-    modules = {}
+    """A notebook's globals, with the objects its host exports. Those are
+    also importable, from the notebook's code only."""
+    modules = dict(exports)
 
     def notebook_import(name, globals=None, locals=None, fromlist=(), level=0):
         if level == 0 and name in modules:
             return modules[name]
         return builtins.__import__(name, globals, locals, fromlist, level)
 
-    ns = {
+    return {
         '__name__': '__main__',
         '__builtins__': dict(vars(builtins), __import__=notebook_import),
         'print': print,
         'notify': notify,
         'set_max_wait': set_max_wait,
         'suppress_tool_wakeups': suppress_tool_wakeups,
-        'command': command,
-        'write_stdin': write_stdin,
-        'Command': Command,
         'transcript': Transcript(),
         'asyncio': asyncio,
         'Path': pathlib.Path,
         'pathlib': pathlib,
+        **modules,
     }
-    for path, detached in exports:
-        module, _, name = path.rpartition('.')
-        function = host_function(path, detached)
-        if not module:
-            ns[name] = function
-            continue
-        if module not in modules:
-            modules[module] = ns[module] = types.ModuleType(module)
-        setattr(modules[module], name, function)
-    return ns
 
 
 sys.stdout = sys.__stdout__ = Output()

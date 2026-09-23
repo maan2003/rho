@@ -13,11 +13,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rho_agent_tools::{PythonCell, PythonExec, PythonNotebook, ReplyState, SourceWaker};
 use rho_claude::mcp::{reply, text_item, tool_result};
 #[cfg(test)]
 use rho_core::ToolOutputStatus;
 use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
+use rho_notebook::{PythonCell, PythonExec, PythonNotebook, ReplyState, SourceWaker};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -46,7 +46,6 @@ struct Cell {
 /// One notebook, its cells, and the exec call (if any) the CLI is waiting on.
 pub(crate) struct PythonHost {
     tool: PythonNotebook,
-    /// The host functions the notebook exposes, for the prompt.
     /// Woken by any cell with something new; the loop asks the boundary.
     notify: Arc<Notify>,
     cells: BTreeMap<u64, Cell>,
@@ -198,10 +197,10 @@ impl PythonHost {
                     .sources()
                     .into_iter()
                     .map(|(_, facts)| match facts {
-                        rho_agent_tools::SourceFacts::Cell(facts) => {
+                        rho_notebook::SourceFacts::Cell(facts) => {
                             SourceKind::Cell { facts, latest }
                         }
-                        rho_agent_tools::SourceFacts::Job(facts) => SourceKind::Job { facts },
+                        rho_notebook::SourceFacts::Job(facts) => SourceKind::Job { facts },
                     }),
             );
         }

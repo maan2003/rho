@@ -22,11 +22,13 @@ chrono = "0.4"
 dirs.workspace = true
 futures.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
+pyo3.workspace = true
+pythonize.workspace = true
 rand.workspace = true
 redb.workspace = true
 rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
 redb-derive = "0.1"
-rho-agent-tools.workspace = true
+rho-notebook.workspace = true
 rho-claude.workspace = true
 rho-context-config.workspace = true
 rho-core.workspace = true

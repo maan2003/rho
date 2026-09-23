@@ -1,0 +1,545 @@
+//! One cell: its Rust-owned state, what its kernel reports into it, and
+//! how it answers the agent loop.
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::PyTuple;
+use rho_core::{ExecId, ToolOutput, ToolOutputStatus, UnixMs};
+use rho_tool_shell::{BoundedOutput, decode_output_lossy};
+
+use crate::commands::{CommandExit, session_id};
+use crate::history::HistorySnapshot;
+use crate::notebook::{ExecState, PythonStreamProgress, Shared};
+use crate::runtime::Input;
+use crate::{JobEnd, output};
+
+pub struct PythonExec {
+    pub(crate) id: ExecId,
+    pub(crate) cell: u64,
+    pub(crate) link: Arc<Mutex<ExecState>>,
+    pub(crate) shared: Arc<Shared>,
+    /// The transcript as it was when the cell was admitted.
+    pub(crate) history: Arc<HistorySnapshot>,
+}
+
+impl PythonExec {
+    pub fn id(&self) -> &ExecId {
+        &self.id
+    }
+
+    pub fn stream_progress(&self) -> PythonStreamProgress {
+        let state = self.link.lock().unwrap();
+        PythonStreamProgress {
+            returned: state.returned.is_some(),
+            ..state.stream
+        }
+    }
+
+    /// Snapshot recovery facts and acknowledge their notification together,
+    /// without acknowledging output or changing execution admission.
+    pub fn take_stream_report(&self) -> PythonStreamProgress {
+        let mut state = self.link.lock().unwrap();
+        let progress = PythonStreamProgress {
+            returned: state.returned.is_some(),
+            ..state.stream
+        };
+        state.stream.recovery = false;
+        progress
+    }
+
+    pub fn feed(&self, source: String, eof: bool) -> Result<(), String> {
+        let state = self.link.lock().unwrap();
+        if state.stream.stopped || state.returned.is_some() {
+            return Ok(());
+        }
+        self.shared.send(Input::StreamFeed {
+            cell: self.cell,
+            source,
+            eof,
+        })
+    }
+
+    /// The caller has chosen to allow execution. Admit at most one ready unit;
+    /// this method owns progress bookkeeping, not scheduling policy.
+    pub fn admit_stream_unit(&self) -> Result<(), String> {
+        let mut state = self.link.lock().unwrap();
+        let progress = &state.stream;
+        let Some(end) = progress.ready else {
+            return Ok(());
+        };
+        if state.returned.is_some()
+            || progress.stopped
+            || progress.settled != progress.admitted
+            || end <= progress.admitted
+        {
+            return Ok(());
+        }
+        state.stream.admitted = end;
+        let result = self.shared.send(Input::StreamPermit {
+            cell: self.cell,
+            end,
+        });
+        if result.is_err() {
+            state.stream.stopped = true;
+            state.stream.recovery = true;
+        }
+        drop(state);
+        if result.is_err() {
+            self.stop_stream();
+        }
+        result
+    }
+
+    /// Stop source admission, not the active unit or its managed commands.
+    pub fn stop_stream(&self) {
+        self.link.lock().unwrap().stream.stopped = true;
+        let _ = self.shared.send(Input::StreamStop { cell: self.cell });
+    }
+
+    /// Provider interruption stops source admission, not execution. The
+    /// notebook owns the explanation in its first leased contribution.
+    pub fn interrupt_stream(&self) {
+        self.link.lock().unwrap().stream.interrupted = true;
+        self.stop_stream();
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.cell
+    }
+
+    /// All Python activity and host operations have stopped; output may still
+    /// need draining. Distinct from the submitted code's return.
+    pub fn quiescent(&self) -> bool {
+        self.link.lock().unwrap().closed()
+    }
+
+    pub fn facts(&self) -> crate::CellFacts {
+        let state = self.link.lock().unwrap();
+        crate::CellFacts {
+            cell: self.cell,
+            started: state.started,
+            returned: state.returned,
+            failed: state.failed,
+            output_since: state.since,
+            notified_at: state.notified,
+            checkin: state.checkin,
+            foreground_cell: self.shared.foreground_cell.load(Ordering::Relaxed),
+        }
+    }
+}
+/// A cell as the agent loop holds it: its execution, and the output it
+/// has leased and not yet had acknowledged.
+pub struct PythonCell(Arc<PythonExec>, Option<ToolOutput>);
+
+impl PythonCell {
+    pub(crate) fn new(exec: Arc<PythonExec>) -> Self {
+        Self(exec, None)
+    }
+}
+
+impl std::ops::Deref for PythonCell {
+    type Target = PythonExec;
+    fn deref(&self) -> &PythonExec {
+        &self.0
+    }
+}
+
+/// The running code's cell: every host call names the cell it belongs to.
+pub(crate) fn current(py: Python<'_>, purpose: &str) -> PyResult<Arc<PythonExec>> {
+    let owner = crate::interpreter::kernel(py)?
+        .getattr("CELL")?
+        .call_method0("get")?;
+    if owner.is_none() {
+        return Err(PyRuntimeError::new_err(format!(
+            "{purpose} only while a cell runs"
+        )));
+    }
+    Ok(Arc::clone(
+        &owner.getattr("cell")?.cast_into::<Cell>()?.get().exec,
+    ))
+}
+
+/// A cell as its kernel sees it: where its events go.
+#[pyclass(frozen)]
+pub(crate) struct Cell {
+    exec: Arc<PythonExec>,
+}
+
+impl Cell {
+    pub(crate) fn new(exec: Arc<PythonExec>) -> Self {
+        Self { exec }
+    }
+
+    /// The cell's state, unless it has already finished: whatever arrives
+    /// after that has nowhere to go.
+    fn state(&self) -> Option<MutexGuard<'_, ExecState>> {
+        let state = self.exec.link.lock().unwrap();
+        state.finished.is_none().then_some(state)
+    }
+}
+
+#[pymethods]
+impl Cell {
+    #[getter]
+    fn id(&self) -> u64 {
+        self.exec.cell
+    }
+
+    fn started(&self) {
+        if let Some(mut state) = self.state() {
+            state.started = true;
+            state.waker.wake();
+        }
+    }
+
+    fn unit_ready(&self, end: usize) {
+        if let Some(mut state) = self.state() {
+            state.stream.ready = Some(end);
+            state.waker.wake();
+        }
+    }
+
+    fn unit_settled(&self, end: usize, error: Option<String>) {
+        let Some(mut state) = self.state() else {
+            return;
+        };
+        let progress = &mut state.stream;
+        if end > progress.settled {
+            progress.settled = end;
+            progress.recovery |= progress.stopped;
+            if error.is_none() {
+                progress.completed = end;
+            } else {
+                progress.stopped = true;
+            }
+        }
+        state.waker.wake();
+        drop(state);
+        if error.is_some() {
+            self.exec.stop_stream();
+        }
+    }
+
+    fn returned(&self, error: Option<String>) {
+        let Some(mut state) = self.state() else {
+            return;
+        };
+        state.returned = Some(UnixMs::now());
+        if let Some(error) = &error {
+            state.fail(error);
+        }
+        state.returned_error = error;
+        state.waker.wake();
+    }
+
+    /// Everything the cell started has ended. `error` repeats the return's
+    /// error, if any, before what failed later.
+    fn finished(&self, error: Option<String>) {
+        let Some(mut state) = self.state() else {
+            return;
+        };
+        if let Some(error) = error {
+            let error = state
+                .returned_error
+                .as_ref()
+                .and_then(|root| error.strip_prefix(root))
+                .unwrap_or(&error)
+                .trim_start_matches('\n')
+                .to_owned();
+            if !error.is_empty() {
+                state.fail(&error);
+            }
+        }
+        state.finished = Some(UnixMs::now());
+        if state.returned.is_none() {
+            state.returned = state.finished;
+        }
+        state.waker.wake();
+    }
+
+    fn text(&self, text: &str, important: bool) {
+        if let Some(mut state) = self.state() {
+            state.write(text, important);
+        }
+    }
+
+    fn max_wait(&self, seconds: u64) {
+        if let Some(mut state) = self.state() {
+            state.checkin.get_or_insert_default().after = std::time::Duration::from_secs(seconds);
+            state.waker.wake();
+        }
+    }
+
+    fn suppress_tool_wakeups(&self) {
+        if let Some(mut state) = self.state() {
+            state.checkin.get_or_insert_default().wake_on_tools = false;
+            state.waker.wake();
+        }
+    }
+
+    fn history_len(&self) -> usize {
+        self.exec.history.len()
+    }
+
+    fn history_get<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyTuple>> {
+        self.exec.history.get(py, index)
+    }
+}
+
+impl PythonCell {
+    /// Whether any other live cell has something unsent, which the same
+    /// reply will carry after this cell's own answer.
+    fn others_have_news(&self) -> bool {
+        self.shared
+            .cells
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| **id != self.cell)
+            .any(|(_, state)| state.lock().unwrap().has_news())
+    }
+
+    /// Everything unsent, in one block: the cell's own output first, then
+    /// each job's. A job is announced as running the first time a reply goes
+    /// out while it is, under a session ID its later pieces name again; a job
+    /// that ends before any reply is only ever reported finished. Delivered
+    /// once and then forgotten.
+    fn render(&mut self, first: bool) -> Option<ToolOutput> {
+        let mut cell = self.link.lock().unwrap();
+        let mut chunks = Vec::new();
+        if !cell.output.is_empty() {
+            chunks.push(decode_output_lossy(
+                std::mem::replace(&mut cell.output, BoundedOutput::for_tokens(Some(10000)))
+                    .into_bytes(),
+            ));
+        }
+        cell.since = None;
+        cell.notified = None;
+        let mut sources = Vec::new();
+        // Output from a cell two or more turns back names its command, so
+        // the model can place it without its own turn for context.
+        let old = self.shared.next_cell.load(Ordering::Relaxed) > self.cell + 2;
+        cell.operations.retain(|op| {
+            let mut op = op.lock().unwrap();
+            if op.finished.is_some() {
+                let output = decode_output_lossy(
+                    std::mem::replace(&mut op.output, BoundedOutput::for_tokens(Some(10000)))
+                        .into_bytes(),
+                );
+                let mut parts = Vec::new();
+                if op.announced {
+                    parts.push(format!("Session ID: {}", session_id(op.id)));
+                }
+                parts.push(format!("Operation {} completed", op.name));
+                if !output.is_empty() {
+                    parts.push(format!("Output:\n{output}"));
+                }
+                sources.push((op.id, parts.join("\n")));
+                false
+            } else {
+                if !op.announced {
+                    op.announced = true;
+                    sources.push((
+                        op.id,
+                        format!(
+                            "Operation {} running in background with session ID {}",
+                            op.name,
+                            session_id(op.id)
+                        ),
+                    ));
+                }
+                true
+            }
+        });
+        cell.jobs.retain(|job| {
+            let mut state = job.state.lock().unwrap();
+            let has_output = !state.unsent.is_empty();
+            let finished = state.finished.clone();
+            let announce = finished.is_none() && !state.announced;
+            if !has_output && finished.is_none() && !announce {
+                return true;
+            }
+            let mut parts = Vec::new();
+            if let Some((_, result)) = &finished {
+                if state.announced {
+                    parts.push(format!("Session ID: {}", session_id(job.id)));
+                }
+                parts.push(match result {
+                    Ok(CommandExit {
+                        exit_code: Some(exit_code),
+                        ..
+                    }) => format!("Process exited with code {exit_code}"),
+                    Ok(CommandExit {
+                        exit_code: None, ..
+                    }) => "Process ended without an exit code".to_owned(),
+                    Err(error) => format!("Command failed: {error}"),
+                });
+            } else {
+                state.announced = true;
+                parts.push(format!(
+                    "Command running in background with session ID {}",
+                    session_id(job.id)
+                ));
+            }
+            if old {
+                parts.push(format!("Command: {}", job.name));
+            }
+            if has_output {
+                // A reply and an explicit `more_output` share one cursor, so a read
+                // after an automatic report carries on from where the report
+                // stopped instead of repeating it. A report that dropped its
+                // own middle showed only a sample, so it leaves the cursor
+                // alone and `display` can still page the whole span.
+                let complete = !state.unsent.is_truncated();
+                let output = decode_output_lossy(
+                    std::mem::replace(
+                        &mut state.unsent,
+                        BoundedOutput::for_tokens(Some(job.budget)),
+                    )
+                    .into_bytes(),
+                );
+                if complete {
+                    state.cursor = state.len;
+                }
+                parts.push(format!("Output:\n{output}"));
+            }
+            state.since = None;
+            sources.push((job.id, parts.join("\n")));
+            if finished.is_some() {
+                state.delivered = true;
+                false
+            } else {
+                true
+            }
+        });
+        sources.sort_by_key(|(id, _)| *id);
+        chunks.extend(sources.into_iter().map(|(_, text)| text));
+        let closed = cell.closed();
+        if closed {
+            cell.delivered = true;
+        }
+        if chunks.is_empty() {
+            if !first {
+                return None;
+            }
+            // The call's one required answer, in the notebook's own words
+            // (`DECISION-the-core-never-speaks-for-a-tool`): a silent cell
+            // whose work is over, or one whose work is still going. Unless an
+            // older cell speaks in the same reply: then the silence is not
+            // the news, and this cell adds nothing to it.
+            if !self.others_have_news() {
+                chunks.push(
+                    if closed {
+                        "No output."
+                    } else {
+                        "No output yet. Output and completion arrive automatically."
+                    }
+                    .into(),
+                );
+            }
+        }
+        let mut result = output(
+            chunks.join("\n"),
+            if *cell.cancelled.borrow() {
+                ToolOutputStatus::Cancelled
+            } else if cell.error {
+                ToolOutputStatus::Error
+            } else {
+                ToolOutputStatus::Success
+            },
+        );
+        if first && cell.stream.interrupted {
+            let execution = if result.status == ToolOutputStatus::Cancelled {
+                "Execution was cancelled."
+            } else {
+                "Execution was not cancelled."
+            };
+            result.output = Arc::new(format!(
+                "Your response was interrupted while generating this tool call. {execution} Continue from the existing state without replaying this call.\n\n{}",
+                result.output,
+            ));
+        }
+        result.images = Arc::new(std::mem::take(&mut cell.images));
+        Some(result)
+    }
+}
+impl PythonCell {
+    pub fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+        use crate::{JobFacts, SourceFacts};
+        // Keep the cell marker distinct from zero-based host request IDs.
+        let mut sources = vec![(u64::MAX, SourceFacts::Cell(self.facts()))];
+        let cell = self.link.lock().unwrap();
+        sources.extend(cell.jobs.iter().map(|job| {
+            let state = job.state.lock().unwrap();
+            (
+                job.id,
+                SourceFacts::Job(JobFacts {
+                    cell: self.cell,
+                    registered_at: state.registered_at,
+                    output_since: state.since,
+                    finished: state.finished.as_ref().map(|(at, _)| JobEnd {
+                        at: *at,
+                        failed: state.failed,
+                    }),
+                }),
+            )
+        }));
+        sources.extend(cell.operations.iter().map(|operation| {
+            let operation = operation.lock().unwrap();
+            (
+                operation.id,
+                SourceFacts::Job(JobFacts {
+                    cell: self.cell,
+                    registered_at: operation.registered_at,
+                    output_since: None,
+                    finished: operation.finished.map(|at| JobEnd {
+                        at,
+                        failed: operation.failed,
+                    }),
+                }),
+            )
+        }));
+        sources
+    }
+    pub fn execution(&self) -> Arc<PythonExec> {
+        self.0.clone()
+    }
+    pub fn done(&self) -> bool {
+        self.1.is_none() && self.link.lock().unwrap().delivered
+    }
+    /// Lease the first contribution. Repeated reads return this same snapshot
+    /// until its owner has committed or handed it off and acknowledges it.
+    pub fn first_output(&mut self) -> ToolOutput {
+        if self.1.is_none() {
+            self.1 = self.render(true);
+        }
+        self.1.clone().expect("a first contribution always exists")
+    }
+    pub fn more_output(&mut self) -> Option<ToolOutput> {
+        if self.1.is_none() {
+            self.1 = self.render(false);
+        }
+        self.1.clone()
+    }
+    /// Release a leased contribution only after its recipient owns it.
+    pub fn acknowledge_output(&mut self) -> bool {
+        self.1.take().is_some()
+    }
+    pub fn cancel(&mut self) {
+        let _ = self.shared.send(Input::Cancel { cell: self.cell });
+        self.link.lock().unwrap().cancelled.send_replace(true);
+        for job in &self.link.lock().unwrap().jobs {
+            job.cancel.notify_one();
+        }
+    }
+}
+impl Drop for PythonCell {
+    fn drop(&mut self) {
+        if !self.done() {
+            self.cancel();
+        }
+        self.shared.cells.lock().unwrap().remove(&self.cell);
+    }
+}

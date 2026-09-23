@@ -12220,10 +12220,11 @@ dependencies = [
  "image",
  "libc",
  "prefix-id",
+ "pyo3",
+ "pythonize",
  "rand 0.8.7",
  "redb",
  "redb-derive",
- "rho-agent-tools",
  "rho-claude",
  "rho-context-config",
  "rho-core",
@@ -12231,6 +12232,7 @@ dependencies = [
  "rho-fs-view",
  "rho-image",
  "rho-inference",
+ "rho-notebook",
  "rho-rpc",
  "rho-shell",
  "rho-shell-proto",
@@ -12247,26 +12249,6 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
-]
-
-[[package]]
-name = "rho-agent-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "camino",
- "futures",
- "rho-core",
- "rho-fs-view",
- "rho-python",
- "rho-tool-shell",
- "rho-web-search",
- "senax-encoder",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -12865,6 +12847,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-notebook"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "camino",
+ "libc",
+ "pyo3",
+ "rho-core",
+ "rho-fs-view",
+ "rho-tool-shell",
+ "senax-encoder",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-openai-realtime"
 version = "0.1.0"
 dependencies = [
@@ -12911,19 +12910,6 @@ dependencies = [
  "flate2",
  "libc",
  "tempfile",
-]
-
-[[package]]
-name = "rho-python"
-version = "0.1.0"
-dependencies = [
- "libc",
- "pyo3",
- "pythonize",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
