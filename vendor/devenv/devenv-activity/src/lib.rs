@@ -40,7 +40,6 @@ mod events;
 mod handle;
 mod instrument;
 mod propagation;
-mod serde_valuable;
 mod stack;
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
@@ -69,7 +68,13 @@ pub use builders::{
 
 // Functions
 pub use handle::{ActivityGuard, ActivityHandle, init};
-pub use serde_valuable::SerdeValuable;
+
+/// Serialize an activity event for the `event` field of a
+/// `devenv_activity::events` tracing event.
+#[doc(hidden)]
+pub fn event_json<T: serde::Serialize + ?Sized>(event: &T) -> String {
+    serde_json::to_string(event).unwrap_or_default()
+}
 pub use stack::{
     append_eval_log, append_eval_op, current_activity_id, current_activity_level,
     emit_task_hierarchy, log_to_task, message, message_with_details, set_expected,

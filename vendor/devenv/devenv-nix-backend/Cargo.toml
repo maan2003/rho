@@ -6,24 +6,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-serde_json.workspace = true
-async-trait.workspace = true
-cstr.workspace = true
 miette.workspace = true
-serde.workspace = true
-ser_nix.workspace = true
-include_dir.workspace = true
-tracing.workspace = true
-once_cell.workspace = true
 opentelemetry.workspace = true
-tokio.workspace = true
-uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 devenv-core.workspace = true
-devenv-cache-core.workspace = true
-devenv-eval-cache.workspace = true
-devenv-activity.workspace = true
-sqlx.workspace = true
 
 # Dependencies to nix-bindings-rust crates
 nix-bindings-flake.workspace = true
@@ -32,16 +21,8 @@ nix-bindings-store.workspace = true
 nix-bindings-util.workspace = true
 nix-bindings-fetchers.workspace = true
 nix-bindings-bindgen-raw.workspace = true
-nix-cmd.workspace = true
-nix.workspace = true
-tempfile.workspace = true
-
-[dev-dependencies]
-devenv-nix-backend-macros.workspace = true
-tempfile.workspace = true
-tokio.workspace = true
+nix = { workspace = true, features = ["resource"] }
 
 [features]
-default = []
-test-all = ["test-nix-store"]
+# Tests that need a working Nix store.
 test-nix-store = []

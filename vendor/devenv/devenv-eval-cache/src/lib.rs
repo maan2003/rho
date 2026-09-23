@@ -1,25 +1,9 @@
-pub mod caching_eval;
+//! Cache of evaluated development shells, keyed so that every checkout and
+//! worktree of a flake can share entries. See [`inputs`] for how evaluation
+//! effects become checkout-independent inputs and [`db`] for storage.
+
 pub mod db;
-pub mod eval_context;
-pub mod eval_inputs;
-pub mod ffi_cache;
-pub mod resource_manager;
+pub mod inputs;
 
-pub use devenv_core::eval_op::{EvalOp, OpObserver};
-pub use devenv_core::internal_log;
-pub use devenv_core::internal_log::{ActivityType, Field, InternalLog, ResultType, Verbosity};
-pub use eval_inputs::{
-    EnvInputDesc, FileInputDesc, FileState, Input, check_env_state, check_file_state,
-    has_file_content_changed, truncate_to_seconds,
-};
-
-pub use caching_eval::{
-    CacheError, CachedEval, CachedEvalResult, CachingEvalService, CachingEvalState, Error,
-    UncachedEvalState, UncachedReason,
-};
-pub use eval_context::EvalContext;
-pub use ffi_cache::{CachingConfig, EvalCacheKey, EvalInputTracker, ops_to_inputs};
-pub use resource_manager::{EvalResourceRegistry, EvalResourceSpec};
-
-// Re-export database query functions for file tracking
-pub use db::{get_all_tracked_file_paths, get_file_inputs_by_key_hash};
+pub use db::{CacheKey, CachedShell, EnvCache};
+pub use inputs::{FlakeScheme, FlakeView, Input, InputId, Kind, RecordError, Recorded, Root, record_inputs};

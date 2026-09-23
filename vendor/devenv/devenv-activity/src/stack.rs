@@ -74,7 +74,7 @@ pub(crate) fn send_activity_event(event: ActivityEvent) {
 /// implemented, while `source.file` and `source.line` carry the tracked public
 /// API caller.
 ///
-/// The event is passed to tracing as a borrowed [`SerdeValuable`](crate::SerdeValuable).
+/// The event is passed to tracing as a JSON string in the `event` field.
 /// Nothing is serialized here: a layer that wants the payload walks the typed
 /// event itself when it visits the `event` field.
 #[doc(hidden)]
@@ -85,11 +85,11 @@ macro_rules! __trace_activity_event {
             target: "devenv_activity::events",
             tracing::Level::DEBUG
         ) {
-            let __event = $crate::SerdeValuable($event);
+            let __event = $crate::event_json($event);
             tracing::debug!(
                 target: "devenv_activity::events",
                 parent: $parent,
-                event = __event.as_tracing_value(),
+                event = %__event,
                 source.file = $caller.file(),
                 source.line = $caller.line() as u64,
                 source.column = $caller.column() as u64,
@@ -101,10 +101,10 @@ macro_rules! __trace_activity_event {
             target: "devenv_activity::events",
             tracing::Level::DEBUG
         ) {
-            let __event = $crate::SerdeValuable($event);
+            let __event = $crate::event_json($event);
             tracing::debug!(
                 target: "devenv_activity::events",
-                event = __event.as_tracing_value(),
+                event = %__event,
                 source.file = $caller.file(),
                 source.line = $caller.line() as u64,
                 source.column = $caller.column() as u64,

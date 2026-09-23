@@ -5,23 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-devenv-activity.workspace = true
-devenv-cache-core.workspace = true
+blake3.workspace = true
 devenv-core.workspace = true
-ser_nix.workspace = true
-futures.workspace = true
-hex.workspace = true
-miette.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-sqlx.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[features]
-default = []

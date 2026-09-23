@@ -3,7 +3,6 @@ resolver = "2"
 members = [
   "devenv-activity",
   "devenv-activity-macros",
-  "devenv-cache-core",
   "devenv-core",
   "devenv-eval-cache",
   "devenv-nix-backend",
@@ -23,7 +22,6 @@ devenv-activity-macros = { path = "devenv-activity-macros" }
 devenv-core = { path = "devenv-core" }
 devenv-eval-cache = { path = "devenv-eval-cache" }
 devenv-nix-backend = { path = "devenv-nix-backend" }
-devenv-cache-core = { path = "devenv-cache-core" }
 
 nix-bindings-flake = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-expr = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
@@ -133,6 +131,7 @@ which = "8.0.2"
 whoami = "2.1.2"
 xdg = "3.0.0"
 walkdir = "2.5"
+rusqlite = { version = "0.40", features = ["bundled"] }
 globset = "0.4"
 url = "2"
 human-repr = "1.1"
@@ -180,23 +179,3 @@ tracing-opentelemetry = "0.33"
 iocraft = { version = "=0.8.3", features = ["unstable-output-streams"] }
 crossterm = "0.29.0"
 
-[patch.crates-io]
-# https://github.com/crossterm-rs/crossterm/pull/1026
-crossterm = { git = "https://github.com/cachix/crossterm", branch = "0.29-cachix" }
-
-# Improve performance of test runs
-[profile.dev.package]
-insta.opt-level = 3
-similar.opt-level = 3
-
-[profile.release]
-lto = "thin"
-panic = "abort"
-strip = true
-
-# A profiling release build that retains debug symbols for better backtraces
-[profile.profiling]
-inherits = "release"
-debug = true
-strip = false
-lto = false

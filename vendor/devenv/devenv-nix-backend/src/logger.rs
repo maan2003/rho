@@ -21,7 +21,7 @@
 //! This is handled automatically by the `EvalSession` RAII wrapper in the backend.
 
 use devenv_core::nix_log_bridge::{NixLogBridge, activity_type_from_str, result_type_from_str};
-use devenv_eval_cache::internal_log::{Field, InternalLog, Verbosity};
+use devenv_core::internal_log::{Field, InternalLog, Verbosity};
 use miette::Result;
 use nix_bindings_expr::logger::ActivityLoggerBuilder;
 use nix_bindings_util::context::Context;

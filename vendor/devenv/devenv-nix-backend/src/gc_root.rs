@@ -25,16 +25,6 @@ pub(crate) enum GcRootOutcome {
     Invalid,
 }
 
-impl GcRootOutcome {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::Unchanged => "unchanged",
-            Self::Replaced => "replaced",
-            Self::Invalid => "invalid",
-        }
-    }
-}
 
 /// Point `gc_root` at `store_path` and register it with Nix.
 ///

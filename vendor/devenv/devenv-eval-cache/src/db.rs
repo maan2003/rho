@@ -1,885 +1,363 @@
-use crate::eval_inputs::{EnvInputDesc, FileInputDesc, Input};
-use devenv_cache_core::{file::TrackedFile, time};
-use sqlx::sqlite::{Sqlite, SqliteRow};
-use sqlx::{Acquire, Row, SqlitePool};
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+//! SQLite store of evaluated development shells.
+//!
+//! A cache key names everything an evaluation depends on that is not a
+//! recorded input: the shell attribute, the system, how the flake is fetched,
+//! `flake.lock`, and the evaluator version. One key can hold several
+//! candidates, one per distinct input state seen (for example two worktrees
+//! on different branches); [`EnvCache::lookup`] returns the most recently
+//! used candidate whose inputs all still match.
 
-/// Convert an empty string to `None`, non-empty to `Some`.
-pub(crate) fn empty_to_none(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
-}
+use std::collections::HashMap;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// Create a constant for embedded migrations
-pub const MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!();
+use rusqlite::{Connection, OptionalExtension as _, params};
 
-/// The row type for the `file_input` table.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FileInputRow {
-    /// A path
-    pub path: PathBuf,
-    /// Whether the path is a directory
-    pub is_directory: bool,
-    /// Whether a directory is hashed recursively over its contents
-    pub recursive: bool,
-    /// The hash of the file's content
-    pub content_hash: String,
-    /// The last modified time of the file
-    pub modified_at: SystemTime,
-    /// The last time the row was updated
-    pub updated_at: SystemTime,
-}
+use crate::inputs::{FlakeScheme, FlakeView, Input, InputId, Kind, Root};
 
-impl sqlx::FromRow<'_, SqliteRow> for FileInputRow {
-    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
-        let path: &[u8] = row.get("path");
-        let is_directory: bool = row.get("is_directory");
-        let recursive: bool = row.get("recursive");
-        let content_hash: String = row.get("content_hash");
-        let modified_at: i64 = row.get("modified_at");
-        let updated_at: i64 = row.get("updated_at");
-        Ok(Self {
-            path: PathBuf::from(OsStr::from_bytes(path)),
-            is_directory,
-            recursive,
-            content_hash,
-            modified_at: time::system_time_from_unix_seconds(modified_at),
-            updated_at: time::system_time_from_unix_seconds(updated_at),
-        })
-    }
-}
+/// Candidates kept per key; older ones are evicted on store.
+const MAX_CANDIDATES: i64 = 8;
 
-// Helper method to convert a FileInputRow to a TrackedFile
-impl FileInputRow {
-    pub fn to_tracked_file(&self) -> TrackedFile {
-        TrackedFile {
-            path: self.path.clone(),
-            is_directory: self.is_directory,
-            content_hash: Some(self.content_hash.clone()),
-            modified_at: self.modified_at,
-            checked_at: self.updated_at,
-        }
-    }
-}
+const SCHEMA_VERSION: i64 = 1;
+const SCHEMA: &str = "
+CREATE TABLE shell (
+  id             INTEGER NOT NULL PRIMARY KEY,
+  key_hash       TEXT NOT NULL,
+  drv_path       TEXT NOT NULL,
+  env_store_path TEXT NOT NULL,
+  env_json       TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  used_at        INTEGER NOT NULL
+);
+CREATE INDEX shell_key ON shell(key_hash, used_at);
 
-impl From<FileInputRow> for Input {
-    fn from(row: FileInputRow) -> Self {
-        Self::File(row.into())
-    }
-}
+CREATE TABLE shell_input (
+  shell_id INTEGER NOT NULL REFERENCES shell(id) ON DELETE CASCADE,
+  root     TEXT NOT NULL,
+  kind     TEXT NOT NULL,
+  path     TEXT NOT NULL,
+  state    TEXT NOT NULL,
+  PRIMARY KEY (shell_id, root, kind, path)
+) WITHOUT ROWID;
+";
 
-impl From<FileInputRow> for FileInputDesc {
-    fn from(row: FileInputRow) -> Self {
-        Self {
-            path: row.path,
-            is_directory: row.is_directory,
-            recursive: row.recursive,
-            content_hash: empty_to_none(row.content_hash),
-            modified_at: row.modified_at,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct EnvInputRow {
-    pub name: String,
-    pub content_hash: String,
-}
-
-impl sqlx::FromRow<'_, SqliteRow> for EnvInputRow {
-    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
-        let name: String = row.get("name");
-        let content_hash: String = row.get("content_hash");
-        Ok(Self { name, content_hash })
-    }
-}
-
-impl From<EnvInputRow> for Input {
-    fn from(row: EnvInputRow) -> Self {
-        Self::Env(row.into())
-    }
-}
-
-impl From<EnvInputRow> for EnvInputDesc {
-    fn from(row: EnvInputRow) -> Self {
-        Self {
-            name: row.name,
-            content_hash: empty_to_none(row.content_hash),
-        }
-    }
-}
-
-pub async fn update_file_modified_at<P: AsRef<Path>>(
-    pool: &SqlitePool,
-    path: P,
-    modified_at: SystemTime,
-) -> Result<(), sqlx::Error> {
-    let modified_at = time::system_time_to_unix_seconds(modified_at);
-    let now = time::now_as_unix_seconds();
-
-    sqlx::query(
-        r#"
-        UPDATE file_input
-        SET modified_at = ?, updated_at = ?
-        WHERE path = ?
-        "#,
-    )
-    .bind(modified_at)
-    .bind(now)
-    .bind(path.as_ref().to_path_buf().into_os_string().as_bytes())
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-// =============================================================================
-// Eval Cache Database Functions
-// =============================================================================
-
-/// The row type for the `cached_eval` table.
+/// Identity of an evaluation apart from its recorded inputs.
 #[derive(Clone, Debug)]
-pub struct EvalRow {
-    /// The primary key
-    pub id: i64,
-    /// A hash of the cache key (NixArgs + attr_name)
-    pub key_hash: String,
-    /// The attribute name being evaluated
-    pub attr_name: String,
-    /// A hash of the content hashes of the input files/envs
-    pub input_hash: String,
-    /// The JSON output of the evaluation
-    pub json_output: String,
-    /// The time the cached eval was checked or created
-    pub updated_at: SystemTime,
+pub struct CacheKey {
+    pub system: String,
+    pub shell: String,
+    pub scheme: FlakeScheme,
+    /// Contents of `flake.lock`, or `None` if the flake has none.
+    pub lock: Option<Vec<u8>>,
+    /// Anything else that changes evaluation results, such as the evaluator
+    /// and Nix versions.
+    pub evaluator: String,
 }
 
-impl sqlx::FromRow<'_, SqliteRow> for EvalRow {
-    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
-        let id: i64 = row.get("id");
-        let key_hash: String = row.get("key_hash");
-        let attr_name: String = row.get("attr_name");
-        let input_hash: String = row.get("input_hash");
-        let json_output: String = row.get("json_output");
-        let updated_at: i64 = row.get("updated_at");
-        Ok(Self {
-            id,
-            key_hash,
-            attr_name,
-            input_hash,
-            json_output,
-            updated_at: time::system_time_from_unix_seconds(updated_at),
-        })
+impl CacheKey {
+    pub fn hash(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        for part in [
+            "rho-dev-shell-v1",
+            &self.system,
+            &self.shell,
+            self.scheme.as_str(),
+            &self.evaluator,
+        ] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        match &self.lock {
+            Some(lock) => h.update(b"lock").update(blake3::hash(lock).as_bytes()),
+            None => h.update(b"nolock"),
+        };
+        h.finalize().to_hex().to_string()
     }
 }
 
-/// Get a cached eval by its key hash.
-pub async fn get_eval_by_key_hash<'a, A>(
-    conn: A,
-    key_hash: &str,
-) -> Result<Option<EvalRow>, sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    let record = sqlx::query_as(
-        r#"
-            SELECT *
-            FROM cached_eval
-            WHERE key_hash = ?
-        "#,
-    )
-    .bind(key_hash)
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    Ok(record)
+/// A cached shell as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedShell {
+    pub drv_path: String,
+    pub env_store_path: String,
+    pub env_json: String,
 }
 
-/// Insert a cached eval with its inputs (files and env vars).
-pub async fn insert_eval_with_inputs<'a, A>(
-    conn: A,
-    key_hash: &str,
-    attr_name: &str,
-    input_hash: &str,
-    json_output: &str,
-    inputs: &[Input],
-) -> Result<(i64, Vec<i64>, Vec<i64>), sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-    let mut tx = conn.begin().await?;
-
-    delete_eval(&mut tx, key_hash).await?;
-    let eval_id = insert_eval(&mut tx, key_hash, attr_name, input_hash, json_output).await?;
-
-    // Partition and extract file and env inputs
-    let (file_inputs, env_inputs) = Input::partition_refs(inputs);
-
-    let file_ids = insert_eval_file_inputs(&mut tx, &file_inputs, eval_id).await?;
-    let env_ids = insert_eval_env_inputs(&mut tx, &env_inputs, eval_id).await?;
-
-    tx.commit().await?;
-
-    Ok((eval_id, file_ids, env_ids))
+pub struct EnvCache {
+    conn: Connection,
 }
 
-async fn insert_eval<'a, A>(
-    conn: A,
-    key_hash: &str,
-    attr_name: &str,
-    input_hash: &str,
-    json_output: &str,
-) -> Result<i64, sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    let record = sqlx::query(
-        r#"
-        INSERT INTO cached_eval (key_hash, attr_name, input_hash, json_output)
-        VALUES (?, ?, ?, ?)
-        RETURNING id
-        "#,
-    )
-    .bind(key_hash)
-    .bind(attr_name)
-    .bind(input_hash)
-    .bind(json_output)
-    .fetch_one(&mut *conn)
-    .await?;
-
-    let id: i64 = record.get(0);
-    Ok(id)
-}
-
-pub(crate) async fn delete_eval<'a, A>(conn: A, key_hash: &str) -> Result<(), sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM cached_eval
-        WHERE key_hash = ?
-        "#,
-    )
-    .bind(key_hash)
-    .execute(&mut *conn)
-    .await?;
-
-    Ok(())
-}
-
-/// Update the updated_at timestamp for a cached eval.
-pub async fn update_eval_updated_at<'a, A>(conn: A, id: i64) -> Result<(), sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-    let now = time::now_as_unix_seconds();
-
-    sqlx::query(
-        r#"
-        UPDATE cached_eval
-        SET updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(now)
-    .bind(id)
-    .execute(&mut *conn)
-    .await?;
-
-    Ok(())
-}
-
-async fn insert_eval_file_inputs<'a, A>(
-    conn: A,
-    file_inputs: &[&FileInputDesc],
-    eval_id: i64,
-) -> Result<Vec<i64>, sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    // Reuse the same file_input table as command caching
-    let insert_file_input = r#"
-        INSERT INTO file_input (path, is_directory, recursive, content_hash, modified_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT (path) DO UPDATE
-        SET content_hash = excluded.content_hash,
-            is_directory = excluded.is_directory,
-            recursive = excluded.recursive,
-            modified_at = excluded.modified_at,
-            updated_at = ?
-        RETURNING id
-    "#;
-
-    let now = time::now_as_unix_seconds();
-    let mut file_ids = Vec::with_capacity(file_inputs.len());
-    for FileInputDesc {
-        path,
-        is_directory,
-        recursive,
-        content_hash,
-        modified_at,
-    } in file_inputs
-    {
-        let modified_at = time::system_time_to_unix_seconds(*modified_at);
-        let id: i64 = sqlx::query(insert_file_input)
-            .bind(path.to_path_buf().into_os_string().as_bytes())
-            .bind(is_directory)
-            .bind(recursive)
-            .bind(content_hash.as_deref().unwrap_or(""))
-            .bind(modified_at)
-            .bind(now)
-            .fetch_one(&mut *conn)
-            .await?
-            .get(0);
-        file_ids.push(id);
+impl EnvCache {
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        // WAL lets concurrent evaluators and validators share the file.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let mut cache = Self { conn };
+        cache.migrate()?;
+        Ok(cache)
     }
 
-    // Link to eval via eval_input_path table
-    let eval_input_path_query = r#"
-        INSERT INTO eval_input_path (cached_eval_id, file_input_id)
-        VALUES (?, ?)
-        ON CONFLICT (cached_eval_id, file_input_id) DO NOTHING
-    "#;
-
-    for &file_id in &file_ids {
-        sqlx::query(eval_input_path_query)
-            .bind(eval_id)
-            .bind(file_id)
-            .execute(&mut *conn)
-            .await?;
-    }
-    Ok(file_ids)
-}
-
-async fn insert_eval_env_inputs<'a, A>(
-    conn: A,
-    env_inputs: &[&EnvInputDesc],
-    eval_id: i64,
-) -> Result<Vec<i64>, sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    let insert_env_input = r#"
-        INSERT INTO eval_env_input (cached_eval_id, name, content_hash)
-        VALUES (?, ?, ?)
-        ON CONFLICT (cached_eval_id, name) DO UPDATE
-        SET content_hash = excluded.content_hash,
-            updated_at = ?
-        RETURNING id
-    "#;
-
-    let now = time::now_as_unix_seconds();
-    let mut env_input_ids = Vec::with_capacity(env_inputs.len());
-    for EnvInputDesc { name, content_hash } in env_inputs {
-        let id: i64 = sqlx::query(insert_env_input)
-            .bind(eval_id)
-            .bind(name)
-            .bind(content_hash.as_deref().unwrap_or(""))
-            .bind(now)
-            .fetch_one(&mut *conn)
-            .await?
-            .get(0);
-        env_input_ids.push(id);
+    fn migrate(&mut self) -> rusqlite::Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version != SCHEMA_VERSION {
+            // A cache: anything unknown is dropped rather than migrated.
+            tx.execute_batch("DROP TABLE IF EXISTS shell_input; DROP TABLE IF EXISTS shell;")?;
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        tx.commit()
     }
 
-    Ok(env_input_ids)
-}
+    /// Find a candidate for `key` whose inputs match `flake_dir` now.
+    pub fn lookup(
+        &self,
+        key: &CacheKey,
+        flake_dir: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> rusqlite::Result<Option<CachedShell>> {
+        let key_hash = key.hash();
+        let mut candidates = self.conn.prepare_cached(
+            "SELECT id FROM shell WHERE key_hash = ?1 ORDER BY used_at DESC, id DESC",
+        )?;
+        let ids: Vec<i64> = candidates
+            .query_map([&key_hash], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
 
-/// Get file inputs for a cached eval by eval ID.
-pub async fn get_files_by_eval_id(
-    pool: &SqlitePool,
-    eval_id: i64,
-) -> Result<Vec<FileInputRow>, sqlx::Error> {
-    let files = sqlx::query_as(
-        r#"
-            SELECT f.path, f.is_directory, f.recursive, f.content_hash, f.modified_at, f.updated_at
-            FROM file_input f
-            JOIN eval_input_path eip ON f.id = eip.file_input_id
-            WHERE eip.cached_eval_id = ?
-        "#,
-    )
-    .bind(eval_id)
-    .fetch_all(pool)
-    .await?;
+        let mut per_candidate = Vec::with_capacity(ids.len());
+        for id in &ids {
+            per_candidate.push((*id, self.inputs(*id)?));
+        }
+        let mut view = FlakeView::new(flake_dir, key.scheme);
+        if view
+            .prefetch(per_candidate.iter().flat_map(|(_, inputs)| inputs.iter().map(|i| &i.id)))
+            .is_err()
+        {
+            return Ok(None);
+        }
+        // Inputs repeat across candidates; compute each current state once.
+        let mut current: HashMap<InputId, Option<String>> = HashMap::new();
+        for (id, inputs) in per_candidate {
+            let matches = inputs.iter().all(|input| {
+                let state = current
+                    .entry(input.id.clone())
+                    .or_insert_with(|| view.state(&input.id, env).ok());
+                state.as_deref() == Some(input.state.as_str())
+            });
+            if matches {
+                self.conn.execute(
+                    "UPDATE shell SET used_at = ?2 WHERE id = ?1",
+                    params![id, now()],
+                )?;
+                return self
+                    .conn
+                    .query_row(
+                        "SELECT drv_path, env_store_path, env_json FROM shell WHERE id = ?1",
+                        [id],
+                        |r| {
+                            Ok(CachedShell {
+                                drv_path: r.get(0)?,
+                                env_store_path: r.get(1)?,
+                                env_json: r.get(2)?,
+                            })
+                        },
+                    )
+                    .optional();
+            }
+        }
+        Ok(None)
+    }
 
-    Ok(files)
-}
+    fn inputs(&self, shell_id: i64) -> rusqlite::Result<Vec<Input>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT root, kind, path, state FROM shell_input WHERE shell_id = ?1")?;
+        let rows = stmt.query_map([shell_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut inputs = Vec::new();
+        for row in rows {
+            let (root, kind, path, state) = row?;
+            let (Some(root), Some(kind)) = (Root::parse(&root), Kind::parse(&kind)) else {
+                // Unknown input kinds can never be validated; the candidate
+                // must not match.
+                inputs.push(Input {
+                    id: InputId { root: Root::Env, kind: Kind::Env, path: String::new() },
+                    state: "\0unknown".into(),
+                });
+                continue;
+            };
+            inputs.push(Input { id: InputId { root, kind, path }, state });
+        }
+        Ok(inputs)
+    }
 
-/// Get env inputs for a cached eval by eval ID.
-pub async fn get_envs_by_eval_id(
-    pool: &SqlitePool,
-    eval_id: i64,
-) -> Result<Vec<EnvInputRow>, sqlx::Error> {
-    let envs = sqlx::query_as(
-        r#"
-            SELECT e.name, e.content_hash
-            FROM eval_env_input e
-            WHERE e.cached_eval_id = ?
-        "#,
-    )
-    .bind(eval_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(envs)
-}
-
-// =============================================================================
-// Resource Spec Database Functions
-// =============================================================================
-
-/// Row type for resource specs.
-#[derive(Clone, Debug)]
-pub struct ResourceSpecRow {
-    pub type_id: String,
-    pub spec: String,
-}
-
-impl sqlx::FromRow<'_, SqliteRow> for ResourceSpecRow {
-    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
-        let type_id: String = row.get("type_id");
-        let spec: String = row.get("spec");
-        Ok(Self { type_id, spec })
+    /// Store a new candidate for `key`, evicting the least recently used beyond [`MAX_CANDIDATES`].
+    pub fn store(
+        &mut self,
+        key: &CacheKey,
+        inputs: &[Input],
+        shell: &CachedShell,
+    ) -> rusqlite::Result<()> {
+        let key_hash = key.hash();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now();
+        tx.execute(
+            "INSERT INTO shell (key_hash, drv_path, env_store_path, env_json, created_at, used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![key_hash, shell.drv_path, shell.env_store_path, shell.env_json, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO shell_input (shell_id, root, kind, path, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for input in inputs {
+                insert.execute(params![
+                    id,
+                    input.id.root.as_str(),
+                    input.id.kind.as_str(),
+                    input.id.path,
+                    input.state
+                ])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM shell WHERE key_hash = ?1 AND id NOT IN (
+               SELECT id FROM shell WHERE key_hash = ?1 ORDER BY used_at DESC, id DESC LIMIT ?2)",
+            params![key_hash, MAX_CANDIDATES],
+        )?;
+        tx.commit()
     }
 }
 
-/// Get resource specs for a cached eval by eval ID.
-pub async fn get_resource_specs_by_eval_id<'a, A>(
-    conn: A,
-    eval_id: i64,
-) -> Result<Vec<ResourceSpecRow>, sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    let specs = sqlx::query_as(
-        r#"
-            SELECT type_id, spec
-            FROM eval_resource_spec
-            WHERE cached_eval_id = ?
-        "#,
-    )
-    .bind(eval_id)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    Ok(specs)
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Insert resource specs for a cached eval.
-pub async fn insert_resource_specs<'a, A>(
-    conn: A,
-    eval_id: i64,
-    specs: &[crate::resource_manager::EvalResourceSpec],
-) -> Result<(), sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    for spec in specs {
-        let spec_json =
-            serde_json::to_string(&spec.data).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
-        sqlx::query(
-            r#"
-            INSERT INTO eval_resource_spec (cached_eval_id, type_id, spec)
-            VALUES (?, ?, ?)
-            ON CONFLICT (cached_eval_id, type_id) DO UPDATE
-            SET spec = excluded.spec,
-                updated_at = strftime('%s', 'now')
-            "#,
-        )
-        .bind(eval_id)
-        .bind(spec.type_id.clone())
-        .bind(spec_json)
-        .execute(&mut *conn)
-        .await?;
-    }
-
-    Ok(())
-}
-
-/// Delete all cached evals that have associated extension-state specs.
-///
-/// When resource replay or eval-input validation fails for one attr, all
-/// state-dependent cache entries must be purged to prevent inconsistent state
-/// across attrs.
-/// The existing `ON DELETE CASCADE` on `eval_resource_spec` and `eval_input_path`
-/// handles cleanup of related rows.
-pub(crate) async fn delete_evals_with_resource_specs(
-    pool: &SqlitePool,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        r#"
-        DELETE FROM cached_eval
-        WHERE id IN (SELECT DISTINCT cached_eval_id FROM eval_resource_spec)
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected())
-}
-
-/// Delete resource specs for a cached eval.
-pub async fn delete_resource_specs_by_eval_id<'a, A>(
-    conn: A,
-    eval_id: i64,
-) -> Result<(), sqlx::Error>
-where
-    A: Acquire<'a, Database = Sqlite>,
-{
-    let mut conn = conn.acquire().await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM eval_resource_spec
-        WHERE cached_eval_id = ?
-        "#,
-    )
-    .bind(eval_id)
-    .execute(&mut *conn)
-    .await?;
-
-    Ok(())
-}
-
-// =============================================================================
-// File Tracking Functions
-// =============================================================================
-
-/// Get file inputs for a specific evaluation by its cache key hash.
-///
-/// This returns the file inputs that were tracked during the evaluation
-/// identified by the given key_hash. Returns empty vec if no such eval exists.
-pub async fn get_file_inputs_by_key_hash(
-    pool: &SqlitePool,
-    key_hash: &str,
-) -> Result<Vec<FileInputDesc>, sqlx::Error> {
-    // First look up the eval to get its ID
-    let Some(eval_row) = get_eval_by_key_hash(pool, key_hash).await? else {
-        return Ok(Vec::new());
-    };
-
-    // Get the file inputs for this eval
-    let file_rows = get_files_by_eval_id(pool, eval_row.id).await?;
-
-    Ok(file_rows.into_iter().map(FileInputDesc::from).collect())
-}
-
-/// Get all unique file paths that have been tracked by any evaluation.
-///
-/// This returns all files that were read during any Nix evaluation,
-/// useful for determining which files to watch for changes.
-pub async fn get_all_tracked_file_paths(
-    pool: &SqlitePool,
-) -> Result<Vec<std::path::PathBuf>, sqlx::Error> {
-    let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
-        r#"
-            SELECT DISTINCT path
-            FROM file_input
-            WHERE is_directory = FALSE
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .filter_map(|(path_bytes,)| {
-            String::from_utf8(path_bytes)
-                .ok()
-                .map(std::path::PathBuf::from)
-        })
-        .collect())
-}
 
 #[cfg(test)]
 mod tests {
-    use devenv_cache_core::compute_string_hash;
+    use std::time::{Duration, SystemTime};
+
+    use devenv_core::eval_op::EvalOp;
 
     use super::*;
-    use sqlx::SqlitePool;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::inputs::record_inputs;
 
-    #[tokio::test]
-    async fn test_recursive_tracking_migration_invalidates_existing_evals() {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        MIGRATIONS.run_to(20260116000000, &pool).await.unwrap();
-
-        sqlx::query(
-            r#"
-            INSERT INTO cached_eval (key_hash, attr_name, input_hash, json_output)
-            VALUES ('old-key', 'old.attr', 'old-input', '{}')
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        MIGRATIONS.run(&pool).await.unwrap();
-
-        let cached_eval_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cached_eval")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(cached_eval_count, 0);
-
-        let recursive_column_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_table_info('file_input') WHERE name = 'recursive'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(recursive_column_count, 1);
+    fn ops(flake: &Path) -> Vec<EvalOp> {
+        let mount = PathBuf::from("/nix/store/00000000000000000000000000000000-source");
+        vec![
+            EvalOp::MountedInput {
+                store_path: mount.clone(),
+                url: format!("path:{}?lastModified=1", flake.display()),
+            },
+            EvalOp::MountedInput {
+                store_path: "/nix/store/11111111111111111111111111111111-source".into(),
+                url: "github:NixOS/nixpkgs/abc".into(),
+            },
+            EvalOp::EvaluatedFile { source: flake.join("flake.nix"), cached: false },
+            EvalOp::ReadFile { source: mount.join("nix/a.nix") },
+            EvalOp::ReadFile { source: "/nix/store/11111111111111111111111111111111-source/lib.nix".into() },
+            EvalOp::EvaluatedFile { source: "«nix-internal»/derivation-internal.nix".into(), cached: false },
+            EvalOp::GetEnv { name: "RHO_TEST_UNSET_VAR".into() },
+        ]
     }
 
-    #[sqlx::test]
-    async fn test_insert_and_retrieve_eval(pool: SqlitePool) {
-        let key_hash = compute_string_hash("(import /foo/bar {}):config.shell");
-        let attr_name = "config.shell";
-        let json_output = r#"{"type":"derivation","path":"/nix/store/abc-shell"}"#;
-        let modified_at = SystemTime::now();
-        let inputs = vec![
-            Input::File(FileInputDesc {
-                path: "/path/to/devenv.nix".into(),
-                is_directory: false,
-                recursive: false,
-                content_hash: Some("hash1".to_string()),
-                modified_at,
-            }),
-            Input::Env(EnvInputDesc {
-                name: "HOME".to_string(),
-                content_hash: Some("hash2".to_string()),
-            }),
-        ];
-        let input_hash = Input::compute_input_hash(&inputs);
-
-        let (eval_id, file_ids, env_ids) = insert_eval_with_inputs(
-            &pool,
-            &key_hash,
-            attr_name,
-            &input_hash,
-            json_output,
-            &inputs,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(file_ids.len(), 1);
-        assert_eq!(env_ids.len(), 1);
-
-        // Retrieve the eval
-        let retrieved_eval = get_eval_by_key_hash(&pool, &key_hash)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retrieved_eval.key_hash, key_hash);
-        assert_eq!(retrieved_eval.attr_name, attr_name);
-        assert_eq!(retrieved_eval.json_output, json_output);
-        assert_eq!(retrieved_eval.input_hash, input_hash);
-
-        // Retrieve file inputs
-        let files = get_files_by_eval_id(&pool, eval_id).await.unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, PathBuf::from("/path/to/devenv.nix"));
-        assert_eq!(files[0].content_hash, "hash1");
-
-        // Retrieve env inputs
-        let envs = get_envs_by_eval_id(&pool, eval_id).await.unwrap();
-        assert_eq!(envs.len(), 1);
-        assert_eq!(envs[0].name, "HOME");
-        assert_eq!(envs[0].content_hash, "hash2");
+    fn key() -> CacheKey {
+        CacheKey {
+            system: "x86_64-linux".into(),
+            shell: "default".into(),
+            scheme: FlakeScheme::Path,
+            lock: Some(b"{}".to_vec()),
+            evaluator: "test".into(),
+        }
     }
 
-    #[sqlx::test]
-    async fn test_eval_update_replaces_old(pool: SqlitePool) {
-        let key_hash = compute_string_hash("(import /foo/bar {}):config.packages");
-        let attr_name = "config.packages";
-        let modified_at = SystemTime::now();
-
-        // First eval
-        let inputs1 = vec![Input::File(FileInputDesc {
-            path: "/path/to/file1.nix".into(),
-            is_directory: false,
-            recursive: false,
-            content_hash: Some("old_hash".to_string()),
-            modified_at,
-        })];
-        let input_hash1 = Input::compute_input_hash(&inputs1);
-        let json_output1 = r#"["pkg1"]"#;
-
-        insert_eval_with_inputs(
-            &pool,
-            &key_hash,
-            attr_name,
-            &input_hash1,
-            json_output1,
-            &inputs1,
-        )
-        .await
-        .unwrap();
-
-        // Second eval with same key but different inputs/output
-        let inputs2 = vec![Input::File(FileInputDesc {
-            path: "/path/to/file2.nix".into(),
-            is_directory: false,
-            recursive: false,
-            content_hash: Some("new_hash".to_string()),
-            modified_at,
-        })];
-        let input_hash2 = Input::compute_input_hash(&inputs2);
-        let json_output2 = r#"["pkg1","pkg2"]"#;
-
-        let (eval_id, _, _) = insert_eval_with_inputs(
-            &pool,
-            &key_hash,
-            attr_name,
-            &input_hash2,
-            json_output2,
-            &inputs2,
-        )
-        .await
-        .unwrap();
-
-        // Should have replaced the old eval
-        let retrieved = get_eval_by_key_hash(&pool, &key_hash)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retrieved.json_output, json_output2);
-        assert_eq!(retrieved.input_hash, input_hash2);
-
-        // Should have only the new file input
-        let files = get_files_by_eval_id(&pool, eval_id).await.unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, PathBuf::from("/path/to/file2.nix"));
+    fn shell(n: &str) -> CachedShell {
+        CachedShell { drv_path: n.into(), env_store_path: n.into(), env_json: n.into() }
     }
 
-    #[sqlx::test]
-    async fn test_eval_file_reuse_across_evals(pool: SqlitePool) {
-        let modified_at = SystemTime::now();
-
-        // Shared file input
-        let shared_file = Input::File(FileInputDesc {
-            path: "/path/to/shared.nix".into(),
-            is_directory: false,
-            recursive: false,
-            content_hash: Some("shared_hash".to_string()),
-            modified_at,
-        });
-
-        // First eval
-        let key1 = compute_string_hash("expr1:attr1");
-        let inputs1 = vec![shared_file.clone()];
-        let input_hash1 = Input::compute_input_hash(&inputs1);
-
-        let (_, file_ids1, _) =
-            insert_eval_with_inputs(&pool, &key1, "attr1", &input_hash1, "{}", &inputs1)
-                .await
-                .unwrap();
-
-        // Second eval with same shared file
-        let key2 = compute_string_hash("expr2:attr2");
-        let inputs2 = vec![shared_file];
-        let input_hash2 = Input::compute_input_hash(&inputs2);
-
-        let (_, file_ids2, _) =
-            insert_eval_with_inputs(&pool, &key2, "attr2", &input_hash2, "{}", &inputs2)
-                .await
-                .unwrap();
-
-        // File should be reused (same ID)
-        assert_eq!(file_ids1[0], file_ids2[0]);
+    fn checkout(dir: &Path, a: &str) {
+        std::fs::create_dir_all(dir.join("nix")).unwrap();
+        std::fs::write(dir.join("flake.nix"), "{ }").unwrap();
+        std::fs::write(dir.join("nix/a.nix"), a).unwrap();
     }
 
-    #[sqlx::test]
-    async fn test_delete_evals_with_resource_specs(pool: SqlitePool) {
-        let modified_at = SystemTime::now();
+    fn record(dir: &Path) -> Vec<Input> {
+        let started = SystemTime::now() + Duration::from_secs(3600);
+        record_inputs(&ops(dir), dir, started, &|_| None).unwrap().inputs
+    }
 
-        // Insert eval WITH resource specs
-        let key_with = compute_string_hash("expr:with_ports");
-        let inputs = vec![Input::File(FileInputDesc {
-            path: "/path/to/a.nix".into(),
-            is_directory: false,
-            recursive: false,
-            content_hash: Some("h1".to_string()),
-            modified_at,
-        })];
-        let input_hash = Input::compute_input_hash(&inputs);
-        let (eval_id_with, _, _) = insert_eval_with_inputs(
-            &pool,
-            &key_with,
-            "with_ports",
-            &input_hash,
-            r#"{"port":8080}"#,
-            &inputs,
-        )
-        .await
-        .unwrap();
-
-        insert_resource_specs(
-            &pool,
-            eval_id_with,
-            &[crate::resource_manager::EvalResourceSpec {
-                type_id: "port".to_string(),
-                data: serde_json::json!({"port": 8080}),
-            }],
-        )
-        .await
-        .unwrap();
-
-        // Insert eval WITHOUT resource specs
-        let key_without = compute_string_hash("expr:no_ports");
-        let (_, _, _) = insert_eval_with_inputs(
-            &pool,
-            &key_without,
-            "no_ports",
-            &input_hash,
-            r#"{"value":42}"#,
-            &inputs,
-        )
-        .await
-        .unwrap();
-
-        // Delete evals with resource specs
-        let deleted = delete_evals_with_resource_specs(&pool).await.unwrap();
-        assert_eq!(deleted, 1);
-
-        // The one with specs should be gone
-        assert!(
-            get_eval_by_key_hash(&pool, &key_with)
-                .await
-                .unwrap()
-                .is_none()
+    #[test]
+    fn inputs_are_relative_and_skip_locked_and_builtin_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("one");
+        checkout(&dir, "1");
+        let ids: Vec<_> = record(&dir).into_iter().map(|i| (i.id.root, i.id.kind, i.id.path)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                (Root::Flake, Kind::File, "flake.nix".into()),
+                (Root::Flake, Kind::File, "nix/a.nix".into()),
+                (Root::Env, Kind::Env, "RHO_TEST_UNSET_VAR".into()),
+            ]
         );
+    }
 
-        // The one without specs should remain
-        assert!(
-            get_eval_by_key_hash(&pool, &key_without)
-                .await
-                .unwrap()
-                .is_some()
-        );
+    #[test]
+    fn candidates_are_shared_across_checkouts_and_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+        checkout(&one, "1");
+        checkout(&two, "2");
+        let mut cache = EnvCache::open(&tmp.path().join("cache.sqlite")).unwrap();
+        let env = |_: &str| None;
+
+        cache.store(&key(), &record(&one), &shell("one")).unwrap();
+        assert_eq!(cache.lookup(&key(), &two, &env).unwrap(), None);
+        cache.store(&key(), &record(&two), &shell("two")).unwrap();
+
+        assert_eq!(cache.lookup(&key(), &one, &env).unwrap(), Some(shell("one")));
+        assert_eq!(cache.lookup(&key(), &two, &env).unwrap(), Some(shell("two")));
+        std::fs::write(two.join("nix/a.nix"), "1").unwrap();
+        assert_eq!(cache.lookup(&key(), &two, &env).unwrap(), Some(shell("one")));
+
+        let other_lock = CacheKey { lock: None, ..key() };
+        assert_eq!(cache.lookup(&other_lock, &one, &env).unwrap(), None);
+    }
+
+    #[test]
+    fn inputs_modified_during_eval_are_not_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("one");
+        checkout(&dir, "1");
+        let started = SystemTime::now() - Duration::from_secs(3600);
+        let err = record_inputs(&ops(&dir), &dir, started, &|_| None).unwrap_err();
+        assert!(matches!(err, crate::inputs::RecordError::ChangedDuringEval(_)));
     }
 }

@@ -768,7 +768,9 @@ impl NixLogBridge {
             return false;
         };
 
-        append_eval_op(id, op.into());
+        if let Some(op) = op.to_activity() {
+            append_eval_op(id, op);
+        }
         true
     }
 }

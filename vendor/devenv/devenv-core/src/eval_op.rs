@@ -30,6 +30,12 @@ pub enum EvalOp {
     GetEnv { name: String },
     /// Check that a file exists with `builtins.pathExists`.
     PathExists { source: PathBuf },
+    /// Mounted a fetched input at a virtual store path. Effects on paths
+    /// below `store_path` observe that input's tree.
+    MountedInput { store_path: PathBuf, url: String },
+    /// Forced a source-info metadata attribute (`rev`, `lastModified`, ...)
+    /// of the input mounted at `store_path`.
+    ForcedInputAttr { store_path: PathBuf, name: String },
 }
 
 /// Exact state captured at the moment an evaluation input was consumed.
@@ -59,10 +65,12 @@ impl EvalInputState {
     }
 }
 
-/// Convert to the activity event type for serialization.
-impl From<EvalOp> for devenv_activity::EvalOp {
-    fn from(op: EvalOp) -> Self {
-        match op {
+impl EvalOp {
+    /// Convert to the activity event type for serialization. Input mounts and
+    /// metadata observations only matter to caching and have no event.
+    pub fn to_activity(&self) -> Option<devenv_activity::EvalOp> {
+        let op = self.clone();
+        Some(match op {
             EvalOp::CopiedSource { source, target } => {
                 devenv_activity::EvalOp::CopiedSource { source, target }
             }
@@ -80,7 +88,8 @@ impl From<EvalOp> for devenv_activity::EvalOp {
             }
             EvalOp::GetEnv { name } => devenv_activity::EvalOp::GetEnv { name },
             EvalOp::PathExists { source } => devenv_activity::EvalOp::PathExists { source },
-        }
+            EvalOp::MountedInput { .. } | EvalOp::ForcedInputAttr { .. } => return None,
+        })
     }
 }
 
@@ -118,6 +127,14 @@ impl EvalOp {
                 name: subject.to_owned(),
             }),
             ("path-exists", None) => Some(EvalOp::PathExists { source: path() }),
+            ("mount-input", Some(url)) => Some(EvalOp::MountedInput {
+                store_path: path(),
+                url: url.to_owned(),
+            }),
+            ("input-attr", Some(name)) => Some(EvalOp::ForcedInputAttr {
+                store_path: path(),
+                name: name.to_owned(),
+            }),
             _ => None,
         }
     }

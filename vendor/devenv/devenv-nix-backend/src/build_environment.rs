@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// A captured build environment from a Nix shell derivation.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct BuildEnvironment {
     pub variables: HashMap<String, Variable>,
     #[serde(rename = "bashFunctions", default)]
@@ -16,7 +16,7 @@ pub struct BuildEnvironment {
 }
 
 /// A bash variable with its type and value.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Variable {
     Var {
