@@ -11,28 +11,26 @@ mod tool;
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-pub use python::{PythonCell, PythonExec, PythonNotebook, PythonStreamProgress};
-use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus};
-use rho_web_search::WebSearchTools;
+pub use python::{
+    HostFunction, PythonCell, PythonExec, PythonNotebook, PythonStreamProgress, ToolCx,
+};
+use rho_core::{ToolExecutionContext, ToolOutput, ToolOutputStatus};
+use rho_web_search::{WebRequest, WebSearchTools};
 pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, ReplyState, SourceFacts, SourceWaker};
 
-/// An async Rust callback registered by name in a Python notebook.
-/// Python owns the callable signatures and documentation; this trait only
-/// dispatches calls.
-pub trait HostFunction: Send + Sync + 'static {
-    fn name(&self) -> &'static str;
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput>;
-}
-
-impl HostFunction for WebSearchTools {
-    fn name(&self) -> &'static str {
-        rho_web_search::WEB_SEARCH_TOOL_NAME
-    }
-
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        WebSearchTools::call(self, call, ToolExecutionContext::default())
-    }
+/// `web.run(**request)`: the results arrive with the cell's report, and the
+/// call also returns them.
+pub fn web_run(tools: WebSearchTools) -> HostFunction {
+    HostFunction::new("web.run", &[], move |cx: ToolCx, request: WebRequest| {
+        let tools = tools.clone();
+        async move {
+            let output = tools
+                .run(request, ToolExecutionContext::default())
+                .await?;
+            cx.report(&output);
+            Ok(output)
+        }
+    })
 }
 
 pub(crate) fn output(text: impl Into<String>, status: ToolOutputStatus) -> ToolOutput {

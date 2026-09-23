@@ -45,11 +45,25 @@ pub(super) enum Control {
     Rewind(u32),
 }
 
+/// A notebook host function the daemon answers for the worker.
+#[derive(Debug, Encode, Decode)]
+pub(crate) enum SharedCall {
+    Agent(crate::multi_agent_tools::AgentCall),
+    Papercut(crate::papercut::PapercutArgs),
+}
+
+/// How the daemon answered a [`SharedCall`]: text for the model either way.
+#[derive(Encode, Decode)]
+pub(super) enum SharedReply {
+    Ok(String),
+    Err(String),
+}
+
 #[derive(Encode, Decode)]
 pub(super) enum Request<'a> {
     Name(String),
     Team,
-    SharedTool(rho_core::ToolCall),
+    SharedTool(SharedCall),
     Usage(AgentUsageBucket),
     Completed(String),
     Failed(String),
@@ -87,7 +101,7 @@ pub(super) enum Request<'a> {
 #[derive(Encode, Decode)]
 pub(super) enum Reply {
     Team(Option<crate::multi_agent_tools::Team>),
-    Tool(rho_core::ToolOutput),
+    Shared(SharedReply),
     Head(AgentHead),
     History {
         next: AgentEventPos,
@@ -385,18 +399,12 @@ impl Host {
             .await
             .cloned()
     }
-    pub(crate) async fn shared_tool(&self, call: rho_core::ToolCall) -> rho_core::ToolOutput {
+    pub(crate) async fn shared_tool(&self, call: SharedCall) -> Result<String, String> {
         match self.request(Request::SharedTool(call)).await {
-            Ok(Reply::Tool(output)) => output,
-            result => rho_core::ToolOutput {
-                output: Arc::new(match result {
-                    Err(error) => error.to_string(),
-                    _ => "unexpected shared service reply".into(),
-                }),
-                full_output: None,
-                images: Arc::new(Vec::new()),
-                status: rho_core::ToolOutputStatus::Error,
-            },
+            Ok(Reply::Shared(SharedReply::Ok(text))) => Ok(text),
+            Ok(Reply::Shared(SharedReply::Err(error))) => Err(error),
+            Ok(_) => Err("unexpected shared service reply".into()),
+            Err(error) => Err(error.to_string()),
         }
     }
 

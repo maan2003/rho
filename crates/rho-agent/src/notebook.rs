@@ -2,17 +2,18 @@
 //! surface.
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-use rho_agent_tools::HostFunction;
-use rho_core::{AgentId, ToolCall, ToolOutput};
+use rho_agent_tools::{HostFunction, ToolCx};
+use rho_core::AgentId;
 use rho_inference::Inference;
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
 
 use crate::View;
 use crate::db::AgentRole;
-use crate::multi_agent_tools::{self, Team};
-use crate::worker::Host;
+use crate::image_tool::{ImageTools, ViewImageArgs};
+use crate::multi_agent_tools::{AgentCall, Team};
+use crate::papercut::PapercutArgs;
+use crate::worker::{Host, SharedCall};
 
 /// What every runtime's tools are built from: the shell, and the host
 /// functions Rho answers itself (images, collaboration, web search,
@@ -26,68 +27,75 @@ pub(crate) fn host_tools(
     inference: Option<&Inference>,
     multi_agent: Option<&Team>,
     host: Option<&Arc<Host>>,
-) -> (ShellTools, Vec<Arc<dyn HostFunction>>) {
+) -> (ShellTools, Vec<HostFunction>) {
     let shell = ShellTools::new(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         Arc::clone(view),
     )
     .with_env("RHO_AGENT_ID", agent_id.encoded());
-    let mut others: Vec<Arc<dyn HostFunction>> = vec![Arc::new(ImageTool(
-        crate::image_tool::ImageTools::new(Arc::clone(view)),
-    ))];
+    let images = ImageTools::new(Arc::clone(view));
+    let mut functions = vec![
+        HostFunction::new("view_image", &["path"], move |cx: ToolCx, args: ViewImageArgs| {
+            let images = images.clone();
+            async move {
+                let (text, image) = images.view(args).await.map_err(|e| e.to_string())?;
+                cx.report(&text);
+                cx.show_image(image);
+                Ok(())
+            }
+        })
+        .detached(),
+    ];
     if let Some(host) = host.filter(|_| multi_agent.is_some()) {
-        others.extend(
-            multi_agent_tools::agent_functions(role)
-                .iter()
-                .map(|&name| {
-                    Arc::new(SharedTool {
-                        host: host.clone(),
-                        name,
-                    }) as Arc<dyn HostFunction>
+        functions.push(shared(host, "agents.message", &[], |args| {
+            SharedCall::Agent(AgentCall::Message(args))
+        }));
+        if matches!(role, AgentRole::Engineer { .. }) {
+            functions.extend([
+                shared(host, "agents.spawn_new_engineer", &[], |args| {
+                    SharedCall::Agent(AgentCall::SpawnEngineer(args))
                 }),
-        );
+                shared(host, "agents.cancel", &[], |args| {
+                    SharedCall::Agent(AgentCall::Cancel(args))
+                }),
+                shared(host, "agents.spawn_new_advisor", &["msg"], |args| {
+                    SharedCall::Agent(AgentCall::SpawnAdvisor(args))
+                }),
+            ]);
+        }
     }
     if let Some(inference) = inference {
-        others.push(Arc::new(WebSearchTools::new(
+        functions.push(rho_agent_tools::web_run(WebSearchTools::new(
             inference.clone(),
             agent_id.encoded().to_owned(),
         )));
     }
     if let Some(host) = host {
-        others.push(Arc::new(SharedTool {
-            host: host.clone(),
-            name: crate::papercut::PAPERCUT_TOOL_NAME,
+        functions.push(shared(host, "papercut", &[], |args: PapercutArgs| {
+            SharedCall::Papercut(args)
         }));
     }
-    (shell, others)
+    (shell, functions)
 }
 
-struct ImageTool(crate::image_tool::ImageTools);
-
-impl HostFunction for ImageTool {
-    fn name(&self) -> &'static str {
-        crate::image_tool::VIEW_IMAGE_TOOL_NAME
-    }
-
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        let tools = self.0.clone();
-        Box::pin(async move { tools.call(call).await })
-    }
-}
-
-/// A collaboration or report tool, answered by the daemon.
-struct SharedTool {
-    host: Arc<Host>,
-    name: &'static str,
-}
-
-impl HostFunction for SharedTool {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        let host = self.host.clone();
-        Box::pin(async move { host.shared_tool(call).await })
-    }
+/// A function the daemon answers. Its reply is both reported and returned.
+fn shared<A>(
+    host: &Arc<Host>,
+    path: &'static str,
+    positional: &'static [&'static str],
+    call: impl Fn(A) -> SharedCall + Send + Sync + 'static,
+) -> HostFunction
+where
+    A: serde::de::DeserializeOwned + Send + 'static,
+{
+    let host = Arc::clone(host);
+    HostFunction::new(path, positional, move |cx: ToolCx, args: A| {
+        let host = Arc::clone(&host);
+        let call = call(args);
+        async move {
+            let text = host.shared_tool(call).await?;
+            cx.report(&text);
+            Ok(text)
+        }
+    })
 }

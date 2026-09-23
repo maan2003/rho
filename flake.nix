@@ -285,8 +285,10 @@
               pname = projectName;
               src = buildSrc;
               nativeBuildInputs = guiNativeBuildInputs;
-              buildInputs = guiBuildInputs;
+              # The notebook embeds this CPython; PyO3 links its libpython.
+              buildInputs = guiBuildInputs ++ [ pkgs.python3 ];
               env.RUSTDOCFLAGS = "-D warnings";
+              env.PYO3_PYTHON = "${pythonPackages}/bin/python3";
               env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${rhoGit}/libexec/git-core/git-remote-http";

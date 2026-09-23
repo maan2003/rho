@@ -1,9 +1,8 @@
-//! Built-in multi-agent tools: `spawn_engineer`, `message_agent`,
-//! `interrupt_engineer`.
+//! Built-in multi-agent tools: the notebook's `agents` module.
 //!
 //! These are ordinary fast tools (codex-v2 style): asynchrony lives in the
-//! per-agent message queue, not in tool execution. `spawn_engineer` returns the
-//! child id immediately; results come back as mail, and the loop's own `wait`
+//! per-agent message queue, not in tool execution. `spawn_new_engineer` returns
+//! the child id immediately; results come back as mail, and the loop's own `wait`
 //! tool is how an agent waits for them.
 //!
 //! The tools are injected into the core agent as a [`MultiAgentTools`]
@@ -12,7 +11,7 @@
 
 use std::sync::Arc;
 
-use rho_core::{ToolCall, ToolOutput, ToolOutputStatus};
+use senax_encoder::{Decode, Encode};
 use serde::Deserialize;
 
 use crate::MessageDelivery;
@@ -70,67 +69,44 @@ impl MultiAgentTools {
     }
 }
 
-pub const SPAWN_ENGINEER_TOOL_NAME: &str = "spawn_engineer";
-pub const MESSAGE_AGENT_TOOL_NAME: &str = "message_agent";
-pub const INTERRUPT_ENGINEER_TOOL_NAME: &str = "interrupt_engineer";
-pub const ASK_ADVISOR_TOOL_NAME: &str = "ask_advisor";
-
-pub fn is_agent_tool(name: &str) -> bool {
-    matches!(
-        name,
-        SPAWN_ENGINEER_TOOL_NAME
-            | MESSAGE_AGENT_TOOL_NAME
-            | INTERRUPT_ENGINEER_TOOL_NAME
-            | ASK_ADVISOR_TOOL_NAME
-    )
+/// A collaboration call, typed from the notebook's Python arguments to the
+/// daemon that answers it.
+#[derive(Debug, Encode, Decode)]
+pub(crate) enum AgentCall {
+    SpawnEngineer(SpawnArgs),
+    Message(SendArgs),
+    Cancel(InterruptArgs),
+    SpawnAdvisor(AdvisorArgs),
 }
 
-pub fn agent_functions(role: AgentRole) -> &'static [&'static str] {
-    match role {
-        AgentRole::Engineer { .. } => &[
-            SPAWN_ENGINEER_TOOL_NAME,
-            MESSAGE_AGENT_TOOL_NAME,
-            INTERRUPT_ENGINEER_TOOL_NAME,
-            ASK_ADVISOR_TOOL_NAME,
-        ],
-        AgentRole::Advisor { .. } => &[MESSAGE_AGENT_TOOL_NAME],
+impl AgentCall {
+    /// Whether an agent in `role` may make this call. The daemon checks it
+    /// again: a worker's notebook is not trusted to offer only these.
+    pub(crate) fn allowed(&self, role: AgentRole) -> bool {
+        match role {
+            AgentRole::Engineer { .. } => true,
+            AgentRole::Advisor { .. } => matches!(self, Self::Message(_)),
+        }
     }
 }
 
-pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> ToolOutput {
-    let result = match call.name.as_str() {
-        SPAWN_ENGINEER_TOOL_NAME => spawn_engineer(&tools, &call).await,
-        MESSAGE_AGENT_TOOL_NAME => message_agent(&tools, &call).await,
-        INTERRUPT_ENGINEER_TOOL_NAME => interrupt_engineer(&tools, &call).await,
-        ASK_ADVISOR_TOOL_NAME => ask_advisor(&tools, &call).await,
-        _ => Err(anyhow::anyhow!(
-            "unsupported tool call: {}",
-            call.name.as_str()
-        )),
-    };
-    match result {
-        Ok(output) => ToolOutput {
-            full_output: None,
-            images: std::sync::Arc::new(Vec::new()),
-            output: Arc::new(output),
-            status: ToolOutputStatus::Success,
-        },
-        Err(error) => ToolOutput {
-            full_output: None,
-            images: std::sync::Arc::new(Vec::new()),
-            output: Arc::new(error.to_string()),
-            status: ToolOutputStatus::Error,
-        },
+pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: AgentCall) -> anyhow::Result<String> {
+    match call {
+        AgentCall::SpawnEngineer(args) => spawn_engineer(&tools, args).await,
+        AgentCall::Message(args) => message_agent(&tools, args).await,
+        AgentCall::Cancel(args) => interrupt_engineer(&tools, args).await,
+        AgentCall::SpawnAdvisor(args) => ask_advisor(&tools, args).await,
     }
 }
 
-#[derive(Deserialize)]
-struct AdvisorArgs {
+#[derive(Debug, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdvisorArgs {
+    #[serde(rename = "msg")]
     message: String,
 }
 
-async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
-    let args: AdvisorArgs = serde_json::from_str(&call.arguments)?;
+async fn ask_advisor(tools: &MultiAgentTools, args: AdvisorArgs) -> anyhow::Result<String> {
     anyhow::ensure!(!args.message.trim().is_empty(), "message must not be empty");
     let pool = tools.pool()?;
     let parent = pool.db().read().get_agent(tools.self_id).config;
@@ -165,10 +141,12 @@ fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligen
     }
 }
 
-#[derive(Deserialize)]
-struct SpawnArgs {
+#[derive(Debug, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnArgs {
     task_name: String,
     prompt: String,
+    #[serde(default)]
     workdir: Option<String>,
 }
 
@@ -177,8 +155,7 @@ pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
     Ok(AgentRole::default())
 }
 
-async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
-    let args: SpawnArgs = serde_json::from_str(&call.arguments)?;
+async fn spawn_engineer(tools: &MultiAgentTools, args: SpawnArgs) -> anyhow::Result<String> {
     if args.prompt.trim().is_empty() {
         anyhow::bail!("prompt must not be empty");
     }
@@ -204,14 +181,14 @@ async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Res
     ))
 }
 
-#[derive(Deserialize)]
-struct SendArgs {
+#[derive(Debug, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SendArgs {
     agent_id: String,
     message: String,
 }
 
-async fn message_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
-    let args: SendArgs = serde_json::from_str(&call.arguments)?;
+async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Result<String> {
     if args.message.trim().is_empty() {
         anyhow::bail!("message must not be empty");
     }
@@ -256,13 +233,13 @@ async fn message_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resu
     Ok(format!("Message sent to {}.", pool.agent_handle(recipient)))
 }
 
-#[derive(Deserialize)]
-struct InterruptArgs {
+#[derive(Debug, Deserialize, Encode, Decode)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InterruptArgs {
     agent_id: String,
 }
 
-async fn interrupt_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
-    let args: InterruptArgs = serde_json::from_str(&call.arguments)?;
+async fn interrupt_engineer(tools: &MultiAgentTools, args: InterruptArgs) -> anyhow::Result<String> {
     let pool = tools.pool()?;
     let raw_agent_id = args
         .agent_id

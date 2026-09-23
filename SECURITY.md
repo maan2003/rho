@@ -793,46 +793,53 @@ own tools denied.
   descendant cleanup: parent-death signals are best effort. Neither process
   death nor recovery rolls back external effects or resumes code automatically.
   There are no cgroups or process-tree rollback guarantees.
-- Ordinary RustPython host access is enabled: `pathlib`, `open`, `os`, and
-  other supported standard-library modules work directly. `pathlib` and `Path`
-  are prebound; imports remain ordinary Python imports. The dedicated VM thread
-  unshares its filesystem attributes and sets its initial cwd, while retaining
-  the inherited workset mount namespace. Python `chdir` therefore affects that notebook,
-  not the daemon or sibling notebooks; it remains shared between its live cells.
+- Notebooks run on embedded CPython (PyO3, one interpreter per worker process)
+  with ordinary host access: `pathlib`, `open`, `os`, the whole standard library
+  and native extension modules work directly. `pathlib` and `Path` are prebound;
+  imports remain ordinary Python imports. Each notebook has its own globals, its
+  own event loop and a dedicated thread that unshares its filesystem attributes
+  and sets its initial cwd, while retaining the inherited workset mount namespace.
+  Python `chdir` therefore affects that notebook, not the daemon or sibling
+  notebooks; it remains shared between its live cells. Imported modules and
+  other interpreter-wide state (`sys.path`, logging, warnings) are shared by every
+  notebook in the worker; host modules such as `agents` are per notebook.
 - Python is explicitly **not a sandbox**. Workspace mount mapping provides path
   correctness, not capability isolation. Unlike managed shell commands, native
   Python file operations are not Landlock-restricted. Process-global environment
   mutations, signals, descriptor operations, and process exit retain their normal
-  behavior inside the worker. Ordinary interpreter exit or failure no longer
-  exits the daemon, but same-user hostile operations and host resource exhaustion
-  are not contained. Python code must still be trusted. Automatic Python signal-handler installation
-  is disabled so imports do not replace the host's Ctrl-C handler; explicit
-  Python signal changes still retain their normal semantics.
+  behavior inside the worker. `ctypes` and native extensions can read and write
+  the worker's memory, including credential and route snapshots it holds.
+  Ordinary interpreter failure does not exit the daemon, but same-user hostile
+  operations and host resource exhaustion are not contained. Python code must
+  still be trusted. Automatic Python signal-handler installation is disabled so
+  imports do not replace the host's Ctrl-C handler; explicit Python signal
+  changes still retain their normal semantics.
   Commands should use `command()` when Rust-managed
   lifetime and automatic output are wanted; ordinary Python subprocesses do not
   acquire that managed lifecycle automatically.
-- Standard asyncio owns Python task scheduling, timers, and I/O. Rust messages
-  wake its selector through an eventfd; cell context follows tasks and callbacks.
-  Native Rust accounting checks attributed activity and reports cell completion
-  on the interpreter thread, without moving Python objects across threads.
+- Each notebook runs the stock asyncio selector loop. Rust messages wake it
+  through an eventfd inbox; Python objects never cross threads. A cell's
+  ownership is a context variable that asyncio copies into its tasks and
+  callbacks and that threads inherit; the loop counts each cell's live tasks,
+  callbacks, timers, descriptor watchers and threads, and the cell finishes
+  when its code has returned and that count is zero. Host functions are typed:
+  arguments are decoded directly from Python objects, host work runs on the
+  worker's Tokio runtime, and cancelling the awaitable aborts it.
   Asyncio networking and subprocesses have ordinary unsandboxed Python access,
-  not the managed lifecycle of `command()`. Native extension wheels are unsupported.
-  Real Python threads are enabled. Notebook-created threads inherit cell context
-  unless the caller supplies an explicit context; executor workers belong to
-  the pool, while each submitted job keeps its cell alive until actual completion.
+  not the managed lifecycle of `command()`.
+  Real Python threads are enabled and share one interpreter lock with every
+  notebook in the worker. Notebook-created threads inherit cell context unless
+  the caller supplies an explicit context; executor workers belong to the pool,
+  and submitted work keeps its cell alive through the task awaiting it.
   Cancelling an asyncio future does not imply its thread has stopped. Host-function
   registration must run on the notebook event loop, not a worker thread.
-  PyYAML and HTTPX are supplied from the Nix-pinned package closure; Rustls provides
-  TLS and SQLite is compiled into the runtime.
-  A ten-second event-loop heartbeat and per-callback timing detect synchronous
-  blocking. Native VM checkpoints run every 1,024 instructions. After two minutes,
-  a checkpoint raises a timeout in the executing user
-  task or callback, including imported Python code, at a safe dispatch boundary.
-  Awaiting I/O and executor workers do not consume this blocking budget. Other
-  cells and pending work remain live; this does not cancel an entire cell's jobs.
-  Cancellation acknowledgement does not clear interruption while attributed
-  threads or executor work remain alive. User tracing remains independent.
-  Python can exhaust memory, catch cancellation, or block in native computation. Cancellation of Python is best-effort; Rust command and
+  PyYAML and HTTPX are supplied from the Nix-pinned package closure alongside
+  the pinned CPython.
+  Cancelling a cell cancels its asyncio tasks and callbacks only. Synchronous
+  Python is never interrupted: a notebook stuck in synchronous or native code
+  blocks its own loop, and other notebooks only through the shared interpreter
+  lock; recovery is restarting the workset worker. Python can exhaust memory,
+  catch cancellation, or block in native computation. Rust command and
   nested-tool cancellation do not depend on Python cooperation.
 - Managed commands use watched direnv environment generations and a native Bash
   supervisor with immutable environment. Cache invalidation covers discovery,

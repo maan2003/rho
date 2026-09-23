@@ -1,20 +1,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rho_core::{ImageDetail, ToolCall, ToolOutput, ToolOutputStatus};
+use rho_core::{ImageContent, ImageDetail};
 use serde::Deserialize;
 
 use crate::View;
-
-pub(crate) const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 
 #[derive(Clone)]
 pub(crate) struct ImageTools {
     view: Arc<View>,
 }
 
+/// The arguments of the notebook's `view_image()`.
 #[derive(Deserialize)]
-struct ViewImageArgs {
+#[serde(deny_unknown_fields)]
+pub(crate) struct ViewImageArgs {
     path: PathBuf,
     #[serde(default)]
     detail: ImageDetail,
@@ -25,30 +25,21 @@ impl ImageTools {
         Self { view }
     }
 
-    pub(crate) async fn call(&self, call: ToolCall) -> ToolOutput {
-        match self.load(&call.arguments).await {
-            Ok((path, prepared)) => ToolOutput {
-                output: Arc::new(format!(
-                    "Loaded image {} ({}x{}).",
-                    path.display(),
-                    prepared.width,
-                    prepared.height
-                )),
-                full_output: None,
-                images: Arc::new(vec![prepared.content]),
-                status: ToolOutputStatus::Success,
-            },
-            Err(error) => ToolOutput {
-                output: Arc::new(error.to_string()),
-                full_output: None,
-                images: Arc::new(Vec::new()),
-                status: ToolOutputStatus::Error,
-            },
-        }
+    /// Load an image for the model: a one-line description and the image.
+    pub(crate) async fn view(&self, args: ViewImageArgs) -> anyhow::Result<(String, ImageContent)> {
+        let (path, prepared) = self.load(args).await?;
+        Ok((
+            format!(
+                "Loaded image {} ({}x{}).",
+                path.display(),
+                prepared.width,
+                prepared.height
+            ),
+            prepared.content,
+        ))
     }
 
-    async fn load(&self, arguments: &str) -> anyhow::Result<(PathBuf, rho_image::PreparedImage)> {
-        let args: ViewImageArgs = serde_json::from_str(arguments)?;
+    async fn load(&self, args: ViewImageArgs) -> anyhow::Result<(PathBuf, rho_image::PreparedImage)> {
         let visible = if args.path.is_absolute() {
             args.path
         } else {
@@ -66,8 +57,6 @@ impl ImageTools {
 #[cfg(test)]
 mod tests {
     use image::{DynamicImage, ImageBuffer, Rgba};
-    use rho_core::{ToolCallId, ToolName, ToolType};
-
     use super::*;
 
     #[tokio::test]
@@ -97,20 +86,12 @@ mod tests {
                 camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
             )
             .unwrap();
-        let output = ImageTools::new(view)
-            .call(ToolCall {
-                id: ToolCallId::try_from("image-call".to_owned()).unwrap(),
-                name: ToolName::try_from(VIEW_IMAGE_TOOL_NAME).unwrap(),
-                tool_type: ToolType::Function,
-                arguments: r#"{"path":"image.png","detail":"original"}"#.to_owned(),
-            })
-            .await;
+        let args = serde_json::from_str(r#"{"path":"image.png","detail":"original"}"#).unwrap();
+        let (_, image) = ImageTools::new(view).view(args).await.unwrap();
 
-        assert_eq!(output.status, ToolOutputStatus::Success);
-        assert_eq!(output.images.len(), 1);
-        assert_eq!(output.images[0].media_type, "image/png");
-        assert_eq!(output.images[0].detail, ImageDetail::Original);
-        let decoded = image::load_from_memory(&output.images[0].data).unwrap();
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.detail, ImageDetail::Original);
+        let decoded = image::load_from_memory(&image.data).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (4096, 1));
     }
 }

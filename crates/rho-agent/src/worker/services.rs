@@ -254,30 +254,33 @@ impl Services {
                 Reply::Team(team)
             }
             Request::SharedTool(call) => {
-                use rho_agent_tools::HostFunction as _;
-                let output = if call.name.as_str() == crate::papercut::PAPERCUT_TOOL_NAME {
-                    crate::papercut::PapercutTool {
+                let result = match call {
+                    super::ipc::SharedCall::Papercut(args) => crate::papercut::PapercutTool {
                         db: self.db.clone(),
                         agent_id: self.agent,
                     }
-                    .call(call)
+                    .record(args)
                     .await
-                } else {
-                    let pool = self.pool.upgrade().context("agent pool is shutting down")?;
-                    let head = self.db.read().get_agent(self.agent);
-                    anyhow::ensure!(
-                        crate::multi_agent_tools::agent_functions(head.config.role)
-                            .contains(&call.name.as_str()),
-                        "not an available daemon-owned tool"
-                    );
-                    let tools = crate::multi_agent_tools::MultiAgentTools::new(
-                        Arc::downgrade(&pool),
-                        self.agent,
-                        head.parent,
-                    );
-                    crate::multi_agent_tools::call_agent_tool(tools, call).await
+                    .map(|id| format!("Saved papercut #{id}.")),
+                    super::ipc::SharedCall::Agent(call) => {
+                        let pool = self.pool.upgrade().context("agent pool is shutting down")?;
+                        let head = self.db.read().get_agent(self.agent);
+                        anyhow::ensure!(
+                            call.allowed(head.config.role),
+                            "not an available daemon-owned tool"
+                        );
+                        let tools = crate::multi_agent_tools::MultiAgentTools::new(
+                            Arc::downgrade(&pool),
+                            self.agent,
+                            head.parent,
+                        );
+                        crate::multi_agent_tools::call_agent_tool(tools, call).await
+                    }
                 };
-                Reply::Tool(output)
+                Reply::Shared(match result {
+                    Ok(text) => super::ipc::SharedReply::Ok(text),
+                    Err(error) => super::ipc::SharedReply::Err(error.to_string()),
+                })
             }
             Request::Usage(usage) => {
                 if let Some(pool) = self.pool.upgrade() {

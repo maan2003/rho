@@ -5,10 +5,8 @@ mod search;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
 use rho_core::{
-    ContentPart, ContextBlock, InferenceResponseItem, ToolCall, ToolExecutionContext, ToolOutput,
-    ToolOutputStatus,
+    ContentPart, ContextBlock, InferenceResponseItem, ToolExecutionContext,
 };
 use rho_inference::Inference;
 
@@ -17,7 +15,10 @@ use crate::search::{
     SearchInput, SearchRequest, SearchResponse, SearchSettings,
 };
 
-pub const WEB_SEARCH_TOOL_NAME: &str = "web__run";
+/// The arguments of `web.run`: standard OpenAI web request fields.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub struct WebRequest(SearchCommands);
 const SEARCH_URL: &str = "https://chatgpt.com/backend-api/codex/alpha/search";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const ASSISTANT_CONTEXT_TOKENS: usize = 1_000;
@@ -44,42 +45,13 @@ impl WebSearchTools {
         }
     }
 
-    pub fn call(
+    /// Run one `web.run` request.
+    pub async fn run(
         &self,
-        call: ToolCall,
-        context: ToolExecutionContext,
-    ) -> BoxFuture<'static, ToolOutput> {
-        let tools = self.clone();
-        Box::pin(async move {
-            match tools.call_inner(call, context).await {
-                Ok(output) => ToolOutput {
-                    full_output: None,
-                    images: std::sync::Arc::new(Vec::new()),
-                    output: Arc::new(output),
-                    status: ToolOutputStatus::Success,
-                },
-                Err(error) => ToolOutput {
-                    full_output: None,
-                    images: std::sync::Arc::new(Vec::new()),
-                    output: Arc::new(error),
-                    status: ToolOutputStatus::Error,
-                },
-            }
-        })
-    }
-
-    async fn call_inner(
-        &self,
-        call: ToolCall,
+        request: WebRequest,
         context: ToolExecutionContext,
     ) -> Result<String, String> {
-        let commands = if call.arguments.trim().is_empty() {
-            SearchCommands::default()
-        } else {
-            serde_json::from_str::<SearchCommands>(&call.arguments)
-                .map_err(|error| format!("invalid web search arguments: {error}"))?
-        };
-
+        let commands = request.0;
         let auth = self
             .inference
             .auth()

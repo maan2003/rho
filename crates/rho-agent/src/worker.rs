@@ -13,7 +13,7 @@ pub use workset::{
 };
 mod runtime;
 mod services;
-pub(crate) use ipc::{Host, StoreError};
+pub(crate) use ipc::{Host, SharedCall, StoreError};
 pub use remote::Remote;
 
 #[cfg(test)]

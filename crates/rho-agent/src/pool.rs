@@ -1057,27 +1057,17 @@ mod tests {
             if let Some(workdir) = workdir {
                 args["workdir"] = workdir.into();
             }
-            rho_core::ToolCall {
-                id: rho_core::ToolCallId::try_from("spawn-test").unwrap(),
-                name: rho_core::ToolName::try_from("spawn_engineer").unwrap(),
-                tool_type: rho_core::ToolType::Function,
-                arguments: args.to_string(),
-            }
+            crate::multi_agent_tools::AgentCall::SpawnEngineer(serde_json::from_value(args).unwrap())
         };
         for (workdir, expected) in [
             (Some("/src/checkout"), "/src/checkout"),
             (None, "/src/parent"),
         ] {
             let before = pool.db.read().list_agent_ids();
-            let result =
-                crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(workdir)).await;
-            assert_eq!(
-                result.status,
-                rho_core::ToolOutputStatus::Success,
-                "{}",
-                result.output
-            );
-            assert!(result.output.contains(&format!("It works in {expected}.")));
+            let output = crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(workdir))
+                .await
+                .unwrap();
+            assert!(output.contains(&format!("It works in {expected}.")));
             let read = pool.db.read();
             let child_id = read
                 .list_agent_ids()
@@ -1146,22 +1136,14 @@ mod tests {
                 assert!(!native_catalogue.contains("Private skill body."));
             }
             drop(read);
-            let cancelled = crate::multi_agent_tools::call_agent_tool(
+            crate::multi_agent_tools::call_agent_tool(
                 tools.clone(),
-                rho_core::ToolCall {
-                    id: rho_core::ToolCallId::try_from("cancel-test").unwrap(),
-                    name: rho_core::ToolName::try_from("interrupt_engineer").unwrap(),
-                    tool_type: rho_core::ToolType::Function,
-                    arguments: serde_json::json!({"agent_id": team.agent}).to_string(),
-                },
+                crate::multi_agent_tools::AgentCall::Cancel(
+                    serde_json::from_value(serde_json::json!({"agent_id": team.agent})).unwrap(),
+                ),
             )
-            .await;
-            assert_eq!(
-                cancelled.status,
-                rho_core::ToolOutputStatus::Success,
-                "{}",
-                cancelled.output
-            );
+            .await
+            .unwrap();
         }
 
         let count = pool.db.read().list_agent_ids().len();
@@ -1169,11 +1151,7 @@ mod tests {
             let result =
                 crate::multi_agent_tools::call_agent_tool(tools.clone(), spawn(Some(invalid)))
                     .await;
-            assert_eq!(
-                result.status,
-                rho_core::ToolOutputStatus::Error,
-                "{invalid}"
-            );
+            assert!(result.is_err(), "{invalid}");
             assert_eq!(pool.db.read().list_agent_ids().len(), count);
         }
         pool.execution(parent_id).await.unwrap().shutdown().await;

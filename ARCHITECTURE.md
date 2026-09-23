@@ -437,21 +437,22 @@ security, resource-isolation, or rollback boundary.
   `rho-agent` assembles it as a built-in tool and supplies the configured model,
   recent transcript, and output budget; the tool resolves the same ChatGPT
   OAuth credentials as inference and calls the first-party search endpoint.
-- `rho-python` owns a RustPython notebook on one dedicated thread inside the
-  agent worker, not the daemon.
-  Each submitted execution carries a shared Rust host handle. Registration,
-  output, execution lifecycle, and patience callbacks update that handle
-  synchronously before Python continues; no Python object crosses threads.
-  Async host completions wake the interpreter through eventfd and resolve its
-  futures on the interpreter thread. Rust accounts for cell-owned tasks,
-  workers, callbacks, timers and selector registrations to determine quiescence;
-  asyncio still owns scheduling and I/O. Lifecycle events cross a typed native
-  bridge; arbitrary tool arguments retain Python's JSON encoding semantics.
-  Native VM checkpoints check cancellation and callback deadlines every 1,024
-  instructions, entering Python only when interruption is pending. They do not
-  install or replace `sys.settrace`. Shared globals and ordinary asyncio remain.
+- `rho-python` embeds CPython (PyO3) inside the agent worker, not the daemon:
+  one interpreter per worker, and per notebook its own globals, a dedicated
+  thread and a stock asyncio selector loop that wakes on an inbox eventfd.
+  `kernel.py` owns notebook semantics: a cell is a context variable that
+  asyncio copies into every task and callback and threads inherit, a loop
+  subclass counts each cell's tasks, callbacks, timers, watchers and threads,
+  and the cell settles when its code has returned and nothing it started is
+  live. It also splits streamed source into top-level units and provides the
+  notebook builtins. The Rust side owns transport, events and typed host
+  functions, which decode Python arguments directly into serde types and run
+  on the worker's Tokio runtime; no JSON crosses the boundary and no Python
+  object crosses threads. Synchronous Python is never interrupted; a stuck
+  notebook is recovered by restarting the worker.
   Python runs with private cwd state inside the agent's workset view;
   this is path mapping, not a sandbox.
+
 - `rho-agent-tools` owns each `PythonExec` and its independently registered host
   operations. The submitted code returning, remaining Python activity stopping,
   operations finishing, and transcript delivery are separate facts. Async task

@@ -1,21 +1,26 @@
 //! Python notebook adapter. Rho owns subprocesses, retained output, and source
 //! policy.
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rho_core::{
-    ContentPart, ContextBlock, ExecCall, ExecId, InferenceResponseItem, MessageSender, ToolCall,
-    ToolOutput, ToolOutputStatus, ToolType, UnixMs,
+    ContentPart, ContextBlock, ExecCall, ExecId, InferenceResponseItem, MessageSender, ToolOutput,
+    ToolOutputStatus, ToolType, UnixMs,
 };
-use rho_python::{Event, History, Input, Sender, Session};
+use rho_python::{
+    CommandExit, Event, History, HistoryContent, HistoryImage, HistoryItem, HistoryProviderData,
+    HostFuture, Input, Sender, Session,
+};
 use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools, decode_output_lossy};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::{HostFunction, JobEnd, SourceWaker, output};
+use crate::{JobEnd, SourceWaker, output};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
@@ -24,7 +29,6 @@ pub struct PythonNotebook {
     session: Session,
     shared: Arc<Shared>,
     history: Arc<HistoryStore>,
-    runtime: tokio::runtime::Handle,
 }
 
 #[derive(Default)]
@@ -80,7 +84,7 @@ impl History for HistoryStore {
         Ok(self.snapshot(cell)?.locations.len())
     }
 
-    fn get(&self, cell: u64, index: usize) -> Result<Value, String> {
+    fn get(&self, cell: u64, index: usize) -> Result<HistoryItem, String> {
         let snapshot = self.snapshot(cell)?;
         let &(block, offset) = snapshot
             .locations
@@ -90,11 +94,13 @@ impl History for HistoryStore {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     tasks: Mutex<HostTasks>,
     next_cell: AtomicU64,
+    /// Host calls and commands, one ID space: they are the cell's sources.
+    next_request: AtomicU64,
     shell: ShellTools,
-    others: HashMap<String, Arc<dyn HostFunction>>,
+    runtime: tokio::runtime::Handle,
     cells: Mutex<HashMap<u64, Arc<Mutex<ExecState>>>>,
     jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
     /// The newest cell that registered a job: where the foreground begins.
@@ -243,7 +249,7 @@ struct JobState {
     announced: bool,
     /// Oldest unsent output.
     since: Option<UnixMs>,
-    finished: Option<(UnixMs, Value)>,
+    finished: Option<(UnixMs, Result<CommandExit, String>)>,
     /// A non-zero or missing exit code, a spawn failure, or a cancellation.
     failed: bool,
     delivered: bool,
@@ -256,42 +262,59 @@ fn history_block_len(block: &ContextBlock) -> usize {
     }
 }
 
-fn history_content(content: &[ContentPart]) -> Value {
-    Value::Array(
-        content
-            .iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => json!({"kind": "text", "text": text}),
-                ContentPart::Image { media_type, data } => {
-                    json!({"kind": "image", "media_type": media_type, "data": data})
-                }
-            })
-            .collect(),
-    )
+fn history_content(content: &[ContentPart]) -> Vec<HistoryContent> {
+    content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => HistoryContent {
+                kind: "text",
+                text: Some(text.clone()),
+                media_type: None,
+                data: None,
+            },
+            ContentPart::Image { media_type, data } => HistoryContent {
+                kind: "image",
+                text: None,
+                media_type: Some(media_type.clone()),
+                data: Some(data.clone()),
+            },
+        })
+        .collect()
 }
 
-fn history_images(images: &[rho_core::ImageContent]) -> Value {
-    Value::Array(
-        images
-            .iter()
-            .map(|image| {
-                json!({
-                    "media_type": image.media_type,
-                    "data": image.data,
-                    "detail": match image.detail {
-                        rho_core::ImageDetail::High => "high",
-                        rho_core::ImageDetail::Original => "original",
-                    },
-                })
-            })
-            .collect(),
-    )
+fn history_text(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+        .collect()
 }
 
-fn provider_data(provider: &dyn rho_core::ProviderSpecificData) -> Result<Value, String> {
+fn history_images(images: &[rho_core::ImageContent]) -> Vec<HistoryImage> {
+    images
+        .iter()
+        .map(|image| HistoryImage {
+            media_type: image.media_type.clone(),
+            data: image.data.clone(),
+            detail: Some(match image.detail {
+                rho_core::ImageDetail::High => "high",
+                rho_core::ImageDetail::Original => "original",
+            }),
+        })
+        .collect()
+}
+
+fn provider_data(
+    provider: &dyn rho_core::ProviderSpecificData,
+) -> Result<Option<HistoryProviderData>, String> {
     let encoded =
         senax_encoder::encode(&provider.clone_box()).map_err(|error| error.to_string())?;
-    Ok(json!({"tag": provider.tag(), "data": encoded.as_ref()}))
+    Ok(Some(HistoryProviderData {
+        tag: provider.tag().to_owned(),
+        data: encoded.to_vec(),
+    }))
 }
 
 fn tool_type(value: ToolType) -> &'static str {
@@ -309,169 +332,186 @@ fn output_status(value: ToolOutputStatus) -> &'static str {
     }
 }
 
-fn history_item(block: &ContextBlock, offset: usize) -> Result<Value, String> {
-    let value = match block {
+fn history_item(block: &ContextBlock, offset: usize) -> Result<HistoryItem, String> {
+    let item = match block {
         ContextBlock::UserMessage { sender, content } => {
             let (role, sender) = match sender {
                 MessageSender::User => ("user", None),
-                MessageSender::Agent { id } => ("agent", Some(id.encoded())),
+                MessageSender::Agent { id } => ("agent", Some(id.encoded().to_owned())),
             };
-            json!({
-                "kind": "message",
-                "role": role,
-                "sender": sender,
-                "text": content.iter().filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    ContentPart::Image { .. } => None,
-                }).collect::<Vec<_>>().join(""),
-                "content": history_content(content),
-            })
+            HistoryItem {
+                kind: "message",
+                role: Some(role),
+                sender,
+                text: Some(history_text(content)),
+                content: history_content(content),
+                ..HistoryItem::default()
+            }
         }
-        ContextBlock::DeveloperMessage { text } => {
-            json!({"kind": "message", "role": "developer", "text": text})
-        }
+        ContextBlock::DeveloperMessage { text } => HistoryItem {
+            kind: "message",
+            role: Some("developer"),
+            text: Some(text.clone()),
+            ..HistoryItem::default()
+        },
         ContextBlock::ToolResults { results } => {
             let result = &results[offset];
-            json!({
-                "kind": "tool_result",
-                "call_id": result.call_id.as_str(),
-                "tool_type": tool_type(result.tool_type),
-                "text": result.body.output.as_str(),
-                "images": history_images(&result.body.images),
-                "status": output_status(result.body.status),
-                "started_at": result.started_at.0,
-                "finished_at": result.finished_at.0,
-                "metadata": result.metadata,
-            })
+            HistoryItem {
+                kind: "tool_result",
+                call_id: Some(result.call_id.as_str().to_owned()),
+                tool_type: Some(tool_type(result.tool_type)),
+                text: Some(result.body.output.as_str().to_owned()),
+                images: history_images(&result.body.images),
+                status: Some(output_status(result.body.status)),
+                started_at: Some(result.started_at.0 as i64),
+                finished_at: Some(result.finished_at.0 as i64),
+                metadata: result
+                    .metadata
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+                ..HistoryItem::default()
+            }
         }
-        ContextBlock::ToolUpdate(update) => json!({
-            "kind": "tool_update",
-            "call_id": update.call_id.as_str(),
-            "tool_type": tool_type(update.tool_type),
-            "text": update.output.as_str(),
-            "images": history_images(&update.images),
-            "status": update.status.map(output_status),
-            "at": update.at.0,
-        }),
+        ContextBlock::ToolUpdate(update) => HistoryItem {
+            kind: "tool_update",
+            call_id: Some(update.call_id.as_str().to_owned()),
+            tool_type: Some(tool_type(update.tool_type)),
+            text: Some(update.output.as_str().to_owned()),
+            images: history_images(&update.images),
+            status: update.status.map(output_status),
+            at: Some(update.at.0 as i64),
+            ..HistoryItem::default()
+        },
         ContextBlock::InferenceResponse {
             items,
             provider_response_id,
         } => {
-            let response_id = provider_response_id.as_ref().map(|id| id.as_str());
+            let response_id = provider_response_id.as_ref().map(|id| id.as_str().to_owned());
             match &items[offset] {
                 InferenceResponseItem::AssistantMessage {
                     provider_specific,
                     content,
                     phase,
-                } => json!({
-                    "kind": "message",
-                    "role": "assistant",
-                    "text": content.iter().filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        ContentPart::Image { .. } => None,
-                    }).collect::<Vec<_>>().join(""),
-                    "content": history_content(content),
-                    "phase": phase.map(|phase| match phase {
+                } => HistoryItem {
+                    kind: "message",
+                    role: Some("assistant"),
+                    text: Some(history_text(content)),
+                    content: history_content(content),
+                    phase: phase.map(|phase| match phase {
                         rho_core::MessagePhase::Commentary => "commentary",
                         rho_core::MessagePhase::FinalAnswer => "final_answer",
                     }),
-                    "provider": provider_data(provider_specific.as_ref())?,
-                    "response_id": response_id,
-                }),
+                    provider: provider_data(provider_specific.as_ref())?,
+                    response_id,
+                    ..HistoryItem::default()
+                },
                 InferenceResponseItem::ToolCall {
                     provider_specific,
                     id,
                     name,
                     tool_type: kind,
                     arguments,
-                } => json!({
-                    "kind": "tool_call",
-                    "name": name.as_str(),
-                    "text": arguments,
-                    "call_id": id.as_str(),
-                    "tool_type": tool_type(*kind),
-                    "provider": provider_data(provider_specific.as_ref())?,
-                    "response_id": response_id,
-                }),
+                } => HistoryItem {
+                    kind: "tool_call",
+                    name: Some(name.as_str().to_owned()),
+                    text: Some(arguments.clone()),
+                    call_id: Some(id.as_str().to_owned()),
+                    tool_type: Some(tool_type(*kind)),
+                    provider: provider_data(provider_specific.as_ref())?,
+                    response_id,
+                    ..HistoryItem::default()
+                },
                 InferenceResponseItem::EncryptedReasoning {
                     provider_specific,
                     summary,
-                } => json!({
-                    "kind": "encrypted_reasoning",
-                    "summary": summary,
-                    "provider": provider_data(provider_specific.as_ref())?,
-                    "response_id": response_id,
-                }),
+                } => HistoryItem {
+                    kind: "encrypted_reasoning",
+                    summary: summary.clone(),
+                    provider: provider_data(provider_specific.as_ref())?,
+                    response_id,
+                    ..HistoryItem::default()
+                },
                 InferenceResponseItem::RawReasoning {
                     provider_specific,
                     content,
                     summary,
-                } => json!({
-                    "kind": "reasoning",
-                    "text": content,
-                    "summary": summary,
-                    "provider": provider_data(provider_specific.as_ref())?,
-                    "response_id": response_id,
-                }),
-                InferenceResponseItem::Compaction { provider_specific } => json!({
-                    "kind": "compaction",
-                    "provider": provider_data(provider_specific.as_ref())?,
-                    "response_id": response_id,
-                }),
-                InferenceResponseItem::Unknown { provider_specific } => json!({
-                    "kind": "unknown",
-                    "provider": provider_data(provider_specific.as_ref())?,
-                    "response_id": response_id,
-                }),
+                } => HistoryItem {
+                    kind: "reasoning",
+                    text: Some(content.clone()),
+                    summary: summary.clone(),
+                    provider: provider_data(provider_specific.as_ref())?,
+                    response_id,
+                    ..HistoryItem::default()
+                },
+                InferenceResponseItem::Compaction { provider_specific } => HistoryItem {
+                    kind: "compaction",
+                    provider: provider_data(provider_specific.as_ref())?,
+                    response_id,
+                    ..HistoryItem::default()
+                },
+                InferenceResponseItem::Unknown { provider_specific } => HistoryItem {
+                    kind: "unknown",
+                    provider: provider_data(provider_specific.as_ref())?,
+                    response_id,
+                    ..HistoryItem::default()
+                },
             }
         }
-        ContextBlock::CompactionTrigger => json!({"kind": "compaction_trigger"}),
-        ContextBlock::ContextRotation { retain_from } => {
-            json!({"kind": "context_rotation", "retain_from": retain_from})
-        }
-        ContextBlock::ToolHistoryEvicted { call_ids } => json!({
-            "kind": "tool_history_evicted",
-            "call_ids": call_ids.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        }),
+        ContextBlock::CompactionTrigger => HistoryItem {
+            kind: "compaction_trigger",
+            ..HistoryItem::default()
+        },
+        ContextBlock::ContextRotation { retain_from } => HistoryItem {
+            kind: "context_rotation",
+            retain_from: Some(*retain_from),
+            ..HistoryItem::default()
+        },
+        ContextBlock::ToolHistoryEvicted { call_ids } => HistoryItem {
+            kind: "tool_history_evicted",
+            call_ids: call_ids.iter().map(|id| id.as_str().to_owned()).collect(),
+            ..HistoryItem::default()
+        },
     };
-    Ok(value)
+    Ok(item)
 }
 
 impl PythonNotebook {
-    pub fn new(shell: ShellTools, others: Vec<Arc<dyn HostFunction>>) -> Result<Self, String> {
-        let functions = others
-            .iter()
-            .map(|function| function.name().to_owned())
-            .collect();
+    pub fn new(shell: ShellTools, functions: Vec<HostFunction>) -> Result<Self, String> {
+        let runtime = tokio::runtime::Handle::current();
         let shared = Arc::new(Shared {
             tasks: Mutex::new(HostTasks::default()),
             next_cell: AtomicU64::new(1),
+            next_request: AtomicU64::new(0),
             shell,
-            others: others
-                .into_iter()
-                .map(|function| (function.name().to_owned(), function))
-                .collect(),
+            runtime: runtime.clone(),
             cells: Mutex::new(HashMap::new()),
             jobs: Mutex::new(BTreeMap::new()),
             foreground_cell: AtomicU64::new(0),
         });
         let history = Arc::new(HistoryStore::default());
         let shell = shared.shell.clone();
-        let runtime = tokio::runtime::Handle::current();
         let setup_runtime = runtime.clone();
-        let session = Session::new_with_history(
+        let session = Session::new(
             move || {
                 unsafe { setup_runtime.block_on(shell.enter_interpreter_thread()) }
                     .map_err(|error| error.to_string())
             },
-            functions,
-            history.clone(),
+            rho_python::Host {
+                functions: functions
+                    .iter()
+                    .map(|function| (function.bind)(&shared))
+                    .collect(),
+                commands: Some(Arc::new(NotebookCommands(Arc::clone(&shared)))),
+                history: history.clone(),
+            },
+            runtime,
         )?;
         Ok(Self {
             session,
             shared,
             history,
-            runtime,
         })
     }
 }
@@ -564,7 +604,6 @@ impl PythonNotebook {
             shared: Arc::clone(&self.shared),
             history: Arc::clone(&self.history),
             sender: self.session.sender(),
-            runtime: self.runtime.clone(),
         });
         let sender = self.session.sender();
         self.history.admit(cell);
@@ -586,140 +625,129 @@ impl PythonNotebook {
         Box::new(PythonCell(exec, None))
     }
 }
-async fn resolve(sender: &Sender, request: u64, result: Result<Value, String>) {
-    let (value, error) = match result {
-        Ok(value) => (value, None),
-        Err(error) => (Value::Null, Some(error)),
-    };
-    if let Err(error) = sender
-        .send_async(Input::Resolve {
-            request,
-            value,
-            error,
-        })
-        .await
-    {
-        // A large result must fail its await rather than strand the cell.
-        let _ = sender
-            .send_async(Input::Resolve {
-                request,
-                value: Value::Null,
-                error: Some(error),
-            })
-            .await;
+/// What one host call made from a cell shows the model: its report text and
+/// images arrive with the cell's output.
+pub struct ToolCx {
+    link: Arc<Mutex<ExecState>>,
+    operation: Arc<Mutex<Operation>>,
+}
+
+impl ToolCx {
+    /// Text the model sees in the cell's next report.
+    pub fn report(&self, text: &str) {
+        if !text.is_empty() {
+            self.operation.lock().unwrap().output.push(text.as_bytes());
+        }
+    }
+
+    /// Show an image with the cell's next report.
+    pub fn show_image(&self, image: rho_core::ImageContent) {
+        let mut cell = self.link.lock().unwrap();
+        if cell.images.len() < 20 {
+            cell.images.push(image);
+            return;
+        }
+        drop(cell);
+        self.report("[an image was not shown: this cell is at its limit of 20]");
     }
 }
-// Every Python host call registers ownership before the driver accepts the next
-// event. Awaiting its future is optional and never controls the Rust lifetime.
-fn register_call(
+
+type Bind = dyn Fn(&Arc<Shared>) -> rho_python::Function + Send + Sync;
+
+/// A Rust function callable from notebook Python. Arguments arrive typed,
+/// deserialized straight from the call; the result goes straight back.
+#[derive(Clone)]
+pub struct HostFunction {
+    path: &'static str,
+    bind: Arc<Bind>,
+}
+
+impl HostFunction {
+    /// `path` places the function in the notebook (`"agents.message"` is
+    /// `message` in the `agents` module); `positional` names the leading
+    /// parameters that may be passed positionally, the rest are keyword-only.
+    /// The call is registered with its cell before Python continues, runs to
+    /// completion whether or not Python awaits it, and ends with the cell's
+    /// cancellation.
+    pub fn new<A, R, F, Fut>(path: &'static str, positional: &'static [&'static str], call: F) -> Self
+    where
+        A: DeserializeOwned + Send + 'static,
+        R: Serialize + Send + 'static,
+        F: Fn(ToolCx, A) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, String>> + Send + 'static,
+    {
+        let call = Arc::new(call);
+        Self {
+            path,
+            bind: Arc::new(move |shared| {
+                let shared = Arc::clone(shared);
+                let call = Arc::clone(&call);
+                rho_python::Function::new(path, positional, move |cell, args: A| {
+                    let call = Arc::clone(&call);
+                    register(&shared, cell, Some(path), None, move |link, operation| {
+                        let cx = ToolCx {
+                            link,
+                            operation: operation.expect("host calls are operations"),
+                        };
+                        call(cx, args)
+                    })
+                })
+            }),
+        }
+    }
+
+    /// Calling it returns `None` rather than an awaitable; its outcome shows
+    /// only in the cell's report.
+    pub fn detached(self) -> Self {
+        let bind = self.bind;
+        Self {
+            path: self.path,
+            bind: Arc::new(move |shared| bind(shared).detached()),
+        }
+    }
+
+    pub fn path(&self) -> &'static str {
+        self.path
+    }
+}
+
+/// Register work with its cell, then run it on the host runtime. Ownership
+/// is recorded before Python continues; awaiting the returned future is
+/// optional and never controls the work's lifetime.
+fn register<R, Fut>(
     shared: &Arc<Shared>,
-    sender: &Sender,
-    request: u64,
-    name: String,
-    args: Value,
-    link: Arc<Mutex<ExecState>>,
-    runtime: &tokio::runtime::Handle,
-) {
+    cell: u64,
+    operation: Option<&str>,
+    job: Option<Arc<Job>>,
+    work: impl FnOnce(Arc<Mutex<ExecState>>, Option<Arc<Mutex<Operation>>>) -> Fut,
+) -> Result<HostFuture<R>, String>
+where
+    R: Send + 'static,
+    Fut: Future<Output = Result<R, String>> + Send + 'static,
+{
     let mut tasks = shared.tasks.lock().unwrap();
     if tasks.closed {
-        sender.cancel(link.lock().unwrap().cell);
-        return;
+        return Err("Python notebook closed".into());
     }
     while let Some(result) = tasks.running.try_join_next() {
         if let Err(error) = result {
             tasks.failure.get_or_insert_with(|| error.to_string());
         }
     }
-
-    // Publish command handles synchronously: write_stdin in the same cell can
-    // refer to a command whose process has not started yet.
-    let job = if name == "command" {
-        (|| -> Result<Arc<Job>, String> {
-            let mut jobs = shared.jobs.lock().unwrap();
-            if jobs.len() >= JOB_LIMIT {
-                let old = jobs
-                    .iter()
-                    .find(|(_, j)| j.state.lock().unwrap().delivered)
-                    .map(|(id, _)| *id);
-                if let Some(id) = old {
-                    jobs.remove(&id);
-                } else {
-                    return Err("64 command handles are still active or awaiting delivery".into());
-                }
-            }
-            let budget = args["max_tokens"].as_u64().unwrap_or(2000).clamp(1, 10000) as usize;
-            let job = Arc::new(Job {
-                id: request,
-                name: {
-                    let mut name = args["cmd"]
-                        .as_str()
-                        .unwrap_or("command")
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if name.len() > 60 {
-                        let mut end = 57;
-                        while !name.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        name.truncate(end);
-                        name.push_str("...");
-                    }
-                    name
-                },
-                state: Mutex::new(JobState {
-                    file: tempfile::tempfile().map_err(|e| e.to_string())?,
-                    len: 0,
-                    dropped: 0,
-                    cursor: 0,
-                    unsent: BoundedOutput::for_tokens(Some(budget)),
-                    registered_at: UnixMs::now(),
-                    announced: false,
-                    since: None,
-                    finished: None,
-                    failed: false,
-                    delivered: false,
-                }),
-                stdin: tokio::sync::Mutex::new(None),
-                cancel: Notify::new(),
-                budget,
-                ready: tokio::sync::watch::channel(false).0,
-                done: tokio::sync::watch::channel(false).0,
-            });
-            jobs.insert(request, Arc::clone(&job));
-            Ok(job)
-        })()
-        .map(Some)
-    } else {
-        // The same synchronous publication for a handle recovered from a
-        // session ID: the existing job is filed under this request too, so the
-        // Command that comes back works at once, with nothing to await.
-        if name == "find_command"
-            && let Some(label) = args["session_id"].as_u64()
-        {
-            let mut jobs = shared.jobs.lock().unwrap();
-            let found = jobs
-                .iter()
-                .find(|(id, _)| session_id(**id) == label as u32)
-                .map(|(_, job)| Arc::clone(job));
-            if let Some(job) = found {
-                jobs.insert(request, job);
-            }
-        }
-        Ok(None)
-    };
-    let operation = (name != "command").then(|| {
+    let link = shared
+        .cells
+        .lock()
+        .unwrap()
+        .get(&cell)
+        .cloned()
+        .ok_or("Execution is no longer running")?;
+    if *link.lock().unwrap().cancelled.borrow() {
+        return Err("Execution cancelled".into());
+    }
+    let operation = operation.map(|name| {
         Arc::new(Mutex::new(Operation {
-            id: request,
-            name: match name.as_str() {
-                "web__run" => "web.run",
-                "spawn_engineer" => "agents.spawn_new_engineer",
-                "ask_advisor" => "agents.spawn_new_advisor",
-                "message_agent" => "agents.message",
-                "interrupt_engineer" => "agents.cancel",
-                other => other,
-            }
-            .to_owned(),
+            id: shared.next_request.fetch_add(1, Ordering::Relaxed),
+            name: name.to_owned(),
             output: BoundedOutput::for_tokens(Some(10000)),
             registered_at: UnixMs::now(),
             announced: false,
@@ -728,79 +756,320 @@ fn register_call(
         }))
     });
     {
-        let mut cell = link.lock().unwrap();
+        let mut state = link.lock().unwrap();
         // Registering work is what moves the foreground: from here on, older
         // cells' jobs are background to this one's.
-        shared
-            .foreground_cell
-            .fetch_max(cell.cell, Ordering::Relaxed);
+        shared.foreground_cell.fetch_max(cell, Ordering::Relaxed);
         if let Some(operation) = &operation {
-            cell.operations.push(operation.clone());
+            state.operations.push(Arc::clone(operation));
         }
-        cell.waker.wake();
-        cell.pending += 1;
-        if let Ok(Some(job)) = &job {
-            cell.jobs.push(Arc::clone(job));
+        if let Some(job) = &job {
+            state.jobs.push(Arc::clone(job));
         }
+        state.pending += 1;
+        state.waker.wake();
     }
-    let shared = Arc::clone(shared);
-    let sender = sender.clone();
-    tasks.running.spawn_on(async move {
-        let mut cancelled = link.lock().unwrap().cancelled.subscribe();
-        let result = match &job {
-            Ok(Some(job)) => run_command(&shared.shell, job, &args, &link, &mut cancelled).await,
-            Ok(None) => tokio::select! {
-                biased;
-                _ = cancelled.wait_for(|cancelled| *cancelled) => Err("Tool call cancelled".into()),
-                result = host_call(&shared, &name, args, &link, operation.as_ref().unwrap()) => result,
-            },
-            Err(error) => Err(error.clone()),
-        };
-        if let Ok(Some(job)) = &job {
+    let work = work(Arc::clone(&link), operation.clone());
+    let (done, result) = tokio::sync::oneshot::channel();
+    tasks.running.spawn_on(
+        async move {
+            let result = if job.is_some() {
+                // A command stops its process and records how it ended
+                // itself; interrupting it here would skip that.
+                work.await
+            } else {
+                let mut cancelled = link.lock().unwrap().cancelled.subscribe();
+                tokio::select! {
+                    biased;
+                    _ = cancelled.wait_for(|cancelled| *cancelled) => {
+                        Err("Tool call cancelled".to_owned())
+                    }
+                    result = work => result,
+                }
+            };
+            if let Some(operation) = &operation {
+                let mut operation = operation.lock().unwrap();
+                if let Err(error) = &result {
+                    operation.output.push(error.as_bytes());
+                    operation.failed = true;
+                    link.lock().unwrap().error = true;
+                }
+                operation.finished = Some(UnixMs::now());
+            }
+            {
+                let mut state = link.lock().unwrap();
+                state.pending -= 1;
+                state.waker.wake();
+            }
+            let _ = done.send(result);
+        },
+        &shared.runtime,
+    );
+    Ok(Box::pin(async move {
+        result
+            .await
+            .map_err(|_| "Python notebook closed".to_owned())?
+    }))
+}
+
+fn command_name(cmd: &str) -> String {
+    let mut name = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.len() > 60 {
+        let mut end = 57;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+        name.push_str("...");
+    }
+    name
+}
+
+/// The notebook's `command()` and `Command`, over the jobs in [`Shared`].
+struct NotebookCommands(Arc<Shared>);
+
+impl NotebookCommands {
+    fn job(&self, id: u64) -> Result<Arc<Job>, String> {
+        self.0
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| "Command handle expired or unknown".to_owned())
+    }
+
+    fn new_job(&self, cmd: &str, budget: usize) -> Result<Arc<Job>, String> {
+        let mut jobs = self.0.jobs.lock().unwrap();
+        if jobs.len() >= JOB_LIMIT {
+            let old = jobs
+                .iter()
+                .find(|(_, j)| j.state.lock().unwrap().delivered)
+                .map(|(id, _)| *id);
+            match old {
+                Some(id) => jobs.remove(&id),
+                None => {
+                    return Err("64 command handles are still active or awaiting delivery".into());
+                }
+            };
+        }
+        let id = self.0.next_request.fetch_add(1, Ordering::Relaxed);
+        let job = Arc::new(Job {
+            id,
+            name: command_name(cmd),
+            state: Mutex::new(JobState {
+                file: tempfile::tempfile().map_err(|e| e.to_string())?,
+                len: 0,
+                dropped: 0,
+                cursor: 0,
+                unsent: BoundedOutput::for_tokens(Some(budget)),
+                registered_at: UnixMs::now(),
+                announced: false,
+                since: None,
+                finished: None,
+                failed: false,
+                delivered: false,
+            }),
+            stdin: tokio::sync::Mutex::new(None),
+            cancel: Notify::new(),
+            budget,
+            ready: tokio::sync::watch::channel(false).0,
+            done: tokio::sync::watch::channel(false).0,
+        });
+        jobs.insert(id, Arc::clone(&job));
+        Ok(job)
+    }
+}
+
+impl rho_python::Commands for NotebookCommands {
+    fn start(
+        &self,
+        cell: u64,
+        cmd: String,
+        workdir: Option<String>,
+        max_tokens: usize,
+    ) -> Result<(u64, HostFuture<CommandExit>), String> {
+        // Published synchronously: write_stdin in the same cell can refer to
+        // a command whose process has not started yet.
+        let job = self.new_job(&cmd, max_tokens.clamp(1, 10000))?;
+        let id = job.id;
+        let shell = self.0.shell.clone();
+        let registered = Arc::clone(&job);
+        let result = register(&self.0, cell, None, Some(Arc::clone(&job)), move |link, _| async move {
+            let result = run_command(&shell, &job, &cmd, workdir.as_deref(), &link).await;
             *job.stdin.lock().await = None;
             job.ready.send_replace(true);
             // Failure is a fact of the process, computed here and nowhere
-            // else: a non-zero exit, no exit code at all (a signal), a
-            // spawn failure, or a cancellation.
-            let (summary, failed) = match &result {
-                Ok(value) => (value.clone(), value["exit_code"].as_i64() != Some(0)),
-                Err(error) => (json!({"id":request,"error":error}), true),
-            };
+            // else: a non-zero exit, no exit code at all (a signal), a spawn
+            // failure, or a cancellation.
+            let failed = !matches!(&result, Ok(CommandExit { exit_code: Some(0), .. }));
             let mut state = job.state.lock().unwrap();
-            state.finished = Some((UnixMs::now(), summary));
-            let _ = job.done.send(true);
+            state.finished = Some((UnixMs::now(), result.clone()));
             state.failed = failed;
-        } else if let Err(error) = &result {
-            let mut operation = operation.as_ref().unwrap().lock().unwrap();
-            operation.output.push(error.as_bytes());
-            operation.failed = true;
-            link.lock().unwrap().error = true;
+            drop(state);
+            job.done.send_replace(true);
+            result
+        });
+        if result.is_err() {
+            self.0.jobs.lock().unwrap().remove(&registered.id);
         }
-        {
-            let mut cell = link.lock().unwrap();
-            if let Some(operation) = operation {
-                operation.lock().unwrap().finished = Some(UnixMs::now());
+        Ok((id, result?))
+    }
+
+    // A session ID is a label the reports show, not a handle, and labels come
+    // round again every 9,000 requests. Only live jobs are searched, and two
+    // live jobs wearing one label is an error rather than a guess.
+    fn find(&self, label: u64) -> Result<u64, String> {
+        let found: Vec<u64> = self
+            .0
+            .jobs
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .filter(|id| u64::from(session_id(*id)) == label)
+            .collect();
+        match found.as_slice() {
+            [id] => Ok(*id),
+            [] => Err(format!("No live command has session ID {label}")),
+            _ => Err(format!(
+                "Session ID {label} names more than one live command; keep the handle command() returned"
+            )),
+        }
+    }
+
+    fn wait(&self, cell: u64, id: u64) -> Result<HostFuture<CommandExit>, String> {
+        let job = self.job(id)?;
+        register(&self.0, cell, Some("wait_command"), None, move |_, _| async move {
+            let mut done = job.done.subscribe();
+            loop {
+                let finished = job.state.lock().unwrap().finished.clone();
+                if let Some((_, result)) = finished {
+                    return result;
+                }
+                done.changed().await.map_err(|e| e.to_string())?;
             }
-            cell.pending -= 1;
-            cell.waker.wake();
-        }
-        resolve(&sender, request, result).await;
-    }, runtime);
+        })
+    }
+
+    // `write_stdin` only writes. Reading output is `more_output`'s job, so
+    // that one function owns the cursor and nobody reads by accident.
+    fn write_stdin(&self, cell: u64, id: u64, chars: String) -> Result<HostFuture<()>, String> {
+        let job = self.job(id)?;
+        register(&self.0, cell, Some("write_stdin"), None, move |_, _| async move {
+            if chars.is_empty() {
+                return Ok(());
+            }
+            job.ready
+                .subscribe()
+                .wait_for(|ready| *ready)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut stdin = job.stdin.lock().await;
+            let stdin = stdin.as_mut().ok_or("Command stdin not ready or closed")?;
+            stdin
+                .write_all(chars.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
+            stdin.flush().await.map_err(|e| e.to_string())
+        })
+    }
+
+    fn more_output(&self, cell: u64, id: u64, max_tokens: usize) -> Result<HostFuture<()>, String> {
+        let job = self.job(id)?;
+        register(&self.0, cell, Some("more_output"), None, move |_, operation| async move {
+            let page = read_page(&job, max_tokens)?;
+            operation
+                .expect("more_output is an operation")
+                .lock()
+                .unwrap()
+                .output
+                .push(page.as_bytes());
+            Ok(())
+        })
+    }
+
+    fn cancel(&self, cell: u64, id: u64) -> Result<HostFuture<()>, String> {
+        let job = self.job(id)?;
+        register(&self.0, cell, Some("cancel_command"), None, move |_, _| async move {
+            job.cancel.notify_one();
+            Ok(())
+        })
+    }
+}
+
+/// The next page of a command's log, in the shape its own output arrives in.
+fn read_page(job: &Job, max_tokens: usize) -> Result<String, String> {
+    let mut state = job.state.lock().unwrap();
+    let start = state.cursor;
+    let size = (state.len - start).min(max_tokens.clamp(1, 10000) * 4);
+    let mut bytes = vec![0; size];
+    state
+        .file
+        .seek(SeekFrom::Start(start as u64))
+        .map_err(|e| e.to_string())?;
+    state
+        .file
+        .read_exact(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    // Do not split a UTF-8 character merely because a page hit its budget.
+    // Non-UTF-8 process output still follows the shell's lossy-text contract.
+    if size < state.len - start
+        && let Err(error) = std::str::from_utf8(&bytes)
+        && error.error_len().is_none()
+    {
+        bytes.truncate(error.valid_up_to());
+    }
+    state.cursor += bytes.len();
+    // Reading by hand takes over from the automatic report: whatever was
+    // waiting to be reported is dropped, so the next reply does not say
+    // again what this page just showed. The rest is paged the same way.
+    state.unsent = BoundedOutput::for_tokens(Some(job.budget));
+    state.since = None;
+    let page = String::from_utf8_lossy(&bytes).into_owned();
+    let remaining = state.len - state.cursor;
+    let finished = state.finished.is_some();
+    let dropped = state.dropped;
+    drop(state);
+    let mut parts = vec![format!("Session ID: {}", session_id(job.id))];
+    if page.is_empty() {
+        parts.push(
+            if finished {
+                "No more output."
+            } else {
+                "No more output yet. Output and completion arrive automatically."
+            }
+            .to_owned(),
+        );
+    } else {
+        parts.push(format!("Output:\n{page}"));
+    }
+    if remaining > 0 {
+        parts.push(format!(
+            "[{remaining} more bytes; call more_output() again for the next page]"
+        ));
+    }
+    if dropped > 0 {
+        parts.push(format!(
+            "[{dropped} bytes never reached the log: the command outran its limit]"
+        ));
+    }
+    Ok(parts.join("\n"))
 }
 
 async fn run_command(
     shell: &ShellTools,
     job: &Job,
-    args: &Value,
+    cmd: &str,
+    workdir: Option<&str>,
     link: &Arc<Mutex<ExecState>>,
-    cancelled: &mut tokio::sync::watch::Receiver<bool>,
-) -> Result<Value, String> {
-    let cmd = args["cmd"].as_str().ok_or("command requires cmd")?;
+) -> Result<CommandExit, String> {
+    let mut cancelled = link.lock().unwrap().cancelled.subscribe();
     let mut process = tokio::select! {
         biased;
         _ = cancelled.wait_for(|cancelled| *cancelled) => return Err("Command cancelled".into()),
         _ = job.cancel.notified() => return Err("Command cancelled".into()),
-        process = shell.spawn(cmd, args["workdir"].as_str()) => process.map_err(|e| e.to_string())?,
+        process = shell.spawn(cmd, workdir) => process.map_err(|e| e.to_string())?,
     };
     let work = async {
         *job.stdin.lock().await = process.take_stdin();
@@ -832,7 +1101,10 @@ async fn run_command(
             }
             link.lock().unwrap().waker.wake();
         }
-        Ok(json!({"id": job.id, "exit_code": exit_code}))
+        Ok(CommandExit {
+            id: job.id,
+            exit_code,
+        })
     };
     let result = tokio::select! {
         biased;
@@ -847,190 +1119,6 @@ async fn run_command(
     result
 }
 
-async fn host_call(
-    shared: &Shared,
-    name: &str,
-    args: Value,
-    link: &Arc<Mutex<ExecState>>,
-    operation: &Arc<Mutex<Operation>>,
-) -> Result<Value, String> {
-    // A session ID is a label the reports show, not a handle, and labels come
-    // round again every 9,000 requests. Only live jobs are searched, and two
-    // live jobs wearing one label is an error rather than a guess.
-    if name == "find_command" {
-        let label = args["session_id"].as_u64().ok_or("Expected a session ID")? as u32;
-        let found: Vec<u64> = shared
-            .jobs
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .filter(|id| session_id(*id) == label)
-            .collect();
-        return match found.as_slice() {
-            [id] => Ok(json!(id)),
-            [] => Err(format!("No live command has session ID {label}")),
-            _ => Err(format!(
-                "Session ID {label} names more than one live command; keep the handle command() returned"
-            )),
-        };
-    }
-    if matches!(
-        name,
-        "write_stdin" | "more_output" | "wait_command" | "cancel_command"
-    ) {
-        let id = args["id"].as_u64().ok_or("Expected command handle")?;
-        let job = shared
-            .jobs
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .ok_or("Command handle expired or unknown")?;
-        if name == "cancel_command" {
-            job.cancel.notify_one();
-            return Ok(Value::Null);
-        }
-        if name == "wait_command" {
-            let mut done = job.done.subscribe();
-            loop {
-                let finished = job.state.lock().unwrap().finished.clone();
-                if let Some((_, summary)) = finished {
-                    return Ok(summary);
-                }
-                done.changed().await.map_err(|e| e.to_string())?;
-            }
-        }
-        // `write_stdin` only writes. Reading output is `display`'s job, so
-        // that one function owns the cursor and nobody reads by accident.
-        if name == "write_stdin" {
-            let chars = args["chars"].as_str().ok_or("chars must be a string")?;
-            if !chars.is_empty() {
-                job.ready
-                    .subscribe()
-                    .wait_for(|ready| *ready)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let mut stdin = job.stdin.lock().await;
-                let stdin = stdin.as_mut().ok_or("Command stdin not ready or closed")?;
-                stdin
-                    .write_all(chars.as_bytes())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                stdin.flush().await.map_err(|e| e.to_string())?;
-            }
-            return Ok(Value::Null);
-        }
-        let mut state = job.state.lock().unwrap();
-        let start = state.cursor;
-        let size = (state.len - start)
-            .min(args["max_tokens"].as_u64().unwrap_or(2000).clamp(1, 10000) as usize * 4);
-        let mut bytes = vec![0; size];
-        state
-            .file
-            .seek(SeekFrom::Start(start as u64))
-            .map_err(|e| e.to_string())?;
-        state
-            .file
-            .read_exact(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        // Do not split a UTF-8 character merely because a page hit its budget.
-        // Non-UTF-8 process output still follows the shell's lossy-text contract.
-        if size < state.len - start
-            && let Err(error) = std::str::from_utf8(&bytes)
-            && error.error_len().is_none()
-        {
-            bytes.truncate(error.valid_up_to());
-        }
-        state.cursor += bytes.len();
-        // Reading by hand takes over from the automatic report: whatever was
-        // waiting to be reported is dropped, so the next reply does not say
-        // again what this page just showed. The rest is paged the same way.
-        state.unsent = BoundedOutput::for_tokens(Some(job.budget));
-        state.since = None;
-        let page = String::from_utf8_lossy(&bytes).into_owned();
-        let remaining = state.len - state.cursor;
-        let finished = state.finished.is_some();
-        let dropped = state.dropped;
-        drop(state);
-        // The same shape a command's own output arrives in, so a page reads
-        // like the report it continues.
-        let mut parts = vec![format!("Session ID: {}", session_id(id))];
-        if page.is_empty() {
-            parts.push(
-                if finished {
-                    "No more output."
-                } else {
-                    "No more output yet. Output and completion arrive automatically."
-                }
-                .to_owned(),
-            );
-        } else {
-            parts.push(format!("Output:\n{page}"));
-        }
-        if remaining > 0 {
-            parts.push(format!(
-                "[{remaining} more bytes; call more_output() again for the next page]"
-            ));
-        }
-        if dropped > 0 {
-            parts.push(format!(
-                "[{dropped} bytes never reached the log: the command outran its limit]"
-            ));
-        }
-        operation
-            .lock()
-            .unwrap()
-            .output
-            .push(parts.join("\n").as_bytes());
-        return Ok(Value::Null);
-    }
-    let tool = shared
-        .others
-        .get(name)
-        .ok_or_else(|| format!("Unknown tool: {name}"))?;
-    let call = ToolCall {
-        id: format!("python-{name}")
-            .try_into()
-            .map_err(|_| "Invalid tool ID")?,
-        name: name.try_into().map_err(|_| "Invalid host function name")?,
-        tool_type: ToolType::Function,
-        arguments: args.to_string(),
-    };
-    let result = tool.call(call).await;
-    if result.status != ToolOutputStatus::Success {
-        return Err((*result.output).clone());
-    }
-    // A tool that answers with pictures shows them here and now. Handing back
-    // a reference to display in a second call only ever meant the same thing
-    // one step later, and a reference could expire before it was used.
-    let mut dropped = 0;
-    if !result.images.is_empty() {
-        let mut cell = link.lock().unwrap();
-        for image in result.images.iter() {
-            if cell.images.len() >= 20 {
-                dropped += 1;
-                continue;
-            }
-            cell.images.push(image.clone());
-        }
-    }
-    if !result.output.is_empty() {
-        operation
-            .lock()
-            .unwrap()
-            .output
-            .push(result.output.as_bytes());
-    }
-    if dropped > 0 {
-        operation.lock().unwrap().output.push(
-            format!("[{dropped} more images not shown: this cell is at its limit of 20]")
-                .as_bytes(),
-        );
-    }
-    Ok(serde_json::from_str(&result.output)
-        .unwrap_or_else(|_| Value::String((*result.output).clone())))
-}
 pub struct PythonExec {
     id: ExecId,
     cell: u64,
@@ -1038,7 +1126,6 @@ pub struct PythonExec {
     shared: Arc<Shared>,
     history: Arc<HistoryStore>,
     sender: Sender,
-    runtime: tokio::runtime::Handle,
 }
 impl PythonExec {
     pub fn id(&self) -> &ExecId {
@@ -1178,29 +1265,6 @@ impl rho_python::Execution for PythonExec {
                     self.stop_stream();
                 }
             }
-            Event::Call {
-                request,
-                name,
-                arguments,
-                ..
-            } => {
-                if *self.link.lock().unwrap().cancelled.borrow() {
-                    let sender = self.sender.clone();
-                    self.runtime.spawn(async move {
-                        resolve(&sender, request, Err("Execution cancelled".into())).await;
-                    });
-                } else {
-                    register_call(
-                        &self.shared,
-                        &self.sender,
-                        request,
-                        name,
-                        arguments,
-                        self.link.clone(),
-                        &self.runtime,
-                    );
-                }
-            }
             Event::Started { .. } => {
                 let mut state = self.link.lock().unwrap();
                 state.started = true;
@@ -1338,19 +1402,20 @@ impl PythonCell {
                 return true;
             }
             let mut parts = Vec::new();
-            if let Some((_, summary)) = &finished {
+            if let Some((_, result)) = &finished {
                 if state.announced {
                     parts.push(format!("Session ID: {}", session_id(job.id)));
                 }
-                match summary.get("exit_code") {
-                    Some(exit_code) if !exit_code.is_null() => {
-                        parts.push(format!("Process exited with code {exit_code}"));
+                parts.push(match result {
+                    Ok(CommandExit {
+                        exit_code: Some(exit_code),
+                        ..
+                    }) => format!("Process exited with code {exit_code}"),
+                    Ok(CommandExit { exit_code: None, .. }) => {
+                        "Process ended without an exit code".to_owned()
                     }
-                    _ => match summary.get("error").and_then(Value::as_str) {
-                        Some(error) => parts.push(format!("Command failed: {error}")),
-                        None => parts.push("Process ended without an exit code".to_owned()),
-                    },
-                }
+                    Err(error) => format!("Command failed: {error}"),
+                });
             } else {
                 state.announced = true;
                 parts.push(format!(

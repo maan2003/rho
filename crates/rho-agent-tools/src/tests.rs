@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rho_core::{
     ContentPart, ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem,
-    ToolCall, ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate,
+    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate,
     UnixMs,
 };
 use rho_fs_view::PathOverrides;
@@ -11,7 +11,7 @@ use rho_tool_shell::ShellTools;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::{JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker};
+use crate::{HostFunction, JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker, ToolCx};
 
 fn shell() -> ShellTools {
     ShellTools::in_directory(
@@ -29,9 +29,14 @@ fn shell_in(directory: &tempfile::TempDir) -> ShellTools {
     )
 }
 
-fn python(shell: ShellTools, others: Vec<Arc<dyn crate::HostFunction>>) -> Arc<PythonNotebook> {
-    Arc::new(PythonNotebook::new(shell, others).unwrap())
+fn python(shell: ShellTools, functions: Vec<HostFunction>) -> Arc<PythonNotebook> {
+    Arc::new(PythonNotebook::new(shell, functions).unwrap())
 }
+
+/// A host function that takes no arguments.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoArgs {}
 
 fn call(id: &str, arguments: serde_json::Value) -> ExecCall {
     ExecCall {
@@ -595,24 +600,15 @@ async fn python_asyncio_timeout_does_not_own_the_managed_command() {
 
 #[tokio::test]
 async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() {
-    struct Echo;
-    impl crate::HostFunction for Echo {
-        fn name(&self) -> &'static str {
-            "echo"
-        }
-        fn call(
-            &self,
-            call: ToolCall,
-        ) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
-            Box::pin(async move {
-                crate::output(
-                    serde_json::from_str::<String>(&call.arguments).unwrap(),
-                    ToolOutputStatus::Success,
-                )
-            })
-        }
+    #[derive(serde::Deserialize)]
+    struct Text {
+        text: String,
     }
-    let tool = python(shell(), vec![Arc::new(Echo)]);
+    let echo = HostFunction::new("echo", &["text"], |cx: ToolCx, args: Text| async move {
+        cx.report(&args.text);
+        Ok(args.text)
+    });
+    let tool = python(shell(), vec![echo]);
     let wake = Arc::new(Notify::new());
     let mut cell = tool.exec(call("echo", json!(
         "echo('unawaited output')\nresult = await echo('awaited output')\nassert isinstance(result, str)\nassert result == 'awaited output'"
@@ -728,31 +724,28 @@ async fn old_execution_keeps_its_own_checkin_without_touching_new_execution() {
     old.acknowledge_output();
 }
 
-struct PendingTool(Arc<std::sync::atomic::AtomicUsize>);
-impl crate::HostFunction for PendingTool {
-    fn name(&self) -> &'static str {
-        "pending"
-    }
-    fn call(&self, _: ToolCall) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
-        struct Guard(Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            }
+/// `pending()`: never finishes; `count` is how many are running.
+fn pending_tool(count: Arc<std::sync::atomic::AtomicUsize>) -> HostFunction {
+    struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
-        let count = self.0.clone();
-        Box::pin(async move {
+    }
+    HostFunction::new("pending", &[], move |_: ToolCx, _: NoArgs| {
+        let count = count.clone();
+        async move {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _guard = Guard(count);
-            std::future::pending().await
-        })
-    }
+            std::future::pending::<Result<(), String>>().await
+        }
+    })
 }
 
 #[tokio::test]
 async fn python_cancellation_owns_pending_host_calls() {
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let tool = python(shell(), vec![Arc::new(PendingTool(count.clone()))]);
+    let tool = python(shell(), vec![pending_tool(count.clone())]);
     let wake = Arc::new(Notify::new());
     let mut cell = tool.exec(
         call("p1", json!("notify('starting'); await pending()")),
@@ -818,7 +811,7 @@ async fn python_session_id_recovers_a_handle_whose_python_name_was_lost() {
         call(
             "p2",
             json!(format!(
-                "job = Command.from_session_id({label})\njob.cancel()\nprint('recovered', job.id > 0)"
+                "job = Command.from_session_id({label})\njob.cancel()\nprint('recovered', isinstance(job.id, int))"
             )),
         ),
         SourceWaker::new(wake.clone()),
@@ -900,10 +893,10 @@ async fn python_retained_pages_do_not_split_unicode_characters() {
 async fn python_host_state_is_committed_before_return_without_agent_polling() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("registered");
-    let tool = python(shell(), Vec::new());
+    let tool = python(shell(), vec![pending_tool(Default::default())]);
     let wake = Arc::new(Notify::new());
     let source = format!(
-        "set_max_wait(300)\ncommand('echo registered')\nweb.run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
+        "set_max_wait(300)\ncommand('echo registered')\npending()\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
         marker.to_str().unwrap()
     );
     let mut cell = tool.exec(call("sync", json!(source)), SourceWaker::new(wake.clone()));
@@ -1020,27 +1013,19 @@ async fn a_silent_cell_says_nothing_when_an_older_cell_speaks_in_the_same_reply(
 
 #[tokio::test]
 async fn operation_output_does_not_change_exec_return_facts() {
-    struct ReleasedTool(Arc<Notify>);
-    impl crate::HostFunction for ReleasedTool {
-        fn name(&self) -> &'static str {
-            "released"
-        }
-        fn call(&self, _: ToolCall) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
-            let release = self.0.clone();
-            Box::pin(async move {
-                release.notified().await;
-                crate::output("nested result", ToolOutputStatus::Success)
-            })
-        }
-    }
     let release = Arc::new(Notify::new());
-    let tool = python(
-        shell(),
-        vec![
-            Arc::new(ReleasedTool(release.clone())),
-            Arc::new(PendingTool(Default::default())),
-        ],
-    );
+    let released = {
+        let release = release.clone();
+        HostFunction::new("released", &[], move |cx: ToolCx, _: NoArgs| {
+            let release = release.clone();
+            async move {
+                release.notified().await;
+                cx.report("nested result");
+                Ok(())
+            }
+        })
+    };
+    let tool = python(shell(), vec![released, pending_tool(Default::default())]);
     let wake = Arc::new(Notify::new());
     let mut cell = tool.exec(
         call("return-facts", json!("released()\npending()")),
@@ -1091,33 +1076,31 @@ async fn operation_output_does_not_change_exec_return_facts() {
 
 #[tokio::test]
 async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
-    struct EchoTool(&'static str);
-    impl crate::HostFunction for EchoTool {
-        fn name(&self) -> &'static str {
-            self.0
-        }
-        fn call(
-            &self,
-            call: ToolCall,
-        ) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
-            Box::pin(async move {
-                crate::output(
-                    format!("{}:{}", call.name.as_str(), call.arguments),
-                    ToolOutputStatus::Success,
-                )
-            })
-        }
-    }
-    let others: Vec<Arc<dyn crate::HostFunction>> = [
-        "spawn_engineer",
-        "interrupt_engineer",
-        "message_agent",
-        "ask_advisor",
-        "web__run",
-        "view_image",
+    // Each function answers with its path and the arguments it received.
+    let others: Vec<HostFunction> = [
+        ("agents.spawn_new_engineer", &[][..]),
+        ("agents.cancel", &[]),
+        ("agents.message", &[]),
+        ("agents.spawn_new_advisor", &["msg"]),
+        ("web.run", &[]),
     ]
     .into_iter()
-    .map(|name| Arc::new(EchoTool(name)) as Arc<dyn crate::HostFunction>)
+    .map(|(path, positional)| {
+        HostFunction::new(
+            path,
+            positional,
+            move |cx: ToolCx, args: serde_json::Map<String, serde_json::Value>| async move {
+                let text = format!("{path}:{}", serde_json::Value::Object(args));
+                cx.report(&text);
+                Ok(text)
+            },
+        )
+    })
+    .chain([HostFunction::new("view_image", &["path"], |cx: ToolCx, _: serde_json::Value| async move {
+        cx.report("viewed");
+        Ok(())
+    })
+    .detached()])
     .collect();
     let tool = PythonNotebook::new(shell(), others).unwrap();
     let wake = Arc::new(Notify::new());
@@ -1136,17 +1119,17 @@ assert "ask_advisor" not in globals()
 assert "message_agent" not in globals()
 assert "interrupt_engineer" not in globals()
 result = await agents.spawn_new_engineer(task_name="test", prompt="work")
-assert result.startswith("spawn_engineer:")
-assert json.loads(result.split(":", 1)[1])["workdir"] is None
+assert result.startswith("agents.spawn_new_engineer:")
+assert json.loads(result.split(":", 1)[1]) == {"task_name": "test", "prompt": "work"}
 result = await agents.spawn_new_engineer(task_name="test", prompt="work", workdir="/src/checkout")
 assert json.loads(result.split(":", 1)[1]) == {
     "task_name": "test", "prompt": "work", "workdir": "/src/checkout",
 }
-assert (await agents.message(agent_id="eng-test", message="hello")).startswith("message_agent:")
+assert (await agents.message(agent_id="eng-test", message="hello")).startswith("agents.message:")
 cancelled = await agents.cancel(agent_id="eng-test")
 assert json.loads(cancelled.split(":", 1)[1]) == {"agent_id": "eng-test"}
 agents.spawn_new_advisor("background review")
-assert (await web.run(search_query=[])).startswith("web__run:")
+assert (await web.run(search_query=[])).startswith("web.run:")
 assert view_image("test.png") is None
 "#
             ),
@@ -1158,7 +1141,7 @@ assert view_image("test.png") is None
     cell.acknowledge_output();
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
     assert!(output.output.contains("background review"), "{output:?}");
-    assert!(output.output.contains("interrupt_engineer:"), "{output:?}");
+    assert!(output.output.contains("agents.cancel:"), "{output:?}");
 }
 
 #[tokio::test]
@@ -1170,18 +1153,12 @@ async fn unregistered_python_callbacks_are_not_callable() {
             "no-delegation",
             json!(
                 r#"
-import agents
-assert not hasattr(agents, 'spawn_new_advisor')
-assert not hasattr(agents, 'spawn_new_engineer')
-assert not hasattr(agents, 'message')
-assert not hasattr(agents, 'cancel')
-# Bypassing the Python namespace still cannot dispatch an unregistered callback.
-try:
-    await command.__globals__['_request']('ask_advisor', {'message': 'not allowed'})
-except RuntimeError as error:
-    assert 'Unknown tool: ask_advisor' in str(error)
-else:
-    raise AssertionError('unregistered callback executed')
+import sys
+assert 'agents' not in globals() and 'agents' not in sys.modules
+assert 'web' not in globals()
+# No generic dispatcher exists to reach an unregistered function through.
+assert not any(name.startswith('_') and callable(value)
+               for name, value in globals().items() if name != '__builtins__')
 print('unregistered callback rejected')
 "#
             ),
@@ -1202,7 +1179,7 @@ async fn python_announces_sources_once_in_registration_order_including_late_sour
     let directory = tempfile::tempdir().unwrap();
     let release = directory.path().join("release");
     let registered = directory.path().join("registered");
-    let tool = python(shell(), vec![Arc::new(PendingTool(Default::default()))]);
+    let tool = python(shell(), vec![pending_tool(Default::default())]);
     let wake = Arc::new(Notify::new());
     let source = format!(
         "command('sleep 600')\npending()\ncommand('sleep 601')\nasync def later():\n    while not Path({:?}).exists():\n        await asyncio.sleep(0.01)\n    pending()\n    Path({:?}).touch()\nasyncio.create_task(later())",
@@ -1400,7 +1377,7 @@ async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tool = python(
         shell_in(&directory),
-        vec![Arc::new(PendingTool(count.clone()))],
+        vec![pending_tool(count.clone())],
     );
     let wake = Arc::new(Notify::new());
     let _cell = tool.exec(
@@ -1636,3 +1613,4 @@ async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
         }
     }
 }
+
