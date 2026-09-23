@@ -211,9 +211,7 @@ impl Web {
     /// results arrive with the cell's report, and the call also returns them.
     #[pyo3(signature = (**request))]
     fn run(&self, py: Python<'_>, request: Option<Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
-        let request = request.unwrap_or_else(|| PyDict::new(py));
-        let request: WebRequest = pythonize::depythonize(request.as_any())
-            .map_err(|error| PyTypeError::new_err(format!("web.run(): {error}")))?;
+        let request = web_request(&request.unwrap_or_else(|| PyDict::new(py)))?;
         let tools = self.tools.clone();
         operation(py, "web.run", move |cx| async move {
             let output = tools.run(request, ToolExecutionContext::default()).await?;
@@ -221,6 +219,12 @@ impl Web {
             Ok(output)
         })
     }
+}
+
+/// The keyword arguments as the request they spell.
+fn web_request(request: &Bound<'_, PyDict>) -> PyResult<WebRequest> {
+    pythonize::depythonize(request.as_any())
+        .map_err(|error| PyTypeError::new_err(format!("web.run(): {error}")))
 }
 
 /// `papercut(*, description)`: record Rho friction locally.
@@ -247,6 +251,33 @@ mod tests {
 
     use super::*;
     use crate::python::PythonNotebook;
+
+    #[tokio::test]
+    async fn web_run_arguments_become_a_web_request() {
+        let directory = tempfile::tempdir().unwrap();
+        // The notebook brings up the interpreter.
+        let _notebook = PythonNotebook::new(
+            ShellTools::in_directory(
+                Duration::from_secs(5),
+                directory.path().to_str().unwrap().into(),
+                Default::default(),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        Python::attach(|py| {
+            let parse = |source: &str| {
+                let request = py
+                    .eval(&std::ffi::CString::new(source).unwrap(), None, None)
+                    .unwrap();
+                web_request(request.cast::<PyDict>().unwrap())
+            };
+            parse("dict(search_query=[{'q': 'rho'}])").unwrap();
+            parse("dict(open=[{'ref_id': 'https://example.com'}])").unwrap();
+            let error = parse("dict(search_query='rho')").unwrap_err();
+            assert!(error.is_instance_of::<PyTypeError>(py), "{error}");
+        });
+    }
 
     /// A daemon that answers every call with the call itself.
     fn echo_daemon(calls: Arc<Mutex<Vec<String>>>) -> Daemon {
