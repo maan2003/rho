@@ -2,8 +2,7 @@
 //! backend and cache crates.
 
 pub mod eval_op;
-pub mod internal_log;
 pub mod nix_log_bridge;
 
-pub use eval_op::{EvalInputState, EvalOp, OpObserver};
-pub use internal_log::{ActivityType, Field, InternalLog, ResultType, Verbosity};
+pub use eval_op::{EvalOp, OpObserver};
+pub use nix_log_bridge::NixLogBridge;

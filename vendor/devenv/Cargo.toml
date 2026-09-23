@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "devenv-activity",
-  "devenv-activity-macros",
   "devenv-cache-core",
   "devenv-core",
   "devenv-eval-cache",
@@ -18,50 +16,16 @@ repository = "https://github.com/cachix/devenv/"
 
 [workspace.dependencies]
 arc-swap = "1.9.2"
-devenv-activity = { path = "devenv-activity" }
-devenv-activity-macros = { path = "devenv-activity-macros" }
 devenv-cache-core = { path = "devenv-cache-core" }
 devenv-core = { path = "devenv-core" }
-devenv-eval-cache = { path = "devenv-eval-cache" }
-devenv-nix-backend = { path = "devenv-nix-backend" }
-
 nix-bindings-flake = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-expr = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-store = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-util = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-fetchers = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
-nix-cmd = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-bindgen-raw = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
-
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", branch = "master" }
-libghostty-vt-sys = { git = "https://github.com/Uzaaft/libghostty-rs.git", branch = "master", default-features = false, features = [
-  "pkg-config",
-] }
-base64 = "0.22"
 anyhow = "1.0.102"
-async-priority-channel = "0.2.0"
-async-trait = "0.1"
-bytes = "1"
 blake3 = "1.8.3"
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.6.1", features = ["derive", "cargo", "env"] }
-clap_complete = { version = "4.6.3", features = ["unstable-dynamic"] }
-clap_mangen = "0.3.0"
-cstr = "0.2"
-cli-table = "0.5.0"
-console = "0.16.3"
-detect-coding-agent = "0.1.0"
-dialoguer = "0.12.0"
-dotenv = { package = "dotenv-ng", version = "1.0.0" }
-fd-lock = "4"
-futures = "0.3.32"
-hex = "0.4.3"
-hostname = "0.4.2"
-humantime = "2"
-include_dir = "0.7.4"
-indexmap = "2.14.0"
-indoc = "2.0.7"
-pathdiff = "0.2.3"
 miette = { version = "7.6.0", features = ["fancy"] }
 nix = { version = "0.31", features = [
   "fs",
@@ -71,113 +35,10 @@ nix = { version = "0.31", features = [
   "signal",
   "term",
 ] }
-nix-flake-lock = "0.1.0"
-num_enum = "0.7"
-once_cell = "1.21.4"
-petgraph = "0.8.3"
-pretty_assertions = { version = "1.4.1", features = ["unstable"] }
-netstat2 = "0.11"
-regex = "1.12.3"
-schemars = "1.2.1"
-schematic = { version = "0.19", features = [
-  "schema",
-  "yaml",
-  "renderer_template",
-  "renderer_json_schema",
-] }
-secrecy = "0.10"
-# https://github.com/mikaelmello/inquire/pull/330
-secretspec = "0.20"
-semver = "1"
 serde = { version = "1.0.228", features = ["derive"] }
-# default-features = false drops the `reqwest` feature (remote https
-# imports); we only read a local cachix config and want no network stack.
-serde_dhall = { version = "0.13.0", default-features = false }
 serde_json = "1.0.149"
-serde_repr = "0.1.20"
-serde_with = "3"
-serde_yaml = "0.9.34"
-toml = "0.9.12"
-ser_nix = "0.2.4"
-similar = "3.1.0"
-sha2 = "0.11.0"
-shell-escape = "0.1.5"
-sqlx = { version = "0.9.0", features = ["time", "sqlite", "runtime-tokio"] }
-strum = { version = "0.28", features = ["derive"] }
 tempfile = "3.27.0"
-termimad = "0.34"
-tokio-test = "0.4"
 thiserror = "2.0.18"
-tracing = { version = "0.1.44", features = ["valuable"] }
-tracing-subscriber = { version = "0.3.23", features = [
-  "env-filter",
-  "json",
-  "valuable",
-] }
-valuable = { version = "0.1", features = ["derive"] }
-valuable-serde = "0.1"
-json-subscriber = { version = "0.2.8" }
-tokio = { version = "1.52.1", features = [
-  "process",
-  "fs",
-  "io-util",
-  "macros",
-  "rt-multi-thread",
-  "sync",
-  "time",
-] }
-tokio-util = { version = "0.7.18", features = ["io"] }
-tokio-stream = "0.1"
-uuid = { version = "1.23", features = ["v4"] }
-which = "8.0.2"
-whoami = "2.1.2"
-xdg = "3.0.0"
+tracing = "0.1.44"
 walkdir = "2.5"
 rusqlite = { version = "0.40", features = ["bundled"] }
-globset = "0.4"
-url = "2"
-human-repr = "1.1"
-insta = { version = "1.47", features = ["filters", "json"] }
-notify = { version = "8", default-features = false }
-watchexec = "8.4.1"
-watchexec-filterer-globset = "8.0"
-watchexec-supervisor = "5.4.0"
-signal-hook = "0.4"
-signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
-socket2 = "0.6"
-process-wrap = { version = "9.1", features = ["tokio1"] }
-pingora-core = { version = "=0.8.1", default-features = false }
-pingora-http = { version = "=0.8.1", default-features = false }
-pingora-proxy = { version = "=0.8.1", default-features = false }
-portable-pty = "0.9.0"
-ignore = "0.4.25"
-proptest = "1.11"
-libc = "0.2"
-libsqlite3-sys = { version = "0.37", default-features = false }
-proc-macro2 = "1.0"
-quote = "1.0"
-syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
-
-reqwest = { version = "0.13", features = ["json", "query", "stream"] }
-axum = "0.8"
-caps = "0.5"
-rmcp = { version = "2.0", features = [
-  "server",
-  "transport-io",
-  "transport-streamable-http-server",
-] }
-sd-notify = "0.5"
-
-# Optional OpenTelemetry dependencies
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
-  "trace",
-  "metrics",
-] }
-tracing-opentelemetry = "0.33"
-
-# Ensure crossterm versions match between these
-iocraft = { version = "=0.8.3", features = ["unstable-output-streams"] }
-crossterm = "0.29.0"
-

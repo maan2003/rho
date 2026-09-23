@@ -1,8 +1,7 @@
 //! Evaluation operation types and structured Nix effect parsing.
 //!
 //! Nix emits evaluation dependencies through a dedicated one-shot callback.
-//! Keeping the wire conversion here means cache invalidation and the UI use
-//! the same typed representation without depending on logger activities.
+//! This is the typed form of those effects that cache invalidation consumes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,61 +35,6 @@ pub enum EvalOp {
     /// Forced a source-info metadata attribute (`rev`, `lastModified`, ...)
     /// of the input mounted at `store_path`.
     ForcedInputAttr { store_path: PathBuf, name: String },
-}
-
-/// Exact state captured at the moment an evaluation input was consumed.
-///
-/// Primops use this when re-reading the input later could associate a stale
-/// evaluation result with newer file or environment state.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum EvalInputState {
-    File {
-        path: PathBuf,
-        content_sha256: Option<String>,
-    },
-    Env {
-        name: String,
-        content_sha256: Option<String>,
-    },
-}
-
-impl EvalInputState {
-    pub fn operation(&self) -> EvalOp {
-        match self {
-            Self::File { path, .. } => EvalOp::ReadFile {
-                source: path.clone(),
-            },
-            Self::Env { name, .. } => EvalOp::GetEnv { name: name.clone() },
-        }
-    }
-}
-
-impl EvalOp {
-    /// Convert to the activity event type for serialization. Input mounts and
-    /// metadata observations only matter to caching and have no event.
-    pub fn to_activity(&self) -> Option<devenv_activity::EvalOp> {
-        let op = self.clone();
-        Some(match op {
-            EvalOp::CopiedSource { source, target } => {
-                devenv_activity::EvalOp::CopiedSource { source, target }
-            }
-            EvalOp::FilteredSource { source, target } => {
-                devenv_activity::EvalOp::FilteredSource { source, target }
-            }
-            EvalOp::EvaluatedFile { source, cached } => {
-                devenv_activity::EvalOp::EvaluatedFile { source, cached }
-            }
-            EvalOp::ReadFile { source } => devenv_activity::EvalOp::ReadFile { source },
-            EvalOp::ReadDir { source } => devenv_activity::EvalOp::ReadDir { source },
-            EvalOp::ReadFileType { source } => devenv_activity::EvalOp::ReadFileType { source },
-            EvalOp::HashFile { source, algorithm } => {
-                devenv_activity::EvalOp::HashFile { source, algorithm }
-            }
-            EvalOp::GetEnv { name } => devenv_activity::EvalOp::GetEnv { name },
-            EvalOp::PathExists { source } => devenv_activity::EvalOp::PathExists { source },
-            EvalOp::MountedInput { .. } | EvalOp::ForcedInputAttr { .. } => return None,
-        })
-    }
 }
 
 impl EvalOp {
@@ -147,21 +91,12 @@ impl EvalOp {
 pub trait OpObserver: Send + Sync + 'static {
     /// Called when an operation is observed during evaluation.
     fn record(&self, op: EvalOp);
-
-    /// Record both an input identity and the state actually consumed.
-    fn record_input_state(&self, input: EvalInputState) {
-        self.record(input.operation());
-    }
 }
 
 /// Wrapper to allow `Arc<dyn OpObserver>` to implement `OpObserver`.
 impl OpObserver for Arc<dyn OpObserver> {
     fn record(&self, op: EvalOp) {
         (**self).record(op);
-    }
-
-    fn record_input_state(&self, input: EvalInputState) {
-        (**self).record_input_state(input);
     }
 }
 

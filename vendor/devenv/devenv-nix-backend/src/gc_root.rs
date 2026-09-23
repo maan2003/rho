@@ -14,7 +14,7 @@ use crate::anyhow_ext::AnyhowToMiette;
 
 /// What was found at the GC root path before the root was registered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GcRootOutcome {
+pub enum GcRootOutcome {
     /// No entry existed.
     Created,
     /// A symlink already pointed at the store path.

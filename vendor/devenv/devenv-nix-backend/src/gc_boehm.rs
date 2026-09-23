@@ -2,12 +2,10 @@
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
-use std::sync::{LazyLock, Once};
+use std::sync::Once;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use opentelemetry::metrics::{Gauge, Histogram};
-use opentelemetry::{KeyValue, global};
 
 // Ensure Nix/GC is initialized exactly once across all threads.
 static NIX_INIT: Once = Once::new();
@@ -115,82 +113,9 @@ pub fn heap_stats() -> HeapStats {
     }
 }
 
-struct Instruments {
-    heap: Gauge<u64>,
-    live: Gauge<u64>,
-    free: Gauge<u64>,
-    unmapped: Gauge<u64>,
-    allocated_since_gc: Gauge<u64>,
-    collections: Gauge<u64>,
-    collection_duration: Histogram<f64>,
-    reclaimed: Histogram<u64>,
-}
-
-impl Instruments {
-    fn new() -> Self {
-        let meter = global::meter("devenv_nix_backend::gc_boehm");
-        Self {
-            heap: meter
-                .u64_gauge("devenv.nix.gc.heap.size")
-                .with_description("Bytes in the Boehm heap")
-                .with_unit("By")
-                .build(),
-            live: meter
-                .u64_gauge("devenv.nix.gc.heap.live")
-                .with_description("Boehm heap bytes not on free lists")
-                .with_unit("By")
-                .build(),
-            free: meter
-                .u64_gauge("devenv.nix.gc.heap.free")
-                .with_description("Bytes on Boehm free lists")
-                .with_unit("By")
-                .build(),
-            unmapped: meter
-                .u64_gauge("devenv.nix.gc.heap.unmapped")
-                .with_description("Boehm heap bytes returned to the operating system")
-                .with_unit("By")
-                .build(),
-            allocated_since_gc: meter
-                .u64_gauge("devenv.nix.gc.allocated_since_collection")
-                .with_description("Bytes allocated since the last Boehm collection")
-                .with_unit("By")
-                .build(),
-            collections: meter
-                .u64_gauge("devenv.nix.gc.collections")
-                .with_description("Completed Boehm collections")
-                .with_unit("{collection}")
-                .build(),
-            collection_duration: meter
-                .f64_histogram("devenv.nix.gc.collection.duration")
-                .with_description("Duration of explicitly requested Boehm collections")
-                .with_unit("s")
-                .build(),
-            reclaimed: meter
-                .u64_histogram("devenv.nix.gc.collection.reclaimed")
-                .with_description("Bytes reclaimed by explicitly requested Boehm collections")
-                .with_unit("By")
-                .build(),
-        }
-    }
-
-    fn record_heap(&self, stage: &'static str, stats: HeapStats) {
-        let attributes = [KeyValue::new("stage", stage)];
-        self.heap.record(stats.heap_bytes, &attributes);
-        self.live.record(stats.live_bytes(), &attributes);
-        self.free.record(stats.free_bytes, &attributes);
-        self.unmapped.record(stats.unmapped_bytes, &attributes);
-        self.allocated_since_gc
-            .record(stats.bytes_since_gc, &attributes);
-        self.collections.record(stats.collections, &attributes);
-    }
-}
-
-static INSTRUMENTS: LazyLock<Instruments> = LazyLock::new(Instruments::new);
-
-/// Record a heap snapshot as an OTLP span and metrics sample.
+/// Record a heap snapshot as a tracing span.
 pub fn observe(stage: &'static str) -> HeapStats {
     let stats = heap_stats();
-    INSTRUMENTS.record_heap(stage, stats);
 
     let span = tracing::info_span!(
         target: "devenv_nix_backend::gc_boehm",
@@ -242,11 +167,6 @@ pub fn collect(stage: &'static str) {
     let elapsed = started.elapsed().as_secs_f64();
     let after = heap_stats();
     let reclaimed = before.live_bytes().saturating_sub(after.live_bytes());
-
-    let attributes = [KeyValue::new("stage", stage)];
-    INSTRUMENTS.record_heap(stage, after);
-    INSTRUMENTS.collection_duration.record(elapsed, &attributes);
-    INSTRUMENTS.reclaimed.record(reclaimed, &attributes);
 
     span.record("gc_duration_seconds", elapsed);
     span.record("gc_reclaimed_bytes", reclaimed);

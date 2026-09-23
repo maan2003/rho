@@ -3520,31 +3520,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "devenv-activity"
-version = "2.3.2"
-dependencies = [
- "arc-swap",
- "devenv-activity-macros",
- "humantime",
- "serde",
- "serde_json",
- "serde_with",
- "strum 0.28.0",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "devenv-activity-macros"
-version = "2.3.2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "devenv-cache-core"
 version = "2.3.2"
 dependencies = [
@@ -3560,13 +3535,6 @@ name = "devenv-core"
 version = "2.3.2"
 dependencies = [
  "arc-swap",
- "devenv-activity",
- "num_enum",
- "regex",
- "serde",
- "serde_json",
- "serde_repr",
- "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -3597,7 +3565,6 @@ dependencies = [
  "nix-bindings-flake",
  "nix-bindings-store",
  "nix-bindings-util",
- "opentelemetry",
  "serde",
  "serde_json",
  "tracing",
@@ -9893,20 +9860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "pin-project-lite",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
 name = "optfield"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13186,6 +13139,7 @@ dependencies = [
  "devenv-eval-cache",
  "devenv-nix-backend",
  "serde_json",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -16324,8 +16278,6 @@ checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
 dependencies = [
  "serde",
  "tracing-core",
- "valuable",
- "valuable-serde",
 ]
 
 [[package]]
@@ -16347,8 +16299,6 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
- "valuable",
- "valuable-serde",
 ]
 
 [[package]]
@@ -17092,16 +17042,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "valuable-serde"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ee0548edecd1b907be7e67789923b7d02275b9ba4a33ebc33300e2c947a8cb1"
-dependencies = [
- "serde",
- "valuable",
-]
 
 [[package]]
 name = "value-bag"

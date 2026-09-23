@@ -10,6 +10,7 @@ pub use gc_boehm::{
     unregister_current_thread as gc_unregister_current_thread,
 };
 mod gc_root;
+pub use gc_root::GcRootOutcome;
 
 mod file_limit;
 

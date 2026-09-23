@@ -232,6 +232,18 @@ pub fn delete_evals(conn: &Connection, key_hash: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Remove one candidate.
+pub fn delete_eval(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM cached_eval WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Ids of every candidate.
+pub fn get_eval_ids(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached("SELECT id FROM cached_eval")?;
+    stmt.query_map([], |row| row.get(0))?.collect()
+}
+
 /// Mark a candidate as used now.
 pub fn update_eval_updated_at(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute(

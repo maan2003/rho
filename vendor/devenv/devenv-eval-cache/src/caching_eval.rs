@@ -119,6 +119,19 @@ impl CachingEvalService {
         Ok(eval_id)
     }
 
+    /// Remove one candidate, e.g. when its store paths were garbage
+    /// collected.
+    pub fn remove(&self, eval_id: i64) -> CacheResult<()> {
+        db::delete_eval(self.db.conn(), eval_id)?;
+        Ok(())
+    }
+
+    /// Ids of every stored candidate, for pruning per-candidate state kept
+    /// outside the database such as GC roots.
+    pub fn eval_ids(&self) -> CacheResult<Vec<i64>> {
+        Ok(db::get_eval_ids(self.db.conn())?)
+    }
+
     /// Remove every cached candidate of `key`, e.g. when a cached result is
     /// no longer usable because its store paths were garbage collected.
     pub fn invalidate(&self, key: &EvalCacheKey) -> CacheResult<()> {

@@ -6,7 +6,7 @@
 //!
 //!     rho-nix-eval shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
@@ -57,6 +57,13 @@ fn default_cache_path() -> PathBuf {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     // Evaluation recurses deeply; match the Nix CLI's stack.
     std::thread::Builder::new()
         .stack_size(NIX_STACK_SIZE)
@@ -112,18 +119,15 @@ fn run(args: Args) -> Result<()> {
     );
 
     // A broken cache must not stop evaluation.
-    let mut cache = args.cache.and_then(|path| {
-        CachingEvalService::open(path)
+    let mut cache = args.cache.as_ref().and_then(|path| {
+        CachingEvalService::open(path.clone())
             .inspect_err(|e| eprintln!("eval cache unavailable: {e}"))
             .ok()
     });
     if let Some(cache) = &cache {
-        let hit = Checkout::new(&args.flake_dir, scheme)
-            .map_err(anyhow::Error::from)
-            .and_then(|checkout| Ok(cache.get_cached(&key, &checkout, &env)?));
-        match hit {
-            Ok(Some(hit)) => {
-                report("hit", &Shell::from_json(&hit.json_output)?, t0, None);
+        match lookup(cache, &key, &args.flake_dir, &env) {
+            Ok(Some(shell)) => {
+                report("hit", &shell, t0, None);
                 return Ok(());
             }
             Ok(None) => {}
@@ -157,21 +161,77 @@ fn run(args: Args) -> Result<()> {
         Some(cache) => identities.to_inputs(&checkout, &mut cache.hashes(), &env)?,
         None => identities.to_inputs(&checkout, &mut devenv_eval_cache::eval_inputs::Uncached, &env)?,
     };
-    for input in &inputs {
-        eprintln!("input {input:?}");
-    }
     let stats = Some((lookup_done, eval_done, inputs.len(), eval.ops.len()));
     if let Some(changed) = any_input_modified_after(&inputs, &checkout, eval.started_at) {
         eprintln!("not caching: {} changed during evaluation", changed.display());
         report("uncacheable", &shell, t0, stats);
         return Ok(());
     }
-    if let Some(cache) = &mut cache {
-        if let Err(e) = cache.store(&key, &shell.to_json(), &inputs) {
-            eprintln!("failed to store eval result: {e}");
+    if let (Some(cache), Some(cache_path)) = (&mut cache, &args.cache) {
+        let stored = cache.store(&key, &shell.to_json(), &inputs).and_then(|eval_id| {
+            Ok((eval_id, cache.eval_ids()?))
+        });
+        match stored {
+            Ok((eval_id, live)) => {
+                let roots = gc_roots_dir(cache_path);
+                if let Err(e) = root_shell(&mut nix, &roots, eval_id, &shell, &live) {
+                    eprintln!("failed to register GC root: {e}");
+                }
+            }
+            Err(e) => eprintln!("failed to store eval result: {e}"),
         }
     }
     report("miss", &shell, t0, stats);
+    Ok(())
+}
+
+/// A valid cached shell for `key`, dropping candidates whose store paths were
+/// garbage collected (as devenv does) and trying the next.
+fn lookup(
+    cache: &CachingEvalService,
+    key: &EvalCacheKey,
+    flake_dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Shell>> {
+    let checkout = Checkout::new(flake_dir, key.scheme)?;
+    while let Some(hit) = cache.get_cached(key, &checkout, env)? {
+        let shell = Shell::from_json(&hit.json_output)?;
+        // Only the environment is used; its GC root keeps its closure alive.
+        if Path::new(&shell.env_store_path).exists() {
+            return Ok(Some(shell));
+        }
+        eprintln!("cached shell {} was garbage collected", shell.env_store_path);
+        cache.remove(hit.eval_id)?;
+    }
+    Ok(None)
+}
+
+/// GC roots of cached shells live next to the cache, one per candidate.
+fn gc_roots_dir(cache_path: &Path) -> PathBuf {
+    let mut dir = cache_path.as_os_str().to_owned();
+    dir.push(".gcroots");
+    PathBuf::from(dir)
+}
+
+/// Root `shell`'s environment as candidate `eval_id`, and drop roots of
+/// candidates the cache no longer holds.
+fn root_shell(
+    nix: &mut NixRuntime,
+    roots: &Path,
+    eval_id: i64,
+    shell: &Shell,
+    live: &[i64],
+) -> Result<()> {
+    std::fs::create_dir_all(roots)?;
+    nix.add_gc_root(&roots.join(eval_id.to_string()), &shell.env_store_path)
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    for entry in std::fs::read_dir(roots)? {
+        let entry = entry?;
+        let id = entry.file_name().to_str().and_then(|name| name.parse::<i64>().ok());
+        if id.is_none_or(|id| !live.contains(&id)) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
     Ok(())
 }
 

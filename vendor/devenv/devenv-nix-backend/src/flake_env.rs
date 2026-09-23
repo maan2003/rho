@@ -1,7 +1,7 @@
 //! Evaluate a flake's `devShells` output into a development environment.
 //!
 //! One [`NixRuntime`] owns the process-global Nix state: GC registration,
-//! settings, the store connection and the activity logger. Each
+//! settings, the store connection and the logger. Each
 //! [`NixRuntime::eval_dev_shell`] call builds a fresh `EvalState`, locks the
 //! flake in check mode (a stale or missing lock is an error, never a write),
 //! realises the shell derivation, and returns the environment together with
@@ -9,6 +9,7 @@
 //! those effects mean for caching.
 
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -27,7 +28,7 @@ use nix_bindings_util::settings;
 
 use crate::anyhow_ext::AnyhowToMiette;
 use crate::build_environment::BuildEnvironment;
-use crate::gc_root::ensure_gc_root;
+use crate::gc_root::{GcRootOutcome, ensure_gc_root};
 use crate::logger::{NixLoggerSetup, setup_nix_logger};
 use crate::umask_guard::UmaskGuard;
 
@@ -62,7 +63,7 @@ pub struct DevShell {
 /// A development shell plus what its evaluation depended on.
 pub struct DevShellEval {
     pub shell: DevShell,
-    /// Effects in observation order, including input mounts.
+    /// Distinct effects, including input mounts, in no particular order.
     pub ops: Vec<EvalOp>,
     /// Wall-clock time just before evaluation started. Inputs modified at
     /// or after this instant may have changed while being read.
@@ -119,7 +120,9 @@ impl NixRuntime {
         let started_at = SystemTime::now();
         let shell = self.eval_dev_shell_inner(request);
         self.logger.bridge.remove_observer(&observer);
-        let ops = std::mem::take(&mut *recorder.ops.lock().unwrap());
+        let ops = std::mem::take(&mut *recorder.ops.lock().unwrap())
+            .into_iter()
+            .collect();
         Ok(DevShellEval {
             shell: shell?,
             ops,
@@ -205,18 +208,21 @@ impl NixRuntime {
     }
 
     /// Point `gc_root` at `store_path` and register it as a Nix GC root.
-    pub fn add_gc_root(&mut self, gc_root: &Path, store_path: &str) -> Result<()> {
-        ensure_gc_root(&mut self.store, gc_root, store_path).map(|_| ())
+    pub fn add_gc_root(&mut self, gc_root: &Path, store_path: &str) -> Result<GcRootOutcome> {
+        ensure_gc_root(&mut self.store, gc_root, store_path)
     }
 }
 
+/// Collects distinct effects. Nix repeats many of them (`pathExists`,
+/// `getEnv`, re-reads), so deduplicating on insert bounds memory by the
+/// distinct inputs rather than the raw event count, as devenv's tracker does.
 #[derive(Default)]
 struct Recorder {
-    ops: Mutex<Vec<EvalOp>>,
+    ops: Mutex<HashSet<EvalOp>>,
 }
 
 impl OpObserver for Recorder {
     fn record(&self, op: EvalOp) {
-        self.ops.lock().unwrap().push(op);
+        self.ops.lock().unwrap().insert(op);
     }
 }
