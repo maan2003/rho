@@ -33,6 +33,7 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-mirror",
+  "crates/rho-nix-eval",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
@@ -58,6 +59,7 @@ members = [
 ]
 exclude = [
   "vendor/brush",
+  "vendor/devenv",
   "vendor/moq",
   "vendor/libvpx-rs",
   "vendor/noq",
@@ -82,6 +84,8 @@ axum = "0.8"
 base64 = "0.22"
 brush-builtins = { path = "vendor/brush/brush-builtins" }
 brush-core = { path = "vendor/brush/brush-core" }
+devenv-eval-cache = { path = "vendor/devenv/devenv-eval-cache" }
+devenv-nix-backend = { path = "vendor/devenv/devenv-nix-backend" }
 buffer_diff = { path = "vendor/zed/crates/buffer_diff" }
 bytes = "1"
 camino = "1"

@@ -18,6 +18,7 @@ across an upstream update, and avoid unrelated cleanup inside a subtree.
 | `vendor/iroh` | https://github.com/n0-computer/iroh.git |
 | `vendor/noq` | https://github.com/n0-computer/noq.git |
 | `crates/senax-encoder` | https://github.com/yossyX/senax-encoder.git |
+| `vendor/devenv` | https://github.com/cachix/devenv.git (hard fork, see its README; not updated by `subtree pull`) |
 
 The upstream baseline of a subtree is the newest squash commit reachable
 from `HEAD`, found by its trailers:
