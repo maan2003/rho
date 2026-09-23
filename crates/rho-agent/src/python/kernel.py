@@ -292,8 +292,9 @@ def starts_statement(line):
 
 
 class Stream:
-    """A cell whose source arrives in pieces and runs one admitted top-level
-    statement at a time."""
+    """A cell whose source arrives in pieces and runs one top-level statement
+    at a time: each admitted while the source is still arriving, and the rest
+    freely once it has all arrived."""
 
     def __init__(self, owner, filename):
         self.owner = owner
@@ -449,17 +450,16 @@ class Notebook:
         stream.eof = stream.eof or eof
         linecache.cache[stream.filename] = (
             len(stream.text), None, stream.text.splitlines(True), stream.filename)
-        self.advance(stream)
+        if stream.eof and stream.pending is not None:
+            self.run_unit(stream)
+        else:
+            self.advance(stream)
 
     def on_permit(self, cell, end):
         stream = self.streams.get(cell)
         if stream is None or stream.stopped or stream.pending is None or stream.pending[0] != end:
             return
-        code = stream.pending[1]
-        stream.pending = None
-        stream.running = end
-        stream.owner.hold()
-        self.run_code(stream.owner, code, lambda error: self.settled(stream, end, error))
+        self.run_unit(stream)
 
     def on_stop(self, cell):
         stream = self.streams.get(cell)
@@ -491,8 +491,17 @@ class Notebook:
         if unit is not None:
             stream.pending = unit
             stream.owner.cell.unit_ready(unit[0])
+            if stream.eof:
+                self.run_unit(stream)
         elif stream.eof and stream.pos >= len(stream.text):
             self.close(stream, None)
+
+    def run_unit(self, stream):
+        end, code = stream.pending
+        stream.pending = None
+        stream.running = end
+        stream.owner.hold()
+        self.run_code(stream.owner, code, lambda error: self.settled(stream, end, error))
 
     def settled(self, stream, end, error):
         stream.owner.cell.unit_settled(end, error)

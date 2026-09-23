@@ -116,8 +116,8 @@ security, resource-isolation, or rollback boundary.
   replay projection. Claude Code owns its own history and compaction instead.
   The two concrete runtimes share a pure boundary and the `python` module's concrete
   notebook, jobs, and leased output—not a universal runtime or tool-session trait.
-  `PythonExec` owns streaming-unit progress; the agent chooses admission and
-  validates provider identity/source without maintaining a second progress ledger.
+  `PythonExec` owns streaming-unit progress; the agent chooses admission while
+  the response is in flight and validates provider identity/source without maintaining a second progress ledger.
 - `rho-fs-view` owns the state root (`~/.local/state/rho`) and the agent
   filesystem view; `WORKSET.md` is its design note and `VIEW.md` the
   requirements the view is built towards. A workset is one plain

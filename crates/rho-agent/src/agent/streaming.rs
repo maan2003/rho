@@ -8,11 +8,14 @@ use rho_inference::exec::set_source;
 
 use super::*;
 
+/// The streamed call of the response in flight. Its source so far is its
+/// cell's, in [`Cells`].
+#[derive(Clone)]
 pub(super) struct Stream {
+    pub id: ToolCallId,
     pub exec: Arc<crate::python::PythonExec>,
     item: InferenceResponseItem,
     index: usize,
-    source: String,
 }
 
 impl Agent {
@@ -34,26 +37,25 @@ impl Agent {
         if incoming.source.len() > 1024 * 1024 {
             return Err(anyhow::anyhow!("Streaming Python source exceeds 1 MiB"));
         }
-        if let Some(id) = &in_flight.stream {
-            if id != &incoming.id {
+        if let Some(stream) = &in_flight.stream {
+            if stream.id != incoming.id {
                 return Err(anyhow::anyhow!(
                     "Provider changed the streaming exec identity"
                 ));
             }
-            let stream = self.streams.get_mut(id).unwrap();
+            let held = self.cells.get_mut(&stream.id).unwrap();
             let mut identity = item.clone();
             set_source(&mut identity, String::new());
             if index != stream.index
                 || identity != stream.item
-                || !incoming.source.starts_with(&stream.source)
+                || !incoming.source.starts_with(&held.source)
             {
                 return Err(anyhow::anyhow!(
                     "Provider changed previously received Python source or call metadata"
                 ));
             }
-            let fragment = incoming.source[stream.source.len()..].to_owned();
-            stream.source = incoming.source;
-            self.cells.get_mut(id).unwrap().source = stream.source.clone();
+            let fragment = incoming.source[held.source.len()..].to_owned();
+            held.source = incoming.source;
             if !fragment.is_empty() {
                 stream
                     .exec
@@ -84,42 +86,41 @@ impl Agent {
             at: now,
         })
         .await?;
-        self.streams.insert(
-            incoming.id.clone(),
-            Stream {
-                exec: exec.clone(),
-                item: identity,
-                index,
-                source: incoming.source.clone(),
-            },
-        );
         let Phase::Requesting(in_flight) = &mut self.phase else {
             unreachable!()
         };
-        in_flight.stream = Some(incoming.id);
+        in_flight.stream = Some(Stream {
+            id: incoming.id,
+            exec: exec.clone(),
+            item: identity,
+            index,
+        });
         exec.feed(incoming.source, false)
             .map_err(anyhow::Error::msg)
     }
 
-    pub(super) fn advance_streams(&mut self, admit: bool) {
-        if !admit {
+    /// Admit the next ready statement of the call still arriving.
+    pub(super) fn admit_stream(&mut self) {
+        let Phase::Requesting(InFlight {
+            stream: Some(stream),
+            ..
+        }) = &self.phase
+        else {
             return;
-        }
-        for stream in self.streams.values() {
-            if let Err(error) = stream.exec.admit_stream_unit() {
-                self.recovery_notes.push(error);
-            }
+        };
+        if let Err(error) = stream.exec.admit_stream_unit() {
+            self.recovery_notes.push(error);
         }
     }
 
     pub(super) fn finish_stream(&mut self, items: &[InferenceResponseItem]) -> Result<(), String> {
-        let Phase::Requesting(in_flight) = &self.phase else {
+        let Phase::Requesting(InFlight {
+            stream: Some(stream),
+            ..
+        }) = &self.phase
+        else {
             return Ok(());
         };
-        let Some(id) = &in_flight.stream else {
-            return Ok(());
-        };
-        let stream = self.streams.get(id).unwrap();
         let calls = items
             .iter()
             .filter(|item| matches!(item, InferenceResponseItem::ToolCall { .. }))
@@ -130,11 +131,15 @@ impl Agent {
             );
         }
         let mut expected = stream.item.clone();
-        set_source(&mut expected, stream.source.clone());
+        set_source(
+            &mut expected,
+            self.cells.get(&stream.id).unwrap().source.clone(),
+        );
         if calls[0] != &expected {
             return Err("Provider final exec differs from its streamed source".into());
         }
-        // Only validated successful response completion closes the last unit.
+        // Only validated successful response completion closes the last unit,
+        // and lets the rest run without admission.
         stream.exec.feed(String::new(), true)?;
         Ok(())
     }
@@ -143,21 +148,20 @@ impl Agent {
         let Phase::Requesting(in_flight) = &mut self.phase else {
             return Ok(false);
         };
-        let Some(id) = in_flight.stream.take() else {
+        let Some(stream) = in_flight.stream.take() else {
             return Ok(false);
         };
-        let stream = self.streams.remove(&id).unwrap();
         let Some(ran) = stream.exec.interrupt_stream() else {
-            self.cells.remove(&id);
+            self.cells.remove(&stream.id);
             self.cells.set_latest(None);
             return Ok(false);
         };
         // What ran becomes the call, so its result has a place in history
         // and the model sees exactly the code that executed.
-        let source = stream.source[..ran].to_owned();
-        self.cells.get_mut(&id).unwrap().source = source.clone();
+        let held = self.cells.get_mut(&stream.id).unwrap();
+        held.source.truncate(ran);
         let mut item = stream.item;
-        set_source(&mut item, source);
+        set_source(&mut item, held.source.clone());
         self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
             output: vec![ContextBlock::InferenceResponse {
                 items: vec![item],
@@ -169,18 +173,6 @@ impl Agent {
         }))
         .await?;
         Ok(true)
-    }
-
-    /// Forget streams whose code has returned: nothing more will be admitted.
-    /// The one still arriving stays, whatever its code did.
-    pub(super) fn retire_streams(&mut self) {
-        let arriving = match &self.phase {
-            Phase::Requesting(in_flight) => in_flight.stream.clone(),
-            Phase::Idle { .. } => None,
-        };
-        self.streams.retain(|id, stream| {
-            arriving.as_ref() == Some(id) || stream.exec.facts().returned.is_none()
-        });
     }
 }
 
@@ -303,7 +295,6 @@ pub(in crate::agent) mod tests {
                 mail: Vec::new(),
                 cells: Cells::new(Arc::clone(&wake)),
                 observations: Observations::default(),
-                streams: BTreeMap::new(),
                 recovery_notes: Vec::new(),
                 context_used: None,
                 turn: None,
@@ -341,7 +332,7 @@ pub(in crate::agent) mod tests {
     async fn until(agent: &mut Agent, predicate: impl Fn(&Agent) -> bool) {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                agent.advance_streams(true);
+                agent.admit_stream();
                 if predicate(agent) {
                     return;
                 }
@@ -708,7 +699,6 @@ pub(in crate::agent) mod tests {
         });
         let decision = agent.decide(UnixMs::now());
         assert_eq!(decision, Boundary::AbortAndResend);
-        agent.advance_streams(decision != Boundary::AbortAndResend);
         assert_eq!(exec(&agent).stream_progress().admitted, 0);
         let exec = exec(&agent).execution();
         agent.abandon_stream(UnixMs::now()).await.unwrap();
@@ -719,22 +709,17 @@ pub(in crate::agent) mod tests {
         })
         .await
         .unwrap();
-        assert!(agent.streams.is_empty());
         assert!(agent.cells.is_empty());
         assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(!directory.path().join("wrong").exists());
     }
 
     #[tokio::test]
-    async fn successful_response_does_not_retire_a_still_awaiting_unit() {
+    async fn response_end_runs_the_unadmitted_rest_and_keeps_an_awaiting_cell() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
         let source = "import asyncio\ngate = asyncio.Event()\nawait gate.wait()\n";
         agent.handle(update("one", source)).await.unwrap();
-        until(&mut agent, |agent| {
-            exec(agent).stream_progress().admitted == source.len()
-        })
-        .await;
         agent
             .handle(Event::Inference(InferenceEvent::ContextItem {
                 index: 0,
@@ -749,11 +734,23 @@ pub(in crate::agent) mod tests {
             }))
             .await
             .unwrap();
+        assert!(matches!(agent.phase, Phase::Idle { .. }));
+        let one = exec(&agent).execution();
+        // Nothing admits once the response has ended; the cell runs on its own.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while one.stream_progress().settled < "import asyncio\ngate = asyncio.Event()\n".len() {
+                agent.wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
         agent.start_request(UnixMs::now(), None).await.unwrap();
         agent.session.abort();
-        assert_eq!(
-            agent.streams.len(),
-            1,
+        assert!(
+            agent
+                .cells
+                .get(&ToolCallId::try_from("one").unwrap())
+                .is_some(),
             "an outstanding await cannot be acknowledged as settled"
         );
         agent.flush_events().await.unwrap();
@@ -764,37 +761,18 @@ pub(in crate::agent) mod tests {
             "its one provider result was already drained"
         );
         assert!(recovered.recovery_notes.is_empty());
-        // Another notebook cell can release it; the original execution still
-        // carries the eventual settlement in memory.
+        // Another notebook cell can release it.
         agent.phase = Phase::Requesting(InFlight::default());
         agent.handle(update("two", "gate.set()\n")).await.unwrap();
-        until(&mut agent, |agent| {
-            agent
-                .streams
-                .get(&ToolCallId::try_from("one").unwrap())
-                .unwrap()
-                .exec
-                .facts()
-                .returned
-                .is_some()
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while one.facts().returned.is_none() {
+                agent.admit_stream();
+                agent.wake.notified().await;
+            }
         })
-        .await;
-        agent.flush_events().await.unwrap();
-        let (_, events) = agent.db.read().agent_events(agent.agent_id);
-        assert!(replay::replay(events).recovery_notes.is_empty());
-        agent.retire_streams();
-        assert!(
-            !agent
-                .streams
-                .contains_key(&ToolCallId::try_from("one").unwrap()),
-            "a returned stream is retired"
-        );
-        assert!(
-            agent
-                .streams
-                .contains_key(&ToolCallId::try_from("two").unwrap()),
-            "the stream still arriving is kept"
-        );
+        .await
+        .unwrap();
+        assert_eq!(one.stream_progress().settled, source.len());
     }
     #[tokio::test]
     async fn rewind_rebuilds_recovery_state_instead_of_carrying_abandoned_notes() {
@@ -975,7 +953,6 @@ pub(in crate::agent) mod tests {
                 ..
             }
         ));
-        assert!(agent.streams.is_empty());
         assert!(agent.cells.is_empty());
         assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(agent.recovery_notes.is_empty());

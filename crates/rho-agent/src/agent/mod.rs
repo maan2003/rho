@@ -204,7 +204,6 @@ impl AgentHandle {
             mail: replayed.mail,
             cells: Cells::new(Arc::clone(&wake)),
             observations: Observations::default(),
-            streams: BTreeMap::new(),
             recovery_notes: replayed.recovery_notes,
             context_used: replayed.context_used,
             turn: None,
@@ -465,7 +464,7 @@ pub(crate) struct InFlight {
     /// runs.
     previous_failure: Option<Arc<str>>,
     retry: Option<(UnixMs, u32)>,
-    stream: Option<ToolCallId>,
+    stream: Option<streaming::Stream>,
     /// This request compacted on behalf of work that still owes a reply, so a
     /// compaction must not be where the agent stops. A fact about *this*
     /// request, so a request that never finishes never has to unset it.
@@ -501,7 +500,6 @@ pub(crate) struct Agent {
     /// When each pending event was first seen: the clocks the boundary's
     /// patiences run on.
     observations: Observations,
-    streams: BTreeMap<ToolCallId, streaming::Stream>,
     recovery_notes: Vec<String>,
 
     context_used: Option<u64>,
@@ -583,9 +581,6 @@ impl Agent {
     /// for the next one, until the last handle is dropped.
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.session.abort();
-        for stream in self.streams.values() {
-            stream.exec.stop_stream();
-        }
         self.cells.cancel();
         if let Some(surface) = self.surface.get_if_ready() {
             surface
@@ -594,7 +589,6 @@ impl Agent {
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
-        self.streams.clear();
         self.cells.clear();
         self.flush_events().await?;
         Ok(())
@@ -607,16 +601,11 @@ impl Agent {
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
             let now = UnixMs::now();
-            // An idle agent settles its streams first, so the cell facts the
-            // decision reads are the ones an admitted statement produced.
-            // In flight, admission waits on the decision: a statement is not
-            // admitted into a request about to be thrown away.
-            if matches!(self.phase, Phase::Idle { .. }) {
-                self.advance_streams(true);
-            }
             let decision = self.decide(now);
-            if matches!(self.phase, Phase::Requesting(_)) {
-                self.advance_streams(decision != Boundary::AbortAndResend);
+            // Admission waits on the decision: a statement is not admitted
+            // into a request about to be thrown away.
+            if decision != Boundary::AbortAndResend {
+                self.admit_stream();
             }
             let deadline = match decision {
                 Boundary::No { recheck } => recheck,
@@ -826,7 +815,7 @@ impl Agent {
                         provider_response_id,
                     } => {
                         let finished = in_flight.pending.finish();
-                        let exec = in_flight.stream.clone();
+                        let exec = in_flight.stream.as_ref().map(|stream| stream.id.clone());
                         if let Some(id) = exec {
                             self.persist(AgentEvent::ExecObserved {
                                 id,
@@ -1120,7 +1109,6 @@ impl Agent {
         self.provider_history = Some(replayed.history);
         self.usage_caps = replayed.usage_caps;
         self.recovery_notes = replayed.recovery_notes;
-        self.streams.clear();
         self.cells.set_latest(None);
         self.user = replayed.user;
         self.mail = replayed.mail;
@@ -1430,7 +1418,6 @@ impl Agent {
             self.session.abort();
         }
         self.cells.acknowledge();
-        self.retire_streams();
         let input = self.provider_input().await?;
         self.surface
             .get_if_ready()
@@ -1539,7 +1526,7 @@ impl Agent {
             },
         });
         if let Some(call) = call {
-            if self.streams.contains_key(&call.id) {
+            if self.cells.get(&call.id).is_some() {
                 self.cells.set_latest(Some(&call.id));
             } else {
                 self.start_exec(call, now);

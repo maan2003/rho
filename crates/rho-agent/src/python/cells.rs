@@ -95,6 +95,10 @@ impl Cells {
             .map(|held| held.cell.execution());
     }
 
+    pub(crate) fn get(&self, id: &ExecId) -> Option<&Held> {
+        self.held.get(id)
+    }
+
     pub(crate) fn get_mut(&mut self, id: &ExecId) -> Option<&mut Held> {
         self.held.get_mut(id)
     }

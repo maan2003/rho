@@ -35,6 +35,8 @@ impl PythonExec {
         self.link.lock().unwrap().stream
     }
 
+    /// More of the cell's source. Once `eof` says it has all arrived, the
+    /// statements not yet admitted run without waiting to be.
     pub fn feed(&self, source: String, eof: bool) -> Result<(), String> {
         let state = self.link.lock().unwrap();
         if state.stream_stopped || state.returned.is_some() {

@@ -89,8 +89,10 @@ A cancelled or failed runtime waits for fresh input as specified by
 
 Native Python units may execute while a response streams. `PythonExec` owns
 the live admitted/settled/successful-prefix ledger and reports it directly;
-the agent decides whether to admit a ready unit and owns provider-source
-validation and canonical conversation publication. Admission and
+while a response is in flight, the agent decides whether to admit a ready
+unit; validated response completion is EOF, after which the remaining units
+run without admission. The agent owns provider-source validation and
+canonical conversation publication. Admission and
 settlement are ordered in memory, without per-unit database writes. Provider interruption is not EOF, and admitted effects are never replayed.
 Only coherent conversation boundaries are persisted; a restart may lose recent
 execution and output without rolling back external effects. Settlement, model
