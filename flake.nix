@@ -92,26 +92,6 @@
             exact = true;
           }];
         });
-        # `nix develop` of a local flake's dev shell answers from
-        # rho-devshell-builder's cache (VIEW.md 3); anything else is Nix.
-        # Only `bin/nix` is replaced; the legacy `nix-*` commands stay links
-        # into Nix itself.
-        agentNix = pkgs.symlinkJoin {
-          name = "rho-agent-nix";
-          paths = [ pkgs.nix ];
-          postBuild = ''
-            rm $out/bin/nix
-            cat > $out/bin/nix <<'EOF'
-        #!${pkgs.runtimeShell}
-        if [ "''${1-}" = develop ] && [ -n "''${RHO_DEVSHELL_BUILDER-}" ]; then
-          shift
-          exec "$RHO_DEVSHELL_BUILDER" develop ${pkgs.nix}/bin/nix "$@"
-        fi
-        exec ${pkgs.nix}/bin/nix "$@"
-        EOF
-            chmod +x $out/bin/nix
-          '';
-        };
         rhoBash = pkgs.bash.overrideAttrs (old: {
           pname = "rho-bash";
           # Pinned one-shot Bash spare pool, maintained in its own fork.
@@ -159,7 +139,7 @@
           # system-path.nix), minus what has no meaning in a view (acl,
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
           # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
-          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) agentNix ]
+          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) nixFork ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
             ++ (with pkgs; [
             bashInteractive bzip2
@@ -287,10 +267,13 @@
         pythonPackages = pkgs.python3.withPackages (ps: [ ps.pyyaml ps.httpx ]);
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
-        # Evaluation in rho-devshell-builder: records what the evaluator read.
+        # Evaluation in rho-devshell-builder records what the evaluator
+        # read; the agent base's `nix develop` takes local flakes' dev shells
+        # from the builder's cache.
         nixFork = nix.packages.${system}.nix.appendPatches [
           ./nix/patches/nix-0001-libexpr-report-input-mounts-and-forced-source-info-m.patch
           ./nix/patches/nix-0002-libexpr-record-observed-reads-of-mounted-local-input.patch
+          ./nix/patches/nix-0003-nix-develop-take-a-local-flake-dev-shell-from-RHO_DEVSHELL_BUILDER.patch
         ];
 
         guiNativeBuildInputs = [

@@ -8,13 +8,11 @@
 //!
 //!     rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
 //!     rho-devshell-builder exec [--] PROGRAM [ARGS...]
-//!     rho-devshell-builder develop NIX [ARGS...]
 //!
 //! `shell` prints the shell as JSON, for the agent worker to activate and
 //! watch. `exec` runs a program in the dev shell of the nearest flake above
-//! the working directory, or as it is outside flakes. `develop` is
-//! `nix develop ARGS...` from the cache for a local flake's dev shell, with
-//! or without `--command`, and hands anything else to the real `NIX`.
+//! the working directory, or as it is outside flakes. The agent base's
+//! patched `nix develop` runs `shell` too.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -35,8 +33,7 @@ use devenv_nix_backend::{DevShellRequest, NIX_STACK_SIZE, NixRuntime};
 const EVALUATOR: &str = concat!("rho-devshell-builder/", env!("CARGO_PKG_VERSION"), " nix-2.35-rho2");
 
 const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
-       rho-devshell-builder exec [--] PROGRAM [ARGS...]
-       rho-devshell-builder develop NIX [ARGS...]";
+       rho-devshell-builder exec [--] PROGRAM [ARGS...]";
 
 /// Bash running a program after the shell's activation script, which it
 /// reads from the descriptor in `$1`. `shellHook` output goes to stderr so
@@ -46,7 +43,6 @@ const EXEC_SCRIPT: &str = r#"fd=$1; shift; . "/dev/fd/$fd" >&2; exec {fd}<&-; un
 enum Mode {
     Shell(Args),
     Exec(Vec<OsString>),
-    Develop { nix: OsString, args: Vec<OsString> },
 }
 
 struct Args {
@@ -78,10 +74,6 @@ fn parse_args() -> Result<Mode> {
                 bail!("{USAGE}");
             }
             return Ok(Mode::Exec(program));
-        }
-        Some("develop") => {
-            let nix = args.next().context(USAGE)?;
-            return Ok(Mode::Develop { nix, args: args.collect() });
         }
         _ => bail!("{USAGE}"),
     }
@@ -128,7 +120,6 @@ fn main() -> Result<()> {
         .spawn(move || match mode {
             Mode::Shell(args) => report(&build(&args)?),
             Mode::Exec(program) => exec(&program),
-            Mode::Develop { nix, args } => develop(&nix, &args),
         })?
         .join()
         .expect("evaluator thread panicked")
@@ -177,71 +168,6 @@ fn script_fd(script: &str) -> Result<OwnedFd> {
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     std::fs::File::from(fd.try_clone()?).write_all(script.as_bytes())?;
     Ok(fd)
-}
-
-/// `nix develop ARGS...` for the cases the cache answers: an optional local
-/// flake (`.`, `./dir`, `/dir`, with `#NAME` for another dev shell) and an
-/// optional `--command`/`-c`. Any other form, and any shell that fails to
-/// build here, goes to the real Nix, which also reports errors as Nix does.
-fn develop(nix: &OsString, args: &[OsString]) -> Result<()> {
-    let real_nix = || {
-        Err(std::process::Command::new(nix).arg("develop").args(args).exec())
-            .with_context(|| format!("exec {nix:?}"))
-    };
-    let Some((installable, command)) = parse_develop(args) else {
-        return real_nix();
-    };
-    let (path, shell) = match installable.split_once('#') {
-        Some((path, shell)) => (path, shell),
-        None => (installable, ""),
-    };
-    let Some(flake_dir) = find_flake(Path::new(if path.is_empty() { "." } else { path })) else {
-        return real_nix();
-    };
-    let mut build_args = Args::new(flake_dir);
-    if !shell.is_empty() {
-        build_args.shell = shell.to_owned();
-    }
-    let Ok(activation) = build(&build_args).and_then(|built| activation(&built.shell)) else {
-        return real_nix();
-    };
-    match command {
-        Some(command) => run_in_shell(&activation, command),
-        None => {
-            // Interactive, as `nix develop` starts it: the shell is the rc file.
-            let fd = script_fd(&activation)?;
-            let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-            Err(std::process::Command::new("bash")
-                .arg("--rcfile")
-                .arg(format!("/dev/fd/{raw}"))
-                .exec())
-            .context("exec bash")
-        }
-    }
-}
-
-/// The installable (`.` when absent) and command of a `nix develop`
-/// invocation the cache can answer.
-fn parse_develop(args: &[OsString]) -> Option<(&str, Option<&[OsString]>)> {
-    let mut installable = None;
-    let mut command = None;
-    for (i, arg) in args.iter().enumerate() {
-        let arg = arg.to_str()?;
-        if matches!(arg, "-c" | "--command") {
-            command = Some(&args[i + 1..]).filter(|command| !command.is_empty());
-            command?;
-            break;
-        }
-        if arg.starts_with('-') || installable.is_some() {
-            return None;
-        }
-        installable = Some(arg);
-    }
-    let installable = installable.unwrap_or(".");
-    let (path, shell) = installable.split_once('#').unwrap_or((installable, ""));
-    // A bare word is a registry flake; a dotted fragment is an attribute path.
-    let local = path.is_empty() || path.starts_with('.') || path.starts_with('/');
-    (local && !path.contains(':') && !shell.contains('.')).then_some((installable, command))
 }
 
 /// The nearest directory with a `flake.nix`, looking no further up than the
@@ -556,15 +482,35 @@ impl GitDirs {
     }
 }
 
-/// Bash applying `shell` to the caller's environment, `shellHook` included.
-/// `RHO_DEVSHELL_PATH_PREFIX` then goes before the shell's `PATH`.
+/// Bash applying `shell` to the caller's environment, `shellHook` included,
+/// then [`AFTER_SHELL`].
 fn activation(shell: &Shell) -> Result<String> {
     let mut script = BuildEnvironment::from_json(&shell.env_json)?.to_activation_script();
-    script.push_str(
-        "\nif [ -n \"${RHO_DEVSHELL_PATH_PREFIX-}\" ]; then PATH=\"$RHO_DEVSHELL_PATH_PREFIX:$PATH\"; export PATH; fi\n",
-    );
+    script.push_str(AFTER_SHELL);
     Ok(script)
 }
+
+/// The caller's tools ahead of the shell's own. `RHO_DEVSHELL_CARGO`, a
+/// directory with the `cargo` to use, goes first, except that a shell whose
+/// `cargo` is cargo-deluxe keeps it: deluxe intercepts and runs the next
+/// `cargo` on `PATH`, so this one goes right after it. Then
+/// `RHO_DEVSHELL_PATH_PREFIX` goes before everything.
+const AFTER_SHELL: &str = r#"
+if [ -n "${RHO_DEVSHELL_CARGO-}" ]; then
+    __rho_cargo=$(command -v cargo || true)
+    case $__rho_cargo in
+        *-cargo-deluxe-*/bin/cargo)
+            __rho_cargo=${__rho_cargo%/cargo}
+            PATH=${PATH/"$__rho_cargo"/"$__rho_cargo:$RHO_DEVSHELL_CARGO"} ;;
+        *) PATH="$RHO_DEVSHELL_CARGO:$PATH" ;;
+    esac
+    unset __rho_cargo
+fi
+if [ -n "${RHO_DEVSHELL_PATH_PREFIX-}" ]; then
+    PATH="$RHO_DEVSHELL_PATH_PREFIX:$PATH"
+fi
+export PATH
+"#;
 
 /// Print the result for the caller: the shell as a Bash activation script,
 /// the candidate it is cached as, and what to watch to know it may be stale.

@@ -1,0 +1,121 @@
+From 6d3b756437ca7da7f0a3764d99d022ac56dc16a5 Mon Sep 17 00:00:00 2001
+From: maan2003 <manmeetmann2003@gmail.com>
+Date: Wed, 23 Sep 2026 20:15:56 +0000
+Subject: [PATCH] nix develop: take a local flake dev shell from
+ $RHO_DEVSHELL_BUILDER
+
+rho-devshell-builder builds the same -env output as getShellOutPath and
+caches it against what evaluation read. For the dev shell nix develop would
+try first, evaluated purely with the flake's own lock file, take its
+output instead of evaluating; everything after (flags, rc script, profile)
+is unchanged. A command from a cached shell uses bash from PATH rather than
+locking the flake to find its bashInteractive.
+---
+ src/nix/develop.cc | 75 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/src/nix/develop.cc b/src/nix/develop.cc
+index 57558c483..8ce7f1268 100644
+--- a/src/nix/develop.cc
++++ b/src/nix/develop.cc
+@@ -10,6 +10,9 @@
+ #include "nix/store/outputs-query.hh"
+ #include "nix/store/derivations.hh"
+ #include "nix/store/build-environment.hh"
++#include "nix/cmd/common-eval-args.hh"
++#include "nix/util/environment-variables.hh"
++#include "nix/util/processes.hh"
+ 
+ #ifndef _WIN32 // TODO re-enable on Windows
+ #  include "run.hh"
+@@ -214,8 +217,77 @@ struct Common : InstallableCommand, MixProfile
+         return res;
+     }
+ 
++    /**
++     * Whether the build environment came from `RHO_DEVSHELL_BUILDER`, so
++     * that nothing was evaluated.
++     */
++    bool cachedShell = false;
++
++    /**
++     * rho: the `-env` output of a local flake's `devShells.<system>.<name>`
++     * from `$RHO_DEVSHELL_BUILDER`, which builds the same output and caches
++     * it against what evaluation read. Only for the dev shell this command
++     * would try first, evaluated purely with the flake's own lock file;
++     * anything else, and any failure, is left to evaluation.
++     */
++    std::optional<StorePath> getCachedShellOutPath(ref<Store> store, ref<Installable> installable)
++    {
++        auto builder = getEnv("RHO_DEVSHELL_BUILDER");
++        auto flake = installable.dynamic_pointer_cast<InstallableFlake>();
++        if (!builder || builder->empty() || !flake || !evalSettings.pureEval)
++            return std::nullopt;
++
++        auto & lock = flake->lockFlags;
++        if (lock.recreateLockFile || !lock.inputOverrides.empty() || !lock.inputUpdates.empty()
++            || lock.referenceLockFilePath || lock.outputLockFilePath)
++            return std::nullopt;
++
++        auto & input = flake->flakeRef.input;
++        auto type = input.getType();
++        auto source = input.getSourcePath(fetchSettings);
++        if ((type != "git" && type != "path") || !source || input.getRef() || input.getRev())
++            return std::nullopt;
++
++        // The first attribute path InstallableFlake::getActualAttrPaths
++        // tries, without its side effect on `attrPaths`.
++        auto & first = flake->attrPaths.front();
++        auto attrPath = first.starts_with(".")         ? first.substr(1)
++                        : flake->prefixes.empty()      ? first
++                                                       : flake->prefixes.front() + first;
++        auto prefix = "devShells." + settings.thisSystem.get() + ".";
++        if (!attrPath.starts_with(prefix) || attrPath.find('.', prefix.size()) != std::string::npos)
++            return std::nullopt;
++
++        try {
++            auto flakeDir = *source / flake->flakeRef.subdir;
++            auto [status, out] = runProgram(
++                RunOptions{
++                    .program = *builder,
++                    .args = {"shell", flakeDir.string(), "--shell", attrPath.substr(prefix.size())},
++                });
++            if (status != 0) {
++                debug("'%s' could not build the dev shell; evaluating", *builder);
++                return std::nullopt;
++            }
++            auto path = store->parseStorePath(nlohmann::json::parse(out).at("env_store_path").get<std::string>());
++            if (!store->isValidPath(path))
++                return std::nullopt;
++            return path;
++        } catch (Error & e) {
++            debug("dev shell cache failed: %s", e.what());
++        } catch (nlohmann::json::exception & e) {
++            debug("dev shell cache failed: %s", e.what());
++        }
++        return std::nullopt;
++    }
++
+     StorePath getShellOutPath(ref<Store> store, ref<Installable> installable)
+     {
++        if (auto cached = getCachedShellOutPath(store, installable)) {
++            cachedShell = true;
++            return *cached;
++        }
++
+         auto path = installable->getStorePath();
+         if (path && hasSuffix(path->to_string(), "-env"))
+             return *path;
+@@ -383,6 +455,9 @@ struct CmdDevelop : Common, MixEnvironment
+         std::filesystem::path shell = "bash";
+         bool foundInteractive = false;
+ 
++        // rho: a command from a cached shell runs in the `bash` on PATH;
++        // finding the flake's bashInteractive would lock and fetch the flake.
++        if (!(cachedShell && !command.empty()))
+         try {
+             auto state = getEvalState();
+ 
+-- 
+2.55.0
+

@@ -430,8 +430,9 @@ security, resource-isolation, or rollback boundary.
   decides whether the shell actually changed before its activation reruns.
   The builder links the Nix C API of cachix's Nix carrying
   `nix/patches/nix-*.patch` (flake input `nix`), is installed next to the
-  daemon, and also serves `rho-devshell-builder exec` and the agent base's
-  `nix develop`. A generation uses a native,
+  daemon, and also serves `rho-devshell-builder exec`. The agent base's
+  `nix` is the same patched Nix, whose `nix develop` takes a local flake's
+  dev shell from the builder instead of evaluating it. A generation uses a native,
   single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
   namespace. It keeps up to five pristine children of the initialized variable/builtin image
   ready for one-shot cwd/stdio specialization, replenishing when idle and falling

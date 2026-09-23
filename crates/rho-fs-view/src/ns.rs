@@ -375,17 +375,19 @@ impl Namespace {
                 // The agent's own nix profile first, then the base userland
                 // (VIEW.md). Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
-                // Passed through from the user: the terminal and the timezone.
-                for name in ["TERM", "TZ"] {
+                // Passed through from the user: the terminal, the timezone,
+                // and the cargo that goes ahead of a dev shell's.
+                for name in ["TERM", "TZ", "RHO_DEVSHELL_CARGO"] {
                     if let Some(value) = self.environment.get(name) {
                         command.env(name, value);
                     }
                 }
                 // Ahead of a flake dev shell's own PATH (VIEW.md 3): the
-                // daemon's find fork, then cargo-installed binaries.
+                // daemon's prefix (its find fork), then cargo-installed
+                // binaries.
                 let mut prefix = OsString::new();
-                if let Some(find) = self.environment.get("RHO_FIND_BIN") {
-                    prefix.push(find);
+                if let Some(daemon) = self.environment.get("RHO_DEVSHELL_PATH_PREFIX") {
+                    prefix.push(daemon);
                     prefix.push(":");
                 }
                 prefix.push(format!("{home}/.cache/cargo/bin"));
