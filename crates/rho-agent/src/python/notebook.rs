@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::{IntoPyObjectExt, PyClass, PyClassInitializer};
-use rho_agent_types::{ContextBlock, ExecCall, ExecId, UnixMs};
+use rho_agent_host_proto::UnixMs;
+use rho_inference::types::{ContextBlock, ExecCall, ExecId};
 use rho_tool_shell::{BoundedOutput, ShellTools};
 use tokio::sync::Notify;
 
@@ -93,9 +94,9 @@ pub(crate) struct ExecState {
     pub(crate) sources: Vec<Arc<Source>>,
     pub(crate) pending: usize,
     pub(crate) cancelled: tokio::sync::watch::Sender<bool>,
-    pub(crate) images: Vec<rho_agent_types::ImageContent>,
+    pub(crate) images: Vec<rho_inference::types::ImageContent>,
     /// The contribution read and not yet acknowledged.
-    pub(crate) lease: Option<rho_agent_types::ToolOutput>,
+    pub(crate) lease: Option<rho_inference::types::ToolOutput>,
 }
 
 impl ExecState {
@@ -402,7 +403,7 @@ impl ToolCx {
     }
 
     /// Show an image with the cell's next report.
-    pub fn show_image(&self, image: rho_agent_types::ImageContent) {
+    pub fn show_image(&self, image: rho_inference::types::ImageContent) {
         let mut cell = self.link.lock().unwrap();
         if cell.images.len() < 20 {
             cell.images.push(image);

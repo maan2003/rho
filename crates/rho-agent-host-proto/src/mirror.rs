@@ -9,10 +9,9 @@
 //! This vocabulary is shared with the daemon's raw log: the runtimes write
 //! these very types, so there are no twins to keep in step.
 
-use rho_agent_types::{AgentId, AgentRole, MessageDelivery, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::{Place, WorksetMode};
+use crate::{AgentId, AgentRole, MessageDelivery, Place, UnixMs, WorksetMode};
 
 /// A position in one agent's log: dense, starting at zero with the
 /// agent's creation, never reused. A rewind is told at a new position
@@ -243,7 +242,7 @@ pub enum MirrorEvent {
     },
     ExecObserved {
         id: String,
-        milestone: rho_agent_types::ExecMilestone,
+        milestone: crate::ExecMilestone,
         at: UnixMs,
     },
 }
@@ -351,15 +350,6 @@ pub enum Item {
 pub enum ArgumentsFormat {
     Json,
     Text,
-}
-
-impl From<rho_agent_types::ToolType> for ArgumentsFormat {
-    fn from(tool_type: rho_agent_types::ToolType) -> Self {
-        match tool_type {
-            rho_agent_types::ToolType::Function => Self::Json,
-            rho_agent_types::ToolType::Custom => Self::Text,
-        }
-    }
 }
 
 /// Whether a text item is the model thinking aloud or its answer.

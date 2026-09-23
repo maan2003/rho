@@ -12,9 +12,9 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, Task};
 use gpui_tokio::Tokio;
-use rho_ui_proto::client::Client;
-use rho_ui_proto::mirror::{AgentPos, DetailBody, Live, LogEntry, Seq};
-use rho_ui_proto::{
+use rho_agent_host_proto::client::Client;
+use rho_agent_host_proto::mirror::{AgentPos, DetailBody, Live, LogEntry, Seq};
+use rho_agent_host_proto::{
     AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
     read_frame, write_frame,
 };
@@ -99,30 +99,30 @@ impl EventSink {
 }
 
 pub enum ConnEvent {
-    DesktopSessions(Vec<rho_ui_proto::DesktopSession>),
+    DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
     DeskSynced {
-        store: rho_desk::cells::DeviceId,
+        store: rho_agent_host_proto::desk::cells::DeviceId,
         node_namespace: u16,
-        delta: rho_desk::cells::Snapshot,
-        bodies: Vec<rho_desk::cells::BodySnapshot>,
+        delta: rho_agent_host_proto::desk::cells::Snapshot,
+        bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
     },
     DeskCellsAvailable {
-        frontier: rho_desk::cells::Version,
+        frontier: rho_agent_host_proto::desk::cells::Version,
     },
     DeskTextApplied {
-        id: rho_desk::cells::Id,
-        operation: rho_desk::TextOperation,
+        id: rho_agent_host_proto::desk::cells::Id,
+        operation: rho_agent_host_proto::desk::TextOperation,
     },
     DeskResyncRequired,
     Ready {
-        auth: rho_ui_proto::AuthState,
+        auth: rho_agent_host_proto::AuthState,
         machine_seed: u64,
         agent_counter: u64,
         /// How far the daemon's journal runs, so a client holding more
         /// knows its copy is of another database.
         journal_head: Seq,
     },
-    AuthState(rho_ui_proto::AuthState),
+    AuthState(rho_agent_host_proto::AuthState),
     AgentCreated {
         agent_id: AgentId,
     },
@@ -151,10 +151,10 @@ pub enum ConnEvent {
         used_percent: f64,
         reset_at_unix: i64,
     },
-    QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
-    QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
-    GlobalUsage(Vec<rho_ui_proto::AgentUsageSeries>),
-    AgentCostDistribution(Vec<rho_ui_proto::AgentCostSeries>),
+    QuotaUsage(Vec<rho_agent_host_proto::QuotaSummary>),
+    QuotaHistory(Vec<rho_agent_host_proto::QuotaSeries>),
+    GlobalUsage(Vec<rho_agent_host_proto::AgentUsageSeries>),
+    AgentCostDistribution(Vec<rho_agent_host_proto::AgentCostSeries>),
     ServerError(String),
     Recovering(std::time::Duration),
     Recovered,
@@ -179,8 +179,9 @@ pub enum GitApprovalDecision {
 /// One workspace file channel. Dropping the owner cancels the transport and
 /// tears down its daemon-side watcher.
 pub struct WorkspaceChannel {
-    pub outgoing: futures_mpsc::Sender<rho_ui_proto::WorkspaceClientFrame>,
-    pub incoming: futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::WorkspaceServerFrame>>,
+    pub outgoing: futures_mpsc::Sender<rho_agent_host_proto::WorkspaceClientFrame>,
+    pub incoming:
+        futures_mpsc::Receiver<anyhow::Result<rho_agent_host_proto::WorkspaceServerFrame>>,
     pub transport: ChannelTask,
 }
 
@@ -205,8 +206,8 @@ async fn dial_channel(
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
-        rx_limit: rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        tx_limit: rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        rx_limit: rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
         tx_capacity: 16,
         rx_capacity: 32,
     });
@@ -218,22 +219,22 @@ async fn dial_channel(
     })
 }
 
-/// One attached terminal: a dedicated stream carrying [`rho_ui_proto::term`]
-/// frames after the handshake. Dropping the owner cancels the attachment; the
-/// terminal keeps running in the daemon.
+/// One attached terminal: a dedicated stream carrying
+/// [`rho_agent_host_proto::term`] frames after the handshake. Dropping the
+/// owner cancels the attachment; the terminal keeps running in the daemon.
 pub struct TerminalChannel {
     pub terminal_id: u64,
-    pub frames: futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::term::TermServerFrame>>,
-    pub input: futures_mpsc::Sender<rho_ui_proto::term::TermClientFrame>,
+    pub frames: futures_mpsc::Receiver<anyhow::Result<rho_agent_host_proto::term::TermServerFrame>>,
+    pub input: futures_mpsc::Sender<rho_agent_host_proto::term::TermClientFrame>,
     pub transport: rho_rpc::ChannelTask,
 }
 
 /// One attachment to an agent's daemon-owned Comint-style shell. Dropping
 /// `input` detaches this GUI but does not stop the shell process.
 pub struct ShellChannel {
-    pub frames: futures_mpsc::Receiver<rho_ui_proto::shell::ShellServerFrame>,
+    pub frames: futures_mpsc::Receiver<rho_agent_host_proto::shell::ShellServerFrame>,
     pub submit: tokio::sync::mpsc::Sender<ShellSubmission>,
-    pub control: tokio::sync::mpsc::Sender<rho_ui_proto::shell::ShellClientFrame>,
+    pub control: tokio::sync::mpsc::Sender<rho_agent_host_proto::shell::ShellClientFrame>,
 }
 
 pub struct ShellSubmission {
@@ -253,8 +254,8 @@ pub(crate) async fn dial_realtime(
         _ => anyhow::bail!("unexpected reply to RealtimeOpen"),
     };
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_ui_proto::MAX_FRAME_LEN,
-        rx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
+        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
         tx_capacity: 32,
         rx_capacity: 32,
     });
@@ -269,7 +270,7 @@ pub(crate) async fn dial_realtime(
 
 enum ShellControlReply {
     Started,
-    List(Vec<rho_ui_proto::shell::ShellInfo>),
+    List(Vec<rho_agent_host_proto::shell::ShellInfo>),
     Closed,
     Failed(String),
 }
@@ -323,7 +324,7 @@ async fn dial_diff_snapshot(
     workspace: WorkspaceInfo,
     known_commit_id: Option<String>,
     include_paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>> {
+) -> anyhow::Result<Option<rho_agent_host_proto::WorkspaceDiffSnapshot>> {
     let mut stream = dial_bulk_stream(dialer).await?;
     write_frame(
         &mut stream,
@@ -348,7 +349,7 @@ async fn dial_diff_base_contents(
     operation_id: String,
     commit_id: String,
     paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>> {
+) -> anyhow::Result<Vec<rho_agent_host_proto::WorkspaceDiffBaseContent>> {
     let mut stream = dial_bulk_stream(dialer).await?;
     write_frame(
         &mut stream,
@@ -390,7 +391,7 @@ async fn dial_visualization(
 
 async fn dial_gui_telemetry(dialer: ChannelDialer, snapshot: Vec<u8>) -> anyhow::Result<String> {
     anyhow::ensure!(
-        snapshot.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot is too large"
     );
     let mut stream = dial_bulk_stream(dialer).await?;
@@ -412,7 +413,7 @@ async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stre
 async fn dial_terminal_list(
     dialer: ChannelDialer,
     agent: String,
-) -> anyhow::Result<Vec<rho_ui_proto::term::TerminalInfo>> {
+) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
     let mut stream = dial_stream(dialer).await?;
     write_frame(
         &mut stream,
@@ -474,8 +475,8 @@ async fn dial_terminal(
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_ui_proto::MAX_FRAME_LEN,
-        rx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
+        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
         tx_capacity: 64,
         rx_capacity: 256,
     });
@@ -501,17 +502,17 @@ async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<Shel
     let (mut frames_tx, frames_rx) = futures_mpsc::channel(32);
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::channel::<ShellSubmission>(8);
     let (control_tx, mut control_rx) =
-        tokio::sync::mpsc::channel::<rho_ui_proto::shell::ShellClientFrame>(8);
+        tokio::sync::mpsc::channel::<rho_agent_host_proto::shell::ShellClientFrame>(8);
     let pending = Arc::new(Mutex::new(
         HashMap::<u64, tokio::sync::oneshot::Sender<u64>>::new(),
     ));
     let reader_pending = Arc::clone(&pending);
     tokio::spawn(async move {
         while let Ok(frame) =
-            read_frame::<_, rho_ui_proto::shell::ShellServerFrame>(&mut reader).await
+            read_frame::<_, rho_agent_host_proto::shell::ShellServerFrame>(&mut reader).await
         {
             match frame {
-                rho_ui_proto::shell::ShellServerFrame::Accepted {
+                rho_agent_host_proto::shell::ShellServerFrame::Accepted {
                     submission,
                     execution,
                 } => {
@@ -541,7 +542,7 @@ async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<Shel
                     pending.lock().unwrap().insert(submission_id, submission.accepted);
                     let result = write_frame(
                         &mut writer,
-                        &rho_ui_proto::shell::ShellClientFrame::Submit {
+                        &rho_agent_host_proto::shell::ShellClientFrame::Submit {
                             submission: submission_id,
                             command: submission.command,
                         },
@@ -642,7 +643,7 @@ impl DiffClient {
         known_commit_id: Option<String>,
         include_paths: Vec<Utf8PathBuf>,
         cx: &App,
-    ) -> Task<anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>>> {
+    ) -> Task<anyhow::Result<Option<rho_agent_host_proto::WorkspaceDiffSnapshot>>> {
         let dialer = self.dialer.lock().unwrap().clone();
         let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
@@ -661,7 +662,7 @@ impl DiffClient {
         commit_id: String,
         paths: Vec<Utf8PathBuf>,
         cx: &App,
-    ) -> Task<anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>>> {
+    ) -> Task<anyhow::Result<Vec<rho_agent_host_proto::WorkspaceDiffBaseContent>>> {
         let dialer = self.dialer.lock().unwrap().clone();
         let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
@@ -1143,10 +1144,10 @@ fn replay_safe(message: &ClientMessage) -> bool {
 fn validate_control_message(message: &ClientMessage) -> anyhow::Result<()> {
     let payload = senax_encoder::pack(message).context("pack protocol frame")?;
     anyhow::ensure!(
-        payload.len() <= rho_ui_proto::MAX_FRAME_LEN,
+        payload.len() <= rho_agent_host_proto::MAX_FRAME_LEN,
         "protocol frame length {} exceeds {}",
         payload.len(),
-        rho_ui_proto::MAX_FRAME_LEN
+        rho_agent_host_proto::MAX_FRAME_LEN
     );
     Ok(())
 }
@@ -1845,7 +1846,7 @@ async fn connect_iroh(
         "ephemeral iroh client trusted over SSH"
     );
     let connection = endpoint
-        .connect(daemon_id, rho_ui_proto::IROH_ALPN)
+        .connect(daemon_id, rho_agent_host_proto::IROH_ALPN)
         .await
         .context("connect to daemon over iroh")?;
     anyhow::ensure!(
@@ -1971,7 +1972,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use octo_types::{ReceivePackCommands, RefUpdate};
-    use rho_ui_proto::{ClientMessage, GitService, GitTransportRequest};
+    use rho_agent_host_proto::{ClientMessage, GitService, GitTransportRequest};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
@@ -2067,16 +2068,16 @@ mod tests {
                 let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
                 commands_tx
                     .unbounded_send(ClientMessage::SendUserMessage {
-                        agent_id: rho_ui_proto::AgentId::from_counter(
+                        agent_id: rho_agent_host_proto::AgentId::from_counter(
                             1,
-                            &rho_ui_proto::AgentIdDomain(0),
+                            &rho_agent_host_proto::AgentIdDomain(0),
                         )
                         .unwrap(),
-                        content: vec![rho_agent_types::ContentPart::Image {
+                        content: vec![rho_agent_host_proto::ContentPart::Image {
                             media_type: "image/png".to_owned(),
-                            data: vec![0; rho_ui_proto::MAX_FRAME_LEN + 1],
+                            data: vec![0; rho_agent_host_proto::MAX_FRAME_LEN + 1],
                         }],
-                        delivery: rho_agent_types::MessageDelivery::NextRequest,
+                        delivery: rho_agent_host_proto::MessageDelivery::NextRequest,
                     })
                     .unwrap();
                 commands_tx.unbounded_send(ClientMessage::Ping).unwrap();

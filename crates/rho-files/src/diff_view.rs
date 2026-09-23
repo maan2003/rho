@@ -20,10 +20,10 @@ use gpui::{
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use path::rel_path::RelPath;
-use rho_hosts::connection::DiffClient;
-use rho_ui_proto::{
+use rho_agent_host_proto::{
     WorkspaceDiffContent, WorkspaceDiffSnapshot, WorkspaceDiffTarget, WorkspaceInfo,
 };
+use rho_hosts::connection::DiffClient;
 use text::OffsetRangeExt as _;
 use theme::ActiveTheme as _;
 

@@ -119,7 +119,7 @@ pub struct AgentCostSummary {
 /// A quota series is one sample per poll — thousands over a week — and the
 /// reduction to `columns` is what keeps that off the frame.
 pub fn quota_summary(
-    series: &[rho_ui_proto::QuotaSeries],
+    series: &[rho_agent_host_proto::QuotaSeries],
     active_auth_namespaces: &[String],
     days: u64,
     now: u64,
@@ -192,7 +192,7 @@ pub fn quota_summary(
         // one starts, which is why a series is segments rather than points.
         let mut segments = Vec::new();
         let mut segment = Vec::new();
-        let mut previous: Option<&rho_ui_proto::QuotaPoint> = None;
+        let mut previous: Option<&rho_agent_host_proto::QuotaPoint> = None;
         for sample in &model.points {
             let reset = previous.is_some_and(|old| {
                 let reset_time_changed = match (old.reset_at_unix, sample.reset_at_unix) {
@@ -234,7 +234,7 @@ pub fn quota_summary(
 
 /// The legend is the one place the reset time lives: the status line shows
 /// the percent alone.
-fn quota_latest_suffix(latest: &rho_ui_proto::QuotaPoint, now: u64) -> String {
+fn quota_latest_suffix(latest: &rho_agent_host_proto::QuotaPoint, now: u64) -> String {
     let mut suffix = format!(" {}%", latest.remaining_percent);
     if let Some(seconds) = latest
         .reset_at_unix
@@ -248,7 +248,7 @@ fn quota_latest_suffix(latest: &rho_ui_proto::QuotaPoint, now: u64) -> String {
 
 /// Cumulative spend by model over the last `days`.
 pub fn cost_summary(
-    series: &[rho_ui_proto::AgentUsageSeries],
+    series: &[rho_agent_host_proto::AgentUsageSeries],
     days: u64,
     now: u64,
     columns: usize,
@@ -348,7 +348,7 @@ fn cost_band_index(model: &str) -> Option<usize> {
 /// Smoothed model shares over the last `days`, with the band height saying
 /// how much work there was.
 pub fn share_summary(
-    series: &[rho_ui_proto::AgentUsageSeries],
+    series: &[rho_agent_host_proto::AgentUsageSeries],
     days: u64,
     now: u64,
     columns: usize,
@@ -388,7 +388,7 @@ pub fn share_summary(
 
 /// The three quantiles of per-agent GPT-family spend over the last `days`.
 pub fn agent_cost_summary(
-    hosts: &[Vec<rho_ui_proto::AgentCostSeries>],
+    hosts: &[Vec<rho_agent_host_proto::AgentCostSeries>],
     days: u64,
     now: u64,
     columns: usize,
@@ -478,7 +478,7 @@ fn reduce<T: Copy>(points: Vec<(f32, T)>, columns: usize) -> Vec<(f32, T)> {
     reduced
 }
 
-fn requests_since(series: &[rho_ui_proto::AgentUsageSeries], since: u64) -> u64 {
+fn requests_since(series: &[rho_agent_host_proto::AgentUsageSeries], since: u64) -> u64 {
     series
         .iter()
         .flat_map(|series| &series.buckets)
@@ -487,7 +487,7 @@ fn requests_since(series: &[rho_ui_proto::AgentUsageSeries], since: u64) -> u64 
         .sum()
 }
 
-fn approximate_since(series: &[rho_ui_proto::AgentUsageSeries], since: u64) -> bool {
+fn approximate_since(series: &[rho_agent_host_proto::AgentUsageSeries], since: u64) -> bool {
     series
         .iter()
         .flat_map(|series| &series.buckets)
@@ -506,11 +506,11 @@ struct AgentCostScale {
 /// mass before extracting quantiles so busier hours carry proportionally more
 /// evidence without averaging per-host percentiles.
 fn agent_cost_percentile_points(
-    hosts: &[Vec<rho_ui_proto::AgentCostSeries>],
+    hosts: &[Vec<rho_agent_host_proto::AgentCostSeries>],
     now: u64,
     days: u64,
 ) -> Vec<(u64, [f64; 3])> {
-    const COST_WINDOW_HOURS: u64 = rho_ui_proto::AGENT_COST_WINDOW_DAYS * 24;
+    const COST_WINDOW_HOURS: u64 = rho_agent_host_proto::AGENT_COST_WINDOW_DAYS * 24;
     const HISTOGRAM_BINS: usize = 256;
     const MIN_LOG_COST: f64 = -3.0;
     const MAX_LOG_COST: f64 = 5.0;
@@ -519,7 +519,7 @@ fn agent_cost_percentile_points(
     let end_bucket = (now / HOUR_MS * HOUR_MS).saturating_sub(HOUR_MS);
     let half_life_hours = if days <= 7 { 12.0 } else { 48.0 };
     let decay = 0.5_f64.powf(1.0 / half_life_hours);
-    let mut hourly = HashMap::<u64, Vec<((usize, rho_ui_proto::AgentId), f64)>>::new();
+    let mut hourly = HashMap::<u64, Vec<((usize, rho_agent_host_proto::AgentId), f64)>>::new();
     let mut first_bucket = end_bucket;
 
     for (host_index, series_set) in hosts.iter().enumerate() {
@@ -541,7 +541,7 @@ fn agent_cost_percentile_points(
         }
     }
 
-    let mut rolling = HashMap::<(usize, rho_ui_proto::AgentId), f64>::new();
+    let mut rolling = HashMap::<(usize, rho_agent_host_proto::AgentId), f64>::new();
     let mut smoothed_histogram = [0.0; HISTOGRAM_BINS];
     let mut points = Vec::new();
     let mut bucket_start = first_bucket;
@@ -641,7 +641,7 @@ fn format_agent_cost_tick(power: i32) -> String {
 /// Returns hourly exponentially-smoothed model shares. Usage is smoothed
 /// before division, so a low-volume hour has proportionally little influence.
 fn usage_share_points(
-    series: &[rho_ui_proto::AgentUsageSeries],
+    series: &[rho_agent_host_proto::AgentUsageSeries],
     now: u64,
     days: u64,
 ) -> Vec<(u64, [f64; 6], f64)> {
@@ -733,13 +733,13 @@ fn usage_model_index(model: &str) -> Option<usize> {
     }
 }
 
-fn bucket_usage_units(bucket: &rho_ui_proto::AgentUsageBucket) -> f64 {
+fn bucket_usage_units(bucket: &rho_agent_host_proto::AgentUsageBucket) -> f64 {
     10.0 * bucket.input_tokens as f64
         + bucket.cache_read_tokens as f64
         + 30.0 * bucket.output_tokens as f64
 }
 
-fn model_cost(series: &[rho_ui_proto::AgentUsageSeries], model: &str, since: u64) -> f64 {
+fn model_cost(series: &[rho_agent_host_proto::AgentUsageSeries], model: &str, since: u64) -> f64 {
     series
         .iter()
         .filter(|series| series.model == model)
@@ -750,7 +750,7 @@ fn model_cost(series: &[rho_ui_proto::AgentUsageSeries], model: &str, since: u64
 }
 
 /// What a bucket cost, at the provider's posted rates per million tokens.
-pub fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &str) -> f64 {
+pub fn bucket_cost_usd(bucket: &rho_agent_host_proto::AgentUsageBucket, model: &str) -> f64 {
     let (input, cache_read, cache_write_5m, cache_write_1h, output) = match model {
         "fable" => (10.0, 1.0, 12.5, 20.0, 50.0),
         "opus" => (5.0, 0.5, 6.25, 10.0, 25.0),
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn model_cost_uses_provider_cache_rates() {
-        let usage = rho_ui_proto::AgentUsageBucket {
+        let usage = rho_agent_host_proto::AgentUsageBucket {
             input_tokens: 1_000_000,
             cache_read_tokens: 1_000_000,
             cache_write_tokens: 1_000_000,
@@ -794,14 +794,14 @@ mod tests {
 
     #[test]
     fn astra_usage_has_its_own_chart_band() {
-        let bucket = rho_ui_proto::AgentUsageBucket {
+        let bucket = rho_agent_host_proto::AgentUsageBucket {
             bucket_start_ms: 10 * HOUR_MS,
             input_tokens: 1_000_000,
             requests: 1,
             ..Default::default()
         };
         let now = 40 * HOUR_MS + HOUR_MS / 2;
-        let usage = vec![rho_ui_proto::AgentUsageSeries {
+        let usage = vec![rho_agent_host_proto::AgentUsageSeries {
             model: "astra".to_owned(),
             buckets: vec![bucket.clone()],
         }];
@@ -817,9 +817,10 @@ mod tests {
         );
 
         let agent_id =
-            rho_ui_proto::AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+            rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
+                .unwrap();
         let points = agent_cost_percentile_points(
-            &[vec![rho_ui_proto::AgentCostSeries {
+            &[vec![rho_agent_host_proto::AgentCostSeries {
                 agent_id,
                 model: "astra".to_owned(),
                 buckets: vec![bucket],
@@ -833,12 +834,13 @@ mod tests {
     #[test]
     fn agent_cost_percentiles_keep_same_counter_agents_separate_across_hosts() {
         let agent_id =
-            rho_ui_proto::AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+            rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
+                .unwrap();
         let series = |output_tokens| {
-            vec![rho_ui_proto::AgentCostSeries {
+            vec![rho_agent_host_proto::AgentCostSeries {
                 agent_id,
                 model: "gpt".to_owned(),
-                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                buckets: vec![rho_agent_host_proto::AgentUsageBucket {
                     bucket_start_ms: 10 * HOUR_MS,
                     output_tokens,
                     requests: 1,
@@ -860,20 +862,21 @@ mod tests {
     #[test]
     fn agent_cost_percentiles_ignore_the_current_partial_hour() {
         let agent_id =
-            rho_ui_proto::AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+            rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
+                .unwrap();
         let now = 40 * HOUR_MS + HOUR_MS / 2;
         let points = agent_cost_percentile_points(
-            &[vec![rho_ui_proto::AgentCostSeries {
+            &[vec![rho_agent_host_proto::AgentCostSeries {
                 agent_id,
                 model: "gpt".to_owned(),
                 buckets: vec![
-                    rho_ui_proto::AgentUsageBucket {
+                    rho_agent_host_proto::AgentUsageBucket {
                         bucket_start_ms: 10 * HOUR_MS,
                         output_tokens: 1_000_000,
                         requests: 1,
                         ..Default::default()
                     },
-                    rho_ui_proto::AgentUsageBucket {
+                    rho_agent_host_proto::AgentUsageBucket {
                         bucket_start_ms: 40 * HOUR_MS,
                         output_tokens: 10_000_000,
                         requests: 1,
@@ -890,17 +893,17 @@ mod tests {
     #[test]
     fn usage_share_is_weighted_before_smoothing_and_stays_stable_when_idle() {
         let series = vec![
-            rho_ui_proto::AgentUsageSeries {
+            rho_agent_host_proto::AgentUsageSeries {
                 model: "gpt".to_owned(),
-                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                buckets: vec![rho_agent_host_proto::AgentUsageBucket {
                     bucket_start_ms: 0,
                     input_tokens: 10,
                     ..Default::default()
                 }],
             },
-            rho_ui_proto::AgentUsageSeries {
+            rho_agent_host_proto::AgentUsageSeries {
                 model: "fable".to_owned(),
-                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                buckets: vec![rho_agent_host_proto::AgentUsageBucket {
                     bucket_start_ms: 0,
                     output_tokens: 10,
                     ..Default::default()
@@ -919,17 +922,17 @@ mod tests {
     #[test]
     fn seven_day_share_reacts_faster_than_thirty_day_share() {
         let series = vec![
-            rho_ui_proto::AgentUsageSeries {
+            rho_agent_host_proto::AgentUsageSeries {
                 model: "gpt".to_owned(),
-                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                buckets: vec![rho_agent_host_proto::AgentUsageBucket {
                     bucket_start_ms: 0,
                     input_tokens: 10,
                     ..Default::default()
                 }],
             },
-            rho_ui_proto::AgentUsageSeries {
+            rho_agent_host_proto::AgentUsageSeries {
                 model: "fable".to_owned(),
-                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                buckets: vec![rho_agent_host_proto::AgentUsageBucket {
                     bucket_start_ms: HOUR_MS,
                     input_tokens: 10,
                     ..Default::default()
@@ -964,7 +967,7 @@ mod tests {
         const MINUTE_MS: u64 = 60 * 1_000;
         let now = 30 * DAY_MS;
         let samples = (0..7 * 24 * 60)
-            .map(|minute| rho_ui_proto::QuotaPoint {
+            .map(|minute| rho_agent_host_proto::QuotaPoint {
                 observed_at_ms: now - 7 * DAY_MS + minute * MINUTE_MS,
                 // Falling headroom: no resets, so this is one segment and
                 // the reduction has nowhere to hide.
@@ -972,7 +975,7 @@ mod tests {
                 reset_at_unix: Some(1),
             })
             .collect::<Vec<_>>();
-        let series = vec![rho_ui_proto::QuotaSeries {
+        let series = vec![rho_agent_host_proto::QuotaSeries {
             model: "opus".to_owned(),
             auth_namespace: None,
             points: samples,

@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use rho_ui_proto::AgentId;
+use rho_agent_host_proto::AgentId;
 
 /// How many agents a client holds whole at once.
 pub const MAX_ACTIVE_AGENTS: usize = 4;
@@ -69,7 +69,7 @@ mod tests {
 
     fn ids(count: u64) -> Vec<AgentId> {
         (1..=count)
-            .map(|id| AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap())
+            .map(|id| AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).unwrap())
             .collect()
     }
 

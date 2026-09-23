@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 use rho_agents::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
-use rho_ui_proto::AgentId;
-use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 
 /// Where this client stands in a host's journal, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -621,12 +621,12 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::mirror::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
+    use rho_agent_host_proto::mirror::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
 
     use super::*;
 
     fn agent_id(counter: u64) -> AgentId {
-        AgentId::from_counter(counter, &rho_ui_proto::AgentIdDomain(7)).expect("agent id")
+        AgentId::from_counter(counter, &rho_agent_host_proto::AgentIdDomain(7)).expect("agent id")
     }
 
     fn told(agent: AgentId, from_seq: u64) -> Vec<LogEntry> {
@@ -634,7 +634,7 @@ mod tests {
             MirrorEvent::Created {
                 role: Default::default(),
                 runtime: RuntimeKind::Rho,
-                place: rho_ui_proto::Place {
+                place: rho_agent_host_proto::Place {
                     workset: "0123456789ab".into(),
                     cwd: "/src/repo".into(),
                     mode: Default::default(),
@@ -644,17 +644,17 @@ mod tests {
                 spawn_name: Some("the deploy".to_owned()),
                 parent: None,
                 model: "sol".to_owned(),
-                at: rho_agent_types::UnixMs(1_000),
+                at: rho_agent_host_proto::UnixMs(1_000),
             },
             MirrorEvent::Message {
                 from: None,
                 text: "have a look".to_owned(),
-                delivery: rho_agent_types::MessageDelivery::Immediate,
-                at: rho_agent_types::UnixMs(1_000),
+                delivery: rho_agent_host_proto::MessageDelivery::Immediate,
+                at: rho_agent_host_proto::UnixMs(1_000),
             },
             MirrorEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Completed),
-                at: rho_agent_types::UnixMs(2_000),
+                at: rho_agent_host_proto::UnixMs(2_000),
             },
         ]
         .into_iter()

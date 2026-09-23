@@ -378,7 +378,7 @@ fn argument_end_is_distinct_from_item_end_and_response_end() {
     assert!(events.iter().any(|event| matches!(
         event,
         InferenceEvent::ContextItem {
-            event: rho_agent_types::ContextItemEvent::Finish,
+            event: crate::types::ContextItemEvent::Finish,
             ..
         }
     )));

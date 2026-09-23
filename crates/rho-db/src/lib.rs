@@ -188,8 +188,54 @@ where
     }
 
     fn type_name() -> TypeName {
-        TypeName::new(&format!("rho-db::Sen<{}>", std::any::type_name::<T>()))
+        TypeName::new(&format!("rho-db::Sen<{}>", recorded_path::<T>()))
     }
+}
+
+/// Stored types that moved, by their path now and the path their tables
+/// recorded. redb refuses a table whose recorded type differs from the one
+/// it is opened with, so a type keeps answering to its old name.
+const MOVED: &[(&str, &str)] = &[
+    (
+        "rho_agent_host_proto::desk::cells::Cell",
+        "rho_desk::cells::Cell",
+    ),
+    (
+        "rho_agent_host_proto::desk::cells::VerdictEvent",
+        "rho_desk::cells::VerdictEvent",
+    ),
+    (
+        "rho_agent_host_proto::desk::cells::Id",
+        "rho_desk::cells::Id",
+    ),
+    (
+        "rho_agent_host_proto::desk::cells::BodySnapshot",
+        "rho_desk::cells::BodySnapshot",
+    ),
+    (
+        "rho_agent_host_proto::desk::cells::Stamp",
+        "rho_desk::cells::Stamp",
+    ),
+    (
+        "rho_agent_host_proto::desk::cells::CellMutation",
+        "rho_desk::cells::CellMutation",
+    ),
+    (
+        "rho_agent_host_proto::desk::cells::DeviceId",
+        "rho_desk::cells::DeviceId",
+    ),
+    (
+        "rho_agent_host_proto::mirror::MirrorEvent",
+        "rho_ui_proto::mirror::MirrorEvent",
+    ),
+];
+
+fn recorded_path<T>() -> &'static str {
+    let path = std::any::type_name::<T>();
+    MOVED
+        .iter()
+        .find(|(now, _)| *now == path)
+        .map_or(path, |(_, then)| then)
 }
 
 impl<T> redb::Key for Sen<T>

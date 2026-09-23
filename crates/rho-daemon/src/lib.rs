@@ -13,15 +13,15 @@ use rho_agent::db::{
     QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_agent_types::ContentPart;
+use rho_agent_host_proto::server::{Server, ServerConnection};
+use rho_agent_host_proto::{
+    AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
+    ClientMessage, ContentPart, JoinTarget, LandLeaseHolder, LandStatus, Place, QuotaPoint,
+    QuotaSeries, QuotaSummary, ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame,
+    write_frame,
+};
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_ui_proto::server::{Server, ServerConnection};
-use rho_ui_proto::{
-    AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
-    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, Place, QuotaPoint, QuotaSeries,
-    QuotaSummary, ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
-};
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot};
 
 pub mod debug;
@@ -33,7 +33,7 @@ pub mod workspace_channel;
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    rho_ui_proto::socket_path()
+    rho_agent_host_proto::socket_path()
 }
 
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
@@ -235,7 +235,9 @@ fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
     }
 }
 
-fn lock_runtime_directory(paths: &rho_ui_proto::RuntimePaths) -> anyhow::Result<std::fs::File> {
+fn lock_runtime_directory(
+    paths: &rho_agent_host_proto::RuntimePaths,
+) -> anyhow::Result<std::fs::File> {
     let path = paths.daemon_lock();
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -255,7 +257,7 @@ fn lock_runtime_directory(paths: &rho_ui_proto::RuntimePaths) -> anyhow::Result<
 }
 
 struct RuntimeSockets {
-    paths: rho_ui_proto::RuntimePaths,
+    paths: rho_agent_host_proto::RuntimePaths,
     server: Server,
     _lock: std::fs::File,
 }
@@ -280,7 +282,7 @@ fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
 ) -> anyhow::Result<RuntimeSockets> {
-    let paths = rho_ui_proto::RuntimePaths::new(socket_path)?;
+    let paths = rho_agent_host_proto::RuntimePaths::new(socket_path)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
@@ -414,7 +416,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
-        rho_ui_proto::RuntimePaths::SOCKET_ENV.into(),
+        rho_agent_host_proto::RuntimePaths::SOCKET_ENV.into(),
         runtime.paths.socket().as_os_str().to_owned(),
     ));
     configure_octo_git_transport(&mut user_environment)?;
@@ -482,7 +484,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
     let iroh = if args.iroh {
         let (listener, auth) =
-            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_ui_proto::IROH_ALPN).await?;
+            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_agent_host_proto::IROH_ALPN)
+                .await?;
         eprintln!("rho daemon iroh endpoint: {}", listener.endpoint_id());
         Some((listener, auth))
     } else {
@@ -751,7 +754,7 @@ impl GitTransportBroker {
 
     async fn request(
         &self,
-        request: rho_ui_proto::GitTransportRequest,
+        request: rho_agent_host_proto::GitTransportRequest,
     ) -> anyhow::Result<BoxGitStream> {
         self.request_with_timeout(request, std::time::Duration::from_secs(60))
             .await
@@ -759,7 +762,7 @@ impl GitTransportBroker {
 
     async fn request_with_timeout(
         &self,
-        request: rho_ui_proto::GitTransportRequest,
+        request: rho_agent_host_proto::GitTransportRequest,
         timeout: std::time::Duration,
     ) -> anyhow::Result<BoxGitStream> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -899,7 +902,7 @@ struct DeskBinding {
 
 /// What a connection holds after `DeskSync`.
 struct DeskSession {
-    device: rho_desk::cells::DeviceId,
+    device: rho_agent_host_proto::desk::cells::DeviceId,
     node_namespace: u16,
     binding: Arc<DeskBinding>,
 }
@@ -912,7 +915,7 @@ struct Services {
     pool: Arc<AgentPool>,
     db: RhoDb,
     desk_cells: desk_cells::DeskCellStore,
-    desk_devices: Mutex<HashMap<rho_desk::cells::DeviceId, Arc<DeskBinding>>>,
+    desk_devices: Mutex<HashMap<rho_agent_host_proto::desk::cells::DeviceId, Arc<DeskBinding>>>,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     /// The database's machine seed, announced in `Ready` so clients can
@@ -1434,7 +1437,8 @@ where
                 let displaced = desk_session
                     .as_ref()
                     .map(|session: &DeskSession| Arc::clone(&session.binding));
-                let frame = rho_ui_proto::read_frame_optional::<_, ClientMessage>(&mut reader);
+                let frame =
+                    rho_agent_host_proto::read_frame_optional::<_, ClientMessage>(&mut reader);
                 let read = match displaced {
                     Some(binding) => {
                         tokio::select! {
@@ -1530,7 +1534,7 @@ async fn serve_git_transport_request<R, W>(
     services: Arc<Services>,
     reader: R,
     mut writer: W,
-    request: rho_ui_proto::GitTransportRequest,
+    request: rho_agent_host_proto::GitTransportRequest,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1635,8 +1639,8 @@ fn combined_quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSumma
 }
 
 fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
-    let now = rho_agent_types::UnixMs::now().0;
-    let since = rho_agent_types::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
+    let now = rho_agent_host_proto::UnixMs::now().0;
+    let since = rho_agent_host_proto::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
         .into_iter()
         .filter_map(|((model, auth_namespace), observations)| {
@@ -1730,7 +1734,7 @@ fn hourly_global_usage_series(
 
 fn hourly_agent_cost_series(
     db: &RhoDb,
-    since: rho_agent_types::UnixMs,
+    since: rho_agent_host_proto::UnixMs,
 ) -> anyhow::Result<Vec<AgentCostSeries>> {
     const MAX_HOURLY_AGENT_COST_BUCKETS: usize = 500_000;
 
@@ -1800,8 +1804,8 @@ fn merge_hourly_agent_cost_bucket(
 
 fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
     let mut series = claude_quota_history(db);
-    let since = rho_agent_types::UnixMs(
-        rho_agent_types::UnixMs::now()
+    let since = rho_agent_host_proto::UnixMs(
+        rho_agent_host_proto::UnixMs::now()
             .0
             .saturating_sub(30 * 24 * 60 * 60 * 1_000),
     );
@@ -1812,7 +1816,7 @@ fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
             points: history
                 .points
                 .into_iter()
-                .map(|point| rho_ui_proto::QuotaPoint {
+                .map(|point| rho_agent_host_proto::QuotaPoint {
                     observed_at_ms: point.observed_at.0,
                     remaining_percent: point.remaining_percent,
                     reset_at_unix: point.reset_at_unix,
@@ -1824,8 +1828,8 @@ fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
 }
 
 fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
-    let now = rho_agent_types::UnixMs::now().0;
-    let since = rho_agent_types::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
+    let now = rho_agent_host_proto::UnixMs::now().0;
+    let since = rho_agent_host_proto::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
         .into_iter()
         .filter_map(|((model, auth_namespace), observations)| {
@@ -1848,7 +1852,7 @@ fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
 
 fn quota_observation_groups(
     db: &RhoDb,
-    since: rho_agent_types::UnixMs,
+    since: rho_agent_host_proto::UnixMs,
 ) -> BTreeMap<(QuotaModel, Option<String>), Vec<QuotaObservationRecord>> {
     let read = db.read();
     let mut groups = BTreeMap::new();
@@ -1925,7 +1929,7 @@ fn spawn_claude_quota_recorder(
                     continue;
                 }
             };
-            let observed_at = rho_agent_types::UnixMs::now();
+            let observed_at = rho_agent_host_proto::UnixMs::now();
             let mut write = db.write().await;
             let mut changed = write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
@@ -1978,7 +1982,7 @@ const LOG_PAGE: usize = 512;
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
-    since: rho_ui_proto::mirror::Seq,
+    since: rho_agent_host_proto::mirror::Seq,
 ) -> tokio::task::JoinHandle<()> {
     use rho_agent::mirror::Feed;
     tokio::spawn(async move {
@@ -2000,8 +2004,8 @@ fn spawn_log_follow(
                     if !told {
                         told = !matches!(
                             live,
-                            rho_ui_proto::mirror::Live::Item { .. }
-                                | rho_ui_proto::mirror::Live::Appended { .. }
+                            rho_agent_host_proto::mirror::Live::Item { .. }
+                                | rho_agent_host_proto::mirror::Live::Appended { .. }
                         );
                         if !told {
                             continue;
@@ -2053,7 +2057,7 @@ fn spawn_log_follow(
 async fn send_journal_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    sent: &mut rho_ui_proto::mirror::Seq,
+    sent: &mut rho_agent_host_proto::mirror::Seq,
 ) -> bool {
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
@@ -2064,7 +2068,7 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
-                Some(rho_ui_proto::mirror::LogEntry {
+                Some(rho_agent_host_proto::mirror::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
@@ -2312,27 +2316,29 @@ async fn handle_message(
             let usage = services
                 .db
                 .read()
-                .global_agent_usage(rho_agent_types::UnixMs(since_ms));
+                .global_agent_usage(rho_agent_host_proto::UnixMs(since_ms));
             let series = hourly_global_usage_series(usage);
             let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
             Ok(Refresh::None)
         }
         ClientMessage::AgentCostDistribution { since_ms } => {
             const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
-            const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_ui_proto::AGENT_COST_WINDOW_DAYS;
+            const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_agent_host_proto::AGENT_COST_WINDOW_DAYS;
 
             services.pool.flush_agent_usage(None).await;
-            let now = rho_agent_types::UnixMs::now().0;
+            let now = rho_agent_host_proto::UnixMs::now().0;
             let earliest = since_ms
-                .saturating_sub(rho_ui_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
+                .saturating_sub(rho_agent_host_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
                 .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
-            let response =
-                match hourly_agent_cost_series(&services.db, rho_agent_types::UnixMs(earliest)) {
-                    Ok(series) => ServerMessage::AgentCostDistribution { series },
-                    Err(error) => ServerMessage::Error {
-                        message: error.to_string(),
-                    },
-                };
+            let response = match hourly_agent_cost_series(
+                &services.db,
+                rho_agent_host_proto::UnixMs(earliest),
+            ) {
+                Ok(series) => ServerMessage::AgentCostDistribution { series },
+                Err(error) => ServerMessage::Error {
+                    message: error.to_string(),
+                },
+            };
             let _ = outgoing_tx.send(response);
             Ok(Refresh::None)
         }
@@ -2408,7 +2414,7 @@ async fn handle_message(
         } => {
             let result = async {
                 match command {
-                    rho_ui_proto::PrCommand::Create {
+                    rho_agent_host_proto::PrCommand::Create {
                         owner,
                         repo,
                         head,
@@ -2428,22 +2434,22 @@ async fn handle_message(
                         })
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Subscribe { .. } => Ok((
+                    rho_agent_host_proto::PrCommand::Subscribe { .. } => Ok((
                         "persistent PR subscriptions were removed; poll `rho pr status` instead"
                             .to_owned(),
                         Vec::new(),
                     )),
-                    rho_ui_proto::PrCommand::Status { url } => services
+                    rho_agent_host_proto::PrCommand::Status { url } => services
                         .pr_monitor
                         .status(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
-                    rho_ui_proto::PrCommand::Stop { .. } => Ok((
+                    rho_agent_host_proto::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
+                    rho_agent_host_proto::PrCommand::Stop { .. } => Ok((
                         "persistent PR subscriptions were removed".to_owned(),
                         Vec::new(),
                     )),
-                    rho_ui_proto::PrCommand::Comment {
+                    rho_agent_host_proto::PrCommand::Comment {
                         url,
                         reply_comment,
                         body,
@@ -2452,17 +2458,17 @@ async fn handle_message(
                         .comment(&url, reply_comment, &body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Comments { url } => services
+                    rho_agent_host_proto::PrCommand::Comments { url } => services
                         .pr_monitor
                         .comments(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Checks { url } => services
+                    rho_agent_host_proto::PrCommand::Checks { url } => services
                         .pr_monitor
                         .checks(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Edit {
+                    rho_agent_host_proto::PrCommand::Edit {
                         url,
                         base,
                         title,
@@ -2472,12 +2478,12 @@ async fn handle_message(
                         .edit(&url, base, title, body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Rerun { url, run_id } => services
+                    rho_agent_host_proto::PrCommand::Rerun { url, run_id } => services
                         .pr_monitor
                         .rerun(&url, run_id)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Logs { url, run_id } => {
+                    rho_agent_host_proto::PrCommand::Logs { url, run_id } => {
                         services.pr_monitor.logs(&url, run_id).await.map(|data| {
                             (format!("downloaded logs for run {run_id}"), data.to_vec())
                         })
@@ -2617,7 +2623,7 @@ async fn handle_message(
             // message is accepted, the log when the message's row lands.
             let notice = agent.head().pending_notice;
             if let Some(text) = notice.clone() {
-                content.insert(0, rho_agent_types::ContentPart::Text { text });
+                content.insert(0, rho_agent_host_proto::ContentPart::Text { text });
             }
             agent.send_user_content_accepted(content, delivery).await?;
             if notice.is_some() {
@@ -2774,7 +2780,7 @@ where
         }
     };
     write_frame(&mut writer, &ServerMessage::ShellOpened).await?;
-    client.relay::<_, _, rho_ui_proto::shell::ShellClientFrame, rho_ui_proto::shell::ShellServerFrame>(reader, writer).await
+    client.relay::<_, _, rho_agent_host_proto::shell::ShellClientFrame, rho_agent_host_proto::shell::ShellServerFrame>(reader, writer).await
 }
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
@@ -2808,7 +2814,7 @@ async fn shell_attach(
 async fn shell_list(
     services: &Arc<Services>,
     agent: Option<&str>,
-) -> anyhow::Result<Vec<rho_ui_proto::shell::ShellInfo>> {
+) -> anyhow::Result<Vec<rho_agent_host_proto::shell::ShellInfo>> {
     let filter = match agent {
         Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,
@@ -2913,12 +2919,12 @@ async fn serve_gui_telemetry_upload<W>(mut writer: W, snapshot: Vec<u8>) -> anyh
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let response = if snapshot.len() > rho_ui_proto::MAX_GUI_TELEMETRY_BYTES {
+    let response = if snapshot.len() > rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES {
         ServerMessage::GuiTelemetryRefused {
             reason: format!(
                 "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
                 snapshot.len(),
-                rho_ui_proto::MAX_GUI_TELEMETRY_BYTES
+                rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
             ),
         }
     } else {
@@ -2944,9 +2950,9 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
     use std::io::Write as _;
 
     anyhow::ensure!(
-        snapshot.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot exceeds the {} byte limit",
-        rho_ui_proto::MAX_GUI_TELEMETRY_BYTES
+        rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
     );
     let directory = state_root.join("gui-telemetry");
     std::fs::create_dir_all(&directory)
@@ -3036,7 +3042,7 @@ enum TerminalOpenKind {
 
 /// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
 /// (per [`TerminalOpenKind`]), replies `TerminalOpened`, then pumps
-/// [`rho_ui_proto::term`] frames until either side closes. Closing only
+/// [`rho_agent_host_proto::term`] frames until either side closes. Closing only
 /// detaches; the terminal keeps running. A headless create replies and
 /// returns without attaching.
 #[expect(clippy::too_many_arguments)]
@@ -3076,7 +3082,7 @@ where
     }
 
     client
-        .relay::<_, _, rho_ui_proto::term::TermClientFrame, rho_ui_proto::term::TermServerFrame>(
+        .relay::<_, _, rho_agent_host_proto::term::TermClientFrame, rho_agent_host_proto::term::TermServerFrame>(
             reader, writer,
         )
         .await
@@ -3210,7 +3216,7 @@ where
     };
     write_frame(&mut writer, &ServerMessage::ChannelOpened).await?;
 
-    use rho_ui_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
+    use rho_agent_host_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
     let mut changes = watcher_setup.changes;
     let changes_overflowed = watcher_setup.overflowed;
     let mut watcher_ready = Some(watcher_setup.ready);
@@ -3246,19 +3252,19 @@ where
                 // registration completed. Treat that window like overflow; the
                 // GUI already reconciles it by reloading open buffers and
                 // scheduling a fresh semantic barrier.
-                rho_ui_proto::write_frame_limited(
+                rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed {
                         paths: Vec::new(),
                         rescan: true,
                     },
-                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
-            frame = rho_ui_proto::read_frame_limited::<_, WorkspaceClientFrame>(
+            frame = rho_agent_host_proto::read_frame_limited::<_, WorkspaceClientFrame>(
                 &mut reader,
-                rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
             ) => {
                 let frame = match frame {
                     Ok(frame) => frame,
@@ -3286,10 +3292,10 @@ where
                         WorkspaceServerFrame::Saved { request_id, path, result }
                     }
                 };
-                rho_ui_proto::write_frame_limited(
+                rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &response,
-                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
@@ -3306,10 +3312,10 @@ where
                 }
                 let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
                 let rescan = explicit_rescan || overflowed;
-                rho_ui_proto::write_frame_limited(
+                rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed { paths, rescan },
-                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
@@ -3322,9 +3328,9 @@ where
 fn agent_detail(
     db: &RhoDb,
     agent_id: AgentId,
-    pos: rho_ui_proto::mirror::AgentPos,
-) -> rho_ui_proto::mirror::DetailBody {
-    use rho_ui_proto::mirror::DetailBody;
+    pos: rho_agent_host_proto::mirror::AgentPos,
+) -> rho_agent_host_proto::mirror::DetailBody {
+    use rho_agent_host_proto::mirror::DetailBody;
     let event = db.read().agent_event(agent_id, pos.into());
     if let Some(native) = event.as_ref().and_then(rho_agent::AgentEvent::native_event) {
         use rho_agent::native::NativeEvent;
@@ -3333,10 +3339,10 @@ fn agent_detail(
                 input
                     .iter()
                     .flat_map(|item| match item {
-                        rho_agent_types::ContextBlock::ToolResults { results } => {
+                        rho_inference::types::ContextBlock::ToolResults { results } => {
                             results.iter().map(detail_result).collect::<Vec<_>>()
                         }
-                        rho_agent_types::ContextBlock::ToolUpdate(update) => {
+                        rho_inference::types::ContextBlock::ToolUpdate(update) => {
                             vec![detail_update(&update)]
                         }
                         _ => Vec::new(),
@@ -3347,7 +3353,7 @@ fn agent_detail(
                 output
                     .iter()
                     .filter_map(|entry| match entry {
-                        rho_agent_types::ContextBlock::InferenceResponse { items, .. } => {
+                        rho_inference::types::ContextBlock::InferenceResponse { items, .. } => {
                             Some(items)
                         }
                         _ => None,
@@ -3361,8 +3367,8 @@ fn agent_detail(
                     .items
                     .iter()
                     .filter_map(|slot| match slot {
-                        rho_agent_types::StreamingContextItemState::Pending(item)
-                        | rho_agent_types::StreamingContextItemState::Finished(item) => item
+                        rho_inference::types::StreamingContextItemState::Pending(item)
+                        | rho_inference::types::StreamingContextItemState::Finished(item) => item
                             .to_context_item()
                             .ok()
                             .and_then(|item| rho_agent::mirror::item(&item)),
@@ -3376,18 +3382,16 @@ fn agent_detail(
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
                 (!text.is_empty())
-                    .then_some(rho_ui_proto::mirror::Item::Text { text, phase: None })
+                    .then_some(rho_agent_host_proto::mirror::Item::Text { text, phase: None })
                     .into_iter()
-                    .chain(
-                        calls
-                            .into_iter()
-                            .map(|call| rho_ui_proto::mirror::Item::ToolCall {
-                                id: call.id,
-                                name: call.name,
-                                arguments: call.arguments,
-                                format: rho_ui_proto::mirror::ArgumentsFormat::Json,
-                            }),
-                    )
+                    .chain(calls.into_iter().map(|call| {
+                        rho_agent_host_proto::mirror::Item::ToolCall {
+                            id: call.id,
+                            name: call.name,
+                            arguments: call.arguments,
+                            format: rho_agent_host_proto::mirror::ArgumentsFormat::Json,
+                        }
+                    }))
                     .collect(),
             ),
             rho_agent::TranscriptLine::ToolResults { results } => {
@@ -3401,11 +3405,11 @@ fn agent_detail(
                 .items
                 .iter()
                 .filter_map(|slot| match slot {
-                    rho_agent_types::StreamingContextItemState::Pending(item)
-                    | rho_agent_types::StreamingContextItemState::Finished(item) => {
+                    rho_inference::types::StreamingContextItemState::Pending(item)
+                    | rho_inference::types::StreamingContextItemState::Finished(item) => {
                         rho_agent::live::to_item(item)
                     }
-                    rho_agent_types::StreamingContextItemState::Empty => None,
+                    rho_inference::types::StreamingContextItemState::Empty => None,
                 })
                 .collect(),
         ),
@@ -3413,24 +3417,28 @@ fn agent_detail(
     }
 }
 
-fn detail_result(result: &rho_agent_types::ToolResult) -> rho_ui_proto::mirror::DetailResult {
-    use rho_ui_proto::mirror::ToolStatus;
-    rho_ui_proto::mirror::DetailResult {
+fn detail_result(
+    result: &rho_inference::types::ToolResult,
+) -> rho_agent_host_proto::mirror::DetailResult {
+    use rho_agent_host_proto::mirror::ToolStatus;
+    rho_agent_host_proto::mirror::DetailResult {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_agent_types::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_agent_types::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_host_proto::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_host_proto::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         output: result.body.recorded_output().to_owned(),
         error: None,
     }
 }
 
-fn detail_update(update: &rho_agent_types::ToolUpdate) -> rho_ui_proto::mirror::DetailResult {
-    rho_ui_proto::mirror::DetailResult {
+fn detail_update(
+    update: &rho_inference::types::ToolUpdate,
+) -> rho_agent_host_proto::mirror::DetailResult {
+    rho_agent_host_proto::mirror::DetailResult {
         id: update.call_id.as_str().to_owned(),
-        status: rho_ui_proto::mirror::ToolStatus::Success,
+        status: rho_agent_host_proto::mirror::ToolStatus::Success,
         output: update.recorded_output().to_owned(),
         error: None,
     }
@@ -3473,7 +3481,7 @@ fn validate_image_content(content: &[ContentPart]) -> anyhow::Result<()> {
         }
         encoded_total = encoded_total.saturating_add(encoded);
     }
-    if encoded_total > rho_ui_proto::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
+    if encoded_total > rho_agent_host_proto::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
         anyhow::bail!("image attachments exceed the protocol aggregate size limit");
     }
     Ok(())
@@ -3592,9 +3600,8 @@ mod tests {
     use std::sync::Arc;
 
     use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
-    use rho_agent_types::ContentPart;
+    use rho_agent_host_proto::{ContentPart, ServerMessage};
     use rho_db::RhoDb;
-    use rho_ui_proto::ServerMessage;
 
     use super::{
         AgentPool, AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim,
@@ -3606,30 +3613,30 @@ mod tests {
 
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
-        let result = rho_agent_types::ToolResult {
-            call_id: rho_agent_types::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_agent_types::ToolType::Custom,
-            body: rho_agent_types::ToolOutput {
+        let result = rho_inference::types::ToolResult {
+            call_id: rho_inference::types::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_inference::types::ToolType::Custom,
+            body: rho_inference::types::ToolOutput {
                 output: Arc::new("bounded model view".to_owned()),
                 full_output: Some(Arc::new("complete host record".to_owned())),
                 images: Arc::new(Vec::new()),
-                status: rho_agent_types::ToolOutputStatus::Success,
+                status: rho_agent_host_proto::ToolOutputStatus::Success,
             },
-            started_at: rho_agent_types::UnixMs(1),
-            finished_at: rho_agent_types::UnixMs(2),
+            started_at: rho_agent_host_proto::UnixMs(1),
+            finished_at: rho_agent_host_proto::UnixMs(2),
             metadata: None,
         };
 
         assert_eq!(super::detail_result(&result).output, "complete host record");
 
-        let update = rho_agent_types::ToolUpdate {
+        let update = rho_inference::types::ToolUpdate {
             status: None,
             images: Default::default(),
-            call_id: rho_agent_types::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_agent_types::ToolType::Custom,
+            call_id: rho_inference::types::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_inference::types::ToolType::Custom,
             output: Arc::new("bounded update".to_owned()),
             full_output: Some(Arc::new("complete update".to_owned())),
-            at: rho_agent_types::UnixMs(3),
+            at: rho_agent_host_proto::UnixMs(3),
         };
         assert_eq!(super::detail_update(&update).output, "complete update");
     }
@@ -3662,7 +3669,8 @@ mod tests {
     #[tokio::test]
     async fn second_daemon_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths =
+            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let first =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();
@@ -3690,7 +3698,8 @@ mod tests {
     #[tokio::test]
     async fn stale_socket_files_are_removed_and_rebound() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths =
+            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         drop(std::os::unix::net::UnixListener::bind(paths.socket()).unwrap());
         drop(std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap());
 
@@ -3706,7 +3715,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_lock_remains_held_after_socket_setup_returns() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths =
+            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let sockets =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();
@@ -3764,7 +3774,8 @@ mod tests {
     #[test]
     fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
         let agent_id =
-            rho_agent::db::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+            rho_agent::db::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
+                .unwrap();
         let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
             bucket_start_ms,
             model: AgentUsageModel::GPT,
@@ -3785,7 +3796,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_agent_types::UnixMs(at),
+            observed_at: rho_agent_host_proto::UnixMs(at),
             used_percent,
             reset_at_unix,
         };
@@ -3807,7 +3818,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_agent_types::UnixMs(at),
+            observed_at: rho_agent_host_proto::UnixMs(at),
             used_percent,
             reset_at_unix: Some(100),
         };
@@ -3829,7 +3840,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_agent_types::UnixMs(at),
+            observed_at: rho_agent_host_proto::UnixMs(at),
             used_percent,
             reset_at_unix: Some(reset_at_unix),
         };
@@ -3849,14 +3860,14 @@ mod tests {
     async fn claude_quota_history_includes_every_stored_point() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_agent_types::UnixMs::now().0;
+        let now = rho_agent_host_proto::UnixMs::now().0;
         let mut write = db.write().await;
         for index in 0..5 {
             assert!(write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,
                 auth_namespace: Some("default".to_owned()),
-                observed_at: rho_agent_types::UnixMs(now - (4 - index) * 1_000),
+                observed_at: rho_agent_host_proto::UnixMs(now - (4 - index) * 1_000),
                 used_percent: index as u8,
                 reset_at_unix: Some(123),
             }));
@@ -3865,7 +3876,7 @@ mod tests {
             provider: QuotaProvider::Claude,
             model: QuotaModel::FABLE,
             auth_namespace: None,
-            observed_at: rho_agent_types::UnixMs(now),
+            observed_at: rho_agent_host_proto::UnixMs(now),
             used_percent: 25,
             reset_at_unix: Some(456),
         }));
@@ -3895,7 +3906,7 @@ mod tests {
     async fn quota_summary_expires_stale_provider_window() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_agent_types::UnixMs::now();
+        let now = rho_agent_host_proto::UnixMs::now();
         let mut write = db.write().await;
         assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,
@@ -3979,12 +3990,12 @@ mod tests {
         let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
         broker.register(first_tx).await;
         broker.register(second_tx).await;
-        let request = rho_ui_proto::GitTransportRequest {
+        let request = rho_agent_host_proto::GitTransportRequest {
             host: "git.example".to_owned(),
             port: 22,
             user: "git".to_owned(),
             repository: "team/repo.git".to_owned(),
-            service: rho_ui_proto::GitService::ReceivePack,
+            service: rho_agent_host_proto::GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         let waiting = {
@@ -4039,12 +4050,12 @@ mod tests {
     #[tokio::test]
     async fn git_transport_broker_rejects_without_registered_clients() {
         let result = GitTransportBroker::default()
-            .request(rho_ui_proto::GitTransportRequest {
+            .request(rho_agent_host_proto::GitTransportRequest {
                 host: "git.example".to_owned(),
                 port: 22,
                 user: "git".to_owned(),
                 repository: "team/repo.git".to_owned(),
-                service: rho_ui_proto::GitService::UploadPack,
+                service: rho_agent_host_proto::GitService::UploadPack,
                 planned_refs: None,
             })
             .await;
@@ -4065,12 +4076,12 @@ mod tests {
             tokio::spawn(async move {
                 broker
                     .request_with_timeout(
-                        rho_ui_proto::GitTransportRequest {
+                        rho_agent_host_proto::GitTransportRequest {
                             host: "git.example".to_owned(),
                             port: 22,
                             user: "git".to_owned(),
                             repository: "team/repo.git".to_owned(),
-                            service: rho_ui_proto::GitService::UploadPack,
+                            service: rho_agent_host_proto::GitService::UploadPack,
                             planned_refs: None,
                         },
                         std::time::Duration::from_millis(10),
@@ -4170,7 +4181,7 @@ mod tests {
         assert!(
             persist_gui_telemetry(
                 temp.path(),
-                &vec![0; rho_ui_proto::MAX_GUI_TELEMETRY_BYTES + 1]
+                &vec![0; rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES + 1]
             )
             .unwrap_err()
             .to_string()
@@ -4190,7 +4201,7 @@ mod tests {
     /// device id would collide in the CRDT's per-device namespace.
     #[tokio::test]
     async fn a_newer_window_takes_the_device_and_the_displaced_one_may_not_write() {
-        use rho_desk::cells::{
+        use rho_agent_host_proto::desk::cells::{
             CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
         };
 

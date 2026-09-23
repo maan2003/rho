@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_ui_proto::AgentId;
-use rho_ui_proto::mirror::{AgentPos, MirrorEvent};
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::mirror::{AgentPos, MirrorEvent};
 
 use crate::TranscriptFold;
 use crate::state::UiAgentState;
@@ -18,7 +18,7 @@ use crate::store::{AgentStore, FrameSummary};
 /// One change to an agent's transcript: a delta to the runtime's live
 /// tail, or the fold of its mirror made again.
 pub enum TranscriptFrame {
-    Live(rho_ui_proto::mirror::Live),
+    Live(rho_agent_host_proto::mirror::Live),
     /// The mirror's fold, whole. What an agent's first read hands, and
     /// nothing else: a transcript is handed once and appended to after.
     Fold(UiAgentState),
@@ -134,12 +134,12 @@ impl Transcripts {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{MessageDelivery, UnixMs};
+    use rho_agent_host_proto::{MessageDelivery, UnixMs};
 
     use super::*;
 
     fn agent() -> AgentId {
-        AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).expect("an agent id")
+        AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent id")
     }
 
     fn said(text: &str, at: u64) -> MirrorEvent {

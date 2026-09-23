@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rho_ui_proto::AgentId;
-use rho_ui_proto::mirror::{Item, Live, QueuedItem};
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::mirror::{Item, Live, QueuedItem};
 
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
@@ -159,7 +159,7 @@ enum Phase {
     #[default]
     Unknown,
     Requesting,
-    Waiting(Option<rho_agent_types::UnixMs>),
+    Waiting(Option<rho_agent_host_proto::UnixMs>),
     Idle,
 }
 
@@ -402,7 +402,7 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::{AgentIdDomain, MessageDelivery};
+    use rho_agent_host_proto::{AgentIdDomain, MessageDelivery};
 
     use super::*;
 
@@ -426,8 +426,8 @@ mod tests {
 
     #[test]
     fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
-        use rho_agent_types::{ExecMilestone, UnixMs};
-        use rho_ui_proto::mirror::{AgentPos, MirrorEvent};
+        use rho_agent_host_proto::mirror::{AgentPos, MirrorEvent};
+        use rho_agent_host_proto::{ExecMilestone, UnixMs};
 
         use crate::fold::TranscriptFold;
         let mut store = AgentStore::default();
@@ -441,7 +441,7 @@ mod tests {
                     id: "exec-1".into(),
                     name: "exec".into(),
                     arguments: "print(1)".into(),
-                    format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+                    format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
                 },
             },
         );

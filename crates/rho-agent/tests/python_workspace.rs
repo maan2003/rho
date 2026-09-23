@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_agent::python::PythonNotebook;
-use rho_agent_types::ExecCall;
+use rho_inference::types::ExecCall;
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 use rho_tool_shell::ShellTools;
@@ -42,7 +42,7 @@ fn main() {
         cell.acknowledge_output();
         assert_eq!(
             output.status,
-            rho_agent_types::ToolOutputStatus::Success,
+            rho_agent_host_proto::ToolOutputStatus::Success,
             "{output:?}"
         );
         assert!(output.output.contains("/src/project"), "{output:?}");

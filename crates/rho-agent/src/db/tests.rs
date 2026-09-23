@@ -1,4 +1,4 @@
-use rho_agent_types::{ContentPart, UnixMs};
+use rho_agent_host_proto::{ContentPart, UnixMs};
 use rho_db::RhoDb;
 use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
@@ -872,7 +872,7 @@ async fn rewind_cannot_erase_exec_admission() {
     let mut write = db.write().await;
     write.init_agent_tables();
     let agent_id = create(&mut write, None, None);
-    let exec = rho_agent_types::ExecCall {
+    let exec = rho_inference::types::ExecCall {
         id: "once".try_into().unwrap(),
         source: "side_effect()".into(),
     };
@@ -904,11 +904,11 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
         id: uuid::Uuid::new_v4(),
         outputs: vec![(
             "exec-once".try_into().unwrap(),
-            rho_agent_types::ToolOutput {
+            rho_inference::types::ToolOutput {
                 output: std::sync::Arc::new("already ran".into()),
                 full_output: None,
                 images: Default::default(),
-                status: rho_agent_types::ToolOutputStatus::Success,
+                status: rho_agent_host_proto::ToolOutputStatus::Success,
             },
         )],
         wake: crate::WakeFacts::interrupt(),
@@ -930,7 +930,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
         batch.id = uuid::Uuid::new_v4();
         batch.outputs.push((
             "exec-fresh".try_into().unwrap(),
-            rho_agent_types::ToolOutput {
+            rho_inference::types::ToolOutput {
                 output: std::sync::Arc::new("new output".into()),
                 ..batch.outputs[0].1.clone()
             },
@@ -971,7 +971,8 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
 
 #[tokio::test]
 async fn native_later_image_survives_reopen_and_provider_projection() {
-    use rho_agent_types::{ContextBlock, ExecOutput, ToolOutput, ToolOutputStatus};
+    use rho_agent_host_proto::ToolOutputStatus;
+    use rho_inference::types::{ContextBlock, ExecOutput, ToolOutput};
 
     use crate::native::NativeEvent;
     let temp = tempfile::tempdir().unwrap();
@@ -982,10 +983,10 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
         full_output: None,
         status: ToolOutputStatus::Success,
     };
-    let image = rho_agent_types::ImageContent {
+    let image = rho_inference::types::ImageContent {
         media_type: "image/png".into(),
         data: vec![1, 2, 3],
-        detail: rho_agent_types::ImageDetail::Original,
+        detail: rho_inference::types::ImageDetail::Original,
     };
     let later = ToolOutput {
         output: std::sync::Arc::new("later".into()),

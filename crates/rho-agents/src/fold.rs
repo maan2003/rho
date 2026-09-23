@@ -7,12 +7,11 @@
 
 use std::sync::Arc;
 
-use rho_agent_types::{AgentId, AgentRole, UnixMs};
-use rho_ui_proto::mirror::{
+use rho_agent_host_proto::mirror::{
     AgentPos, AgentWant, MirrorEvent, PresentationField, RuntimeKind, SpawnedBy, Speaker,
     ToolOutcome, ToolStatus, TurnEdge, TurnOutcome,
 };
-use rho_ui_proto::{AgentUsageBucket, Place};
+use rho_agent_host_proto::{AgentId, AgentRole, AgentUsageBucket, Place, UnixMs};
 
 use crate::HostId;
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
@@ -341,8 +340,13 @@ pub fn transcript(events: &[(AgentPos, MirrorEvent)]) -> UiAgentState {
 /// entry costs what it changes and never a walk of the whole mirror.
 #[derive(Clone, Debug, Default)]
 pub struct TranscriptFold {
-    exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
-    timing_events: Vec<(AgentPos, String, rho_agent_types::ExecMilestone, UnixMs)>,
+    exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_host_proto::ExecTiming>>,
+    timing_events: Vec<(
+        AgentPos,
+        String,
+        rho_agent_host_proto::ExecMilestone,
+        UnixMs,
+    )>,
     /// One past the newest position folded.
     next: AgentPos,
     /// Shared with every state handed out, so a row costs the blocks it
@@ -370,7 +374,7 @@ pub struct TranscriptFold {
 /// already was, so a reader replaces a suffix rather than a state.
 #[derive(Clone, Debug)]
 pub struct FoldDelta {
-    pub exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
+    pub exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_host_proto::ExecTiming>>,
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
@@ -720,8 +724,8 @@ fn delivered(queued: UiBlock) -> UiBlock {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::MessageDelivery;
-    use rho_ui_proto::mirror::{ArgumentsFormat, Item, ToolOutcome, Usage};
+    use rho_agent_host_proto::MessageDelivery;
+    use rho_agent_host_proto::mirror::{ArgumentsFormat, Item, ToolOutcome, Usage};
 
     use super::*;
     use crate::state::UiTool;
@@ -759,7 +763,7 @@ mod tests {
     /// had. Handing the state whole made a row cost every row above it.
     #[test]
     fn committed_items_keep_live_order_and_phase_and_rewind_together() {
-        use rho_ui_proto::mirror::{ArgumentsFormat, Item, TextPhase};
+        use rho_agent_host_proto::mirror::{ArgumentsFormat, Item, TextPhase};
         let items = vec![
             Item::Text {
                 text: "before".into(),
@@ -865,7 +869,8 @@ mod tests {
         );
 
         let mut store = crate::store::AgentStore::default();
-        let agent = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).expect("an agent id");
+        let agent =
+            AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent id");
         // The reader opened the agent and was handed the transcript whole,
         // once; the page arrives after that.
         store.set_fold(agent, whole);
@@ -1296,7 +1301,7 @@ mod tests {
     #[test]
     fn the_digest_reads_what_the_rails_need() {
         let host = HostId(1);
-        let agent_id = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        let agent_id = AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).unwrap();
         let created = MirrorEvent::Created {
             role: AgentRole::default(),
             runtime: RuntimeKind::Rho,
@@ -1353,19 +1358,19 @@ mod tests {
         assert!(mirrored.tell(
             AgentPos(6),
             &MirrorEvent::ModeChanged {
-                mode: rho_ui_proto::WorksetMode::Exposed,
+                mode: rho_agent_host_proto::WorksetMode::Exposed,
                 at: UnixMs(15),
             }
         ));
         assert_eq!(
             mirrored.identity.place.mode,
-            rho_ui_proto::WorksetMode::Exposed
+            rho_agent_host_proto::WorksetMode::Exposed
         );
         assert_eq!(mirrored.identity.place.cwd, test_place().cwd);
     }
     #[test]
     fn exec_observations_survive_commit_and_rewind_without_retiming() {
-        use rho_agent_types::ExecMilestone::*;
+        use rho_agent_host_proto::ExecMilestone::*;
         let mut fold = TranscriptFold::default();
         let tell = |fold: &mut TranscriptFold, pos, milestone, at| {
             fold.tell(

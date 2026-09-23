@@ -126,9 +126,9 @@ pub enum NodeIdentity {
     },
 }
 
-impl From<rho_desk::cells::Id> for NodeIdentity {
-    fn from(id: rho_desk::cells::Id) -> Self {
-        use rho_desk::cells::Id;
+impl From<rho_agent_host_proto::desk::cells::Id> for NodeIdentity {
+    fn from(id: rho_agent_host_proto::desk::cells::Id) -> Self {
+        use rho_agent_host_proto::desk::cells::Id;
         match id {
             Id::Note(uuid) => Self::Note { uuid: uuid.0 },
             Id::Label(uuid) => Self::Label { uuid: uuid.0 },
@@ -163,14 +163,14 @@ impl From<rho_desk::cells::Id> for NodeIdentity {
 )]
 pub struct AgentIdentity(pub String);
 
-impl From<rho_ui_proto::AgentId> for AgentIdentity {
-    fn from(id: rho_ui_proto::AgentId) -> Self {
+impl From<rho_agent_host_proto::AgentId> for AgentIdentity {
+    fn from(id: rho_agent_host_proto::AgentId) -> Self {
         Self(id.encoded())
     }
 }
 
-impl From<&rho_ui_proto::AgentId> for AgentIdentity {
-    fn from(id: &rho_ui_proto::AgentId) -> Self {
+impl From<&rho_agent_host_proto::AgentId> for AgentIdentity {
+    fn from(id: &rho_agent_host_proto::AgentId) -> Self {
         Self(id.encoded())
     }
 }

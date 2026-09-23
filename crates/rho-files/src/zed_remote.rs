@@ -17,10 +17,10 @@ use gpui::{
     div,
 };
 use language::{Buffer, BufferEvent, Capability};
-use rho_hosts::connection::{Connection, WorkspaceChannel};
-use rho_ui_proto::{
+use rho_agent_host_proto::{
     FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceInfo, WorkspaceServerFrame,
 };
+use rho_hosts::connection::{Connection, WorkspaceChannel};
 use theme::ActiveTheme as _;
 
 #[derive(Clone, Copy, Debug)]

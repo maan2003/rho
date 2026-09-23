@@ -7,11 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rho-inference.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 flate2 = "1"
 camino.workspace = true
-rho-agent-types.workspace = true
+rho-agent-host-proto.workspace = true
 rho-fs-view.workspace = true
 rustix = { version = "1", features = ["process", "thread", "fs", "net"] }
 serde.workspace = true

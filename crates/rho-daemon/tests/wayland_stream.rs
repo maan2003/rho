@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rho_ui_proto::{ClientMessage as C, ServerMessage as S, read_frame, write_frame};
+use rho_agent_host_proto::{ClientMessage as C, ServerMessage as S, read_frame, write_frame};
 
 struct Child(std::process::Child);
 impl Drop for Child {
@@ -75,8 +75,8 @@ fn main() -> Result<()> {
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
         write_frame(&mut local,&C::NewAgent {
-            role:Default::default(), start:rho_ui_proto::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
-            mode:rho_ui_proto::WorksetMode::Exposed,content:None,
+            role:Default::default(), start:rho_agent_host_proto::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
+            mode:rho_agent_host_proto::WorksetMode::Exposed,content:None,
         }).await?;
         let agent=loop {
             match read_frame::<_,S>(&mut local).await? {
@@ -111,7 +111,7 @@ layout { background-color "#315b97"; }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let S::DesktopSessions { sessions } = read_frame::<_,S>(&mut local).await? {
-                    ensure!(sessions == vec![rho_ui_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
+                    ensure!(sessions == vec![rho_agent_host_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
                     break;
                 }
             }
@@ -129,7 +129,7 @@ layout { background-color "#315b97"; }
             S::Error {message}=>anyhow::bail!("trust: {message}"),
             _=>{}
         }}
-        let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_ui_proto::IROH_ALPN)).await??;
+        let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_agent_host_proto::IROH_ALPN)).await??;
         ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id()).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
         let mux=rho_rpc::media::Mux::new(connection.clone());
         let m=mux.clone(); let uni=tokio::spawn(async move {m.receive_uni().await});
@@ -238,7 +238,7 @@ layout { background-color "#315b97"; }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let S::DesktopSessions { sessions } = read_frame::<_, S>(&mut local).await? {
-                    if sessions == vec![rho_ui_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }] { break; }
+                    if sessions == vec![rho_agent_host_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }] { break; }
                 }
             }
             Ok::<_, anyhow::Error>(())

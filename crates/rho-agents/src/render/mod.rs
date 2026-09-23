@@ -10,8 +10,8 @@ pub mod elision;
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_ui_proto::mirror::ArgumentsFormat;
-use rho_ui_proto::{AgentId, MessageDelivery};
+use rho_agent_host_proto::mirror::ArgumentsFormat;
+use rho_agent_host_proto::{AgentId, MessageDelivery};
 use rho_window::style::StyleClass;
 
 use crate::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
@@ -698,7 +698,7 @@ fn json_text_field(arguments: &str, key: &str, format: ArgumentsFormat) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::UnixMs;
+    use rho_agent_host_proto::UnixMs;
 
     use super::*;
 
@@ -1011,7 +1011,8 @@ mod tests {
     /// are the same answer, for every kind of block there is.
     #[test]
     fn block_visibility_agrees_with_rendering() {
-        let sender = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).expect("an agent");
+        let sender =
+            AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent");
         let blocks = [
             UiBlock::UserMessage {
                 text: "said".to_owned(),
@@ -1068,7 +1069,7 @@ mod tests {
     #[test]
     fn exec_timing_names_provider_phases_not_python_duration() {
         let mut exec = tool(UiToolStatus::Success);
-        exec.timing = rho_agent_types::ExecTiming {
+        exec.timing = rho_agent_host_proto::ExecTiming {
             first_block_at: Some(UnixMs(100)),
             arguments_finished_at: Some(UnixMs(2100)),
             response_finished_at: Some(UnixMs(2600)),

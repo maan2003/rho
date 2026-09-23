@@ -58,9 +58,8 @@ redb-derive = { workspace = true }
 prefix-id = { workspace = true, features = ["redb"] }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-browser = { workspace = true }
-rho-agent-types.workspace = true
+rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
-rho-desk.workspace = true
 rho-files = { workspace = true }
 rho-agents = { workspace = true }
 rho-hosts = { workspace = true }
@@ -71,7 +70,6 @@ rho-mirror = { workspace = true }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
-rho-ui-proto.workspace = true
 rho-slack = { workspace = true, features = ["ui"] }
 rho-shell-view = { workspace = true }
 rho-terminal = { workspace = true }

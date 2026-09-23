@@ -6,7 +6,7 @@
 
 use std::borrow::Borrow;
 
-use rho_ui_proto::MessageDelivery;
+use rho_agent_host_proto::MessageDelivery;
 
 use crate::state::{UiBlock, UiMessagePhase};
 
@@ -160,7 +160,7 @@ fn block_is_working(block: &UiBlock) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::mirror::ArgumentsFormat;
+    use rho_agent_host_proto::mirror::ArgumentsFormat;
 
     use super::*;
     use crate::state::{UiMessagePhase, UiTool, UiToolStatus};

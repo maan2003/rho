@@ -26,7 +26,7 @@
 //! scorer noticing.
 
 use gpui::{App, Context, Window};
-use rho_agent_types::AgentId;
+use rho_agent_host_proto::AgentId;
 use rho_agents::HostId;
 
 use crate::minibuffer::Candidate;
@@ -69,7 +69,7 @@ pub(crate) enum FindTarget {
     /// `enter` on the dashboard row does.
     Topic {
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
     },
     Slack(rho_slack::session::Source),
 }
@@ -463,7 +463,7 @@ impl Workspace {
                 let unit = crate::slack::unit_of_source(name, source);
                 let Some(facts) = self
                     .desk_cells
-                    .facts(host, &rho_desk::cells::Id::Slack(unit))
+                    .facts(host, &rho_agent_host_proto::desk::cells::Id::Slack(unit))
                 else {
                     continue;
                 };
@@ -830,7 +830,7 @@ mod tests {
             path: path.to_owned(),
             kind: "agent",
             target: FindTarget::Agent(
-                AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).unwrap(),
             ),
             labels: Vec::new(),
             aka: Vec::new(),
@@ -891,7 +891,9 @@ mod tests {
                 labels: vec![LabelName::new("rho/agent", "the topic")],
                 target: FindTarget::Topic {
                     host: HostId::default(),
-                    node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([7; 16])),
+                    node_id: rho_agent_host_proto::desk::cells::Id::Note(
+                        rho_agent_host_proto::desk::cells::Uuid([7; 16]),
+                    ),
                 },
                 recency: 40,
                 ..agent_row("rig › the topic", 4)

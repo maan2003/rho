@@ -19,10 +19,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_agent_types::{AgentRole, ContentPart};
-use rho_ui_proto::client::Client;
-use rho_ui_proto::mirror::MirrorEvent;
-use rho_ui_proto::{ClientMessage, JoinTarget, ServerMessage, StartMode};
+use rho_agent_host_proto::client::Client;
+use rho_agent_host_proto::mirror::MirrorEvent;
+use rho_agent_host_proto::{
+    AgentRole, ClientMessage, ContentPart, JoinTarget, ServerMessage, StartMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1159,7 +1160,7 @@ async fn probe_async(name: &str) -> Result<()> {
             start: StartMode::Join(JoinTarget::User {
                 repo: workspace.try_into().context("rig workspace is not UTF-8")?,
             }),
-            mode: rho_ui_proto::WorksetMode::View,
+            mode: rho_agent_host_proto::WorksetMode::View,
             content: Some(vec![ContentPart::Text {
                 text: "Complete one deterministic rig probe turn.".to_owned(),
             }]),
@@ -1185,7 +1186,7 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                     let completed_reply = matches!(
                         &entry.event,
-                        MirrorEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_ui_proto::mirror::Item::ToolCall { .. }))
+                        MirrorEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agent_host_proto::mirror::Item::ToolCall { .. }))
                     );
                     if matches!(&entry.event, MirrorEvent::Replied { .. }) {
                         replies += 1;

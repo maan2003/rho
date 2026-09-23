@@ -17,13 +17,13 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
+use rho_agent_host_proto::AgentId;
+pub use rho_agent_host_proto::desk::cells::SlackUnit;
 use rho_agents::{AgentMap, HostId};
-pub use rho_desk::cells::SlackUnit;
-use rho_ui_proto::AgentId;
 
 use crate::workspace::Workspace;
 
-type DraftTopic = Option<(HostId, rho_desk::cells::Id)>;
+type DraftTopic = Option<(HostId, rho_agent_host_proto::desk::cells::Id)>;
 type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
 
 // Dealer curve tuning. These are deliberately all in one place: rho has one
@@ -96,7 +96,7 @@ pub struct DealCard {
     /// The note the card hangs under, which is the anchor the desk cursor
     /// follows and the key the dealer deduplicates on. The verdict itself
     /// lands on the card's own node, `identity`.
-    pub topic_node_id: rho_desk::cells::Id,
+    pub topic_node_id: rho_agent_host_proto::desk::cells::Id,
     pub agent_id: Option<AgentId>,
     pub agent_tag: Option<String>,
     pub breadcrumb: String,
@@ -112,7 +112,7 @@ pub struct DealCard {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeskRoom {
     pub host: HostId,
-    pub node_id: rho_desk::cells::Id,
+    pub node_id: rho_agent_host_proto::desk::cells::Id,
     pub name: String,
 }
 
@@ -131,7 +131,7 @@ pub enum CardTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DealCardId {
     pub host: HostId,
-    pub node_id: rho_desk::cells::Id,
+    pub node_id: rho_agent_host_proto::desk::cells::Id,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +238,7 @@ struct HeadingContext {
     host: HostId,
     /// The row that lends the place. An agent's card is remade when this
     /// row moves, so the set knows which cards a heading holds.
-    heading: rho_desk::cells::Id,
+    heading: rho_agent_host_proto::desk::cells::Id,
     breadcrumb: String,
     room: Option<String>,
     bindings: Vec<AgentId>,
@@ -262,7 +262,7 @@ struct DealerSet {
     of_agent: HashMap<AgentId, DealCardId>,
     /// The agents each heading lends a place to, so that a verdict on a
     /// note costs the cards under it and no others.
-    of_heading: HashMap<(HostId, rho_desk::cells::Id), HashSet<AgentId>>,
+    of_heading: HashMap<(HostId, rho_agent_host_proto::desk::cells::Id), HashSet<AgentId>>,
     /// How many cards have been made since this dashboard existed. The
     /// point of the set is that this rises by what a change names and not
     /// by the size of the desk, so a test can say exactly that.
@@ -318,7 +318,7 @@ pub enum DealScope<'a> {
     /// cards are made again, and so are the cards of the agents the row
     /// heads, since a heading that closes or defers takes its subtree out
     /// of the hand with it.
-    Nodes(&'a [rho_desk::cells::Id]),
+    Nodes(&'a [rho_agent_host_proto::desk::cells::Id]),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -333,11 +333,11 @@ pub struct DealQueueDepth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardCursor {
     /// The newest message in the unit, which is what a Slack verdict writes.
-    Slack(rho_desk::cells::SlackTs),
+    Slack(rho_agent_host_proto::desk::cells::SlackTs),
     /// The agent's own chronology and what it is asking for.
     Agent(rho_agents::AgentFacts, rho_agents::Attention),
     /// The dated mark the card stands on.
-    Desk(DeskMark, rho_desk::cells::Timestamp),
+    Desk(DeskMark, rho_agent_host_proto::desk::cells::Timestamp),
 }
 
 #[derive(Clone, Debug)]
@@ -358,7 +358,7 @@ pub enum StructureDirection {
 /// shared Desk buffers directly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
-    NewDraft(Option<(HostId, rho_desk::cells::Id)>),
+    NewDraft(Option<(HostId, rho_agent_host_proto::desk::cells::Id)>),
 }
 
 /// One place an agent's shared runtime row is projected. The occurrence is
@@ -370,24 +370,24 @@ pub enum RowTarget {
     None,
     TreeTopic {
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         first_attention: Option<AgentId>,
         on_heading_line: bool,
     },
     TreeAgent {
         host: HostId,
-        node_id: rho_desk::cells::Id,
-        topic_node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
+        topic_node_id: rho_agent_host_proto::desk::cells::Id,
         agent_id: AgentId,
     },
     TreePage {
         host: HostId,
-        node_id: rho_desk::cells::Id,
-        topic_node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
+        topic_node_id: rho_agent_host_proto::desk::cells::Id,
         page_id: rho_browser::PageId,
     },
     NewDraft,
-    NewTreeDraft((HostId, rho_desk::cells::Id)),
+    NewTreeDraft((HostId, rho_agent_host_proto::desk::cells::Id)),
 }
 
 /// One generated segment: a slice of a host document, or a generated
@@ -430,7 +430,7 @@ pub struct Dashboard {
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
     new_draft: Option<DraftState>,
-    tree_new_draft_parent: Option<(HostId, rho_desk::cells::Id)>,
+    tree_new_draft_parent: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     /// Collapsed subtrees as anchored fold ranges, org-style: the fold
     /// is persistent state that rides edits, not something re-derived
     /// from the parse. The start anchor is right-biased (org's
@@ -540,7 +540,7 @@ impl Dashboard {
         heading: &crate::desk_view::DeskNode,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> Option<HeadingContext> {
-        if heading.state != rho_desk::cells::State::Open {
+        if heading.state != rho_agent_host_proto::desk::cells::State::Open {
             return None;
         }
         if desk_deferred(heading, now.naive_local()) {
@@ -649,7 +649,7 @@ impl Dashboard {
         let node_id = source
             .agent_node(agent_id)
             .map(|node| node.id.clone())
-            .unwrap_or(rho_desk::cells::Id::Agent(agent_id));
+            .unwrap_or(rho_agent_host_proto::desk::cells::Id::Agent(agent_id));
         Some(RankedDealCard {
             priority,
             heading: Some(context.heading.clone()),
@@ -706,7 +706,7 @@ impl Dashboard {
         order: usize,
         facts: &DealerFacts<'_>,
     ) -> Option<RankedDealCard> {
-        if node.state != rho_desk::cells::State::Open
+        if node.state != rho_agent_host_proto::desk::cells::State::Open
             || desk_deferred(node, facts.now.naive_local())
         {
             return None;
@@ -721,7 +721,9 @@ impl Dashboard {
             heading: None,
             virtual_reply: false,
             order,
-            cursor: CardCursor::Slack(rho_desk::cells::SlackTs(thread.latest.clone())),
+            cursor: CardCursor::Slack(rho_agent_host_proto::desk::cells::SlackTs(
+                thread.latest.clone(),
+            )),
             curve: PriorityCurve::Thread,
             card: DealCard {
                 label,
@@ -774,7 +776,7 @@ impl Dashboard {
             agent_card_facts(&agent.facts, agent.agent_id, facts.now, facts.interactions)?;
         let node_id = node
             .map(|node| node.id.clone())
-            .unwrap_or(rho_desk::cells::Id::Agent(agent.agent_id));
+            .unwrap_or(rho_agent_host_proto::desk::cells::Id::Agent(agent.agent_id));
         let identity = DealCardId {
             host: agent.host,
             node_id: node_id.clone(),
@@ -873,7 +875,7 @@ impl Dashboard {
     pub fn card_for_node(
         &self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         _cx: &App,
     ) -> Option<DealCard> {
         let source = self.deal_hosts.get(&host)?;
@@ -887,7 +889,7 @@ impl Dashboard {
         let agent_id = match node {
             Some(node) => node_agent(node),
             None => match &node_id {
-                rho_desk::cells::Id::Agent(agent_id) => Some(*agent_id),
+                rho_agent_host_proto::desk::cells::Id::Agent(agent_id) => Some(*agent_id),
                 _ => return None,
             },
         };
@@ -913,11 +915,19 @@ impl Dashboard {
         })
     }
 
-    fn breadcrumb_for_node(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<String> {
+    fn breadcrumb_for_node(
+        &self,
+        host: HostId,
+        node_id: rho_agent_host_proto::desk::cells::Id,
+    ) -> Option<String> {
         Some(self.deal_hosts.get(&host)?.breadcrumb(&node_id))
     }
 
-    fn room_for_node(&self, host: HostId, mut node_id: rho_desk::cells::Id) -> Option<DeskRoom> {
+    fn room_for_node(
+        &self,
+        host: HostId,
+        mut node_id: rho_agent_host_proto::desk::cells::Id,
+    ) -> Option<DeskRoom> {
         let source = self.deal_hosts.get(&host)?;
         loop {
             let node = source.node(&node_id)?;
@@ -943,19 +953,25 @@ impl Dashboard {
     /// own source instead. Same answer, one source.
     fn filed_node(
         &self,
-        find: impl Fn(&crate::candidates::HostNodes) -> Option<rho_desk::cells::Id>,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
+        find: impl Fn(&crate::candidates::HostNodes) -> Option<rho_agent_host_proto::desk::cells::Id>,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         self.deal_hosts
             .iter()
             .find_map(|(host, source)| find(source).map(|node_id| (*host, node_id)))
     }
 
-    fn agent_node_id(&self, agent_id: AgentId) -> Option<(HostId, rho_desk::cells::Id)> {
+    fn agent_node_id(
+        &self,
+        agent_id: AgentId,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         self.filed_node(|source| source.agent_node(agent_id).map(|node| node.id.clone()))
     }
 
-    fn page_node_id(&self, page_id: rho_browser::PageId) -> Option<(HostId, rho_desk::cells::Id)> {
-        let page = rho_desk::PageId(*page_id.0.as_bytes());
+    fn page_node_id(
+        &self,
+        page_id: rho_browser::PageId,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+        let page = rho_agent_host_proto::desk::PageId(*page_id.0.as_bytes());
         self.filed_node(|source| source.page_node(page).map(|node| node.id.clone()))
     }
 
@@ -1056,7 +1072,11 @@ impl Dashboard {
     /// source for each of those would make every event cost the desk.
     /// Every id at or under a node, taken from the dealer's source. The
     /// map used to be asked this; the answer never needed a drawn row.
-    pub fn subtree_ids(&self, host: HostId, id: &rho_desk::cells::Id) -> Vec<rho_desk::cells::Id> {
+    pub fn subtree_ids(
+        &self,
+        host: HostId,
+        id: &rho_agent_host_proto::desk::cells::Id,
+    ) -> Vec<rho_agent_host_proto::desk::cells::Id> {
         let Some(source) = self.deal_hosts.get(&host) else {
             return Vec::new();
         };
@@ -1073,7 +1093,10 @@ impl Dashboard {
     /// The first agent filed under a heading, which is what a card on that
     /// heading stands for. Answered from the dealer's source, which indexes
     /// the agents under each heading as it is built.
-    pub fn first_agent_for_topic(&self, topic: (HostId, rho_desk::cells::Id)) -> Option<AgentId> {
+    pub fn first_agent_for_topic(
+        &self,
+        topic: (HostId, rho_agent_host_proto::desk::cells::Id),
+    ) -> Option<AgentId> {
         self.deal_hosts
             .get(&topic.0)
             .and_then(|source| source.agents_under(&topic.1).first())
@@ -1082,7 +1105,10 @@ impl Dashboard {
 
     /// The note a card's room is named after: the highest note above it
     /// that still hangs under notes. From the dealer's source.
-    pub fn room_node(&self, card: &DealCard) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub fn room_node(
+        &self,
+        card: &DealCard,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         let source = self.deal_hosts.get(&card.host)?;
         let mut node_id = card.topic_node_id.clone();
         loop {
@@ -1126,7 +1152,7 @@ impl Dashboard {
     pub(crate) fn patch_deal_source(
         &mut self,
         host: HostId,
-        touched: &BTreeSet<rho_desk::cells::Id>,
+        touched: &BTreeSet<rho_agent_host_proto::desk::cells::Id>,
         nodes: &[crate::desk_view::DeskNode],
     ) -> bool {
         #[cfg(test)]
@@ -1149,18 +1175,20 @@ impl Dashboard {
             // still opens its transcript: the id says which agent, and
             // filing was never what made it openable.
             return match card.node_id {
-                rho_desk::cells::Id::Agent(agent_id) => CardTarget::Agent(agent_id),
+                rho_agent_host_proto::desk::cells::Id::Agent(agent_id) => {
+                    CardTarget::Agent(agent_id)
+                }
                 _ => CardTarget::Missing,
             };
         };
         match &node.id {
-            rho_desk::cells::Id::Agent(_) => {
+            rho_agent_host_proto::desk::cells::Id::Agent(_) => {
                 node.agent().map_or(CardTarget::Missing, CardTarget::Agent)
             }
-            rho_desk::cells::Id::Page(_) => {
+            rho_agent_host_proto::desk::cells::Id::Page(_) => {
                 node_page(node).map_or(CardTarget::Missing, CardTarget::Page)
             }
-            rho_desk::cells::Id::Slack(_) => {
+            rho_agent_host_proto::desk::cells::Id::Slack(_) => {
                 node_unit(node).map_or(CardTarget::Missing, CardTarget::Thread)
             }
             _ => CardTarget::Note,
@@ -1199,7 +1227,7 @@ impl Dashboard {
                 source
                     .nodes()
                     .iter()
-                    .filter(|node| node.state == rho_desk::cells::State::Open)
+                    .filter(|node| node.state == rho_agent_host_proto::desk::cells::State::Open)
                     .filter_map(move |node| {
                         Some((
                             DealCardId {
@@ -1219,7 +1247,7 @@ impl Dashboard {
         self.deal_hosts
             .get(&card.host)
             .and_then(|source| source.node(&card.node_id))
-            .is_some_and(|node| node.state == rho_desk::cells::State::Open)
+            .is_some_and(|node| node.state == rho_agent_host_proto::desk::cells::State::Open)
     }
 
     /// Whether the user has put this agent away: muted, or snoozed to a
@@ -1245,7 +1273,10 @@ impl Dashboard {
     }
 
     /// When a card is put down until.
-    pub fn node_defer_until(&self, card: DealCardId) -> Option<rho_desk::cells::Timestamp> {
+    pub fn node_defer_until(
+        &self,
+        card: DealCardId,
+    ) -> Option<rho_agent_host_proto::desk::cells::Timestamp> {
         self.deal_hosts
             .get(&card.host)
             .and_then(|source| source.node(&card.node_id))
@@ -1355,7 +1386,7 @@ impl Dashboard {
     fn remake_node_cards(
         &mut self,
         host: HostId,
-        node_id: &rho_desk::cells::Id,
+        node_id: &rho_agent_host_proto::desk::cells::Id,
         registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
@@ -1652,7 +1683,7 @@ impl Dashboard {
     /// draft it parks when left and survives refreshes.
     pub fn open_new_draft(
         &mut self,
-        topic: Option<(HostId, rho_desk::cells::Id)>,
+        topic: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -1696,7 +1727,7 @@ impl Dashboard {
         true
     }
 
-    pub fn new_draft_topic(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub fn new_draft_topic(&self) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         self.new_draft.as_ref().and_then(|draft| draft.0.clone())
     }
 
@@ -1865,7 +1896,7 @@ fn outcome_label(facts: &rho_agents::AgentFacts, wait_days: f64) -> String {
 }
 
 fn reply_wait_days(
-    ended: rho_agent_types::UnixMs,
+    ended: rho_agent_host_proto::UnixMs,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> f64 {
     (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0
@@ -1901,15 +1932,18 @@ pub enum DeskMark {
     Deadline,
 }
 
-fn desk_time(at: rho_desk::cells::Timestamp) -> Option<chrono::NaiveDateTime> {
+fn desk_time(at: rho_agent_host_proto::desk::cells::Timestamp) -> Option<chrono::NaiveDateTime> {
     chrono::DateTime::from_timestamp_millis(at.unix_ms).map(|time| time.naive_local())
 }
 
 /// Days between a mark and now, whole days when the mark is only a date.
-fn desk_elapsed(at: rho_desk::cells::Timestamp, now: chrono::NaiveDateTime) -> Option<f64> {
+fn desk_elapsed(
+    at: rho_agent_host_proto::desk::cells::Timestamp,
+    now: chrono::NaiveDateTime,
+) -> Option<f64> {
     let time = desk_time(at)?;
     Some(
-        if at.precision == rho_desk::cells::TimestampPrecision::Day {
+        if at.precision == rho_agent_host_proto::desk::cells::TimestampPrecision::Day {
             now.date().signed_duration_since(time.date()).num_days() as f64
         } else {
             now.signed_duration_since(time).num_seconds() as f64 / 86_400.0
@@ -1919,8 +1953,10 @@ fn desk_elapsed(at: rho_desk::cells::Timestamp, now: chrono::NaiveDateTime) -> O
 
 /// The dated marks a node carries. An Open node with neither is a note, not
 /// a card: the desk is where you write, and writing is not a queue.
-fn desk_marks(node: &crate::desk_view::DeskNode) -> Vec<(DeskMark, rho_desk::cells::Timestamp)> {
-    if node.state != rho_desk::cells::State::Open {
+fn desk_marks(
+    node: &crate::desk_view::DeskNode,
+) -> Vec<(DeskMark, rho_agent_host_proto::desk::cells::Timestamp)> {
+    if node.state != rho_agent_host_proto::desk::cells::State::Open {
         return Vec::new();
     }
     let mut marks = Vec::new();
@@ -1941,7 +1977,8 @@ fn node_closed(
     node: &crate::desk_view::DeskNode,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> bool {
-    node.state != rho_desk::cells::State::Open || desk_deferred(node, now.naive_local())
+    node.state != rho_agent_host_proto::desk::cells::State::Open
+        || desk_deferred(node, now.naive_local())
 }
 
 /// The same question for an agent reached through a note, which knows the
@@ -1964,7 +2001,7 @@ fn desk_deferred(node: &crate::desk_view::DeskNode, now: chrono::NaiveDateTime) 
 
 fn desk_mark_priority(
     mark: DeskMark,
-    at: rho_desk::cells::Timestamp,
+    at: rho_agent_host_proto::desk::cells::Timestamp,
     pace_days: u32,
     now: chrono::NaiveDateTime,
 ) -> f64 {
@@ -1985,7 +2022,7 @@ fn desk_mark_priority(
 
 fn desk_mark_label(
     mark: DeskMark,
-    at: rho_desk::cells::Timestamp,
+    at: rho_agent_host_proto::desk::cells::Timestamp,
     now: chrono::NaiveDateTime,
 ) -> String {
     let Some(elapsed) = desk_elapsed(at, now) else {
@@ -2040,7 +2077,7 @@ struct RankedDealCard {
     /// The row this card hangs under, when a row lends it one. A verdict on
     /// a heading moves every card it holds, and this is how the set finds
     /// them without looking at the others.
-    heading: Option<rho_desk::cells::Id>,
+    heading: Option<rho_agent_host_proto::desk::cells::Id>,
 }
 
 /// The part of a card that slides with the clock, separated from the card
@@ -2051,7 +2088,7 @@ enum PriorityCurve {
     /// overdue; the note's pace is the scale.
     DeskMark {
         mark: DeskMark,
-        at: rho_desk::cells::Timestamp,
+        at: rho_agent_host_proto::desk::cells::Timestamp,
         pace_days: u32,
     },
     /// An agent whose turn has ended. The curve is blocked or FYI by what

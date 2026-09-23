@@ -5,8 +5,9 @@ mod search;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent_types::{ContentPart, ContextBlock, InferenceResponseItem, ToolExecutionContext};
+use rho_agent_host_proto::ContentPart;
 use rho_inference::Inference;
+use rho_inference::types::{ContextBlock, InferenceResponseItem, ToolExecutionContext};
 
 use crate::search::{
     AllowedCaller, ContentItem, ExternalWebAccess, MessagePhase, ResponseItem, SearchCommands,
@@ -130,10 +131,10 @@ fn recent_input(blocks: &[Arc<ContextBlock>]) -> Option<Vec<ResponseItem>> {
                             "assistant",
                             content,
                             phase.map(|phase| match phase {
-                                rho_agent_types::MessagePhase::Commentary => {
+                                rho_agent_host_proto::MessagePhase::Commentary => {
                                     MessagePhase::Commentary
                                 }
-                                rho_agent_types::MessagePhase::FinalAnswer => {
+                                rho_agent_host_proto::MessagePhase::FinalAnswer => {
                                     MessagePhase::FinalAnswer
                                 }
                             }),
@@ -267,17 +268,19 @@ mod tests {
     fn recent_input_keeps_two_user_turns_and_caps_assistant_text() {
         fn user(text: &str) -> Arc<ContextBlock> {
             Arc::new(ContextBlock::UserMessage {
-                sender: rho_agent_types::MessageSender::User,
+                sender: rho_inference::types::MessageSender::User,
                 content: vec![ContentPart::Text { text: text.into() }],
             })
         }
         fn assistant(text: &str) -> Arc<ContextBlock> {
             Arc::new(ContextBlock::InferenceResponse {
                 items: vec![InferenceResponseItem::AssistantMessage {
-                    provider_specific: Box::new(rho_agent_types::UnknownProviderSpecificData {
-                        body: Default::default(),
-                        tag: "test".to_owned(),
-                    }),
+                    provider_specific: Box::new(
+                        rho_inference::types::UnknownProviderSpecificData {
+                            body: Default::default(),
+                            tag: "test".to_owned(),
+                        },
+                    ),
                     content: vec![ContentPart::Text { text: text.into() }],
                     phase: None,
                 }],

@@ -19,11 +19,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use rho_agent_types::{
-    ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
-    ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
-};
+use rho_agent_host_proto::ToolOutputStatus;
 use rho_fs_view::{Namespace as View, PathOverrides};
+use rho_inference::types::{
+    ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
+    ToolResultMetadata, ToolSpec, ToolType,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

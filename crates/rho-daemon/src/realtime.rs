@@ -8,12 +8,12 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use rho_agent_host_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
+use rho_agent_host_proto::{ServerMessage, read_frame, write_frame};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
     ContextChannel, ProviderEvent, Sideband, SidebandConfig, call_id_from_location,
 };
-use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
-use rho_ui_proto::{ServerMessage, read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 

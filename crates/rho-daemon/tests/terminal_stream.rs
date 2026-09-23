@@ -6,8 +6,12 @@
 
 use std::time::Duration;
 
-use rho_ui_proto::term::{ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, WireScreen};
-use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, StartMode, read_frame, write_frame};
+use rho_agent_host_proto::term::{
+    ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, WireScreen,
+};
+use rho_agent_host_proto::{
+    AgentId, ClientMessage, ServerMessage, StartMode, read_frame, write_frame,
+};
 
 fn main() -> anyhow::Result<()> {
     let unshare = std::process::Command::new("unshare")
@@ -97,7 +101,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
                 repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
                 revset: "@".to_owned(),
             },
-            mode: rho_ui_proto::WorksetMode::View,
+            mode: rho_agent_host_proto::WorksetMode::View,
             content: None,
         },
     )

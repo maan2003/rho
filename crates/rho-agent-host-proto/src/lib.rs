@@ -1,33 +1,31 @@
-//! UI wire vocabulary shared by Rho clients and the daemon.
+//! What a client and an agent host say to each other, and the words both
+//! sides share. The GUI depends on this crate and nothing else from the
+//! agent host.
 //!
 //! Transport, authentication, compression, and generic Senax framing live in
-//! `rho-rpc`; this crate owns UI message types, UI-specific limits, logical
-//! traffic accounting, and protocol logs.
+//! `rho-rpc`; this crate owns message types, their limits, logical traffic
+//! accounting, and protocol logs.
 
 use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
-use rho_agent_types::ContentPart;
-pub use rho_agent_types::{
-    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, MessageDelivery,
-};
-pub use rho_workspaces_types::{
-    Place, WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
-    WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
-};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 #[cfg(not(target_family = "wasm"))]
 pub mod client;
-#[doc(hidden)]
-pub use rho_desk as desk_tree;
+pub mod desk;
 pub mod mirror;
+mod place;
 pub mod realtime;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
 pub mod shell;
+pub mod shell_kernel;
 pub mod term;
+mod vocab;
 pub mod workspace;
+pub use place::*;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+pub use vocab::*;
 pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame};
 
 /// Maximum accepted frame payload size.
@@ -128,8 +126,8 @@ pub enum ClientMessage {
     Ping,
     Subscribe,
     DeskSync {
-        device: desk_tree::cells::DeviceId,
-        known: desk_tree::cells::Version,
+        device: desk::cells::DeviceId,
+        known: desk::cells::Version,
         /// Which store the client counted `known` in, when it holds a
         /// replica at all. A version is a count of writes per device inside
         /// one store; carried to another store the same numbers name writes
@@ -137,27 +135,27 @@ pub enum ClientMessage {
         /// says whose numbers these are, and a daemon that does not
         /// recognise the name answers with the whole store rather than a
         /// difference from a number that was never its own.
-        store: Option<desk_tree::cells::DeviceId>,
+        store: Option<desk::cells::DeviceId>,
         /// How much of each note's text the client already holds, by note.
         /// The daemon answers with the operations these lack and leaves
         /// out the bodies with nothing new in them; a note missing from
         /// the map is one the client has never held, and comes whole.
-        bodies: std::collections::BTreeMap<desk_tree::cells::Id, desk_tree::cells::BodyVersion>,
+        bodies: std::collections::BTreeMap<desk::cells::Id, desk::cells::BodyVersion>,
     },
     /// The client's half of a sync: the cells it holds that the daemon's
     /// frontier does not cover. The store is the client's, so the daemon
     /// catches up from it the same way it is caught up from.
     DeskCellsApply {
-        cells: desk_tree::cells::Snapshot,
+        cells: desk::cells::Snapshot,
     },
     DeskMutationApply {
-        mutation: desk_tree::cells::CellMutation,
+        mutation: desk::cells::CellMutation,
     },
     /// An edit to a note's body, which is the only text the store holds.
     DeskTextApply {
-        id: desk_tree::cells::Id,
-        operation: desk_tree::TextOperation,
-        transaction: Option<desk_tree::TextTransaction>,
+        id: desk::cells::Id,
+        operation: desk::TextOperation,
+        transaction: Option<desk::TextTransaction>,
     },
     NewAgent {
         role: AgentRole,
@@ -555,18 +553,18 @@ pub enum ServerMessage {
         /// replica can tell whether what it kept is behind this store or
         /// about a different one. When it does not match what the client
         /// holds, `delta` is the whole store, not a difference.
-        store: desk_tree::cells::DeviceId,
+        store: desk::cells::DeviceId,
         node_namespace: u16,
-        delta: desk_tree::cells::Snapshot,
-        bodies: Vec<desk_tree::cells::BodySnapshot>,
+        delta: desk::cells::Snapshot,
+        bodies: Vec<desk::cells::BodySnapshot>,
     },
     DeskCellsAvailable {
-        frontier: desk_tree::cells::Version,
+        frontier: desk::cells::Version,
     },
     DeskTextApplied {
-        id: desk_tree::cells::Id,
-        operation: desk_tree::TextOperation,
-        transaction: Option<desk_tree::TextTransaction>,
+        id: desk::cells::Id,
+        operation: desk::TextOperation,
+        transaction: Option<desk::TextTransaction>,
     },
     DeskResyncRequired,
     Ready {
@@ -1149,9 +1147,7 @@ mod tests {
 
     #[test]
     fn desk_cells_messages_round_trip() {
-        use desk_tree::cells::{
-            CellMutation, CellWrite, DeviceId, Id, Property, Stamp, Uuid, Version,
-        };
+        use desk::cells::{CellMutation, CellWrite, DeviceId, Id, Property, Stamp, Uuid, Version};
 
         let device = DeviceId([7; 16]);
         let id = Id::Note(Uuid([9; 16]));
@@ -1169,8 +1165,8 @@ mod tests {
             }],
             verdict: None,
         };
-        let text_operation = desk_tree::TextOperation::Edit {
-            timestamp: desk_tree::TreeClock {
+        let text_operation = desk::TextOperation::Edit {
+            timestamp: desk::TreeClock {
                 value: 1,
                 replica_id: 4,
             },
@@ -1185,7 +1181,7 @@ mod tests {
                 store: Some(device),
                 bodies: std::collections::BTreeMap::from([(
                     id.clone(),
-                    desk_tree::cells::BodyVersion::from([(4, 1)]),
+                    desk::cells::BodyVersion::from([(4, 1)]),
                 )]),
             },
             ClientMessage::DeskMutationApply { mutation },
@@ -1203,7 +1199,7 @@ mod tests {
         let message = ServerMessage::DeskSynced {
             store: device,
             node_namespace: 4,
-            delta: desk_tree::cells::Snapshot::default(),
+            delta: desk::cells::Snapshot::default(),
             bodies: Vec::new(),
         };
         let bytes = senax_encoder::pack(&message).unwrap();
@@ -1368,7 +1364,7 @@ mod tests {
                 text: "lo".to_owned(),
             },
             mirror::Live::Waiting {
-                until: Some(rho_agent_types::UnixMs(5)),
+                until: Some(crate::UnixMs(5)),
             },
             mirror::Live::Idle,
         ] {

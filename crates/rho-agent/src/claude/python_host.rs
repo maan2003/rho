@@ -13,9 +13,10 @@
 use std::sync::Arc;
 
 #[cfg(test)]
-use rho_agent_types::ToolOutputStatus;
-use rho_agent_types::{ExecCall, ExecId, ToolOutput, UnixMs};
+use rho_agent_host_proto::ToolOutputStatus;
+use rho_agent_host_proto::UnixMs;
 use rho_claude::mcp::{reply, text_item, tool_result};
+use rho_inference::types::{ExecCall, ExecId, ToolOutput};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -319,7 +320,7 @@ mod tests {
         let output = |text: &str, status| ToolOutput {
             output: Arc::new(text.to_owned()),
             full_output: None,
-            images: Arc::new(vec![rho_agent_types::ImageContent {
+            images: Arc::new(vec![rho_inference::types::ImageContent {
                 media_type: "image/png".into(),
                 data: vec![1, 2, 3],
                 detail: Default::default(),

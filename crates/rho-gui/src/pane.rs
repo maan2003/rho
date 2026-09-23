@@ -5,8 +5,8 @@
 //! once per context (`RHO-WINDOW-DESIGN.md`).
 
 use camino::Utf8PathBuf;
+use rho_agent_host_proto::AgentId;
 use rho_agents::HostId;
-use rho_ui_proto::AgentId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlackInventoryKind {
@@ -38,7 +38,7 @@ pub enum SurfaceKey {
     Usage,
     DeskNode {
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
     },
     Transcript(AgentId),
     File {

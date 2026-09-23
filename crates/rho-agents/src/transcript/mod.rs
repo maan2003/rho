@@ -44,8 +44,8 @@ use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, Weak
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
+use rho_agent_host_proto::AgentId;
 use rho_hosts::connection::VisualizationClient;
-use rho_ui_proto::AgentId;
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use rho_window::visualization::Visualization;
@@ -436,7 +436,7 @@ impl TranscriptModel {
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
-        agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
+        agent_label: &impl Fn(rho_agent_host_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
         self.turn_open = crate::store::turn_open(state.status);

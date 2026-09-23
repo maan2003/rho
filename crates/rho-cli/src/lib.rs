@@ -9,11 +9,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use rho_agent_host_proto::client::Client as UiClient;
+use rho_agent_host_proto::{ClientMessage, ServerMessage};
 use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
 use rho_inference::{AuthArgs, run_auth_cli};
-use rho_ui_proto::client::Client as UiClient;
-use rho_ui_proto::{ClientMessage, ServerMessage};
 
 mod eval;
 mod pr;
@@ -78,7 +78,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
-            rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
+            rho_agent_host_proto::print_protocol_log(&args.path, &mut stdout)?;
             Ok(())
         }
     }
@@ -88,30 +88,30 @@ async fn run(command: Command) -> Result<()> {
 /// trust decisions always come from a local user on the daemon host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
     let request = match args.command {
-        IrohCommand::Approve { code } => rho_ui_proto::ClientMessage::IrohApprove { code },
+        IrohCommand::Approve { code } => rho_agent_host_proto::ClientMessage::IrohApprove { code },
         IrohCommand::TrustInMemory { endpoint_id } => {
-            rho_ui_proto::ClientMessage::IrohTrustInMemory { endpoint_id }
+            rho_agent_host_proto::ClientMessage::IrohTrustInMemory { endpoint_id }
         }
         IrohCommand::Revoke { endpoint_id } => {
-            rho_ui_proto::ClientMessage::IrohRevoke { endpoint_id }
+            rho_agent_host_proto::ClientMessage::IrohRevoke { endpoint_id }
         }
     };
-    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let mut client = UiClient::connect(&socket_path).await?;
     client.send(&request).await?;
     loop {
         match client.recv().await? {
-            rho_ui_proto::ServerMessage::IrohApproved { endpoint_id } => {
+            rho_agent_host_proto::ServerMessage::IrohApproved { endpoint_id } => {
                 println!("enrolled iroh client {endpoint_id}");
                 return Ok(());
             }
-            rho_ui_proto::ServerMessage::IrohRevoked { endpoint_id } => {
+            rho_agent_host_proto::ServerMessage::IrohRevoked { endpoint_id } => {
                 println!("revoked iroh client {endpoint_id}");
                 return Ok(());
             }
-            rho_ui_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
+            rho_agent_host_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
             // The daemon greets every connection with Ready and may stream
             // other broadcasts; only the approve outcome matters here.
             _ => {}
@@ -235,7 +235,7 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
             return Ok(());
         }
     };
-    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let mut daemon = connect_or_start_daemon(&socket_path).await?;

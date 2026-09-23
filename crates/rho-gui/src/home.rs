@@ -18,8 +18,8 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, HighlightStyle, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
+use rho_agent_host_proto::AgentId;
 use rho_transcript::{Item, Transcript};
-use rho_ui_proto::AgentId;
 use theme::ActiveTheme as _;
 
 use crate::dashboard::{DealCard, DealCardId, DealCardKind, LAMP_THRESHOLD, age_label};
@@ -473,7 +473,9 @@ mod tests {
             label: format!("needs reply · {priority}"),
             priority,
             host: HostId::default(),
-            topic_node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([0; 16])),
+            topic_node_id: rho_agent_host_proto::desk::cells::Id::Note(
+                rho_agent_host_proto::desk::cells::Uuid([0; 16]),
+            ),
             agent_id: None,
             agent_tag: None,
             breadcrumb: title.to_owned(),
@@ -481,7 +483,9 @@ mod tests {
             kind: DealCardKind::Desk,
             identity: DealCardId {
                 host: HostId::default(),
-                node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([0; 16])),
+                node_id: rho_agent_host_proto::desk::cells::Id::Note(
+                    rho_agent_host_proto::desk::cells::Uuid([0; 16]),
+                ),
             },
         }
     }
@@ -526,7 +530,9 @@ mod tests {
         assert_eq!(rows.next[0].label, "needs reply · 1.9h");
 
         let agent = DealCard {
-            agent_id: Some(AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap()),
+            agent_id: Some(
+                AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).unwrap(),
+            ),
             kind: DealCardKind::Agent,
             breadcrumb: "slack polish".to_owned(),
             ..card("", 1.0)

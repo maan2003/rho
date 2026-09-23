@@ -534,7 +534,7 @@ fn snapshot_with_cpu_profiles(
         browser_tab_states,
     })?;
     anyhow::ensure!(
-        bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        bytes.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
         "GUI performance snapshot exceeds the upload limit"
     );
     Ok(bytes)
@@ -626,7 +626,7 @@ mod tests {
             Some(std::time::Duration::from_millis(3)),
         );
         let bytes = super::snapshot_with_cpu_profiles(&[], false).unwrap();
-        assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
+        assert!(bytes.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
         assert_eq!(value["version"], 11);

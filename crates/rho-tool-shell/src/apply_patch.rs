@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use rho_agent_types::{ApplyPatchMetadata, ToolFileChange, ToolFileStatus};
+use rho_inference::types::{ApplyPatchMetadata, ToolFileChange, ToolFileStatus};
 
 const SUMMARY_HEADER: &str = "Success. Updated the following files:";
 const MAX_SAFE_FILE_READ_BYTES: u64 = 1024 * 1024;

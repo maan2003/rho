@@ -5,12 +5,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Sink, Stream};
-use rho_agent_types::{
-    ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
-    InferenceResponseItem, MessagePhase, PendingInferenceResponse, ProviderResponseId,
-    StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolName, ToolOutput, ToolOutputStatus,
-    ToolResult, ToolType, UnixMs, text_content,
-};
+use rho_agent_host_proto::{ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -27,6 +22,11 @@ use super::ws::{WsResponseCreate, build_ws_request, next_ws_message};
 use super::*;
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::inference::Inference;
+use crate::types::{
+    ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest, InferenceResponseItem,
+    PendingInferenceResponse, ProviderResponseId, StreamingContextItem, TokenUsage, ToolCall,
+    ToolCallId, ToolName, ToolOutput, ToolResult, ToolType, text_content,
+};
 
 fn first_assistant_message(
     items: &[InferenceResponseItem],
@@ -111,8 +111,8 @@ fn assistant_message_with_phase(text: &str, phase: MessagePhase) -> InferenceRes
     }
 }
 
-fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_agent_types::ProviderSpecificData> {
-    let item_id = rho_agent_types::ProviderResponseItemId::try_from(
+fn provider_specific(_tag: &str, payload: Value) -> Box<dyn crate::types::ProviderSpecificData> {
+    let item_id = crate::types::ProviderResponseItemId::try_from(
         payload["id"].as_str().unwrap_or("test_item"),
     )
     .unwrap();
@@ -141,7 +141,7 @@ fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_agent_types::Pro
 /// A `ContextBlock::UserMessage` carrying a single text part.
 fn user_block(text: &str) -> Arc<ContextBlock> {
     Arc::new(ContextBlock::UserMessage {
-        sender: rho_agent_types::MessageSender::User,
+        sender: crate::types::MessageSender::User,
         content: content_parts(text),
     })
 }

@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
-use rho_agent_types::{AgentId, AgentRole, ContentPart, MessageDelivery};
+use rho_agent_host_proto::client::Client;
+use rho_agent_host_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};
+use rho_agent_host_proto::{
+    AgentId, AgentRole, ClientMessage, ContentPart, MessageDelivery, ServerMessage, StartMode,
+};
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
-use rho_ui_proto::client::Client;
-use rho_ui_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};
-use rho_ui_proto::{ClientMessage, ServerMessage, StartMode};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -207,7 +208,7 @@ async fn run_async(args: Args) -> Result<()> {
                     repo: repo.clone(),
                     revset: "HEAD".into(),
                 },
-                mode: rho_ui_proto::WorksetMode::View,
+                mode: rho_agent_host_proto::WorksetMode::View,
                 content: Some(prompt(index, 0)),
             })
             .await?;
@@ -309,7 +310,7 @@ async fn run_async(args: Args) -> Result<()> {
                     match entry.event {
                         MirrorEvent::Created { runtime, .. } => {
                             ensure!(
-                                runtime == rho_ui_proto::mirror::RuntimeKind::Rho,
+                                runtime == rho_agent_host_proto::mirror::RuntimeKind::Rho,
                                 "created a non-native agent"
                             );
                             agents.insert(entry.agent_id);
@@ -323,7 +324,8 @@ async fn run_async(args: Args) -> Result<()> {
                                 );
                                 if args.scenario == Scenario::RealToolRounds {
                                     ensure!(
-                                        result.status == rho_ui_proto::mirror::ToolStatus::Success,
+                                        result.status
+                                            == rho_agent_host_proto::mirror::ToolStatus::Success,
                                         "real-tool-rounds tool failed"
                                     );
                                 }
@@ -357,7 +359,10 @@ async fn run_async(args: Args) -> Result<()> {
                             calls += items
                                 .iter()
                                 .filter(|item| {
-                                    matches!(item, rho_ui_proto::mirror::Item::ToolCall { .. })
+                                    matches!(
+                                        item,
+                                        rho_agent_host_proto::mirror::Item::ToolCall { .. }
+                                    )
                                 })
                                 .count();
                             compacted += u64::from(did_compact);
@@ -366,7 +371,9 @@ async fn run_async(args: Args) -> Result<()> {
                                     .iter()
                                     .rev()
                                     .find_map(|item| match item {
-                                        rho_ui_proto::mirror::Item::Text { text, .. } => Some(text),
+                                        rho_agent_host_proto::mirror::Item::Text {
+                                            text, ..
+                                        } => Some(text),
                                         _ => None,
                                     })
                                     .is_some_and(|text| text.trim_end().ends_with('?')),

@@ -27,10 +27,10 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use redb::TableDefinition;
-use rho_db::{RhoDb, Sen, SenValue};
-use rho_ui_proto::desk_tree::cells::{
+use rho_agent_host_proto::desk::cells::{
     BodySnapshot, Cell, DeviceId, Id, PropertyKey, Snapshot, Stamp, VerdictEvent, Version,
 };
+use rho_db::{RhoDb, Sen, SenValue};
 
 /// How far this client has read a host's store, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -561,8 +561,55 @@ pub fn reset_host(host: &str) {
 }
 
 #[cfg(test)]
+mod recorded_names {
+    use rho_agent_host_proto::desk::cells;
+    use rho_agent_host_proto::mirror::MirrorEvent;
+    use rho_db::Sen;
+
+    /// redb refuses a table whose recorded value type differs from the
+    /// one it is opened with, and `Sen` records the Rust path. These are
+    /// the paths the daemon's and every client's tables were written
+    /// under; a type that moves has to keep recording its old one.
+    #[test]
+    fn stored_types_keep_the_names_their_tables_recorded() {
+        fn name<T>() -> String
+        where
+            Sen<T>: redb::Value,
+        {
+            <Sen<T> as redb::Value>::type_name().name().to_owned()
+        }
+        assert_eq!(name::<cells::Cell>(), "rho-db::Sen<rho_desk::cells::Cell>");
+        assert_eq!(
+            name::<cells::VerdictEvent>(),
+            "rho-db::Sen<rho_desk::cells::VerdictEvent>"
+        );
+        assert_eq!(name::<cells::Id>(), "rho-db::Sen<rho_desk::cells::Id>");
+        assert_eq!(
+            name::<cells::BodySnapshot>(),
+            "rho-db::Sen<rho_desk::cells::BodySnapshot>"
+        );
+        assert_eq!(
+            name::<cells::Stamp>(),
+            "rho-db::Sen<rho_desk::cells::Stamp>"
+        );
+        assert_eq!(
+            name::<cells::CellMutation>(),
+            "rho-db::Sen<rho_desk::cells::CellMutation>"
+        );
+        assert_eq!(
+            name::<cells::DeviceId>(),
+            "rho-db::Sen<rho_desk::cells::DeviceId>"
+        );
+        assert_eq!(
+            name::<MirrorEvent>(),
+            "rho-db::Sen<rho_ui_proto::mirror::MirrorEvent>"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use rho_ui_proto::desk_tree::cells::{Property, Store, Uuid};
+    use rho_agent_host_proto::desk::cells::{Property, Store, Uuid};
 
     use super::*;
 
@@ -607,7 +654,7 @@ mod tests {
             .expect("the note's history is held");
         assert_eq!(
             body.version(),
-            rho_ui_proto::desk_tree::cells::BodyVersion::from([(1, 2)]),
+            rho_agent_host_proto::desk::cells::BodyVersion::from([(1, 2)]),
             "both operations are there, the first one not thrown away by the second delta"
         );
     }
@@ -648,9 +695,9 @@ mod tests {
         );
     }
 
-    fn edit(replica_id: u16, value: u32) -> rho_ui_proto::desk_tree::TextOperation {
-        rho_ui_proto::desk_tree::TextOperation::Edit {
-            timestamp: rho_ui_proto::desk_tree::TreeClock { value, replica_id },
+    fn edit(replica_id: u16, value: u32) -> rho_agent_host_proto::desk::TextOperation {
+        rho_agent_host_proto::desk::TextOperation::Edit {
+            timestamp: rho_agent_host_proto::desk::TreeClock { value, replica_id },
             version: Vec::new(),
             ranges: vec![(0, 0)],
             new_text: vec!["x".into()],

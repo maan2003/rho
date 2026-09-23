@@ -1,7 +1,8 @@
 //! Native conversation authority. Requests and responses commit ordered,
 //! grouped context entries directly. A response ID always belongs to its own
 //! response entry, never to the containing event. Provider input is disposable.
-use rho_agent_types::{ContextBlock, PendingInferenceResponse, UnixMs};
+use rho_agent_host_proto::UnixMs;
+use rho_inference::types::{ContextBlock, PendingInferenceResponse};
 use senax_encoder::{Decode, Encode};
 
 use crate::{ContextChange, WakeFacts};

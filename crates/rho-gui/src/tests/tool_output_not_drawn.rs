@@ -11,10 +11,10 @@
 //! composing a chunk full of finished calls sends no request.
 
 use gpui::TestAppContext;
+use rho_agent_host_proto::ClientMessage;
+use rho_agent_host_proto::mirror::{AgentPos, DetailBody, DetailResult, ToolStatus};
 use rho_agents::HostId;
 use rho_hosts::connection::ConnEvent;
-use rho_ui_proto::ClientMessage;
-use rho_ui_proto::mirror::{AgentPos, DetailBody, DetailResult, ToolStatus};
 
 use super::{
     UiBlock, UiToolStatus, agent, display_text, feed_frame, state, story, test_workspace, tool,

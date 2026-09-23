@@ -1,7 +1,7 @@
 [package]
 edition.workspace = true
 license.workspace = true
-name = "rho-ui-proto"
+name = "rho-agent-host-proto"
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -15,12 +15,11 @@ camino.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clock.workspace = true
 futures.workspace = true
-rho-agent-types.workspace = true
-rho-desk.workspace = true
+prefix-id = { workspace = true, default-features = false }
+rand.workspace = true
 rho-rpc.workspace = true
-rho-shell-proto.workspace = true
-rho-workspaces-types.workspace = true
 senax-encoder.workspace = true
+serde.workspace = true
 tokio = { version = "1", features = ["io-util"] }
 text.workspace = true
 

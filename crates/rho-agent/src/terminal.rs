@@ -2,10 +2,11 @@
 //!
 //! Each session owns a PTY whose child runs inside an agent's view, plus the
 //! only terminal emulator in the system (an alacritty [`Term`]). Clients are
-//! dumb: they receive display state ([`rho_ui_proto::term`] rows/cursor) and
-//! send input bytes; the workset answers all terminal queries itself, so an
-//! unattached terminal behaves exactly like an attached one. Sessions survive
-//! client detach and die with their child process or the workset.
+//! dumb: they receive display state ([`rho_agent_host_proto::term`]
+//! rows/cursor) and send input bytes; the workset answers all terminal queries
+//! itself, so an unattached terminal behaves exactly like an attached one.
+//! Sessions survive client detach and die with their child process or the
+//! workset.
 //!
 //! Output is synced per frame tick as row diffs against a per-client record
 //! of what that client last displayed, so bandwidth is bounded by grid size ×
@@ -30,8 +31,8 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
 use anyhow::Context as _;
-use rho_ui_proto::AgentId;
-use rho_ui_proto::term::{
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::term::{
     TermCell, TermCellFlags, TermColor, TermCursor, TermCursorShape, TermRow, TermScreen,
     TermServerFrame,
 };
@@ -84,7 +85,7 @@ pub enum ClientInput {
         rows: u16,
     },
     /// Encoded against the terminal's live modes when the session applies it.
-    Keystroke(rho_ui_proto::term::TermKeystroke),
+    Keystroke(rho_agent_host_proto::term::TermKeystroke),
     Paste(String),
     Scroll {
         lines: i16,
@@ -945,7 +946,7 @@ fn set_nonblocking(fd: &OwnedFd) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::term::{ScrollbackItem, WireScreen};
+    use rho_agent_host_proto::term::{ScrollbackItem, WireScreen};
 
     use super::*;
 

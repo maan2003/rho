@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+inventory = "0.3"
 anyhow.workspace = true
 base64.workspace = true
 bytes = "1"
@@ -18,12 +19,12 @@ futures.workspace = true
 futures-util.workspace = true
 rand.workspace = true
 rpassword.workspace = true
-rho-agent-types.workspace = true
+rho-agent-host-proto.workspace = true
 rho-db.workspace = true
 redb.workspace = true
 rustls.workspace = true
-senax-encoder.workspace = true
-serde.workspace = true
+senax-encoder = { workspace = true, features = ["serde_json"] }
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

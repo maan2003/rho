@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use camino::Utf8PathBuf;
 use gpui::App;
-use rho_ui_proto::ClientMessage;
+use rho_agent_host_proto::ClientMessage;
 
 use crate::connection::Connection;
 use crate::{AttachTarget, HostId, HostSink};
@@ -52,7 +52,7 @@ pub struct Host {
     pub name: String,
     pub target: AttachTarget,
     pub status: HostStatus,
-    pub auth: Option<rho_ui_proto::AuthState>,
+    pub auth: Option<rho_agent_host_proto::AuthState>,
     connection: Connection,
 }
 
@@ -91,8 +91,8 @@ pub struct Hosts {
     /// the store; named and qualified here, because what a workdir is
     /// called depends on how many machines are attached.
     workdirs: Vec<HostWorkdir>,
-    quota_summaries: std::collections::HashMap<HostId, Vec<rho_ui_proto::QuotaSummary>>,
-    quota_history: std::collections::HashMap<HostId, Vec<rho_ui_proto::QuotaSeries>>,
+    quota_summaries: std::collections::HashMap<HostId, Vec<rho_agent_host_proto::QuotaSummary>>,
+    quota_history: std::collections::HashMap<HostId, Vec<rho_agent_host_proto::QuotaSeries>>,
 }
 
 impl Hosts {
@@ -333,21 +333,28 @@ impl Hosts {
     pub fn set_quota_summaries(
         &mut self,
         host: HostId,
-        summaries: Vec<rho_ui_proto::QuotaSummary>,
+        summaries: Vec<rho_agent_host_proto::QuotaSummary>,
     ) {
         self.quota_summaries.insert(host, summaries);
     }
 
-    pub fn set_quota_history(&mut self, host: HostId, series: Vec<rho_ui_proto::QuotaSeries>) {
+    pub fn set_quota_history(
+        &mut self,
+        host: HostId,
+        series: Vec<rho_agent_host_proto::QuotaSeries>,
+    ) {
         self.quota_history.insert(host, series);
     }
 
-    pub fn quota_summaries_of(&self, host: HostId) -> Option<&[rho_ui_proto::QuotaSummary]> {
+    pub fn quota_summaries_of(
+        &self,
+        host: HostId,
+    ) -> Option<&[rho_agent_host_proto::QuotaSummary]> {
         self.quota_summaries.get(&host).map(Vec::as_slice)
     }
 
-    pub fn merged_quota_summaries(&self) -> Vec<rho_ui_proto::QuotaSummary> {
-        let mut merged: Vec<rho_ui_proto::QuotaSummary> = Vec::new();
+    pub fn merged_quota_summaries(&self) -> Vec<rho_agent_host_proto::QuotaSummary> {
+        let mut merged: Vec<rho_agent_host_proto::QuotaSummary> = Vec::new();
         for (host, summaries) in &self.quota_summaries {
             for summary in summaries {
                 let Some(namespace) = &summary.auth_namespace else {
@@ -385,8 +392,8 @@ impl Hosts {
 
     /// ChatGPT history is one line per host/namespace. Claude history keeps
     /// the previous tightest-host merge because it has no named auth scope.
-    pub fn merged_quota_history(&self) -> Vec<rho_ui_proto::QuotaSeries> {
-        let mut merged: Vec<rho_ui_proto::QuotaSeries> = Vec::new();
+    pub fn merged_quota_history(&self) -> Vec<rho_agent_host_proto::QuotaSeries> {
+        let mut merged: Vec<rho_agent_host_proto::QuotaSeries> = Vec::new();
         for (host, series_set) in &self.quota_history {
             for series in series_set {
                 if series.model == "gpt" {

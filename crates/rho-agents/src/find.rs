@@ -6,7 +6,7 @@
 //! agent ended up with: they remember the label, or the thing they last
 //! asked for. Every one of those names finds it.
 
-use rho_ui_proto::AgentId;
+use rho_agent_host_proto::AgentId;
 
 use crate::map::AgentMap;
 
@@ -55,12 +55,11 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::{MessageDelivery, UnixMs};
-    use rho_hosts::HostId;
-    use rho_ui_proto::AgentIdDomain;
-    use rho_ui_proto::mirror::{
+    use rho_agent_host_proto::mirror::{
         AgentPos, MirrorEvent, RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome,
     };
+    use rho_agent_host_proto::{AgentIdDomain, MessageDelivery, UnixMs};
+    use rho_hosts::HostId;
 
     use super::*;
     use crate::MirroredAgent;
@@ -71,9 +70,9 @@ mod tests {
 
     fn created(at: u64) -> MirrorEvent {
         MirrorEvent::Created {
-            role: rho_ui_proto::AgentRole::default(),
+            role: rho_agent_host_proto::AgentRole::default(),
             runtime: RuntimeKind::Rho,
-            place: rho_ui_proto::Place {
+            place: rho_agent_host_proto::Place {
                 workset: "0123456789ab".into(),
                 cwd: "/src/repo".into(),
                 mode: Default::default(),

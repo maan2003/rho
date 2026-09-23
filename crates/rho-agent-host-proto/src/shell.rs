@@ -5,11 +5,12 @@
 //! canonical structured state; clients project that state into a read-only
 //! buffer, keep their pending input locally, and submit complete commands.
 
-pub use rho_shell_proto::{
+use senax_encoder::{Decode, Encode, Pack, Unpack};
+
+pub use crate::shell_kernel::{
     MAX_ACTIVE_PAGERS, MAX_COMMAND_BYTES, MAX_PAGER_BYTES, MAX_PAGER_LINES, PagerAction,
     command_fits,
 };
-use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// Maximum structured SGR runs retained for one output stream.
 pub const MAX_STYLE_SPANS: usize = 4096;

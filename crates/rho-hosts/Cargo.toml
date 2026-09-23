@@ -24,11 +24,10 @@ gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 iroh = { workspace = true }
 redb = { workspace = true }
 rho-db = { workspace = true }
-rho-desk = { workspace = true }
+rho-agent-host-proto.workspace = true
 rho-iroh-auth = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc = { workspace = true }
-rho-ui-proto = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -39,7 +38,6 @@ tracing = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-rho-agent-types = { workspace = true }
 tempfile = { workspace = true }
 
 [dependencies.rho-desktop-media]

@@ -3,11 +3,11 @@
 #![allow(dead_code)]
 
 use redb::TableDefinition;
-use rho_db::{Lenient, RhoDb, Sen, SenValue, WriteTxn};
-use rho_desk::cells::{
+use rho_agent_host_proto::desk::cells::{
     BodySnapshot, Cell, CellMutation, DeviceId, Id, Property, PropertyKey, Snapshot, Stamp, Store,
     VerdictEvent, Version,
 };
+use rho_db::{Lenient, RhoDb, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
 const CELLS: TableDefinition<Sen<CellAddress>, Sen<Cell>> =
@@ -132,7 +132,7 @@ impl DeskCellStore {
     /// one-cell delta carrying the whole desk's prose.
     pub(crate) fn bodies_since(
         &self,
-        known: &std::collections::BTreeMap<Id, rho_desk::cells::BodyVersion>,
+        known: &std::collections::BTreeMap<Id, rho_agent_host_proto::desk::cells::BodyVersion>,
     ) -> Vec<BodySnapshot> {
         self.bodies()
             .into_iter()
@@ -171,8 +171,8 @@ impl DeskCellStore {
         &self,
         session_namespace: u16,
         id: Id,
-        operation: rho_desk::TextOperation,
-        transaction: Option<rho_desk::TextTransaction>,
+        operation: rho_agent_host_proto::desk::TextOperation,
+        transaction: Option<rho_agent_host_proto::desk::TextTransaction>,
     ) -> Result<bool, String> {
         if operation.timestamp().replica_id != session_namespace {
             return Err("Desk text operation does not belong to this connection".into());
@@ -278,17 +278,19 @@ impl DeskCellStore {
     pub(crate) async fn seed_desk_rows(
         &self,
         note_text: &str,
-        agents: &[rho_agent_types::AgentId],
+        agents: &[rho_agent_host_proto::AgentId],
     ) -> Result<Id, String> {
         let mut write = self.db.write().await;
         let mut meta = load_meta_from_write(&mut write)?;
         let snapshot = read_snapshot_from_write(&mut write)?;
         let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
-        let created_at = rho_desk::cells::Timestamp {
-            unix_ms: rho_agent_types::UnixMs::now().0 as i64,
-            precision: rho_desk::cells::TimestampPrecision::Millisecond,
+        let created_at = rho_agent_host_proto::desk::cells::Timestamp {
+            unix_ms: rho_agent_host_proto::UnixMs::now().0 as i64,
+            precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
         };
-        let note = Id::Note(rho_desk::cells::Uuid(*uuid::Uuid::new_v4().as_bytes()));
+        let note = Id::Note(rho_agent_host_proto::desk::cells::Uuid(
+            *uuid::Uuid::new_v4().as_bytes(),
+        ));
         store.write(note.clone(), Property::Parent(None))?;
         store.write(note.clone(), Property::CreatedAt(created_at))?;
         for agent_id in agents {
@@ -305,7 +307,8 @@ impl DeskCellStore {
         // writes one the way an edit would.
         let buffer_id = text::BufferId::new(1).map_err(|error| error.to_string())?;
         let mut buffer = text::Buffer::new(text::ReplicaId::new(1), buffer_id, "");
-        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, note_text)]));
+        let operation =
+            rho_agent_host_proto::desk::TextOperation::from_text(&buffer.edit([(0..0, note_text)]));
         write.open_table(BODIES).insert(
             SenValue::borrowed(&note),
             SenValue::owned(BodySnapshot {
@@ -387,9 +390,9 @@ impl DeskCellStore {
 fn validate_text_operation(
     text: &BodySnapshot,
     buffer: &text::Buffer,
-    operation: &rho_desk::TextOperation,
+    operation: &rho_agent_host_proto::desk::TextOperation,
 ) -> Result<(), String> {
-    use rho_desk::TextOperation;
+    use rho_agent_host_proto::desk::TextOperation;
 
     let native = operation.to_text()?;
     let timestamp = operation.timestamp();
@@ -410,7 +413,7 @@ fn validate_text_operation(
     let known = text
         .operations
         .iter()
-        .map(rho_desk::TextOperation::timestamp)
+        .map(rho_agent_host_proto::desk::TextOperation::timestamp)
         .fold(
             std::collections::BTreeMap::<u16, u32>::new(),
             |mut known, clock| {
@@ -435,7 +438,7 @@ fn validate_text_operation(
     {
         return Err("Desk text source version has not been observed".into());
     }
-    let observed = |clock: rho_desk::TreeClock| {
+    let observed = |clock: rho_agent_host_proto::desk::TreeClock| {
         version
             .binary_search_by_key(&clock.replica_id, |candidate| candidate.replica_id)
             .ok()
@@ -756,10 +759,10 @@ fn persist_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use rho_db::RhoDb;
-    use rho_desk::cells::{
+    use rho_agent_host_proto::desk::cells::{
         CellWrite, FactChange, State, Timestamp, TimestampPrecision, Uuid, Verdict, VerdictEvent,
     };
+    use rho_db::RhoDb;
 
     use super::*;
 
@@ -840,13 +843,13 @@ mod tests {
     async fn a_store_holding_the_retired_snooze_cell_opens_and_reads() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));
-        let unit = Id::Slack(rho_desk::cells::SlackUnit {
+        let unit = Id::Slack(rho_agent_host_proto::desk::cells::SlackUnit {
             workspace: "acme".to_owned(),
             channel: "C1".to_owned(),
             thread: Some("500.0".to_owned()),
         });
         let wake = at(4_000_000_000_000);
-        let stood_at = rho_desk::cells::SlackTs("600.0".to_owned());
+        let stood_at = rho_agent_host_proto::desk::cells::SlackTs("600.0".to_owned());
         {
             let mut write = db.write().await;
             initialize(&mut write).unwrap();
@@ -986,7 +989,9 @@ mod tests {
             text::BufferId::new(1).unwrap(),
             "",
         );
-        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, "seeded note")]));
+        let operation = rho_agent_host_proto::desk::TextOperation::from_text(
+            &buffer.edit([(0..0, "seeded note")]),
+        );
         store
             .apply_body(namespace, id.clone(), operation, None)
             .await
@@ -1025,7 +1030,9 @@ mod tests {
             text::BufferId::new(2).unwrap(),
             "",
         );
-        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, " and more")]));
+        let operation = rho_agent_host_proto::desk::TextOperation::from_text(
+            &buffer.edit([(0..0, " and more")]),
+        );
         store
             .apply_body(namespace, id.clone(), operation, None)
             .await
@@ -1133,7 +1140,7 @@ mod tests {
     async fn a_todo_verdict_on_a_slack_unit_files_its_new_note_under_it() {
         let store = fixture_store().await;
         let device = DeviceId([12; 16]);
-        let unit = Id::Slack(rho_desk::cells::SlackUnit {
+        let unit = Id::Slack(rho_agent_host_proto::desk::cells::SlackUnit {
             workspace: "rho".into(),
             channel: "C1".into(),
             thread: Some("1.0".into()),
@@ -1423,14 +1430,16 @@ mod tests {
 
     #[derive(Debug, Encode, Decode)]
     enum LaterTextOperation {
-        Haunt { timestamp: rho_desk::TreeClock },
+        Haunt {
+            timestamp: rho_agent_host_proto::desk::TreeClock,
+        },
     }
 
     #[derive(Debug, Encode, Decode)]
     struct LaterBody {
         id: Id,
         operations: Vec<LaterTextOperation>,
-        transactions: Vec<rho_desk::TextTransaction>,
+        transactions: Vec<rho_agent_host_proto::desk::TextTransaction>,
     }
 
     #[derive(Debug)]
@@ -1503,7 +1512,7 @@ mod tests {
             SenValue::owned(LaterBody {
                 id: unreadable_note.clone(),
                 operations: vec![LaterTextOperation::Haunt {
-                    timestamp: rho_desk::TreeClock {
+                    timestamp: rho_agent_host_proto::desk::TreeClock {
                         value: 1,
                         replica_id: 9,
                     },
@@ -1530,7 +1539,8 @@ mod tests {
         // is refused rather than written over the top.
         let mut buffer =
             text::Buffer::new(text::ReplicaId::new(3), text::BufferId::new(1).unwrap(), "");
-        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, "later")]));
+        let operation =
+            rho_agent_host_proto::desk::TextOperation::from_text(&buffer.edit([(0..0, "later")]));
         assert!(
             store
                 .apply_body(3, unreadable_note, operation, None)
@@ -1548,8 +1558,8 @@ mod tests {
         let body = store.bodies().into_iter().next().unwrap();
         let before = store.bodies();
         for ranges in [vec![(0, 1)], vec![(1, 0)]] {
-            let malformed = rho_desk::TextOperation::Edit {
-                timestamp: rho_desk::TreeClock {
+            let malformed = rho_agent_host_proto::desk::TextOperation::Edit {
+                timestamp: rho_agent_host_proto::desk::TreeClock {
                     value: 1,
                     replica_id: namespace,
                 },
@@ -1569,7 +1579,8 @@ mod tests {
             .buffer(namespace, text::BufferId::new(1).unwrap())
             .unwrap();
         let end = buffer.len();
-        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(end..end, "!")]));
+        let operation =
+            rho_agent_host_proto::desk::TextOperation::from_text(&buffer.edit([(end..end, "!")]));
         assert!(
             store
                 .apply_body(namespace, id.clone(), operation.clone(), None)
@@ -1590,8 +1601,9 @@ mod tests {
             .buffer(namespace, text::BufferId::new(2).unwrap())
             .unwrap();
         let utf_end = utf_buffer.len();
-        let utf_operation =
-            rho_desk::TextOperation::from_text(&utf_buffer.edit([(utf_end..utf_end, "é")]));
+        let utf_operation = rho_agent_host_proto::desk::TextOperation::from_text(
+            &utf_buffer.edit([(utf_end..utf_end, "é")]),
+        );
         store
             .apply_body(namespace, id.clone(), utf_operation, None)
             .await
@@ -1601,9 +1613,11 @@ mod tests {
             .buffer(namespace, text::BufferId::new(3).unwrap())
             .unwrap();
         let utf_end = utf_buffer.len();
-        let mut split_character =
-            rho_desk::TextOperation::from_text(&utf_buffer.edit([(utf_end..utf_end, "x")]));
-        if let rho_desk::TextOperation::Edit { ranges, .. } = &mut split_character {
+        let mut split_character = rho_agent_host_proto::desk::TextOperation::from_text(
+            &utf_buffer.edit([(utf_end..utf_end, "x")]),
+        );
+        if let rho_agent_host_proto::desk::TextOperation::Edit { ranges, .. } = &mut split_character
+        {
             let end = ranges[0].0;
             ranges[0] = (end - 1, end - 1);
         }
@@ -1618,8 +1632,8 @@ mod tests {
 
         let mut stale = operation.clone();
         match &mut stale {
-            rho_desk::TextOperation::Edit { timestamp, .. }
-            | rho_desk::TextOperation::Undo { timestamp, .. } => {
+            rho_agent_host_proto::desk::TextOperation::Edit { timestamp, .. }
+            | rho_agent_host_proto::desk::TextOperation::Undo { timestamp, .. } => {
                 timestamp.value = timestamp.value.saturating_sub(1);
             }
         }
@@ -1640,7 +1654,7 @@ mod tests {
             store
                 .apply_body(
                     namespace,
-                    Id::Slack(rho_desk::cells::SlackUnit {
+                    Id::Slack(rho_agent_host_proto::desk::cells::SlackUnit {
                         workspace: "rho".into(),
                         channel: "C1".into(),
                         thread: None,

@@ -21,7 +21,7 @@ language = { path = "../../vendor/zed/crates/language" }
 languages = { path = "../../vendor/zed/crates/languages", features = ["load-grammars"] }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 node_runtime = { path = "../../vendor/zed/crates/node_runtime" }
-rho-agent-types.workspace = true
+rho-agent-host-proto.workspace = true
 rho-hosts = { workspace = true }
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }

@@ -19,8 +19,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gpui::App;
+use rho_agent_host_proto::desk::cells::Id;
 use rho_agents::{AgentMap, HostId};
-use rho_desk::cells::Id;
 
 use crate::desk_view::{DeskCells, DeskNode};
 use crate::find::{FindCandidate, FindTarget};
@@ -39,14 +39,14 @@ pub(crate) struct HostNodes {
     /// find one node's children is quadratic in a desk that only grows,
     /// which is what made dealing one expensive; it is an index instead.
     children: HashMap<Id, Vec<usize>>,
-    by_agent: HashMap<rho_agent_types::AgentId, usize>,
-    by_page: HashMap<rho_desk::PageId, usize>,
+    by_agent: HashMap<rho_agent_host_proto::AgentId, usize>,
+    by_page: HashMap<rho_agent_host_proto::desk::PageId, usize>,
     titles: HashMap<Id, String>,
     /// Every label's full filing path, `rho/agent`.
     label_paths: HashMap<Id, String>,
     /// The agents filed under each heading, for ranking a heading by how
     /// recently anything under it was touched.
-    heading_agents: HashMap<Id, Vec<rho_agent_types::AgentId>>,
+    heading_agents: HashMap<Id, Vec<rho_agent_host_proto::AgentId>>,
     /// Whether the client held the host's desk when these nodes were
     /// read, from its own replica or from the daemon. An empty desk and a
     /// desk nobody has loaded yet look identical from the nodes alone, and
@@ -161,7 +161,7 @@ impl HostNodes {
     /// The order an agent's own row sits at, or after everything when the
     /// agent has no row. Filing decides where a card is shown, never
     /// whether it exists, so an unfiled agent still gets a number.
-    pub(crate) fn agent_order(&self, agent: rho_agent_types::AgentId) -> usize {
+    pub(crate) fn agent_order(&self, agent: rho_agent_host_proto::AgentId) -> usize {
         self.by_agent.get(&agent).copied().unwrap_or(usize::MAX)
     }
 
@@ -173,12 +173,12 @@ impl HostNodes {
             .map(|at| &self.nodes[*at])
     }
 
-    pub(crate) fn agent_node(&self, agent: rho_agent_types::AgentId) -> Option<&DeskNode> {
+    pub(crate) fn agent_node(&self, agent: rho_agent_host_proto::AgentId) -> Option<&DeskNode> {
         self.by_agent.get(&agent).map(|at| &self.nodes[*at])
     }
 
     /// The row a page is filed as, if it is filed at all.
-    pub(crate) fn page_node(&self, page: rho_desk::PageId) -> Option<&DeskNode> {
+    pub(crate) fn page_node(&self, page: rho_agent_host_proto::desk::PageId) -> Option<&DeskNode> {
         self.by_page.get(&page).map(|index| &self.nodes[*index])
     }
 
@@ -200,7 +200,7 @@ impl HostNodes {
     }
 
     /// The agents filed anywhere under a heading, in the store's order.
-    pub(crate) fn agents_under(&self, heading: &Id) -> &[rho_agent_types::AgentId] {
+    pub(crate) fn agents_under(&self, heading: &Id) -> &[rho_agent_host_proto::AgentId] {
         self.heading_agents
             .get(heading)
             .map_or(&[], |agents| agents.as_slice())
@@ -267,8 +267,8 @@ impl HostNodes {
     /// The map kept this as it composed. Derived here instead by walking
     /// each agent up to its nearest heading, which is the same answer from
     /// the side that does not need a row to have been drawn.
-    fn build_heading_agents(&self) -> HashMap<Id, Vec<rho_agent_types::AgentId>> {
-        let mut under: HashMap<Id, Vec<rho_agent_types::AgentId>> = HashMap::new();
+    fn build_heading_agents(&self) -> HashMap<Id, Vec<rho_agent_host_proto::AgentId>> {
+        let mut under: HashMap<Id, Vec<rho_agent_host_proto::AgentId>> = HashMap::new();
         for node in &self.nodes {
             let Some(agent_id) = node.agent() else {
                 continue;

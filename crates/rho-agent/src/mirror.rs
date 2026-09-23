@@ -2,14 +2,15 @@
 //! a client keeps of it, and the journal observer that tells the daemon
 //! about every append after it commits (`AGENT-LOG-DESIGN.md`).
 
-#[cfg(test)]
-use rho_agent_types::ContextBlock;
-use rho_agent_types::{AgentId, InferenceResponseItem, MessageSender, UnixMs};
-use rho_db::RhoDb;
-use rho_ui_proto::mirror::{
+use rho_agent_host_proto::mirror::{
     AgentPos, Item, Live, LogEntry, MirrorEvent, RuntimeKind, Seq, SpawnedBy, ToolOutcome,
     ToolStatus, Usage,
 };
+use rho_agent_host_proto::{AgentId, UnixMs};
+use rho_db::RhoDb;
+#[cfg(test)]
+use rho_inference::types::ContextBlock;
+use rho_inference::types::{InferenceResponseItem, MessageSender};
 
 use crate::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
 use crate::{AgentEvent, InputKind, PresentationField, QueuedInput};
@@ -131,7 +132,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 let results = input
                     .iter()
                     .flat_map(|item| match item {
-                        rho_agent_types::ContextBlock::ToolResults { results } => {
+                        rho_inference::types::ContextBlock::ToolResults { results } => {
                             results.iter().map(tool_outcome).collect::<Vec<_>>()
                         }
                         _ => Vec::new(),
@@ -146,8 +147,8 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                             compaction: input.iter().any(|item| {
                                 matches!(
                                     item,
-                                    rho_agent_types::ContextBlock::CompactionTrigger
-                                        | rho_agent_types::ContextBlock::ContextRotation { .. }
+                                    rho_inference::types::ContextBlock::CompactionTrigger
+                                        | rho_inference::types::ContextBlock::ContextRotation { .. }
                                 )
                             }),
                             at: *at,
@@ -165,7 +166,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 &output
                     .iter()
                     .filter_map(|entry| match entry {
-                        rho_agent_types::ContextBlock::InferenceResponse { items, .. } => {
+                        rho_inference::types::ContextBlock::InferenceResponse { items, .. } => {
                             Some(items)
                         }
                         _ => None,
@@ -190,13 +191,13 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         };
     }
     let message =
-        |sender: &MessageSender, content: &[rho_agent_types::ContentPart], delivery, at| {
+        |sender: &MessageSender, content: &[rho_agent_host_proto::ContentPart], delivery, at| {
             MirrorEvent::Message {
                 from: match sender {
                     MessageSender::User => None,
                     MessageSender::Agent { id } => Some(*id),
                 },
-                text: rho_agent_types::text_content(content),
+                text: rho_inference::types::text_content(content),
                 delivery,
                 at,
             }
@@ -246,7 +247,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         // reply, the results a request that carried them.
         AgentEvent::Transcript { line, at, .. } => match line {
             crate::TranscriptLine::User { text } => MirrorEvent::ClaudeMessage {
-                speaker: rho_ui_proto::mirror::Speaker::User,
+                speaker: rho_agent_host_proto::mirror::Speaker::User,
                 text: text.clone(),
                 at: *at,
             },
@@ -268,7 +269,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                         arguments: call.arguments.clone(),
                         // A transcript call is Claude's, and Claude's tools
                         // are all schema'd: its arguments are always JSON.
-                        format: rho_ui_proto::mirror::ArgumentsFormat::Json,
+                        format: rho_agent_host_proto::mirror::ArgumentsFormat::Json,
                     }))
                     .collect(),
                 compacted: false,
@@ -348,13 +349,13 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
     })
 }
 
-fn tool_outcome(result: &rho_agent_types::ToolResult) -> ToolOutcome {
+fn tool_outcome(result: &rho_inference::types::ToolResult) -> ToolOutcome {
     ToolOutcome {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_agent_types::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_agent_types::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_host_proto::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_host_proto::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         started_at: result.started_at,
         finished_at: result.finished_at,
@@ -362,8 +363,8 @@ fn tool_outcome(result: &rho_agent_types::ToolResult) -> ToolOutcome {
 }
 
 /// What the model had said when its request failed.
-fn partial_text(partial: &rho_agent_types::PendingInferenceResponse) -> String {
-    use rho_agent_types::{StreamingContextItem, StreamingContextItemState};
+fn partial_text(partial: &rho_inference::types::PendingInferenceResponse) -> String {
+    use rho_inference::types::{StreamingContextItem, StreamingContextItemState};
     let mut text = String::new();
     for slot in &partial.items {
         let (StreamingContextItemState::Pending(item) | StreamingContextItemState::Finished(item)) =
@@ -405,7 +406,7 @@ fn replied(
 pub fn item(value: &InferenceResponseItem) -> Option<Item> {
     Some(match value {
         InferenceResponseItem::AssistantMessage { content, phase, .. } => Item::Text {
-            text: rho_agent_types::text_content(content),
+            text: rho_inference::types::text_content(content),
             phase: phase.map(crate::live::text_phase),
         },
         InferenceResponseItem::RawReasoning {
@@ -451,9 +452,8 @@ fn is_compaction_summary(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use rho_agent_types::{
-        ContentPart, MessageDelivery, ToolOutput, ToolOutputStatus, ToolResult, ToolUpdate,
-    };
+    use rho_agent_host_proto::{ContentPart, MessageDelivery, ToolOutputStatus};
+    use rho_inference::types::{ToolOutput, ToolResult, ToolUpdate};
 
     use super::*;
 
@@ -470,13 +470,13 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: "before".into(),
                 }],
-                phase: Some(rho_agent_types::MessagePhase::Commentary),
+                phase: Some(rho_agent_host_proto::MessagePhase::Commentary),
             },
             InferenceResponseItem::ToolCall {
                 provider_specific: data(),
                 id: "middle".try_into().unwrap(),
                 name: "exec".try_into().unwrap(),
-                tool_type: rho_agent_types::ToolType::Custom,
+                tool_type: rho_inference::types::ToolType::Custom,
                 arguments: "print(42)".into(),
             },
             InferenceResponseItem::AssistantMessage {
@@ -484,7 +484,7 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: "after".into(),
                 }],
-                phase: Some(rho_agent_types::MessagePhase::FinalAnswer),
+                phase: Some(rho_agent_host_proto::MessagePhase::FinalAnswer),
             },
             InferenceResponseItem::Unknown {
                 provider_specific: data(),
@@ -502,17 +502,17 @@ mod tests {
                 items: vec![
                     Item::Text {
                         text: "before".into(),
-                        phase: Some(rho_ui_proto::mirror::TextPhase::Commentary)
+                        phase: Some(rho_agent_host_proto::mirror::TextPhase::Commentary)
                     },
                     Item::ToolCall {
                         id: "middle".into(),
                         name: "exec".into(),
                         arguments: "print(42)".into(),
-                        format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+                        format: rho_agent_host_proto::mirror::ArgumentsFormat::Text,
                     },
                     Item::Text {
                         text: "after".into(),
-                        phase: Some(rho_ui_proto::mirror::TextPhase::FinalAnswer)
+                        phase: Some(rho_agent_host_proto::mirror::TextPhase::FinalAnswer)
                     },
                 ],
                 compacted: false,
@@ -548,7 +548,7 @@ mod tests {
             input: Vec::from(vec![ContextBlock::ToolResults {
                 results: vec![ToolResult {
                     call_id: "call-1".try_into().unwrap(),
-                    tool_type: rho_agent_types::ToolType::Function,
+                    tool_type: rho_inference::types::ToolType::Function,
                     body: ToolOutput {
                         output: std::sync::Arc::new("x".repeat(10_000)),
                         full_output: None,
@@ -588,7 +588,7 @@ mod tests {
                 status: None,
                 images: Default::default(),
                 call_id: "call-1".try_into().unwrap(),
-                tool_type: rho_agent_types::ToolType::Custom,
+                tool_type: rho_inference::types::ToolType::Custom,
                 output: std::sync::Arc::new("bounded".to_owned()),
                 full_output: Some(std::sync::Arc::new("complete".to_owned())),
                 at: UnixMs(2),

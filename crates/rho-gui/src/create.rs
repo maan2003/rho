@@ -54,7 +54,7 @@ struct Area {
     path: String,
     kind: &'static str,
     /// `None` files at the root.
-    target: Option<(HostId, rho_desk::cells::Id)>,
+    target: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     recency: i64,
 }
 
@@ -64,7 +64,7 @@ impl Workspace {
     pub(crate) fn context_area(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         // Home is a window onto the same nodes, so its cursor names an
         // area exactly as the desk's does.
         if self.active_surface().key == crate::pane::SurfaceKey::Home
@@ -82,7 +82,10 @@ impl Workspace {
                     // to the surface left it naming nothing, because Home
                     // is a list and stands for no node of its own.
                     if let Some(host) = self.registry.host_of_agent(agent_id) {
-                        return Some((host, rho_desk::cells::Id::Agent(agent_id)));
+                        return Some((
+                            host,
+                            rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
+                        ));
                     }
                 }
                 crate::home::HomeTarget::None => {}
@@ -101,7 +104,11 @@ impl Workspace {
     /// thing exactly where that thing is and says what it is about. So
     /// Enter alone is create-from-here, and the picker is left for a thing
     /// that belongs somewhere else.
-    fn areas(&self, context: Option<(HostId, rho_desk::cells::Id)>, cx: &App) -> Vec<Area> {
+    fn areas(
+        &self,
+        context: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+        cx: &App,
+    ) -> Vec<Area> {
         let _ = cx;
         let mut areas = vec![Area {
             path: ROOT_ROW.to_owned(),
@@ -190,7 +197,7 @@ impl Workspace {
     fn new_in_area(
         &mut self,
         kind: NewKind,
-        context: Option<(HostId, rho_desk::cells::Id)>,
+        context: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         input: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -224,7 +231,7 @@ impl Workspace {
 
     fn prompt_new_page(
         &mut self,
-        area: Option<(HostId, rho_desk::cells::Id)>,
+        area: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -256,7 +263,7 @@ impl Workspace {
 
     fn new_note_in_area(
         &mut self,
-        area: Option<(HostId, rho_desk::cells::Id)>,
+        area: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -281,7 +288,7 @@ impl Workspace {
         writes.extend(
             self.new_thing_cells(host, area.as_ref())
                 .into_iter()
-                .map(|property| rho_desk::cells::CellWrite {
+                .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
                     id: created.clone(),
                     property,
                 }),

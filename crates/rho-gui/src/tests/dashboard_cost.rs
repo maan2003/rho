@@ -38,7 +38,7 @@ fn desk_of_agents(
     count: u64,
 ) -> (
     gpui::WindowHandle<crate::workspace::Workspace>,
-    Vec<rho_ui_proto::AgentId>,
+    Vec<rho_agent_host_proto::AgentId>,
 ) {
     let mut desk = DeskFixture::new();
     let parent = desk.note(None, "Desk");

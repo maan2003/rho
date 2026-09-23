@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rho_agent_types::UnixMs;
+use rho_agent_host_proto::UnixMs;
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
 use tokio::sync::{Notify, watch};
 

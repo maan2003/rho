@@ -3,13 +3,13 @@ use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
-use rho_agents::{Attention, HostId};
-use rho_desk::cells::{
+use rho_agent_host_proto::ClientMessage;
+use rho_agent_host_proto::desk::cells::{
     BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, Repository,
     SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
     Uuid, Verdict, VerdictEvent, Version,
 };
-use rho_ui_proto::ClientMessage;
+use rho_agents::{Attention, HostId};
 use text::{BufferId, ReplicaId};
 
 use crate::workspace::Workspace;
@@ -27,7 +27,7 @@ struct HostDeskCells {
     /// rather than read off the buffers: the sync is sent before any
     /// buffer exists on a cold start, and the replica's own histories are
     /// what the client resumes from.
-    body_versions: BTreeMap<Id, rho_desk::cells::BodyVersion>,
+    body_versions: BTreeMap<Id, rho_agent_host_proto::desk::cells::BodyVersion>,
     /// The map as it stands, in the order it is drawn, and where each id
     /// sits in it. Kept rather than made: a delta patches the rows it
     /// names, and only a change of shape walks the facts again.
@@ -79,10 +79,10 @@ impl HostDeskCells {
 /// this; it is read from the registry every time a view is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSource {
-    pub agent: rho_agent_types::AgentId,
+    pub agent: rho_agent_host_proto::AgentId,
     /// Who asked for this agent. The store's `Parent` is the user's
     /// filing and beats it; this is where the agent came from.
-    pub spawned_by: Option<rho_agent_types::AgentId>,
+    pub spawned_by: Option<rho_agent_host_proto::AgentId>,
     pub workdir: Option<camino::Utf8PathBuf>,
     /// One past the newest story event this client holds: the cursor a
     /// verdict on this agent writes.
@@ -93,7 +93,7 @@ pub struct AgentSource {
     pub errored: Option<StoryPos>,
     /// What the last finished turn says it asks of the user, and where it
     /// said so.
-    pub wants: Option<(rho_ui_proto::mirror::AgentWant, StoryPos)>,
+    pub wants: Option<(rho_agent_host_proto::mirror::AgentWant, StoryPos)>,
 }
 
 impl AgentSource {
@@ -128,10 +128,10 @@ pub struct SlackSource {
 /// the store, so everything about where it sits comes from here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageSource {
-    pub page: rho_desk::PageId,
+    pub page: rho_agent_host_proto::desk::PageId,
     /// The page the reader opened this tab from: a ctrl-click, or a link
     /// that asked for a new tab. `None` for a tab opened for its own sake.
-    pub opened_from: Option<rho_desk::PageId>,
+    pub opened_from: Option<rho_agent_host_proto::desk::PageId>,
 }
 
 /// The source facts a view joins the store with. Recomputed by the
@@ -146,9 +146,9 @@ pub struct Sources {
     /// agent, one unit or one page per node it builds, and asking by
     /// scanning made a walk cost the nodes times the sources. The lists
     /// are private so these cannot drift from them.
-    by_agent: HashMap<rho_agent_types::AgentId, usize>,
-    by_unit: HashMap<rho_desk::cells::SlackUnit, usize>,
-    by_page: HashMap<rho_desk::PageId, usize>,
+    by_agent: HashMap<rho_agent_host_proto::AgentId, usize>,
+    by_unit: HashMap<rho_agent_host_proto::desk::cells::SlackUnit, usize>,
+    by_page: HashMap<rho_agent_host_proto::desk::PageId, usize>,
 }
 
 // How many source entries the walk has looked at. A lookup that scans
@@ -228,17 +228,17 @@ impl Sources {
         &self.pages
     }
 
-    fn agent(&self, agent: rho_agent_types::AgentId) -> Option<&AgentSource> {
+    fn agent(&self, agent: rho_agent_host_proto::AgentId) -> Option<&AgentSource> {
         charge_scan(1);
         self.by_agent.get(&agent).map(|at| &self.agents[*at])
     }
 
-    fn unit(&self, unit: &rho_desk::cells::SlackUnit) -> Option<&SlackSource> {
+    fn unit(&self, unit: &rho_agent_host_proto::desk::cells::SlackUnit) -> Option<&SlackSource> {
         charge_scan(1);
         self.by_unit.get(unit).map(|at| &self.slack[*at])
     }
 
-    fn page(&self, page: rho_desk::PageId) -> Option<&PageSource> {
+    fn page(&self, page: rho_agent_host_proto::desk::PageId) -> Option<&PageSource> {
         charge_scan(1);
         self.by_page.get(&page).map(|at| &self.pages[*at])
     }
@@ -388,14 +388,14 @@ impl DeskNode {
         matches!(self.id, Id::Note(_))
     }
 
-    pub fn agent(&self) -> Option<rho_agent_types::AgentId> {
+    pub fn agent(&self) -> Option<rho_agent_host_proto::AgentId> {
         match &self.id {
             Id::Agent(agent) => Some(*agent),
             _ => None,
         }
     }
 
-    pub fn page(&self) -> Option<rho_desk::PageId> {
+    pub fn page(&self) -> Option<rho_agent_host_proto::desk::PageId> {
         match &self.id {
             Id::Page(page) => Some(*page),
             _ => None,
@@ -526,8 +526,8 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     })
 }
 
-fn agent_pos(pos: StoryPos) -> rho_ui_proto::mirror::AgentPos {
-    rho_ui_proto::mirror::AgentPos(pos.0)
+fn agent_pos(pos: StoryPos) -> rho_agent_host_proto::mirror::AgentPos {
+    rho_agent_host_proto::mirror::AgentPos(pos.0)
 }
 
 /// The user's verdict on an agent, as the store holds it.
@@ -883,8 +883,8 @@ impl DeskCells {
         &mut self,
         host: HostId,
         id: Id,
-        operation: &rho_desk::TextOperation,
-        transaction: &rho_desk::TextTransaction,
+        operation: &rho_agent_host_proto::desk::TextOperation,
+        transaction: &rho_agent_host_proto::desk::TextTransaction,
     ) {
         let stamp = operation.timestamp();
         let Some(desk) = self.hosts.get_mut(&host) else {
@@ -1061,7 +1061,7 @@ impl DeskCells {
         &mut self,
         host: HostId,
         id: Id,
-        operation: rho_desk::TextOperation,
+        operation: rho_agent_host_proto::desk::TextOperation,
         cx: &mut Context<Workspace>,
     ) {
         let Ok(operation) = operation.to_text() else {
@@ -1326,7 +1326,7 @@ impl DeskCells {
     pub fn agent_verdicts(
         &self,
         host: HostId,
-    ) -> Vec<(rho_agent_types::AgentId, rho_agents::Verdict)> {
+    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents::Verdict)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1346,7 +1346,7 @@ impl DeskCells {
     pub fn agent_filing(
         &self,
         host: HostId,
-    ) -> Vec<(rho_agent_types::AgentId, rho_agents::AgentFiling)> {
+    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1381,7 +1381,7 @@ impl DeskCells {
         &self,
         host: HostId,
         touched: &std::collections::BTreeSet<Id>,
-    ) -> Vec<(rho_agent_types::AgentId, rho_agents::AgentFiling)> {
+    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1966,7 +1966,7 @@ impl DeskCells {
             instead_of,
         };
         let view = &self.hosts.get(&host)?.view;
-        let changes = rho_desk::cells::verdict_changes(
+        let changes = rho_agent_host_proto::desk::cells::verdict_changes(
             id,
             &verdict,
             &|key| view.property(id, key).cloned(),
@@ -2184,7 +2184,7 @@ impl DeskCells {
 
     /// The agent that owns an area: the thing itself when it is an agent,
     /// else the nearest ancestor that is one.
-    pub fn nearest_agent(&self, host: HostId, id: &Id) -> Option<rho_agent_types::AgentId> {
+    pub fn nearest_agent(&self, host: HostId, id: &Id) -> Option<rho_agent_host_proto::AgentId> {
         let nodes = self.nodes(host);
         let mut cursor = Some(id.clone());
         for _ in 0..MAX_ANCESTRY {
@@ -2323,7 +2323,11 @@ impl DeskCells {
     /// cursor. `None` for everything that is not an agent, and for an agent
     /// no source knows about, which is a verdict on a card that cannot be
     /// dealt.
-    fn agent_verdict(&self, host: HostId, id: &Id) -> Option<rho_desk::cells::AgentVerdict> {
+    fn agent_verdict(
+        &self,
+        host: HostId,
+        id: &Id,
+    ) -> Option<rho_agent_host_proto::desk::cells::AgentVerdict> {
         let Id::Agent(agent) = id else {
             return None;
         };
@@ -2333,7 +2337,7 @@ impl DeskCells {
             .agents
             .iter()
             .find(|source| &source.agent == agent)
-            .map(|source| rho_desk::cells::AgentVerdict {
+            .map(|source| rho_agent_host_proto::desk::cells::AgentVerdict {
                 newest: source.newest,
             })
     }
@@ -2355,7 +2359,7 @@ impl DeskCells {
         host: HostId,
         id: &Id,
         verdict: DeskVerdict,
-        agent: Option<rho_desk::cells::AgentVerdict>,
+        agent: Option<rho_agent_host_proto::desk::cells::AgentVerdict>,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
             DeskVerdict::Done => (Verdict::Done, Vec::new()),
@@ -2383,11 +2387,11 @@ impl DeskCells {
                 // again the moment the note exists.
                 let verdict = Verdict::Todo { note };
                 let view = &self.hosts.get(&host)?.view;
-                let changes = rho_desk::cells::verdict_changes(
+                let changes = rho_agent_host_proto::desk::cells::verdict_changes(
                     id,
                     &verdict,
                     &|key| view.property(id, key).cloned(),
-                    Some(rho_desk::cells::TodoCadence {
+                    Some(rho_agent_host_proto::desk::cells::TodoCadence {
                         defer_until,
                         pace_days: pace,
                     }),
@@ -2430,7 +2434,7 @@ impl DeskCells {
         // entry against, so a verdict that touches two facts (a snooze, which
         // zeroes the pace as well) cannot drift between writer and checker.
         let view = &self.hosts.get(&host)?.view;
-        let changes = rho_desk::cells::verdict_changes(
+        let changes = rho_agent_host_proto::desk::cells::verdict_changes(
             id,
             &verdict,
             &|key| view.property(id, key).cloned(),
@@ -2578,9 +2582,9 @@ fn watch_note_buffer(
             is_local: true,
         } = event
         {
-            let operation = rho_desk::TextOperation::from_text(operation);
+            let operation = rho_agent_host_proto::desk::TextOperation::from_text(operation);
             let timestamp = operation.timestamp();
-            let transaction = rho_desk::TextTransaction {
+            let transaction = rho_agent_host_proto::desk::TextTransaction {
                 id: timestamp,
                 edit_ids: vec![timestamp],
             };
@@ -2658,8 +2662,8 @@ mod tests {
     #[test]
     fn a_thing_filed_under_a_label_brings_its_subtree_and_leaves_the_root() {
         let label = Id::Label(Uuid([1; 16]));
-        let origin = Id::Page(rho_desk::PageId([2; 16]));
-        let tab = Id::Page(rho_desk::PageId([3; 16]));
+        let origin = Id::Page(rho_agent_host_proto::desk::PageId([2; 16]));
+        let tab = Id::Page(rho_agent_host_proto::desk::PageId([3; 16]));
         let nodes = BTreeMap::from([
             (label.clone(), node(label.clone(), None, &[])),
             (

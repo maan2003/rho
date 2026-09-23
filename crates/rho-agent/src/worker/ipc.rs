@@ -5,7 +5,8 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::{ExecId, UnixMs};
+use rho_agent_host_proto::UnixMs;
+use rho_inference::types::ExecId;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -25,14 +26,14 @@ pub(super) struct Bootstrap {
 pub(super) enum Control {
     Retire,
     User {
-        content: Vec<rho_agent_types::ContentPart>,
-        delivery: rho_agent_types::MessageDelivery,
+        content: Vec<rho_agent_host_proto::ContentPart>,
+        delivery: rho_agent_host_proto::MessageDelivery,
     },
     Mail {
-        sender: rho_agent_types::AgentId,
+        sender: rho_agent_host_proto::AgentId,
         label: String,
         body: String,
-        delivery: rho_agent_types::MessageDelivery,
+        delivery: rho_agent_host_proto::MessageDelivery,
     },
     NoticeCarried,
     TellTail,
@@ -138,7 +139,7 @@ pub(super) enum Message<'a> {
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
-        queue: Option<Vec<rho_ui_proto::mirror::QueuedItem>>,
+        queue: Option<Vec<rho_agent_host_proto::mirror::QueuedItem>>,
         reset: bool,
     },
     HistoryBatch {
@@ -199,7 +200,7 @@ impl Drop for Pending {
 /// its existing status slot; the writer snapshots only when it can send.
 #[derive(Default)]
 struct Publication {
-    queue: Mutex<Option<Vec<rho_ui_proto::mirror::QueuedItem>>>,
+    queue: Mutex<Option<Vec<rho_agent_host_proto::mirror::QueuedItem>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
     full: std::sync::atomic::AtomicBool,
@@ -413,7 +414,7 @@ impl Host {
         self.tell_tail();
     }
 
-    pub(crate) fn publish_queue(&self, queue: Vec<rho_ui_proto::mirror::QueuedItem>) {
+    pub(crate) fn publish_queue(&self, queue: Vec<rho_agent_host_proto::mirror::QueuedItem>) {
         *self.publication.queue.lock().expect("poison") = Some(queue);
     }
 
@@ -754,15 +755,15 @@ mod tests {
                     id: 19,
                     body: Request::Append(AgentEvent::Native(
                         crate::native::NativeEvent::RequestStarted {
-                            input: vec![rho_agent_types::ContextBlock::UserMessage {
+                            input: vec![rho_inference::types::ContextBlock::UserMessage {
                                 sender: crate::MessageSender::User,
-                                content: vec![rho_agent_types::ContentPart::Text {
+                                content: vec![rho_agent_host_proto::ContentPart::Text {
                                     text: "a".repeat(count),
                                 }],
                             }],
                             context: None,
                             wake: None,
-                            at: rho_agent_types::UnixMs(1),
+                            at: rho_agent_host_proto::UnixMs(1),
                         },
                     )),
                 })
@@ -781,10 +782,10 @@ mod tests {
         else {
             panic!("wrong logical message")
         };
-        let rho_agent_types::ContextBlock::UserMessage { content, .. } = &input[0] else {
+        let rho_inference::types::ContextBlock::UserMessage { content, .. } = &input[0] else {
             panic!()
         };
-        let rho_agent_types::ContentPart::Text { text } = &content[0] else {
+        let rho_agent_host_proto::ContentPart::Text { text } = &content[0] else {
             panic!()
         };
         assert_eq!(text.len(), count);

@@ -78,8 +78,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("rho-ui-proto-{}-{nonce}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "rho-agent-host-proto-{}-{nonce}.sock",
+            std::process::id()
+        ));
         let server = Server::bind(&path).unwrap();
         let accept = tokio::spawn(async move { server.accept().await.unwrap() });
 

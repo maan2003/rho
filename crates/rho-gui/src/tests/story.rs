@@ -4,15 +4,16 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use rho_agent_types::{MessageDelivery, UnixMs};
+use rho_agent_host_proto::mirror::{
+    AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge,
+};
+use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
 use rho_hosts::connection::ConnEvent;
-use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge};
-use rho_ui_proto::{AgentId, AgentRole, Place};
 
-pub type UiRuntimeKind = rho_ui_proto::mirror::RuntimeKind;
-pub type UiSpawnedBy = rho_ui_proto::mirror::SpawnedBy;
-pub type UiAgentWant = rho_ui_proto::mirror::AgentWant;
-pub type UiTurnOutcome = rho_ui_proto::mirror::TurnOutcome;
+pub type UiRuntimeKind = rho_agent_host_proto::mirror::RuntimeKind;
+pub type UiSpawnedBy = rho_agent_host_proto::mirror::SpawnedBy;
+pub type UiAgentWant = rho_agent_host_proto::mirror::AgentWant;
+pub type UiTurnOutcome = rho_agent_host_proto::mirror::TurnOutcome;
 
 /// A position in an agent's story, as the old `Ready` named it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -208,7 +209,7 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> ConnEvent {
     let journal_head = NEXT_SEQ.with(|next| Seq(next.get() - 1));
     ConnEvent::Many(vec![
         ConnEvent::Ready {
-            auth: rho_ui_proto::AuthState {
+            auth: rho_agent_host_proto::AuthState {
                 namespaces: Vec::new(),
                 disabled_namespaces: Vec::new(),
                 active_namespace: None,

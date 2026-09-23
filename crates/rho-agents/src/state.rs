@@ -1,9 +1,8 @@
 //! How a client draws an agent: the block list and status it folds from
 //! the mirror and the live tail. Nothing here crosses the wire.
 
-use rho_agent_types::{MessagePhase, ToolOutputStatus, UnixMs};
-use rho_ui_proto::MessageDelivery;
-use rho_ui_proto::mirror::{ArgumentsFormat, TextPhase};
+use rho_agent_host_proto::mirror::{ArgumentsFormat, TextPhase};
+use rho_agent_host_proto::{MessageDelivery, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// One agent's transcript as a client draws it: a flat block list plus a
@@ -23,13 +22,13 @@ pub struct UiAgentState {
     pub usage: UiAgentUsage,
     #[senax(default)]
     pub exec_timings:
-        std::sync::Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
+        std::sync::Arc<std::collections::BTreeMap<String, rho_agent_host_proto::ExecTiming>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiAgentUsage {
     pub provider: String,
-    pub total: rho_ui_proto::AgentUsageBucket,
+    pub total: rho_agent_host_proto::AgentUsageBucket,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -54,12 +53,12 @@ pub enum UiBlock {
         text: String,
         delivery: MessageDelivery,
         /// The sending agent; `None` for the user.
-        sender: Option<rho_ui_proto::AgentId>,
+        sender: Option<rho_agent_host_proto::AgentId>,
     },
     /// A delivered message from another agent.
     AgentMessage {
         /// The sending agent.
-        sender: rho_ui_proto::AgentId,
+        sender: rho_agent_host_proto::AgentId,
         text: String,
     },
 }
@@ -127,7 +126,7 @@ pub struct UiTool {
     pub finished_at: Option<UnixMs>,
     pub metadata: Option<UiToolMetadata>,
     #[senax(default)]
-    pub timing: rho_agent_types::ExecTiming,
+    pub timing: rho_agent_host_proto::ExecTiming,
     /// Whether `arguments` is JSON or the raw text the model wrote. A text
     /// tool's arguments are shown as they are and never parsed.
     pub format: ArgumentsFormat,

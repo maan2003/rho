@@ -2,7 +2,7 @@
 //!
 //! This crate deliberately stays at the Claude Code boundary: process
 //! spawning, stream-json messages, and transcript loading. Rho-specific
-//! projection into `rho_agent_types` lives in `rho-agent`.
+//! projection into `rho_inference::types` lives in `rho-agent`.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -194,17 +194,17 @@ impl ClaudeCode {
 
     pub async fn send_user_content_with_uuid(
         &mut self,
-        content: Vec<rho_agent_types::ContentPart>,
+        content: Vec<rho_agent_host_proto::ContentPart>,
         uuid: String,
     ) -> Result<()> {
         use base64::Engine as _;
         let content = content
             .into_iter()
             .map(|part| match part {
-                rho_agent_types::ContentPart::Text { text } => {
+                rho_agent_host_proto::ContentPart::Text { text } => {
                     protocol::InputContent::Text { text }
                 }
-                rho_agent_types::ContentPart::Image { media_type, data } => {
+                rho_agent_host_proto::ContentPart::Image { media_type, data } => {
                     protocol::InputContent::image(
                         media_type,
                         base64::engine::general_purpose::STANDARD.encode(data),
