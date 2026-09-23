@@ -1,0 +1,8 @@
+
+# Devenv
+.devenv*
+devenv.local.nix
+
+# Test-generated files
+directory/poetry.lock
+

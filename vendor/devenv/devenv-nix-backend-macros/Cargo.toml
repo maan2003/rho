@@ -1,0 +1,15 @@
+[package]
+name = "devenv-nix-backend-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Proc-macros for devenv-nix-backend test instrumentation"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+quote.workspace = true
+syn.workspace = true

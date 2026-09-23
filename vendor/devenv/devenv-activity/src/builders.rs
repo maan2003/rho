@@ -1,0 +1,928 @@
+//! Builder types for creating activities.
+//!
+//! Activities can be started in two ways:
+//!
+//! - **Builder style**: `Activity::operation("name").start()` — convenient
+//!   but span metadata (`module_path`, `file`, `line`) will point to this
+//!   module since `tracing::span!()` expands here.
+//!
+//! - **Macro style**: `activity!(INFO, operation, "name")` or
+//!   `#[instrument_activity("name")]` — creates the span at the call site
+//!   so that tracing *metadata* (`module_path`, `file`, `line`) points to
+//!   the caller's module. This is the preferred approach.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tracing::Span;
+
+use crate::Timestamp;
+use crate::activity::{Activity, ActivityType};
+use crate::events::{
+    ActivityEvent, ActivityLevel, Build, Command, Evaluate, Fetch, FetchKind, Operation,
+    PortBinding, Process, ReadyProbe, Task,
+};
+use crate::stack::{current_activity_id, current_activity_level, send_activity_event};
+
+static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a new activity ID.
+/// Uses high bit to distinguish from Nix-generated IDs.
+pub fn next_id() -> u64 {
+    ID_COUNTER.fetch_add(1, Ordering::Relaxed) | (1 << 63)
+}
+
+/// A fully-owned activity start event, ready to be traced and emitted.
+pub struct PreparedActivity {
+    event: ActivityEvent,
+    id: u64,
+    activity_type: ActivityType,
+    level: ActivityLevel,
+    display_name: Option<String>,
+}
+
+/// Borrowed scalar fields exported on an activity span.
+///
+/// Kept as one compact projection so span creation performs a single event
+/// match and never clones builder-owned strings. Collections stay in the
+/// structured activity event; only their cardinality is duplicated as a
+/// directly queryable scalar attribute.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ActivitySpanFields<'a> {
+    pub derivation_path: Option<&'a str>,
+    pub fetch_kind: Option<&'static str>,
+    pub url: Option<&'a str>,
+    pub command: Option<&'a str>,
+    pub task_name: Option<&'a str>,
+    pub process_name: Option<&'a str>,
+    pub process_port_count: Option<u64>,
+    pub process_ready_probe: Option<&'a ReadyProbe>,
+    pub operation_detail: Option<&'a str>,
+}
+
+impl PreparedActivity {
+    fn new(
+        event: ActivityEvent,
+        id: u64,
+        activity_type: ActivityType,
+        level: ActivityLevel,
+    ) -> Self {
+        Self {
+            event,
+            id,
+            activity_type,
+            level,
+            display_name: None,
+        }
+    }
+
+    fn with_display_name(mut self, display_name: String) -> Self {
+        self.display_name = Some(display_name);
+        self
+    }
+
+    #[inline]
+    pub fn activity_name(&self) -> &str {
+        match &self.event {
+            ActivityEvent::Build(Build::Queued { name, .. } | Build::Start { name, .. })
+            | ActivityEvent::Fetch(Fetch::Start { name, .. })
+            | ActivityEvent::Evaluate(Evaluate::Start { name, .. })
+            | ActivityEvent::Command(Command::Start { name, .. })
+            | ActivityEvent::Process(Process::Start { name, .. })
+            | ActivityEvent::Operation(Operation::Start { name, .. }) => name,
+            ActivityEvent::Task(Task::Start { .. }) => self
+                .display_name
+                .as_deref()
+                .expect("prepared task activities have a display name"),
+            _ => unreachable!("prepared activities always contain start or queued events"),
+        }
+    }
+
+    #[inline]
+    pub fn activity_kind(&self) -> &'static str {
+        match self.activity_type {
+            ActivityType::Build => "build",
+            ActivityType::Fetch(_) => "fetch",
+            ActivityType::Evaluate => "evaluate",
+            ActivityType::Task => "task",
+            ActivityType::Command => "command",
+            ActivityType::Process => "process",
+            ActivityType::Operation => "operation",
+        }
+    }
+
+    #[inline]
+    pub fn resolved_level(&self) -> ActivityLevel {
+        self.level
+    }
+    #[inline]
+    pub fn event(&self) -> &ActivityEvent {
+        &self.event
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn span_fields(&self) -> ActivitySpanFields<'_> {
+        match &self.event {
+            ActivityEvent::Build(
+                Build::Queued {
+                    derivation_path, ..
+                }
+                | Build::Start {
+                    derivation_path, ..
+                },
+            ) => ActivitySpanFields {
+                derivation_path: derivation_path.as_deref(),
+                ..ActivitySpanFields::default()
+            },
+            ActivityEvent::Fetch(Fetch::Start { kind, url, .. }) => ActivitySpanFields {
+                fetch_kind: Some(kind.as_str()),
+                url: url.as_deref(),
+                ..ActivitySpanFields::default()
+            },
+            ActivityEvent::Command(Command::Start { command, .. }) => ActivitySpanFields {
+                command: command.as_deref(),
+                ..ActivitySpanFields::default()
+            },
+            ActivityEvent::Task(Task::Start { .. }) => ActivitySpanFields {
+                task_name: self.display_name.as_deref(),
+                ..ActivitySpanFields::default()
+            },
+            ActivityEvent::Process(Process::Start {
+                name,
+                command,
+                ports,
+                ready_probe,
+                ..
+            }) => ActivitySpanFields {
+                command: command.as_deref(),
+                process_name: Some(name),
+                process_port_count: Some(ports.len() as u64),
+                process_ready_probe: ready_probe.as_ref(),
+                ..ActivitySpanFields::default()
+            },
+            ActivityEvent::Operation(Operation::Start { detail, .. }) => ActivitySpanFields {
+                operation_detail: detail.as_deref(),
+                ..ActivitySpanFields::default()
+            },
+            _ => ActivitySpanFields::default(),
+        }
+    }
+
+    /// Emit the start event and return the activity guard.
+    ///
+    /// The start event is mirrored into tracing under the new span, then sent
+    /// over the activity channel. The tracked caller is kept on the activity
+    /// so that its completion event points at the same source location.
+    #[track_caller]
+    pub fn finish(self, span: Span) -> Activity {
+        let caller = std::panic::Location::caller();
+        crate::__trace_activity_event!(parent: &span, &self.event, caller);
+        send_activity_event(self.event);
+        Activity::new(span, self.id, self.activity_type, self.level, caller)
+    }
+}
+
+/// Trait implemented by all activity builders.
+pub trait ActivityStart: Sized {
+    /// Return the pre-assigned activity ID, if one was set via `.id()`.
+    fn existing_id(&self) -> Option<u64>;
+
+    /// Resolve the effective tracing level for this activity.
+    fn resolved_level(&self) -> ActivityLevel;
+
+    /// Consume the builder into its one typed start event.
+    fn prepare(self, id: u64) -> PreparedActivity;
+
+    /// Start the activity, creating a tracing span.
+    ///
+    /// Prefer the [`crate::start!`] macro which expands the span at the call site,
+    /// giving correct `code.file.path` / `code.module.name` metadata.
+    /// This method exists for use inside other macros that already handle
+    /// span creation (e.g. `activity!`, `#[instrument_activity]`).
+    #[track_caller]
+    fn start(self) -> Activity {
+        let id = self.existing_id().unwrap_or_else(crate::next_id);
+        let prepared = self.prepare(id);
+        let span = crate::__create_activity_span!(&prepared, id);
+        prepared.finish(span)
+    }
+}
+
+/// Start an activity from any builder expression.
+///
+/// Expands the tracing span at the call site so that span metadata
+/// (`code.file.path`, `code.line.number`, `code.module.name`) points
+/// to the caller's module.
+///
+/// ```ignore
+/// // Simple — shorthand for Activity::operation(...).start()
+/// start!(Activity::operation("Running MCP server").detail(format!(...)))
+/// start!(Activity::fetch(FetchKind::Download, name).url(&u).id(id))
+/// start!(Activity::task(&name).id(activity_id))
+/// ```
+#[macro_export]
+macro_rules! start {
+    ($builder:expr $(, $($($k:ident).+ = $v:expr),+ )?) => {{
+        let __builder = $builder;
+        let __id = $crate::ActivityStart::existing_id(&__builder).unwrap_or_else($crate::next_id);
+        let __prepared = $crate::ActivityStart::prepare(__builder, __id);
+        let __span = $crate::__create_activity_span!(&__prepared, __id $(, $($($k).+ = $v),+ )?);
+        __prepared.finish(__span)
+    }};
+}
+
+/// Queue a build activity, expanding the span at the call site.
+///
+/// ```ignore
+/// queue!(Activity::build("foo").derivation_path(drv).parent(parent_id))
+/// ```
+#[macro_export]
+macro_rules! queue {
+    ($builder:expr $(, $($($k:ident).+ = $v:expr),+ )?) => {{
+        let __builder = $builder;
+        let __id = $crate::ActivityStart::existing_id(&__builder).unwrap_or_else($crate::next_id);
+        let __prepared = __builder.prepare_queued(__id);
+        let __span = $crate::__create_activity_span!(&__prepared, __id $(, $($($k).+ = $v),+ )?);
+        __prepared.finish(__span)
+    }};
+}
+
+/// Create and start an activity (shorthand).
+///
+/// ```ignore
+/// activity!(INFO, operation, "Configuring shell")
+/// activity!(DEBUG, evaluate, format!("Checking cachix.{}", field))
+/// ```
+#[macro_export]
+macro_rules! activity {
+    ($level:ident, $kind:ident, $name:expr $(, $($($k:ident).+ = $v:expr),+ )?) => {
+        $crate::start!(
+            $crate::__activity_builder!($kind, $name).level($crate::__to_activity_level!($level))
+            $(, $($($k).+ = $v),+ )?
+        )
+    };
+}
+
+/// Map a kind keyword to a builder constructor.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __activity_builder {
+    (build, $name:expr) => {
+        $crate::Activity::build($name)
+    };
+    (operation, $name:expr) => {
+        $crate::Activity::operation($name)
+    };
+    (evaluate, $name:expr) => {
+        $crate::Activity::evaluate($name)
+    };
+    (task, $name:expr) => {
+        $crate::Activity::task($name)
+    };
+    (command, $name:expr) => {
+        $crate::Activity::command($name)
+    };
+    (process, $name:expr) => {
+        $crate::Activity::process($name)
+    };
+}
+
+/// Map a level keyword to `ActivityLevel`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __to_activity_level {
+    (ERROR) => {
+        $crate::ActivityLevel::Error
+    };
+    (WARN) => {
+        $crate::ActivityLevel::Warn
+    };
+    (INFO) => {
+        $crate::ActivityLevel::Info
+    };
+    (DEBUG) => {
+        $crate::ActivityLevel::Debug
+    };
+    (TRACE) => {
+        $crate::ActivityLevel::Trace
+    };
+}
+
+/// Create an activity span using tracing's lower-level API directly.
+///
+/// Used by [`ActivityStart::start()`] and [`BuildBuilder::queue()`] to create
+/// tracing spans with the base activity fields plus any extra fields.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __create_activity_span {
+    ($prepared:expr, $id:expr $(, $($($k:ident).+ = $v:expr),+ )?) => {{
+        use tracing::__macro_support::Callsite as _;
+        use tracing::callsite::{DefaultCallsite, Identifier};
+        use tracing::field::FieldSet;
+
+        // Common fields + caller-supplied extras. Each call site gets its own set.
+        // The span carries scalar attributes only. The typed start payload is
+        // emitted as a `devenv_activity::events` event under the span, so
+        // layers that do not want it never see it.
+        const FIELD_NAMES: &[&str] = &[
+            "activity_id",
+            "otel.name",
+            "devenv.ui.message",
+            "devenv.activity.kind",
+            "devenv.activity.complete",
+            "devenv.outcome",
+            "devenv.derivation_path",
+            "devenv.fetch.kind",
+            "devenv.url",
+            "devenv.command",
+            "devenv.task.name",
+            "devenv.process.name",
+            "devenv.process.port_count",
+            "devenv.process.ready_probe",
+            "devenv.operation.detail",
+            "otel.status_code",
+            "otel.status_description",
+            $($( stringify!($($k).+) ),+ )?
+        ];
+
+        macro_rules! def_callsite {
+            ($lvl:expr, $CS:ident, $META:ident) => {
+                static $META: tracing::Metadata<'static> = tracing::Metadata::new(
+                    "activity",
+                    "devenv_activity::spans",
+                    $lvl,
+                    Some(file!()),
+                    Some(line!()),
+                    Some(module_path!()),
+                    FieldSet::new(FIELD_NAMES, Identifier(&$CS)),
+                    tracing::metadata::Kind::SPAN,
+                );
+                static $CS: DefaultCallsite = DefaultCallsite::new(&$META);
+            };
+        }
+
+        def_callsite!(tracing::Level::ERROR, CS_E, M_E);
+        def_callsite!(tracing::Level::WARN, CS_W, M_W);
+        def_callsite!(tracing::Level::INFO, CS_I, M_I);
+        def_callsite!(tracing::Level::DEBUG, CS_D, M_D);
+        def_callsite!(tracing::Level::TRACE, CS_T, M_T);
+
+        let __level = $prepared.resolved_level();
+        let cs: &DefaultCallsite = match __level {
+            $crate::ActivityLevel::Error => &CS_E,
+            $crate::ActivityLevel::Warn => &CS_W,
+            $crate::ActivityLevel::Info => &CS_I,
+            $crate::ActivityLevel::Debug => &CS_D,
+            $crate::ActivityLevel::Trace => &CS_T,
+        };
+
+        let interest = cs.interest();
+        if interest.is_never() {
+            tracing::Span::none()
+        } else {
+            let meta = cs.metadata();
+            if tracing::__macro_support::__is_enabled(meta, interest) {
+                let __name = $prepared.activity_name();
+                let __kind = $prepared.activity_kind();
+                let __otel_name_owned;
+                let __otel_name: &str = if __name.as_bytes().iter().any(|b| b.is_ascii_uppercase()) {
+                    __otel_name_owned = __name.to_ascii_lowercase();
+                    __otel_name_owned.as_str()
+                } else {
+                    __name
+                };
+                let fs = meta.fields();
+                let __fields = $prepared.span_fields();
+                let __ready_probe = __fields
+                    .process_ready_probe
+                    .map(tracing::field::display);
+                fn __optional_value<T: tracing::field::Value>(
+                    value: &Option<T>,
+                ) -> Option<&dyn tracing::field::Value> {
+                    value
+                        .as_ref()
+                        .map(|value| value as &dyn tracing::field::Value)
+                }
+
+                // `value_set_all` associates values positionally with
+                // `FIELD_NAMES`, avoiding a field-name lookup per value.
+                tracing::Span::new(
+                    meta,
+                    &fs.value_set_all(&[
+                        Some(&$id as &dyn tracing::field::Value),
+                        Some(&__otel_name as &dyn tracing::field::Value),
+                        Some(&__name as &dyn tracing::field::Value),
+                        Some(&__kind as &dyn tracing::field::Value),
+                        None,
+                        None,
+                        __optional_value(&__fields.derivation_path),
+                        __optional_value(&__fields.fetch_kind),
+                        __optional_value(&__fields.url),
+                        __optional_value(&__fields.command),
+                        __optional_value(&__fields.task_name),
+                        __optional_value(&__fields.process_name),
+                        __optional_value(&__fields.process_port_count),
+                        __optional_value(&__ready_probe),
+                        __optional_value(&__fields.operation_detail),
+                        None,
+                        None,
+                        $($( Some(&$v as &dyn tracing::field::Value) ),+ )?
+                    ]),
+                )
+            } else {
+                tracing::Span::none()
+            }
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Builder implementations
+// ---------------------------------------------------------------------------
+
+/// Builder for Build activities
+pub struct BuildBuilder {
+    name: String,
+    derivation_path: Option<String>,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: Option<ActivityLevel>,
+}
+
+impl BuildBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            derivation_path: None,
+            id: None,
+            parent: None,
+            level: None,
+        }
+    }
+
+    pub fn derivation_path(mut self, path: impl Into<String>) -> Self {
+        self.derivation_path = Some(path.into());
+        self
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+
+    /// Queue a build activity.
+    ///
+    /// Prefer the [`queue!`] macro for correct call-site metadata.
+    #[track_caller]
+    pub fn queue(self) -> Activity {
+        let id = self.existing_id().unwrap_or_else(next_id);
+        let prepared = self.prepare_queued(id);
+        let span = crate::__create_activity_span!(&prepared, id);
+        prepared.finish(span)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_queued(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let event = ActivityEvent::Build(Build::Queued {
+            id,
+            name: self.name,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            derivation_path: self.derivation_path,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Build, level)
+    }
+}
+
+impl ActivityStart for BuildBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or_default()
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let event = ActivityEvent::Build(Build::Start {
+            id,
+            name: self.name,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            derivation_path: self.derivation_path,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Build, level)
+    }
+}
+
+/// Builder for Fetch activities
+pub struct FetchBuilder {
+    kind: FetchKind,
+    name: String,
+    url: Option<String>,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: Option<ActivityLevel>,
+}
+
+impl FetchBuilder {
+    pub(crate) fn new(kind: FetchKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            url: None,
+            id: None,
+            parent: None,
+            level: None,
+        }
+    }
+
+    pub fn url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+}
+
+impl ActivityStart for FetchBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or_default()
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let kind = self.kind;
+        let event = ActivityEvent::Fetch(Fetch::Start {
+            id,
+            kind,
+            name: self.name,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            url: self.url,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Fetch(kind), level)
+    }
+}
+
+/// Builder for Evaluate activities
+pub struct EvaluateBuilder {
+    name: String,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: Option<ActivityLevel>,
+}
+
+impl EvaluateBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            id: None,
+            parent: None,
+            level: None,
+        }
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+}
+
+impl ActivityStart for EvaluateBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or_default()
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let event = ActivityEvent::Evaluate(Evaluate::Start {
+            id,
+            name: self.name,
+            level,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Evaluate, level)
+    }
+}
+
+/// Builder for Task activities
+pub struct TaskBuilder {
+    name: String,
+    id: Option<u64>,
+    level: Option<ActivityLevel>,
+}
+
+impl TaskBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            id: None,
+            level: None,
+        }
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+}
+
+impl ActivityStart for TaskBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or_default()
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let name = self.name;
+        let event = ActivityEvent::Task(Task::Start {
+            id,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Task, level).with_display_name(name)
+    }
+}
+
+/// Builder for Command activities
+pub struct CommandBuilder {
+    name: String,
+    command: Option<String>,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: Option<ActivityLevel>,
+}
+
+impl CommandBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: None,
+            id: None,
+            parent: None,
+            level: None,
+        }
+    }
+
+    pub fn command(mut self, cmd: impl Into<String>) -> Self {
+        self.command = Some(cmd.into());
+        self
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+}
+
+impl ActivityStart for CommandBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or(ActivityLevel::Debug)
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let event = ActivityEvent::Command(Command::Start {
+            id,
+            name: self.name,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            command: self.command,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Command, level)
+    }
+}
+
+/// Builder for Process activities (long-running managed processes)
+pub struct ProcessBuilder {
+    name: String,
+    command: Option<String>,
+    ports: Vec<PortBinding>,
+    urls: Vec<String>,
+    ready_probe: Option<ReadyProbe>,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: Option<ActivityLevel>,
+}
+
+impl ProcessBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: None,
+            ports: Vec::new(),
+            urls: Vec::new(),
+            ready_probe: None,
+            id: None,
+            parent: None,
+            level: None,
+        }
+    }
+
+    pub fn command(mut self, cmd: impl Into<String>) -> Self {
+        self.command = Some(cmd.into());
+        self
+    }
+
+    pub fn ports(mut self, ports: Vec<PortBinding>) -> Self {
+        self.ports = ports;
+        self
+    }
+
+    pub fn urls(mut self, urls: Vec<String>) -> Self {
+        self.urls = urls;
+        self
+    }
+
+    pub fn ready_probe(mut self, probe: ReadyProbe) -> Self {
+        self.ready_probe = Some(probe);
+        self
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+}
+
+impl ActivityStart for ProcessBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or_default()
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let event = ActivityEvent::Process(Process::Start {
+            id,
+            name: self.name,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            command: self.command,
+            ports: self.ports,
+            urls: Box::new(self.urls),
+            ready_probe: self.ready_probe,
+            level,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Process, level)
+    }
+}
+
+/// Builder for Operation activities
+pub struct OperationBuilder {
+    name: String,
+    detail: Option<String>,
+    id: Option<u64>,
+    parent: Option<Option<u64>>,
+    level: Option<ActivityLevel>,
+}
+
+impl OperationBuilder {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            detail: None,
+            id: None,
+            parent: None,
+            level: None,
+        }
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn parent(mut self, parent: Option<u64>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    pub fn level(mut self, level: ActivityLevel) -> Self {
+        self.level = Some(level);
+        self
+    }
+}
+
+impl ActivityStart for OperationBuilder {
+    fn resolved_level(&self) -> ActivityLevel {
+        self.level
+            .or_else(current_activity_level)
+            .unwrap_or_default()
+    }
+
+    fn existing_id(&self) -> Option<u64> {
+        self.id
+    }
+
+    fn prepare(self, id: u64) -> PreparedActivity {
+        let level = self.resolved_level();
+        let event = ActivityEvent::Operation(Operation::Start {
+            id,
+            name: self.name,
+            parent: self.parent.unwrap_or_else(current_activity_id),
+            detail: self.detail,
+            level,
+            timestamp: Timestamp::now(),
+        });
+        PreparedActivity::new(event, id, ActivityType::Operation, level)
+    }
+}

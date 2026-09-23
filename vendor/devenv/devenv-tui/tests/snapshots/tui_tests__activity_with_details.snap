@@ -1,0 +1,7 @@
+---
+source: devenv-tui/tests/tui_tests.rs
+expression: output
+---
+⠋ Building shell → nix eval --json .#devenv.config [TIME]
+
+                                             ↑↓ j/k ^D/^U

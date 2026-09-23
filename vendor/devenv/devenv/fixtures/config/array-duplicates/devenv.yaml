@@ -1,0 +1,6 @@
+nixpkgs:
+  cuda_capabilities: ["7.5", "7.5", "8.0"]
+  permitted_insecure_packages: ["pkg1", "pkg2", "pkg1"]
+imports:
+  - ./sub1
+  - ./sub2

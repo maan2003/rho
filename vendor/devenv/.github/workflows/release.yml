@@ -1,0 +1,66 @@
+name: "Release"
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+    paths-ignore:
+      - "docs/**"
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (tag or branch) to release'
+        required: true
+        default: 'main'
+        type: string
+
+concurrency:
+  group: "release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref_name }}"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.system }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: aarch64-linux
+            runs-on: '["self-hosted", "linux", "ARM64"]'
+          - system: x86_64-linux
+            runs-on: '["self-hosted", "linux", "X64"]'
+          - system: aarch64-darwin
+            runs-on: '["self-hosted", "macOS", "ARM64"]'
+
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      system: ${{ matrix.system }}
+      runs-on: ${{ matrix.runs-on }}
+      ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || '' }}
+
+  pin:
+    needs: build
+    name: pin (${{ matrix.system }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: aarch64-linux
+            runs-on: '["self-hosted", "linux", "ARM64"]'
+          - system: x86_64-linux
+            runs-on: '["self-hosted", "linux", "X64"]'
+          - system: aarch64-darwin
+            runs-on: '["self-hosted", "macOS", "ARM64"]'
+
+    uses: ./.github/workflows/pin.yml
+    secrets: inherit
+    with:
+      system: ${{ matrix.system }}
+      runs-on: ${{ matrix.runs-on }}
+      ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref_name }}

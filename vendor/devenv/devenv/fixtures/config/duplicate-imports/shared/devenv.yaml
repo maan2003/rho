@@ -1,0 +1,3 @@
+allow_unfree: true
+permitted_insecure_packages:
+  - "shared-package"

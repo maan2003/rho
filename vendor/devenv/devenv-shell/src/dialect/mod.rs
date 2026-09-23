@@ -1,0 +1,753 @@
+//! Shell dialect abstraction for supporting different shell types (bash, zsh, fish, etc.).
+//!
+//! The [`ShellDialect`] trait encapsulates shell-specific behavior for interactive
+//! shell sessions, including rcfile generation, environment diff tracking, reload
+//! hooks, and launch arguments.
+
+mod bash;
+mod fish;
+mod nushell;
+mod zsh;
+
+pub use bash::BashDialect;
+pub use fish::FishDialect;
+pub use nushell::NushellDialect;
+pub use zsh::ZshDialect;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use crate::keybindings::ShellKeybindings;
+
+/// Shell-specific behavior for interactive sessions.
+pub trait ShellDialect: Send + Sync {
+    /// Shell name for display/logging (e.g., "bash", "zsh", "fish").
+    fn name(&self) -> &str;
+
+    /// Arguments to launch an interactive shell with a custom init script.
+    /// Returns (prefix_args, suffix_args) that go around the rcfile path.
+    /// e.g. bash: (["--noprofile", "--rcfile"], ["-i"])
+    fn interactive_args(&self) -> InteractiveArgs;
+
+    /// Generate the rcfile/init script content for an interactive shell.
+    fn rcfile_content(&self, ctx: &RcfileContext) -> String;
+
+    /// Generate environment diff helper functions (for hot-reload tracking).
+    fn env_diff_helpers(&self) -> &str;
+
+    /// Generate the hot-reload hook script (prompt hook).
+    fn reload_hook(&self, reload_file: &Path, keybindings: &ShellKeybindings) -> String;
+
+    /// Path to the user's shell rc file (e.g., ~/.bashrc, ~/.zshrc).
+    fn user_rcfile(&self) -> Option<PathBuf>;
+
+    /// Generate a shell-specific PS1/prompt prefix for "(devenv)".
+    fn prompt_prefix(&self) -> &str;
+
+    /// Format task exports as shell export statements.
+    ///
+    /// Keys are already sorted (BTreeMap), giving deterministic output (important for direnv diffing).
+    fn format_task_exports(&self, exports: &BTreeMap<String, String>) -> String;
+
+    /// Format task messages as shell print statements.
+    fn format_task_messages(&self, messages: &[String]) -> String;
+
+    /// Write supplementary init files (e.g., zsh's ZDOTDIR .zshrc).
+    /// Default implementation is a no-op (bash doesn't need extra files).
+    fn write_init_files(&self, ctx: &RcfileContext) -> std::io::Result<()> {
+        let _ = ctx;
+        Ok(())
+    }
+}
+
+/// Arguments for launching an interactive shell with a custom init script.
+pub struct InteractiveArgs {
+    /// Args before the rcfile path (e.g., `["--noprofile", "--rcfile"]` for bash).
+    pub prefix: Vec<String>,
+    /// Args after the rcfile path (e.g., `["-i"]` for bash).
+    pub suffix: Vec<String>,
+}
+
+/// Look up a dialect by name, defaulting to bash if no match.
+pub fn create_dialect(shell_name: &str) -> Box<dyn ShellDialect> {
+    match shell_name {
+        "zsh" => Box::new(ZshDialect),
+        "fish" => Box::new(FishDialect),
+        "nu" => Box::new(NushellDialect),
+        "bash" => Box::new(BashDialect),
+        other => {
+            tracing::warn!(
+                shell = other,
+                "unrecognized shell dialect, falling back to bash"
+            );
+            Box::new(BashDialect)
+        }
+    }
+}
+
+/// Return `$XDG_CONFIG_HOME`, falling back to `$HOME/.config`.
+pub(crate) fn xdg_config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+/// Generate the bash subprocess script used during hot-reload.
+///
+/// This script reverses the previous env diff, sources the new devenv
+/// environment, computes a new diff, and outputs `export -p` for the
+/// calling shell to parse.
+///
+/// The calling shell (zsh/fish) captures this script's stdout via command
+/// substitution and then `eval`s it. Sourcing the devenv environment runs the
+/// `shellHook` (i.e. `enterShell`), which prints to stdout. That output must
+/// not leak into the captured `export -p` stream, otherwise the caller would
+/// `eval` arbitrary `enterShell` output and hit shell parse errors. We redirect
+/// the `source` output to the user's terminal so it is still displayed on
+/// reload (matching bash's behavior), falling back to discarding it when no
+/// controlling terminal is available.
+pub(crate) fn bash_reload_subprocess_script(env_diff_helpers: &str, reload_file: &str) -> String {
+    format!(
+        r#"{env_diff_helpers}
+
+# Reverse previous diff
+__devenv_apply_reverse_diff
+
+# Capture env before sourcing new devenv
+_before=$(mktemp)
+__devenv_capture_env > "$_before"
+
+# Send enterShell output to the terminal instead of the captured stdout.
+# Probe by actually opening /dev/tty: it can exist with writable permission
+# bits yet fail to open (ENXIO) when there is no controlling terminal.
+if {{ : >/dev/tty; }} 2>/dev/null; then
+    _devenv_reload_out=/dev/tty
+else
+    _devenv_reload_out=/dev/null
+fi
+
+# Source new devenv environment
+source "{reload_file}" >"$_devenv_reload_out" 2>"$_devenv_reload_out"
+rm -f "{reload_file}"
+unset _devenv_reload_out
+
+# Compute new diff
+__devenv_compute_diff "$_before"
+rm -f "$_before"
+
+# Output current environment for the calling shell to parse
+export -p"#,
+        env_diff_helpers = env_diff_helpers,
+        reload_file = reload_file,
+    )
+}
+
+/// Context passed to [`ShellDialect::rcfile_content`] for generating the init script.
+pub struct RcfileContext<'a> {
+    /// Path to the devenv environment script to source.
+    pub env_script_path: &'a Path,
+    /// Environment diff helper functions.
+    pub env_diff_helpers: &'a str,
+    /// Reload hook script (empty if no reload).
+    pub reload_hook: &'a str,
+    /// Path to the target shell binary (e.g., /usr/bin/zsh). None for bash (no exec needed).
+    pub target_shell_path: Option<&'a str>,
+    /// Directory for writing shell init files (e.g., .devenv/).
+    pub init_dir: &'a Path,
+    pub shell_keybindings: &'a ShellKeybindings,
+    /// Whether to add the devenv prompt prefix.
+    pub prompt_prefix: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keybindings::{ShellAction, ShellKeyChord, ShellKeyCode};
+    use std::process::Command;
+
+    /// Regression test for https://github.com/cachix/devenv/issues/2919
+    ///
+    /// The non-bash reload path captures this subprocess's stdout and `eval`s it.
+    /// Sourcing the devenv environment runs `enterShell` (via `eval "$shellHook"`),
+    /// which prints to stdout. That output must not leak into the captured
+    /// `export -p` stream, otherwise the caller `eval`s arbitrary `enterShell`
+    /// output and hits a shell parse error (e.g. `(eval):6: parse error near '\n'`).
+    #[test]
+    fn reload_subprocess_does_not_leak_enter_shell_output() {
+        // Simulate the activation script: `enterShell` prints to stdout and the
+        // environment exports a variable that the reload must propagate.
+        let reload_file =
+            std::env::temp_dir().join(format!("devenv-reload-test-{}.sh", std::process::id()));
+        std::fs::write(
+            &reload_file,
+            r#"echo "hello from devenv"
+echo "GNU bash, version 5.3.9(1)-release (x86_64-pc-linux-gnu)"
+echo ""
+echo "License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>"
+export DEVENV_RELOAD_TEST_VAR=reload_works
+"#,
+        )
+        .expect("failed to write fake reload file");
+
+        let script = bash_reload_subprocess_script(
+            BashDialect.env_diff_helpers(),
+            &reload_file.to_string_lossy(),
+        );
+
+        // Capture stdout exactly as the zsh/fish reload hook does (no tty here,
+        // so `enterShell` output falls back to /dev/null).
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("failed to run reload subprocess script");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // The exported variable must reach the captured `export -p` output.
+        assert!(
+            stdout.contains("DEVENV_RELOAD_TEST_VAR"),
+            "reload output should propagate exported variables, got:\n{stdout}"
+        );
+
+        // `enterShell` stdout must NOT leak into the captured output, otherwise
+        // the caller's `eval` would choke on it.
+        assert!(
+            !stdout.contains("hello from devenv"),
+            "enterShell output leaked into captured reload stdout:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("License GPLv3+"),
+            "enterShell output leaked into captured reload stdout:\n{stdout}"
+        );
+
+        // The captured output must be evaluable without a parse error, which is
+        // the actual symptom reported in the issue.
+        let eval = Command::new("bash")
+            .arg("-c")
+            .arg(stdout.as_ref())
+            .output()
+            .expect("failed to eval captured reload output");
+        assert!(
+            eval.status.success(),
+            "evaluating captured reload output failed: {}",
+            String::from_utf8_lossy(&eval.stderr)
+        );
+
+        let _ = std::fs::remove_file(&reload_file);
+    }
+
+    /// Regression tests for https://github.com/cachix/devenv/issues/2861
+    ///
+    /// A shell hook-spawned by `devenv shell` must `exit` when the user `cd`s
+    /// outside `DEVENV_ROOT`, so the parent shell can follow. This must be
+    /// handled directly in devenv's own generated init files (not just the
+    /// user-loaded hook script), so it works regardless of whether the
+    /// user's own rc file re-sources the hook for this non-login shell (a
+    /// common fish idiom is to gate the whole rc behind `status is-login`,
+    /// which a hook-spawned `fish -i` never satisfies).
+    fn unique_tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("devenv-{name}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prompt_setting_preserves_user_prompts() {
+        for shell in ["bash", "zsh", "fish", "nu"] {
+            if Command::new(shell).arg("--version").output().is_err() {
+                eprintln!("skipping prompt test: {shell} is unavailable");
+                continue;
+            }
+            let tmp = unique_tmp_dir(&format!("{shell}-prompt"));
+            let dialect = create_dialect(shell);
+            let shell_keybindings = ShellKeybindings::default();
+            std::fs::write(tmp.join(".bashrc"), "PS1='custom> '\n").unwrap();
+            std::fs::write(tmp.join(".zshrc"), "PROMPT='custom> '\n").unwrap();
+
+            for prompt_prefix in [true, false] {
+                let ctx = RcfileContext {
+                    env_script_path: Path::new("/dev/null"),
+                    env_diff_helpers: dialect.env_diff_helpers(),
+                    reload_hook: "",
+                    target_shell_path: None,
+                    init_dir: &tmp,
+                    shell_keybindings: &shell_keybindings,
+                    prompt_prefix,
+                };
+                dialect.write_init_files(&ctx).unwrap();
+                let script = match shell {
+                    "bash" => format!("{}\nprintf '%s' \"$PS1\"", dialect.rcfile_content(&ctx)),
+                    "zsh" => format!(
+                        "source {:?}\nprintf '%s' \"$PROMPT\"",
+                        tmp.join("zsh/.zshrc")
+                    ),
+                    "fish" => format!(
+                        "set fish_function_path; functions -e fish_prompt; source {:?}; fish_prompt",
+                        tmp.join("devenv.fish")
+                    ),
+                    "nu" => {
+                        let path = tmp.join("nu/config.nu");
+                        // Do not load the real user's config discovered during generation.
+                        let config = std::fs::read_to_string(&path).unwrap();
+                        let config = config
+                            .lines()
+                            .filter(|line| !line.starts_with("source "))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        std::fs::write(&path, config).unwrap();
+                        format!(
+                            "$env.PROMPT_COMMAND = {{|| 'custom> '}}; source {path:?}; print -n (do $env.PROMPT_COMMAND)"
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let mut command = Command::new(shell);
+                match shell {
+                    "bash" => {
+                        command.args(["--noprofile", "--norc"]);
+                    }
+                    "zsh" => {
+                        command.arg("-f");
+                    }
+                    "fish" => {
+                        command.arg("--no-config");
+                    }
+                    "nu" => {
+                        command.arg("--no-config-file");
+                    }
+                    _ => unreachable!(),
+                }
+                let output = command
+                    .env("HOME", &tmp)
+                    .env("_DEVENV_PATH", std::env::var("PATH").unwrap_or_default())
+                    .env_remove("_DEVENV_REAL_ZDOTDIR")
+                    .env_remove("_DEVENV_HOOK_DIR")
+                    .env_remove("GHOSTTY_RESOURCES_DIR")
+                    .args(["-c", &script])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let prefix = if prompt_prefix { "(devenv) " } else { "" };
+                let user_prompt = if shell == "fish" { "> " } else { "custom> " };
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    format!("{prefix}{user_prompt}"),
+                    "{shell}, prompt_prefix={prompt_prefix}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(tmp);
+        }
+    }
+
+    #[test]
+    fn disabled_fish_prompt_preserves_user_prompt_and_reload_hooks() {
+        if Command::new("fish").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = unique_tmp_dir("fish-prompt-reload");
+        let shell_keybindings = ShellKeybindings::default();
+        let ctx = RcfileContext {
+            env_script_path: Path::new("/dev/null"),
+            env_diff_helpers: "",
+            reload_hook: "function __devenv_reload_apply; echo -n RELOAD; end\nfunction __devenv_restore_path; echo -n PATH; end",
+            target_shell_path: None,
+            init_dir: &tmp,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: false,
+        };
+        FishDialect.write_init_files(&ctx).unwrap();
+        let script = format!(
+            "function fish_prompt; echo -n 'custom> '; end; source {:?}; fish_prompt",
+            tmp.join("devenv.fish")
+        );
+        let output = Command::new("fish")
+            .env_remove("_DEVENV_HOOK_DIR")
+            .env("_DEVENV_PATH", std::env::var("PATH").unwrap_or_default())
+            .args(["--no-config", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "custom> RELOADPATH"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reload_hooks_preserve_defaults_and_apply_overrides() {
+        let reload_file = Path::new("/tmp/devenv-reload");
+        let defaults = ShellKeybindings::default();
+        assert!(
+            !BashDialect
+                .reload_hook(reload_file, &defaults)
+                .contains("bind -x")
+        );
+        assert!(
+            FishDialect
+                .reload_hook(reload_file, &defaults)
+                .contains("bind (string unescape '\\x1b\\x12')")
+        );
+        assert!(
+            ZshDialect
+                .reload_hook(reload_file, &defaults)
+                .contains("DEVENV_RELOAD_KEYBIND")
+        );
+
+        let mut custom = ShellKeybindings::default();
+        custom.replace(
+            ShellAction::Reload,
+            vec![ShellKeyChord::new(
+                ShellKeyCode::Function(12),
+                false,
+                false,
+                false,
+            )],
+        );
+        assert!(
+            BashDialect
+                .reload_hook(reload_file, &custom)
+                .contains("bind -x '\"\\x1b\\x5b\\x32\\x34\\x7e\"")
+        );
+        assert!(
+            FishDialect
+                .reload_hook(reload_file, &custom)
+                .contains("bind (string unescape '\\x1b\\x5b\\x32\\x34\\x7e')")
+        );
+        let zsh = ZshDialect.reload_hook(reload_file, &custom);
+        assert!(zsh.contains("bindkey $'\\x1b\\x5b\\x32\\x34\\x7e'"));
+        assert!(!zsh.contains("DEVENV_RELOAD_KEYBIND"));
+
+        custom.replace(ShellAction::Reload, Vec::new());
+        assert!(
+            !BashDialect
+                .reload_hook(reload_file, &custom)
+                .contains("bind -x")
+        );
+        assert!(
+            !FishDialect
+                .reload_hook(reload_file, &custom)
+                .contains("bind (")
+        );
+        assert!(
+            !ZshDialect
+                .reload_hook(reload_file, &custom)
+                .contains("bindkey ")
+        );
+    }
+
+    #[test]
+    fn nushell_reload_hook_uses_configured_binding() {
+        let tmp = unique_tmp_dir("nu-reload-keybinding");
+        let mut shell_keybindings = ShellKeybindings::default();
+        shell_keybindings.replace(
+            ShellAction::Reload,
+            vec![ShellKeyChord::new(
+                ShellKeyCode::Function(12),
+                false,
+                false,
+                false,
+            )],
+        );
+        let ctx = RcfileContext {
+            env_script_path: Path::new("/dev/null"),
+            env_diff_helpers: "",
+            reload_hook: "/tmp/devenv-reload",
+            target_shell_path: None,
+            init_dir: &tmp,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: true,
+        };
+        NushellDialect.write_init_files(&ctx).unwrap();
+        let config = std::fs::read_to_string(tmp.join("nu/config.nu")).unwrap();
+        assert!(config.contains("modifier: \"none\""));
+        assert!(config.contains("keycode: \"f12\""));
+        assert!(!config.contains("keycode: char_r"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bash_rcfile_exits_on_cd_out_when_hook_spawned() {
+        let tmp = unique_tmp_dir("bash-cdout");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(root.join(".devenv")).unwrap();
+        let empty_home = tmp.join("home");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        // User prompt setup may replace PROMPT_COMMAND entirely. The devenv
+        // cd-out handler must be installed after this bashrc is sourced.
+        std::fs::write(
+            empty_home.join(".bashrc"),
+            "PROMPT_COMMAND='echo USER_PROMPT_COMMAND'\n",
+        )
+        .unwrap();
+
+        let env_script = tmp.join("env.sh");
+        std::fs::write(&env_script, format!("export DEVENV_ROOT={root:?}\n")).unwrap();
+
+        let shell_keybindings = ShellKeybindings::default();
+        let ctx = RcfileContext {
+            env_script_path: &env_script,
+            env_diff_helpers: BashDialect.env_diff_helpers(),
+            reload_hook: "",
+            target_shell_path: None,
+            init_dir: &tmp,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: true,
+        };
+        let rcfile_path = tmp.join("rcfile.sh");
+        std::fs::write(&rcfile_path, BashDialect.rcfile_content(&ctx)).unwrap();
+
+        // PROMPT_COMMAND only runs before an interactive prompt, so evaluate
+        // it explicitly under `bash -c`. This also verifies that sourcing the
+        // user's bashrc above did not overwrite the devenv handler, and that
+        // installing the handler did not discard the user's prompt command.
+        let script = format!(
+            "source {rcfile_path:?}\ncd \"$DEVENV_ROOT\"\neval \"$PROMPT_COMMAND\"\ncd /\neval \"$PROMPT_COMMAND\"\necho SHOULD_NOT_REACH\n"
+        );
+        let output = Command::new("bash")
+            .env("HOME", &empty_home)
+            .env("_DEVENV_HOOK_DIR", &root)
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("failed to run bash rcfile");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("USER_PROMPT_COMMAND"),
+            "[bash] devenv discarded the user's PROMPT_COMMAND.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !stdout.contains("SHOULD_NOT_REACH"),
+            "[bash] hook-spawned rcfile did not exit on cd-out.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let exit_dir = std::fs::read_to_string(root.join(".devenv/exit-dir")).unwrap();
+        assert_eq!(exit_dir, "/", "exit-dir should record cd target");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn zsh_rcfile_exits_on_cd_out_when_hook_spawned() {
+        if Command::new("zsh").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = unique_tmp_dir("zsh-cdout");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(root.join(".devenv")).unwrap();
+        let init_dir = tmp.join("init");
+        std::fs::create_dir_all(&init_dir).unwrap();
+        let empty_home = tmp.join("home");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        // User prompt setup may replace the precmd hook array entirely. The
+        // devenv cd-out handler must be installed after this zshrc is sourced
+        // without discarding the user's hook.
+        std::fs::write(
+            empty_home.join(".zshrc"),
+            "user_precmd() { echo USER_PRECMD; }\nprecmd_functions=(user_precmd)\n",
+        )
+        .unwrap();
+
+        let shell_keybindings = ShellKeybindings::default();
+        let ctx = RcfileContext {
+            env_script_path: Path::new("/dev/null"),
+            env_diff_helpers: "",
+            reload_hook: "",
+            target_shell_path: None,
+            init_dir: &init_dir,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: true,
+        };
+        ZshDialect.write_init_files(&ctx).unwrap();
+        let zsh_dir = init_dir.join("zsh");
+
+        // `precmd` only runs before an interactive prompt, so invoke its
+        // registered functions explicitly under `zsh -c`. This also verifies
+        // that sourcing the user's zshrc above did not discard the handler,
+        // and that installing the handler preserved the user's hook.
+        let script = "cd \"$DEVENV_ROOT\"\nfor hook in \"${precmd_functions[@]}\"; do \"$hook\"; done\ncd /\nfor hook in \"${precmd_functions[@]}\"; do \"$hook\"; done\necho SHOULD_NOT_REACH\n";
+        let output = Command::new("zsh")
+            .env("HOME", &empty_home)
+            .env("ZDOTDIR", &zsh_dir)
+            .env("DEVENV_ROOT", &root)
+            .env("_DEVENV_HOOK_DIR", &root)
+            .env("_DEVENV_PATH", std::env::var("PATH").unwrap_or_default())
+            .arg("-i")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("failed to run zsh rcfile");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("USER_PRECMD"),
+            "[zsh] devenv discarded the user's precmd hook.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !stdout.contains("SHOULD_NOT_REACH"),
+            "[zsh] hook-spawned rcfile did not exit on cd-out.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let exit_dir = std::fs::read_to_string(root.join(".devenv/exit-dir")).unwrap();
+        assert_eq!(exit_dir, "/", "exit-dir should record cd target");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fish_rcfile_exits_on_cd_out_when_hook_spawned() {
+        if Command::new("fish").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = unique_tmp_dir("fish-cdout");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(root.join(".devenv")).unwrap();
+        let init_dir = tmp.join("init");
+        std::fs::create_dir_all(&init_dir).unwrap();
+
+        let shell_keybindings = ShellKeybindings::default();
+        let ctx = RcfileContext {
+            env_script_path: Path::new("/dev/null"),
+            env_diff_helpers: "",
+            reload_hook: "",
+            target_shell_path: None,
+            init_dir: &init_dir,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: true,
+        };
+        FishDialect.write_init_files(&ctx).unwrap();
+        let devenv_fish = init_dir.join("devenv.fish");
+
+        for hook_loaded_first in [false, true] {
+            // Fish runs config.fish before the -C init script. If config.fish
+            // loads the hook, it consumes the exported marker first. Simulate
+            // that ordering without loading user or vendor Fish configuration.
+            let hook_setup = if hook_loaded_first {
+                "set -g _devenv_hook_dir $_DEVENV_HOOK_DIR\nset -e _DEVENV_HOOK_DIR\n"
+            } else {
+                ""
+            };
+            let script =
+                format!("{hook_setup}source {devenv_fish:?}\ncd /\necho SHOULD_NOT_REACH\n");
+            let output = Command::new("fish")
+                .arg("--no-config")
+                .env("DEVENV_ROOT", &root)
+                .env("_DEVENV_HOOK_DIR", &root)
+                .env("_DEVENV_PATH", std::env::var("PATH").unwrap_or_default())
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("failed to run fish rcfile");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("SHOULD_NOT_REACH"),
+                "[fish] hook-spawned rcfile did not exit on cd-out (hook_loaded_first={hook_loaded_first}).\nstdout: {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let exit_dir_file = root.join(".devenv/exit-dir");
+            let exit_dir = std::fs::read_to_string(&exit_dir_file).unwrap();
+            assert_eq!(exit_dir, "/", "exit-dir should record cd target");
+            std::fs::remove_file(exit_dir_file).unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn nu_rcfile_exits_on_cd_out_when_hook_spawned() {
+        if Command::new("nu").arg("--version").output().is_err() {
+            return;
+        }
+        let tmp = unique_tmp_dir("nu-cdout");
+        let root = tmp.join("project");
+        std::fs::create_dir_all(root.join(".devenv")).unwrap();
+        let init_dir = tmp.join("init");
+        std::fs::create_dir_all(&init_dir).unwrap();
+
+        let shell_keybindings = ShellKeybindings::default();
+        let ctx = RcfileContext {
+            env_script_path: Path::new("/dev/null"),
+            env_diff_helpers: "",
+            reload_hook: "",
+            target_shell_path: None,
+            init_dir: &init_dir,
+            shell_keybindings: &shell_keybindings,
+            prompt_prefix: true,
+        };
+        NushellDialect.write_init_files(&ctx).unwrap();
+        let config_nu = init_dir.join("nu").join("config.nu");
+
+        // Simulate a user config.nu replacing the PWD hook list with its own
+        // callback. Do this in the generated file so the test does not depend
+        // on process-global HOME/XDG_CONFIG_HOME state while files are
+        // generated in parallel.
+        let config = std::fs::read_to_string(&config_nu).unwrap();
+        let user_config_marker =
+            "# Source user's config.nu for their customizations (aliases, keybindings, etc.)\n";
+        let marker_end = config.find(user_config_marker).unwrap() + user_config_marker.len();
+        let source_line_end = marker_end + config[marker_end..].find('\n').unwrap() + 1;
+        let mut config_with_user_hooks = String::with_capacity(config.len());
+        config_with_user_hooks.push_str(&config[..marker_end]);
+        config_with_user_hooks
+            .push_str("$env.config.hooks.env_change.PWD = [{|| print USER_PWD_HOOK }]\n");
+        config_with_user_hooks.push_str(&config[source_line_end..]);
+        std::fs::write(&config_nu, config_with_user_hooks).unwrap();
+
+        // PWD hooks only fire in truly interactive sessions, so invoke the
+        // registered callback explicitly under `nu -c`. This verifies that
+        // sourcing the user's config above did not discard the handler, and
+        // that installing the handler preserved the user's callback.
+        let script = format!(
+            "source {config_nu:?}\ncd $env.DEVENV_ROOT\nfor hook in $env.config.hooks.env_change.PWD {{ do $hook }}\ncd /\nfor hook in $env.config.hooks.env_change.PWD {{ do $hook }}\nprint SHOULD_NOT_REACH\n"
+        );
+        let output = Command::new("nu")
+            .env("DEVENV_ROOT", &root)
+            .env("_DEVENV_HOOK_DIR", &root)
+            .env("_DEVENV_PATH", std::env::var("PATH").unwrap_or_default())
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("failed to run nu rcfile");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("USER_PWD_HOOK"),
+            "[nu] devenv discarded the user's PWD hook.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !stdout.contains("SHOULD_NOT_REACH"),
+            "[nu] hook-spawned rcfile did not exit on cd-out.\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // Not reaching the end of the script is necessary but not sufficient: a
+        // bare `exit` from inside a hook throws `ShellError::Exit`, which only
+        // the REPL top level handles. Under `nu -c` that unwinds the script and
+        // exits 0, but a real interactive shell reports "Exit doesn't catch
+        // internally" and stays alive (#3033). Only actually terminating the
+        // process is faithful to what the parent hook waits for, so require
+        // death by signal — which `exit` can never produce.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(15),
+            "[nu] cd-out unwound the script instead of terminating the shell \
+             process (status: {:?}).\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let exit_dir = std::fs::read_to_string(root.join(".devenv/exit-dir")).unwrap();
+        assert_eq!(exit_dir, "/", "exit-dir should record cd target");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

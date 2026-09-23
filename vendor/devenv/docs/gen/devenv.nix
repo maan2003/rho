@@ -1,0 +1,251 @@
+{
+  pkgs,
+  lib,
+  inputs,
+  options,
+  ...
+}:
+
+let
+  # Import the filterOptions function
+  filterOptions = import ./filterOptions.nix lib;
+
+  # Filter options for documentation
+  filterGitHooks =
+    path: opt:
+    if lib.lists.hasPrefix [ "git-hooks" "hooks" ] path then
+      builtins.elemAt path 2 == "_freeformOptions"
+      || builtins.elem (builtins.elemAt path 3) [
+        "enable"
+        "packageOverrides"
+        "settings"
+      ]
+    else
+      true;
+
+  # Exclude repeated module options from treefmt programs, keep enable and settings
+  filterTreefmt =
+    path: opt:
+    if lib.lists.hasPrefix [ "treefmt" "config" "programs" ] path && builtins.length path > 4 then
+      !builtins.elem (builtins.elemAt path 4) [
+        "description"
+        "excludes"
+        "finalPackage"
+        "includes"
+        "package"
+        "priority"
+      ]
+    else
+      true;
+
+  filterDocOptions = path: opt: filterGitHooks path opt && filterTreefmt path opt;
+
+  # Rewrite source declarations to GitHub URLs
+  sources = [
+    {
+      # The local devenv input points at src/modules. Strip that suffix so
+      # declaration paths remain relative to the repository root.
+      prefix = lib.strings.removeSuffix "/src/modules" (toString inputs.devenv.outPath);
+      url = "https://github.com/cachix/devenv/blob/main";
+    }
+    {
+      prefix = inputs.git-hooks.outPath;
+      url = "https://github.com/cachix/git-hooks.nix/blob/master";
+    }
+    {
+      prefix = inputs.treefmt-nix.outPath;
+      url = "https://github.com/numtide/treefmt-nix/blob/main";
+    }
+  ];
+
+  rewriteSource =
+    decl:
+    let
+      source = lib.lists.findFirst (
+        src:
+        let
+          prefix = toString src.prefix;
+        in
+        decl == prefix || lib.strings.hasPrefix "${prefix}/" decl
+      ) null sources;
+      prefix =
+        if source == null then
+          throw "Failed to rewrite source url for module: ${decl}"
+        else
+          toString source.prefix;
+      path = lib.strings.removePrefix prefix decl;
+      url = source.url + path;
+    in
+    {
+      name = url;
+      inherit url;
+    };
+
+  # Speed up doc builds by skipping narinfo queries
+  disableSubstitutes =
+    drv:
+    drv.overrideAttrs (_: {
+      allowSubstitutes = false;
+    });
+
+  mkDocOptions =
+    {
+      opts,
+      docOpts ? { },
+    }:
+    let
+      optionsDoc = pkgs.nixosOptionsDoc (
+        {
+          options = filterOptions filterDocOptions (builtins.removeAttrs opts [ "_module" ]);
+          warningsAreErrors = true;
+          transformOptions = opt: (opt // { declarations = map rewriteSource opt.declarations; });
+        }
+        // docOpts
+      );
+    in
+    optionsDoc
+    // {
+      optionsAsciiDoc = disableSubstitutes optionsDoc.optionsAsciiDoc;
+      optionsJSON = disableSubstitutes optionsDoc.optionsJSON;
+      optionsCommonMark = disableSubstitutes optionsDoc.optionsCommonMark;
+    };
+
+  # Generate documentation for all options
+  allOptions = mkDocOptions {
+    opts = options;
+  };
+
+  # Default doc template
+  defaultDoc = "@AUTOGEN_OPTIONS@";
+
+  # Generate individual docs for languages, services, and process managers
+  generateOptionDocs =
+    opts:
+    mkDocOptions {
+      inherit opts;
+      docOpts = {
+        variablelistId = "options";
+      };
+    };
+
+  # The docs to generate
+  docs = [
+    {
+      options = options.languages;
+      srcDir = "languages";
+      outDir = "$out/docs/individual-docs/languages";
+    }
+    {
+      options = options.services;
+      srcDir = "services";
+      outDir = "$out/docs/individual-docs/services";
+    }
+    {
+      options = options.process.managers;
+      srcDir = "process-managers";
+      outDir = "$out/docs/individual-docs/supported-process-managers";
+    }
+  ];
+
+  # Generate individual documentation files
+  generateIndividualDocs = pkgs.stdenv.mkDerivation {
+    name = "generate-individual-docs";
+    src = ../src/individual-docs;
+    allowSubstitutes = false;
+    buildPhase = ''
+      ${lib.concatStringsSep "\n" (
+        lib.map (
+          {
+            options,
+            srcDir,
+            outDir,
+          }:
+          ''
+            mkdir -p ${outDir}
+
+            ${lib.concatStringsSep "\n" (
+              lib.mapAttrsToList (name: options: ''
+                srcFile=${srcDir}/${name}.md
+                outFile=${outDir}/${name}.md
+                optionsFile=${(generateOptionDocs options).optionsCommonMark}
+
+                title="${name}"
+                if [ -f "$srcFile" ]; then
+                  sourceTitle=$(sed -n 's/^# //p' "$srcFile" | head -n 1)
+                  if [ -n "$sourceTitle" ]; then
+                    title="$sourceTitle"
+                  fi
+                fi
+
+                {
+                  echo "---"
+                  echo "title: \"$title\""
+                  echo "---"
+                  echo
+                  echo "<!-- Do not edit this generated file. Edit docs/src/individual-docs instead. -->"
+                  echo
+                  if [ -f "$srcFile" ]; then
+                    awk 'BEGIN { skipped = 0 } !skipped && /^# / { skipped = 1; next } { print }' "$srcFile"
+                  else
+                    echo "${defaultDoc}"
+                  fi
+                } > "$outFile"
+
+                # Process and substitute options in place
+                substituteInPlace "$outFile" --subst-var-by AUTOGEN_OPTIONS "$(
+                  echo "## Options"
+                  echo
+                  sed \
+                    -e 's/^## /### /g' \
+                    -e 's/\\\([.#]\)/\1/g' \
+                    "$optionsFile"
+                )"
+
+                sed -i 's/[[:blank:]]\+$//' "$outFile"
+
+              '') options
+            )}
+          ''
+        ) docs
+      )}
+    '';
+    installPhase = ''
+      mkdir -p $out
+      cp -r . $out/
+    '';
+  };
+
+in
+{
+  devenv.warnOnNewVersion = false;
+
+  packages = [ pkgs.jq ];
+
+  # Expose the outputs for the flake and scripts to use
+  outputs = {
+    devenv-docs-options = allOptions.optionsCommonMark;
+    devenv-docs-options-json = allOptions.optionsJSON;
+    devenv-generate-individual-docs = generateIndividualDocs;
+  };
+
+  scripts."devenv-build" = {
+    description = "Run devenv build, handling JSON output for devenv 2.0.0+";
+    exec = ./scripts/devenv-build.sh;
+  };
+
+  scripts."devenv-generate-doc-options" = {
+    description = "Generate option docs";
+    exec = ./scripts/generate-doc-options.sh;
+  };
+
+  scripts."devenv-generate-individual-docs" = {
+    description = "Generate individual docs of all devenv modules";
+    exec = ./scripts/generate-individual-docs.sh;
+  };
+
+  scripts."devenv-verify-individual-docs" = {
+    description = "Generate missing template markdown files";
+    exec = ./scripts/verify-individual-docs.sh;
+  };
+
+}

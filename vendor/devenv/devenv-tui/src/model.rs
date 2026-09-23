@@ -1,0 +1,2206 @@
+use crate::app::TuiConfig;
+use devenv_activity::{
+    ActivityEvent, ActivityLevel, ActivityOutcome, Build, Command, EvalOp, Evaluate,
+    ExpectedCategory, Fetch, FetchKind, Message, Operation, PortBinding, Process, ProcessStatus,
+    ReadyProbe, SetExpected, Task,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Configuration for limiting displayed child activities
+#[derive(Debug, Clone)]
+pub struct ChildActivityLimit {
+    /// Maximum number of child lines to show
+    pub max_lines: usize,
+    /// How long completed items stay visible after completion
+    pub linger_duration: Duration,
+}
+
+impl Default for ChildActivityLimit {
+    fn default() -> Self {
+        Self {
+            max_lines: 5,
+            linger_duration: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Activity data model - contains only activity state from the event processor.
+/// This is the only data that needs to be behind an RwLock.
+#[derive(Debug)]
+pub struct ActivityModel {
+    pub message_log: VecDeque<Message>,
+    pub activities: HashMap<u64, Activity>,
+    pub root_activities: Vec<u64>,
+    pub build_logs: HashMap<u64, Arc<VecDeque<String>>>,
+    /// Total count of log lines received per activity (not affected by buffer rotation)
+    pub log_line_counts: HashMap<u64, usize>,
+    pub app_state: AppState,
+    pub completed_messages: Vec<String>,
+    config: Arc<TuiConfig>,
+    /// Expected build count announced by Nix (via SetExpected events)
+    expected_builds: Option<u64>,
+    /// Expected download count announced by Nix (via SetExpected events)
+    expected_downloads: Option<u64>,
+    /// Additional parents for activities (for displaying under multiple parents in TUI)
+    additional_parents: HashMap<u64, Vec<u64>>,
+}
+
+impl Default for ActivityModel {
+    fn default() -> Self {
+        Self::with_config(Arc::new(TuiConfig::default()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BuildActivity {
+    pub phase: Option<String>,
+    pub log_stdout_lines: Vec<String>,
+    pub log_stderr_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DownloadActivity {
+    pub size_current: Option<u64>,
+    pub size_total: Option<u64>,
+    pub speed: Option<u64>,
+    pub substituter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+pub struct ProgressActivity {
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub unit: Option<String>,
+    pub percent: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct QueryActivity {
+    pub substituter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskActivity {
+    pub status: TaskDisplayStatus,
+    pub duration: Option<std::time::Duration>,
+    pub show_output: bool,
+    pub last_log_line: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct EvaluatingActivity {
+    pub files_read: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MessageActivity {
+    pub level: ActivityLevel,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProcessActivity {
+    pub status: ProcessStatus,
+    pub ports: Vec<PortBinding>,
+    pub urls: Vec<String>,
+    /// The configured readiness probe, if any
+    pub ready_probe: Option<ReadyProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActivityVariant {
+    Task(TaskActivity),
+    UserOperation,
+    Evaluating(EvaluatingActivity),
+    Build(BuildActivity),
+    Download(DownloadActivity),
+    /// Copying local sources to the store
+    Copy,
+    Query(QueryActivity),
+    FetchTree,
+    /// Devenv-specific operations (e.g., "Building shell", "Entering shell")
+    Devenv,
+    /// Long-running managed processes
+    Process(ProcessActivity),
+    /// Standalone messages displayed as children of their parent activity
+    Message(MessageActivity),
+    Unknown,
+}
+
+/// Key-value detail/metadata for an activity
+#[derive(Debug, Clone)]
+pub struct ActivityDetail {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub id: u64,
+    pub name: String,
+    pub short_name: String,
+    pub parent_id: Option<u64>,
+    pub start_time: Instant,
+    pub state: NixActivityState,
+    /// When the activity completed (for lingering display)
+    pub completed_at: Option<Instant>,
+    pub detail: Option<String>,
+    pub variant: ActivityVariant,
+    pub progress: Option<ProgressActivity>,
+    /// Additional details/metadata (shown when expanded)
+    pub details: Vec<ActivityDetail>,
+    /// Activity level for filtering (defaults to Info)
+    pub level: ActivityLevel,
+}
+
+/// UI state - lives outside the RwLock, managed by the UI thread.
+#[derive(Debug)]
+pub struct UiState {
+    pub preferences: Arc<crate::config::TuiPreferences>,
+    keymap: Arc<crate::config::Keymap>,
+    pub run_context: Arc<crate::config::TuiRunContext>,
+    pub pending_key: Option<String>,
+    pub viewport: ViewportConfig,
+    pub selected_activity: Option<u64>,
+    pub inline_logs_activity: Option<u64>,
+    pub process_previews_hidden: bool,
+    pub expanded_activities: HashSet<u64>,
+    pub process_search: Option<ProcessSearch>,
+    pub hide_stopped_processes: bool,
+    pub scroll: ScrollState,
+    pub view_options: ViewOptions,
+    /// Size the last frame was laid out at. Seeded from the terminal in
+    /// [`UiState::new`], so it is usable before anything has been painted.
+    pub terminal_size: TerminalSize,
+    pub interrupt_prompt_active: bool,
+    /// When the interrupt prompt is open while attached to a running process
+    /// manager: the prompt offers detach (leave running) vs stop the manager,
+    /// rather than the in-process "keep running vs quit".
+    pub interrupt_prompt_attached: bool,
+    pub view_mode: ViewMode,
+}
+
+impl UiState {
+    /// Create a new UiState, querying the terminal for its size.
+    pub fn new() -> Self {
+        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+        let preferences = crate::config::TuiPreferences::default();
+        let keymap = preferences.keybindings.resolve().unwrap();
+        Self {
+            preferences: Arc::new(preferences),
+            keymap: Arc::new(keymap),
+            run_context: Arc::new(crate::config::TuiRunContext::default()),
+            pending_key: None,
+            viewport: ViewportConfig {
+                current: 10,
+                min: 10,
+                max: 40,
+                activities_visible: 5,
+            },
+            selected_activity: None,
+            inline_logs_activity: None,
+            process_previews_hidden: false,
+            expanded_activities: HashSet::new(),
+            process_search: None,
+            hide_stopped_processes: false,
+            scroll: ScrollState {
+                log_offset: 0,
+                activity_position: 0,
+            },
+            view_options: ViewOptions {
+                show_details: false,
+            },
+            terminal_size: TerminalSize { width, height },
+            interrupt_prompt_active: false,
+            interrupt_prompt_attached: false,
+            view_mode: ViewMode::Main,
+        }
+    }
+
+    /// Record the size the current frame is rendered at.
+    pub fn set_terminal_size(&mut self, width: u16, height: u16) {
+        self.terminal_size = TerminalSize { width, height };
+    }
+
+    pub fn set_preferences(
+        &mut self,
+        preferences: crate::config::TuiPreferences,
+    ) -> Result<(), crate::config::UserConfigError> {
+        let keymap = preferences.keybindings.resolve()?;
+        self.preferences = Arc::new(preferences);
+        self.keymap = Arc::new(keymap);
+        Ok(())
+    }
+
+    pub fn keymap(&self) -> &Arc<crate::config::Keymap> {
+        &self.keymap
+    }
+
+    pub fn show_interrupt_prompt(&mut self, attached: bool) {
+        self.interrupt_prompt_active = true;
+        self.interrupt_prompt_attached = attached;
+    }
+
+    pub fn clear_interrupt_prompt(&mut self) {
+        self.interrupt_prompt_active = false;
+        self.interrupt_prompt_attached = false;
+    }
+
+    pub fn interrupt_prompt_active(&self) -> bool {
+        self.interrupt_prompt_active
+    }
+
+    /// Whether the open interrupt prompt is the attached-mode (detach vs stop)
+    /// variant.
+    pub fn interrupt_prompt_attached(&self) -> bool {
+        self.interrupt_prompt_attached
+    }
+
+    /// Toggle the `hide_stopped_processes` filter.
+    ///
+    /// Callers must then clear [`Self::selected_activity`] if the previous
+    /// selection is no longer selectable under the new filter state
+    /// (see [`ActivityModel::is_selectable`]).
+    pub fn toggle_hide_stopped_processes(&mut self) {
+        self.hide_stopped_processes = !self.hide_stopped_processes;
+    }
+
+    /// Select the next or previous activity from the list of selectable IDs.
+    ///
+    /// When `forward` is true, selects the next activity (or first if none selected).
+    /// When `forward` is false, selects the previous activity (or last if none selected).
+    pub fn select_activity(&mut self, selectable: &[u64], forward: bool) {
+        self.select_activity_by(selectable, 1, forward);
+    }
+
+    pub fn select_activity_by(&mut self, selectable: &[u64], steps: usize, forward: bool) {
+        if selectable.is_empty() {
+            return;
+        }
+        match self.selected_activity {
+            None => {
+                self.selected_activity = if forward {
+                    selectable.first().copied()
+                } else {
+                    selectable.last().copied()
+                };
+            }
+            Some(current_id) => {
+                if let Some(current_pos) = selectable.iter().position(|&id| id == current_id) {
+                    if forward {
+                        self.selected_activity = selectable
+                            .get(current_pos.saturating_add(steps).min(selectable.len() - 1))
+                            .copied();
+                    } else {
+                        self.selected_activity =
+                            selectable.get(current_pos.saturating_sub(steps)).copied();
+                    }
+                } else {
+                    self.selected_activity = selectable.first().copied();
+                }
+            }
+        }
+    }
+
+    pub fn toggle_inline_logs(&mut self) {
+        self.inline_logs_activity = match self.selected_activity {
+            Some(id) if self.inline_logs_activity != Some(id) => Some(id),
+            _ => None,
+        };
+    }
+
+    pub fn focus_inline_logs(&mut self, activity_id: u64) {
+        self.inline_logs_activity = Some(activity_id);
+        self.process_previews_hidden = true;
+    }
+
+    pub fn hide_process_previews(&mut self) {
+        self.inline_logs_activity = None;
+        self.process_previews_hidden = true;
+    }
+
+    pub fn toggle_activity_expansion(&mut self, activity_id: u64) {
+        if !self.expanded_activities.insert(activity_id) {
+            self.expanded_activities.remove(&activity_id);
+        }
+    }
+
+    pub fn start_process_search(&mut self) {
+        if self.process_search.is_none() {
+            self.process_search = Some(ProcessSearch {
+                query: String::new(),
+                original_selection: self.selected_activity,
+            });
+            self.inline_logs_activity = None;
+        }
+    }
+
+    pub fn finish_process_search(&mut self) {
+        self.process_search = None;
+    }
+
+    pub fn cancel_process_search(&mut self) {
+        if let Some(search) = self.process_search.take() {
+            self.selected_activity = search.original_selection;
+        }
+    }
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Debug)]
+pub struct ViewportConfig {
+    pub current: u16,
+    pub min: u16,
+    pub max: u16,
+    pub activities_visible: u16,
+}
+
+#[derive(Debug)]
+pub struct ScrollState {
+    pub log_offset: usize,
+    pub activity_position: usize,
+}
+
+#[derive(Debug)]
+pub struct ViewOptions {
+    pub show_details: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSearch {
+    pub query: String,
+    pub original_selection: Option<u64>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum AppState {
+    Running,
+    ShuttingDown,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskDisplayStatus {
+    Pending,
+    Running,
+    Success,
+    Failed,
+    Skipped,
+    Cancelled,
+}
+
+/// Which view is currently active in the TUI
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum ViewMode {
+    /// Main activity list view (non-fullscreen, preserves terminal scrollback)
+    #[default]
+    Main,
+    /// Expanded log view for a specific activity (fullscreen, uses alternate screen)
+    /// Note: scroll_offset is managed as component-local state for immediate responsiveness
+    ExpandedLogs { activity_id: u64 },
+}
+
+/// Controls rendering behavior independent of view content.
+/// This is passed to the view function to control how it renders,
+/// separate from ViewMode which controls *what* to render.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum RenderContext {
+    /// Normal rendering with full UI (nav bar, etc.)
+    #[default]
+    Normal,
+    /// Final render before exit - no nav bar
+    Final,
+}
+
+impl ActivityModel {
+    /// Create a new ActivityModel.
+    pub fn new() -> Self {
+        Self::with_config(Arc::new(TuiConfig::default()))
+    }
+
+    /// Create a new ActivityModel with custom configuration.
+    pub fn with_config(config: Arc<TuiConfig>) -> Self {
+        Self {
+            message_log: VecDeque::new(),
+            activities: HashMap::new(),
+            root_activities: Vec::new(),
+            build_logs: HashMap::new(),
+            log_line_counts: HashMap::new(),
+            app_state: AppState::Running,
+            completed_messages: Vec::new(),
+            config,
+            expected_builds: None,
+            expected_downloads: None,
+            additional_parents: HashMap::new(),
+        }
+    }
+
+    /// Get the TUI configuration.
+    pub fn config(&self) -> &TuiConfig {
+        &self.config
+    }
+
+    /// Apply an activity event to the model. Returns `true` if the event may
+    /// have changed the visible model (so the UI should redraw), and `false`
+    /// for known no-ops (shell events, skipped `.narinfo` fetches) so the render
+    /// loop is not woken needlessly.
+    pub fn apply_activity_event(&mut self, event: ActivityEvent) -> bool {
+        match event {
+            ActivityEvent::Build(build_event) => {
+                self.handle_build_event(build_event);
+                true
+            }
+            ActivityEvent::Fetch(fetch_event) => self.handle_fetch_event(fetch_event),
+            ActivityEvent::Evaluate(eval_event) => {
+                self.handle_evaluate_event(eval_event);
+                true
+            }
+            ActivityEvent::Task(task_event) => {
+                self.handle_task_event(task_event);
+                true
+            }
+            ActivityEvent::Command(cmd_event) => {
+                self.handle_command_event(cmd_event);
+                true
+            }
+            ActivityEvent::Process(proc_event) => {
+                self.handle_process_event(proc_event);
+                true
+            }
+            ActivityEvent::Operation(op_event) => {
+                self.handle_operation_event(op_event);
+                true
+            }
+            ActivityEvent::Message(msg) => {
+                self.handle_message(msg);
+                true
+            }
+            ActivityEvent::SetExpected(expected) => {
+                self.handle_set_expected(expected);
+                true
+            }
+            ActivityEvent::Shell(_) => {
+                // Shell events are handled separately by the shell runner;
+                // they don't affect the activity model.
+                false
+            }
+        }
+    }
+
+    fn handle_build_event(&mut self, event: Build) {
+        match event {
+            Build::Queued {
+                id,
+                name,
+                parent,
+                derivation_path,
+                ..
+            } => {
+                let variant = ActivityVariant::Build(BuildActivity {
+                    phase: Some("queued".to_string()),
+                    log_stdout_lines: Vec::new(),
+                    log_stderr_lines: Vec::new(),
+                });
+                self.create_activity_with_options(
+                    id,
+                    name,
+                    parent,
+                    derivation_path,
+                    variant,
+                    ActivityLevel::Info,
+                    NixActivityState::Queued,
+                );
+            }
+            Build::Start {
+                id,
+                name,
+                parent,
+                derivation_path,
+                ..
+            } => {
+                let variant = ActivityVariant::Build(BuildActivity {
+                    phase: Some("running".to_string()),
+                    log_stdout_lines: Vec::new(),
+                    log_stderr_lines: Vec::new(),
+                });
+                self.create_activity(
+                    id,
+                    name,
+                    parent,
+                    derivation_path,
+                    variant,
+                    ActivityLevel::Info,
+                );
+            }
+            Build::Complete { id, outcome, .. } => {
+                self.handle_activity_complete(id, outcome);
+            }
+            Build::Phase { id, phase, .. } => {
+                self.handle_activity_phase(id, phase);
+            }
+            Build::Progress {
+                id, done, expected, ..
+            } => {
+                self.handle_item_progress(id, done, expected);
+            }
+            Build::Log {
+                id, line, is_error, ..
+            } => {
+                self.handle_activity_log(id, line, is_error);
+            }
+        }
+    }
+
+    /// Returns `true` if the model may have changed; `false` for skipped
+    /// `.narinfo` downloads, which are not displayed.
+    fn handle_fetch_event(&mut self, event: Fetch) -> bool {
+        match event {
+            Fetch::Start {
+                id,
+                kind,
+                name,
+                parent,
+                url,
+                ..
+            } => {
+                // Skip .narinfo downloads - these are redundant with Query activities.
+                // When Nix checks if a store path exists in a cache, it emits both:
+                // 1. A Query activity with the human-readable store path name
+                // 2. A Download activity for the actual .narinfo HTTP request
+                // We only display the Query since it has the better name.
+                if kind == FetchKind::Download && name.ends_with(".narinfo") {
+                    return false;
+                }
+
+                let substituter = url.as_ref().and_then(|u| {
+                    url::Url::parse(u)
+                        .ok()
+                        .and_then(|parsed| parsed.host_str().map(|h| h.to_string()))
+                });
+                let variant = match kind {
+                    FetchKind::Query => ActivityVariant::Query(QueryActivity {
+                        substituter: substituter.clone(),
+                    }),
+                    FetchKind::Tree => ActivityVariant::FetchTree,
+                    FetchKind::Download => ActivityVariant::Download(DownloadActivity {
+                        size_current: Some(0),
+                        size_total: None,
+                        speed: None,
+                        substituter,
+                    }),
+                    FetchKind::Copy => ActivityVariant::Copy,
+                };
+                self.create_activity(id, name, parent, url, variant, ActivityLevel::Info);
+                true
+            }
+            Fetch::Complete { id, outcome, .. } => {
+                self.handle_activity_complete(id, outcome);
+                true
+            }
+            Fetch::Progress {
+                id, current, total, ..
+            } => {
+                self.handle_byte_progress(id, current, total);
+                true
+            }
+        }
+    }
+
+    fn handle_evaluate_event(&mut self, event: Evaluate) {
+        match event {
+            Evaluate::Start {
+                id,
+                name,
+                level,
+                parent,
+                ..
+            } => {
+                let variant = ActivityVariant::Evaluating(EvaluatingActivity::default());
+                self.create_activity(id, name, parent, None, variant, level);
+            }
+            Evaluate::Complete { id, outcome, .. } => {
+                self.handle_activity_complete(id, outcome);
+            }
+            Evaluate::Log { id, line, .. } => {
+                self.handle_activity_log(id, line, false);
+            }
+            Evaluate::Op { id, op, .. } => {
+                // The progress count is derived only from structured Nix
+                // effects, never from their human-readable rendering.
+                let counts_as_file_read = matches!(
+                    op,
+                    EvalOp::EvaluatedFile { cached: false, .. }
+                        | EvalOp::ReadFile { .. }
+                        | EvalOp::ReadFileType { .. }
+                        | EvalOp::HashFile { .. }
+                        | EvalOp::PathExists { .. }
+                );
+                if counts_as_file_read
+                    && let Some(activity) = self.activities.get_mut(&id)
+                    && let ActivityVariant::Evaluating(eval) = &mut activity.variant
+                {
+                    eval.files_read += 1;
+                }
+            }
+        }
+    }
+
+    fn handle_task_event(&mut self, event: Task) {
+        match event {
+            Task::Hierarchy { tasks, edges, .. } => {
+                // Build parent relationships from edges first
+                // edges are (parent_id, child_id) pairs
+                // First edge for a child is the primary parent, rest are additional parents
+                let mut primary_parents: HashMap<u64, u64> = HashMap::new();
+                let mut additional: HashMap<u64, Vec<u64>> = HashMap::new();
+
+                for (parent_id, child_id) in edges {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        primary_parents.entry(child_id)
+                    {
+                        // First edge - set as primary parent
+                        e.insert(parent_id);
+                    } else {
+                        // Already has primary parent, add as additional
+                        additional.entry(child_id).or_default().push(parent_id);
+                    }
+                }
+
+                // Create all task activities upfront in Queued state
+                // Use parent from edges if available
+                for task_info in tasks {
+                    // Skip process tasks - they create Process activities instead
+                    if task_info.is_process {
+                        continue;
+                    }
+
+                    let variant = ActivityVariant::Task(TaskActivity {
+                        status: TaskDisplayStatus::Pending,
+                        duration: None,
+                        show_output: task_info.show_output,
+                        last_log_line: None,
+                    });
+                    let parent = primary_parents.get(&task_info.id).copied();
+                    self.create_activity_with_options(
+                        task_info.id,
+                        task_info.name,
+                        parent,
+                        None,
+                        variant,
+                        ActivityLevel::Info,
+                        NixActivityState::Queued,
+                    );
+                }
+
+                // Store additional parents
+                for (child_id, parents) in additional {
+                    if !parents.is_empty() {
+                        self.additional_parents.insert(child_id, parents);
+                    }
+                }
+            }
+            Task::Start { id, .. } => {
+                // Transition task from Queued to Active
+                if let Some(activity) = self.activities.get_mut(&id) {
+                    activity.state = NixActivityState::Active;
+                    activity.start_time = Instant::now();
+                    activity.completed_at = None;
+                    if let ActivityVariant::Task(task) = &mut activity.variant {
+                        task.status = TaskDisplayStatus::Running;
+                        task.duration = None;
+                    }
+                }
+            }
+            Task::Complete { id, outcome, .. } => {
+                self.handle_activity_complete(id, outcome);
+            }
+            Task::Progress {
+                id, done, expected, ..
+            } => {
+                self.handle_item_progress(id, done, expected);
+            }
+            Task::Log {
+                id, line, is_error, ..
+            } => {
+                self.handle_activity_log(id, line, is_error);
+            }
+        }
+    }
+
+    fn handle_command_event(&mut self, event: Command) {
+        match event {
+            Command::Start {
+                id,
+                name,
+                parent,
+                command,
+                ..
+            } => {
+                let variant = ActivityVariant::UserOperation;
+                self.create_activity(id, name, parent, command, variant, ActivityLevel::Debug);
+            }
+            Command::Complete { id, outcome, .. } => {
+                self.handle_activity_complete(id, outcome);
+            }
+            Command::Log {
+                id, line, is_error, ..
+            } => {
+                self.handle_activity_log(id, line, is_error);
+            }
+        }
+    }
+
+    fn handle_process_event(&mut self, event: Process) {
+        match event {
+            Process::Start {
+                id,
+                name,
+                parent,
+                command,
+                ports,
+                urls,
+                ready_probe,
+                level,
+                ..
+            } => {
+                let variant = ActivityVariant::Process(ProcessActivity {
+                    status: ProcessStatus::Starting,
+                    ports,
+                    urls: *urls,
+                    ready_probe,
+                });
+                self.create_activity(id, name, parent, command, variant, level);
+            }
+            Process::Complete { id, outcome, .. } => {
+                if let Some(activity) = self.activities.get_mut(&id)
+                    && let ActivityVariant::Process(ref mut proc) = activity.variant
+                {
+                    proc.status = ProcessStatus::Stopped;
+                }
+                self.handle_activity_complete(id, outcome);
+            }
+            Process::Log {
+                id, line, is_error, ..
+            } => {
+                self.handle_activity_log(id, line, is_error);
+            }
+            Process::Status { id, status, .. } => {
+                if let Some(activity) = self.activities.get_mut(&id) {
+                    // Ignore status updates after the activity is completed
+                    if matches!(activity.state, NixActivityState::Completed { .. }) {
+                        return;
+                    }
+                    if let ActivityVariant::Process(ref mut proc) = activity.variant {
+                        proc.status = status;
+                    }
+                }
+            }
+            Process::Exited { id, success, .. } => {
+                let outcome = if success { "success" } else { "failure" };
+                self.handle_activity_log(id, format!("Process exited ({outcome})"), !success);
+            }
+            Process::Restarted { id, attempt, .. } => {
+                self.handle_activity_log(id, format!("Restarted (attempt {attempt})"), false);
+            }
+        }
+    }
+
+    fn handle_operation_event(&mut self, event: Operation) {
+        match event {
+            Operation::Start {
+                id,
+                name,
+                parent,
+                detail,
+                level,
+                ..
+            } => {
+                let variant = ActivityVariant::Devenv;
+                self.create_activity(id, name, parent, detail, variant, level);
+            }
+            Operation::Complete { id, outcome, .. } => {
+                self.handle_activity_complete(id, outcome);
+            }
+            Operation::Progress {
+                id,
+                done,
+                expected,
+                detail,
+                ..
+            } => {
+                self.handle_item_progress(id, done, expected);
+                if let Some(activity) = self.activities.get_mut(&id) {
+                    activity.detail = detail;
+                }
+            }
+            Operation::Log {
+                id, line, is_error, ..
+            } => {
+                self.handle_activity_log(id, line, is_error);
+            }
+        }
+    }
+
+    fn handle_set_expected(&mut self, event: SetExpected) {
+        match event.category {
+            ExpectedCategory::Build => {
+                self.expected_builds = Some(event.expected);
+            }
+            ExpectedCategory::Download => {
+                self.expected_downloads = Some(event.expected);
+            }
+        }
+    }
+
+    fn create_activity(
+        &mut self,
+        id: u64,
+        name: String,
+        parent: Option<u64>,
+        detail: Option<String>,
+        variant: ActivityVariant,
+        level: ActivityLevel,
+    ) {
+        self.create_activity_with_options(
+            id,
+            name,
+            parent,
+            detail,
+            variant,
+            level,
+            NixActivityState::Active,
+        );
+    }
+
+    fn create_activity_with_options(
+        &mut self,
+        id: u64,
+        name: String,
+        parent: Option<u64>,
+        detail: Option<String>,
+        variant: ActivityVariant,
+        level: ActivityLevel,
+        state: NixActivityState,
+    ) {
+        // Nix stream activities (Build, Fetch, Evaluate) don't have explicit levels
+        // in their events - they come from Nix's JSON output. We inherit level from
+        // parent so that activities under a Debug-level operation are also Debug.
+        // Our own activities (Operation, Task, Command, Message) already have correct
+        // levels set explicitly, so no inheritance needed.
+        let is_nix_activity = matches!(
+            variant,
+            ActivityVariant::Build(_)
+                | ActivityVariant::Download(_)
+                | ActivityVariant::Copy
+                | ActivityVariant::Evaluating(_)
+                | ActivityVariant::Query(_)
+                | ActivityVariant::FetchTree
+        );
+
+        let effective_level = if is_nix_activity {
+            // Inherit level from parent if parent has a higher (less visible) level
+            if let Some(parent_id) = parent {
+                if let Some(parent_activity) = self.activities.get(&parent_id) {
+                    if parent_activity.level > level {
+                        parent_activity.level
+                    } else {
+                        level
+                    }
+                } else {
+                    level
+                }
+            } else {
+                level
+            }
+        } else {
+            // Non-Nix activities have their own explicit levels
+            level
+        };
+
+        let is_root = parent.is_none();
+
+        let activity = Activity {
+            id,
+            name: name.clone(),
+            short_name: name,
+            parent_id: parent,
+            start_time: Instant::now(),
+            state,
+            completed_at: None,
+            detail,
+            variant,
+            progress: None,
+            details: Vec::new(),
+            level: effective_level,
+        };
+
+        if is_root {
+            self.root_activities.push(id);
+        }
+
+        self.activities.insert(id, activity);
+    }
+
+    fn handle_activity_complete(&mut self, id: u64, outcome: ActivityOutcome) {
+        // First, get the activity info we need
+        let (variant, success, cached, duration) = {
+            if let Some(activity) = self.activities.get(&id) {
+                let success = matches!(
+                    outcome,
+                    ActivityOutcome::Success | ActivityOutcome::Cached | ActivityOutcome::Skipped
+                );
+                let cached = matches!(outcome, ActivityOutcome::Cached);
+                let duration = if matches!(&activity.state, NixActivityState::Queued) {
+                    Duration::ZERO
+                } else {
+                    activity.start_time.elapsed()
+                };
+                (activity.variant.clone(), success, cached, duration)
+            } else {
+                return;
+            }
+        };
+
+        // Update the activity state
+        if let Some(activity) = self.activities.get_mut(&id) {
+            activity.state = NixActivityState::Completed {
+                success,
+                cached,
+                duration,
+            };
+            activity.completed_at = Some(Instant::now());
+
+            // Clear the phase when build completes so it's not displayed
+            if let ActivityVariant::Build(ref mut build) = activity.variant {
+                build.phase = None;
+            }
+
+            if let ActivityVariant::Task(ref mut task) = activity.variant {
+                task.status = match outcome {
+                    ActivityOutcome::Success => TaskDisplayStatus::Success,
+                    ActivityOutcome::Cached | ActivityOutcome::Skipped => {
+                        TaskDisplayStatus::Skipped
+                    }
+                    ActivityOutcome::Failed | ActivityOutcome::DependencyFailed => {
+                        TaskDisplayStatus::Failed
+                    }
+                    ActivityOutcome::Cancelled => TaskDisplayStatus::Cancelled,
+                };
+                task.duration = Some(duration);
+            }
+        }
+
+        // For Devenv (Operation) activities, check if any child Evaluate was cached
+        // and propagate that cache status to the parent
+        if matches!(variant, ActivityVariant::Devenv) {
+            let has_cached_child = self.activities.values().any(|child| {
+                child.parent_id == Some(id)
+                    && matches!(child.variant, ActivityVariant::Evaluating(_))
+                    && matches!(
+                        child.state,
+                        NixActivityState::Completed { cached: true, .. }
+                    )
+            });
+
+            if has_cached_child
+                && let Some(activity) = self.activities.get_mut(&id)
+                && let NixActivityState::Completed {
+                    success, duration, ..
+                } = activity.state
+            {
+                activity.state = NixActivityState::Completed {
+                    success,
+                    cached: true,
+                    duration,
+                };
+            }
+        }
+    }
+
+    fn handle_item_progress(&mut self, id: u64, done: u64, expected: u64) {
+        if let Some(activity) = self.activities.get_mut(&id) {
+            let percent = if expected > 0 {
+                Some((done as f32 / expected as f32) * 100.0)
+            } else {
+                None
+            };
+
+            activity.progress = Some(ProgressActivity {
+                current: Some(done),
+                total: Some(expected),
+                unit: Some("items".to_string()),
+                percent,
+            });
+        }
+    }
+
+    fn handle_byte_progress(&mut self, id: u64, current: u64, total: Option<u64>) {
+        if let Some(activity) = self.activities.get_mut(&id) {
+            let percent = total.map(|t| {
+                if t > 0 {
+                    (current as f32 / t as f32) * 100.0
+                } else {
+                    0.0
+                }
+            });
+
+            activity.progress = Some(ProgressActivity {
+                current: Some(current),
+                total,
+                unit: Some("bytes".to_string()),
+                percent,
+            });
+
+            if let ActivityVariant::Download(ref mut download) = activity.variant {
+                let speed = if let Some(prev_current) = download.size_current {
+                    let time_delta = 0.1;
+                    let bytes_delta = current.saturating_sub(prev_current) as f64;
+                    (bytes_delta / time_delta) as u64
+                } else {
+                    0
+                };
+
+                download.size_current = Some(current);
+                download.size_total = total;
+                download.speed = Some(speed);
+            }
+        }
+    }
+
+    fn handle_activity_phase(&mut self, id: u64, phase: String) {
+        if let Some(activity) = self.activities.get_mut(&id)
+            && let ActivityVariant::Build(ref mut build) = activity.variant
+        {
+            build.phase = Some(phase);
+        }
+    }
+
+    fn handle_activity_log(&mut self, id: u64, line: String, is_error: bool) {
+        let logs = self
+            .build_logs
+            .entry(id)
+            .or_insert_with(|| Arc::new(VecDeque::new()));
+        let logs_mut = Arc::make_mut(logs);
+        if logs_mut.len() >= self.config.max_log_lines_per_build {
+            logs_mut.pop_front();
+        }
+        logs_mut.push_back(line.clone());
+
+        // Track total line count (not affected by buffer rotation)
+        *self.log_line_counts.entry(id).or_insert(0) += 1;
+
+        if let Some(activity) = self.activities.get_mut(&id) {
+            match &mut activity.variant {
+                ActivityVariant::Build(build) => {
+                    if is_error {
+                        build.log_stderr_lines.push(line);
+                    } else {
+                        build.log_stdout_lines.push(line);
+                    }
+                }
+                ActivityVariant::Task(task) => {
+                    task.last_log_line = Some(line);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Log a line to an activity's log buffer without counting or other side effects.
+    fn log_to_activity(&mut self, id: u64, line: String) {
+        let logs = self
+            .build_logs
+            .entry(id)
+            .or_insert_with(|| Arc::new(VecDeque::new()));
+        let logs_mut = Arc::make_mut(logs);
+        if logs_mut.len() >= self.config.max_log_lines_per_build {
+            logs_mut.pop_front();
+        }
+        logs_mut.push_back(line);
+
+        *self.log_line_counts.entry(id).or_insert(0) += 1;
+    }
+
+    fn handle_message(&mut self, msg: Message) {
+        self.add_log_message(msg.clone());
+
+        // Only create activity for messages with a parent
+        if msg.parent.is_some() {
+            let id = msg.id;
+            let level = msg.level;
+            let has_details = msg.details.is_some();
+            let text = msg.text.clone();
+            let variant = ActivityVariant::Message(MessageActivity {
+                level,
+                details: msg.details.clone(),
+            });
+            self.create_activity_with_options(
+                id,
+                msg.text,
+                msg.parent,
+                None,
+                variant,
+                level,
+                NixActivityState::Active,
+            );
+
+            // Store details as lines in build_logs for expansion
+            if let Some(details) = &msg.details {
+                let lines: VecDeque<String> = details.lines().map(String::from).collect();
+                self.build_logs.insert(id, Arc::new(lines));
+            }
+
+            // Propagate error details to parent's build_logs so the parent
+            // activity can show them inline when it fails (e.g. Evaluate errors).
+            if level == ActivityLevel::Error
+                && let Some(parent_id) = msg.parent
+            {
+                self.log_to_activity(parent_id, text);
+                if let Some(details) = &msg.details {
+                    for line in details.lines() {
+                        self.log_to_activity(parent_id, line.to_string());
+                    }
+                }
+            }
+
+            // Mark message activities as immediately completed (they're just informational)
+            if let Some(activity) = self.activities.get_mut(&id) {
+                activity.state = NixActivityState::Completed {
+                    success: has_details, // Show as "expandable" if has details
+                    cached: false,
+                    duration: std::time::Duration::ZERO,
+                };
+                activity.completed_at = Some(Instant::now());
+            }
+        }
+    }
+
+    pub fn add_log_message(&mut self, message: Message) {
+        self.message_log.push_back(message);
+        if self.message_log.len() > self.config.max_log_messages {
+            self.message_log.pop_front();
+        }
+    }
+
+    pub fn get_active_activities(&self) -> Vec<&Activity> {
+        self.activities
+            .values()
+            .filter(|activity| {
+                matches!(
+                    activity.state,
+                    NixActivityState::Queued | NixActivityState::Active
+                )
+            })
+            .collect()
+    }
+
+    pub fn get_selectable_activity_ids(&self, ui_state: &UiState) -> Vec<u64> {
+        let display = self.get_display_activities(ui_state);
+        self.get_selectable_activity_ids_from_display(&display, ui_state)
+    }
+
+    pub fn get_selectable_activity_ids_from_display(
+        &self,
+        display: &[DisplayActivity],
+        ui_state: &UiState,
+    ) -> Vec<u64> {
+        let mut seen = HashSet::new();
+        display
+            .iter()
+            .filter(|da| {
+                // Processes are always selectable (so disabled ones can be started)
+                matches!(da.activity.variant, ActivityVariant::Process(_))
+                    || self.is_activity_collapsible(da.activity.id, ui_state)
+                    || self
+                        .build_logs
+                        .get(&da.activity.id)
+                        .is_some_and(|logs| !logs.is_empty())
+            })
+            .filter_map(|da| {
+                let id = da.activity.id;
+                seen.insert(id).then_some(id)
+            })
+            .collect()
+    }
+
+    pub fn get_matching_process_activity_ids(&self, ui_state: &UiState, query: &str) -> Vec<u64> {
+        let display = self.get_display_activities(ui_state);
+        self.get_matching_process_activity_ids_from_display(&display, query)
+    }
+
+    pub fn get_matching_process_activity_ids_from_display(
+        &self,
+        display: &[DisplayActivity],
+        query: &str,
+    ) -> Vec<u64> {
+        let query = query.to_lowercase();
+        display
+            .iter()
+            .filter(|da| matches!(da.activity.variant, ActivityVariant::Process(_)))
+            .filter(|da| da.activity.name.to_lowercase().contains(&query))
+            .map(|da| da.activity.id)
+            .collect()
+    }
+
+    /// Returns `true` if `id` would appear in
+    /// [`Self::get_selectable_activity_ids`] for the given `ui_state`.
+    pub fn is_selectable(&self, id: u64, ui_state: &UiState) -> bool {
+        self.get_selectable_activity_ids(ui_state).contains(&id)
+    }
+
+    pub fn get_display_activities(&self, ui_state: &UiState) -> Vec<DisplayActivity> {
+        self.get_display_activities_with_limit(&ChildActivityLimit::default(), ui_state)
+    }
+
+    pub fn get_display_activities_with_limit(
+        &self,
+        limit: &ChildActivityLimit,
+        ui_state: &UiState,
+    ) -> Vec<DisplayActivity> {
+        let mut activities = Vec::new();
+        // Track (activity_id, parent_id) pairs to allow same activity under multiple parents
+        let mut processed: std::collections::HashSet<(u64, Option<u64>)> =
+            std::collections::HashSet::new();
+
+        for &root_id in &self.root_activities {
+            self.add_display_activity(
+                &mut activities,
+                root_id,
+                None,
+                0,
+                &mut processed,
+                limit,
+                ui_state,
+            );
+        }
+
+        activities
+    }
+
+    fn add_display_activity(
+        &self,
+        activities: &mut Vec<DisplayActivity>,
+        activity_id: u64,
+        parent_id: Option<u64>,
+        depth: usize,
+        processed: &mut std::collections::HashSet<(u64, Option<u64>)>,
+        limit: &ChildActivityLimit,
+        ui_state: &UiState,
+    ) {
+        // Track (activity_id, parent_id) to allow same activity under different parents
+        if !processed.insert((activity_id, parent_id)) {
+            return;
+        }
+
+        if let Some(activity) = self.activities.get(&activity_id) {
+            // Skip command activities (UserOperation) - they are internal details
+            if matches!(activity.variant, ActivityVariant::UserOperation)
+                || self.is_hidden_process(activity, ui_state)
+            {
+                return;
+            }
+
+            // Filter by activity level: skip activities below the filter level
+            // ActivityLevel ordering: Error < Warn < Info < Debug < Trace
+            // We show activities at or below (more severe than or equal to) filter_level
+            let activity_visible = activity.level <= self.config.filter_level;
+
+            // Get all children (not filtered by level) so we can traverse through
+            // filtered parents to find visible children
+            let (all_children, _total, _hidden_count) = self.get_children(activity_id, limit);
+
+            if activity_visible {
+                activities.push(DisplayActivity {
+                    activity: activity.clone(),
+                    depth,
+                });
+            }
+
+            if activity_visible && self.is_activity_collapsed(activity_id, ui_state) {
+                return;
+            }
+
+            // Recursively process children.
+            // Even if this activity is filtered, still traverse to children
+            // so we can find visible descendants (e.g., Info messages under Debug parents).
+            let child_depth = if activity_visible { depth + 1 } else { depth };
+            for child in all_children {
+                self.add_display_activity(
+                    activities,
+                    child.id,
+                    Some(activity_id),
+                    child_depth,
+                    processed,
+                    limit,
+                    ui_state,
+                );
+            }
+        }
+    }
+
+    fn is_hidden_process(&self, activity: &Activity, ui_state: &UiState) -> bool {
+        if !ui_state.hide_stopped_processes {
+            return false;
+        }
+
+        match (&activity.variant, &activity.state) {
+            (
+                ActivityVariant::Process(ProcessActivity {
+                    status: ProcessStatus::Stopped | ProcessStatus::Exited,
+                    ..
+                }),
+                NixActivityState::Completed { success: false, .. },
+            ) => false,
+            (
+                ActivityVariant::Process(ProcessActivity {
+                    status: ProcessStatus::Stopped | ProcessStatus::Exited,
+                    ..
+                }),
+                _,
+            ) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether `activity` is a direct child of `parent_id`, accounting for the
+    /// primary parent link and any additional parents.
+    fn is_direct_child_of(&self, activity: &Activity, parent_id: u64) -> bool {
+        activity.parent_id == Some(parent_id)
+            || self
+                .additional_parents
+                .get(&activity.id)
+                .is_some_and(|parents| parents.contains(&parent_id))
+    }
+
+    /// Count how many direct children of `parent_id` are hidden by the
+    /// `hide_stopped_processes` filter. Returns 0 when the filter is off.
+    pub fn count_hidden_process_children(&self, parent_id: u64, ui_state: &UiState) -> usize {
+        if !ui_state.hide_stopped_processes {
+            return 0;
+        }
+        self.activities
+            .values()
+            .filter(|a| {
+                self.is_direct_child_of(a, parent_id) && self.is_hidden_process(a, ui_state)
+            })
+            .count()
+    }
+
+    fn is_completed_shell_activity(&self, activity: &Activity) -> bool {
+        let is_shell_activity = matches!(
+            activity.variant,
+            ActivityVariant::Evaluating(_) | ActivityVariant::Devenv
+        ) && activity.name.to_lowercase().contains("shell");
+        if !matches!(
+            activity.state,
+            NixActivityState::Completed { success: true, .. }
+        ) {
+            return false;
+        }
+        if self.activities.values().any(|child| {
+            matches!(child.variant, ActivityVariant::Process(_))
+                && self.is_direct_child_of(child, activity.id)
+        }) {
+            return false;
+        }
+        is_shell_activity
+    }
+
+    fn has_diagnostic_descendant(&self, activity_id: u64) -> bool {
+        let mut pending = vec![activity_id];
+        let mut visited = HashSet::from([activity_id]);
+
+        while let Some(parent_id) = pending.pop() {
+            for child in self
+                .activities
+                .values()
+                .filter(|child| self.is_direct_child_of(child, parent_id))
+            {
+                if !visited.insert(child.id) {
+                    continue;
+                }
+                if matches!(
+                    child.variant,
+                    ActivityVariant::Message(MessageActivity {
+                        level: ActivityLevel::Error | ActivityLevel::Warn,
+                        ..
+                    })
+                ) {
+                    return true;
+                }
+                pending.push(child.id);
+            }
+        }
+
+        false
+    }
+
+    pub fn collapsible_descendant_count(
+        &self,
+        activity_id: u64,
+        ui_state: &UiState,
+    ) -> Option<usize> {
+        let activity = self.activities.get(&activity_id)?;
+        if !self.is_completed_shell_activity(activity)
+            || self.has_diagnostic_descendant(activity_id)
+            || activity
+                .parent_id
+                .and_then(|parent_id| self.activities.get(&parent_id))
+                .is_some_and(|parent| self.is_completed_shell_activity(parent))
+        {
+            return None;
+        }
+        let descendant_count = self.visible_descendant_count(activity_id, ui_state);
+        (descendant_count > 0).then_some(descendant_count)
+    }
+
+    pub fn is_activity_collapsible(&self, activity_id: u64, ui_state: &UiState) -> bool {
+        self.collapsible_descendant_count(activity_id, ui_state)
+            .is_some()
+    }
+
+    pub fn is_activity_collapsed(&self, activity_id: u64, ui_state: &UiState) -> bool {
+        self.is_activity_collapsible(activity_id, ui_state)
+            && !ui_state.expanded_activities.contains(&activity_id)
+    }
+
+    pub fn visible_descendant_count(&self, activity_id: u64, ui_state: &UiState) -> usize {
+        fn visit(
+            model: &ActivityModel,
+            activity_id: u64,
+            ui_state: &UiState,
+            visited: &mut HashSet<u64>,
+        ) -> usize {
+            model
+                .activities
+                .values()
+                .filter(|child| {
+                    !matches!(child.variant, ActivityVariant::UserOperation)
+                        && !model.is_hidden_process(child, ui_state)
+                        && model.is_direct_child_of(child, activity_id)
+                })
+                .map(|child| {
+                    if visited.insert(child.id) {
+                        usize::from(child.level <= model.config.filter_level)
+                            + visit(model, child.id, ui_state, visited)
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+
+        let mut visited = HashSet::from([activity_id]);
+        visit(self, activity_id, ui_state, &mut visited)
+    }
+
+    pub fn calculate_summary(&self) -> ActivitySummary {
+        let mut summary = ActivitySummary::default();
+
+        for activity in self.activities.values() {
+            match (&activity.variant, &activity.state) {
+                (
+                    ActivityVariant::Build(_),
+                    NixActivityState::Queued | NixActivityState::Active,
+                ) => summary.active_builds += 1,
+                (ActivityVariant::Build(_), NixActivityState::Completed { success: true, .. }) => {
+                    summary.completed_builds += 1;
+                }
+                (ActivityVariant::Build(_), NixActivityState::Completed { success: false, .. }) => {
+                    summary.failed_builds += 1;
+                }
+                (
+                    ActivityVariant::Download(_) | ActivityVariant::Copy,
+                    NixActivityState::Queued | NixActivityState::Active,
+                ) => summary.active_downloads += 1,
+                (
+                    ActivityVariant::Download(_) | ActivityVariant::Copy,
+                    NixActivityState::Completed { success: true, .. },
+                ) => {
+                    summary.completed_downloads += 1;
+                }
+                (
+                    ActivityVariant::Query(_),
+                    NixActivityState::Queued | NixActivityState::Active,
+                ) => summary.active_queries += 1,
+                (ActivityVariant::Query(_), NixActivityState::Completed { success: true, .. }) => {
+                    summary.completed_queries += 1;
+                }
+                (ActivityVariant::Task(task), _) => match task.status {
+                    TaskDisplayStatus::Running | TaskDisplayStatus::Pending => {
+                        summary.running_tasks += 1
+                    }
+                    TaskDisplayStatus::Success | TaskDisplayStatus::Skipped => {
+                        summary.completed_tasks += 1
+                    }
+                    TaskDisplayStatus::Failed | TaskDisplayStatus::Cancelled => {
+                        summary.failed_tasks += 1
+                    }
+                },
+                (ActivityVariant::Process(proc), state) => {
+                    if proc.status.is_active() {
+                        summary.running_processes += 1;
+                        summary.total_processes += 1;
+                    } else if matches!(
+                        proc.status,
+                        ProcessStatus::Stopped | ProcessStatus::Exited | ProcessStatus::GaveUp
+                    ) {
+                        if proc.status.is_failed()
+                            || matches!(state, NixActivityState::Completed { success: false, .. })
+                        {
+                            summary.failed_processes += 1;
+                        } else {
+                            summary.stopped_processes += 1;
+                        }
+                        summary.total_processes += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        summary.total_builds =
+            summary.active_builds + summary.completed_builds + summary.failed_builds;
+        summary.expected_builds = self.expected_builds;
+        summary.expected_downloads = self.expected_downloads;
+        summary
+    }
+
+    pub fn get_activity(&self, activity_id: u64) -> Option<&Activity> {
+        self.activities.get(&activity_id)
+    }
+
+    pub fn get_build_logs(&self, activity_id: u64) -> Option<&Arc<VecDeque<String>>> {
+        self.build_logs.get(&activity_id)
+    }
+
+    /// Get total log line count for an activity (not affected by buffer rotation)
+    pub fn get_log_line_count(&self, activity_id: u64) -> usize {
+        self.log_line_counts.get(&activity_id).copied().unwrap_or(0)
+    }
+
+    /// Get standalone error messages (those without a parent activity).
+    /// Returns the most recent error messages for display in the TUI panel.
+    pub fn get_error_messages(&self) -> Vec<&Message> {
+        self.message_log
+            .iter()
+            .filter(|msg| msg.parent.is_none() && msg.level == ActivityLevel::Error)
+            .collect()
+    }
+
+    /// Get error messages from Activity::Message variants.
+    /// This catches errors that may have been created as activities but not in message_log.
+    pub fn get_activity_error_messages(&self) -> Vec<(&str, Option<&str>)> {
+        self.activities
+            .values()
+            .filter_map(|activity| {
+                if let ActivityVariant::Message(msg_data) = &activity.variant
+                    && msg_data.level == ActivityLevel::Error
+                {
+                    Some((activity.name.as_str(), msg_data.details.as_deref()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get stderr output from failed or incomplete builds.
+    /// Returns tuples of (build_name, stderr_lines).
+    ///
+    /// This includes:
+    /// - Builds that completed with success=false
+    /// - Builds that are still active/queued but have stderr output
+    ///   (the FFI layer doesn't always report failures properly)
+    pub fn get_failed_build_errors(&self) -> Vec<(&str, &[String])> {
+        self.activities
+            .values()
+            .filter_map(|activity| {
+                if let ActivityVariant::Build(build) = &activity.variant
+                    && !build.log_stderr_lines.is_empty()
+                {
+                    // Include if explicitly failed OR still active (likely unreported failure)
+                    let is_failed = matches!(
+                        activity.state,
+                        NixActivityState::Completed { success: false, .. }
+                    );
+                    let is_incomplete = matches!(
+                        activity.state,
+                        NixActivityState::Active | NixActivityState::Queued
+                    );
+                    if is_failed || is_incomplete {
+                        return Some((activity.name.as_str(), build.log_stderr_lines.as_slice()));
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
+    pub fn get_total_duration(&self) -> Option<std::time::Duration> {
+        let earliest_start = self.activities.values().map(|a| a.start_time).min()?;
+        Some(Instant::now().duration_since(earliest_start))
+    }
+
+    pub fn get_active_display_activities(&self, ui_state: &UiState) -> Vec<DisplayActivity> {
+        self.get_display_activities(ui_state)
+            .into_iter()
+            .filter(|da| {
+                matches!(
+                    da.activity.state,
+                    NixActivityState::Queued | NixActivityState::Active
+                )
+            })
+            .collect()
+    }
+
+    /// Get children of an activity without level filtering.
+    /// Used for traversing through filtered parents to find visible descendants.
+    /// Prioritizes active activities, then lingering completed ones, then older completed ones.
+    /// Returns a tuple of (visible_children, total_children_count, hidden_count).
+    ///
+    /// Task activities always show all their children without linger/limit restrictions,
+    /// so completed tasks remain visible after execution.
+    fn get_children(
+        &self,
+        parent_id: u64,
+        limit: &ChildActivityLimit,
+    ) -> (Vec<&Activity>, usize, usize) {
+        let now = Instant::now();
+
+        // Check if parent is a Task activity - tasks always show all children
+        let parent_is_task = self
+            .activities
+            .get(&parent_id)
+            .is_some_and(|a| matches!(a.variant, ActivityVariant::Task(_)));
+
+        // Get all children of this parent (including additional parents),
+        // excluding hidden activities.
+        let mut all_children: Vec<_> = self
+            .activities
+            .values()
+            .filter(|a| {
+                !matches!(a.variant, ActivityVariant::UserOperation)
+                    && self.is_direct_child_of(a, parent_id)
+            })
+            .collect();
+
+        let total_count = all_children.len();
+
+        // For Task parents or process groups, always show all children without limits
+        let has_process_children = all_children
+            .iter()
+            .any(|a| matches!(a.variant, ActivityVariant::Process(_)));
+        if parent_is_task || has_process_children {
+            // Sort non-process activities first (by id), then processes alphabetically
+            all_children.sort_by(|a, b| {
+                let a_is_process = matches!(a.variant, ActivityVariant::Process(_));
+                let b_is_process = matches!(b.variant, ActivityVariant::Process(_));
+                match (a_is_process, b_is_process) {
+                    (false, true) => std::cmp::Ordering::Less,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, false) => a.id.cmp(&b.id),
+                    (true, true) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                }
+            });
+            return (all_children, total_count, 0);
+        }
+
+        // Sort by id for consistent ordering
+        all_children.sort_by_key(|a| a.id);
+
+        // Partition into active (including queued) and completed
+        let (active, completed): (Vec<_>, Vec<_>) = all_children
+            .into_iter()
+            .partition(|a| matches!(a.state, NixActivityState::Queued | NixActivityState::Active));
+
+        // Sort completed by completion time (most recent first)
+        let mut completed_with_time: Vec<_> = completed
+            .into_iter()
+            .map(|a| {
+                let completed_at = a.completed_at.unwrap_or(a.start_time);
+                (a, completed_at)
+            })
+            .collect();
+        completed_with_time.sort_by(|a, b| b.1.cmp(&a.1)); // Most recent first
+
+        // Separate lingering (within linger_duration) from older completed
+        let (lingering, older): (Vec<_>, Vec<_>) =
+            completed_with_time
+                .into_iter()
+                .partition(|(_, completed_at)| {
+                    now.duration_since(*completed_at) < limit.linger_duration
+                });
+
+        // Build result: prioritize active, then lingering, then older
+        let mut result: Vec<&Activity> = Vec::new();
+
+        // Add all active items first (they always show)
+        for a in &active {
+            if result.len() >= limit.max_lines {
+                break;
+            }
+            result.push(a);
+        }
+
+        // Add lingering completed items
+        for (a, _) in &lingering {
+            if result.len() >= limit.max_lines {
+                break;
+            }
+            result.push(a);
+        }
+
+        // Fill remaining with older completed items
+        for (a, _) in &older {
+            if result.len() >= limit.max_lines {
+                break;
+            }
+            result.push(a);
+        }
+
+        // Sort final result by id for consistent display order
+        result.sort_by_key(|a| a.id);
+
+        let hidden_count = total_count.saturating_sub(result.len());
+        (result, total_count, hidden_count)
+    }
+
+    /// Check if an activity has any children
+    pub fn has_children(&self, activity_id: u64) -> bool {
+        self.activities
+            .values()
+            .any(|a| a.parent_id == Some(activity_id))
+    }
+
+    /// Get count of children for an activity (respecting filter level)
+    pub fn get_children_count(&self, activity_id: u64) -> usize {
+        let filter_level = self.config.filter_level;
+        self.activities
+            .values()
+            .filter(|a| {
+                a.parent_id == Some(activity_id)
+                    && !matches!(a.variant, ActivityVariant::UserOperation)
+                    && a.level <= filter_level
+            })
+            .count()
+    }
+}
+
+/// State of a Nix activity
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NixActivityState {
+    /// Activity is queued, waiting to start (no timer shown)
+    Queued,
+    /// Activity is actively running (timer shown)
+    Active,
+    Completed {
+        success: bool,
+        cached: bool,
+        duration: std::time::Duration,
+    },
+}
+
+#[derive(Debug)]
+pub struct DisplayActivity {
+    pub activity: Activity,
+    pub depth: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ActivitySummary {
+    pub active_builds: usize,
+    pub completed_builds: usize,
+    pub failed_builds: usize,
+    pub total_builds: usize,
+    /// Expected build count from Nix (via SetExpected events)
+    pub expected_builds: Option<u64>,
+    pub active_downloads: usize,
+    pub completed_downloads: usize,
+    /// Expected download count from Nix (via SetExpected events)
+    pub expected_downloads: Option<u64>,
+    pub active_queries: usize,
+    pub completed_queries: usize,
+    pub running_tasks: usize,
+    pub completed_tasks: usize,
+    pub failed_tasks: usize,
+    pub running_processes: usize,
+    /// Explicitly stopped or exited processes that are eligible for the
+    /// hide-stopped filter.
+    pub stopped_processes: usize,
+    /// Terminal process failures (currently `GaveUp`, plus legacy failed
+    /// completions). These remain visible when stopped processes are hidden.
+    pub failed_processes: usize,
+    /// Process activities the summary bar tracks: active, stopped, and failed.
+    /// Excludes `NotStarted`, so a shell that only has disabled-autostart
+    /// processes renders nothing in the bar.
+    /// `running_processes` is a live gauge (can go down); this is a
+    /// snapshot count of tracked processes, not cumulative progress.
+    pub total_processes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devenv_activity::Timestamp;
+
+    fn set_expected_event(category: ExpectedCategory, expected: u64) -> SetExpected {
+        SetExpected {
+            category,
+            expected,
+            timestamp: Timestamp::now(),
+        }
+    }
+
+    fn files_read(model: &ActivityModel, id: u64) -> usize {
+        let activity = model.activities.get(&id).expect("evaluation activity");
+        let ActivityVariant::Evaluating(evaluating) = &activity.variant else {
+            panic!("activity {id} is not an evaluation");
+        };
+        evaluating.files_read
+    }
+
+    #[test]
+    fn eval_file_count_classifies_structured_effects() {
+        let mut model = ActivityModel::default();
+        let id = 42;
+
+        model.apply_activity_event(ActivityEvent::Evaluate(Evaluate::Start {
+            id,
+            name: "Evaluating shell".to_string(),
+            level: ActivityLevel::Info,
+            parent: None,
+            timestamp: Timestamp::now(),
+        }));
+
+        let counted_effects = [
+            EvalOp::EvaluatedFile {
+                source: "/project/devenv.nix".into(),
+                cached: false,
+            },
+            EvalOp::ReadFile {
+                source: "/project/.env".into(),
+            },
+            EvalOp::ReadFileType {
+                source: "/project/config".into(),
+            },
+            EvalOp::HashFile {
+                source: "/project/source".into(),
+                algorithm: "sha256".to_string(),
+            },
+            EvalOp::PathExists {
+                source: "/project/devenv.local.nix".into(),
+            },
+        ];
+        for op in counted_effects {
+            model.apply_activity_event(ActivityEvent::Evaluate(Evaluate::Op {
+                id,
+                op,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        assert_eq!(files_read(&model, id), 5);
+        assert_eq!(model.get_log_line_count(id), 0);
+
+        let non_file_effects = [
+            EvalOp::EvaluatedFile {
+                source: "/project/devenv.nix".into(),
+                cached: true,
+            },
+            EvalOp::ReadDir {
+                source: "/project".into(),
+            },
+            EvalOp::GetEnv {
+                name: "HOME".to_string(),
+            },
+            EvalOp::CopiedSource {
+                source: "/project".into(),
+                target: "/nix/store/source".into(),
+            },
+            EvalOp::FilteredSource {
+                source: "/project".into(),
+                target: "/nix/store/filtered-source".into(),
+            },
+        ];
+        for op in non_file_effects {
+            model.apply_activity_event(ActivityEvent::Evaluate(Evaluate::Op {
+                id,
+                op,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        assert_eq!(files_read(&model, id), 5);
+        assert_eq!(model.get_log_line_count(id), 0);
+    }
+
+    #[test]
+    fn test_set_expected_replaces_not_accumulates() {
+        let mut model = ActivityModel::default();
+
+        model.handle_set_expected(set_expected_event(ExpectedCategory::Download, 5));
+        assert_eq!(model.expected_downloads, Some(5));
+
+        // The bridge recomputed the total — the model should replace, not add
+        model.handle_set_expected(set_expected_event(ExpectedCategory::Download, 8));
+        assert_eq!(model.expected_downloads, Some(8));
+    }
+
+    #[test]
+    fn test_set_expected_categories_are_independent() {
+        let mut model = ActivityModel::default();
+
+        model.handle_set_expected(set_expected_event(ExpectedCategory::Build, 3));
+        model.handle_set_expected(set_expected_event(ExpectedCategory::Download, 10));
+
+        assert_eq!(model.expected_builds, Some(3));
+        assert_eq!(model.expected_downloads, Some(10));
+    }
+
+    #[test]
+    fn test_set_expected_propagates_to_summary() {
+        let mut model = ActivityModel::default();
+
+        model.handle_set_expected(set_expected_event(ExpectedCategory::Build, 7));
+        model.handle_set_expected(set_expected_event(ExpectedCategory::Download, 12));
+
+        let summary = model.calculate_summary();
+        assert_eq!(summary.expected_builds, Some(7));
+        assert_eq!(summary.expected_downloads, Some(12));
+    }
+
+    #[test]
+    fn test_ui_state_interrupt_prompt_can_be_toggled() {
+        let mut ui = UiState::new();
+
+        assert!(!ui.interrupt_prompt_active());
+
+        ui.show_interrupt_prompt(false);
+        assert!(ui.interrupt_prompt_active());
+
+        ui.clear_interrupt_prompt();
+        assert!(!ui.interrupt_prompt_active());
+    }
+
+    #[test]
+    fn test_hide_stopped_processes_matches_runtime_manual_stop_shape() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        model.apply_activity_event(ActivityEvent::Process(Process::Start {
+            id: 1,
+            name: "manually-stopped".to_string(),
+            parent: Some(100),
+            command: None,
+            ports: vec![],
+            urls: Box::default(),
+            ready_probe: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+        model.apply_activity_event(ActivityEvent::Process(Process::Status {
+            id: 1,
+            status: ProcessStatus::Stopping,
+            timestamp: Timestamp::now(),
+        }));
+        model.apply_activity_event(ActivityEvent::Process(Process::Status {
+            id: 1,
+            status: ProcessStatus::Stopped,
+            timestamp: Timestamp::now(),
+        }));
+
+        let visible_before: Vec<_> = model
+            .get_display_activities(&ui_state)
+            .into_iter()
+            .map(|da| da.activity.name)
+            .collect();
+        assert!(visible_before.contains(&"manually-stopped".to_string()));
+
+        ui_state.hide_stopped_processes = true;
+
+        let visible_after: Vec<_> = model
+            .get_display_activities(&ui_state)
+            .into_iter()
+            .map(|da| da.activity.name)
+            .collect();
+        assert!(!visible_after.contains(&"manually-stopped".to_string()));
+    }
+
+    #[test]
+    fn test_summary_total_processes_counts_running_and_stopped() {
+        let mut model = ActivityModel::default();
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        for (id, name) in [(1, "running"), (2, "also-running"), (3, "stopped")] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Start {
+                id,
+                name: name.to_string(),
+                parent: Some(100),
+                command: None,
+                ports: vec![],
+                urls: Box::default(),
+                ready_probe: None,
+                level: ActivityLevel::Info,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        model.apply_activity_event(ActivityEvent::Process(Process::Status {
+            id: 3,
+            status: ProcessStatus::Stopped,
+            timestamp: Timestamp::now(),
+        }));
+
+        let summary = model.calculate_summary();
+        assert_eq!(summary.running_processes, 2);
+        assert_eq!(summary.stopped_processes, 1);
+        assert_eq!(
+            summary.total_processes, 3,
+            "total should reflect the full count of process activities visible in the TUI"
+        );
+    }
+
+    #[test]
+    fn test_count_hidden_process_children_reports_hidden_clean_stops() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        for (id, name) in [(1, "clean-stop-1"), (2, "clean-stop-2"), (3, "running")] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Start {
+                id,
+                name: name.to_string(),
+                parent: Some(100),
+                command: None,
+                ports: vec![],
+                urls: Box::default(),
+                ready_probe: None,
+                level: ActivityLevel::Info,
+                timestamp: Timestamp::now(),
+            }));
+        }
+        for id in [1, 2] {
+            model.apply_activity_event(ActivityEvent::Process(Process::Status {
+                id,
+                status: ProcessStatus::Stopped,
+                timestamp: Timestamp::now(),
+            }));
+        }
+
+        assert_eq!(
+            model.count_hidden_process_children(100, &ui_state),
+            0,
+            "nothing is hidden while the filter is off"
+        );
+
+        ui_state.hide_stopped_processes = true;
+        assert_eq!(
+            model.count_hidden_process_children(100, &ui_state),
+            2,
+            "both clean stops are hidden under the Running processes parent"
+        );
+    }
+
+    #[test]
+    fn process_phase_summary_and_filter_matrix_preserves_gave_up() {
+        let mut model = ActivityModel::default();
+        let mut ui_state = UiState::new();
+
+        model.apply_activity_event(ActivityEvent::Operation(Operation::Start {
+            id: 100,
+            name: "Running processes".to_string(),
+            parent: None,
+            detail: None,
+            level: ActivityLevel::Info,
+            timestamp: Timestamp::now(),
+        }));
+
+        let statuses = [
+            ProcessStatus::NotStarted,
+            ProcessStatus::Waiting,
+            ProcessStatus::Starting,
+            ProcessStatus::Running,
+            ProcessStatus::Ready,
+            ProcessStatus::Restarting,
+            ProcessStatus::Stopping,
+            ProcessStatus::Stopped,
+            ProcessStatus::Exited,
+            ProcessStatus::GaveUp,
+        ];
+        for (offset, status) in statuses.into_iter().enumerate() {
+            let id = offset as u64 + 1;
+            model.apply_activity_event(ActivityEvent::Process(Process::Start {
+                id,
+                name: format!("{status:?}"),
+                parent: Some(100),
+                command: None,
+                ports: vec![],
+                urls: Box::default(),
+                ready_probe: None,
+                level: ActivityLevel::Info,
+                timestamp: Timestamp::now(),
+            }));
+            model.apply_activity_event(ActivityEvent::Process(Process::Status {
+                id,
+                status,
+                timestamp: Timestamp::now(),
+            }));
+        }
+
+        let summary = model.calculate_summary();
+        assert_eq!(summary.running_processes, 6);
+        assert_eq!(summary.stopped_processes, 2);
+        assert_eq!(summary.failed_processes, 1);
+        assert_eq!(summary.total_processes, 9);
+
+        ui_state.hide_stopped_processes = true;
+        let visible: HashSet<_> = model
+            .get_display_activities(&ui_state)
+            .into_iter()
+            .map(|display| display.activity.name)
+            .collect();
+        assert!(!visible.contains("Stopped"));
+        assert!(!visible.contains("Exited"));
+        assert!(
+            visible.contains("GaveUp"),
+            "GaveUp is a failure, not an ordinary hidden stop"
+        );
+        assert!(visible.contains("NotStarted"));
+    }
+}

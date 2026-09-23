@@ -1,0 +1,1124 @@
+//! Per-concern option structs and resolved settings.
+//!
+//! Each concern follows the same pattern:
+//! - Options struct: all `Option<T>` fields, no clap dependency
+//! - Resolved settings struct: plain Rust with concrete types
+//! - `resolve()`: takes options by value, merges with Config
+
+use tracing::error;
+
+use crate::config::{Clean, Config, NixBackendType, SecretspecConfig};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NixBuildDefaults {
+    pub max_jobs: u8,
+    pub cores: u8,
+}
+
+static NIX_BUILD_DEFAULTS: std::sync::LazyLock<NixBuildDefaults> =
+    std::sync::LazyLock::new(NixBuildDefaults::compute);
+
+impl NixBuildDefaults {
+    pub fn defaults() -> &'static Self {
+        &NIX_BUILD_DEFAULTS
+    }
+
+    fn compute() -> Self {
+        let total_cores = std::thread::available_parallelism()
+            .unwrap_or_else(|e| {
+                error!("Failed to get number of logical CPUs: {}", e);
+                4.try_into().unwrap()
+            })
+            .get();
+
+        let max_jobs = (total_cores / 4).max(1);
+        let cores = (total_cores / max_jobs).max(1);
+
+        Self {
+            max_jobs: max_jobs as u8,
+            cores: cores as u8,
+        }
+    }
+}
+
+pub fn default_system() -> String {
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "unknown architecture"
+    };
+
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "unknown OS"
+    };
+    format!("{arch}-{os}")
+}
+
+/// Resolve a boolean flag pair (`--flag` / `--no-flag`).
+///
+/// Returns `Some(true)` if `--flag` was set, `Some(false)` if `--no-flag` was set,
+/// `None` if neither was set (defer to config, then to default).
+///
+/// The logical default lives in `.unwrap_or(default)` at the call site,
+/// not in clap's `default_value_t`.
+/// Convert a CLI flag value into an `Option<bool>`.
+///
+/// - Bare `bool`: `false` means "not passed" → `None`, `true` → `Some(true)`.
+/// - `Option<bool>`: passed through as-is, so `Some(false)` is an explicit choice.
+pub trait IntoFlag {
+    fn into_flag(self) -> Option<bool>;
+}
+
+impl IntoFlag for bool {
+    fn into_flag(self) -> Option<bool> {
+        if self { Some(true) } else { None }
+    }
+}
+
+impl IntoFlag for Option<bool> {
+    fn into_flag(self) -> Option<bool> {
+        self
+    }
+}
+
+/// Resolve a pair of positive/negative CLI flags into an `Option<bool>`.
+///
+/// `--no-*` always wins. Otherwise the positive flag is interpreted via
+/// [`IntoFlag`]: bare `false` is "unset", `Some(false)` is "explicitly off".
+pub fn flag(yes: impl IntoFlag, no: bool) -> Option<bool> {
+    match (yes.into_flag(), no) {
+        (_, true) => Some(false),
+        (Some(v), _) => Some(v),
+        (None, false) => None,
+    }
+}
+
+/// Combine two values, preferring `self` (higher precedence).
+pub(crate) trait Combine: Sized {
+    fn combine(self, other: Self) -> Self;
+}
+
+impl<T> Combine for Option<T> {
+    fn combine(self, other: Self) -> Self {
+        self.or(other)
+    }
+}
+
+impl<T> Combine for Vec<T> {
+    /// Prefer self if non-empty; fall back to other.
+    fn combine(self, other: Self) -> Self {
+        if !self.is_empty() { self } else { other }
+    }
+}
+
+// --- Nix ---
+
+#[derive(Clone, Debug, Default)]
+pub struct NixOptions {
+    pub max_jobs: Option<u8>,
+    pub cores: Option<u8>,
+    pub system: Option<String>,
+    pub impure: Option<bool>,
+    pub offline: Option<bool>,
+    pub nix_options: Vec<String>,
+    pub nix_debugger: Option<bool>,
+    pub backend: Option<NixBackendType>,
+}
+
+/// Resolved Nix build settings.
+///
+/// Produced by `NixSettings::resolve(NixOptions, &Config)` as a pure function.
+/// Controls how the Nix evaluator and builder behave.
+#[derive(Clone, Debug)]
+pub struct NixSettings {
+    pub impure: bool,
+    pub system: String,
+    pub max_jobs: u8,
+    pub cores: u8,
+    pub offline: bool,
+    pub nix_options: Vec<String>,
+    pub nix_debugger: bool,
+    pub backend: NixBackendType,
+    /// When true, bypass Nix's fetcher cache (equivalent to `nix --refresh`).
+    /// Sets `tarball-ttl` to 0 so inputs resolve to the latest revision.
+    pub refresh_fetchers: bool,
+}
+
+impl Default for NixSettings {
+    fn default() -> Self {
+        let defaults = NixBuildDefaults::defaults();
+        Self {
+            impure: false,
+            system: default_system(),
+            max_jobs: defaults.max_jobs,
+            cores: defaults.cores,
+            offline: false,
+            nix_options: Vec::new(),
+            nix_debugger: false,
+            backend: NixBackendType::default(),
+            refresh_fetchers: false,
+        }
+    }
+}
+
+impl NixSettings {
+    /// Resolve Nix build settings from options and config sources.
+    ///
+    /// `impure` uses option-wins semantics: `Some(true)`/`Some(false)` override config,
+    /// falling back to `config.impure` when `None`.
+    pub fn resolve(options: NixOptions, config: &Config) -> Self {
+        let defaults = NixBuildDefaults::defaults();
+        // Nix options are applied after the dedicated settings, so the last
+        // `--nix-option system` value is the system Nix will actually use.
+        let system = options
+            .nix_options
+            .chunks_exact(2)
+            .rev()
+            .find(|pair| pair[0] == "system")
+            .map(|pair| pair[1].clone())
+            .or(options.system)
+            .unwrap_or_else(default_system);
+        Self {
+            impure: options.impure.unwrap_or(config.impure),
+            system,
+            max_jobs: options.max_jobs.unwrap_or(defaults.max_jobs),
+            cores: options.cores.unwrap_or(defaults.cores),
+            offline: options.offline.unwrap_or(false),
+            nix_options: options.nix_options,
+            nix_debugger: options.nix_debugger.unwrap_or(false),
+            backend: options.backend.unwrap_or_else(|| config.backend.clone()),
+            refresh_fetchers: false,
+        }
+    }
+}
+
+// --- Cache ---
+
+#[derive(Clone, Debug, Default)]
+pub struct CacheOptions {
+    pub eval_cache: Option<bool>,
+    pub refresh_eval_cache: Option<bool>,
+    pub refresh_task_cache: Option<bool>,
+}
+
+/// Resolved cache settings.
+#[derive(Clone, Debug)]
+pub struct CacheSettings {
+    pub eval_cache: bool,
+    pub refresh_eval_cache: bool,
+    pub refresh_task_cache: bool,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            eval_cache: true,
+            refresh_eval_cache: false,
+            refresh_task_cache: false,
+        }
+    }
+}
+
+impl CacheSettings {
+    /// Resolve cache settings from options.
+    ///
+    /// All cache settings are CLI-only today (no config file counterpart).
+    pub fn resolve(options: CacheOptions) -> Self {
+        Self {
+            eval_cache: options.eval_cache.unwrap_or(true),
+            refresh_eval_cache: options.refresh_eval_cache.unwrap_or(false),
+            refresh_task_cache: options.refresh_task_cache.unwrap_or(false),
+        }
+    }
+}
+
+// --- Shell ---
+
+#[derive(Clone, Debug, Default)]
+pub struct ShellOptions {
+    pub clean: Option<Vec<String>>,
+    pub profiles: Vec<String>,
+    pub reload: Option<bool>,
+    pub shell: Option<String>,
+}
+
+/// Resolved shell settings.
+#[derive(Clone, Debug)]
+pub struct ShellSettings {
+    pub clean: Clean,
+    pub profiles: Vec<String>,
+    pub reload: bool,
+    pub prompt_prefix: bool,
+    /// The shell dialect name (e.g. "zsh", "bash").
+    pub shell: String,
+    /// The absolute path to the shell binary when known from the login-shell
+    /// database (i.e. the path returned by `getpwuid`). When present, callers
+    /// should prefer this over resolving the shell name via `$SHELL` or `which`,
+    /// which can fail in stripped environments.
+    pub shell_path: Option<std::path::PathBuf>,
+}
+
+impl Default for ShellSettings {
+    fn default() -> Self {
+        Self {
+            clean: Clean::default(),
+            profiles: Vec::new(),
+            reload: true,
+            prompt_prefix: true,
+            shell: "bash".to_string(),
+            shell_path: None,
+        }
+    }
+}
+
+impl ShellSettings {
+    /// Resolve shell settings from options and config sources.
+    ///
+    /// Precedence: Options > Config > hook hint > $SHELL > login shell > Default.
+    pub fn resolve(options: ShellOptions, config: &Config) -> Self {
+        Self::resolve_with_shell_hint(options, config, None)
+    }
+
+    /// Resolve shell settings with a non-authoritative hint from the invoking
+    /// shell integration. Explicit options and project configuration still win.
+    pub fn resolve_with_shell_hint(
+        options: ShellOptions,
+        config: &Config,
+        shell_hint: Option<&str>,
+    ) -> Self {
+        Self::resolve_with_shell_hint_env_and_login_shell(
+            options,
+            config,
+            shell_hint,
+            shell_name_from_env,
+            login_shell_name,
+        )
+    }
+
+    #[cfg(test)]
+    fn resolve_with_env_and_login_shell(
+        options: ShellOptions,
+        config: &Config,
+        env_shell: impl FnOnce() -> Option<String>,
+        login_shell: impl FnOnce() -> Option<(String, std::path::PathBuf)>,
+    ) -> Self {
+        Self::resolve_with_shell_hint_env_and_login_shell(
+            options,
+            config,
+            None,
+            env_shell,
+            login_shell,
+        )
+    }
+
+    fn resolve_with_shell_hint_env_and_login_shell(
+        options: ShellOptions,
+        config: &Config,
+        shell_hint: Option<&str>,
+        env_shell: impl FnOnce() -> Option<String>,
+        login_shell: impl FnOnce() -> Option<(String, std::path::PathBuf)>,
+    ) -> Self {
+        let clean = if let Some(keep) = options.clean {
+            Clean {
+                enabled: true,
+                keep,
+            }
+        } else {
+            config.clean.clone().unwrap_or_default()
+        };
+
+        let config_profiles: Vec<String> = config.profile.iter().cloned().collect();
+        let profiles = options.profiles.combine(config_profiles);
+
+        let reload = options.reload.combine(config.reload).unwrap_or(true);
+
+        let (shell, shell_path, source) = if let Some(shell) = options.shell.to_owned() {
+            if let Some(supported) = supported_shell(&shell) {
+                (supported, None, "CLI --shell")
+            } else {
+                tracing::warn!(
+                    "Shell '{}' requested via CLI --shell is not supported (bash/zsh/fish/nu); falling back to bash",
+                    shell
+                );
+                ("bash".to_string(), None, "CLI --shell (fallback)")
+            }
+        } else if let Some(shell) = config.shell.clone() {
+            if let Some(supported) = supported_shell(&shell) {
+                (supported, None, "devenv.yaml")
+            } else {
+                tracing::warn!(
+                    "Shell '{}' configured in devenv.yaml is not supported (bash/zsh/fish/nu); falling back to bash",
+                    shell
+                );
+                ("bash".to_string(), None, "devenv.yaml (fallback)")
+            }
+        } else if let Some(shell) = shell_hint.and_then(supported_shell) {
+            // Preserve the absolute login-shell path when it describes the
+            // hinted dialect. This keeps hook activation working even when
+            // the editor also supplied a stripped PATH.
+            let shell_path = if shell == "bash" {
+                None
+            } else {
+                login_shell().and_then(|(name, path)| (name == shell).then_some(path))
+            };
+            (shell, shell_path, "shell hook")
+        } else if let Some(shell) = env_shell().and_then(|shell| supported_shell(&shell)) {
+            (shell, None, "$SHELL env")
+        } else if let Some((name, path)) = login_shell()
+            .and_then(|(name, path)| supported_shell(&name).map(|supported| (supported, path)))
+        {
+            (name, Some(path), "login shell")
+        } else {
+            ("bash".to_string(), None, "default")
+        };
+
+        tracing::debug!(
+            "Shell settings resolved: shell={} (source: {}){}",
+            shell,
+            source,
+            shell_path
+                .as_ref()
+                .map(|p| format!(" path={}", p.display()))
+                .unwrap_or_default()
+        );
+
+        Self {
+            clean,
+            profiles,
+            reload,
+            prompt_prefix: config.prompt_prefix.unwrap_or(true),
+            shell,
+            shell_path,
+        }
+    }
+}
+
+fn supported_shell(shell: &str) -> Option<String> {
+    match shell {
+        "bash" | "zsh" | "fish" | "nu" => Some(shell.to_string()),
+        _ => None,
+    }
+}
+
+fn shell_name_from_env() -> Option<String> {
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| shell_name_from_path(&shell))
+}
+
+fn shell_name_from_path(shell: &str) -> Option<String> {
+    std::path::Path::new(shell)
+        .file_name()?
+        .to_str()
+        .map(String::from)
+}
+
+fn login_shell_name() -> Option<(String, std::path::PathBuf)> {
+    login_shell_path().and_then(|path| {
+        let name = shell_name_from_path(&path)?;
+        Some((name, std::path::PathBuf::from(&path)))
+    })
+}
+
+#[cfg(unix)]
+fn login_shell_path() -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .and_then(|u| u.shell.to_str().map(String::from))
+}
+
+#[cfg(not(unix))]
+fn login_shell_path() -> Option<String> {
+    None
+}
+
+// --- Secrets ---
+
+#[derive(Clone, Debug, Default)]
+pub struct SecretOptions {
+    pub secretspec_provider: Option<String>,
+    pub secretspec_profile: Option<String>,
+}
+
+/// Resolved secret management settings.
+#[derive(Clone, Debug, Default)]
+pub struct SecretSettings {
+    pub secretspec: Option<SecretspecConfig>,
+}
+
+impl SecretSettings {
+    /// Resolve secret settings from options and config sources.
+    ///
+    /// Precedence: Options > Config > Default.
+    /// If option fields are present, they override the matching config fields.
+    /// When no config exists, `enable` defaults to `true` so the user can
+    /// pass `--secretspec-provider` without also adding secretspec config.
+    /// When config explicitly sets `enable: false`, that value is preserved.
+    pub fn resolve(options: SecretOptions, config: &Config) -> Self {
+        let has_override =
+            options.secretspec_provider.is_some() || options.secretspec_profile.is_some();
+
+        let secretspec = if has_override {
+            let base = config.secretspec.clone().unwrap_or_default();
+            let enable = config.secretspec.as_ref().is_none_or(|c| c.enable);
+            Some(SecretspecConfig {
+                enable,
+                provider: options.secretspec_provider.or(base.provider),
+                profile: options.secretspec_profile.or(base.profile),
+                cachix_auth_token: base.cachix_auth_token,
+            })
+        } else {
+            config.secretspec.clone()
+        };
+
+        Self { secretspec }
+    }
+}
+
+// --- Input overrides ---
+
+#[derive(Clone, Debug, Default)]
+pub struct InputOverrides {
+    pub override_inputs: Vec<String>,
+    pub nix_module_options: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn flag_both_unset() {
+        assert_eq!(flag(false, false), None);
+    }
+
+    #[test]
+    fn flag_yes_set() {
+        assert_eq!(flag(true, false), Some(true));
+    }
+
+    #[test]
+    fn flag_no_set() {
+        assert_eq!(flag(false, true), Some(false));
+    }
+
+    #[test]
+    fn flag_no_wins_over_yes() {
+        assert_eq!(flag(true, true), Some(false));
+    }
+
+    #[test]
+    fn flag_option_none() {
+        assert_eq!(flag(None::<bool>, false), None);
+    }
+
+    #[test]
+    fn flag_option_some_true() {
+        assert_eq!(flag(Some(true), false), Some(true));
+    }
+
+    #[test]
+    fn flag_option_some_false() {
+        assert_eq!(flag(Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn flag_option_no_wins_over_some_true() {
+        assert_eq!(flag(Some(true), true), Some(false));
+    }
+
+    #[test]
+    fn nix_settings_defaults() {
+        let options = NixOptions::default();
+        let config = Config::default();
+        let settings = NixSettings::resolve(options, &config);
+        assert!(!settings.impure);
+        assert!(!settings.offline);
+        assert!(!settings.nix_debugger);
+        assert!(settings.nix_options.is_empty());
+    }
+
+    #[test]
+    fn nix_settings_impure_from_options() {
+        let options = NixOptions {
+            impure: Some(true),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = NixSettings::resolve(options, &config);
+        assert!(settings.impure);
+    }
+
+    #[test]
+    fn nix_settings_impure_from_config() {
+        let options = NixOptions::default();
+        let config = Config {
+            impure: true,
+            ..Default::default()
+        };
+        let settings = NixSettings::resolve(options, &config);
+        assert!(settings.impure);
+    }
+
+    #[test]
+    fn nix_settings_no_impure_overrides_config() {
+        let options = NixOptions {
+            impure: Some(false),
+            ..Default::default()
+        };
+        let config = Config {
+            impure: true,
+            ..Default::default()
+        };
+        let settings = NixSettings::resolve(options, &config);
+        assert!(!settings.impure);
+    }
+
+    #[test]
+    fn nix_settings_system_from_options() {
+        let options = NixOptions {
+            system: Some("x86_64-linux".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = NixSettings::resolve(options, &config);
+        assert_eq!(settings.system, "x86_64-linux");
+    }
+
+    #[test]
+    fn nix_settings_system_from_nix_options() {
+        let options = NixOptions {
+            nix_options: vec!["system".into(), "x86_64-linux".into()],
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = NixSettings::resolve(options, &config);
+        assert_eq!(settings.system, "x86_64-linux");
+    }
+
+    #[test]
+    fn nix_settings_last_system_nix_option_wins() {
+        let options = NixOptions {
+            system: Some("aarch64-linux".into()),
+            nix_options: vec![
+                "system".into(),
+                "i686-linux".into(),
+                "sandbox".into(),
+                "false".into(),
+                "system".into(),
+                "x86_64-linux".into(),
+            ],
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = NixSettings::resolve(options, &config);
+        assert_eq!(settings.system, "x86_64-linux");
+    }
+
+    #[test]
+    fn nix_settings_option_fields() {
+        let options = NixOptions {
+            max_jobs: Some(4),
+            cores: Some(2),
+            offline: Some(true),
+            nix_options: vec!["sandbox".into(), "false".into()],
+            nix_debugger: Some(true),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = NixSettings::resolve(options, &config);
+        assert_eq!(settings.max_jobs, 4);
+        assert_eq!(settings.cores, 2);
+        assert!(settings.offline);
+        assert_eq!(settings.nix_options, vec!["sandbox", "false"]);
+        assert!(settings.nix_debugger);
+    }
+
+    #[test]
+    fn cache_settings_defaults() {
+        let options = CacheOptions::default();
+        let settings = CacheSettings::resolve(options);
+        assert!(settings.eval_cache);
+        assert!(!settings.refresh_eval_cache);
+        assert!(!settings.refresh_task_cache);
+    }
+
+    #[test]
+    fn cache_settings_eval_cache_disabled() {
+        let options = CacheOptions {
+            eval_cache: Some(false),
+            ..Default::default()
+        };
+        let settings = CacheSettings::resolve(options);
+        assert!(!settings.eval_cache);
+    }
+
+    #[test]
+    fn cache_settings_refresh_flags() {
+        let options = CacheOptions {
+            refresh_eval_cache: Some(true),
+            refresh_task_cache: Some(true),
+            ..Default::default()
+        };
+        let settings = CacheSettings::resolve(options);
+        assert!(settings.refresh_eval_cache);
+        assert!(settings.refresh_task_cache);
+    }
+
+    #[test]
+    fn shell_settings_options_clean_overrides_config() {
+        let options = ShellOptions {
+            clean: Some(vec!["PATH".into()]),
+            ..Default::default()
+        };
+        let config = Config {
+            clean: Some(Clean {
+                enabled: true,
+                keep: vec!["HOME".into()],
+            }),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(settings.clean.enabled);
+        assert_eq!(settings.clean.keep, vec!["PATH"]);
+    }
+
+    #[test]
+    fn shell_settings_config_clean_used_when_options_absent() {
+        let options = ShellOptions::default();
+        let config = Config {
+            clean: Some(Clean {
+                enabled: true,
+                keep: vec!["HOME".into()],
+            }),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(settings.clean.enabled);
+        assert_eq!(settings.clean.keep, vec!["HOME"]);
+    }
+
+    #[test]
+    fn shell_settings_clean_defaults_to_disabled() {
+        let options = ShellOptions::default();
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(!settings.clean.enabled);
+    }
+
+    #[test]
+    fn shell_settings_options_profiles_override_config() {
+        let options = ShellOptions {
+            profiles: vec!["dev".into()],
+            ..Default::default()
+        };
+        let config = Config {
+            profile: Some("prod".into()),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.profiles, vec!["dev"]);
+    }
+
+    #[test]
+    fn shell_settings_config_profile_used_when_options_absent() {
+        let options = ShellOptions::default();
+        let config = Config {
+            profile: Some("prod".into()),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.profiles, vec!["prod"]);
+    }
+
+    #[test]
+    fn shell_settings_no_profiles_by_default() {
+        let options = ShellOptions::default();
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(settings.profiles.is_empty());
+    }
+
+    #[test]
+    fn shell_settings_prompt_defaults_to_true_and_respects_config() {
+        for prompt_prefix in [None, Some(false), Some(true)] {
+            let config = Config {
+                prompt_prefix,
+                ..Default::default()
+            };
+            let settings = ShellSettings::resolve(ShellOptions::default(), &config);
+            assert_eq!(settings.prompt_prefix, prompt_prefix.unwrap_or(true));
+        }
+    }
+
+    #[test]
+    fn shell_settings_reload_defaults_to_true() {
+        let options = ShellOptions::default();
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(settings.reload);
+    }
+
+    #[test]
+    fn shell_settings_no_reload_overrides_config() {
+        let options = ShellOptions {
+            reload: Some(false),
+            ..Default::default()
+        };
+        let config = Config {
+            reload: Some(true),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(!settings.reload);
+    }
+
+    #[test]
+    fn shell_settings_config_reload_false_respected() {
+        let options = ShellOptions::default();
+        let config = Config {
+            reload: Some(false),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert!(!settings.reload);
+    }
+
+    #[test]
+    fn shell_settings_shell_from_options() {
+        let options = ShellOptions {
+            shell: Some("zsh".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.shell, "zsh");
+    }
+
+    #[test]
+    fn shell_settings_shell_from_config() {
+        let options = ShellOptions::default();
+        let config = Config {
+            shell: Some("zsh".into()),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.shell, "zsh");
+    }
+
+    #[test]
+    fn shell_settings_hook_hint_precedes_stale_env_shell() {
+        let settings = ShellSettings::resolve_with_shell_hint_env_and_login_shell(
+            ShellOptions::default(),
+            &Config::default(),
+            Some("zsh"),
+            || Some("bash".to_string()),
+            || {
+                Some((
+                    "zsh".to_string(),
+                    std::path::PathBuf::from("/run/current-system/sw/bin/zsh"),
+                ))
+            },
+        );
+
+        assert_eq!(settings.shell, "zsh");
+        assert_eq!(
+            settings.shell_path,
+            Some(std::path::PathBuf::from("/run/current-system/sw/bin/zsh"))
+        );
+    }
+
+    #[test]
+    fn shell_settings_config_precedes_hook_hint() {
+        let config = Config {
+            shell: Some("fish".into()),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve_with_shell_hint_env_and_login_shell(
+            ShellOptions::default(),
+            &config,
+            Some("zsh"),
+            || panic!("config shell should suppress ambient shell lookup"),
+            || panic!("config shell should suppress login shell lookup"),
+        );
+
+        assert_eq!(settings.shell, "fish");
+        assert!(settings.shell_path.is_none());
+    }
+
+    #[test]
+    fn shell_settings_options_precede_hook_hint() {
+        let options = ShellOptions {
+            shell: Some("bash".into()),
+            ..Default::default()
+        };
+        let settings = ShellSettings::resolve_with_shell_hint_env_and_login_shell(
+            options,
+            &Config::default(),
+            Some("zsh"),
+            || panic!("explicit shell should suppress ambient shell lookup"),
+            || panic!("explicit shell should suppress login shell lookup"),
+        );
+
+        assert_eq!(settings.shell, "bash");
+        assert!(settings.shell_path.is_none());
+    }
+
+    #[test]
+    fn shell_settings_unsupported_hook_hint_uses_env_shell() {
+        let settings = ShellSettings::resolve_with_shell_hint_env_and_login_shell(
+            ShellOptions::default(),
+            &Config::default(),
+            Some("tcsh"),
+            || Some("fish".to_string()),
+            || panic!("supported ambient shell should suppress login shell lookup"),
+        );
+
+        assert_eq!(settings.shell, "fish");
+        assert!(settings.shell_path.is_none());
+    }
+
+    #[test]
+    fn shell_settings_shell_from_env_precedes_login_shell() {
+        let settings = ShellSettings::resolve_with_env_and_login_shell(
+            ShellOptions::default(),
+            &Config::default(),
+            || Some("bash".to_string()), // env_shell replaces shell_name_from_env, which returns the basename
+            || {
+                Some((
+                    "zsh".to_string(),
+                    std::path::PathBuf::from("/run/current-system/sw/bin/zsh"),
+                ))
+            },
+        );
+
+        assert_eq!(settings.shell, "bash");
+        // $SHELL env source never populates shell_path
+        assert!(settings.shell_path.is_none());
+    }
+
+    #[test]
+    fn shell_settings_unsupported_env_shell_uses_login_shell() {
+        let settings = ShellSettings::resolve_with_env_and_login_shell(
+            ShellOptions::default(),
+            &Config::default(),
+            || Some("sh".to_string()), // basename only, as shell_name_from_env returns
+            || {
+                Some((
+                    "zsh".to_string(),
+                    std::path::PathBuf::from("/run/current-system/sw/bin/zsh"),
+                ))
+            },
+        );
+
+        assert_eq!(settings.shell, "zsh");
+        // login shell source populates shell_path with the absolute path
+        assert_eq!(
+            settings.shell_path,
+            Some(std::path::PathBuf::from("/run/current-system/sw/bin/zsh"))
+        );
+    }
+
+    #[test]
+    fn shell_settings_shell_from_login_shell_when_env_missing() {
+        let settings = ShellSettings::resolve_with_env_and_login_shell(
+            ShellOptions::default(),
+            &Config::default(),
+            || None,
+            || {
+                Some((
+                    "zsh".to_string(),
+                    std::path::PathBuf::from("/run/current-system/sw/bin/zsh"),
+                ))
+            },
+        );
+
+        assert_eq!(settings.shell, "zsh");
+        assert_eq!(
+            settings.shell_path,
+            Some(std::path::PathBuf::from("/run/current-system/sw/bin/zsh"))
+        );
+    }
+
+    #[test]
+    fn shell_settings_unsupported_login_shell_falls_back_to_bash() {
+        let settings = ShellSettings::resolve_with_env_and_login_shell(
+            ShellOptions::default(),
+            &Config::default(),
+            || None,
+            || Some(("tcsh".to_string(), std::path::PathBuf::from("/bin/tcsh"))),
+        );
+
+        // tcsh is unsupported; login_shell() returns Some but supported_shell filters it → bash default
+        assert_eq!(settings.shell, "bash");
+        assert!(settings.shell_path.is_none());
+    }
+
+    #[test]
+    fn shell_settings_unsupported_shell_falls_back_to_bash() {
+        let options = ShellOptions {
+            shell: Some("tcsh".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.shell, "bash");
+    }
+
+    #[test]
+    fn shell_settings_fish_from_options() {
+        let options = ShellOptions {
+            shell: Some("fish".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.shell, "fish");
+    }
+
+    #[test]
+    fn shell_settings_nu_from_options() {
+        let options = ShellOptions {
+            shell: Some("nu".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = ShellSettings::resolve(options, &config);
+        assert_eq!(settings.shell, "nu");
+    }
+
+    #[test]
+    fn secret_settings_options_provider_overrides_config() {
+        let options = SecretOptions {
+            secretspec_provider: Some("aws".into()),
+            ..Default::default()
+        };
+        let config = Config {
+            secretspec: Some(SecretspecConfig {
+                enable: true,
+                provider: Some("gcp".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let settings = SecretSettings::resolve(options, &config);
+        let sc = settings.secretspec.unwrap();
+        assert!(sc.enable);
+        assert_eq!(sc.provider, Some("aws".into()));
+    }
+
+    #[test]
+    fn secret_settings_options_profile_overrides_config() {
+        let options = SecretOptions {
+            secretspec_profile: Some("staging".into()),
+            ..Default::default()
+        };
+        let config = Config {
+            secretspec: Some(SecretspecConfig {
+                enable: true,
+                provider: Some("gcp".into()),
+                profile: Some("prod".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let settings = SecretSettings::resolve(options, &config);
+        let sc = settings.secretspec.unwrap();
+        assert!(sc.enable);
+        assert_eq!(sc.profile, Some("staging".into()));
+        assert_eq!(sc.provider, Some("gcp".into()));
+    }
+
+    #[test]
+    fn secret_settings_config_used_when_options_absent() {
+        let options = SecretOptions::default();
+        let config = Config {
+            secretspec: Some(SecretspecConfig {
+                enable: true,
+                provider: Some("gcp".into()),
+                profile: Some("prod".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let settings = SecretSettings::resolve(options, &config);
+        let sc = settings.secretspec.unwrap();
+        assert!(sc.enable);
+        assert_eq!(sc.provider, Some("gcp".into()));
+        assert_eq!(sc.profile, Some("prod".into()));
+    }
+
+    #[test]
+    fn secret_settings_options_enables_when_config_absent() {
+        let options = SecretOptions {
+            secretspec_provider: Some("aws".into()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let settings = SecretSettings::resolve(options, &config);
+        let sc = settings.secretspec.unwrap();
+        assert!(sc.enable);
+        assert_eq!(sc.provider, Some("aws".into()));
+        assert_eq!(sc.profile, None);
+    }
+
+    #[test]
+    fn secret_settings_none_when_both_absent() {
+        let options = SecretOptions::default();
+        let config = Config::default();
+        let settings = SecretSettings::resolve(options, &config);
+        assert!(settings.secretspec.is_none());
+    }
+
+    #[test]
+    fn secret_settings_options_preserves_config_enable_false() {
+        let options = SecretOptions {
+            secretspec_provider: Some("aws".into()),
+            ..Default::default()
+        };
+        let config = Config {
+            secretspec: Some(SecretspecConfig {
+                enable: false,
+                profile: Some("prod".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let settings = SecretSettings::resolve(options, &config);
+        let sc = settings.secretspec.unwrap();
+        assert!(!sc.enable);
+        assert_eq!(sc.provider, Some("aws".into()));
+        assert_eq!(sc.profile, Some("prod".into()));
+    }
+}
+
+/// Process-wide output verbosity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VerbosityLevel {
+    /// Minimal output, only errors
+    Quiet,
+    /// Standard output level
+    Normal,
+    /// Detailed output including debug information
+    Verbose,
+}
+
+impl std::fmt::Display for VerbosityLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerbosityLevel::Quiet => write!(f, "quiet"),
+            VerbosityLevel::Normal => write!(f, "normal"),
+            VerbosityLevel::Verbose => write!(f, "verbose"),
+        }
+    }
+}
