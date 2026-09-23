@@ -155,6 +155,24 @@
             cacert agentRegistry
           ]);
         };
+        # Cargo with a shared, fine-grained build cache: agents' dev shells use
+        # it ahead of their own cargo (VIEW.md 3).
+        cargoSharedCache = pkgs.rustPlatform.buildRustPackage {
+          pname = "cargo-shared-cache";
+          version = "0.100.0-6db91010";
+          src = pkgs.fetchFromGitHub {
+            owner = "maan2003";
+            repo = "cargo";
+            rev = "6db9101050424551d5a5f73c1dcd4cb778ce27a0";
+            hash = "sha256-PUyv2mfLDH7NJh+LkfoI/ZS03E7yHYqPv+EkuLGaOZ0=";
+          };
+          cargoHash = "sha256-KY2pDD8wNJQvtJtv/Xx0PGvA1cymaBYPkx2BXb1KF8A=";
+          cargoBuildFlags = [ "--package" "cargo" "--bin" "cargo" ];
+          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
+          buildInputs = [ pkgs.curl pkgs.openssl pkgs.zlib ];
+          doCheck = false;
+          meta.mainProgram = "cargo";
+        };
         findutils = pkgs.rustPlatform.buildRustPackage {
           pname = "findutils";
           version = "0.9.2";
@@ -381,6 +399,7 @@
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               env.RHO_FIND_BIN = "${findutils}/bin";
+              env.RHO_SHARED_CARGO_BIN = "${cargoSharedCache}/bin";
               postInstall = ''
                 mkdir -p $out/share/rho/skills
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
@@ -453,7 +472,7 @@
           default = multiBuild.package;
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
-          inherit findutils;
+          inherit findutils cargoSharedCache;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           rho-agent-desktop = rhoAgentDesktop;
         };
@@ -502,6 +521,9 @@
           ++ guiBuildInputs;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          # Baked into rho-fs-view as they are in the package build.
+          RHO_FIND_BIN = "${findutils}/bin";
+          RHO_SHARED_CARGO_BIN = "${cargoSharedCache}/bin";
           LD_LIBRARY_PATH = guiLibraryPath;
           NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''

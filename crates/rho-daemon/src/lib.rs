@@ -300,7 +300,6 @@ fn start_runtime_sockets(
 
 pub use rho_fs_view::PathOverrides;
 
-const EMBEDDED_FIND_BIN: Option<&str> = option_env!("RHO_FIND_BIN");
 const FIND_DENY_ROOTS_ENV: &str = "FIND_DENY_ROOTS";
 
 fn find_deny_roots() -> OsString {
@@ -309,15 +308,9 @@ fn find_deny_roots() -> OsString {
         .expect("protected root paths must not contain a path separator")
 }
 
-/// Nix packages embed the find fork's directory, which dev shells get ahead of
-/// their own PATH (`RHO_DEVSHELL_PATH_PREFIX`, VIEW.md 3).
 /// This must run before the Tokio runtime starts, because mutating the process
 /// environment is not thread-safe.
 pub fn configure_embedded_environment() {
-    if let Some(path) = EMBEDDED_FIND_BIN {
-        // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
-        unsafe { std::env::set_var("RHO_DEVSHELL_PATH_PREFIX", path) };
-    }
     // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
@@ -410,9 +403,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     eprintln!("rho daemon: Claude configuration {}", claude.config_home());
 
     let mut user_environment = login_environment()?;
-    if let Some(path) = EMBEDDED_FIND_BIN {
-        user_environment.push(("RHO_DEVSHELL_PATH_PREFIX".into(), path.into()));
-    }
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
         rho_ui_proto::RuntimePaths::SOCKET_ENV.into(),

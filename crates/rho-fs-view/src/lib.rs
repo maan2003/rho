@@ -42,6 +42,14 @@ pub const AGENT_BASE: &str = env!(
 /// Without the store socket in its environment it is plain git.
 pub const GIT: &str = concat!(env!("RHO_AGENT_BASE"), "/bin/git");
 
+/// Rho's find fork (`flake.nix` findutils), which goes ahead of a dev
+/// shell's own `PATH` so its deny roots hold there too (VIEW.md 3).
+pub const FIND_BIN: Option<&str> = option_env!("RHO_FIND_BIN");
+
+/// The shared-cache cargo fork (`flake.nix` cargoSharedCache), used ahead of
+/// a dev shell's cargo (VIEW.md 3).
+pub const SHARED_CARGO_BIN: Option<&str> = option_env!("RHO_SHARED_CARGO_BIN");
+
 /// The agent's home inside the view.
 pub const AGENT_HOME: &str = "/home/agent";
 

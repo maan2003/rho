@@ -181,6 +181,7 @@ test "$GIT_CONFIG_SYSTEM" = /etc/gitconfig
 test "$(git config --get core.pager)" = cat
 test "$RHO_DEVSHELL_CACHE" = {cache}/rho-devshell/cache.sqlite
 test -n "$RHO_DEVSHELL_BUILDER"
+case "$RHO_DEVSHELL_PATH_PREFIX" in *:/home/agent/.cache/cargo/bin|/home/agent/.cache/cargo/bin) ;; *) exit 1 ;; esac
 test "$INSIDE_AGENT" = 1
 test "$CARGO_HOME" = /home/agent/.cache/cargo
 touch /home/agent/.cache/from-view

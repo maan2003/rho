@@ -66,13 +66,14 @@ security boundary (see `WORKSET.md`); it is a distribution.
      *Why:* the garbage-collection roots of cached shells live beside
      it, and the nix daemon resolves them on the host. At a view-only
      path the roots would dangle and every GC would delete the shells.
-   - After a dev shell is applied, the user's `RHO_DEVSHELL_CARGO` (a
-     directory with the `cargo` to use, such as a shared-cache fork) goes
-     first on its `PATH`, or right after the shell's own `cargo` when
-     that is cargo-deluxe, which runs the next `cargo` on `PATH`. Then
-     `RHO_DEVSHELL_PATH_PREFIX` (the daemon's find fork, then cargo's
-     shared bin directory) goes before everything. Exposed mode gets the
-     same, with the daemon's prefix alone.
+   - After a dev shell is applied, `RHO_DEVSHELL_CARGO` (Rho's
+     shared-cache cargo fork, `cargoSharedCache` in the flake) goes first
+     on its `PATH`, or right after the shell's own `cargo` when that is
+     cargo-deluxe, which runs the next `cargo` on `PATH`. Then
+     `RHO_DEVSHELL_PATH_PREFIX` (Rho's find fork, then cargo's shared bin
+     directory) goes before everything. The worker sets both when it
+     prepares a command, from paths baked in at build time; exposed mode
+     gets the same, with the find fork alone as the prefix.
    - The base's `nix` is Rho's patched Nix. `nix develop` and
      `nix print-dev-env` of a local flake's dev shell take the shell's
      environment from the builder (`RHO_DEVSHELL_BUILDER`), so it comes
@@ -183,11 +184,11 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under `~/.cache`;
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
 from the user's environment or git config, read once when the daemon
-starts; `RHO_DEVSHELL_CACHE`, `RHO_DEVSHELL_PATH_PREFIX` and
-`RHO_DEVSHELL_BUILDER` (above);
+starts; `RHO_DEVSHELL_CACHE`, `RHO_DEVSHELL_PATH_PREFIX`,
+`RHO_DEVSHELL_CARGO` and `RHO_DEVSHELL_BUILDER` (above);
 `FIND_DENY_ROOTS` for Rho's find;
 `NIX_REMOTE=daemon` when the host has a nix daemon;
-`RHO_GIT_STORE_SOCKET`. Passed through from the user: `TERM`, `TZ`, `RHO_DEVSHELL_CARGO`. Variables the caller sets on a command
+`RHO_GIT_STORE_SOCKET`. Passed through from the user: `TERM`, `TZ`. Variables the caller sets on a command
 survive.
 
 ## Where it lives

@@ -375,23 +375,22 @@ impl Namespace {
                 // The agent's own nix profile first, then the base userland
                 // (VIEW.md). Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
-                // Passed through from the user: the terminal, the timezone,
-                // and the cargo that goes ahead of a dev shell's.
-                for name in ["TERM", "TZ", "RHO_DEVSHELL_CARGO"] {
+                // Passed through from the user: the terminal and the timezone.
+                for name in ["TERM", "TZ"] {
                     if let Some(value) = self.environment.get(name) {
                         command.env(name, value);
                     }
                 }
                 // Ahead of a flake dev shell's own PATH (VIEW.md 3): the
-                // daemon's prefix (its find fork), then cargo-installed
-                // binaries.
-                let mut prefix = OsString::new();
-                if let Some(daemon) = self.environment.get("RHO_DEVSHELL_PATH_PREFIX") {
-                    prefix.push(daemon);
-                    prefix.push(":");
-                }
-                prefix.push(format!("{home}/.cache/cargo/bin"));
-                command.env("RHO_DEVSHELL_PATH_PREFIX", prefix);
+                // find fork, then cargo-installed binaries.
+                let cargo_bin = format!("{home}/.cache/cargo/bin");
+                command.env(
+                    "RHO_DEVSHELL_PATH_PREFIX",
+                    match crate::FIND_BIN {
+                        Some(find) => format!("{find}:{cargo_bin}"),
+                        None => cargo_bin,
+                    },
+                );
                 command.env("RHO_DEVSHELL_CACHE", self.devshell_cache.join("cache.sqlite"));
                 // For the base's `nix develop` (VIEW.md 3).
                 command.env("RHO_DEVSHELL_BUILDER", crate::devshell_builder());
@@ -429,7 +428,14 @@ impl Namespace {
                     .get("PATH")
                     .map(|path| self.path_overrides.add_to(path));
                 command.env("PATH", prepend_path(&crate::git_dir(), path.as_deref()));
+                if let Some(find) = crate::FIND_BIN {
+                    command.env("RHO_DEVSHELL_PATH_PREFIX", find);
+                }
             }
+        }
+        // The cargo ahead of a dev shell's own (VIEW.md 3).
+        if let Some(cargo) = crate::SHARED_CARGO_BIN {
+            command.env("RHO_DEVSHELL_CARGO", cargo);
         }
         command.envs(
             self.store_environment
