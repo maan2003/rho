@@ -1,4 +1,5 @@
-//! Cells-V2 persistence.
+//! The host's copy of the desk on disk: cells, verdicts, note bodies and
+//! the mutations that made them, in the host's database.
 
 #![allow(dead_code)]
 
@@ -62,12 +63,12 @@ struct CellMeta {
 }
 
 #[derive(Clone)]
-pub(crate) struct DeskCellStore {
+pub struct DeskCellStore {
     db: RhoDb,
 }
 
 impl DeskCellStore {
-    pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
+    pub async fn new(db: RhoDb) -> Result<Self, String> {
         let mut write = db.write().await;
         initialize(&mut write)?;
         write.open_table(MUTATIONS);
@@ -82,7 +83,7 @@ impl DeskCellStore {
     /// whole store rather than a difference from a number that was never
     /// ours. Identity and delta are read under one transaction, so the name
     /// the client writes down is the name the cells were counted in.
-    pub(crate) fn sync_for(
+    pub fn sync_for(
         &self,
         held: Option<DeviceId>,
         known: &Version,
@@ -102,7 +103,7 @@ impl DeskCellStore {
         Ok((meta.daemon_device, delta))
     }
 
-    pub(crate) fn sync_since(&self, known: &Version) -> Result<Snapshot, String> {
+    pub fn sync_since(&self, known: &Version) -> Result<Snapshot, String> {
         let read = self.db.read();
         let meta = read
             .open_table(META)
@@ -114,7 +115,7 @@ impl DeskCellStore {
             .map(|store| store.since(known))
     }
 
-    pub(crate) fn frontier(&self) -> Result<Version, String> {
+    pub fn frontier(&self) -> Result<Version, String> {
         self.db
             .read()
             .open_table(META)
@@ -130,7 +131,7 @@ impl DeskCellStore {
     /// has never held is missing from `known` and comes whole; a note
     /// with nothing new in it is not sent at all, which is what stops a
     /// one-cell delta carrying the whole desk's prose.
-    pub(crate) fn bodies_since(
+    pub fn bodies_since(
         &self,
         known: &std::collections::BTreeMap<Id, rho_agent_host_proto::desk::cells::BodyVersion>,
     ) -> Vec<BodySnapshot> {
@@ -143,7 +144,7 @@ impl DeskCellStore {
             .collect()
     }
 
-    pub(crate) fn bodies(&self) -> Vec<BodySnapshot> {
+    pub fn bodies(&self) -> Vec<BodySnapshot> {
         let mut skipped = 0usize;
         let bodies: Vec<BodySnapshot> = self
             .db
@@ -167,7 +168,7 @@ impl DeskCellStore {
     /// The words of a note. Only a note has a body, which is the one thing
     /// left to check here: the store no longer holds a machine-owned row
     /// for anything, so there is nothing else to keep a client out of.
-    pub(crate) async fn apply_body(
+    pub async fn apply_body(
         &self,
         session_namespace: u16,
         id: Id,
@@ -234,7 +235,7 @@ impl DeskCellStore {
         Ok(true)
     }
 
-    pub(crate) async fn node_namespace(&self, device: DeviceId) -> Result<u16, String> {
+    pub async fn node_namespace(&self, device: DeviceId) -> Result<u16, String> {
         let mut write = self.db.write().await;
         let mut meta = write
             .open_table(META)
@@ -275,7 +276,7 @@ impl DeskCellStore {
     ///
     /// Writes as the daemon's own device, like the conversions. Never runs
     /// on its own; only `rho debug seed-agents` calls it.
-    pub(crate) async fn seed_desk_rows(
+    pub async fn seed_desk_rows(
         &self,
         note_text: &str,
         agents: &[rho_agent_host_proto::AgentId],
@@ -326,7 +327,7 @@ impl DeskCellStore {
     /// the daemon catches up — a write made while it was away, or one that
     /// never made it off the wire, arrives here at the next handshake
     /// rather than living on one device forever.
-    pub(crate) async fn apply_cells(&self, cells: Snapshot) -> Result<(), String> {
+    pub async fn apply_cells(&self, cells: Snapshot) -> Result<(), String> {
         if cells.cells.is_empty() && cells.verdicts.is_empty() {
             return Ok(());
         }
@@ -349,7 +350,7 @@ impl DeskCellStore {
         Ok(())
     }
 
-    pub(crate) async fn apply_mutation(
+    pub async fn apply_mutation(
         &self,
         session_device: DeviceId,
         mutation: CellMutation,
@@ -578,7 +579,7 @@ fn subject_bounds(id: &Id) -> Result<(), String> {
 /// Opens the cell tables, making the empty state on a database that has
 /// none. The conversions that used to run here are gone: each ran once on
 /// every daemon it was ever going to run on.
-pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
+pub fn initialize(write: &mut WriteTxn) -> Result<(), String> {
     let meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {

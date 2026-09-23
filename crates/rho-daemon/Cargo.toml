@@ -30,6 +30,7 @@ rho-claude.workspace = true
 rho-claude-usage.workspace = true
 rho-agent-host-proto.workspace = true
 rho-db.workspace = true
+rho-desk-server.workspace = true
 rho-inference.workspace = true
 rho-image.workspace = true
 rho-openai-realtime.workspace = true
@@ -47,7 +48,6 @@ reqwest.workspace = true
 redb.workspace = true
 tempfile.workspace = true
 senax-encoder.workspace = true
-text.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = [

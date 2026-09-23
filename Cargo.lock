@@ -12456,6 +12456,7 @@ dependencies = [
  "rho-claude",
  "rho-claude-usage",
  "rho-db",
+ "rho-desk-server",
  "rho-desktop-media",
  "rho-desktop-proto",
  "rho-fs-view",
@@ -12474,7 +12475,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "text",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -12511,6 +12511,23 @@ dependencies = [
  "rho-slack",
  "senax-encoder",
  "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rho-desk-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "redb",
+ "rho-agent-host-proto",
+ "rho-db",
+ "senax-encoder",
+ "tempfile",
+ "text",
  "tokio",
  "tracing",
  "uuid",
