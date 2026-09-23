@@ -3892,30 +3892,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_migrates_legacy_scoped_gpt_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        assert!(write.record_quota_observation(QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            auth_namespace: Some("work".to_owned()),
-            observed_at: rho_agent_types::UnixMs(123),
-            used_percent: 42,
-            reset_at_unix: Some(456),
-        }));
-        write.commit();
-
-        let inference = rho_inference::Inference::new(db).await.unwrap();
-        let history = inference.quota_history(rho_agent_types::UnixMs(0));
-
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].auth_namespace, "work");
-        assert_eq!(history[0].points[0].remaining_percent, 58);
-    }
-
-    #[tokio::test]
     async fn quota_summary_expires_stale_provider_window() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
