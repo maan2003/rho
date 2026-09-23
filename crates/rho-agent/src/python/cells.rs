@@ -11,7 +11,7 @@ use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
 use tokio::sync::Notify;
 
 use crate::boundary::SourceKind;
-use crate::python::{PythonCell, PythonExec, PythonNotebook, SourceWaker};
+use crate::python::{PythonExec, PythonNotebook, SourceWaker};
 
 pub(crate) struct Cells {
     wake: Arc<Notify>,
@@ -20,12 +20,19 @@ pub(crate) struct Cells {
     latest: Option<Arc<PythonExec>>,
 }
 
+/// Forgetting a held cell releases it.
 pub(crate) struct Held {
-    pub(crate) cell: Box<PythonCell>,
+    pub(crate) exec: Arc<PythonExec>,
     /// The call as the model wrote it, for readers.
     pub(crate) source: String,
     pub(crate) started_at: UnixMs,
     answered: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.exec.release();
+    }
 }
 
 /// One cell's contribution at a boundary.
@@ -49,8 +56,8 @@ impl Cells {
 
     /// Run `call` as the newest cell.
     pub(crate) fn exec(&mut self, notebook: &PythonNotebook, call: ExecCall, now: UnixMs) {
-        let cell = notebook.exec(call.clone(), self.waker());
-        self.hold(call, cell, now);
+        let exec = notebook.exec(call.clone(), self.waker());
+        self.hold(call, exec, now);
     }
 
     /// Start a streamed call as the newest cell; its source arrives later.
@@ -60,9 +67,8 @@ impl Cells {
         call: ExecCall,
         now: UnixMs,
     ) -> Arc<PythonExec> {
-        let cell = notebook.start_stream(call.id.clone(), self.waker());
-        let exec = cell.execution();
-        self.hold(call, cell, now);
+        let exec = notebook.start_stream(call.id.clone(), self.waker());
+        self.hold(call, Arc::clone(&exec), now);
         exec
     }
 
@@ -70,12 +76,12 @@ impl Cells {
         SourceWaker::new(Arc::clone(&self.wake))
     }
 
-    fn hold(&mut self, call: ExecCall, cell: Box<PythonCell>, now: UnixMs) {
-        self.latest = Some(cell.execution());
+    fn hold(&mut self, call: ExecCall, exec: Arc<PythonExec>, now: UnixMs) {
+        self.latest = Some(Arc::clone(&exec));
         self.held.insert(
             call.id,
             Held {
-                cell,
+                exec,
                 source: call.source,
                 started_at: now,
                 answered: false,
@@ -92,7 +98,7 @@ impl Cells {
     pub(crate) fn set_latest(&mut self, id: Option<&ExecId>) {
         self.latest = id
             .and_then(|id| self.held.get(id))
-            .map(|held| held.cell.execution());
+            .map(|held| Arc::clone(&held.exec));
     }
 
     pub(crate) fn get(&self, id: &ExecId) -> Option<&Held> {
@@ -122,7 +128,7 @@ impl Cells {
 
     pub(crate) fn cancel(&mut self) {
         for held in self.held.values_mut() {
-            held.cell.cancel();
+            held.exec.cancel();
         }
     }
 
@@ -137,11 +143,11 @@ impl Cells {
         let mut sources = Vec::new();
         for (id, held) in &self.held {
             sources.push(SourceKind::Cell {
-                facts: held.cell.facts(),
+                facts: held.exec.facts(),
                 latest: latest == Some(id),
             });
             sources.extend(
-                held.cell
+                held.exec
                     .jobs()
                     .into_iter()
                     .map(|facts| SourceKind::Job { facts }),
@@ -167,13 +173,13 @@ impl Cells {
     pub(crate) fn drain(&mut self) -> Vec<Reply> {
         let latest = self.latest.as_ref().map(|exec| exec.id().clone());
         let mut held = self.held.iter_mut().collect::<Vec<_>>();
-        held.sort_by_key(|(id, held)| (Some(*id) != latest.as_ref(), held.cell.sequence()));
+        held.sort_by_key(|(id, held)| (Some(*id) != latest.as_ref(), held.exec.sequence()));
         held.into_iter()
             .filter_map(|(id, held)| {
                 let output = if held.answered {
-                    held.cell.more_output()?
+                    held.exec.more_output()?
                 } else {
-                    held.cell.first_output()
+                    held.exec.first_output()
                 };
                 Some(Reply {
                     id: id.clone(),
@@ -188,10 +194,10 @@ impl Cells {
     /// The recipient owns what was drained: forget cells with nothing left.
     pub(crate) fn acknowledge(&mut self) {
         for held in self.held.values_mut() {
-            if held.cell.acknowledge_output() {
+            if held.exec.acknowledge_output() {
                 held.answered = true;
             }
         }
-        self.held.retain(|_, held| !held.cell.done());
+        self.held.retain(|_, held| !held.exec.done());
     }
 }

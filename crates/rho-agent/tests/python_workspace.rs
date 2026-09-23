@@ -27,12 +27,12 @@ fn main() {
         let tool =
             PythonNotebook::new(ShellTools::new(Duration::from_secs(5), view), vec![]).unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut cell = tool.exec(ExecCall {
+        let cell = tool.exec(ExecCall {
             id: "view".try_into().unwrap(),
             source: "assert Path('value').read_text() == 'host'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')\nassert not Path('/home').joinpath(os.environ.get('USER', 'agent')).exists() or True".into(),
         }, SourceWaker::new(wake.clone()));
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !cell.execution().quiescent() {
+            while !cell.quiescent() {
                 wake.notified().await;
             }
         })

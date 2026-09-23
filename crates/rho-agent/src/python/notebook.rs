@@ -14,7 +14,7 @@ use rho_core::{ContextBlock, ExecCall, ExecId, UnixMs};
 use rho_tool_shell::{BoundedOutput, ShellTools};
 
 use crate::python::SourceWaker;
-use crate::python::cell::{PythonCell, PythonExec};
+use crate::python::cell::PythonExec;
 use crate::python::history::HistorySnapshot;
 use crate::python::runtime::{Build, Inbox, Input, Message};
 use crate::python::source::Source;
@@ -92,6 +92,8 @@ pub(crate) struct ExecState {
     pub(crate) pending: usize,
     pub(crate) cancelled: tokio::sync::watch::Sender<bool>,
     pub(crate) images: Vec<rho_core::ImageContent>,
+    /// The contribution read and not yet acknowledged.
+    pub(crate) lease: Option<rho_core::ToolOutput>,
 }
 
 impl ExecState {
@@ -198,15 +200,15 @@ impl PythonNotebook {
         }
     }
 
-    pub fn exec(&self, call: ExecCall, waker: SourceWaker) -> Box<PythonCell> {
+    pub fn exec(&self, call: ExecCall, waker: SourceWaker) -> Arc<PythonExec> {
         self.start(call.id, Some(call.source), waker)
     }
 
-    pub fn start_stream(&self, id: ExecId, waker: SourceWaker) -> Box<PythonCell> {
+    pub fn start_stream(&self, id: ExecId, waker: SourceWaker) -> Arc<PythonExec> {
         self.start(id, None, waker)
     }
 
-    fn start(&self, id: ExecId, source: Option<String>, waker: SourceWaker) -> Box<PythonCell> {
+    fn start(&self, id: ExecId, source: Option<String>, waker: SourceWaker) -> Arc<PythonExec> {
         let tasks = self.shared.tasks.lock().unwrap();
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
@@ -228,6 +230,7 @@ impl PythonNotebook {
             pending: 0,
             cancelled: tokio::sync::watch::channel(false).0,
             images: Vec::new(),
+            lease: None,
         }));
         self.shared
             .cells
@@ -260,7 +263,7 @@ impl PythonNotebook {
             state.returned = Some(UnixMs::now());
             state.finished = state.returned;
         }
-        Box::new(PythonCell::new(exec))
+        exec
     }
 }
 

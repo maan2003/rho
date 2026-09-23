@@ -9,13 +9,13 @@ use rho_core::{ExecCall, ToolOutput, ToolOutputStatus};
 use tokio::sync::Notify;
 
 use crate::python::tests::{shell, shell_in};
-use crate::python::{Export, PythonCell, PythonNotebook, SourceWaker};
+use crate::python::{Export, PythonExec, PythonNotebook, SourceWaker};
 
 fn notebook() -> PythonNotebook {
     PythonNotebook::new(shell(), Vec::new()).unwrap()
 }
 
-fn start(notebook: &PythonNotebook, source: &str) -> (Box<PythonCell>, Arc<Notify>) {
+fn start(notebook: &PythonNotebook, source: &str) -> (Arc<PythonExec>, Arc<Notify>) {
     let wake = Arc::new(Notify::new());
     let cell = notebook.exec(
         ExecCall {
@@ -38,8 +38,8 @@ async fn until(wake: &Notify, mut done: impl FnMut() -> bool) {
 }
 
 /// Everything the cell said once it and its work have ended.
-async fn finish(mut cell: Box<PythonCell>, wake: &Notify) -> ToolOutput {
-    let exec = cell.execution();
+async fn finish(cell: Arc<PythonExec>, wake: &Notify) -> ToolOutput {
+    let exec = Arc::clone(&cell);
     until(wake, || exec.quiescent()).await;
     let output = cell.first_output();
     cell.acknowledge_output();
@@ -61,7 +61,7 @@ async fn run_ok(notebook: &PythonNotebook, source: &str) -> String {
 async fn stream(notebook: &PythonNotebook, source: &str) -> ToolOutput {
     let wake = Arc::new(Notify::new());
     let cell = notebook.start_stream("stream".try_into().unwrap(), SourceWaker::new(wake.clone()));
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     exec.feed(source.into(), true).unwrap();
     until(&wake, || {
         exec.admit_stream_unit().unwrap();
@@ -212,7 +212,7 @@ async fn input_backlog_crosses_multiple_drain_batches_without_refusing_a_cell() 
 async fn shutdown_bypasses_backlog_and_ends_waiting_cells() {
     let notebook = notebook();
     let (cell, wake) = start(&notebook, "notify('waiting'); await asyncio.Event().wait()");
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     until(&wake, || exec.facts().notified_at.is_some()).await;
     let backlog = notebook.start_stream(
         "backlog".try_into().unwrap(),
@@ -231,7 +231,7 @@ async fn streaming_requires_each_permit_and_stop_does_not_finish_the_suffix() {
     let notebook = notebook();
     let wake = Arc::new(Notify::new());
     let cell = notebook.start_stream("stream".try_into().unwrap(), SourceWaker::new(wake.clone()));
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     let first = "seen = ['first']\n";
     exec.feed(
         format!("{first}seen.append('second')\nif True:\n    seen.append('suffix')\n"),
@@ -274,7 +274,7 @@ async fn stream_loss_allows_admitted_await_to_settle_without_admitting_more() {
     .await;
     let wake = Arc::new(Notify::new());
     let cell = notebook.start_stream("stream".try_into().unwrap(), SourceWaker::new(wake.clone()));
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     let first = "await gate.wait(); seen.append('settled')\n";
     exec.feed(format!("{first}seen.append('wrong')\n"), false)
         .unwrap();
@@ -354,7 +354,7 @@ set_max_wait(seconds=3)
 suppress_tool_wakeups()
 "#,
     );
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     let output = finish(cell, &wake).await;
     assert_eq!(output.output.as_str(), "xxxx\n[truncated]Ω \"quoted\"\n");
     let checkin = exec.facts().checkin.unwrap();
@@ -365,11 +365,11 @@ suppress_tool_wakeups()
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_stops_awaiting_work_without_losing_notebook() {
     let notebook = notebook();
-    let (mut cell, wake) = start(
+    let (cell, wake) = start(
         &notebook,
         "survives = 42\nasyncio.create_task(asyncio.sleep(3600))\nnotify('started')\nawait asyncio.Event().wait()",
     );
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     until(&wake, || exec.facts().notified_at.is_some()).await;
     cell.cancel();
     let output = finish(cell, &wake).await;
@@ -482,11 +482,11 @@ async fn standard_asyncio_callbacks_keep_cells_alive_and_can_be_cancelled() {
     )
     .await;
     assert_eq!(output, "callback\n");
-    let (mut cell, wake) = start(
+    let (cell, wake) = start(
         &notebook,
         "asyncio.get_running_loop().call_later(3600, notify, 'too late')\nprint('scheduled')",
     );
-    let exec = cell.execution();
+    let exec = Arc::clone(&cell);
     until(&wake, || exec.facts().returned.is_some()).await;
     assert!(!exec.quiescent());
     cell.cancel();
@@ -509,7 +509,7 @@ loop.add_reader(reader, ready)
 print('watching')
 "#,
     );
-    let exec = watching.execution();
+    let exec = Arc::clone(&watching);
     until(&wake, || exec.facts().returned.is_some()).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(!exec.quiescent());

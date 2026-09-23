@@ -117,23 +117,6 @@ impl PythonExec {
         }
     }
 }
-/// A cell as the agent loop holds it: its execution, and the output it
-/// has leased and not yet had acknowledged.
-pub struct PythonCell(Arc<PythonExec>, Option<ToolOutput>);
-
-impl PythonCell {
-    pub(crate) fn new(exec: Arc<PythonExec>) -> Self {
-        Self(exec, None)
-    }
-}
-
-impl std::ops::Deref for PythonCell {
-    type Target = PythonExec;
-    fn deref(&self) -> &PythonExec {
-        &self.0
-    }
-}
-
 /// The running code's cell: every host call names the cell it belongs to.
 pub(crate) fn current(py: Python<'_>, purpose: &str) -> PyResult<Arc<PythonExec>> {
     let owner = crate::python::interpreter::kernel(py)?
@@ -262,7 +245,7 @@ impl Cell {
     }
 }
 
-impl PythonCell {
+impl PythonExec {
     /// Whether any other live cell has something unsent, which the same
     /// reply will carry after this cell's own answer.
     fn others_have_news(&self) -> bool {
@@ -278,7 +261,7 @@ impl PythonCell {
     /// Everything unsent, in one block: the cell's own output first, then
     /// each source's report in the order they started. A source is forgotten
     /// once its end is reported.
-    fn render(&mut self, first: bool) -> Option<ToolOutput> {
+    fn render(&self, first: bool) -> Option<ToolOutput> {
         let mut cell = self.link.lock().unwrap();
         let mut chunks = Vec::new();
         if !cell.output.is_empty() {
@@ -342,7 +325,7 @@ impl PythonCell {
         Some(result)
     }
 }
-impl PythonCell {
+impl PythonExec {
     /// The facts of each job the cell started and has not finished
     /// reporting, in the order they started.
     pub fn jobs(&self) -> Vec<crate::python::JobFacts> {
@@ -352,42 +335,46 @@ impl PythonCell {
             .map(|source| source.facts(self.cell))
             .collect()
     }
-    pub fn execution(&self) -> Arc<PythonExec> {
-        self.0.clone()
-    }
+    /// Everything has been said and acknowledged.
     pub fn done(&self) -> bool {
-        self.1.is_none() && self.link.lock().unwrap().delivered
+        let state = self.link.lock().unwrap();
+        state.lease.is_none() && state.delivered
     }
     /// Lease the first contribution. Repeated reads return this same snapshot
     /// until its owner has committed or handed it off and acknowledges it.
-    pub fn first_output(&mut self) -> ToolOutput {
-        if self.1.is_none() {
-            self.1 = self.render(true);
-        }
-        self.1.clone().expect("a first contribution always exists")
+    pub fn first_output(&self) -> ToolOutput {
+        self.more_output_or(true)
+            .expect("a first contribution always exists")
     }
-    pub fn more_output(&mut self) -> Option<ToolOutput> {
-        if self.1.is_none() {
-            self.1 = self.render(false);
+    pub fn more_output(&self) -> Option<ToolOutput> {
+        self.more_output_or(false)
+    }
+    fn more_output_or(&self, first: bool) -> Option<ToolOutput> {
+        let leased = self.link.lock().unwrap().lease.clone();
+        if leased.is_some() {
+            return leased;
         }
-        self.1.clone()
+        let output = self.render(first);
+        self.link.lock().unwrap().lease = output.clone();
+        output
     }
     /// Release a leased contribution only after its recipient owns it.
-    pub fn acknowledge_output(&mut self) -> bool {
-        self.1.take().is_some()
+    pub fn acknowledge_output(&self) -> bool {
+        self.link.lock().unwrap().lease.take().is_some()
     }
-    pub fn cancel(&mut self) {
+    pub fn cancel(&self) {
         let _ = self.shared.send(Input::Cancel { cell: self.cell });
-        self.link.lock().unwrap().cancelled.send_replace(true);
-        for source in &self.link.lock().unwrap().sources {
+        let state = self.link.lock().unwrap();
+        state.cancelled.send_replace(true);
+        for source in &state.sources {
             if let Some(process) = &source.process {
                 process.cancel.notify_one();
             }
         }
     }
-}
-impl Drop for PythonCell {
-    fn drop(&mut self) {
+    /// Its holder is done with the cell: stop whatever it still owes, and
+    /// forget it.
+    pub fn release(&self) {
         if !self.done() {
             self.cancel();
         }

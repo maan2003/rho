@@ -325,8 +325,8 @@ pub(in crate::agent) mod tests {
         })
     }
 
-    fn exec(agent: &Agent) -> &crate::python::PythonCell {
-        &agent.cells.iter().next().unwrap().1.cell
+    fn exec(agent: &Agent) -> &Arc<crate::python::PythonExec> {
+        &agent.cells.iter().next().unwrap().1.exec
     }
 
     async fn until(agent: &mut Agent, predicate: impl Fn(&Agent) -> bool) {
@@ -700,7 +700,7 @@ pub(in crate::agent) mod tests {
         let decision = agent.decide(UnixMs::now());
         assert_eq!(decision, Boundary::AbortAndResend);
         assert_eq!(exec(&agent).stream_progress().admitted, 0);
-        let exec = exec(&agent).execution();
+        let exec = Arc::clone(exec(&agent));
         agent.abandon_stream(UnixMs::now()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
             while exec.facts().returned.is_none() {
@@ -735,7 +735,7 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         assert!(matches!(agent.phase, Phase::Idle { .. }));
-        let one = exec(&agent).execution();
+        let one = Arc::clone(exec(&agent));
         // Nothing admits once the response has ended; the cell runs on its own.
         tokio::time::timeout(Duration::from_secs(15), async {
             while one.stream_progress().settled < "import asyncio\ngate = asyncio.Event()\n".len() {

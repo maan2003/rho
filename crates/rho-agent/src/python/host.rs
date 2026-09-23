@@ -266,14 +266,14 @@ mod tests {
         );
         let notebook = PythonNotebook::new(shell, exports).unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut cell = notebook.exec(
+        let cell = notebook.exec(
             ExecCall {
                 id: "agents".try_into().unwrap(),
                 source: source.into(),
             },
             SourceWaker::new(wake.clone()),
         );
-        let exec = cell.execution();
+        let exec = Arc::clone(&cell);
         tokio::time::timeout(Duration::from_secs(10), async {
             while !exec.quiescent() {
                 let _ = tokio::time::timeout(Duration::from_millis(100), wake.notified()).await;
