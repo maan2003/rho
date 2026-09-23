@@ -5,7 +5,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result};
 use reqwest::Url;
-use rho_agent_host_proto::{ClientMessage, GitService, GitTransportRequest, ServerMessage};
+use rho_agent_host_proto::{GitService, GitTransportRequest, Open, Opened, Reply, Request};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn main() -> Result<()> {
@@ -63,17 +63,17 @@ async fn query_pat_available(host: &str) -> Result<bool> {
     let socket = rho_agent_host_proto::RuntimePaths::from_env()?
         .socket()
         .to_owned();
-    let mut client = rho_agent_host_proto::client::Client::connect(&socket)
-        .await
-        .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
-    client
-        .send(&ClientMessage::GitTransportQuery {
+    let reply = rho_agent_host_proto::client::request(
+        &socket,
+        Request::GitTransportPolicy {
             host: host.to_owned(),
-        })
-        .await?;
-    match client.recv().await? {
-        ServerMessage::GitTransportPolicy { pat_available } => Ok(pat_available),
-        message => anyhow::bail!("unexpected Git transport policy reply: {message:?}"),
+        },
+    )
+    .await
+    .with_context(|| format!("ask the rho daemon at {}", socket.display()))?;
+    match reply {
+        Reply::GitTransportPolicy { pat_available } => Ok(pat_available),
+        reply => anyhow::bail!("unexpected Git transport policy reply: {reply:?}"),
     }
 }
 
@@ -204,14 +204,13 @@ async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> 
         .await
         .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
     client
-        .send(&ClientMessage::GitTransportRequest {
+        .send(&Open::GitTransport {
             request: request.clone(),
         })
         .await?;
     match client.recv().await? {
-        ServerMessage::GitTransportReady => {}
-        ServerMessage::GitTransportRefused { reason } => anyhow::bail!("{reason}"),
-        message => anyhow::bail!("unexpected Git transport reply: {message:?}"),
+        Opened::Ready => {}
+        Opened::Refused { reason } => anyhow::bail!("{reason}"),
     }
 
     if helper_handshake {

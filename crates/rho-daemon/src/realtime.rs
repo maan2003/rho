@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent_host_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
-use rho_agent_host_proto::{ServerMessage, read_frame, write_frame};
+use rho_agent_host_proto::realtime::{Opened, RealtimeClientFrame, RealtimeServerFrame};
+use rho_agent_host_proto::{read_frame, write_frame};
 use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
     ContextChannel, ProviderEvent, Sideband, SidebandConfig, call_id_from_location,
@@ -41,7 +41,7 @@ where
         Err(_) => {
             write_frame(
                 &mut writer,
-                &ServerMessage::RealtimeRefused {
+                &Opened::Refused {
                     reason: "another GUI already owns the voice session".to_owned(),
                 },
             )
@@ -63,7 +63,7 @@ where
         Err(error) => {
             write_frame(
                 &mut writer,
-                &ServerMessage::RealtimeRefused {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -74,7 +74,7 @@ where
 
     write_frame(
         &mut writer,
-        &ServerMessage::RealtimeOpened {
+        &Opened::Answer {
             answer_sdp: opened.answer_sdp,
         },
     )

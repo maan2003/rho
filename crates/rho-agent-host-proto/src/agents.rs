@@ -1,6 +1,6 @@
 //! The agents stream: a host's journal and its agents' live tails.
 //!
-//! A stream of its own, opened by [`crate::ClientMessage::AgentsOpen`], so
+//! A stream of its own, opened by [`crate::Open::Agents`], so
 //! that a catch-up of thousands of pages never queues ahead of anything
 //! else the host says and its reader is the agents client alone. Every
 //! frame after the opening one is a [`ClientFrame`] or a [`ServerFrame`].

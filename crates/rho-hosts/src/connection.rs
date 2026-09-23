@@ -1,7 +1,7 @@
 //! Daemon connection: an IO task on the shared tokio runtime ([`gpui_tokio`]),
-//! bridged to the GUI through channels. Inbound server messages become
-//! [`ConnEvent`]s on a futures channel the workspace awaits (no polling);
-//! outbound commands are fire-and-forget.
+//! bridged to the GUI through channels. What the control stream pushes
+//! becomes [`ConnEvent`]s on a futures channel the workspace awaits (no
+//! polling); every request is a stream of its own, answered once.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,13 +15,16 @@ use rho_agent_host_proto::agents::{
     ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
 };
 use rho_agent_host_proto::client::Client;
+use rho_agent_host_proto::control::{
+    ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
+};
 use rho_agent_host_proto::desk::stream::{
     ClientFrame as DeskClientFrame, ServerFrame as DeskServerFrame,
 };
 use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
 use rho_agent_host_proto::{
-    AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
-    read_frame, write_frame,
+    AgentId, GitProvided, GitService, GitTransportRequest, Open, Opened, Reply, Request,
+    WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -59,15 +62,6 @@ const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(
 
 fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
     (delay * 2).min(MAX_RECONNECT_DELAY)
-}
-
-fn shell_request_id(message: &ClientMessage) -> Option<u64> {
-    match message {
-        ClientMessage::ShellStart { request_id, .. }
-        | ClientMessage::ShellList { request_id, .. }
-        | ClientMessage::ShellClose { request_id, .. } => Some(*request_id),
-        _ => None,
-    }
 }
 
 use crate::{AgentSink, AttachTarget, DeskSink, HostId, Sinks};
@@ -172,15 +166,7 @@ pub enum ConnEvent {
     /// Several events in order, delivered as one. A daemon sends them
     /// separately; a test that stands for one stands for the batch.
     Many(Vec<ConnEvent>),
-    TurnCancelled,
-    ChatGptUsage {
-        used_percent: f64,
-        reset_at_unix: i64,
-    },
     QuotaUsage(Vec<rho_agent_host_proto::QuotaSummary>),
-    QuotaHistory(Vec<rho_agent_host_proto::QuotaSeries>),
-    GlobalUsage(Vec<rho_agent_host_proto::AgentUsageSeries>),
-    AgentCostDistribution(Vec<rho_agent_host_proto::AgentCostSeries>),
     ServerError(String),
     Recovering(std::time::Duration),
     Recovered,
@@ -221,14 +207,9 @@ async fn dial_channel(
     workspace: WorkspaceInfo,
 ) -> anyhow::Result<WorkspaceChannel> {
     let mut stream = dialer.open(None).await?;
-    write_frame(&mut stream, &ClientMessage::ChannelOpen { workspace }).await?;
-    let reply: ServerMessage = read_frame(&mut stream).await?;
-    match reply {
-        ServerMessage::ChannelOpened => {}
-        ServerMessage::ChannelClosed { reason } => {
-            anyhow::bail!("daemon refused workspace file channel: {reason}")
-        }
-        _ => anyhow::bail!("unexpected reply to ChannelOpen"),
+    write_frame(&mut stream, &Open::Workspace { workspace }).await?;
+    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
+        anyhow::bail!("daemon refused workspace file channel: {reason}")
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
@@ -273,11 +254,10 @@ pub(crate) async fn dial_realtime(
     offer_sdp: String,
 ) -> anyhow::Result<crate::realtime_client::RealtimeChannel> {
     let mut stream = dial_stream(dialer).await?;
-    write_frame(&mut stream, &ClientMessage::RealtimeOpen { offer_sdp }).await?;
-    let answer_sdp = match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::RealtimeOpened { answer_sdp } => answer_sdp,
-        ServerMessage::RealtimeRefused { reason } => anyhow::bail!("{reason}"),
-        _ => anyhow::bail!("unexpected reply to RealtimeOpen"),
+    write_frame(&mut stream, &Open::Realtime { offer_sdp }).await?;
+    let answer_sdp = match read_frame(&mut stream).await? {
+        rho_agent_host_proto::realtime::Opened::Answer { answer_sdp } => answer_sdp,
+        rho_agent_host_proto::realtime::Opened::Refused { reason } => anyhow::bail!("{reason}"),
     };
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
         tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
@@ -294,50 +274,20 @@ pub(crate) async fn dial_realtime(
     })
 }
 
-enum ShellControlReply {
-    Started,
-    List(Vec<rho_agent_host_proto::shell::ShellInfo>),
-    Closed,
-    Failed(String),
-}
-
-struct ShellControlRequests {
-    next: u64,
-    pending: HashMap<u64, tokio::sync::oneshot::Sender<ShellControlReply>>,
-}
-
-impl Default for ShellControlRequests {
-    fn default() -> Self {
-        Self {
-            next: 1,
-            pending: HashMap::new(),
-        }
-    }
-}
-
-async fn shell_control_request(
-    commands: &futures_mpsc::UnboundedSender<ClientMessage>,
-    requests: &Arc<Mutex<ShellControlRequests>>,
-    make_message: impl FnOnce(u64) -> ClientMessage,
-) -> anyhow::Result<ShellControlReply> {
-    let (request_id, receiver) = {
-        let mut requests = requests.lock().unwrap();
-        let request_id = requests.next;
-        requests.next = requests
-            .next
-            .checked_add(1)
-            .context("shell request ids exhausted")?;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        requests.pending.insert(request_id, sender);
-        (request_id, receiver)
+/// One request on a stream of its own. A refusal is an error.
+async fn dial_request(dialer: ChannelDialer, request: Request) -> anyhow::Result<Reply> {
+    // Bulk answers wait behind interactive traffic; everything else is
+    // someone waiting on a keypress, as urgent as the control stream.
+    let priority = match &request {
+        Request::Visualization { .. } | Request::GuiTelemetryUpload { .. } => None,
+        _ => Some(1),
     };
-    if commands.unbounded_send(make_message(request_id)).is_err() {
-        requests.lock().unwrap().pending.remove(&request_id);
-        anyhow::bail!("daemon control connection closed");
+    let mut stream = dialer.open(priority).await?;
+    write_frame(&mut stream, &Open::Request(request)).await?;
+    match read_frame(&mut stream).await? {
+        Reply::Failed { reason } => anyhow::bail!(reason),
+        reply => Ok(reply),
     }
-    receiver
-        .await
-        .context("shell lifecycle request was dropped")
 }
 
 async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
@@ -349,20 +299,13 @@ async fn dial_visualization(
     dialer: ChannelDialer,
     id: String,
 ) -> anyhow::Result<VisualizationArtifact> {
-    let mut stream = dial_bulk_stream(dialer).await?;
-    write_frame(
-        &mut stream,
-        &ClientMessage::VisualizationGet { id: id.clone() },
-    )
-    .await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::VisualizationContent {
+    match dial_request(dialer, Request::Visualization { id: id.clone() }).await? {
+        Reply::Visualization {
             id: response_id,
             mime_type,
             content,
         } if response_id == id => Ok(VisualizationArtifact { mime_type, content }),
-        ServerMessage::VisualizationRefused { reason } => anyhow::bail!(reason),
-        _ => anyhow::bail!("unexpected reply to VisualizationGet"),
+        _ => anyhow::bail!("unexpected reply to a visualization request"),
     }
 }
 
@@ -371,36 +314,20 @@ async fn dial_gui_telemetry(dialer: ChannelDialer, snapshot: Vec<u8>) -> anyhow:
         snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot is too large"
     );
-    let mut stream = dial_bulk_stream(dialer).await?;
-    write_frame(&mut stream, &ClientMessage::GuiTelemetryUpload { snapshot }).await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::GuiTelemetryStored { path } => Ok(path),
-        ServerMessage::GuiTelemetryRefused { reason } => anyhow::bail!(reason),
-        _ => anyhow::bail!("unexpected reply to GuiTelemetryUpload"),
+    match dial_request(dialer, Request::GuiTelemetryUpload { snapshot }).await? {
+        Reply::GuiTelemetryStored { path } => Ok(path),
+        _ => anyhow::bail!("unexpected reply to a GUI telemetry upload"),
     }
 }
 
-/// Opens a low-priority one-shot/bulk stream. Unlike terminal streams this
-/// deliberately keeps iroh's default priority below interactive traffic.
-async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
-    dialer.open(None).await
-}
-
-/// One-shot `TerminalList` request for one agent's running terminals.
+/// One agent's running terminals.
 async fn dial_terminal_list(
     dialer: ChannelDialer,
     agent: String,
 ) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
-    let mut stream = dial_stream(dialer).await?;
-    write_frame(
-        &mut stream,
-        &ClientMessage::TerminalList { agent: Some(agent) },
-    )
-    .await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::TerminalList { terminals } => Ok(terminals),
-        ServerMessage::TerminalRefused { reason } => anyhow::bail!("{reason}"),
-        _ => anyhow::bail!("unexpected reply to TerminalList"),
+    match dial_request(dialer, Request::TerminalList { agent: Some(agent) }).await? {
+        Reply::TerminalList { terminals } => Ok(terminals),
+        _ => anyhow::bail!("unexpected reply to a terminal list request"),
     }
 }
 
@@ -427,28 +354,21 @@ async fn dial_terminal(
             None => (0, true),
         }
     };
-    let open = if create {
-        ClientMessage::TerminalCreate {
-            agent,
-            terminal_id,
-            attach: true,
-            cols,
-            rows,
-        }
-    } else {
-        ClientMessage::TerminalAttach {
-            agent,
-            terminal_id,
-            cols,
-            rows,
-        }
+    let open = Open::Terminal {
+        agent,
+        terminal_id,
+        open: if create {
+            rho_agent_host_proto::term::TerminalOpen::Create { attach: true }
+        } else {
+            rho_agent_host_proto::term::TerminalOpen::Attach
+        },
+        cols,
+        rows,
     };
     let mut stream = dial_stream(dialer).await?;
     write_frame(&mut stream, &open).await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::TerminalOpened { .. } => {}
-        ServerMessage::TerminalRefused { reason } => anyhow::bail!("{reason}"),
-        _ => anyhow::bail!("unexpected reply on terminal stream"),
+    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
+        anyhow::bail!("{reason}")
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
@@ -466,13 +386,31 @@ async fn dial_terminal(
     })
 }
 
+/// Starts the agent's shell when none runs, then attaches.
+async fn start_and_dial_shell(
+    dialer: ChannelDialer,
+    agent: String,
+) -> anyhow::Result<ShellChannel> {
+    let list = Request::ShellList {
+        agent: Some(agent.clone()),
+    };
+    let Reply::ShellList { shells } = dial_request(dialer.clone(), list).await? else {
+        anyhow::bail!("unexpected shell list reply");
+    };
+    if shells.is_empty() {
+        let start = Request::ShellStart {
+            agent: agent.clone(),
+        };
+        dial_request(dialer.clone(), start).await?;
+    }
+    dial_shell(dialer, agent).await
+}
+
 async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<ShellChannel> {
     let mut stream = dial_stream(dialer).await?;
-    write_frame(&mut stream, &ClientMessage::ShellAttach { agent }).await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::ShellOpened => {}
-        ServerMessage::ShellAttachRefused { reason } => anyhow::bail!("{reason}"),
-        _ => anyhow::bail!("unexpected reply on shell stream"),
+    write_frame(&mut stream, &Open::Shell { agent }).await?;
+    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
+        anyhow::bail!("{reason}")
     }
 
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -547,7 +485,9 @@ async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<Shel
 }
 
 pub struct Connection {
-    commands: futures_mpsc::UnboundedSender<ClientMessage>,
+    /// The runtime the IO task runs on, where requests are dialed.
+    #[cfg_attr(feature = "test-support", expect(dead_code))]
+    runtime: tokio::runtime::Handle,
     agent_commands: futures_mpsc::UnboundedSender<AgentsClientFrame>,
     /// The focus last asked for, told again to every agents stream that
     /// opens: it is state, not a request.
@@ -555,14 +495,22 @@ pub struct Connection {
     desk_commands: futures_mpsc::UnboundedSender<DeskClientFrame>,
     /// `None` until the IO task connects; channels cannot open earlier.
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
-    shell_requests: Arc<Mutex<ShellControlRequests>>,
     /// Dropping this aborts the IO task, tearing the connection down with the
     /// workspace.
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
     #[cfg(feature = "test-support")]
-    sent: Arc<Mutex<Vec<ClientMessage>>>,
+    requests: Arc<Mutex<TestRequests>>,
     #[cfg(feature = "test-support")]
     desk_sent: Arc<Mutex<Vec<DeskClientFrame>>>,
+}
+
+/// Requests a test connection was asked to make: what they were, and the
+/// ones the test has yet to answer, oldest first.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct TestRequests {
+    sent: Vec<Request>,
+    unanswered: std::collections::VecDeque<tokio::sync::oneshot::Sender<anyhow::Result<Reply>>>,
 }
 
 /// What the desk client says down one host's desk stream. Whatever is
@@ -600,23 +548,6 @@ impl AgentCommands {
 }
 
 type AgentFocus = Arc<Mutex<Option<Vec<AgentId>>>>;
-
-/// A command channel to one daemon, on its own: clonable, `Send`, and
-/// carrying nothing of the GUI.
-#[derive(Clone)]
-pub struct Commands {
-    commands: futures_mpsc::UnboundedSender<ClientMessage>,
-    #[cfg(feature = "test-support")]
-    sent: Arc<Mutex<Vec<ClientMessage>>>,
-}
-
-impl Commands {
-    pub fn send(&self, message: ClientMessage) {
-        #[cfg(feature = "test-support")]
-        self.sent.lock().unwrap().push(message.clone());
-        let _ = self.commands.unbounded_send(message);
-    }
-}
 
 pub struct VisualizationArtifact {
     pub mime_type: String,
@@ -715,37 +646,9 @@ impl Connection {
     /// Target-neutral GPUI task API used by portable shell surfaces.
     pub fn open_shell_task(&self, agent: String, cx: &App) -> Task<anyhow::Result<ShellChannel>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        let commands = self.commands.clone();
-        let requests = Arc::clone(&self.shell_requests);
         let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
-            let reply = shell_control_request(&commands, &requests, |request_id| {
-                ClientMessage::ShellList {
-                    request_id,
-                    agent: Some(agent.clone()),
-                }
-            })
-            .await?;
-            let running = match reply {
-                ShellControlReply::List(shells) => !shells.is_empty(),
-                ShellControlReply::Failed(reason) => anyhow::bail!(reason),
-                _ => anyhow::bail!("unexpected shell list reply"),
-            };
-            if !running {
-                match shell_control_request(&commands, &requests, |request_id| {
-                    ClientMessage::ShellStart {
-                        request_id,
-                        agent: agent.clone(),
-                    }
-                })
-                .await?
-                {
-                    ShellControlReply::Started => {}
-                    ShellControlReply::Failed(reason) => anyhow::bail!(reason),
-                    _ => anyhow::bail!("unexpected shell start reply"),
-                }
-            }
-            dial_shell(dialer, agent).await
+            start_and_dial_shell(dialer, agent).await
         });
         cx.spawn(async move |_| {
             task.await
@@ -754,19 +657,8 @@ impl Connection {
     }
 
     pub fn close_shell_task(&self, agent: String, cx: &App) -> Task<anyhow::Result<()>> {
-        let commands = self.commands.clone();
-        let requests = Arc::clone(&self.shell_requests);
-        cx.spawn(async move |_| {
-            match shell_control_request(&commands, &requests, |request_id| {
-                ClientMessage::ShellClose { request_id, agent }
-            })
-            .await?
-            {
-                ShellControlReply::Closed => Ok(()),
-                ShellControlReply::Failed(reason) => anyhow::bail!(reason),
-                _ => anyhow::bail!("unexpected shell close reply"),
-            }
-        })
+        let reply = self.request(Request::ShellClose { agent });
+        cx.spawn(async move |_| reply.await.map(drop))
     }
 
     pub fn visualization_client(&self) -> VisualizationClient {
@@ -775,8 +667,35 @@ impl Connection {
         }
     }
 
-    pub fn send(&self, message: ClientMessage) {
-        self.commands().send(message);
+    /// Makes one request on a stream of its own. The answer does not need
+    /// any particular executor; a refusal is an error.
+    pub fn request(
+        &self,
+        request: Request,
+    ) -> impl std::future::Future<Output = anyhow::Result<Reply>> + Send + 'static {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "test-support")]
+        {
+            let mut requests = self.requests.lock().unwrap();
+            requests.sent.push(request);
+            requests.unanswered.push_back(reply_tx);
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let dialer = self.dialer.lock().unwrap().clone();
+            self.runtime.spawn(async move {
+                let reply = match dialer {
+                    Some(dialer) => dial_request(dialer, request).await,
+                    None => Err(anyhow::anyhow!("not connected to rho-daemon")),
+                };
+                let _ = reply_tx.send(reply);
+            });
+        }
+        async move {
+            reply_rx
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("request was dropped")))
+        }
     }
 
     /// The agents stream's command channel, for the agents client.
@@ -786,19 +705,21 @@ impl Connection {
         }
     }
 
-    fn commands(&self) -> Commands {
-        Commands {
-            commands: self.commands.clone(),
-            #[cfg(feature = "test-support")]
-            sent: Arc::clone(&self.sent),
-        }
-    }
-
-    /// Everything sent down this connection since it was last asked, for a
+    /// Every request made on this connection since it was last asked, for a
     /// test that checks what the client said rather than what it drew.
     #[cfg(feature = "test-support")]
-    pub fn take_sent_for_test(&self) -> Vec<ClientMessage> {
-        std::mem::take(&mut *self.sent.lock().unwrap())
+    pub fn take_sent_for_test(&self) -> Vec<Request> {
+        std::mem::take(&mut self.requests.lock().unwrap().sent)
+    }
+
+    /// Answers the oldest request not yet answered, as the daemon would.
+    #[cfg(feature = "test-support")]
+    pub fn answer_for_test(&self, reply: anyhow::Result<Reply>) {
+        let answer = self.requests.lock().unwrap().unanswered.pop_front();
+        answer
+            .expect("no request is waiting for an answer")
+            .send(reply)
+            .ok();
     }
 
     /// The desk stream's command channel.
@@ -851,37 +772,9 @@ impl Connection {
         cx: &App,
     ) -> Task<Result<anyhow::Result<ShellChannel>, gpui_tokio::JoinError>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        let commands = self.commands.clone();
-        let requests = Arc::clone(&self.shell_requests);
         Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
-            let reply = shell_control_request(&commands, &requests, |request_id| {
-                ClientMessage::ShellList {
-                    request_id,
-                    agent: Some(agent.clone()),
-                }
-            })
-            .await?;
-            let running = match reply {
-                ShellControlReply::List(shells) => !shells.is_empty(),
-                ShellControlReply::Failed(reason) => anyhow::bail!("{reason}"),
-                _ => anyhow::bail!("unexpected shell list reply"),
-            };
-            if !running {
-                let reply = shell_control_request(&commands, &requests, |request_id| {
-                    ClientMessage::ShellStart {
-                        request_id,
-                        agent: agent.clone(),
-                    }
-                })
-                .await?;
-                match reply {
-                    ShellControlReply::Started => {}
-                    ShellControlReply::Failed(reason) => anyhow::bail!("{reason}"),
-                    _ => anyhow::bail!("unexpected shell start reply"),
-                }
-            }
-            dial_shell(dialer, agent).await
+            start_and_dial_shell(dialer, agent).await
         })
     }
 
@@ -891,19 +784,8 @@ impl Connection {
         agent: String,
         cx: &App,
     ) -> Task<Result<anyhow::Result<()>, gpui_tokio::JoinError>> {
-        let commands = self.commands.clone();
-        let requests = Arc::clone(&self.shell_requests);
-        Tokio::spawn(cx, async move {
-            let reply = shell_control_request(&commands, &requests, |request_id| {
-                ClientMessage::ShellClose { request_id, agent }
-            })
-            .await?;
-            match reply {
-                ShellControlReply::Closed => Ok(()),
-                ShellControlReply::Failed(reason) => anyhow::bail!("{reason}"),
-                _ => anyhow::bail!("unexpected shell close reply"),
-            }
-        })
+        let reply = self.request(Request::ShellClose { agent });
+        Tokio::spawn(cx, async move { reply.await.map(drop) })
     }
 
     /// Dials a dedicated workspace file stream and runs
@@ -964,8 +846,6 @@ pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Conn
         host,
         agents: sinks.agents,
     };
-    let (command_tx, command_rx) = futures_mpsc::unbounded();
-    let command_rx = Arc::new(tokio::sync::Mutex::new(command_rx));
     let (agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
     let agent_command_rx = Arc::new(tokio::sync::Mutex::new(agent_command_rx));
     let agent_focus = AgentFocus::default();
@@ -975,9 +855,7 @@ pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Conn
     };
     let (desk_command_tx, desk_command_rx) = futures_mpsc::unbounded();
     let desk_command_rx = Arc::new(tokio::sync::Mutex::new(desk_command_rx));
-    let pending_command = Arc::new(Mutex::new(None));
     let dialer = Arc::new(Mutex::new(None));
-    let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
     let io_task = if !supervises() {
         Tokio::spawn(cx, async {})
     } else {
@@ -997,23 +875,19 @@ pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Conn
                         commands: desk_command_rx,
                     },
                 },
-                command_rx,
-                pending_command,
                 dialer.clone(),
-                Arc::clone(&shell_requests),
             ),
         )
     };
     Connection {
-        commands: command_tx,
+        runtime: Tokio::handle(cx),
         agent_commands: agent_command_tx,
         agent_focus,
         desk_commands: desk_command_tx,
         dialer,
-        shell_requests,
         _io_task: io_task,
         #[cfg(feature = "test-support")]
-        sent: Arc::new(Mutex::new(Vec::new())),
+        requests: Arc::default(),
         #[cfg(feature = "test-support")]
         desk_sent: Arc::new(Mutex::new(Vec::new())),
     }
@@ -1023,10 +897,7 @@ async fn supervise(
     target: AttachTarget,
     events: EventSink,
     streams: Streams,
-    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
-    pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
-    shell_requests: Arc<Mutex<ShellControlRequests>>,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut reconnecting = false;
@@ -1035,17 +906,7 @@ async fn supervise(
             break;
         }
         let mut connected = false;
-        let result = run(
-            target.clone(),
-            &events,
-            &streams,
-            Arc::clone(&commands),
-            Arc::clone(&pending_command),
-            &dialer,
-            Arc::clone(&shell_requests),
-            &mut connected,
-        )
-        .await;
+        let result = run(target.clone(), &events, &streams, &dialer, &mut connected).await;
         *dialer.lock().unwrap() = None;
         if events.events.is_closed() {
             break;
@@ -1082,111 +943,6 @@ async fn supervise(
     }
 }
 
-async fn run_control_writer<W>(
-    mut writer: W,
-    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
-    pending_command: Arc<Mutex<Option<ClientMessage>>>,
-    attempted_shell_requests: Arc<Mutex<HashSet<u64>>>,
-    events: Option<EventSink>,
-    shell_requests: Option<Arc<Mutex<ShellControlRequests>>>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut usage_refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
-    usage_refresh.tick().await;
-    loop {
-        let message = if let Some(message) = pending_command.lock().unwrap().clone() {
-            message
-        } else {
-            tokio::select! {
-                message = async { commands.lock().await.next().await } => {
-                    let Some(message) = message else { return Ok(()) };
-                    *pending_command.lock().unwrap() = Some(message.clone());
-                    message
-                }
-                _ = usage_refresh.tick() => {
-                    write_frame(&mut writer, &ClientMessage::ChatGptUsage).await?;
-                    continue;
-                }
-            }
-        };
-        if let Err(error) = validate_control_message(&message) {
-            pending_command.lock().unwrap().take();
-            let reason = format!("command rejected before sending: {error:#}");
-            if let Some(request_id) = shell_request_id(&message)
-                && let Some(requests) = &shell_requests
-                && let Some(response) = requests.lock().unwrap().pending.remove(&request_id)
-            {
-                let _ = response.send(ShellControlReply::Failed(reason.clone()));
-            }
-            if let Some(events) = &events {
-                let _ = events.unbounded_send(ConnEvent::ServerError(reason));
-            }
-            continue;
-        }
-        if let Err(error) = write_frame(&mut writer, &message).await {
-            if !replay_safe(&message) {
-                pending_command.lock().unwrap().take();
-                let reason = format!("command outcome unknown after disconnect: {error:#}");
-                if let Some(request_id) = shell_request_id(&message)
-                    && let Some(requests) = &shell_requests
-                    && let Some(response) = requests.lock().unwrap().pending.remove(&request_id)
-                {
-                    let _ = response.send(ShellControlReply::Failed(reason.clone()));
-                }
-                if let Some(events) = &events {
-                    let _ = events.unbounded_send(ConnEvent::ServerError(reason));
-                }
-            }
-            return Err(error);
-        }
-        pending_command.lock().unwrap().take();
-        if let Some(request_id) = shell_request_id(&message) {
-            attempted_shell_requests.lock().unwrap().insert(request_id);
-        }
-    }
-}
-
-fn replay_safe(message: &ClientMessage) -> bool {
-    matches!(
-        message,
-        ClientMessage::Ping
-            | ClientMessage::Subscribe
-            | ClientMessage::GitTransportRegister
-            | ClientMessage::ShellList { .. }
-            | ClientMessage::ChatGptUsage
-            | ClientMessage::QuotaHistory
-            | ClientMessage::GlobalUsage { .. }
-            | ClientMessage::AgentCostDistribution { .. }
-    )
-}
-
-fn validate_control_message(message: &ClientMessage) -> anyhow::Result<()> {
-    let payload = senax_encoder::pack(message).context("pack protocol frame")?;
-    anyhow::ensure!(
-        payload.len() <= rho_agent_host_proto::MAX_FRAME_LEN,
-        "protocol frame length {} exceeds {}",
-        payload.len(),
-        rho_agent_host_proto::MAX_FRAME_LEN
-    );
-    Ok(())
-}
-
-fn fail_attempted_shell_requests(
-    shell_requests: &Mutex<ShellControlRequests>,
-    attempted: &Mutex<HashSet<u64>>,
-    reason: &str,
-) {
-    let attempted = std::mem::take(&mut *attempted.lock().unwrap());
-    let mut requests = shell_requests.lock().unwrap();
-    for request_id in attempted {
-        if let Some(response) = requests.pending.remove(&request_id) {
-            let _ = response.send(ShellControlReply::Failed(reason.to_owned()));
-        }
-    }
-}
-
 async fn abort_tasks<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
@@ -1196,10 +952,7 @@ async fn run(
     target: AttachTarget,
     events: &EventSink,
     streams: &Streams,
-    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
-    pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
-    shell_requests: Arc<Mutex<ShellControlRequests>>,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
     let (mut stream, agent_connection, _endpoint) = match target {
@@ -1229,13 +982,13 @@ async fn run(
             (stream, Some(connection), Some(endpoint))
         }
     };
-    write_frame(&mut stream, &ClientMessage::Subscribe).await?;
-    let message: ServerMessage = read_frame(&mut stream).await?;
-    let ServerMessage::Ready {
+    write_frame(&mut stream, &Open::Control).await?;
+    let frame: ControlFrame = read_frame(&mut stream).await?;
+    let ControlFrame::Ready {
         auth,
         machine_seed,
         agent_counter,
-    } = message
+    } = frame
     else {
         anyhow::bail!("rho daemon did not send ready message");
     };
@@ -1263,11 +1016,34 @@ async fn run(
         streams_dialer.clone(),
         streams.agents.clone(),
     ));
-    let mut desk_task = tokio::spawn(run_desk_stream(streams_dialer, streams.desk.clone()));
+    let mut desk_task = tokio::spawn(run_desk_stream(
+        streams_dialer.clone(),
+        streams.desk.clone(),
+    ));
+    // Quota moves on its own as well as when the host says so.
+    let quota_task = {
+        let events = events.clone();
+        tokio::spawn(async move {
+            let mut refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            loop {
+                refresh.tick().await;
+                match dial_request(streams_dialer.clone(), Request::QuotaUsage).await {
+                    Ok(Reply::QuotaUsage { summaries }) => {
+                        if events
+                            .unbounded_send(ConnEvent::QuotaUsage(summaries))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => tracing::warn!("unexpected reply to a quota request"),
+                    Err(error) => tracing::debug!(%error, "quota refresh failed"),
+                }
+            }
+        })
+    };
 
-    write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
-
-    write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
+    write_frame(&mut stream, &ControlClientFrame::ProvideGitTransport).await?;
 
     let health_connection = agent_connection;
     let git_transport_limit = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1275,7 +1051,8 @@ async fn run(
         HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
     ));
 
-    let (mut reader, writer) = tokio::io::split(stream);
+    // The write half is held, unused, so the stream stays open.
+    let (mut reader, _writer) = tokio::io::split(stream);
     let health_task = health_connection.map(|connection| {
         let events = events.clone();
         tokio::spawn(async move {
@@ -1309,20 +1086,10 @@ async fn run(
             }
         })
     });
-    let attempted_shell_requests = Arc::new(Mutex::new(HashSet::new()));
-    let mut writer_task = tokio::spawn(run_control_writer(
-        writer,
-        commands,
-        pending_command,
-        Arc::clone(&attempted_shell_requests),
-        Some(events.clone()),
-        Some(Arc::clone(&shell_requests)),
-    ));
-    let mut writer_finished = false;
     let mut git_provider_tasks = tokio::task::JoinSet::new();
 
     let read_error = loop {
-        let message: ServerMessage = tokio::select! {
+        let frame: ControlFrame = tokio::select! {
             result = &mut agents_task => {
                 break Some(match result {
                     Ok(Ok(())) => anyhow::anyhow!("daemon agents stream closed"),
@@ -1337,24 +1104,16 @@ async fn run(
                     Err(error) => anyhow::anyhow!("daemon desk stream task failed: {error}"),
                 });
             }
-            result = &mut writer_task => {
-                writer_finished = true;
-                break Some(match result {
-                    Ok(Ok(())) => anyhow::anyhow!("daemon control writer stopped"),
-                    Ok(Err(error)) => error.context("write daemon control frame"),
-                    Err(error) => anyhow::anyhow!("daemon control writer task failed: {error}"),
-                });
-            }
             result = read_frame(&mut reader) => match result {
-                Ok(message) => message,
+                Ok(frame) => frame,
                 Err(error) => break Some(error),
             },
         };
-        let event = match message {
-            ServerMessage::DesktopSessions { sessions } => {
+        let event = match frame {
+            ControlFrame::DesktopSessions { sessions } => {
                 Some(ConnEvent::DesktopSessions(sessions))
             }
-            ServerMessage::Ready {
+            ControlFrame::Ready {
                 auth,
                 machine_seed,
                 agent_counter,
@@ -1363,24 +1122,10 @@ async fn run(
                 machine_seed,
                 agent_counter,
             }),
-            ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
-            ServerMessage::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated { agent_id }),
-            ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
-            ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
-            ServerMessage::ChatGptUsage {
-                used_percent,
-                reset_at_unix,
-            } => Some(ConnEvent::ChatGptUsage {
-                used_percent,
-                reset_at_unix,
-            }),
-            ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries)),
-            ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series)),
-            ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series)),
-            ServerMessage::AgentCostDistribution { series } => {
-                Some(ConnEvent::AgentCostDistribution(series))
-            }
-            ServerMessage::GitTransportRequested {
+            ControlFrame::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
+            ControlFrame::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated { agent_id }),
+            ControlFrame::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries)),
+            ControlFrame::GitTransportRequested {
                 request_id,
                 provider_id,
                 request,
@@ -1421,62 +1166,12 @@ async fn run(
                 });
                 None
             }
-            ServerMessage::GitTransportDone { request_id } => {
+            ControlFrame::GitTransportDone { request_id } => {
                 if let Some(done) = git_requests.lock().unwrap().remove(&request_id) {
                     done.send_replace(true);
                 }
                 Some(ConnEvent::GitTransportDone { request_id })
             }
-            ServerMessage::ShellStarted { request_id } => {
-                if let Some(request) = shell_requests.lock().unwrap().pending.remove(&request_id) {
-                    let _ = request.send(ShellControlReply::Started);
-                }
-                None
-            }
-            ServerMessage::ShellList { request_id, shells } => {
-                if let Some(request) = shell_requests.lock().unwrap().pending.remove(&request_id) {
-                    let _ = request.send(ShellControlReply::List(shells));
-                }
-                None
-            }
-            ServerMessage::ShellClosed { request_id } => {
-                if let Some(request) = shell_requests.lock().unwrap().pending.remove(&request_id) {
-                    let _ = request.send(ShellControlReply::Closed);
-                }
-                None
-            }
-            ServerMessage::ShellRequestFailed { request_id, reason } => {
-                if let Some(request) = shell_requests.lock().unwrap().pending.remove(&request_id) {
-                    let _ = request.send(ShellControlReply::Failed(reason));
-                }
-                None
-            }
-            ServerMessage::Pong
-            | ServerMessage::ClaudeAccounts { .. }
-            | ServerMessage::VisualizationRecorded { .. }
-            | ServerMessage::PlatformStatus { .. }
-            | ServerMessage::IrohApproved { .. }
-            | ServerMessage::IrohRevoked { .. }
-            | ServerMessage::Snapshotted { .. }
-            | ServerMessage::PrCommandResult { .. }
-            | ServerMessage::GitTransportReady
-            | ServerMessage::GitTransportRefused { .. }
-            | ServerMessage::GitTransportPolicy { .. } => None,
-            // Dedicated-stream handshake replies never belong to the UI session.
-            ServerMessage::ChannelOpened
-            | ServerMessage::ChannelClosed { .. }
-            | ServerMessage::TerminalOpened { .. }
-            | ServerMessage::TerminalRefused { .. }
-            | ServerMessage::TerminalList { .. }
-            | ServerMessage::ShellOpened
-            | ServerMessage::ShellAttachRefused { .. }
-            | ServerMessage::GuiTelemetryStored { .. }
-            | ServerMessage::GuiTelemetryRefused { .. }
-            | ServerMessage::RealtimeOpened { .. }
-            | ServerMessage::RealtimeRefused { .. }
-            | ServerMessage::VisualizationContent { .. }
-            | ServerMessage::VisualizationRefused { .. }
-            | ServerMessage::WaylandOpened => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
@@ -1484,10 +1179,8 @@ async fn run(
             break None;
         }
     };
-    if !writer_finished {
-        writer_task.abort();
-        let _ = writer_task.await;
-    }
+    quota_task.abort();
+    let _ = quota_task.await;
     agents_task.abort();
     let _ = agents_task.await;
     desk_task.abort();
@@ -1497,11 +1190,6 @@ async fn run(
         let _ = task.await;
     }
     abort_tasks(&mut git_provider_tasks).await;
-    let failure = read_error
-        .as_ref()
-        .map(|error| format!("daemon connection lost: {error:#}"))
-        .unwrap_or_else(|| "daemon connection closed".to_owned());
-    fail_attempted_shell_requests(&shell_requests, &attempted_shell_requests, &failure);
     git_requests.lock().unwrap().clear();
     match read_error {
         Some(error) => Err(error),
@@ -1534,7 +1222,7 @@ struct DeskStreamSink {
 /// this device, which takes the connection down with it.
 async fn run_desk_stream(dialer: ChannelDialer, stream: DeskStream) -> anyhow::Result<()> {
     let mut socket = dial_stream(dialer).await?;
-    write_frame(&mut socket, &ClientMessage::DeskOpen).await?;
+    write_frame(&mut socket, &Open::Desk).await?;
     let (mut reader, mut writer) = tokio::io::split(socket);
     let mut commands = stream.commands.lock().await;
     // Written for the last stream; the handshake after `Opened` carries
@@ -1617,8 +1305,8 @@ struct AgentStreamSink {
 /// connection down and brings both streams up again together.
 async fn run_agents_stream(dialer: ChannelDialer, stream: AgentStream) -> anyhow::Result<()> {
     // Bulk priority: a catch-up must not hold up the control stream.
-    let mut socket = dial_bulk_stream(dialer).await?;
-    write_frame(&mut socket, &ClientMessage::AgentsOpen).await?;
+    let mut socket = dialer.open(None).await?;
+    write_frame(&mut socket, &Open::Agents).await?;
     let (mut reader, mut writer) = tokio::io::split(socket);
     let mut commands = stream.commands.lock().await;
     // A follow asked of the last stream's journal head; this stream says
@@ -1870,14 +1558,14 @@ async fn report_git_transport_decision(
     let mut stream = dial_stream(dialer).await?;
     write_frame(
         &mut stream,
-        &ClientMessage::GitTransportProvide {
+        &Open::GitProvide {
             request_id,
             provider_id,
             claim,
         },
     )
     .await?;
-    let _: ServerMessage = read_frame(&mut stream).await?;
+    let _: GitProvided = read_frame(&mut stream).await?;
     Ok(())
 }
 
@@ -1889,18 +1577,16 @@ async fn open_git_transport_provider(
     let mut stream = dial_stream(dialer).await?;
     write_frame(
         &mut stream,
-        &ClientMessage::GitTransportProvide {
+        &Open::GitProvide {
             request_id,
             provider_id,
             claim: true,
         },
     )
     .await?;
-    match read_frame::<_, ServerMessage>(&mut stream).await? {
-        ServerMessage::GitTransportReady => Ok(Some(stream)),
-        ServerMessage::GitTransportDone { .. } => Ok(None),
-        ServerMessage::GitTransportRefused { reason } => anyhow::bail!(reason),
-        _ => anyhow::bail!("unexpected Git transport provider handshake reply"),
+    match read_frame(&mut stream).await? {
+        GitProvided::Ready => Ok(Some(stream)),
+        GitProvided::Done => Ok(None),
     }
 }
 
@@ -2020,9 +1706,12 @@ async fn connect_iroh(
             == rho_iroh_auth::ClientAuthResult::Approved,
         "daemon did not approve SSH-trusted iroh client"
     );
-    let (send, recv) = connection.open_bi().await.context("open iroh UI stream")?;
+    let (send, recv) = connection
+        .open_bi()
+        .await
+        .context("open iroh control stream")?;
     send.set_priority(1)
-        .context("set iroh UI control stream priority")?;
+        .context("set iroh control stream priority")?;
     let stream = rho_rpc::Stream::new(recv, send);
     Ok((stream, connection, endpoint))
 }
@@ -2136,15 +1825,11 @@ mod shutdown_tests {
                 commands: Arc::new(tokio::sync::Mutex::new(desk_command_rx)),
             },
         };
-        let (_command_tx, command_rx) = futures_mpsc::unbounded();
         let supervisor = supervise(
             crate::AttachTarget::Unix(socket),
             events,
             streams,
-            Arc::new(tokio::sync::Mutex::new(command_rx)),
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(ShellControlRequests::default())),
         );
 
         let ended = runtime.block_on(async {
@@ -2166,18 +1851,16 @@ mod shutdown_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use octo_types::{ReceivePackCommands, RefUpdate};
-    use rho_agent_host_proto::{ClientMessage, GitService, GitTransportRequest};
+    use rho_agent_host_proto::{GitService, GitTransportRequest};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
-        INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY, ShellControlReply, ShellControlRequests,
-        abort_tasks, copy_planned_receive_pack, display_field, fail_attempted_shell_requests,
-        git_push_prompt, next_reconnect_delay, read_frame, receive_pack_refs_match,
-        run_control_writer, validate_git_transport_request,
+        INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY, abort_tasks, copy_planned_receive_pack,
+        display_field, git_push_prompt, next_reconnect_delay, receive_pack_refs_match,
+        validate_git_transport_request,
     };
 
     #[test]
@@ -2188,164 +1871,6 @@ mod tests {
         }
         assert_eq!(delay, MAX_RECONNECT_DELAY);
         assert_eq!(next_reconnect_delay(delay), MAX_RECONNECT_DELAY);
-    }
-
-    #[test]
-    fn writer_failure_returns_to_the_connection_supervisor() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (writer, peer) = tokio::io::duplex(64);
-                drop(peer);
-                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
-                commands_tx.unbounded_send(ClientMessage::Ping).unwrap();
-                let result = run_control_writer(
-                    writer,
-                    Arc::new(tokio::sync::Mutex::new(commands_rx)),
-                    Arc::new(Mutex::new(None)),
-                    Arc::new(Mutex::new(HashSet::new())),
-                    None,
-                    None,
-                )
-                .await;
-                assert!(result.is_err());
-            });
-    }
-
-    #[test]
-    fn failed_write_replays_the_in_flight_command() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
-                commands_tx.unbounded_send(ClientMessage::Ping).unwrap();
-                let commands = Arc::new(tokio::sync::Mutex::new(commands_rx));
-                let pending = Arc::new(Mutex::new(None));
-                let attempted = Arc::new(Mutex::new(HashSet::new()));
-                let (failed_writer, peer) = tokio::io::duplex(64);
-                drop(peer);
-                assert!(
-                    run_control_writer(
-                        failed_writer,
-                        Arc::clone(&commands),
-                        Arc::clone(&pending),
-                        Arc::clone(&attempted),
-                        None,
-                        None,
-                    )
-                    .await
-                    .is_err()
-                );
-                assert!(matches!(
-                    pending.lock().unwrap().as_ref(),
-                    Some(ClientMessage::Ping)
-                ));
-
-                let (writer, mut reader) = tokio::io::duplex(1024);
-                let replay = tokio::spawn(run_control_writer(
-                    writer, commands, pending, attempted, None, None,
-                ));
-                let message: ClientMessage = read_frame(&mut reader).await.unwrap();
-                assert!(matches!(message, ClientMessage::Ping));
-                replay.abort();
-                let _ = replay.await;
-            });
-    }
-
-    #[test]
-    fn permanently_invalid_command_does_not_poison_the_queue() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
-                commands_tx
-                    .unbounded_send(ClientMessage::SendUserMessage {
-                        agent_id: rho_agent_host_proto::AgentId::from_counter(
-                            1,
-                            &rho_agent_host_proto::AgentIdDomain(0),
-                        )
-                        .unwrap(),
-                        content: vec![rho_agent_host_proto::ContentPart::Image {
-                            media_type: "image/png".to_owned(),
-                            data: vec![0; rho_agent_host_proto::MAX_FRAME_LEN + 1],
-                        }],
-                        delivery: rho_agent_host_proto::MessageDelivery::NextRequest,
-                    })
-                    .unwrap();
-                commands_tx.unbounded_send(ClientMessage::Ping).unwrap();
-                let (writer, mut reader) = tokio::io::duplex(1024);
-                let task = tokio::spawn(run_control_writer(
-                    writer,
-                    Arc::new(tokio::sync::Mutex::new(commands_rx)),
-                    Arc::new(Mutex::new(None)),
-                    Arc::new(Mutex::new(HashSet::new())),
-                    None,
-                    None,
-                ));
-
-                let message: ClientMessage = read_frame(&mut reader).await.unwrap();
-                assert!(matches!(message, ClientMessage::Ping));
-                task.abort();
-                let _ = task.await;
-            });
-    }
-
-    #[test]
-    fn ambiguous_non_idempotent_write_is_not_replayed() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
-                commands_tx
-                    .unbounded_send(ClientMessage::ShellStart {
-                        request_id: 1,
-                        agent: "test".to_owned(),
-                    })
-                    .unwrap();
-                let pending = Arc::new(Mutex::new(None));
-                let (writer, peer) = tokio::io::duplex(64);
-                drop(peer);
-                assert!(
-                    run_control_writer(
-                        writer,
-                        Arc::new(tokio::sync::Mutex::new(commands_rx)),
-                        Arc::clone(&pending),
-                        Arc::new(Mutex::new(HashSet::new())),
-                        None,
-                        None,
-                    )
-                    .await
-                    .is_err()
-                );
-                assert!(pending.lock().unwrap().is_none());
-            });
-    }
-
-    #[test]
-    fn teardown_fails_only_requests_attempted_on_the_dead_session() {
-        let mut requests = ShellControlRequests::default();
-        let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
-        let (queued_tx, _queued_rx) = tokio::sync::oneshot::channel();
-        requests.pending.insert(1, attempted_tx);
-        requests.pending.insert(2, queued_tx);
-        let requests = Mutex::new(requests);
-        let attempted = Mutex::new(HashSet::from([1]));
-
-        fail_attempted_shell_requests(&requests, &attempted, "lost");
-
-        assert!(matches!(
-            attempted_rx.blocking_recv().unwrap(),
-            ShellControlReply::Failed(reason) if reason == "lost"
-        ));
-        assert!(requests.lock().unwrap().pending.contains_key(&2));
     }
 
     #[test]
@@ -2607,20 +2132,16 @@ async fn open_wayland_stream(
     let mut stream = rho_rpc::Stream::new(recv, send);
     write_frame(
         &mut stream,
-        &ClientMessage::WaylandOpen {
+        &Open::Wayland {
             media_id: id,
             agent,
             session,
         },
     )
     .await?;
-    anyhow::ensure!(
-        matches!(
-            read_frame::<_, ServerMessage>(&mut stream).await?,
-            ServerMessage::WaylandOpened
-        ),
-        "Wayland open refused"
-    );
+    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
+        anyhow::bail!("Wayland open refused: {reason}");
+    }
     tracing::info!(
         desktop_id = id,
         elapsed_ms = started.elapsed().as_millis(),

@@ -2,8 +2,6 @@ use std::path::Path;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::{ClientMessage, ServerMessage, read_frame, write_frame};
-
 /// Async Unix-socket listener for the rho UI protocol.
 pub struct Server {
     listener: UnixListener,
@@ -46,14 +44,6 @@ impl ServerConnection {
         let peer_cred = stream.peer_cred().ok();
         let stream = rho_rpc::accept_unix(stream).await?;
         Ok(Self { stream, peer_cred })
-    }
-
-    pub async fn recv(&mut self) -> anyhow::Result<ClientMessage> {
-        read_frame(&mut self.stream).await
-    }
-
-    pub async fn send(&mut self, message: &ServerMessage) -> anyhow::Result<()> {
-        write_frame(&mut self.stream, message).await
     }
 
     pub fn peer_cred(&self) -> std::io::Result<tokio::net::unix::UCred> {

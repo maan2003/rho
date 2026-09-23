@@ -13,11 +13,14 @@ use rho_agent::db::{
     QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
+use rho_agent_host_proto::control::{
+    ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
+};
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
-    AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
-    ClientMessage, ContentPart, JoinTarget, Place, QuotaPoint, QuotaSeries, QuotaSummary,
-    ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
+    AgentCommand, AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries,
+    AuthState, ContentPart, GitProvided, JoinTarget, Open, Opened, Place, QuotaPoint, QuotaSeries,
+    QuotaSummary, Reply, Request, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
@@ -604,8 +607,8 @@ async fn run_iroh_listener(
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
             let uni_task = tokio::spawn(async move { uni.receive_uni().await });
-            // One UI control session per iroh connection; the rest of its
-            // streams are dedicated (files, shells, one-shot queries).
+            // One control stream per iroh connection; every other stream
+            // is opened for one thing of its own.
             let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let services = services.clone();
@@ -619,48 +622,29 @@ async fn run_iroh_listener(
                         else {
                             return Ok(());
                         };
-                        let first = tokio::time::timeout(
+                        let open = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            read_frame::<_, ClientMessage>(&mut recv),
+                            read_frame::<_, Open>(&mut recv),
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
-                        if let ClientMessage::WaylandOpen {
+                        if let Open::Wayland {
                             media_id,
                             agent,
                             session,
-                        } = first
+                        } = open
                         {
                             let transport = media.session(media_id)?;
                             send.set_priority(100)?;
                             let mut writer = rho_rpc::Writer::new(send);
-                            write_frame(&mut writer, &ServerMessage::WaylandOpened).await?;
+                            write_frame(&mut writer, &Opened::Ready).await?;
                             return serve_wayland(
                                 services, transport, recv, writer, agent, session,
                             )
                             .await;
                         }
-                        // Dedicated streams (workspace files, shells,
-                        // terminals, one-shot queries) are not the UI control
-                        // session and must not claim it.
-                        let dedicated = matches!(
-                            &first,
-                            ClientMessage::ChannelOpen { .. }
-                                | ClientMessage::AgentsOpen
-                                | ClientMessage::DeskOpen
-                                | ClientMessage::RealtimeOpen { .. }
-                                | ClientMessage::GuiTelemetryUpload { .. }
-                                | ClientMessage::VisualizationGet { .. }
-                                | ClientMessage::WaylandOpen { .. }
-                                | ClientMessage::TerminalCreate { .. }
-                                | ClientMessage::TerminalAttach { .. }
-                                | ClientMessage::TerminalList { .. }
-                                | ClientMessage::ShellAttach { .. }
-                                | ClientMessage::GitTransportRequest { .. }
-                                | ClientMessage::GitTransportProvide { .. }
-                                | ClientMessage::GitTransportQuery { .. }
-                        );
-                        let control = if !dedicated {
+                        let control = matches!(open, Open::Control);
+                        if control {
                             anyhow::ensure!(
                                 control_claimed
                                     .compare_exchange(
@@ -670,28 +654,20 @@ async fn run_iroh_listener(
                                         Ordering::Relaxed
                                     )
                                     .is_ok(),
-                                "iroh connection already has a UI control session"
+                                "iroh connection already has a control stream"
                             );
                             send.set_priority(1)
                                 .context("set iroh control stream priority")?;
-                            true
-                        } else {
-                            false
-                        };
+                        }
                         if matches!(
-                            &first,
-                            ClientMessage::TerminalCreate { .. }
-                                | ClientMessage::TerminalAttach { .. }
-                                | ClientMessage::ShellAttach { .. }
-                                | ClientMessage::RealtimeOpen { .. }
+                            open,
+                            Open::Terminal { .. } | Open::Shell { .. } | Open::Realtime { .. }
                         ) {
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
                         let writer = rho_rpc::Writer::new(send);
-                        let result =
-                            serve_connection_io(services, iroh_auth, recv, writer, Some(first))
-                                .await;
+                        let result = serve_stream(services, iroh_auth, open, recv, writer).await;
                         if control {
                             control_claimed.store(false, Ordering::Release);
                         }
@@ -715,13 +691,13 @@ type BoxGitStream = Box<dyn GitStream>;
 
 #[derive(Default)]
 struct GitTransportState {
-    providers: HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+    providers: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
     pending: HashMap<u64, PendingGitTransport>,
 }
 
 struct PendingGitTransport {
     response: oneshot::Sender<Result<BoxGitStream, String>>,
-    recipients: HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+    recipients: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
     remaining: HashSet<u64>,
 }
 
@@ -738,7 +714,7 @@ enum GitProviderClaim {
 }
 
 impl GitTransportBroker {
-    async fn register(&self, provider: mpsc::UnboundedSender<ServerMessage>) {
+    async fn register(&self, provider: mpsc::UnboundedSender<ControlFrame>) {
         let provider_id = self.next_provider_id.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.providers.retain(|_, provider| !provider.is_closed());
@@ -784,7 +760,7 @@ impl GitTransportBroker {
             let mut disconnected = Vec::new();
             for (&provider_id, provider) in &recipients {
                 if provider
-                    .send(ServerMessage::GitTransportRequested {
+                    .send(ControlFrame::GitTransportRequested {
                         request_id,
                         provider_id,
                         request: request.clone(),
@@ -860,12 +836,12 @@ impl GitTransportBroker {
 
     fn notify_done(
         request_id: u64,
-        recipients: &HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+        recipients: &HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
         except: Option<u64>,
     ) {
         for (&provider_id, provider) in recipients {
             if Some(provider_id) != except {
-                let _ = provider.send(ServerMessage::GitTransportDone { request_id });
+                let _ = provider.send(ControlFrame::GitTransportDone { request_id });
             }
         }
     }
@@ -892,7 +868,7 @@ struct Services {
     /// Daemon-wide fanout for messages every client must hear regardless of
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
-    events: broadcast::Sender<ServerMessage>,
+    events: broadcast::Sender<ControlFrame>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
     /// The Claude configuration this daemon runs against, resolved in `run`.
@@ -949,9 +925,9 @@ impl Services {
         self.inference.set_account_enabled(name, enabled).await;
     }
 
-    async fn ready_message(&self) -> ServerMessage {
+    async fn ready_message(&self) -> ControlFrame {
         let read = self.db.read();
-        ServerMessage::Ready {
+        ControlFrame::Ready {
             auth: self.auth_state(),
             machine_seed: self.machine_seed,
             agent_counter: read.last_agent_counter(),
@@ -1069,150 +1045,118 @@ async fn serve_connection(
     connection: ServerConnection,
 ) -> anyhow::Result<()> {
     let stream = connection.into_stream();
-    let (reader, writer) = stream.into_split();
-    serve_connection_io(services, iroh_auth, reader, writer, None).await
+    let (mut reader, writer) = stream.into_split();
+    let open = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_frame::<_, Open>(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??;
+    serve_stream(services, iroh_auth, open, reader, writer).await
 }
 
-/// One UI protocol session over any framed byte stream (Unix socket or an
-/// iroh bi-stream from an enrolled remote client).
-async fn serve_connection_io<R, W>(
+/// One stream over any framed byte stream (a Unix socket connection or an
+/// iroh bi-stream from an enrolled remote client), serving what its first
+/// frame opened.
+async fn serve_stream<R, W>(
     services: Arc<Services>,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    open: Open,
     reader: R,
-    writer: W,
-    first: Option<ClientMessage>,
+    mut writer: W,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // The first client frame chooses the stream's protocol: `ChannelOpen`
-    // dedicates the whole stream to one workspace channel, anything else starts a
-    // normal UI session (every UI client speaks first — Subscribe or a
-    // command — so waiting here never deadlocks).
-    let mut reader = reader;
-    let first = match first {
-        Some(first) => first,
-        None => tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            read_frame::<_, ClientMessage>(&mut reader),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??,
-    };
-    if let ClientMessage::ChannelOpen { workspace } = first {
-        return serve_workspace_channel(services, reader, writer, workspace).await;
-    }
-    if let ClientMessage::AgentsOpen = first {
-        return serve_agents(services, reader, writer).await;
-    }
-    if let ClientMessage::DeskOpen = first {
-        return services.desk.serve(reader, writer).await;
-    }
-    if let ClientMessage::RealtimeOpen { offer_sdp } = first {
-        return realtime::serve(services, reader, writer, offer_sdp).await;
-    }
-    if let ClientMessage::GuiTelemetryUpload { snapshot } = first {
-        return serve_gui_telemetry_upload(writer, snapshot).await;
-    }
-    if let ClientMessage::VisualizationGet { id } = first {
-        let mut writer = writer;
-        let response = match services.visualizations.get(&id) {
-            Some(visualization) => ServerMessage::VisualizationContent {
-                id,
-                mime_type: visualization.mime_type,
-                content: visualization.content,
-            },
-            None => ServerMessage::VisualizationRefused {
-                reason: format!("visualization {id} does not exist"),
-            },
-        };
-        write_frame(&mut writer, &response).await?;
-        return Ok(());
-    }
-    if let ClientMessage::TerminalCreate {
-        agent,
-        terminal_id,
-        attach,
-        cols,
-        rows,
-    } = first
-    {
-        let open = TerminalOpenKind::Create { attach };
-        return serve_terminal(
-            services,
-            reader,
-            writer,
+    match open {
+        Open::Control => serve_control(services, reader, writer).await,
+        Open::Agents => serve_agents(services, reader, writer).await,
+        Open::Desk => services.desk.serve(reader, writer).await,
+        Open::Workspace { workspace } => {
+            serve_workspace_channel(services, reader, writer, workspace).await
+        }
+        Open::Realtime { offer_sdp } => realtime::serve(services, reader, writer, offer_sdp).await,
+        Open::Terminal {
             agent,
             terminal_id,
             open,
             cols,
             rows,
-        )
-        .await;
-    }
-    if let ClientMessage::TerminalAttach {
-        agent,
-        terminal_id,
-        cols,
-        rows,
-    } = first
-    {
-        let open = TerminalOpenKind::Attach;
-        return serve_terminal(
-            services,
-            reader,
-            writer,
-            agent,
-            terminal_id,
-            open,
-            cols,
-            rows,
-        )
-        .await;
-    }
-    if let ClientMessage::TerminalList { agent } = first {
-        return serve_terminal_list(services, writer, agent).await;
-    }
-    if let ClientMessage::ShellAttach { agent } = first {
-        return serve_shell(services, reader, writer, agent).await;
-    }
-    if let ClientMessage::GitTransportRequest { request } = first {
-        return serve_git_transport_request(services, reader, writer, request).await;
-    }
-    if let ClientMessage::GitTransportProvide {
-        request_id,
-        provider_id,
-        claim,
-    } = first
-    {
-        return serve_git_transport_provider(
-            services,
-            reader,
-            writer,
+        } => {
+            serve_terminal(
+                services,
+                reader,
+                writer,
+                agent,
+                terminal_id,
+                open,
+                cols,
+                rows,
+            )
+            .await
+        }
+        Open::Shell { agent } => serve_shell(services, reader, writer, agent).await,
+        Open::Wayland { .. } => {
+            write_frame(
+                &mut writer,
+                &Opened::Refused {
+                    reason: "Wayland streams need an iroh connection".to_owned(),
+                },
+            )
+            .await
+        }
+        Open::GitTransport { request } => {
+            serve_git_transport_request(services, reader, writer, request).await
+        }
+        Open::GitProvide {
             request_id,
             provider_id,
             claim,
-        )
-        .await;
+        } => {
+            serve_git_transport_provider(services, reader, writer, request_id, provider_id, claim)
+                .await
+        }
+        Open::Request(request) => {
+            let reply = match handle_request(&services, iroh_auth.as_ref(), request).await {
+                Ok((reply, refresh)) => {
+                    if let Refresh::Ready = refresh {
+                        // Registry changes show on every client (GUI rails
+                        // and a waiting CLI), so the refreshed snapshot goes
+                        // through the daemon-wide event fanout.
+                        let _ = services.events.send(services.ready_message().await);
+                    }
+                    reply
+                }
+                // The whole chain, not just the outermost context: a new
+                // agent that failed said "create managed workspace" and
+                // kept the reason to itself, which is not something a
+                // reader can act on.
+                Err(error) => Reply::Failed {
+                    reason: format!("{error:#}"),
+                },
+            };
+            write_frame(&mut writer, &reply).await
+        }
     }
-    if let ClientMessage::GitTransportQuery { host } = first {
-        let pat_available =
-            host == "github.com" && services.platform_secrets.contains_nonempty("GITHUB_TOKEN");
-        let mut writer = writer;
-        write_frame(
-            &mut writer,
-            &ServerMessage::GitTransportPolicy { pat_available },
-        )
-        .await?;
-        return Ok(());
-    }
+}
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
+/// The control stream: host-wide state pushed to one client, and its
+/// offer to carry SSH Git transport.
+async fn serve_control<R, W>(
+    services: Arc<Services>,
+    mut reader: R,
+    writer: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ControlFrame>();
     tokio::spawn(async move {
         let mut writer = writer;
-        while let Some(message) = outgoing_rx.recv().await {
-            if write_frame(&mut writer, &message).await.is_err() {
+        while let Some(frame) = outgoing_rx.recv().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
                 break;
             }
         }
@@ -1227,7 +1171,7 @@ where
 
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
-    {
+    let created_task = {
         let services = Arc::clone(&services);
         let outgoing_tx = outgoing_tx.clone();
         tokio::spawn(async move {
@@ -1235,7 +1179,7 @@ where
                 match created_rx.recv().await {
                     Ok(created) => {
                         if outgoing_tx
-                            .send(ServerMessage::AgentCreated {
+                            .send(ControlFrame::AgentCreated {
                                 agent_id: created.agent_id,
                             })
                             .is_err()
@@ -1252,40 +1196,38 @@ where
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
-    }
+        })
+    };
 
     // Daemon-wide events fan out to every client, not just the connection
-    // whose action produced them; aborted on disconnect so the writer channel
-    // can close.
-    let events_tx = outgoing_tx.clone();
-    let events_services = Arc::clone(&services);
-    let events_task = tokio::spawn(async move {
-        loop {
-            match events_rx.recv().await {
-                Ok(message) => {
-                    if events_tx.send(message).is_err() {
-                        break;
+    // whose action produced them.
+    let events_task = {
+        let services = Arc::clone(&services);
+        let outgoing_tx = outgoing_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match events_rx.recv().await {
+                    Ok(frame) => {
+                        if outgoing_tx.send(frame).is_err() {
+                            break;
+                        }
                     }
-                }
-                // Most of what fans out is a piece of `Ready`; the whole of
-                // it stands in for whatever was missed.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if events_tx
-                        .send(events_services.ready_message().await)
-                        .is_err()
-                    {
-                        break;
+                    // Most of what fans out is a piece of `Ready`; the whole
+                    // of it stands in for whatever was missed.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if outgoing_tx.send(services.ready_message().await).is_err() {
+                            break;
+                        }
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        })
+    };
 
     // Reconcile ephemeral advertisements in workset namespaces. Only changes
     // cross the authenticated GUI stream; discovery never starts an encoder.
-    let desktop_task = matches!(&first, ClientMessage::Subscribe).then(|| {
+    let desktop_task = {
         let services = services.clone();
         let outgoing = outgoing_tx.clone();
         tokio::spawn(async move {
@@ -1311,7 +1253,7 @@ where
                 if sessions != previous {
                     previous = sessions.clone();
                     if outgoing
-                        .send(ServerMessage::DesktopSessions { sessions })
+                        .send(ControlFrame::DesktopSessions { sessions })
                         .is_err()
                     {
                         break;
@@ -1319,45 +1261,21 @@ where
                 }
             }
         })
-    });
+    };
 
-    let mut first = Some(first);
     let result = loop {
-        let message = match first.take() {
-            Some(message) => message,
-            None => {
-                match rho_agent_host_proto::read_frame_optional::<_, ClientMessage>(&mut reader)
-                    .await
-                {
-                    Ok(Some(message)) => message,
-                    Ok(None) => break Ok(()),
-                    Err(error) => break Err(error),
-                }
+        match rho_agent_host_proto::read_frame_optional::<_, ControlClientFrame>(&mut reader).await
+        {
+            Ok(Some(ControlClientFrame::ProvideGitTransport)) => {
+                services.git_transport.register(outgoing_tx.clone()).await;
             }
-        };
-        match handle_message(&services, iroh_auth.as_ref(), &outgoing_tx, message).await {
-            Ok(Refresh::Ready) => {
-                // Registry changes show on every client (GUI rails and a
-                // waiting CLI), so the refreshed snapshot goes through
-                // the daemon-wide event fanout, not just this connection.
-                let _ = services.events.send(services.ready_message().await);
-            }
-            Ok(Refresh::None) => {}
-            Err(error) => {
-                // The whole chain, not just the outermost context: a new
-                // agent that failed said "create managed workspace" and
-                // kept the reason to itself, which is not something a
-                // reader can act on.
-                let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: format!("{error:#}"),
-                });
-            }
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
         }
     };
+    created_task.abort();
     events_task.abort();
-    if let Some(task) = desktop_task {
-        task.abort();
-    }
+    desktop_task.abort();
     result
 }
 
@@ -1378,7 +1296,7 @@ where
         Err(error) => {
             write_frame(
                 &mut writer,
-                &ServerMessage::GitTransportRefused {
+                &Opened::Refused {
                     reason: error.to_string(),
                 },
             )
@@ -1386,7 +1304,7 @@ where
             return Ok(());
         }
     };
-    write_frame(&mut writer, &ServerMessage::GitTransportReady).await?;
+    write_frame(&mut writer, &Opened::Ready).await?;
     let requester = tokio::io::join(reader, writer);
     rho_rpc::relay_bidirectional(requester, provider).await?;
     Ok(())
@@ -1410,10 +1328,10 @@ where
         .await?
     {
         GitProviderClaim::Done => {
-            write_frame(&mut writer, &ServerMessage::GitTransportDone { request_id }).await?;
+            write_frame(&mut writer, &GitProvided::Done).await?;
         }
         GitProviderClaim::Selected(response) => {
-            if let Err(error) = write_frame(&mut writer, &ServerMessage::GitTransportReady).await {
+            if let Err(error) = write_frame(&mut writer, &GitProvided::Ready).await {
                 let _ = response.send(Err(format!(
                     "selected GUI SSH Git client disconnected: {error}"
                 )));
@@ -1440,10 +1358,10 @@ fn spawn_inference_projection(services: Arc<Services>) {
                 break;
             };
             let _ = state.borrow_and_update();
-            let _ = services.events.send(ServerMessage::AuthState {
+            let _ = services.events.send(ControlFrame::AuthState {
                 auth: services.auth_state(),
             });
-            let _ = services.events.send(ServerMessage::QuotaUsage {
+            let _ = services.events.send(ControlFrame::QuotaUsage {
                 summaries: combined_quota_summaries(&services.db, &services.inference),
             });
         }
@@ -1739,8 +1657,8 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
 fn claude_accounts_message(
     db: &RhoDb,
     claude: &rho_claude::accounts::ClaudePaths,
-) -> anyhow::Result<ServerMessage> {
-    Ok(ServerMessage::ClaudeAccounts {
+) -> anyhow::Result<Reply> {
+    Ok(Reply::ClaudeAccounts {
         accounts: claude.list()?,
         current: db.read().claude_account(),
     })
@@ -1751,7 +1669,7 @@ fn spawn_claude_quota_recorder(
     account: String,
     db: RhoDb,
     inference: Inference,
-    events: broadcast::Sender<ServerMessage>,
+    events: broadcast::Sender<ControlFrame>,
 ) {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
@@ -1782,7 +1700,7 @@ fn spawn_claude_quota_recorder(
             });
             write.commit();
             if changed {
-                let _ = events.send(ServerMessage::QuotaUsage {
+                let _ = events.send(ControlFrame::QuotaUsage {
                     summaries: combined_quota_summaries(&db, &inference),
                 });
             }
@@ -2010,33 +1928,24 @@ async fn send_journal_from(
     }
 }
 
-/// Whether a handled message changed registry state that clients see through
-/// `Ready` (agents and workdirs); `Ready` refreshes every
-/// connection, so all clients converge on the change at once.
+/// Whether a handled request changed registry state that clients see through
+/// `Ready` (agents and workdirs); `Ready` refreshes every control stream,
+/// so all clients converge on the change at once.
 enum Refresh {
     Ready,
     None,
 }
 
-/// One client request. `Err` becomes a [`ServerMessage::Error`]; extra replies
-/// (creation events, pongs) are sent inline before the caller's `Ready`.
-#[allow(clippy::too_many_arguments)]
-async fn handle_message(
+/// One request stream's request. `Err` becomes a [`Reply::Failed`].
+async fn handle_request(
     services: &Arc<Services>,
     iroh_auth: Option<&rho_iroh_auth::IrohAuth>,
-    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    message: ClientMessage,
-) -> anyhow::Result<Refresh> {
-    match message {
-        ClientMessage::Ping => {
-            let _ = outgoing_tx.send(ServerMessage::Pong);
-            Ok(Refresh::None)
-        }
-        ClientMessage::ClaudeAccounts => {
-            let _ = outgoing_tx.send(claude_accounts_message(&services.db, &services.claude)?);
-            Ok(Refresh::None)
-        }
-        ClientMessage::SetClaudeAccount { name } => {
+    request: Request,
+) -> anyhow::Result<(Reply, Refresh)> {
+    let reply = match request {
+        Request::Agent(command) => return handle_agent_command(services, command).await,
+        Request::ClaudeAccounts => claude_accounts_message(&services.db, &services.claude)?,
+        Request::SetClaudeAccount { name } => {
             // The account has to be there before an agent tries to mount it;
             // a switch to a name with no directory would fail at the next
             // turn of every agent at once.
@@ -2044,37 +1953,44 @@ async fn handle_message(
             let mut write = services.db.write().await;
             write.set_claude_account(&name);
             write.commit();
-            let _ = outgoing_tx.send(claude_accounts_message(&services.db, &services.claude)?);
-            Ok(Refresh::None)
+            claude_accounts_message(&services.db, &services.claude)?
         }
-        ClientMessage::RecordVisualization { mime_type, content } => {
+        Request::SetAuthAccountEnabled { name, enabled } => {
+            services.set_auth_account_enabled(&name, enabled).await;
+            Reply::Done
+        }
+        Request::Visualization { id } => {
+            let visualization = services
+                .visualizations
+                .get(&id)
+                .with_context(|| format!("visualization {id} does not exist"))?;
+            Reply::Visualization {
+                id,
+                mime_type: visualization.mime_type,
+                content: visualization.content,
+            }
+        }
+        Request::RecordVisualization { mime_type, content } => {
             let id = services.visualizations.record(mime_type, content).await?;
-            let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });
-            Ok(Refresh::None)
+            Reply::VisualizationRecorded { id }
         }
-        ClientMessage::ChatGptUsage => {
-            let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
-                summaries: combined_quota_summaries(&services.db, &services.inference),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::QuotaHistory => {
-            let _ = outgoing_tx.send(ServerMessage::QuotaHistory {
-                series: quota_history(&services.db, &services.inference),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::GlobalUsage { since_ms } => {
+        Request::QuotaUsage => Reply::QuotaUsage {
+            summaries: combined_quota_summaries(&services.db, &services.inference),
+        },
+        Request::QuotaHistory => Reply::QuotaHistory {
+            series: quota_history(&services.db, &services.inference),
+        },
+        Request::GlobalUsage { since_ms } => {
             services.pool.flush_agent_usage(None).await;
             let usage = services
                 .db
                 .read()
                 .global_agent_usage(rho_agent_host_proto::UnixMs(since_ms));
-            let series = hourly_global_usage_series(usage);
-            let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
-            Ok(Refresh::None)
+            Reply::GlobalUsage {
+                series: hourly_global_usage_series(usage),
+            }
         }
-        ClientMessage::AgentCostDistribution { since_ms } => {
+        Request::AgentCostDistribution { since_ms } => {
             const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
             const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_agent_host_proto::AGENT_COST_WINDOW_DAYS;
 
@@ -2083,64 +1999,35 @@ async fn handle_message(
             let earliest = since_ms
                 .saturating_sub(rho_agent_host_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
                 .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
-            let response = match hourly_agent_cost_series(
-                &services.db,
-                rho_agent_host_proto::UnixMs(earliest),
-            ) {
-                Ok(series) => ServerMessage::AgentCostDistribution { series },
-                Err(error) => ServerMessage::Error {
-                    message: error.to_string(),
-                },
-            };
-            let _ = outgoing_tx.send(response);
-            Ok(Refresh::None)
+            Reply::AgentCostDistribution {
+                series: hourly_agent_cost_series(
+                    &services.db,
+                    rho_agent_host_proto::UnixMs(earliest),
+                )?,
+            }
         }
-        ClientMessage::ShellStart { request_id, agent } => {
-            let services = Arc::clone(services);
-            let outgoing_tx = outgoing_tx.clone();
-            tokio::spawn(async move {
-                let response = match shell_start(&services, &agent).await {
-                    Ok(()) => ServerMessage::ShellStarted { request_id },
-                    Err(error) => ServerMessage::ShellRequestFailed {
-                        request_id,
-                        reason: format!("{error:#}"),
-                    },
-                };
-                let _ = outgoing_tx.send(response);
-            });
-            Ok(Refresh::None)
+        Request::TerminalList { agent } => Reply::TerminalList {
+            terminals: terminal_list(services, agent.as_deref()).await?,
+        },
+        Request::ShellStart { agent } => {
+            shell_start(services, &agent).await?;
+            Reply::Done
         }
-        ClientMessage::ShellList { request_id, agent } => {
-            let response = match shell_list(services, agent.as_deref()).await {
-                Ok(shells) => ServerMessage::ShellList { request_id, shells },
-                Err(error) => ServerMessage::ShellRequestFailed {
-                    request_id,
-                    reason: format!("{error:#}"),
-                },
-            };
-            let _ = outgoing_tx.send(response);
-            Ok(Refresh::None)
+        Request::ShellList { agent } => Reply::ShellList {
+            shells: shell_list(services, agent.as_deref()).await?,
+        },
+        Request::ShellClose { agent } => {
+            shell_close(services, &agent).await?;
+            Reply::Done
         }
-        ClientMessage::ShellClose { request_id, agent } => {
-            let services = Arc::clone(services);
-            let outgoing_tx = outgoing_tx.clone();
-            tokio::spawn(async move {
-                let response = match shell_close(&services, &agent).await {
-                    Ok(()) => ServerMessage::ShellClosed { request_id },
-                    Err(error) => ServerMessage::ShellRequestFailed {
-                        request_id,
-                        reason: format!("{error:#}"),
-                    },
-                };
-                let _ = outgoing_tx.send(response);
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::GitTransportRegister => {
-            services.git_transport.register(outgoing_tx.clone()).await;
-            Ok(Refresh::None)
-        }
-        ClientMessage::PlatformSecretsSet { secrets } => {
+        Request::GitTransportPolicy { host } => Reply::GitTransportPolicy {
+            pat_available: host == "github.com"
+                && services.platform_secrets.contains_nonempty("GITHUB_TOKEN"),
+        },
+        Request::GuiTelemetryUpload { snapshot } => Reply::GuiTelemetryStored {
+            path: store_gui_telemetry(snapshot).await?,
+        },
+        Request::PlatformSecretsSet { secrets } => {
             let wants_octo = secrets.iter().any(|(key, _)| key == "GITHUB_TOKEN");
             let (running, detail) = match services.platform_secrets.install_merge(secrets) {
                 Ok((store, stashed)) => {
@@ -2157,11 +2044,9 @@ async fn handle_message(
                 }
                 Err(error) => (false, format!("{error:#}")),
             };
-            let _ = outgoing_tx.send(ServerMessage::PlatformStatus { running, detail });
-            Ok(Refresh::None)
+            Reply::PlatformStatus { running, detail }
         }
-        ClientMessage::PrCommand {
-            request_id,
+        Request::Pr {
             agent_id: _,
             command,
         } => {
@@ -2244,20 +2129,71 @@ async fn handle_message(
                 }
             }
             .await;
-            let (output, data, is_error) = match result {
-                Ok((output, data)) => (output, data, false),
-                Err(error) => (format!("{error:#}"), Vec::new(), true),
-            };
-            let _ = outgoing_tx.send(ServerMessage::PrCommandResult {
-                request_id,
-                output,
-                data,
-                is_error,
-            });
-            Ok(Refresh::None)
+            match result {
+                Ok((output, data)) => Reply::Pr {
+                    output,
+                    data,
+                    is_error: false,
+                },
+                Err(error) => Reply::Pr {
+                    output: format!("{error:#}"),
+                    data: Vec::new(),
+                    is_error: true,
+                },
+            }
         }
-        ClientMessage::Subscribe => Ok(Refresh::None),
-        ClientMessage::NewAgent {
+        Request::Snapshot => Reply::Snapshotted {
+            path: debug::daemon_snapshot(&services.db).await?,
+        },
+        Request::IrohApprove { code } => {
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
+            let code = code
+                .parse::<rho_iroh_auth::EnrollmentCode>()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let endpoint_id = auth
+                .approve_code(&code)
+                .await
+                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
+            Reply::IrohApproved {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        }
+        Request::IrohTrustInMemory { endpoint_id } => {
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
+            let endpoint_id = endpoint_id
+                .parse::<iroh::EndpointId>()
+                .context("invalid iroh client endpoint id")?;
+            auth.trust_in_memory(endpoint_id).await;
+            Reply::IrohApproved {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        }
+        Request::IrohRevoke { endpoint_id } => {
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
+            let endpoint_id = endpoint_id
+                .parse::<iroh::EndpointId>()
+                .context("invalid iroh client endpoint id")?;
+            anyhow::ensure!(
+                auth.revoke(endpoint_id).await,
+                "iroh client is not enrolled"
+            );
+            Reply::IrohRevoked {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        }
+    };
+    Ok((reply, Refresh::None))
+}
+
+async fn handle_agent_command(
+    services: &Arc<Services>,
+    command: AgentCommand,
+) -> anyhow::Result<(Reply, Refresh)> {
+    match command {
+        AgentCommand::New {
             role,
             start,
             mode,
@@ -2266,25 +2202,18 @@ async fn handle_message(
             if let Some(content) = content.as_mut() {
                 prepare_image_content(content).await?;
             }
-            // Subscription and the AgentCreated announcement ride the pool's
-            // creation broadcast (all connections, including this one).
-            let (_, agent) = services.create(role, start, mode).await?;
+            // Control streams hear of the agent from the pool's creation
+            // broadcast; the reply tells this client which one is its own.
+            let (agent_id, agent) = services.create(role, start, mode).await?;
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
                 agent
                     .send_user_content_accepted(content, MessageDelivery::NextRequest)
                     .await?;
             }
-            Ok(Refresh::Ready)
+            Ok((Reply::AgentCreated { agent_id }, Refresh::Ready))
         }
-        // Only valid as a stream's first frame (`serve_agents`).
-        ClientMessage::AgentsOpen => {
-            anyhow::bail!("AgentsOpen must be the first frame on a dedicated stream")
-        }
-        ClientMessage::DeskOpen => {
-            anyhow::bail!("DeskOpen must be the first frame on a dedicated stream")
-        }
-        ClientMessage::SendUserMessage {
+        AgentCommand::Send {
             agent_id,
             mut content,
             delivery,
@@ -2302,24 +2231,24 @@ async fn handle_message(
             if notice.is_some() {
                 agent.notice_carried();
             }
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
         // A compaction rides the next request whichever lane the client
         // named; the lane is not a thing the runtime reads for it.
-        ClientMessage::CompactAgent {
+        AgentCommand::Compact {
             agent_id,
             delivery: _,
         } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.compact();
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
-        ClientMessage::ChangeAgentRole { agent_id, role } => {
+        AgentCommand::ChangeRole { agent_id, role } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_role(role).await?;
-            Ok(Refresh::Ready)
+            Ok((Reply::Done, Refresh::Ready))
         }
-        ClientMessage::ChangeAgentMode { agent_id, mode } => {
+        AgentCommand::ChangeMode { agent_id, mode } => {
             let changed = services.pool.change_mode(agent_id, mode).await?;
             for id in changed {
                 if id != agent_id && services.pool.is_live(id) {
@@ -2328,99 +2257,27 @@ async fn handle_message(
             }
             // Back at once, in the new view, for whoever is looking.
             services.load(agent_id).await?;
-            Ok(Refresh::Ready)
+            Ok((Reply::Done, Refresh::Ready))
         }
-        ClientMessage::ChangePromptCacheKey { agent_id } => {
+        AgentCommand::ChangePromptCacheKey { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_prompt_cache_key()?;
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
-        ClientMessage::SetAuthAccountEnabled { name, enabled } => {
-            services.set_auth_account_enabled(&name, enabled).await;
-            Ok(Refresh::None)
-        }
-        ClientMessage::CancelTurn { agent_id } => {
+        AgentCommand::Cancel { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.cancel();
-            let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
-        ClientMessage::RewindAgent { agent_id, turns } => {
+        AgentCommand::Rewind { agent_id, turns } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.rewind(turns).await?;
-            Ok(Refresh::Ready)
+            Ok((Reply::Done, Refresh::Ready))
         }
-        ClientMessage::ContinueTurn { agent_id } => {
+        AgentCommand::Continue { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.retry();
-            Ok(Refresh::None)
-        }
-        ClientMessage::Snapshot => {
-            let path = debug::daemon_snapshot(&services.db).await?;
-            let _ = outgoing_tx.send(ServerMessage::Snapshotted { path });
-            Ok(Refresh::None)
-        }
-        ClientMessage::IrohApprove { code } => {
-            let auth =
-                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
-            let code = code
-                .parse::<rho_iroh_auth::EnrollmentCode>()
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let endpoint_id = auth
-                .approve_code(&code)
-                .await
-                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
-            let _ = outgoing_tx.send(ServerMessage::IrohApproved {
-                endpoint_id: endpoint_id.to_string(),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::IrohTrustInMemory { endpoint_id } => {
-            let auth =
-                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
-            let endpoint_id = endpoint_id
-                .parse::<iroh::EndpointId>()
-                .context("invalid iroh client endpoint id")?;
-            auth.trust_in_memory(endpoint_id).await;
-            let _ = outgoing_tx.send(ServerMessage::IrohApproved {
-                endpoint_id: endpoint_id.to_string(),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::IrohRevoke { endpoint_id } => {
-            let auth =
-                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
-            let endpoint_id = endpoint_id
-                .parse::<iroh::EndpointId>()
-                .context("invalid iroh client endpoint id")?;
-            anyhow::ensure!(
-                auth.revoke(endpoint_id).await,
-                "iroh client is not enrolled"
-            );
-            let _ = outgoing_tx.send(ServerMessage::IrohRevoked {
-                endpoint_id: endpoint_id.to_string(),
-            });
-            Ok(Refresh::None)
-        }
-        // Only valid as a stream's first frame (see `serve_connection_io`);
-        // inside a UI session it is a protocol error.
-        ClientMessage::ChannelOpen { .. } => {
-            anyhow::bail!("ChannelOpen must be the first frame on a dedicated stream")
-        }
-        ClientMessage::RealtimeOpen { .. } => {
-            anyhow::bail!("RealtimeOpen must be the first frame on a dedicated stream")
-        }
-        ClientMessage::GuiTelemetryUpload { .. }
-        | ClientMessage::VisualizationGet { .. }
-        | ClientMessage::WaylandOpen { .. }
-        | ClientMessage::TerminalCreate { .. }
-        | ClientMessage::TerminalAttach { .. }
-        | ClientMessage::TerminalList { .. }
-        | ClientMessage::ShellAttach { .. }
-        | ClientMessage::GitTransportRequest { .. }
-        | ClientMessage::GitTransportProvide { .. }
-        | ClientMessage::GitTransportQuery { .. } => {
-            anyhow::bail!("channel messages must be the first frame on a dedicated stream")
+            Ok((Reply::Done, Refresh::None))
         }
     }
 }
@@ -2442,7 +2299,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ShellAttachRefused {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -2450,7 +2307,7 @@ where
             return Err(error);
         }
     };
-    write_frame(&mut writer, &ServerMessage::ShellOpened).await?;
+    write_frame(&mut writer, &Opened::Ready).await?;
     client.relay::<_, _, rho_agent_host_proto::shell::ShellClientFrame, rho_agent_host_proto::shell::ShellServerFrame>(reader, writer).await
 }
 
@@ -2546,35 +2403,21 @@ fn rho_pager_program() -> std::ffi::OsString {
     "rho-pager".into()
 }
 
-async fn serve_gui_telemetry_upload<W>(mut writer: W, snapshot: Vec<u8>) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let response = if snapshot.len() > rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES {
-        ServerMessage::GuiTelemetryRefused {
-            reason: format!(
-                "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
-                snapshot.len(),
-                rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
-            ),
-        }
-    } else {
-        let result = tokio::task::spawn_blocking(move || {
-            let state = dirs::state_dir().context("state directory not available")?;
-            persist_gui_telemetry(&state.join("rho"), &snapshot)
-        })
-        .await
-        .context("GUI telemetry storage task failed")?;
-        match result {
-            Ok(path) => ServerMessage::GuiTelemetryStored {
-                path: path.display().to_string(),
-            },
-            Err(error) => ServerMessage::GuiTelemetryRefused {
-                reason: format!("failed to store GUI telemetry: {error:#}"),
-            },
-        }
-    };
-    write_frame(&mut writer, &response).await
+async fn store_gui_telemetry(snapshot: Vec<u8>) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
+        "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
+        snapshot.len(),
+        rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
+    );
+    let path = tokio::task::spawn_blocking(move || {
+        let state = dirs::state_dir().context("state directory not available")?;
+        persist_gui_telemetry(&state.join("rho"), &snapshot)
+    })
+    .await
+    .context("GUI telemetry storage task failed")?
+    .context("failed to store GUI telemetry")?;
+    Ok(path.display().to_string())
 }
 
 fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyhow::Result<PathBuf> {
@@ -2616,14 +2459,9 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
     anyhow::bail!("could not allocate a unique GUI telemetry filename")
 }
 
-/// How a terminal stream's first frame opens its terminal.
-enum TerminalOpenKind {
-    Create { attach: bool },
-    Attach,
-}
-
 /// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
-/// (per [`TerminalOpenKind`]), replies `TerminalOpened`, then pumps
+/// (per [`TerminalOpen`](rho_agent_host_proto::term::TerminalOpen)), replies
+/// `Opened::Ready`, then pumps
 /// [`rho_agent_host_proto::term`] frames until either side closes. Closing only
 /// detaches; the terminal keeps running. A headless create replies and
 /// returns without attaching.
@@ -2634,7 +2472,7 @@ async fn serve_terminal<R, W>(
     mut writer: W,
     agent: String,
     terminal_id: u64,
-    open: TerminalOpenKind,
+    open: rho_agent_host_proto::term::TerminalOpen,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()>
@@ -2642,14 +2480,17 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let create = matches!(open, TerminalOpenKind::Create { .. });
+    let create = matches!(
+        open,
+        rho_agent_host_proto::term::TerminalOpen::Create { .. }
+    );
     let attached = terminal_attach(&services, &agent, terminal_id, create, cols, rows).await;
     let client = match attached {
         Ok(attached) => attached,
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::TerminalRefused {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -2657,8 +2498,11 @@ where
             return Err(error);
         }
     };
-    write_frame(&mut writer, &ServerMessage::TerminalOpened { terminal_id }).await?;
-    if matches!(open, TerminalOpenKind::Create { attach: false }) {
+    write_frame(&mut writer, &Opened::Ready).await?;
+    if matches!(
+        open,
+        rho_agent_host_proto::term::TerminalOpen::Create { attach: false }
+    ) {
         // Headless create: the terminal keeps running with no clients.
         return Ok(());
     }
@@ -2704,33 +2548,16 @@ async fn terminal_attach(
         .await
 }
 
-/// Answers a [`ClientMessage::TerminalList`] one-shot stream.
-async fn serve_terminal_list<W>(
-    services: Arc<Services>,
-    mut writer: W,
-    agent: Option<String>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let filter = match &agent {
-        Some(agent) => match services.resolve_display_agent_id(agent).await {
-            Ok(agent_id) => Some(agent_id),
-            Err(error) => {
-                let _ = write_frame(
-                    &mut writer,
-                    &ServerMessage::TerminalRefused {
-                        reason: format!("{error:#}"),
-                    },
-                )
-                .await;
-                return Err(error);
-            }
-        },
+/// The daemon's terminals, or one agent's.
+async fn terminal_list(
+    services: &Arc<Services>,
+    agent: Option<&str>,
+) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
+    let filter = match agent {
+        Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,
     };
     let mut terminals = Vec::new();
-    let filter = filter.map(|id| id.encoded());
     for process in services.pool.executions().await {
         if let rho_agent::WorksetReply::Terminals(entries) = process
             .action(rho_agent::WorksetAction::TerminalList)
@@ -2743,7 +2570,7 @@ where
             );
         }
     }
-    write_frame(&mut writer, &ServerMessage::TerminalList { terminals }).await
+    Ok(terminals)
 }
 
 /// Serves a bounded typed file channel rooted in one workspace checkout.
@@ -2762,7 +2589,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ChannelClosed {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -2775,7 +2602,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ChannelClosed {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -2788,7 +2615,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ChannelClosed {
+                &Opened::Refused {
                     reason: format!("watch workspace: {error:#}"),
                 },
             )
@@ -2796,7 +2623,7 @@ where
             return Err(error);
         }
     };
-    write_frame(&mut writer, &ServerMessage::ChannelOpened).await?;
+    write_frame(&mut writer, &Opened::Ready).await?;
 
     use rho_agent_host_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
     let mut changes = watcher_setup.changes;
@@ -3182,7 +3009,8 @@ mod tests {
     use std::sync::Arc;
 
     use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
-    use rho_agent_host_proto::{ContentPart, ServerMessage};
+    use rho_agent_host_proto::ContentPart;
+    use rho_agent_host_proto::control::ServerFrame as ControlFrame;
     use rho_db::RhoDb;
 
     use super::{
@@ -3585,7 +3413,7 @@ mod tests {
             tokio::spawn(async move { broker.request(request).await })
         };
         let (request_id, first_provider) = match first_rx.recv().await.unwrap() {
-            ServerMessage::GitTransportRequested {
+            ControlFrame::GitTransportRequested {
                 request_id,
                 provider_id,
                 ..
@@ -3593,7 +3421,7 @@ mod tests {
             message => panic!("unexpected provider message: {message:?}"),
         };
         let second_provider = match second_rx.recv().await.unwrap() {
-            ServerMessage::GitTransportRequested {
+            ControlFrame::GitTransportRequested {
                 request_id: second_request,
                 provider_id,
                 ..
@@ -3623,7 +3451,7 @@ mod tests {
         waiting.await.unwrap().unwrap();
         assert!(matches!(
             first_rx.recv().await,
-            Some(ServerMessage::GitTransportDone {
+            Some(ControlFrame::GitTransportDone {
                 request_id: done_request
             }) if done_request == request_id
         ));
@@ -3672,7 +3500,7 @@ mod tests {
             })
         };
         let request_id = match provider_rx.recv().await.unwrap() {
-            ServerMessage::GitTransportRequested { request_id, .. } => request_id,
+            ControlFrame::GitTransportRequested { request_id, .. } => request_id,
             message => panic!("unexpected provider message: {message:?}"),
         };
         let error = match waiting.await.unwrap() {
@@ -3682,7 +3510,7 @@ mod tests {
         assert!(error.to_string().contains("within 60 seconds"));
         assert!(matches!(
             provider_rx.recv().await,
-            Some(ServerMessage::GitTransportDone {
+            Some(ControlFrame::GitTransportDone {
                 request_id: done_request
             }) if done_request == request_id
         ));

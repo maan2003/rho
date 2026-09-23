@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use rho_agent_host_proto::client::Client as UiClient;
-use rho_agent_host_proto::{ClientMessage, ServerMessage};
+use rho_agent_host_proto::{Open, Reply, Request};
 use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
 use rho_inference::{AuthArgs, run_auth_cli};
@@ -88,34 +88,33 @@ async fn run(command: Command) -> Result<()> {
 /// trust decisions always come from a local user on the daemon host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
     let request = match args.command {
-        IrohCommand::Approve { code } => rho_agent_host_proto::ClientMessage::IrohApprove { code },
-        IrohCommand::TrustInMemory { endpoint_id } => {
-            rho_agent_host_proto::ClientMessage::IrohTrustInMemory { endpoint_id }
-        }
-        IrohCommand::Revoke { endpoint_id } => {
-            rho_agent_host_proto::ClientMessage::IrohRevoke { endpoint_id }
-        }
+        IrohCommand::Approve { code } => Request::IrohApprove { code },
+        IrohCommand::TrustInMemory { endpoint_id } => Request::IrohTrustInMemory { endpoint_id },
+        IrohCommand::Revoke { endpoint_id } => Request::IrohRevoke { endpoint_id },
     };
     let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let mut client = UiClient::connect(&socket_path).await?;
-    client.send(&request).await?;
-    loop {
-        match client.recv().await? {
-            rho_agent_host_proto::ServerMessage::IrohApproved { endpoint_id } => {
-                println!("enrolled iroh client {endpoint_id}");
-                return Ok(());
-            }
-            rho_agent_host_proto::ServerMessage::IrohRevoked { endpoint_id } => {
-                println!("revoked iroh client {endpoint_id}");
-                return Ok(());
-            }
-            rho_agent_host_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
-            // The daemon greets every connection with Ready and may stream
-            // other broadcasts; only the approve outcome matters here.
-            _ => {}
-        }
+    match rho_agent_host_proto::client::request(&socket_path, request).await? {
+        Reply::IrohApproved { endpoint_id } => println!("enrolled iroh client {endpoint_id}"),
+        Reply::IrohRevoked { endpoint_id } => println!("revoked iroh client {endpoint_id}"),
+        Reply::Failed { reason } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("unexpected reply from the daemon"),
+    }
+    Ok(())
+}
+
+/// One request to the daemon, starting it if it is not running. A refusal
+/// is an error.
+pub(crate) async fn daemon_request(
+    socket_path: &std::path::Path,
+    request: Request,
+) -> Result<Reply> {
+    let mut daemon = connect_or_start_daemon(socket_path).await?;
+    daemon.send(&Open::Request(request)).await?;
+    match daemon.recv().await? {
+        Reply::Failed { reason } => anyhow::bail!(reason),
+        reply => Ok(reply),
     }
 }
 
@@ -220,10 +219,8 @@ pub(crate) enum ClaudeAccountCommand {
 /// view namespace outside an agent; agents get the same directory by mount.
 async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
     let request = match &args.command {
-        ClaudeAccountCommand::List => ClientMessage::ClaudeAccounts,
-        ClaudeAccountCommand::Use { name } => {
-            ClientMessage::SetClaudeAccount { name: name.clone() }
-        }
+        ClaudeAccountCommand::List => Request::ClaudeAccounts,
+        ClaudeAccountCommand::Use { name } => Request::SetClaudeAccount { name: name.clone() },
         ClaudeAccountCommand::Login { name } => {
             let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
             eprintln!("rho: opening Claude on account {name} ({dir}); run /login");
@@ -238,21 +235,15 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
     let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let mut daemon = connect_or_start_daemon(&socket_path).await?;
-    daemon.send(&request).await?;
-    loop {
-        match daemon.recv().await? {
-            ServerMessage::ClaudeAccounts { accounts, current } => {
-                for name in accounts {
-                    let mark = if name == current { "*" } else { " " };
-                    println!("{mark} {name}");
-                }
-                return Ok(());
-            }
-            ServerMessage::Error { message } => anyhow::bail!(message),
-            _ => {}
-        }
+    let Reply::ClaudeAccounts { accounts, current } = daemon_request(&socket_path, request).await?
+    else {
+        anyhow::bail!("unexpected reply from the daemon");
+    };
+    for name in accounts {
+        let mark = if name == current { "*" } else { " " };
+        println!("{mark} {name}");
     }
+    Ok(())
 }
 
 #[derive(Clone, clap::Args)]

@@ -2,14 +2,23 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::{
-    ClientMessage, ProtocolLogDirection, ServerMessage, append_protocol_log_record,
-    protocol_frame_bytes, read_frame, write_frame,
+    Open, ProtocolLogDirection, Reply, Request, append_protocol_log_record, protocol_frame_bytes,
+    read_frame, write_frame,
 };
 
-/// Raw async client for the rho UI Unix-socket protocol.
+/// One request on a stream of its own, over the daemon's Unix socket.
+pub async fn request(socket: impl AsRef<Path>, request: Request) -> anyhow::Result<Reply> {
+    let mut client = Client::connect(socket).await?;
+    client.send(&Open::Request(request)).await?;
+    client.recv().await
+}
+
+/// Raw async client for one stream over the daemon's Unix socket. The first
+/// frame sent is an [`Open`].
 pub struct Client {
     stream: rho_rpc::Stream,
     logger: Option<ProtocolLogger>,
@@ -28,20 +37,20 @@ impl Client {
         }
     }
 
-    pub async fn send(&mut self, message: &ClientMessage) -> anyhow::Result<()> {
-        write_frame(&mut self.stream, message).await?;
+    pub async fn send<T: Packer>(&mut self, frame: &T) -> anyhow::Result<()> {
+        write_frame(&mut self.stream, frame).await?;
         if let Some(logger) = &self.logger {
-            logger.log(ProtocolLogDirection::ClientToServer, message);
+            logger.log(ProtocolLogDirection::ClientToServer, frame);
         }
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> anyhow::Result<ServerMessage> {
-        let message = read_frame(&mut self.stream).await?;
+    pub async fn recv<T: Packer + Unpacker>(&mut self) -> anyhow::Result<T> {
+        let frame = read_frame(&mut self.stream).await?;
         if let Some(logger) = &self.logger {
-            logger.log(ProtocolLogDirection::ServerToClient, &message);
+            logger.log(ProtocolLogDirection::ServerToClient, &frame);
         }
-        Ok(message)
+        Ok(frame)
     }
 
     /// Finishes the client's compressed send stream and half-closes the

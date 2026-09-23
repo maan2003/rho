@@ -5,6 +5,18 @@
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
+/// The answer to [`crate::Open::Realtime`].
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Opened {
+    Answer {
+        answer_sdp: String,
+    },
+    /// The host closes the stream after sending it.
+    Refused {
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum RealtimeClientFrame {
     Close,

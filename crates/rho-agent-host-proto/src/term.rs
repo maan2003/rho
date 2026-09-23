@@ -1,9 +1,8 @@
 //! Wire vocabulary for workset-owned terminals.
 //!
-//! A terminal stream is dedicated by a [`crate::ClientMessage::TerminalOpen`]
-//! first frame (like workspace file channels); after the
-//! [`crate::ServerMessage::TerminalOpened`] handshake the stream carries senax
-//! frames of [`TermClientFrame`] and [`TermServerFrame`].
+//! A terminal stream is opened by [`crate::Open::Terminal`]; after
+//! [`crate::Opened::Ready`] an attached stream carries senax frames of
+//! [`TermClientFrame`] and [`TermServerFrame`].
 //!
 //! The protocol is deliberately dumb on the client side: the workset owns the
 //! only terminal emulator, and the wire carries *display state* — cell rows,
@@ -13,6 +12,18 @@
 use std::collections::VecDeque;
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+
+/// How [`crate::Open::Terminal`] reaches its terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum TerminalOpen {
+    /// Spawns it, refused if `terminal_id` is already running. With
+    /// `attach` the stream stays on it; otherwise it runs headless and the
+    /// stream closes.
+    Create { attach: bool },
+    /// Attaches to it while it runs. Closing the stream detaches; the
+    /// terminal keeps running.
+    Attach,
+}
 
 /// Client → daemon frames after the terminal handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -169,7 +180,7 @@ impl TermColor {
     pub const DEFAULT_BG: Self = Self::Background;
 }
 
-/// One running terminal in a [`crate::ServerMessage::TerminalList`] reply.
+/// One running terminal in a [`crate::Reply::TerminalList`] reply.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct TerminalInfo {
     /// Encoded agent id ("eng-ht08").

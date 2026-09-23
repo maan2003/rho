@@ -233,32 +233,27 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
 /// Ask the running daemon for a snapshot: it alone can copy the file
 /// between commits, in a state that opens without repair.
 async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
-    let mut client = rho_agent_host_proto::client::Client::connect(socket)
-        .await
-        .context("the daemon holds the database, and its socket does not answer")?;
-    client
-        .send(&rho_agent_host_proto::ClientMessage::Snapshot)
-        .await?;
-    loop {
-        match client.recv().await? {
-            rho_agent_host_proto::ServerMessage::Snapshotted { path } => {
-                let path = path.into_std_path_buf();
-                let dir = path.parent().context("snapshot has no directory")?;
-                return Ok(Snapshot {
-                    source: source.to_owned(),
-                    _dir: SnapshotDir(dir.to_owned()),
-                    path,
-                });
-            }
-            rho_agent_host_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
-            // Ready and broadcasts come first; only the answer matters.
-            _ => {}
+    let reply =
+        rho_agent_host_proto::client::request(socket, rho_agent_host_proto::Request::Snapshot)
+            .await
+            .context("the daemon holds the database, and its socket does not answer")?;
+    match reply {
+        rho_agent_host_proto::Reply::Snapshotted { path } => {
+            let path = path.into_std_path_buf();
+            let dir = path.parent().context("snapshot has no directory")?;
+            Ok(Snapshot {
+                source: source.to_owned(),
+                _dir: SnapshotDir(dir.to_owned()),
+                path,
+            })
         }
+        rho_agent_host_proto::Reply::Failed { reason } => anyhow::bail!("{reason}"),
+        reply => anyhow::bail!("unexpected reply to a snapshot request: {reply:?}"),
     }
 }
 
 /// The daemon's half of
-/// [`ClientMessage::Snapshot`](rho_agent_host_proto::ClientMessage::Snapshot):
+/// [`Request::Snapshot`](rho_agent_host_proto::Request::Snapshot):
 /// a snapshot of `db` in a directory of its own beside it.
 pub(crate) async fn daemon_snapshot(db: &RhoDb) -> anyhow::Result<camino::Utf8PathBuf> {
     let dir = new_snapshot_dir(db.path())?;

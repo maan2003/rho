@@ -24,9 +24,7 @@ use rho_agent_host_proto::agents::{
 };
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::TranscriptEvent;
-use rho_agent_host_proto::{
-    AgentRole, ClientMessage, ContentPart, JoinTarget, ServerMessage, StartMode,
-};
+use rho_agent_host_proto::{AgentCommand, AgentRole, ContentPart, JoinTarget, Reply, StartMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1154,18 +1152,16 @@ async fn probe_async(name: &str) -> Result<()> {
     client
         .send_agents(&AgentsClientFrame::Follow { since: head })
         .await?;
-    client
-        .send(&ClientMessage::NewAgent {
-            role: AgentRole::default(),
-            start: StartMode::Join(JoinTarget::User {
-                repo: workspace.try_into().context("rig workspace is not UTF-8")?,
-            }),
-            mode: rho_agent_host_proto::WorksetMode::View,
-            content: Some(vec![ContentPart::Text {
-                text: "Complete one deterministic rig probe turn.".to_owned(),
-            }]),
-        })
-        .await?;
+    client.send(AgentCommand::New {
+        role: AgentRole::default(),
+        start: StartMode::Join(JoinTarget::User {
+            repo: workspace.try_into().context("rig workspace is not UTF-8")?,
+        }),
+        mode: rho_agent_host_proto::WorksetMode::View,
+        content: Some(vec![ContentPart::Text {
+            text: "Complete one deterministic rig probe turn.".to_owned(),
+        }]),
+    });
     // Follow has no acknowledgement. Let the deliberately fast fake finish,
     // then replay from the pre-creation head so setup cannot race the turn.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1216,8 +1212,8 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                 }
             }
-            Incoming::Control(ServerMessage::Error { message }) => {
-                bail!("rig probe failed: {message}")
+            Incoming::Reply(Reply::Failed { reason }) => {
+                bail!("rig probe failed: {reason}")
             }
             _ => {}
         }

@@ -1,10 +1,10 @@
 use std::io::Read as _;
 
 use anyhow::bail;
-use rho_agent_host_proto::{ClientMessage, ServerMessage};
+use rho_agent_host_proto::{Reply, Request};
 use rho_visualizations::{MAX_VISUALIZATION_BYTES, SVG_MIME_TYPE};
 
-use crate::{RecordVisualizationArgs, connect_or_start_daemon};
+use crate::{RecordVisualizationArgs, daemon_request};
 
 pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
     let mut content = Vec::new();
@@ -18,21 +18,13 @@ pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
     let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let mut daemon = connect_or_start_daemon(&socket_path).await?;
-    daemon
-        .send(&ClientMessage::RecordVisualization {
-            mime_type: SVG_MIME_TYPE.to_owned(),
-            content,
-        })
-        .await?;
-    loop {
-        match daemon.recv().await? {
-            ServerMessage::VisualizationRecorded { id } => {
-                println!("{id}");
-                return Ok(());
-            }
-            ServerMessage::Error { message } => bail!(message),
-            _ => {}
-        }
-    }
+    let request = Request::RecordVisualization {
+        mime_type: SVG_MIME_TYPE.to_owned(),
+        content,
+    };
+    let Reply::VisualizationRecorded { id } = daemon_request(&socket_path, request).await? else {
+        bail!("unexpected reply from the daemon");
+    };
+    println!("{id}");
+    Ok(())
 }

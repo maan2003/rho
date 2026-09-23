@@ -31,7 +31,8 @@ pub(crate) use phone::set_touch_modal_editing;
 use rho_agent_host_proto::AdvisorIntelligence;
 use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agent_host_proto::{
-    AgentId, AgentRole, ClientMessage, ContentPart, EngineerIntelligence, MessageDelivery,
+    AgentCommand, AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, Reply,
+    Request,
 };
 use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
@@ -1253,10 +1254,40 @@ impl Workspace {
     /// Routes an agent-scoped command to the daemon that owns the agent.
     /// Commands for an agent whose host is unknown or gone are dropped: the
     /// daemon that could act on it is not there to hear them.
-    fn send_to_agent(&self, agent_id: AgentId, message: ClientMessage) {
-        if let Some(connection) = self.connection_for(agent_id) {
-            connection.send(message);
+    fn send_to_agent(&self, agent_id: AgentId, command: AgentCommand, cx: &mut Context<Self>) {
+        if let Some(host) = self.host_of(agent_id) {
+            self.request(host, Request::Agent(command), cx, |_, _, _| {});
         }
+    }
+
+    /// Makes one request of a host. `on_reply` hears the answer; a refusal,
+    /// or a host that went before answering, is a notice instead.
+    fn request(
+        &self,
+        host: HostId,
+        request: Request,
+        cx: &mut Context<Self>,
+        on_reply: impl FnOnce(&mut Self, Reply, &mut Context<Self>) + 'static,
+    ) {
+        let Some(connection) = self.hosts.connection(host) else {
+            return;
+        };
+        let reply = connection.request(request);
+        cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            this.update(cx, |this, cx| match reply {
+                Ok(reply) => on_reply(this, reply, cx),
+                Err(error) => this.report_refusal(host, &format!("{error:#}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn report_refusal(&mut self, host: HostId, reason: &str, cx: &mut Context<Self>) {
+        let source = self.error_source(host);
+        let text = format!("[{source} error: {reason}]");
+        self.notice_on(None, &text, StyleClass::SystemImportant, cx);
     }
 
     pub(crate) fn send_desk(&self, host: HostId, frame: DeskClientFrame) {
@@ -2201,38 +2232,6 @@ impl Workspace {
             }
             ConnEvent::AgentCreated { agent_id } => {
                 self.note_agent_created(host, agent_id);
-                if let Some(area) = self.pending_agent_filing.take() {
-                    let writes = self
-                        .new_thing_cells(host, Some(&area))
-                        .into_iter()
-                        .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
-                            id: rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
-                            property,
-                        })
-                        .collect::<Vec<_>>();
-                    if !writes.is_empty() {
-                        self.apply_desk_writes(host, writes, None, window, cx);
-                    }
-                }
-                if self.awaiting_draft_agent == Some(host) {
-                    self.awaiting_draft_agent = None;
-                    self.activate_agent(agent_id, cx);
-                    // The draft became this agent: reset the compose surface
-                    // and follow the new agent.
-                    let label = self
-                        .draft_default_workdir()
-                        .map(|path| self.hosts.workdir_label(&path))
-                        .unwrap_or_default();
-                    self.draft_model.update(cx, |view, cx| {
-                        view.set_body_text("", cx);
-                        view.clear_attachments(cx);
-                        view.set_workdir_text(&label, cx);
-                        view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
-                        view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
-                        view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
-                    });
-                    self.select_agent(Some(agent_id), window, cx);
-                }
                 cx.notify();
             }
             ConnEvent::Many(events) => {
@@ -2240,78 +2239,11 @@ impl Workspace {
                     self.handle_event(host, event, window, cx);
                 }
             }
-            ConnEvent::ChatGptUsage {
-                used_percent,
-                reset_at_unix,
-            } => {
-                self.hosts.set_quota_summaries(
-                    host,
-                    vec![rho_agent_host_proto::QuotaSummary {
-                        model: "gpt".to_owned(),
-                        auth_namespace: None,
-                        remaining_percent: 100u8
-                            .saturating_sub(used_percent.clamp(0.0, 100.0).round() as u8),
-                        burn_10m: 0,
-                        burn_2h: 0,
-                        burn_1d: 0,
-                        burn_3d: 0,
-                        reset_at_unix: Some(reset_at_unix),
-                    }],
-                );
-                cx.notify();
-            }
             ConnEvent::QuotaUsage(summaries) => {
                 self.hosts.set_quota_summaries(host, summaries);
                 cx.notify();
             }
-            ConnEvent::QuotaHistory(series) => {
-                self.hosts.set_quota_history(host, series);
-                if let Some(view) = self.usage.opened_view() {
-                    let history = self.hosts.merged_quota_history();
-                    let active = self.hosts.active_quota_namespaces();
-                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
-                }
-                cx.notify();
-            }
-            ConnEvent::GlobalUsage(series) => {
-                self.usage.record_global(host, series);
-                if let Some(view) = self.usage.opened_view() {
-                    let usage = self.usage.merged_global();
-                    view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
-                }
-                cx.notify();
-            }
-            ConnEvent::AgentCostDistribution(series) => {
-                self.usage.record_agent_cost(host, series);
-                if let Some(view) = self.usage.opened_view() {
-                    let usage = self.usage.merged_agent_cost();
-                    view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
-                }
-                cx.notify();
-            }
-            ConnEvent::TurnCancelled => {
-                // Cancellation is an acknowledgement for an in-flight action,
-                // not transcript content. The system notice buffer is
-                // intentionally persistent, so rendering it there leaves
-                // "[turn cancelled]" visible forever.
-            }
-            ConnEvent::ServerError(message) => {
-                // A failed creation keeps the draft buffers; the user fixes
-                // the workdir and submits again. The daemon's whole cause is
-                // what the draft shows, so the reason a creation refused is
-                // readable for longer than an echo.
-                let refused_draft = self.awaiting_draft_agent == Some(host);
-                if refused_draft {
-                    self.awaiting_draft_agent = None;
-                }
-                let source = self.error_source(host);
-                let text = format!("[{source} error: {message}]");
-                if refused_draft {
-                    self.refuse_draft(&text, cx);
-                } else {
-                    self.notice_on(None, &text, StyleClass::SystemImportant, cx);
-                }
-            }
+            ConnEvent::ServerError(message) => self.report_refusal(host, &message, cx),
             ConnEvent::Recovering(elapsed) => {
                 let changed = !self
                     .hosts
@@ -2618,11 +2550,12 @@ impl Workspace {
         }
         self.send_to_agent(
             agent_id,
-            ClientMessage::SendUserMessage {
+            AgentCommand::Send {
                 agent_id,
                 content,
                 delivery: MessageDelivery::NextRequest,
             },
+            cx,
         );
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the daemon persists the same timestamp).
@@ -2724,15 +2657,93 @@ impl Workspace {
             .draft_area
             .take()
             .and_then(|(area_host, node_id)| (area_host == host).then_some((host, node_id)));
-        self.hosts.send(
-            host,
-            ClientMessage::NewAgent {
-                role,
-                start,
-                mode,
-                content: Some(content),
-            },
-        );
+        let Some(connection) = self.hosts.connection(host) else {
+            return;
+        };
+        let reply = connection.request(Request::Agent(AgentCommand::New {
+            role,
+            start,
+            mode,
+            content: Some(content),
+        }));
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = reply.await;
+            this.update_in(cx, |this, window, cx| {
+                this.draft_answered(host, reply, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The host's answer to the draft's submission: the agent it became,
+    /// filed and followed, or why there is none.
+    fn draft_answered(
+        &mut self,
+        host: HostId,
+        reply: anyhow::Result<Reply>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let awaited = self.awaiting_draft_agent == Some(host);
+        if awaited {
+            self.awaiting_draft_agent = None;
+        }
+        let filing = self
+            .pending_agent_filing
+            .take_if(|(filing_host, _)| *filing_host == host);
+        let agent_id = match reply {
+            Ok(Reply::AgentCreated { agent_id }) => agent_id,
+            Ok(_) => return,
+            // A failed creation keeps the draft buffers; the user fixes the
+            // workdir and submits again. The daemon's whole cause is what
+            // the draft shows, so the reason a creation refused is readable
+            // for longer than an echo.
+            Err(error) => {
+                let source = self.error_source(host);
+                let text = format!("[{source} error: {error:#}]");
+                if awaited {
+                    self.refuse_draft(&text, cx);
+                } else {
+                    self.notice_on(None, &text, StyleClass::SystemImportant, cx);
+                }
+                return;
+            }
+        };
+        self.note_agent_created(host, agent_id);
+        if let Some(area) = filing {
+            let writes = self
+                .new_thing_cells(host, Some(&area))
+                .into_iter()
+                .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
+                    id: rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
+                    property,
+                })
+                .collect::<Vec<_>>();
+            if !writes.is_empty() {
+                self.apply_desk_writes(host, writes, None, window, cx);
+            }
+        }
+        if awaited {
+            self.activate_agent(agent_id, cx);
+            // The draft became this agent: reset the compose surface and
+            // follow the new agent.
+            let label = self
+                .draft_default_workdir()
+                .map(|path| self.hosts.workdir_label(&path))
+                .unwrap_or_default();
+            self.draft_model.update(cx, |view, cx| {
+                view.set_body_text("", cx);
+                view.clear_attachments(cx);
+                view.set_workdir_text(&label, cx);
+                view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+                view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
+                view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
+            });
+            self.select_agent(Some(agent_id), window, cx);
+        }
+        self.refresh_dashboard(cx);
+        cx.notify();
     }
 
     fn paste_prompt(&mut self, _: &PastePrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -2883,7 +2894,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::CancelTurn { agent_id });
+            self.send_to_agent(agent_id, AgentCommand::Cancel { agent_id }, cx);
         }
     }
 
@@ -2892,7 +2903,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::RewindAgent { agent_id, turns });
+            self.send_to_agent(agent_id, AgentCommand::Rewind { agent_id, turns }, cx);
         }
     }
 
@@ -2901,7 +2912,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::ContinueTurn { agent_id });
+            self.send_to_agent(agent_id, AgentCommand::Continue { agent_id }, cx);
         }
     }
 
@@ -2912,10 +2923,11 @@ impl Workspace {
             }
             self.send_to_agent(
                 agent_id,
-                ClientMessage::CompactAgent {
+                AgentCommand::Compact {
                     agent_id,
                     delivery: rho_agent_host_proto::MessageDelivery::NextRequest,
                 },
+                cx,
             );
             self.notice_on(
                 Some(&agent_id),
@@ -2932,7 +2944,11 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::ChangePromptCacheKey { agent_id });
+            self.send_to_agent(
+                agent_id,
+                AgentCommand::ChangePromptCacheKey { agent_id },
+                cx,
+            );
             self.notice_on(
                 Some(&agent_id),
                 "changed prompt cache key",
@@ -2956,10 +2972,11 @@ impl Workspace {
         }
         self.send_to_agent(
             agent_id,
-            ClientMessage::ChangeAgentRole {
+            AgentCommand::ChangeRole {
                 agent_id,
                 role: AgentRole::Engineer { intelligence },
             },
+            cx,
         );
     }
 
@@ -2975,7 +2992,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        self.send_to_agent(agent_id, ClientMessage::ChangeAgentMode { agent_id, mode });
+        self.send_to_agent(agent_id, AgentCommand::ChangeMode { agent_id, mode }, cx);
         self.notice_on(
             Some(&agent_id),
             &format!(
@@ -3881,12 +3898,14 @@ impl Workspace {
                     .get(host)
                     .and_then(|host| host.auth.as_ref())
                     .is_some_and(|auth| auth.disabled_namespaces.iter().any(|item| item == name));
-                workspace.hosts.send(
+                workspace.request(
                     host,
-                    ClientMessage::SetAuthAccountEnabled {
+                    Request::SetAuthAccountEnabled {
                         name: name.to_owned(),
                         enabled,
                     },
+                    cx,
+                    |_, _, _| {},
                 );
                 workspace.notice_on(
                     None,
@@ -5083,11 +5102,19 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn take_host_messages_for_test(&self, host: HostId) -> Vec<ClientMessage> {
+    pub(crate) fn take_host_messages_for_test(&self, host: HostId) -> Vec<Request> {
         self.hosts
             .connection(host)
             .map(Connection::take_sent_for_test)
             .unwrap_or_default()
+    }
+
+    /// Answers the host's oldest unanswered request, as its daemon would.
+    #[cfg(test)]
+    pub(crate) fn answer_host_request_for_test(&self, host: HostId, reply: anyhow::Result<Reply>) {
+        if let Some(connection) = self.hosts.connection(host) {
+            connection.answer_for_test(reply);
+        }
     }
 
     /// Forgets everything sent to the host so far, on every stream.
@@ -8004,6 +8031,45 @@ impl Workspace {
     /// the screen what this client already holds so it draws at once, and
     /// display it. Picking another chart from the menu comes back through
     /// here and redraws the same surface.
+    /// Asks every host the same usage question; the answers merge as
+    /// they come.
+    fn ask_every_host(&self, request: Request, cx: &mut Context<Self>) {
+        for host in self.hosts.ids() {
+            self.request(host, request.clone(), cx, move |this, reply, cx| {
+                this.usage_arrived(host, reply, cx)
+            });
+        }
+    }
+
+    fn usage_arrived(&mut self, host: HostId, reply: Reply, cx: &mut Context<Self>) {
+        match reply {
+            Reply::QuotaHistory { series } => {
+                self.hosts.set_quota_history(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let history = self.hosts.merged_quota_history();
+                    let active = self.hosts.active_quota_namespaces();
+                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
+                }
+            }
+            Reply::GlobalUsage { series } => {
+                self.usage.record_global(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let usage = self.usage.merged_global();
+                    view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
+                }
+            }
+            Reply::AgentCostDistribution { series } => {
+                self.usage.record_agent_cost(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let usage = self.usage.merged_agent_cost();
+                    view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
+                }
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
     pub(crate) fn open_usage_chart(
         &mut self,
         chart: crate::usage::Chart,
@@ -8018,20 +8084,18 @@ impl Workspace {
         // the answers come back.
         match crate::usage::Usage::request_for(chart, days, now_ms()) {
             crate::usage::Request::QuotaHistory => {
-                self.hosts.broadcast(|| ClientMessage::QuotaHistory);
+                self.ask_every_host(Request::QuotaHistory, cx);
                 let history = self.hosts.merged_quota_history();
                 let active = self.hosts.active_quota_namespaces();
                 view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
             }
             crate::usage::Request::GlobalUsage { since_ms } => {
-                self.hosts
-                    .broadcast(|| ClientMessage::GlobalUsage { since_ms });
+                self.ask_every_host(Request::GlobalUsage { since_ms }, cx);
                 let usage = self.usage.merged_global();
                 view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
             }
             crate::usage::Request::AgentCostDistribution { since_ms } => {
-                self.hosts
-                    .broadcast(|| ClientMessage::AgentCostDistribution { since_ms });
+                self.ask_every_host(Request::AgentCostDistribution { since_ms }, cx);
                 let usage = self.usage.merged_agent_cost();
                 view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
             }

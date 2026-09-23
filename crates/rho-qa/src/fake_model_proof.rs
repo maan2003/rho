@@ -18,7 +18,7 @@ use rho_agent_host_proto::agents::{
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
 use rho_agent_host_proto::{
-    AgentId, AgentRole, ClientMessage, ContentPart, MessageDelivery, ServerMessage, StartMode,
+    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, Reply, StartMode,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;
@@ -205,17 +205,15 @@ async fn run_async(args: Args) -> Result<()> {
     };
     let submitted = Instant::now();
     for index in 0..agent_count {
-        client
-            .send(&ClientMessage::NewAgent {
-                role: AgentRole::default(),
-                start: StartMode::NewOn {
-                    repo: repo.clone(),
-                    revset: "HEAD".into(),
-                },
-                mode: rho_agent_host_proto::WorksetMode::View,
-                content: Some(prompt(index, 0)),
-            })
-            .await?;
+        client.send(AgentCommand::New {
+            role: AgentRole::default(),
+            start: StartMode::NewOn {
+                repo: repo.clone(),
+                revset: "HEAD".into(),
+            },
+            mode: rho_agent_host_proto::WorksetMode::View,
+            content: Some(prompt(index, 0)),
+        });
     }
 
     let started = Instant::now();
@@ -286,7 +284,7 @@ async fn run_async(args: Args) -> Result<()> {
                 )
             })??;
         match message {
-            Incoming::Control(ServerMessage::AgentCreated { agent_id }) => {
+            Incoming::Reply(Reply::AgentCreated { agent_id }) => {
                 agents.insert(agent_id);
                 ensure!(
                     agents.len() <= agent_count,
@@ -416,13 +414,11 @@ async fn run_async(args: Args) -> Result<()> {
                             if args.scenario == Scenario::Baseline && Instant::now() < deadline {
                                 let cycle = cycles.entry(entry.agent_id).or_default();
                                 *cycle += 1;
-                                client
-                                    .send(&ClientMessage::SendUserMessage {
-                                        agent_id: entry.agent_id,
-                                        content: prompt(0, *cycle),
-                                        delivery: MessageDelivery::Immediate,
-                                    })
-                                    .await?;
+                                client.send(AgentCommand::Send {
+                                    agent_id: entry.agent_id,
+                                    content: prompt(0, *cycle),
+                                    delivery: MessageDelivery::Immediate,
+                                });
                             }
                         }
                         _ => {}
@@ -445,8 +441,8 @@ async fn run_async(args: Args) -> Result<()> {
                     _ => bail!("daemon Detail body did not match its journal event"),
                 }
             }
-            Incoming::Control(ServerMessage::Error { message }) => {
-                bail!("daemon refused proof action: {message}")
+            Incoming::Reply(Reply::Failed { reason }) => {
+                bail!("daemon refused proof action: {reason}")
             }
             _ => {}
         }

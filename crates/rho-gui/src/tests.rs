@@ -3907,34 +3907,6 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        state(vec![user("first")], Vec::new()),
-    );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::TurnCancelled,
-                window,
-                cx,
-            );
-        })
-        .expect("handle cancellation acknowledgement");
-
-    let text = display_text(&workspace, cx);
-    assert!(
-        !text.contains("[turn cancelled]"),
-        "turn cancellation acknowledgement should not become persistent transcript text: {text:?}"
-    );
-}
-
-#[gpui::test]
 fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
@@ -6648,33 +6620,28 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
 }
 
 #[gpui::test]
-fn unnamed_legacy_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
+fn unnamed_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
+    let summary = rho_agent_host_proto::QuotaSummary {
+        model: "gpt".to_owned(),
+        auth_namespace: None,
+        remaining_percent: 40,
+        burn_10m: 0,
+        burn_2h: 0,
+        burn_1d: 0,
+        burn_3d: 0,
+        reset_at_unix: Some(1),
+    };
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::ChatGptUsage {
-                    used_percent: 60.,
-                    reset_at_unix: 1,
-                },
+                ConnEvent::QuotaUsage(vec![summary.clone()]),
                 window,
                 cx,
             );
-            assert_eq!(
-                workspace.merged_quota_summaries_for_test(),
-                vec![rho_agent_host_proto::QuotaSummary {
-                    model: "gpt".to_owned(),
-                    auth_namespace: None,
-                    remaining_percent: 40,
-                    burn_10m: 0,
-                    burn_2h: 0,
-                    burn_1d: 0,
-                    burn_3d: 0,
-                    reset_at_unix: Some(1),
-                }]
-            );
+            assert_eq!(workspace.merged_quota_summaries_for_test(), vec![summary]);
         })
         .unwrap();
 }
@@ -9309,7 +9276,9 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
             assert!(
                 sent.iter().any(|message| matches!(
                     message,
-                    rho_agent_host_proto::ClientMessage::NewAgent { .. }
+                    rho_agent_host_proto::Request::Agent(
+                        rho_agent_host_proto::AgentCommand::New { .. }
+                    )
                 )),
                 "the draft started an agent"
             );
@@ -10883,16 +10852,14 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
+        .update(cx, |workspace, _, _| {
+            workspace.answer_host_request_for_test(
                 HostId::default(),
-                ConnEvent::ServerError("create workspace: no such repository".to_owned()),
-                window,
-                cx,
+                Err(anyhow::anyhow!("create workspace: no such repository")),
             );
         })
         .expect("the daemon refuses");
+    cx.run_until_parked();
 
     let refusal = workspace
         .update(cx, |workspace, _, cx| {

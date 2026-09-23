@@ -1,7 +1,7 @@
 //! Wire vocabulary for workset-owned Comint-style shell sessions.
 //!
-//! A shell stream is dedicated by [`crate::ClientMessage::ShellStart`] or
-//! [`crate::ClientMessage::ShellAttach`]. The workset owns the process and its
+//! A shell is started by [`crate::Request::ShellStart`] and a stream attached
+//! to it by [`crate::Open::Shell`]. The workset owns the process and its
 //! canonical structured state; clients project that state into a read-only
 //! buffer, keep their pending input locally, and submit complete commands.
 
@@ -46,7 +46,7 @@ pub struct ShellStyleSpan {
     pub style: ShellTextStyle,
 }
 
-/// One workset-owned shell returned by [`crate::ServerMessage::ShellList`].
+/// One workset-owned shell returned by [`crate::Reply::ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
     /// Encoded agent id ("eng-ht08").

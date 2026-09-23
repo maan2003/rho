@@ -13,6 +13,7 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 #[cfg(not(target_family = "wasm"))]
 pub mod agents;
 pub mod client;
+pub mod control;
 pub mod desk;
 mod place;
 pub mod realtime;
@@ -36,9 +37,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/16";
+pub const IROH_ALPN: &[u8] = b"rho/ui/17";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP16";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP17";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,18 +122,164 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
         .to_owned())
 }
 
-/// Message sent from a UI client to the rho daemon.
+/// The first frame on every stream: what the stream is for. Every frame
+/// after it, both ways, is that kind's own, so neither side ever reads a
+/// frame meant for another kind of stream.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum ClientMessage {
-    Ping,
-    Subscribe,
-    /// The first frame of an agents stream ([`agents`]); every frame after
-    /// it, both ways, is that module's.
-    AgentsOpen,
-    /// The first frame of a desk stream ([`desk::stream`]); every frame
-    /// after it, both ways, is that module's.
-    DeskOpen,
-    NewAgent {
+pub enum Open {
+    /// A GUI's session: what the host pushes to it ([`control`]). One per
+    /// iroh connection.
+    Control,
+    /// The host's journal and its agents' live tails ([`agents`]).
+    Agents,
+    /// The desk ([`desk::stream`]).
+    Desk,
+    /// Workspace file access for one workspace. Answered with [`Opened`];
+    /// after `Ready` the stream carries [`workspace::WorkspaceClientFrame`]
+    /// and [`workspace::WorkspaceServerFrame`], and closing it closes the
+    /// channel and its filesystem watcher.
+    Workspace { workspace: WorkspaceInfo },
+    /// A voice session. Answered with [`realtime::Opened`]; after the
+    /// answer the stream carries [`realtime::RealtimeClientFrame`] and
+    /// [`realtime::RealtimeServerFrame`].
+    Realtime { offer_sdp: String },
+    /// A daemon-owned terminal for an agent. Answered with [`Opened`]; an
+    /// attached stream then carries [`term::TermClientFrame`] and
+    /// [`term::TermServerFrame`], the first of them a snapshot of the
+    /// screen preceded by history. Otherwise the terminal runs headless
+    /// and the stream closes.
+    Terminal {
+        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
+        agent: String,
+        /// Client-chosen id, unique among the agent's running terminals
+        /// ([`Request::TerminalList`] enumerates them).
+        terminal_id: u64,
+        open: term::TerminalOpen,
+        /// The client's viewport, applied to the PTY (last writer wins).
+        cols: u16,
+        rows: u16,
+    },
+    /// Attaches to an agent's running shell ([`Request::ShellStart`]).
+    /// Answered with [`Opened`], then [`shell`] frames. Closing the stream
+    /// only detaches; the shell keeps running.
+    Shell { agent: String },
+    /// One live application over MoQ streams on this connection. Answered
+    /// with [`Opened`].
+    Wayland {
+        media_id: u64,
+        agent: String,
+        session: String,
+    },
+    /// A Git remote helper's transport, paired with a GUI that provides
+    /// it. After [`Opened::Ready`] the stream is raw Git data.
+    GitTransport { request: GitTransportRequest },
+    /// A GUI's answer to [`control::ServerFrame::GitTransportRequested`].
+    /// Answered with [`GitProvided`]; after `Ready` the stream is raw Git
+    /// data.
+    GitProvide {
+        request_id: u64,
+        provider_id: u64,
+        /// Whether this GUI claims the transport after approving the
+        /// operation. The first claim selects the credential provider.
+        claim: bool,
+    },
+    /// One request, answered with one [`Reply`]; then the stream closes.
+    Request(Request),
+}
+
+/// The answer to opening a stream the host can refuse.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Opened {
+    Ready,
+    /// The host closes the stream after sending it.
+    Refused {
+        reason: String,
+    },
+}
+
+/// The answer to [`Open::GitProvide`].
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitProvided {
+    /// This GUI carries the transport: raw Git data follows.
+    Ready,
+    /// The approval race completed or expired. Deliberately carries no
+    /// result or winner.
+    Done,
+}
+
+/// What a client can ask of a host in one round trip.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Request {
+    /// Answered with [`Reply::AgentCreated`] for [`AgentCommand::New`] and
+    /// [`Reply::Done`] for the rest.
+    Agent(AgentCommand),
+    /// Every running terminal, of one agent if it names one (display
+    /// handle or id prefix). Answered with [`Reply::TerminalList`].
+    TerminalList { agent: Option<String> },
+    /// Starts the daemon-owned Comint-style shell for an agent. Attaching
+    /// is [`Open::Shell`].
+    ShellStart { agent: String },
+    /// Running shells, of one agent if it names one. Answered with
+    /// [`Reply::ShellList`].
+    ShellList { agent: Option<String> },
+    /// Stops an agent's running shell gracefully.
+    ShellClose { agent: String },
+    /// How the remote helper should reach `host`: PAT-backed GitHub HTTP
+    /// or client-held SSH. Answered with [`Reply::GitTransportPolicy`].
+    GitTransportPolicy { host: String },
+    /// A bounded, client-produced performance snapshot, kept under the
+    /// daemon's state directory. Answered with [`Reply::GuiTelemetryStored`].
+    GuiTelemetryUpload { snapshot: Vec<u8> },
+    /// A recorded visualization. Answered with [`Reply::Visualization`].
+    Visualization { id: String },
+    /// Stores an immutable visualization snapshot. Answered with
+    /// [`Reply::VisualizationRecorded`].
+    RecordVisualization { mime_type: String, content: Vec<u8> },
+    /// Answered with [`Reply::QuotaUsage`].
+    QuotaUsage,
+    /// Answered with [`Reply::QuotaHistory`].
+    QuotaHistory,
+    /// Answered with [`Reply::GlobalUsage`].
+    GlobalUsage { since_ms: u64 },
+    /// Raw per-agent usage needed to form cost distributions beginning at
+    /// `since_ms`, with the fixed trailing-window lookback. Answered with
+    /// [`Reply::AgentCostDistribution`].
+    AgentCostDistribution { since_ms: u64 },
+    /// Which Claude accounts exist and which one agents run on. Answered
+    /// with [`Reply::ClaudeAccounts`].
+    ClaudeAccounts,
+    /// Puts every agent on `name` from its next turn. Answered with
+    /// [`Reply::ClaudeAccounts`] as it stands after the switch.
+    SetClaudeAccount { name: String },
+    /// Enables or disables one provider account namespace on this host.
+    SetAuthAccountEnabled { name: String, enabled: bool },
+    /// Installs platform secrets into the daemon's RAM-only store.
+    /// Answered with [`Reply::PlatformStatus`].
+    PlatformSecretsSet { secrets: Vec<(String, String)> },
+    /// Approves a pending iroh client enrollment by its displayed code,
+    /// trusting that client's endpoint key persistently. Answered with
+    /// [`Reply::IrohApproved`].
+    IrohApprove { code: String },
+    /// Trusts an iroh endpoint in daemon memory. A privileged
+    /// local-control operation intended to be invoked through SSH.
+    IrohTrustInMemory { endpoint_id: String },
+    /// Revokes persistent trust for an iroh client endpoint.
+    IrohRevoke { endpoint_id: String },
+    /// Copies the daemon's database for inspection, as of its latest
+    /// commit and ready to open without repair. Answered with
+    /// [`Reply::Snapshotted`]; the copy is the caller's to delete.
+    Snapshot,
+    /// Answered with [`Reply::Pr`].
+    Pr {
+        agent_id: Option<String>,
+        command: PrCommand,
+    },
+}
+
+/// What a client tells a host to do to its agents.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum AgentCommand {
+    New {
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
@@ -142,210 +289,57 @@ pub enum ClientMessage {
         mode: WorksetMode,
         content: Option<Vec<ContentPart>>,
     },
-    SendUserMessage {
+    Send {
         agent_id: AgentId,
         content: Vec<ContentPart>,
         delivery: MessageDelivery,
     },
-    CompactAgent {
+    Compact {
         agent_id: AgentId,
         delivery: MessageDelivery,
     },
-    ChangeAgentRole {
+    ChangeRole {
         agent_id: AgentId,
         role: AgentRole,
     },
     /// How the agent sees the filesystem from now on. Its loop restarts
     /// in the new view, so the Python notebook's state is lost.
-    ChangeAgentMode {
+    ChangeMode {
         agent_id: AgentId,
         mode: WorksetMode,
     },
-    CancelTurn {
+    Cancel {
         agent_id: AgentId,
     },
-    RewindAgent {
+    Rewind {
         agent_id: AgentId,
         turns: u32,
     },
-    ContinueTurn {
+    Continue {
         agent_id: AgentId,
     },
-    /// Enables or disables one provider account namespace on this host.
-    SetAuthAccountEnabled {
-        name: String,
-        enabled: bool,
-    },
-    /// Install platform secrets into the daemon's RAM-only store.
-    PlatformSecretsSet {
-        secrets: Vec<(String, String)>,
-    },
-    /// Approve a pending iroh client enrollment by its displayed code,
-    /// trusting that client's endpoint key persistently.
-    IrohApprove {
-        code: String,
-    },
-    /// Copy the daemon's database for inspection, as of its latest commit
-    /// and ready to open without repair. Answered with
-    /// [`ServerMessage::Snapshotted`]; the copy is the caller's to delete.
-    Snapshot,
-    /// Directly trust an iroh endpoint in daemon memory. This is a privileged
-    /// local-control operation intended to be invoked through SSH.
-    IrohTrustInMemory {
-        endpoint_id: String,
-    },
-    /// Revoke persistent trust for an iroh client endpoint.
-    IrohRevoke {
-        endpoint_id: String,
-    },
-    PrCommand {
-        request_id: u64,
-        agent_id: Option<String>,
-        command: PrCommand,
-    },
-    /// Give a Rho-runtime agent a fresh key for subsequent provider requests.
+    /// Gives a Rho-runtime agent a fresh key for subsequent provider
+    /// requests.
     ChangePromptCacheKey {
         agent_id: AgentId,
     },
-    /// Dedicates this whole stream to workspace file access: sent as the
-    /// *first* message on a fresh stream (a new iroh bi-stream or Unix
-    /// connection), never inside a UI session. The daemon binds a headless
-    /// workspace and replies [`ServerMessage::ChannelOpened`]; after that
-    /// handshake the stream carries [`workspace::WorkspaceClientFrame`] and
-    /// [`workspace::WorkspaceServerFrame`] values. Closing the stream closes
-    /// the channel and its filesystem watcher.
-    ChannelOpen {
-        workspace: WorkspaceInfo,
-    },
-    /// Opens a dedicated realtime stream. After
-    /// [`ServerMessage::RealtimeOpened`] the stream carries
-    /// [`realtime::RealtimeClientFrame`] and
-    /// [`realtime::RealtimeServerFrame`] values until either side closes it.
-    RealtimeOpen {
-        offer_sdp: String,
-    },
-    /// Spawns a daemon-owned terminal for an agent: sent as the *first*
-    /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
-    /// Refused ([`ServerMessage::TerminalRefused`]) if `terminal_id` is
-    /// already running. On success the daemon replies
-    /// [`ServerMessage::TerminalOpened`]; with `attach` the stream then
-    /// carries senax frames of [`term::TermClientFrame`] /
-    /// [`term::TermServerFrame`], otherwise the terminal runs headless and
-    /// the stream closes.
-    TerminalCreate {
-        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
-        agent: String,
-        /// Client-chosen id, unique among the agent's running terminals
-        /// ([`ClientMessage::TerminalList`] enumerates them).
-        terminal_id: u64,
-        /// Continue this stream as an attached terminal stream.
-        attach: bool,
-        /// Initial PTY size.
-        cols: u16,
-        rows: u16,
-    },
-    /// Attaches this whole stream to a *running* terminal (refused if it is
-    /// not running): handshake and frames as in
-    /// [`ClientMessage::TerminalCreate`] with `attach`. Closing the stream
-    /// detaches; the terminal keeps running.
-    TerminalAttach {
-        agent: String,
-        terminal_id: u64,
-        /// The client's viewport, applied to the PTY (last writer wins).
-        cols: u16,
-        rows: u16,
-    },
-    /// One-shot request on a fresh stream: the daemon replies with a single
-    /// [`ServerMessage::TerminalList`] (or [`ServerMessage::TerminalRefused`]
-    /// if `agent` does not resolve) and closes the stream.
-    TerminalList {
-        /// Restrict to one agent's terminals (display handle or id prefix).
-        agent: Option<String>,
-    },
-    /// Advertise this control connection as a client-held SSH Git transport
-    /// provider. Every native GUI registers and may receive approval requests.
-    GitTransportRegister,
-    /// First frame on a Git remote-helper stream. The daemon pairs it with
-    /// the registered GUI provider, then the stream switches to raw Git data.
-    GitTransportRequest {
-        request: GitTransportRequest,
-    },
-    /// First frame on the GUI's dedicated provider stream.
-    GitTransportProvide {
-        request_id: u64,
-        provider_id: u64,
-        /// Whether this GUI claims the transport after approving the operation.
-        /// The first claim selects the credential provider.
-        claim: bool,
-    },
-    /// One-shot query on a fresh local stream used by the remote helper to
-    /// choose PAT-backed GitHub HTTP or client-held SSH before negotiation.
-    GitTransportQuery {
-        host: String,
-    },
-    /// Starts the daemon-owned Comint-style shell for an agent. This travels
-    /// on the main UI control stream; attachment is a separate stream.
-    ShellStart {
-        request_id: u64,
-        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
-        agent: String,
-    },
-    /// Attaches this dedicated stream to an already-running shell. Closing
-    /// the stream only detaches; it does not stop the shell.
-    ShellAttach {
-        agent: String,
-    },
-    /// Main-control request listing running shells, optionally for one agent.
-    ShellList {
-        request_id: u64,
-        agent: Option<String>,
-    },
-    /// Main-control request to gracefully stop an agent's running shell.
-    ShellClose {
-        request_id: u64,
-        agent: String,
-    },
-    /// One-shot request on a fresh stream. The daemon persists this bounded,
-    /// client-produced performance snapshot under its state directory.
-    GuiTelemetryUpload {
-        snapshot: Vec<u8>,
-    },
-    /// Requests the daemon account's weekly ChatGPT Codex allowance.
-    ChatGptUsage,
-    QuotaHistory,
-    GlobalUsage {
-        since_ms: u64,
-    },
-    /// Raw per-agent usage needed to form cost distributions beginning at
-    /// `since_ms`. The daemon includes the fixed trailing-window lookback.
-    AgentCostDistribution {
-        since_ms: u64,
-    },
-    /// Asks which Claude accounts exist and which one agents run on, and
-    /// replies with [`ServerMessage::ClaudeAccounts`].
-    ClaudeAccounts,
-    /// Puts every agent on `name` from its next turn, replying with
-    /// [`ServerMessage::ClaudeAccounts`] as it stands after the switch.
-    SetClaudeAccount {
-        name: String,
-    },
-    /// Stores an immutable visualization snapshot and replies with
-    /// [`ServerMessage::VisualizationRecorded`].
-    RecordVisualization {
-        mime_type: String,
-        content: Vec<u8>,
-    },
-    /// One-shot request on a fresh stream. The daemon returns only the
-    /// requested artifact, if it exists, then closes the stream.
-    VisualizationGet {
-        id: String,
-    },
-    /// Attach one live application over MoQ streams on this connection.
-    WaylandOpen {
-        media_id: u64,
-        agent: String,
-        session: String,
-    },
+}
+
+impl AgentCommand {
+    /// The agent the command is for; `None` for a new one.
+    pub fn agent_id(&self) -> Option<AgentId> {
+        match self {
+            Self::New { .. } => None,
+            Self::Send { agent_id, .. }
+            | Self::Compact { agent_id, .. }
+            | Self::ChangeRole { agent_id, .. }
+            | Self::ChangeMode { agent_id, .. }
+            | Self::Cancel { agent_id }
+            | Self::Rewind { agent_id, .. }
+            | Self::Continue { agent_id }
+            | Self::ChangePromptCacheKey { agent_id } => Some(*agent_id),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -436,141 +430,37 @@ pub enum JoinTarget {
     User { repo: Utf8PathBuf },
 }
 
-/// Message sent from the rho daemon to a UI client.
+/// The answer to a [`Request`].
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum ServerMessage {
-    Pong,
-    Ready {
-        auth: AuthState,
-        /// The daemon database's machine seed; clients need it to encode
-        /// agent IDs (see [`AgentIdDomain`]).
-        machine_seed: u64,
-        /// Last allocated agent-id counter; clients use it for uniform
-        /// short-prefix rendering.
-        agent_counter: u64,
-    },
-    Error {
-        message: String,
-    },
-    /// The host's active/default auth changed, or its available namespaces
-    /// were refreshed.
-    AuthState {
-        auth: AuthState,
-    },
-    PlatformStatus {
-        running: bool,
-        detail: String,
+pub enum Reply {
+    /// Done, with nothing to say.
+    Done,
+    /// Not done, and why: the whole chain of causes.
+    Failed {
+        reason: String,
     },
     AgentCreated {
         agent_id: AgentId,
     },
-    TurnCancelled {
-        agent_id: AgentId,
-    },
-    /// Reply to [`ClientMessage::Snapshot`]: where the copy is, in a
-    /// directory of its own beside the database.
-    Snapshotted {
-        path: Utf8PathBuf,
-    },
-    /// Reply to [`ClientMessage::IrohApprove`]: the enrolled client's
-    /// endpoint id.
-    IrohApproved {
-        endpoint_id: String,
-    },
-    IrohRevoked {
-        endpoint_id: String,
-    },
-    PrCommandResult {
-        request_id: u64,
-        output: String,
-        data: Vec<u8>,
-        is_error: bool,
-    },
-    /// Handshake reply on a workspace-channel stream (see
-    /// [`ClientMessage::ChannelOpen`]).
-    ChannelOpened,
-    /// Handshake refusal on a workspace-channel stream; the daemon closes the
-    /// stream after sending it.
-    ChannelClosed {
-        reason: String,
-    },
-    RealtimeOpened {
-        answer_sdp: String,
-    },
-    RealtimeRefused {
-        reason: String,
-    },
-    /// Handshake reply on a terminal stream (see
-    /// [`ClientMessage::TerminalCreate`] and
-    /// [`ClientMessage::TerminalAttach`]). On an attached stream the first
-    /// [`term::TermServerFrame`] after it is a snapshot of the current screen
-    /// preceded by history.
-    TerminalOpened {
-        terminal_id: u64,
-    },
-    /// Handshake refusal on a terminal stream; the daemon closes the stream
-    /// after sending it.
-    TerminalRefused {
-        reason: String,
-    },
-    /// Reply to [`ClientMessage::TerminalList`]: every running terminal
-    /// (of one agent, if the request named one).
     TerminalList {
         terminals: Vec<term::TerminalInfo>,
     },
-    /// Request fanned out to every registered GUI credential provider.
-    GitTransportRequested {
-        request_id: u64,
-        provider_id: u64,
-        request: GitTransportRequest,
-    },
-    /// Dedicated Git stream handshake succeeded; subsequent bytes are raw
-    /// Git protocol data.
-    GitTransportReady,
-    GitTransportRefused {
-        reason: String,
+    ShellList {
+        shells: Vec<shell::ShellInfo>,
     },
     GitTransportPolicy {
         pat_available: bool,
     },
-    /// An approval race completed or expired. Deliberately carries no result
-    /// or winner information.
-    GitTransportDone {
-        request_id: u64,
-    },
-    /// Handshake reply on a Comint-style shell stream.
-    ShellOpened,
-    /// Main-control reply to [`ClientMessage::ShellStart`].
-    ShellStarted {
-        request_id: u64,
-    },
-    /// Main-control reply to [`ClientMessage::ShellList`].
-    ShellList {
-        request_id: u64,
-        shells: Vec<shell::ShellInfo>,
-    },
-    /// Main-control reply after [`ClientMessage::ShellClose`] stops the shell.
-    ShellClosed {
-        request_id: u64,
-    },
-    /// Failed main-control lifecycle request.
-    ShellRequestFailed {
-        request_id: u64,
-        reason: String,
-    },
-    /// Handshake refusal on a dedicated shell attachment stream.
-    ShellAttachRefused {
-        reason: String,
-    },
     GuiTelemetryStored {
         path: String,
     },
-    GuiTelemetryRefused {
-        reason: String,
+    Visualization {
+        id: String,
+        mime_type: String,
+        content: Vec<u8>,
     },
-    ChatGptUsage {
-        used_percent: f64,
-        reset_at_unix: i64,
+    VisualizationRecorded {
+        id: String,
     },
     QuotaUsage {
         summaries: Vec<QuotaSummary>,
@@ -588,20 +478,25 @@ pub enum ServerMessage {
         accounts: Vec<String>,
         current: String,
     },
-    VisualizationRecorded {
-        id: String,
+    PlatformStatus {
+        running: bool,
+        detail: String,
     },
-    VisualizationContent {
-        id: String,
-        mime_type: String,
-        content: Vec<u8>,
+    /// The enrolled client's endpoint id.
+    IrohApproved {
+        endpoint_id: String,
     },
-    VisualizationRefused {
-        reason: String,
+    IrohRevoked {
+        endpoint_id: String,
     },
-    WaylandOpened,
-    DesktopSessions {
-        sessions: Vec<DesktopSession>,
+    /// Where the copy is, in a directory of its own beside the database.
+    Snapshotted {
+        path: Utf8PathBuf,
+    },
+    Pr {
+        output: String,
+        data: Vec<u8>,
+        is_error: bool,
     },
 }
 
@@ -867,7 +762,7 @@ pub fn print_protocol_log(
             .context("protocol log frame length mismatch")?;
         match direction {
             ProtocolLogDirection::ClientToServer => {
-                let message: ClientMessage =
+                let message: Open =
                     senax_encoder::unpack(&mut payload).context("unpack client frame")?;
                 writeln!(
                     output,
@@ -877,7 +772,7 @@ pub fn print_protocol_log(
                 )?;
             }
             ProtocolLogDirection::ServerToClient => {
-                let message: ServerMessage =
+                let message: Reply =
                     senax_encoder::unpack(&mut payload).context("unpack server frame")?;
                 writeln!(
                     output,
@@ -947,9 +842,20 @@ mod tests {
         );
     }
 
+    fn round_trips<T>(message: T)
+    where
+        T: Packer + senax_encoder::Unpacker + PartialEq + std::fmt::Debug,
+    {
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: T = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
     #[test]
     fn protocol_log_records_full_length_prefixed_frame() {
-        let frame = protocol_frame_bytes(&ClientMessage::Ping).unwrap();
+        let open = Open::Request(Request::Snapshot);
+        let frame = protocol_frame_bytes(&open).unwrap();
         let mut log = Vec::new();
         append_protocol_log_record(&mut log, 123, ProtocolLogDirection::ClientToServer, &frame)
             .unwrap();
@@ -962,159 +868,123 @@ mod tests {
         assert_eq!(recorded_frame, frame);
 
         let mut payload = &recorded_frame[4..];
-        let message: ClientMessage = senax_encoder::unpack(&mut payload).unwrap();
-        assert_eq!(message, ClientMessage::Ping);
+        let message: Open = senax_encoder::unpack(&mut payload).unwrap();
+        assert_eq!(message, open);
     }
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP9\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP16\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
     #[test]
-    fn pr_command_round_trips() {
-        let message = ClientMessage::PrCommand {
-            request_id: 7,
-            agent_id: Some("eng-abcd".into()),
-            command: PrCommand::Edit {
-                url: "https://github.com/acme/widgets/pull/1".into(),
-                base: Some("release".into()),
-                title: Some("Better title".into()),
-                body: Some("Better summary".into()),
+    fn requests_and_replies_round_trip() {
+        let agent_id = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
+        for request in [
+            Request::Pr {
+                agent_id: Some("eng-abcd".into()),
+                command: PrCommand::Edit {
+                    url: "https://github.com/acme/widgets/pull/1".into(),
+                    base: Some("release".into()),
+                    title: Some("Better title".into()),
+                    body: Some("Better summary".into()),
+                },
             },
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
+            Request::SetAuthAccountEnabled {
+                name: "work".to_owned(),
+                enabled: false,
+            },
+            Request::AgentCostDistribution { since_ms: 42 },
+            Request::RecordVisualization {
+                mime_type: "image/svg+xml".to_owned(),
+                content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
+            },
+            Request::ShellStart {
+                agent: "eng-test".to_owned(),
+            },
+            Request::GitTransportPolicy {
+                host: "github.com".to_owned(),
+            },
+            Request::GuiTelemetryUpload {
+                snapshot: br#"{"version":1}"#.to_vec(),
+            },
+            Request::Agent(AgentCommand::Send {
+                agent_id,
+                content: vec![
+                    ContentPart::Text {
+                        text: "inspect".to_owned(),
+                    },
+                    ContentPart::Image {
+                        media_type: "image/gif".to_owned(),
+                        data: vec![1, 2, 3],
+                    },
+                ],
+                delivery: MessageDelivery::NextRequest,
+            }),
+        ] {
+            round_trips(Open::Request(request));
+        }
+        for reply in [
+            Reply::GlobalUsage {
+                series: vec![AgentUsageSeries {
+                    model: "fable".to_owned(),
+                    buckets: vec![AgentUsageBucket {
+                        bucket_start_ms: 300_000,
+                        input_tokens: 10,
+                        ..AgentUsageBucket::default()
+                    }],
+                }],
+            },
+            Reply::AgentCostDistribution {
+                series: vec![AgentCostSeries {
+                    agent_id,
+                    model: "gpt".to_owned(),
+                    buckets: vec![AgentUsageBucket {
+                        bucket_start_ms: 3_600_000,
+                        output_tokens: 10,
+                        requests: 1,
+                        ..AgentUsageBucket::default()
+                    }],
+                }],
+            },
+            Reply::Visualization {
+                id: "0123456789abcdef0123456789abcdef".to_owned(),
+                mime_type: "image/svg+xml".to_owned(),
+                content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
+            },
+            Reply::GitTransportPolicy {
+                pat_available: true,
+            },
+            Reply::GuiTelemetryStored {
+                path: "/state/rho/gui-telemetry/snapshot.json".to_owned(),
+            },
+            Reply::AgentCreated { agent_id },
+            Reply::Failed {
+                reason: "no such repository".to_owned(),
+            },
+        ] {
+            round_trips(reply);
+        }
     }
 
     #[test]
-    fn auth_settings_round_trip() {
-        let message = ClientMessage::SetAuthAccountEnabled {
-            name: "work".to_owned(),
-            enabled: false,
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, message);
-
-        let message = ServerMessage::AuthState {
+    fn control_frames_round_trip() {
+        round_trips(control::ServerFrame::AuthState {
             auth: AuthState {
                 namespaces: vec!["default".to_owned(), "work".to_owned()],
                 disabled_namespaces: vec!["work".to_owned()],
                 active_namespace: Some("default".to_owned()),
             },
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, message);
+        });
+        round_trips(control::ServerFrame::GitTransportDone { request_id: 9 });
+        round_trips(control::ClientFrame::ProvideGitTransport);
     }
 
     #[test]
-    fn global_usage_response_round_trips() {
-        let message = ServerMessage::GlobalUsage {
-            series: vec![AgentUsageSeries {
-                model: "fable".to_owned(),
-                buckets: vec![AgentUsageBucket {
-                    bucket_start_ms: 300_000,
-                    input_tokens: 10,
-                    ..AgentUsageBucket::default()
-                }],
-            }],
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
-    }
-
-    #[test]
-    fn agent_cost_distribution_response_round_trips() {
-        let request = ClientMessage::AgentCostDistribution { since_ms: 42 };
-        let bytes = senax_encoder::pack(&request).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(request, decoded);
-
-        let agent_id = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
-        let message = ServerMessage::AgentCostDistribution {
-            series: vec![AgentCostSeries {
-                agent_id,
-                model: "gpt".to_owned(),
-                buckets: vec![AgentUsageBucket {
-                    bucket_start_ms: 3_600_000,
-                    output_tokens: 10,
-                    requests: 1,
-                    ..AgentUsageBucket::default()
-                }],
-            }],
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
-    }
-
-    #[test]
-    fn visualization_messages_round_trip() {
-        let request = ClientMessage::RecordVisualization {
-            mime_type: "image/svg+xml".to_owned(),
-            content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-        };
-        let bytes = senax_encoder::pack(&request).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(request, decoded);
-
-        let response = ServerMessage::VisualizationContent {
-            id: "0123456789abcdef0123456789abcdef".to_owned(),
-            mime_type: "image/svg+xml".to_owned(),
-            content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-        };
-        let bytes = senax_encoder::pack(&response).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(response, decoded);
-    }
-
-    #[test]
-    fn image_user_message_round_trips() {
-        let message = ClientMessage::SendUserMessage {
-            agent_id: AgentId::from_counter(1, &AgentIdDomain(7)).unwrap(),
-            content: vec![
-                ContentPart::Text {
-                    text: "inspect".to_owned(),
-                },
-                ContentPart::Image {
-                    media_type: "image/gif".to_owned(),
-                    data: vec![1, 2, 3],
-                },
-            ],
-            delivery: MessageDelivery::NextRequest,
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
-    }
-
-    #[test]
-    fn shell_messages_round_trip() {
-        let client = ClientMessage::ShellStart {
-            request_id: 7,
-            agent: "eng-test".to_owned(),
-        };
-        let bytes = senax_encoder::pack(&client).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(client, decoded);
-
-        let frame = shell::ShellServerFrame::ExecutionOutput {
+    fn shell_frames_round_trip() {
+        round_trips(shell::ShellServerFrame::ExecutionOutput {
             execution: 3,
             start: 0,
             end: 0,
@@ -1128,11 +998,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
-        };
-        let bytes = senax_encoder::pack(&frame).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(frame, decoded);
+        });
 
         assert!(shell::command_fits(&"x".repeat(shell::MAX_COMMAND_BYTES)));
         assert!(!shell::command_fits(
@@ -1141,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn git_transport_messages_round_trip() {
+    fn stream_openings_round_trip() {
         let request = GitTransportRequest {
             host: "git.example".to_owned(),
             port: 2222,
@@ -1150,57 +1016,29 @@ mod tests {
             service: GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
-        for message in [
-            ClientMessage::GitTransportRegister,
-            ClientMessage::GitTransportRequest {
-                request: request.clone(),
-            },
-            ClientMessage::GitTransportProvide {
+        for open in [
+            Open::Control,
+            Open::Agents,
+            Open::Desk,
+            Open::GitTransport { request },
+            Open::GitProvide {
                 request_id: 9,
                 provider_id: 4,
                 claim: true,
             },
-            ClientMessage::GitTransportQuery {
-                host: "github.com".to_owned(),
+            Open::Terminal {
+                agent: "eng-test".to_owned(),
+                terminal_id: 3,
+                open: term::TerminalOpen::Create { attach: true },
+                cols: 80,
+                rows: 24,
             },
         ] {
-            let bytes = senax_encoder::pack(&message).unwrap();
-            let mut slice: &[u8] = &bytes;
-            let decoded = senax_encoder::unpack(&mut slice).unwrap();
-            assert_eq!(message, decoded);
+            round_trips(open);
         }
-
-        let message = ServerMessage::GitTransportPolicy {
-            pat_available: true,
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
-
-        let message = ServerMessage::GitTransportDone { request_id: 9 };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(message, decoded);
-    }
-
-    #[test]
-    fn gui_telemetry_messages_round_trip() {
-        let request = ClientMessage::GuiTelemetryUpload {
-            snapshot: br#"{"version":1}"#.to_vec(),
-        };
-        let bytes = senax_encoder::pack(&request).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(request, decoded);
-
-        let response = ServerMessage::GuiTelemetryStored {
-            path: "/state/rho/gui-telemetry/snapshot.json".to_owned(),
-        };
-        let bytes = senax_encoder::pack(&response).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(response, decoded);
+        round_trips(Opened::Refused {
+            reason: "not running".to_owned(),
+        });
+        round_trips(GitProvided::Done);
     }
 }

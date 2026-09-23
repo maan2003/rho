@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use camino::Utf8PathBuf;
 use gpui::App;
-use rho_agent_host_proto::ClientMessage;
 
 use crate::connection::Connection;
 use crate::{AttachTarget, HostId, Sinks};
@@ -201,20 +200,6 @@ impl Hosts {
     /// pick their own host later.
     pub fn any_online(&self) -> bool {
         self.hosts.iter().any(|host| host.status.is_online())
-    }
-
-    pub fn send(&self, host: HostId, message: ClientMessage) {
-        if let Some(connection) = self.connection(host) {
-            connection.send(message);
-        }
-    }
-
-    /// Sends the same command to every attached host. Used only for queries
-    /// whose answers the workspace merges, never for mutations.
-    pub fn broadcast(&self, message: impl Fn() -> ClientMessage) {
-        for host in &self.hosts {
-            host.connection.send(message());
-        }
     }
 
     /// Every host id, in the order they were added.
