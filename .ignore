@@ -1,0 +1,3 @@
+# Vendored subtrees would drown every search in upstream code. Search
+# them by naming the path (`rg foo vendor/zed`) or from inside them.
+/vendor/
