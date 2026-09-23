@@ -1732,7 +1732,7 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                rho_hosts::AgentFrame::Log {
+                rho_agents_client::stream::AgentFrame::Log {
                     entries: story::head_entries(story::UiAgentHead {
                         generated_title: Some("renamed".to_owned()),
                         ..ui_head(agents[2])
@@ -2052,7 +2052,7 @@ fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                rho_hosts::AgentFrame::Log {
+                rho_agents_client::stream::AgentFrame::Log {
                     entries: story::head_entries(story::UiAgentHead {
                         generated_title: Some("renamed".to_owned()),
                         ..ui_head(agents[2])
@@ -6596,7 +6596,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
             story::feed(
                 workspace,
                 HostId::default(),
-                rho_hosts::DeskFrame::CellsAvailable { frontier },
+                rho_desk_client::stream::DeskFrame::CellsAvailable { frontier },
                 window,
                 cx,
             );
@@ -7787,7 +7787,7 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
 
 /// The whole story of an agent that has finished a turn and asked for the
 /// user: the least a card needs to rank as waiting on a reply.
-fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_hosts::AgentFrame {
+fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::AgentFrame {
     use story::UiStoryEvent;
     story::story(
         agent_id,
@@ -8047,8 +8047,8 @@ impl DeskFixture {
         }
     }
 
-    pub(super) fn synced(&self) -> rho_hosts::DeskFrame {
-        rho_hosts::DeskFrame::Synced {
+    pub(super) fn synced(&self) -> rho_desk_client::stream::DeskFrame {
+        rho_desk_client::stream::DeskFrame::Synced {
             store: Self::STORE,
             node_namespace: Self::NAMESPACE,
             delta: self.store.snapshot(),
@@ -11807,7 +11807,7 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
         )),
     );
     let held = match old.synced() {
-        rho_hosts::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
+        rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
         _ => unreachable!("the fixture's sync is a Synced"),
     };
 
@@ -11915,7 +11915,7 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
     // What the replica would have handed back: the cells of a previous
     // session, with no daemon behind them.
     let held = match desk.synced() {
-        rho_hosts::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
+        rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
         _ => unreachable!("the fixture's sync is a Synced"),
     };
 

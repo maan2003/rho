@@ -4,31 +4,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rho_desktop_media::codec::Decoder;
+pub use rho_desktop_media::codec::RetainedFrame;
 use rho_desktop_proto::Input;
 use tokio::sync::{mpsc, watch};
 
+/// One decoded image: the YUV planes the decoder retained, which the
+/// renderer samples as they are.
 pub struct Image {
     pub width: usize,
     pub height: usize,
-    pub render: gpui::VideoFrame,
-    pub planes: Arc<rho_desktop_media::codec::RetainedFrame>,
+    pub planes: Arc<RetainedFrame>,
 }
 impl Image {
     /// Convert only when the user exports a screenshot.
     pub fn export_bgra(&self) -> Result<Vec<u8>> {
         Ok(rho_desktop_media::codec::export_bgra(&self.planes)?.bgra)
-    }
-}
-struct VideoData(Arc<rho_desktop_media::codec::RetainedFrame>);
-impl gpui::Yuv444Data for VideoData {
-    fn size(&self) -> (u32, u32) {
-        (self.0.width() as u32, self.0.height() as u32)
-    }
-    fn plane(&self, index: usize) -> &[u8] {
-        self.0.plane(index)
-    }
-    fn stride(&self, index: usize) -> u32 {
-        self.0.stride(index) as u32
     }
 }
 pub struct Viewer {
@@ -67,7 +57,8 @@ pub(crate) async fn open(
     let (motion, mut movement) = watch::channel(None);
     let (packets, mut decode) = mpsc::channel::<bytes::Bytes>(2);
     let decoded = images.clone();
-    // Decode off GPUI and Tokio IO workers. GPUI samples the retained YUV planes.
+    // Decode off the UI and Tokio IO workers; the renderer samples the
+    // retained YUV planes.
     let decode_task = tokio::task::spawn_blocking(move || -> Result<()> {
         tracing::info!(
             desktop_id,
@@ -87,11 +78,9 @@ pub(crate) async fn open(
                     first = false;
                 }
                 let planes = Arc::new(frame);
-                let render = gpui::VideoFrame::new(Arc::new(VideoData(planes.clone())))?;
                 decoded.send_replace(Some(Arc::new(Image {
                     width: planes.width(),
                     height: planes.height(),
-                    render,
                     planes,
                 })));
             }

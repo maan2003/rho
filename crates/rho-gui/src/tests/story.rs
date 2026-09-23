@@ -8,8 +8,9 @@ use rho_agent_host_proto::transcript::{
     AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
 };
 use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
+use rho_agents_client::stream::AgentFrame;
+use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::ConnEvent;
-use rho_hosts::{AgentFrame, DeskFrame};
 
 pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
 pub type UiSpawnedBy = rho_agent_host_proto::transcript::SpawnedBy;

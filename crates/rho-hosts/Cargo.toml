@@ -19,8 +19,6 @@ octo-types = { workspace = true }
 senax-encoder = { workspace = true }
 camino.workspace = true
 futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
-gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 iroh = { workspace = true }
 redb = { workspace = true }
 rho-db = { workspace = true }

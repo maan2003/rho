@@ -20,8 +20,9 @@ use futures::channel::mpsc as futures_mpsc;
 use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::agents::ClientFrame;
 use rho_agent_host_proto::transcript::{AgentPos, Live, LogEntry, Seq, TranscriptEvent};
-use rho_hosts::{AgentCommands, AgentEvent, AgentFrame, AgentSink, SinkClosed};
+use rho_hosts::HostStream;
 
+use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
 use crate::{HostId, Verdict};
 
 /// What the main thread hears from the model.
@@ -372,6 +373,8 @@ impl Model {
 /// and the disk copy behind it.
 pub struct AgentsClient {
     incoming: futures_mpsc::UnboundedSender<ToModel>,
+    /// Each attached host's agents stream, for the focus the window says.
+    streams: std::sync::Mutex<HashMap<HostId, AgentCommands>>,
 }
 
 impl AgentsClient {
@@ -385,7 +388,13 @@ impl AgentsClient {
             .name("rho-model".to_owned())
             .spawn(move || futures::executor::block_on(run(incoming_rx, changes_tx)))
             .expect("spawn the model thread");
-        (Self { incoming }, changes)
+        (
+            Self {
+                incoming,
+                streams: Default::default(),
+            },
+            changes,
+        )
     }
 
     /// A client with no model behind it, for a test that drives the model
@@ -397,12 +406,13 @@ impl AgentsClient {
     pub fn detached() -> (Self, futures_mpsc::UnboundedReceiver<ModelEvent>) {
         let (incoming, _incoming_rx) = futures_mpsc::unbounded();
         let (_changes_tx, changes) = futures_mpsc::unbounded();
-        (Self { incoming }, changes)
-    }
-
-    /// Where the hosts' agents streams go.
-    pub fn sink(&self) -> std::sync::Arc<dyn AgentSink> {
-        std::sync::Arc::new(ModelSink(self.incoming.clone()))
+        (
+            Self {
+                incoming,
+                streams: Default::default(),
+            },
+            changes,
+        )
     }
 
     /// A host the window attached, named before it is dialled: the name is
@@ -411,13 +421,27 @@ impl AgentsClient {
         self.command(ModelCommand::AttachHost { host, name });
     }
 
-    /// The way to speak on that host's agents stream.
-    pub fn host_commands(&self, host: HostId, commands: AgentCommands) {
+    /// The agents stream for a host just attached, for the host to open on
+    /// every connection. Its frames go to the model, and the model and
+    /// [`Self::focus`] speak on it.
+    pub fn stream(&self, host: HostId) -> std::sync::Arc<dyn HostStream> {
+        let (stream, commands) = AgentStream::new(host, self.incoming.clone());
+        self.streams.lock().unwrap().insert(host, commands.clone());
         self.command(ModelCommand::HostCommands { host, commands });
+        std::sync::Arc::new(stream)
     }
 
     pub fn detach_host(&self, host: HostId) {
+        self.streams.lock().unwrap().remove(&host);
         self.command(ModelCommand::DetachHost(host));
+    }
+
+    /// The agents whose live frames a host should stream: every open pane
+    /// on it, replaced wholesale.
+    pub fn focus(&self, host: HostId, agent_ids: Vec<AgentId>) {
+        if let Some(commands) = self.streams.lock().unwrap().get(&host) {
+            commands.focus(agent_ids);
+        }
     }
 
     /// The agents whose rows the window wants, replaced wholesale.
@@ -442,16 +466,6 @@ impl AgentsClient {
         // A model that has gone went with the window; nobody is left to
         // tell.
         let _ = self.incoming.unbounded_send(ToModel::Command(command));
-    }
-}
-
-struct ModelSink(futures_mpsc::UnboundedSender<ToModel>);
-
-impl AgentSink for ModelSink {
-    fn send(&self, event: AgentEvent) -> Result<(), SinkClosed> {
-        self.0
-            .unbounded_send(ToModel::Event(event))
-            .map_err(|_| SinkClosed)
     }
 }
 

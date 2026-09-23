@@ -12273,6 +12273,7 @@ dependencies = [
 name = "rho-agents-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "camino",
  "collections",
@@ -12509,6 +12510,7 @@ dependencies = [
 name = "rho-desk-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "camino",
  "chrono",
@@ -12518,6 +12520,7 @@ dependencies = [
  "rho-agent-host-proto",
  "rho-agents-client",
  "rho-db",
+ "rho-hosts",
  "rho-slack",
  "senax-encoder",
  "tempfile",
@@ -12765,8 +12768,6 @@ dependencies = [
  "bytes",
  "camino",
  "futures",
- "gpui",
- "gpui_tokio",
  "iroh",
  "moq-net",
  "octo-types",

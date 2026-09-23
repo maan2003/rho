@@ -264,7 +264,7 @@ pub fn open_remote_project(
     workspace: WorkspaceInfo,
     cx: &mut App,
 ) -> Task<Result<RemoteProject>> {
-    let channel_task = connection.open_channel(workspace, cx);
+    let channel_task = connection.open_channel(workspace);
     cx.spawn(async move |cx| {
         let WorkspaceChannel {
             outgoing,

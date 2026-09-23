@@ -1,23 +1,23 @@
 //! The machines this client can reach.
 //!
 //! One connection per attached daemon, the handshake that brings it up, and
-//! the streams it carries. Each stream has its own reader: the control
-//! stream's events go to the window, the agents stream's frames to the
-//! agents client, the desk stream's to the desk (`Sinks`). The
-//! crate holds no agent state, no desk state and no window state: what it
-//! knows is which machines exist, whether they are answering, and how to say
-//! something to one of them. Everything that has an opinion about what was
-//! said goes through here rather than reaching a socket itself.
+//! the streams it carries. The control stream's events go to one reader
+//! ([`HostSink`]); every other long-lived stream belongs to a client that
+//! hands the host a [`HostStream`] to run, the agents client's and the
+//! desk's among them. The crate holds no agent state, no desk state and no
+//! window state: what it knows is which machines exist, whether they are
+//! answering, and how to reach one of them.
 
 pub mod connection;
 pub mod hosts;
 pub mod realtime_client;
 pub mod saved;
 
-pub use connection::{
-    AgentCommands, AgentEvent, AgentFrame, ChannelTask, ConnEvent, Connection, DeskCommands,
-    DeskEvent, DeskFrame, HostEvent, spawn,
-};
+pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, spawn};
+
+/// How a stream reaches its host: another Unix connection, or another
+/// bi-stream on the host's authenticated iroh connection.
+pub type Dialer = rho_rpc::Dialer;
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
 
 /// Which attached daemon. Assigned in attachment order; agent ids are
@@ -135,32 +135,15 @@ impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
     }
 }
 
-/// Where a host's agents stream goes: the journal and the live tails.
-pub trait AgentSink: Send + Sync + 'static {
-    fn send(&self, event: AgentEvent) -> Result<(), SinkClosed>;
-}
+/// A stream a client keeps to one host beside the control stream. It opens
+/// once the host is ready and lasts the connection: when it ends, so does
+/// the connection, and on the next one every stream opens again.
+pub trait HostStream: Send + Sync + 'static {
+    /// What the stream is called when it is why a connection went.
+    fn name(&self) -> &'static str;
 
-/// Where a host's desk stream goes.
-pub trait DeskSink: Send + Sync + 'static {
-    fn send(&self, event: DeskEvent) -> Result<(), SinkClosed>;
-}
-
-/// A channel is a sink: its receiver is the reader.
-impl DeskSink for futures::channel::mpsc::UnboundedSender<DeskEvent> {
-    fn send(&self, event: DeskEvent) -> Result<(), SinkClosed> {
-        self.unbounded_send(event).map_err(|_| SinkClosed)
-    }
-}
-
-/// The readers of every attached host's streams.
-#[derive(Clone)]
-pub struct Sinks {
-    /// The control stream: the host's state, auth, usage.
-    pub client: std::sync::Arc<dyn HostSink>,
-    /// The agents stream.
-    pub agents: std::sync::Arc<dyn AgentSink>,
-    /// The desk stream.
-    pub desk: std::sync::Arc<dyn DeskSink>,
+    /// The stream for one connection, from its dial to its end.
+    fn run(&self, dialer: Dialer) -> futures::future::BoxFuture<'static, anyhow::Result<()>>;
 }
 
 /// A sink with no reader: for a `Hosts` that stands in a test for the
@@ -176,31 +159,6 @@ impl HostSink for DroppedSink {
 
     fn is_closed(&self) -> bool {
         false
-    }
-}
-
-#[cfg(feature = "test-support")]
-impl AgentSink for DroppedSink {
-    fn send(&self, _event: AgentEvent) -> Result<(), SinkClosed> {
-        Ok(())
-    }
-}
-
-#[cfg(feature = "test-support")]
-impl DeskSink for DroppedSink {
-    fn send(&self, _event: DeskEvent) -> Result<(), SinkClosed> {
-        Ok(())
-    }
-}
-
-#[cfg(feature = "test-support")]
-impl Sinks {
-    pub fn dropped() -> Self {
-        Self {
-            client: std::sync::Arc::new(DroppedSink),
-            agents: std::sync::Arc::new(DroppedSink),
-            desk: std::sync::Arc::new(DroppedSink),
-        }
     }
 }
 

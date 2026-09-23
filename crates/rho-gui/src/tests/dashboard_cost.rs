@@ -115,7 +115,7 @@ fn cost_of_one_agent_s_news(
                 story::feed(
                     workspace,
                     HostId::default(),
-                    rho_hosts::AgentFrame::Log {
+                    rho_agents_client::stream::AgentFrame::Log {
                         entries: story::head_entries(story::UiAgentHead {
                             generated_title: Some(format!("renamed {nth}")),
                             ..ui_head(agents[2])

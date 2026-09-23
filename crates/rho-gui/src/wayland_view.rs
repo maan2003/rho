@@ -8,10 +8,39 @@ use gpui::*;
 use rho_desktop_proto::Input;
 use theme::ActiveTheme as _;
 
+/// A decoded image and the one frame the renderer draws it from: the
+/// renderer knows a frame by its identity, so an image gets exactly one.
+struct Shown {
+    image: Arc<rho_hosts::wayland::Image>,
+    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
+    render: VideoFrame,
+}
+
+impl Shown {
+    fn new(image: Arc<rho_hosts::wayland::Image>) -> anyhow::Result<Self> {
+        let render = VideoFrame::new(Arc::new(Planes(image.planes.clone())))?;
+        Ok(Self { image, render })
+    }
+}
+
+struct Planes(Arc<rho_hosts::wayland::RetainedFrame>);
+
+impl Yuv444Data for Planes {
+    fn size(&self) -> (u32, u32) {
+        (self.0.width() as u32, self.0.height() as u32)
+    }
+    fn plane(&self, index: usize) -> &[u8] {
+        self.0.plane(index)
+    }
+    fn stride(&self, index: usize) -> u32 {
+        self.0.stride(index) as u32
+    }
+}
+
 pub struct WaylandView {
     viewer: rho_hosts::wayland::Viewer,
-    image: Option<Arc<rho_hosts::wayland::Image>>,
-    frozen: Option<Arc<rho_hosts::wayland::Image>>,
+    image: Option<Rc<Shown>>,
+    frozen: Option<Rc<Shown>>,
     strokes: Vec<Vec<(u32, u32)>>,
     drawing: bool,
     target: Option<Entity<rho_agents_view::AgentModel>>,
@@ -56,6 +85,7 @@ impl WaylandView {
                 let error = errors.borrow_and_update().clone();
                 if this
                     .update(cx, |this, cx| {
+                        this.error = error;
                         if let Some(image) = image {
                             if this.image.is_none() {
                                 tracing::info!(
@@ -64,12 +94,16 @@ impl WaylandView {
                                     "desktop first frame delivered to GUI"
                                 );
                             }
-                            if this.frozen.is_none() {
-                                this.size = (image.width, image.height);
+                            match Shown::new(image) {
+                                Ok(shown) => {
+                                    if this.frozen.is_none() {
+                                        this.size = (shown.image.width, shown.image.height);
+                                    }
+                                    this.image = Some(Rc::new(shown));
+                                }
+                                Err(error) => this.error = Some(format!("{error:#}")),
                             }
-                            this.image = Some(image);
                         }
-                        this.error = error;
                         cx.notify();
                     })
                     .is_err()
@@ -132,7 +166,7 @@ impl WaylandView {
         let Some(image) = self.frozen.as_ref() else {
             return;
         };
-        let mut pixels = match image.export_bgra() {
+        let mut pixels = match image.image.export_bgra() {
             Ok(pixels) => pixels,
             Err(error) => {
                 self.error = Some(error.to_string());

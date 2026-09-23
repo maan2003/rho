@@ -6,13 +6,13 @@
 //! Agent ids are already unique across machines, so the id is
 //! for routing — which socket a command goes down — not for disambiguation.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use camino::Utf8PathBuf;
-use gpui::App;
 
 use crate::connection::Connection;
-use crate::{AttachTarget, HostId, Sinks};
+use crate::{AttachTarget, HostId, HostSink, HostStream};
 
 /// Where a host is in its connection lifecycle. Only `Online` accepts
 /// commands; the rest exist so the chrome can say which host is unwell
@@ -85,7 +85,7 @@ pub struct HostWorkdir {
 pub struct Hosts {
     hosts: Vec<Host>,
     next_id: u32,
-    sinks: Sinks,
+    events: Arc<dyn HostSink>,
     /// Registered workdirs from every attached daemon. Fed by whoever reads
     /// the store; named and qualified here, because what a workdir is
     /// called depends on how many machines are attached.
@@ -95,13 +95,13 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    /// Nothing is attached yet. Every connection's streams go to these
-    /// sinks, whatever the readers behind them make of them.
-    pub fn new(sinks: Sinks) -> Self {
+    /// Nothing is attached yet. Every connection's control events go to
+    /// `events`, whatever the reader behind it makes of them.
+    pub fn new(events: Arc<dyn HostSink>) -> Self {
         Self {
             hosts: Vec::new(),
             next_id: 0,
-            sinks,
+            events,
             workdirs: Vec::new(),
             quota_summaries: std::collections::HashMap::new(),
             quota_history: std::collections::HashMap::new(),
@@ -111,19 +111,24 @@ impl Hosts {
     /// Dials a daemon and starts feeding its events into the shared stream.
     /// Attaching is fire-and-forget: the host appears immediately as
     /// `Connecting` and reports its own progress through the stream.
-    /// The caller is handed the id and the agents stream's command
-    /// channel, so that the agents client can be told about the host before
-    /// a frame arrives.
+    /// `streams` is handed the new id and returns the streams the host
+    /// carries beside its control stream, opened again on every reconnect.
     pub fn attach(
         &mut self,
         name: String,
         target: AttachTarget,
-        cx: &App,
-    ) -> (HostId, crate::connection::AgentCommands) {
+        streams: impl FnOnce(HostId) -> Vec<Arc<dyn HostStream>>,
+        runtime: &tokio::runtime::Handle,
+    ) -> HostId {
         let id = HostId(self.next_id);
         self.next_id += 1;
-        let connection = crate::connection::spawn(id, target.clone(), self.sinks.clone(), cx);
-        let commands = connection.agent_commands();
+        let connection = crate::connection::spawn(
+            id,
+            target.clone(),
+            self.events.clone(),
+            streams(id),
+            runtime,
+        );
         self.hosts.push(Host {
             id,
             name,
@@ -132,7 +137,7 @@ impl Hosts {
             auth: None,
             connection,
         });
-        (id, commands)
+        id
     }
 
     /// Drops a host and tears its connection down. Surfaces and transcripts

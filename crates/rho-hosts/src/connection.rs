@@ -1,27 +1,19 @@
-//! Daemon connection: an IO task on the shared tokio runtime ([`gpui_tokio`]),
-//! bridged to the GUI through channels. What the control stream pushes
+//! Daemon connection: an IO task on the tokio runtime the caller hands in,
+//! bridged to the reader through sinks. What the control stream pushes
 //! becomes [`ConnEvent`]s on a futures channel the workspace awaits (no
 //! polling); every request is a stream of its own, answered once.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
+use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use futures::{SinkExt as _, StreamExt as _};
-use gpui::{App, Task};
-use gpui_tokio::Tokio;
-use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
-};
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::control::{
     ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
 };
-use rho_agent_host_proto::desk::stream::{
-    ClientFrame as DeskClientFrame, ServerFrame as DeskServerFrame,
-};
-use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
 use rho_agent_host_proto::{
     AgentId, GitProvided, GitService, GitTransportRequest, Open, Opened, Reply, Request,
     WorkspaceInfo, read_frame, write_frame,
@@ -64,7 +56,7 @@ fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
     (delay * 2).min(MAX_RECONNECT_DELAY)
 }
 
-use crate::{AgentSink, AttachTarget, DeskSink, HostId, Sinks};
+use crate::{AttachTarget, HostId, HostStream};
 
 /// Owns the transport pumps for a dedicated stream. Dropping it cancels both
 /// directions on every target.
@@ -76,61 +68,6 @@ pub type ChannelTask = rho_rpc::ChannelTask;
 pub struct HostEvent {
     pub host: HostId,
     pub event: ConnEvent,
-}
-
-/// What a host says on its agents stream.
-pub enum AgentFrame {
-    /// The stream is open: whose journal this is and how far it runs.
-    /// Every (re)opened stream starts with one, and a follow is asked for
-    /// only after it.
-    JournalHead {
-        machine_seed: u64,
-        journal_head: Seq,
-    },
-    /// A run of the host's journal, contiguous by seq: the answer to
-    /// `Follow` and everything appended since.
-    Log { entries: Vec<LogEntry> },
-    /// What changed in the runtime's tail past the log, for an agent some
-    /// client is looking at.
-    Live { agent_id: AgentId, live: Live },
-}
-
-/// An agents-stream frame tagged with the host it came from.
-pub struct AgentEvent {
-    pub host: HostId,
-    pub frame: AgentFrame,
-}
-
-/// What a host says on its desk stream.
-pub enum DeskFrame {
-    /// The stream is open. Every (re)opened stream starts here, and the
-    /// client's `Sync` goes after it: a stream that has not synced may not
-    /// write.
-    Opened,
-    /// The answer to `Sync`.
-    Synced {
-        store: rho_agent_host_proto::desk::cells::DeviceId,
-        node_namespace: u16,
-        delta: rho_agent_host_proto::desk::cells::Snapshot,
-        bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
-    },
-    /// The host's copy moved; sync if `frontier` is past what is held.
-    CellsAvailable {
-        frontier: rho_agent_host_proto::desk::cells::Version,
-    },
-    /// A body edit, from whichever device made it.
-    TextApplied {
-        id: rho_agent_host_proto::desk::cells::Id,
-        operation: rho_agent_host_proto::desk::TextOperation,
-    },
-    /// The stream missed some of the host's pokes; sync again.
-    ResyncRequired,
-}
-
-/// A desk-stream frame tagged with the host it came from.
-pub struct DeskEvent {
-    pub host: HostId,
-    pub frame: DeskFrame,
 }
 
 /// One host's end of the shared event channel. Every IO task holds a clone
@@ -485,23 +422,12 @@ async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<Shel
 }
 
 pub struct Connection {
-    /// The runtime the IO task runs on, where requests are dialed.
-    #[cfg_attr(feature = "test-support", expect(dead_code))]
-    runtime: tokio::runtime::Handle,
-    agent_commands: futures_mpsc::UnboundedSender<AgentsClientFrame>,
-    /// The focus last asked for, told again to every agents stream that
-    /// opens: it is state, not a request.
-    agent_focus: AgentFocus,
-    desk_commands: futures_mpsc::UnboundedSender<DeskClientFrame>,
-    /// `None` until the IO task connects; channels cannot open earlier.
-    dialer: Arc<Mutex<Option<ChannelDialer>>>,
+    link: Link,
     /// Dropping this aborts the IO task, tearing the connection down with the
-    /// workspace.
-    _io_task: Task<Result<(), gpui_tokio::JoinError>>,
+    /// workspace. A test connection has none.
+    _io_task: Option<AbortOnDrop<()>>,
     #[cfg(feature = "test-support")]
     requests: Arc<Mutex<TestRequests>>,
-    #[cfg(feature = "test-support")]
-    desk_sent: Arc<Mutex<Vec<DeskClientFrame>>>,
 }
 
 /// Requests a test connection was asked to make: what they were, and the
@@ -513,41 +439,49 @@ struct TestRequests {
     unanswered: std::collections::VecDeque<tokio::sync::oneshot::Sender<anyhow::Result<Reply>>>,
 }
 
-/// What the desk client says down one host's desk stream. Whatever is
-/// queued while the stream is down is dropped when it opens again: the
-/// handshake that follows [`DeskFrame::Opened`] carries whatever the host
-/// missed.
+/// Where a connection's work runs and how it reaches its host.
 #[derive(Clone)]
-pub struct DeskCommands {
-    commands: futures_mpsc::UnboundedSender<DeskClientFrame>,
-    #[cfg(feature = "test-support")]
-    sent: Arc<Mutex<Vec<DeskClientFrame>>>,
+struct Link {
+    runtime: Option<tokio::runtime::Handle>,
+    /// `None` until the IO task connects; streams cannot open earlier.
+    dialer: Arc<Mutex<Option<ChannelDialer>>>,
 }
 
-impl DeskCommands {
-    pub fn send(&self, frame: DeskClientFrame) {
-        #[cfg(feature = "test-support")]
-        self.sent.lock().unwrap().push(frame.clone());
-        let _ = self.commands.unbounded_send(frame);
+impl Link {
+    /// Runs `work` against the host on the connection's runtime. The answer
+    /// needs no particular executor; dropping it cancels the work.
+    fn run<T, F>(
+        &self,
+        work: impl FnOnce(ChannelDialer) -> F,
+    ) -> impl Future<Output = anyhow::Result<T>> + Send + 'static
+    where
+        F: Future<Output = anyhow::Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let dialer = self.dialer.lock().unwrap().clone();
+        let task = match (&self.runtime, dialer) {
+            (Some(runtime), Some(dialer)) => Some(AbortOnDrop(runtime.spawn(work(dialer)))),
+            _ => None,
+        };
+        async move {
+            let Some(mut task) = task else {
+                anyhow::bail!("not connected to rho-daemon");
+            };
+            (&mut task.0)
+                .await
+                .map_err(|error| anyhow::anyhow!("connection task failed: {error}"))?
+        }
     }
 }
 
-/// What the agents client says down one host's agents stream. Clonable,
-/// `Send`, and carrying nothing of the GUI. Whatever is queued while the
-/// stream is down is dropped when it opens again: a follow was asked of
-/// the last stream's journal head, and the new stream says its own.
-#[derive(Clone)]
-pub struct AgentCommands {
-    commands: futures_mpsc::UnboundedSender<AgentsClientFrame>,
-}
+/// A task that ends when its owner lets go of it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
-impl AgentCommands {
-    pub fn send(&self, frame: AgentsClientFrame) {
-        let _ = self.commands.unbounded_send(frame);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
-
-type AgentFocus = Arc<Mutex<Option<Vec<AgentId>>>>;
 
 pub struct VisualizationArtifact {
     pub mime_type: String,
@@ -556,7 +490,7 @@ pub struct VisualizationArtifact {
 
 #[derive(Clone)]
 pub struct VisualizationClient {
-    dialer: Arc<Mutex<Option<ChannelDialer>>>,
+    link: Link,
 }
 
 impl VisualizationClient {
@@ -565,144 +499,121 @@ impl VisualizationClient {
     /// artifact reports the same "not connected" as a dropped connection.
     pub fn detached() -> Self {
         Self {
-            dialer: Arc::new(Mutex::new(None)),
+            link: Link {
+                runtime: None,
+                dialer: Arc::new(Mutex::new(None)),
+            },
         }
     }
 
-    pub fn get(&self, id: String, cx: &App) -> Task<anyhow::Result<VisualizationArtifact>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_visualization(dialer, id).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("visualization task failed: {error}"))?
-        })
+    pub fn get(
+        &self,
+        id: String,
+    ) -> impl Future<Output = anyhow::Result<VisualizationArtifact>> + Send + 'static {
+        self.link.run(|dialer| dial_visualization(dialer, id))
     }
 }
 
 impl Connection {
-    pub fn open_wayland_task(
+    pub fn open_wayland(
         &self,
         agent: String,
         session: String,
-        cx: &App,
-    ) -> Task<anyhow::Result<crate::wayland::Viewer>> {
-        let dialer = self.dialer.lock().unwrap().clone();
+    ) -> impl Future<Output = anyhow::Result<crate::wayland::Viewer>> + Send + 'static {
         let started = std::time::Instant::now();
-        let task = Tokio::spawn(cx, async move {
+        self.link.run(move |dialer| async move {
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis(),
                 "desktop IO task started"
             );
-            let Some(ChannelDialer::Iroh { connection, media }) = dialer else {
+            let ChannelDialer::Iroh { connection, media } = dialer else {
                 anyhow::bail!("the live Wayland viewer requires an Iroh host");
             };
             open_wayland_stream(connection, media, agent, session, started).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("Wayland task failed: {error}"))?
         })
     }
 
-    pub fn upload_gui_telemetry_task(
+    pub fn upload_gui_telemetry(
         &self,
         snapshot: Vec<u8>,
-        cx: &App,
-    ) -> Task<anyhow::Result<String>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_gui_telemetry(dialer, snapshot).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("GUI telemetry task failed: {error}"))?
-        })
+    ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
+        self.link.run(|dialer| dial_gui_telemetry(dialer, snapshot))
     }
 
-    /// Target-neutral GPUI task API used by portable terminal surfaces.
-    pub fn open_terminal_task(
+    /// Dials a dedicated terminal stream for an agent and runs the
+    /// handshake: attach its first running terminal (spawning the default
+    /// one when none run), or spawn a fresh one with `new`.
+    pub fn open_terminal(
         &self,
         agent: String,
         new: bool,
         cols: u16,
         rows: u16,
-        cx: &App,
-    ) -> Task<anyhow::Result<TerminalChannel>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_terminal(dialer, agent, new, cols, rows).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("terminal task failed: {error}"))?
-        })
+    ) -> impl Future<Output = anyhow::Result<TerminalChannel>> + Send + 'static {
+        self.link
+            .run(move |dialer| dial_terminal(dialer, agent, new, cols, rows))
     }
 
-    /// Target-neutral GPUI task API used by portable shell surfaces.
-    pub fn open_shell_task(&self, agent: String, cx: &App) -> Task<anyhow::Result<ShellChannel>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            start_and_dial_shell(dialer, agent).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("shell task failed: {error}"))?
-        })
+    /// Starts the agent's shell when absent, otherwise attaches.
+    pub fn open_shell(
+        &self,
+        agent: String,
+    ) -> impl Future<Output = anyhow::Result<ShellChannel>> + Send + 'static {
+        self.link.run(|dialer| start_and_dial_shell(dialer, agent))
     }
 
-    pub fn close_shell_task(&self, agent: String, cx: &App) -> Task<anyhow::Result<()>> {
+    /// Gracefully closes the agent's persistent shell.
+    pub fn close_shell(
+        &self,
+        agent: String,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
         let reply = self.request(Request::ShellClose { agent });
-        cx.spawn(async move |_| reply.await.map(drop))
+        async move { reply.await.map(drop) }
+    }
+
+    /// Dials a dedicated workspace file stream and runs the handshake.
+    pub fn open_channel(
+        &self,
+        workspace: WorkspaceInfo,
+    ) -> impl Future<Output = anyhow::Result<WorkspaceChannel>> + Send + 'static {
+        self.link.run(|dialer| dial_channel(dialer, workspace))
+    }
+
+    pub fn start_native_realtime(
+        &self,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        input_muted: tokio::sync::watch::Receiver<bool>,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        self.link
+            .run(|dialer| crate::realtime_client::run_native(dialer, stop, input_muted))
     }
 
     pub fn visualization_client(&self) -> VisualizationClient {
         VisualizationClient {
-            dialer: self.dialer.clone(),
+            link: self.link.clone(),
         }
     }
 
-    /// Makes one request on a stream of its own. The answer does not need
-    /// any particular executor; a refusal is an error.
+    /// Makes one request on a stream of its own. The answer needs no
+    /// particular executor; a refusal is an error.
     pub fn request(
         &self,
         request: Request,
-    ) -> impl std::future::Future<Output = anyhow::Result<Reply>> + Send + 'static {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<Reply>> {
         #[cfg(feature = "test-support")]
         {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let mut requests = self.requests.lock().unwrap();
             requests.sent.push(request);
             requests.unanswered.push_back(reply_tx);
+            Box::pin(async move {
+                reply_rx
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("request was dropped")))
+            })
         }
         #[cfg(not(feature = "test-support"))]
-        {
-            let dialer = self.dialer.lock().unwrap().clone();
-            self.runtime.spawn(async move {
-                let reply = match dialer {
-                    Some(dialer) => dial_request(dialer, request).await,
-                    None => Err(anyhow::anyhow!("not connected to rho-daemon")),
-                };
-                let _ = reply_tx.send(reply);
-            });
-        }
-        async move {
-            reply_rx
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("request was dropped")))
-        }
-    }
-
-    /// The agents stream's command channel, for the agents client.
-    pub(crate) fn agent_commands(&self) -> AgentCommands {
-        AgentCommands {
-            commands: self.agent_commands.clone(),
-        }
+        Box::pin(self.link.run(|dialer| dial_request(dialer, request)))
     }
 
     /// Every request made on this connection since it was last asked, for a
@@ -720,103 +631,6 @@ impl Connection {
             .expect("no request is waiting for an answer")
             .send(reply)
             .ok();
-    }
-
-    /// The desk stream's command channel.
-    pub fn desk(&self) -> DeskCommands {
-        DeskCommands {
-            commands: self.desk_commands.clone(),
-            #[cfg(feature = "test-support")]
-            sent: Arc::clone(&self.desk_sent),
-        }
-    }
-
-    /// Everything sent down the desk stream since it was last asked.
-    #[cfg(feature = "test-support")]
-    pub fn take_desk_sent_for_test(&self) -> Vec<DeskClientFrame> {
-        std::mem::take(&mut *self.desk_sent.lock().unwrap())
-    }
-
-    /// The agents whose live frames this connection wants: every open
-    /// pane, replaced wholesale. Everything durable is on the story
-    /// regardless, so this only decides who streams.
-    pub fn focus_agents(&self, agent_ids: Vec<AgentId>) {
-        *self.agent_focus.lock().unwrap() = Some(agent_ids.clone());
-        let _ = self
-            .agent_commands
-            .unbounded_send(AgentsClientFrame::Focus { agent_ids });
-    }
-
-    /// Dials a dedicated terminal stream for an agent and runs the
-    /// handshake: attach its first running terminal (spawning the default
-    /// one when none run), or spawn a fresh one with `new`.
-    pub fn open_terminal(
-        &self,
-        agent: String,
-        new: bool,
-        cols: u16,
-        rows: u16,
-        cx: &App,
-    ) -> Task<Result<anyhow::Result<TerminalChannel>, gpui_tokio::JoinError>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_terminal(dialer, agent, new, cols, rows).await
-        })
-    }
-
-    /// Starts the selected agent's shell when absent, otherwise attaches.
-    pub fn open_shell(
-        &self,
-        agent: String,
-        cx: &App,
-    ) -> Task<Result<anyhow::Result<ShellChannel>, gpui_tokio::JoinError>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            start_and_dial_shell(dialer, agent).await
-        })
-    }
-
-    /// Gracefully closes the selected agent's persistent shell.
-    pub fn close_shell(
-        &self,
-        agent: String,
-        cx: &App,
-    ) -> Task<Result<anyhow::Result<()>, gpui_tokio::JoinError>> {
-        let reply = self.request(Request::ShellClose { agent });
-        Tokio::spawn(cx, async move { reply.await.map(drop) })
-    }
-
-    /// Dials a dedicated workspace file stream and runs
-    /// the handshake.
-    pub fn open_channel(
-        &self,
-        workspace: WorkspaceInfo,
-        cx: &App,
-    ) -> Task<anyhow::Result<WorkspaceChannel>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        let task = Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            dial_channel(dialer, workspace).await
-        });
-        cx.spawn(async move |_| {
-            task.await
-                .map_err(|error| anyhow::anyhow!("workspace channel task failed: {error}"))?
-        })
-    }
-
-    pub fn start_native_realtime(
-        &self,
-        stop: tokio::sync::oneshot::Receiver<()>,
-        input_muted: tokio::sync::watch::Receiver<bool>,
-        cx: &App,
-    ) -> Task<Result<anyhow::Result<()>, gpui_tokio::JoinError>> {
-        let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
-            let dialer = dialer.context("not connected to rho-daemon")?;
-            crate::realtime_client::run_native(dialer, stop, input_muted).await
-        })
     }
 }
 
@@ -836,67 +650,35 @@ pub fn supervises() -> bool {
 }
 
 /// Attaches one daemon. Its events join `events`, tagged with `host`, so
-/// several daemons feed the workspace through a single ordered stream.
-pub fn spawn(host: HostId, target: AttachTarget, sinks: Sinks, cx: &App) -> Connection {
-    let event_tx = EventSink {
-        host,
-        events: sinks.client,
-    };
-    let agents = AgentStreamSink {
-        host,
-        agents: sinks.agents,
-    };
-    let (agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
-    let agent_command_rx = Arc::new(tokio::sync::Mutex::new(agent_command_rx));
-    let agent_focus = AgentFocus::default();
-    let desk = DeskStreamSink {
-        host,
-        desk: sinks.desk,
-    };
-    let (desk_command_tx, desk_command_rx) = futures_mpsc::unbounded();
-    let desk_command_rx = Arc::new(tokio::sync::Mutex::new(desk_command_rx));
+/// several daemons feed the workspace through a single ordered stream;
+/// `streams` open beside the control stream on every connection. The
+/// connection's work runs on `runtime`.
+pub fn spawn(
+    host: HostId,
+    target: AttachTarget,
+    events: Arc<dyn crate::HostSink>,
+    streams: Vec<Arc<dyn HostStream>>,
+    runtime: &tokio::runtime::Handle,
+) -> Connection {
+    let events = EventSink { host, events };
     let dialer = Arc::new(Mutex::new(None));
-    let io_task = if !supervises() {
-        Tokio::spawn(cx, async {})
-    } else {
-        Tokio::spawn(
-            cx,
-            supervise(
-                target,
-                event_tx,
-                Streams {
-                    agents: AgentStream {
-                        sink: agents,
-                        commands: agent_command_rx,
-                        focus: Arc::clone(&agent_focus),
-                    },
-                    desk: DeskStream {
-                        sink: desk,
-                        commands: desk_command_rx,
-                    },
-                },
-                dialer.clone(),
-            ),
-        )
-    };
+    let io_task = supervises()
+        .then(|| AbortOnDrop(runtime.spawn(supervise(target, events, streams, dialer.clone()))));
     Connection {
-        runtime: Tokio::handle(cx),
-        agent_commands: agent_command_tx,
-        agent_focus,
-        desk_commands: desk_command_tx,
-        dialer,
+        link: Link {
+            runtime: Some(runtime.clone()),
+            dialer,
+        },
         _io_task: io_task,
         #[cfg(feature = "test-support")]
         requests: Arc::default(),
-        #[cfg(feature = "test-support")]
-        desk_sent: Arc::new(Mutex::new(Vec::new())),
     }
 }
 
 async fn supervise(
     target: AttachTarget,
     events: EventSink,
-    streams: Streams,
+    streams: Vec<Arc<dyn HostStream>>,
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
@@ -951,7 +733,7 @@ async fn abort_tasks<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
 async fn run(
     target: AttachTarget,
     events: &EventSink,
-    streams: &Streams,
+    streams: &[Arc<dyn HostStream>],
     dialer: &Mutex<Option<ChannelDialer>>,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
@@ -1012,14 +794,14 @@ async fn run(
         .unwrap()
         .clone()
         .context("connected without a dialer")?;
-    let mut agents_task = tokio::spawn(run_agents_stream(
-        streams_dialer.clone(),
-        streams.agents.clone(),
-    ));
-    let mut desk_task = tokio::spawn(run_desk_stream(
-        streams_dialer.clone(),
-        streams.desk.clone(),
-    ));
+    // The first stream to end, however it ends, takes the connection down
+    // and brings every stream up again together.
+    let mut stream_tasks = tokio::task::JoinSet::new();
+    for host_stream in streams {
+        let name = host_stream.name();
+        let run = host_stream.run(streams_dialer.clone());
+        stream_tasks.spawn(async move { (name, run.await) });
+    }
     // Quota moves on its own as well as when the host says so.
     let quota_task = {
         let events = events.clone();
@@ -1090,18 +872,11 @@ async fn run(
 
     let read_error = loop {
         let frame: ControlFrame = tokio::select! {
-            result = &mut agents_task => {
+            Some(result) = stream_tasks.join_next() => {
                 break Some(match result {
-                    Ok(Ok(())) => anyhow::anyhow!("daemon agents stream closed"),
-                    Ok(Err(error)) => error.context("daemon agents stream"),
-                    Err(error) => anyhow::anyhow!("daemon agents stream task failed: {error}"),
-                });
-            }
-            result = &mut desk_task => {
-                break Some(match result {
-                    Ok(Ok(())) => anyhow::anyhow!("daemon desk stream closed"),
-                    Ok(Err(error)) => error.context("daemon desk stream"),
-                    Err(error) => anyhow::anyhow!("daemon desk stream task failed: {error}"),
+                    Ok((name, Ok(()))) => anyhow::anyhow!("daemon {name} stream closed"),
+                    Ok((name, Err(error))) => error.context(format!("daemon {name} stream")),
+                    Err(error) => anyhow::anyhow!("daemon stream task failed: {error}"),
                 });
             }
             result = read_frame(&mut reader) => match result {
@@ -1181,10 +956,7 @@ async fn run(
     };
     quota_task.abort();
     let _ = quota_task.await;
-    agents_task.abort();
-    let _ = agents_task.await;
-    desk_task.abort();
-    let _ = desk_task.await;
+    abort_tasks(&mut stream_tasks).await;
     if let Some(task) = health_task {
         task.abort();
         let _ = task.await;
@@ -1194,163 +966,6 @@ async fn run(
     match read_error {
         Some(error) => Err(error),
         None => Ok(()),
-    }
-}
-
-/// A connection's dedicated streams, as it keeps them across reconnects.
-struct Streams {
-    agents: AgentStream,
-    desk: DeskStream,
-}
-
-/// One host's desk stream, as the connection keeps it across reconnects.
-#[derive(Clone)]
-struct DeskStream {
-    sink: DeskStreamSink,
-    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<DeskClientFrame>>>,
-}
-
-/// One host's end of the desk sink, stamping its [`HostId`].
-#[derive(Clone)]
-struct DeskStreamSink {
-    host: HostId,
-    desk: std::sync::Arc<dyn DeskSink>,
-}
-
-/// A connection's desk stream, for as long as the connection lasts. Ends
-/// with an error when either direction does, or when a newer window takes
-/// this device, which takes the connection down with it.
-async fn run_desk_stream(dialer: ChannelDialer, stream: DeskStream) -> anyhow::Result<()> {
-    let mut socket = dial_stream(dialer).await?;
-    write_frame(&mut socket, &Open::Desk).await?;
-    let (mut reader, mut writer) = tokio::io::split(socket);
-    let mut commands = stream.commands.lock().await;
-    // Written for the last stream; the handshake after `Opened` carries
-    // whatever they held.
-    while commands.try_recv().is_ok() {}
-    let sink = &stream.sink;
-    let send = |frame| {
-        sink.desk.send(DeskEvent {
-            host: sink.host,
-            frame,
-        })
-    };
-    if send(DeskFrame::Opened).is_err() {
-        return Ok(());
-    }
-    let read = async {
-        loop {
-            let frame = match read_frame::<_, DeskServerFrame>(&mut reader).await? {
-                DeskServerFrame::Synced {
-                    store,
-                    node_namespace,
-                    delta,
-                    bodies,
-                } => DeskFrame::Synced {
-                    store,
-                    node_namespace,
-                    delta,
-                    bodies,
-                },
-                DeskServerFrame::CellsAvailable { frontier } => {
-                    DeskFrame::CellsAvailable { frontier }
-                }
-                DeskServerFrame::TextApplied {
-                    id,
-                    operation,
-                    transaction: _,
-                } => DeskFrame::TextApplied { id, operation },
-                DeskServerFrame::ResyncRequired => DeskFrame::ResyncRequired,
-                DeskServerFrame::Displaced => {
-                    anyhow::bail!("the desk moved to a newer window on this device")
-                }
-            };
-            if send(frame).is_err() {
-                return Ok(());
-            }
-        }
-    };
-    let write = async {
-        while let Some(frame) = commands.next().await {
-            write_frame(&mut writer, &frame).await?;
-        }
-        anyhow::Ok(())
-    };
-    tokio::select! {
-        result = read => result,
-        result = write => result,
-    }
-}
-
-/// One host's agents stream, as the connection keeps it across reconnects:
-/// where its frames go, what the agents client queued for it, and the
-/// focus to tell each new one.
-#[derive(Clone)]
-struct AgentStream {
-    sink: AgentStreamSink,
-    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<AgentsClientFrame>>>,
-    focus: AgentFocus,
-}
-
-/// One host's end of the agents sink, stamping its [`HostId`].
-#[derive(Clone)]
-struct AgentStreamSink {
-    host: HostId,
-    agents: std::sync::Arc<dyn AgentSink>,
-}
-
-/// A connection's agents stream, for as long as the connection lasts: the
-/// daemon's frames to the agents sink, the agents client's frames to the
-/// daemon. Ends with an error when either direction does, which takes the
-/// connection down and brings both streams up again together.
-async fn run_agents_stream(dialer: ChannelDialer, stream: AgentStream) -> anyhow::Result<()> {
-    // Bulk priority: a catch-up must not hold up the control stream.
-    let mut socket = dialer.open(None).await?;
-    write_frame(&mut socket, &Open::Agents).await?;
-    let (mut reader, mut writer) = tokio::io::split(socket);
-    let mut commands = stream.commands.lock().await;
-    // A follow asked of the last stream's journal head; this stream says
-    // its own. The focus is state, so it is told again whole.
-    while commands.try_recv().is_ok() {}
-    let focus = stream.focus.lock().unwrap().clone();
-    if let Some(agent_ids) = focus {
-        write_frame(&mut writer, &AgentsClientFrame::Focus { agent_ids }).await?;
-    }
-    let sink = &stream.sink;
-    let read = async {
-        loop {
-            let frame = match read_frame::<_, AgentsServerFrame>(&mut reader).await? {
-                AgentsServerFrame::JournalHead {
-                    machine_seed,
-                    journal_head,
-                } => AgentFrame::JournalHead {
-                    machine_seed,
-                    journal_head,
-                },
-                AgentsServerFrame::Log { entries } => AgentFrame::Log { entries },
-                AgentsServerFrame::Live { agent_id, live } => AgentFrame::Live { agent_id, live },
-                // Nothing here asks for a detail body: the transcript draws
-                // a call's line and never its output.
-                AgentsServerFrame::Detail { .. } => continue,
-            };
-            let event = AgentEvent {
-                host: sink.host,
-                frame,
-            };
-            if sink.agents.send(event).is_err() {
-                return Ok(());
-            }
-        }
-    };
-    let write = async {
-        while let Some(frame) = commands.next().await {
-            write_frame(&mut writer, &frame).await?;
-        }
-        anyhow::Ok(())
-    };
-    tokio::select! {
-        result = read => result,
-        result = write => result,
     }
 }
 
@@ -1772,18 +1387,6 @@ mod shutdown_tests {
         }
     }
 
-    impl crate::AgentSink for Listening {
-        fn send(&self, _event: crate::AgentEvent) -> Result<(), crate::SinkClosed> {
-            Ok(())
-        }
-    }
-
-    impl crate::DeskSink for Listening {
-        fn send(&self, _event: crate::DeskEvent) -> Result<(), crate::SinkClosed> {
-            Ok(())
-        }
-    }
-
     /// Quit has to end the supervisor while the runtime is still there.
     /// A supervisor waiting out its reconnect delay is inside
     /// `tokio::time::sleep`, and a sleep polled after its runtime starts
@@ -1806,29 +1409,10 @@ mod shutdown_tests {
             host: crate::HostId(0),
             events: Arc::new(Listening),
         };
-        let (_agent_command_tx, agent_command_rx) = futures_mpsc::unbounded();
-        let (_desk_command_tx, desk_command_rx) = futures_mpsc::unbounded();
-        let streams = Streams {
-            agents: AgentStream {
-                sink: AgentStreamSink {
-                    host: crate::HostId(0),
-                    agents: Arc::new(Listening),
-                },
-                commands: Arc::new(tokio::sync::Mutex::new(agent_command_rx)),
-                focus: AgentFocus::default(),
-            },
-            desk: DeskStream {
-                sink: DeskStreamSink {
-                    host: crate::HostId(0),
-                    desk: Arc::new(Listening),
-                },
-                commands: Arc::new(tokio::sync::Mutex::new(desk_command_rx)),
-            },
-        };
         let supervisor = supervise(
             crate::AttachTarget::Unix(socket),
             events,
-            streams,
+            Vec::new(),
             Arc::new(Mutex::new(None)),
         );
 

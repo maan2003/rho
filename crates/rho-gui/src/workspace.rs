@@ -48,7 +48,8 @@ use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
 };
 use rho_desk_client::Desk;
-use rho_hosts::connection::{ConnEvent, Connection, DeskFrame, GitApprovalDecision};
+use rho_desk_client::stream::DeskFrame;
+use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
 use rho_window::selection::{ActivePane, Selection};
 use rho_window::style::StyleClass;
@@ -401,6 +402,7 @@ pub struct Workspace {
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
     agents_client: rho_agents_client::model::AgentsClient,
+    desk_streams: rho_desk_client::stream::DeskStreams,
     draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
@@ -863,12 +865,8 @@ impl Workspace {
         // Each stream of a host has its own reader: the agents stream goes
         // to the agents client, the control and desk streams come here.
         let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_hosts::HostEvent>();
-        let (desk_events, desk_events_rx) = futures_mpsc::unbounded::<rho_hosts::DeskEvent>();
-        let hosts = Hosts::new(rho_hosts::Sinks {
-            client: std::sync::Arc::new(host_events),
-            agents: agents_client.sink(),
-            desk: std::sync::Arc::new(desk_events),
-        });
+        let (desk_streams, desk_events_rx) = rho_desk_client::stream::DeskStreams::new();
+        let hosts = Hosts::new(std::sync::Arc::new(host_events));
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
@@ -932,7 +930,7 @@ impl Workspace {
                     batch.push(event);
                 }
                 let updated = this.update_in(cx, |this, window, cx| {
-                    for rho_hosts::DeskEvent { host, frame } in batch {
+                    for rho_desk_client::stream::DeskEvent { host, frame } in batch {
                         this.handle_desk_event(host, frame, window, cx);
                     }
                 });
@@ -1033,6 +1031,7 @@ impl Workspace {
             remote_projects: HashMap::new(),
             pending_syncs: HashMap::new(),
             agents_client,
+            desk_streams,
             draft_model,
             messages,
             draft_area: None,
@@ -1157,11 +1156,19 @@ impl Workspace {
     /// that labels and chrome can qualify by host from the moment the host
     /// exists, not only once it answers.
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
-        let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
-        // The agents client is told the host exists, and how to speak on
-        // its agents stream, before any frame from it can arrive.
-        self.agents_client.attach_host(host, spec.name.clone());
-        self.agents_client.host_commands(host, commands);
+        let agents_client = &self.agents_client;
+        let desk_streams = &self.desk_streams;
+        // The agents client is told the host exists, and gets its agents
+        // stream, before any frame from it can arrive.
+        let host = self.hosts.attach(
+            spec.name.clone(),
+            spec.target,
+            |host| {
+                agents_client.attach_host(host, spec.name.clone());
+                vec![agents_client.stream(host), desk_streams.stream(host)]
+            },
+            &gpui_tokio::Tokio::handle(cx),
+        );
         self.registry.attach_host(host, spec.name);
         self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
@@ -1212,6 +1219,7 @@ impl Workspace {
         self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
         self.agents_client.detach_host(host);
+        self.desk_streams.detach(host);
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.usage.forget_host(host);
@@ -1291,9 +1299,7 @@ impl Workspace {
     }
 
     pub(crate) fn send_desk(&self, host: HostId, frame: DeskClientFrame) {
-        if let Some(connection) = self.hosts.connection(host) {
-            connection.desk().send(frame);
-        }
+        self.desk_streams.send(host, frame);
     }
 
     /// Whether the daemon behind an agent is answering. Acting on an agent
@@ -2485,17 +2491,14 @@ impl Workspace {
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice.muted());
-        let task = connection.start_native_realtime(stop_rx, input_muted_rx, cx);
+        let task = connection.start_native_realtime(stop_rx, input_muted_rx);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
         let session = cx.spawn(async move |this, cx| {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
-            };
+            let result = task.await;
             if result.is_err() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(2))
@@ -3474,7 +3477,7 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.close_shell_task(agent_id.encoded(), cx);
+        let task = connection.close_shell(agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
@@ -3668,7 +3671,7 @@ impl Workspace {
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
-        let task = connection.upload_gui_telemetry_task(snapshot, cx);
+        let task = connection.upload_gui_telemetry(snapshot);
         self.notice_on(
             None,
             "uploading GUI performance snapshot…",
@@ -4005,9 +4008,7 @@ impl Workspace {
             .iter()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect();
-        if let Some(connection) = self.hosts.connection(host) {
-            connection.focus_agents(agent_ids);
-        }
+        self.agents_client.focus(host, agent_ids);
     }
 
     /// Lets go of everything held for an agent that left the active set:
@@ -4867,7 +4868,7 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.open_shell_task(agent_id.encoded(), cx);
+        let task = connection.open_shell(agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -4943,7 +4944,7 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.open_terminal_task(agent_id.encoded(), new, 80, 24, cx);
+        let task = connection.open_terminal(agent_id.encoded(), new, 80, 24);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -5126,10 +5127,7 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn take_desk_frames_for_test(&self, host: HostId) -> Vec<DeskClientFrame> {
-        self.hosts
-            .connection(host)
-            .map(Connection::take_desk_sent_for_test)
-            .unwrap_or_default()
+        self.desk_streams.take_sent_for_test(host)
     }
 
     #[cfg(test)]
@@ -7123,7 +7121,7 @@ impl Workspace {
             return;
         };
         let target = self.models.get(&agent).cloned();
-        let task = connection.open_wayland_task(agent.encoded(), session.clone(), cx);
+        let task = connection.open_wayland(agent.encoded(), session.clone());
         cx.spawn_in(window, async move |this, cx| match task.await {
             Ok(viewer) => {
                 let _ = this.update_in(cx, |this, window, cx| {
