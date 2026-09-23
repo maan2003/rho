@@ -45,18 +45,18 @@ use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_agent_host_proto::AgentId;
+use rho_agents_client::elision::ElisionPlan;
+use rho_agents_client::state::{UiAgentState, UiBlock};
+use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
 use rho_hosts::connection::VisualizationClient;
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use rho_window::visualization::Visualization;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-use crate::render::elision::ElisionPlan;
 use crate::render::{
     BlockKind, RenderedBlock, block_kind, block_visible, render_block_with_agent_labels,
 };
-use crate::state::{UiAgentState, UiBlock};
-use crate::store::{FrameSummary, IncrementalUpdate};
 
 mod store;
 
@@ -301,7 +301,7 @@ impl TranscriptModel {
         debug_assert!(self.buffers.is_empty());
         debug_assert_eq!(prepared.chunks.len(), text_buffers.len());
 
-        self.turn_open = crate::store::turn_open(prepared.state.status);
+        self.turn_open = rho_agents_client::store::turn_open(prepared.state.status);
         self.blocks = prepared.state.blocks;
         self.visible = prepared.visible;
         self.head = 0;
@@ -439,7 +439,7 @@ impl TranscriptModel {
         agent_label: &impl Fn(rho_agent_host_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
-        self.turn_open = crate::store::turn_open(state.status);
+        self.turn_open = rho_agents_client::store::turn_open(state.status);
         let Some(first_changed_block) = summary.first_changed_block else {
             // Status alone can close the turn; the document tail follows,
             // and a replaced excerpt triggers the full re-apply inside.

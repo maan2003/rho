@@ -5,16 +5,13 @@
 //! model applies these as bounded buffer edits. Keeping this layer pure makes
 //! block rendering testable as plain string assertions.
 
-pub mod elision;
-
 use std::ops::Range;
 use std::time::Duration;
 
 use rho_agent_host_proto::transcript::ArgumentsFormat;
 use rho_agent_host_proto::{AgentId, MessageDelivery};
+use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
-
-use crate::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
@@ -721,6 +718,18 @@ mod tests {
 
     fn text_of(spans: &[Span]) -> String {
         spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    /// A shell call reads its command out of the arguments the fold keeps
+    /// whole.
+    #[test]
+    fn a_shell_call_labels_with_its_command() {
+        let (label, _) = tool_label(
+            "shell_command",
+            r#"{"command":"cargo build"}"#,
+            ArgumentsFormat::Json,
+        );
+        assert_eq!(label, "$ cargo build");
     }
 
     #[test]

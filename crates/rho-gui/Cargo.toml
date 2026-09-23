@@ -62,6 +62,7 @@ rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
 rho-files = { workspace = true }
 rho-agents-client = { workspace = true }
+rho-agents-view = { workspace = true }
 rho-hosts = { workspace = true }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }

@@ -15,14 +15,15 @@ use editor::{DisplayElisionId, DisplayElisionProperties, Editor};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
+use rho_agents_client::elision::{
+    ElisionPlan, elision_label, elision_plans_from, turn_start_index,
+};
+use rho_agents_client::state::UiBlock;
 use rho_window::highlights::excerpt_range;
 use settings::Settings as _;
 use text::Anchor;
 use theme_settings::ThemeSettings;
 use ui::{Icon, IconName, IconSize, div};
-
-use crate::render::elision::{ElisionPlan, elision_label, elision_plans_from, turn_start_index};
-use crate::state::UiBlock;
 
 /// What one elision looks like, independent of its editor identity.
 #[derive(Clone, Debug, PartialEq)]

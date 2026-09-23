@@ -16,7 +16,7 @@
 
 use editor::Editor;
 use gpui::{AppContext as _, TestAppContext};
-use rho_agents_client::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
+use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 
 use super::{history_elisions, init_test_app};
 

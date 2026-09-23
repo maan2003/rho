@@ -16,7 +16,7 @@ use rho_agent_host_proto::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_agents_client::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
+use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 use rho_hosts::connection::ConnEvent;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
@@ -434,7 +434,7 @@ fn a_fold_placeholder_wears_the_buffer_s_face(cx: &mut TestAppContext) {
         let buffer_font = theme_settings::ThemeSettings::get_global(cx)
             .buffer_font
             .clone();
-        let mut row = rho_agents_client::transcript::elisions::elision_row("2 tools", cx);
+        let mut row = rho_agents_view::transcript::elisions::elision_row("2 tools", cx);
         let style = gpui::Styled::text_style(&mut row);
         assert_eq!(style.font_family, Some(buffer_font.family));
     });
@@ -3818,7 +3818,7 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
                     rho_window::style::StyleClass::SystemImportant,
                     "important".to_owned(),
                 ))
-                .chain((1..rho_agents_client::messages::LOG_CAP).map(|index| {
+                .chain((1..rho_agents_view::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("ordinary-{index}"),
@@ -3854,13 +3854,13 @@ fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..=rho_agents_client::messages::LOG_CAP {
+            for index in 0..=rho_agents_view::messages::LOG_CAP {
                 workspace.append_test_log_entry(format!("message-{index}"), cx);
             }
             let messages = workspace.message_log_texts(cx);
-            assert_eq!(messages.len(), rho_agents_client::messages::LOG_CAP);
+            assert_eq!(messages.len(), rho_agents_view::messages::LOG_CAP);
             assert_eq!(messages.first().map(String::as_str), Some("message-1"));
-            let expected_last = format!("message-{}", rho_agents_client::messages::LOG_CAP);
+            let expected_last = format!("message-{}", rho_agents_view::messages::LOG_CAP);
             assert_eq!(messages.last(), Some(&expected_last));
         })
         .expect("fill message log");
@@ -3872,7 +3872,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
     let original = workspace
         .update(cx, |workspace, _, cx| {
             workspace.seed_messages_for_test(
-                (0..rho_agents_client::messages::LOG_CAP).map(|index| {
+                (0..rho_agents_view::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("initial-{index}"),
@@ -3885,7 +3885,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
         .expect("seed capped messages");
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..rho_agents_client::messages::REBASE_EVICTIONS {
+            for index in 0..rho_agents_view::messages::REBASE_EVICTIONS {
                 workspace.append_test_message(
                     format!("replacement-{index}"),
                     rho_window::style::StyleClass::SystemInfo,
@@ -3900,7 +3900,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
             assert_ne!(workspace.messages_buffer_id(cx), original);
             assert_eq!(
                 workspace.message_log_texts(cx).len(),
-                rho_agents_client::messages::LOG_CAP
+                rho_agents_view::messages::LOG_CAP
             );
         })
         .expect("inspect rebased messages");
@@ -10947,7 +10947,7 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
         })
         .expect("type the first message");
 
-    cx.dispatch_action(*workspace, rho_agents_client::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycle);
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(
@@ -10983,19 +10983,19 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
 
     // From the body, backwards is the filesystem row, then the start row,
     // then the role row.
-    cx.dispatch_action(*workspace, rho_agents_client::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_filesystem_field_for_test(cx));
         })
         .expect("filesystem row");
-    cx.dispatch_action(*workspace, rho_agents_client::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_start_field_for_test(cx));
         })
         .expect("start row");
-    cx.dispatch_action(*workspace, rho_agents_client::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_role_field_for_test(cx));
@@ -11093,8 +11093,8 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("seed the workdir row");
 
     cx.simulate_keystrokes(*workspace, "escape");
-    cx.dispatch_action(*workspace, rho_agents_client::RoleCycle);
-    cx.dispatch_action(*workspace, rho_agents_client::DraftFieldClear);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_view::DraftFieldClear);
     cx.simulate_keystrokes(*workspace, "o k");
     cx.run_until_parked();
 
@@ -11356,7 +11356,7 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
             cx.subscribe(&model, move |model, event, cx| {
                 if !matches!(
                     event,
-                    rho_agents_client::agent_view::AgentModelEvent::HistoryComposed(_)
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(_)
                 ) {
                     return;
                 }

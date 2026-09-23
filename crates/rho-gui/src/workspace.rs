@@ -33,18 +33,18 @@ use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agent_host_proto::{
     AgentId, AgentRole, ClientMessage, ContentPart, EngineerIntelligence, MessageDelivery,
 };
-use rho_agents_client::agent_view::AgentModel;
 use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
 };
-use rho_agents_client::draft::DraftModel;
-use rho_agents_client::messages::MessageLog;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
-use rho_agents_client::{
-    AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
-    RoleCycleGroup, TranscriptFrame,
+use rho_agents_client::{AgentMap, HostId};
+use rho_agents_view::agent_view::AgentModel;
+use rho_agents_view::draft::DraftModel;
+use rho_agents_view::messages::MessageLog;
+use rho_agents_view::{
+    DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
 };
 use rho_desk_client::Desk;
 use rho_hosts::connection::{ConnEvent, Connection, DeskFrame, GitApprovalDecision};
@@ -381,7 +381,7 @@ pub struct Workspace {
     /// Every transcript this client holds open, and the rendered state a
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
-    transcripts: rho_agents_client::Transcripts,
+    transcripts: rho_agents_view::Transcripts,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
@@ -623,10 +623,10 @@ impl Workspace {
                 &model,
                 window,
                 |workspace, _, event, window, cx| match event {
-                    rho_agents_client::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                    rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => {
                         workspace.finish_initial_agent_load(*agent_id, cx);
                     }
-                    rho_agents_client::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
                         workspace.finish_transcript_search(*agent_id, window, cx);
                     }
                 },
@@ -872,7 +872,7 @@ impl Workspace {
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
             DraftModel::new(
-                rho_agents_client::draft::Hooks::new(move |editor, fields, _, _| {
+                rho_agents_view::draft::Hooks::new(move |editor, fields, _, _| {
                     editor.set_completion_provider(Some(
                         crate::commands::WorkspaceCompletionProvider::new(
                             workspace.clone(),
@@ -888,9 +888,7 @@ impl Workspace {
         });
         let draft_subscription =
             cx.subscribe(&draft_model, |workspace, _, event, cx| match event {
-                rho_agents_client::draft::Event::Edited => {
-                    workspace.mark_draft_active_from_edit(cx)
-                }
+                rho_agents_view::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
             });
         let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {
@@ -1027,7 +1025,7 @@ impl Workspace {
         let mut this = Self {
             hosts,
             active: ActiveAgents::default(),
-            transcripts: rho_agents_client::Transcripts::default(),
+            transcripts: rho_agents_view::Transcripts::default(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
@@ -8168,7 +8166,7 @@ impl Workspace {
         model.update(cx, |model, cx| {
             model.go_to_store_point(
                 &editor,
-                rho_agents_client::transcript::StorePoint {
+                rho_agents_view::transcript::StorePoint {
                     block: 0,
                     offset: 0,
                 },
@@ -8262,7 +8260,7 @@ impl Workspace {
             // through is composed while they do.
             self.echo("composing history", StyleClass::SystemInfo, cx);
             model.update(cx, |model, cx| {
-                model.request_history(rho_agents_client::agent_view::HistoryWant::All, window, cx);
+                model.request_history(rho_agents_view::agent_view::HistoryWant::All, window, cx);
             });
         }
         self.prompt_for_query(
@@ -8294,7 +8292,7 @@ impl Workspace {
                 query,
             });
             model.update(cx, |model, cx| {
-                model.request_history(rho_agents_client::agent_view::HistoryWant::All, window, cx);
+                model.request_history(rho_agents_view::agent_view::HistoryWant::All, window, cx);
             });
             return;
         }

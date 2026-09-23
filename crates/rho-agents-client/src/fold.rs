@@ -933,7 +933,7 @@ mod tests {
         );
 
         let visible = vec![true; state.blocks.len()];
-        let plans = crate::render::elision::elision_plans_from(
+        let plans = crate::elision::elision_plans_from(
             &state.blocks,
             &visible,
             0,
@@ -943,7 +943,7 @@ mod tests {
         let last = plans.last().expect("the calls of the open turn elide");
         assert_eq!(
             last.tail_rows,
-            crate::render::elision::LIMITED_TAIL_ROWS,
+            crate::elision::LIMITED_TAIL_ROWS,
             "the open turn's last fold keeps its tail: {plans:?}"
         );
     }
@@ -994,10 +994,11 @@ mod tests {
         assert_eq!(tool.arguments, code, "the whole cell, every line of it");
     }
 
-    /// And the reduction that lost it is still the label's: a shell call
-    /// reads its command out of the arguments it now carries.
+    /// And the reduction that lost it still leaves the label its command: a
+    /// shell call carries its arguments whole, which is what the transcript
+    /// reads its label out of.
     #[test]
-    fn a_shell_call_still_labels_with_its_command() {
+    fn a_shell_call_still_carries_its_command() {
         let state = told(vec![
             user("build it", 1),
             TranscriptEvent::Turn {
@@ -1023,8 +1024,8 @@ mod tests {
             },
         ]);
         let tool = only_tool(&state);
-        let (label, _) = crate::render::tool_label(&tool.name, &tool.arguments, tool.format);
-        assert_eq!(label, "$ cargo build");
+        assert_eq!(tool.name, "shell_command");
+        assert_eq!(tool.arguments, r#"{"command":"cargo build"}"#);
     }
 
     #[test]

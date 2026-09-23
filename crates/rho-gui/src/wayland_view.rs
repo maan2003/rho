@@ -14,7 +14,7 @@ pub struct WaylandView {
     frozen: Option<Arc<rho_hosts::wayland::Image>>,
     strokes: Vec<Vec<(u32, u32)>>,
     drawing: bool,
-    target: Option<Entity<rho_agents_client::AgentModel>>,
+    target: Option<Entity<rho_agents_view::AgentModel>>,
     status: Option<String>,
     size: (usize, usize),
     bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -104,7 +104,7 @@ impl WaylandView {
             _updates: updates,
         }
     }
-    pub fn with_target(mut self, target: Option<Entity<rho_agents_client::AgentModel>>) -> Self {
+    pub fn with_target(mut self, target: Option<Entity<rho_agents_view::AgentModel>>) -> Self {
         self.target = target;
         self
     }
