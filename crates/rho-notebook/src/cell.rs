@@ -13,6 +13,10 @@ use crate::notebook::{ExecState, PythonStreamProgress, Shared};
 use crate::output;
 use crate::runtime::Input;
 
+/// Opens the first reply of a call whose response stopped part-way: the call
+/// history keeps is the part that ran.
+pub const INTERRUPTED: &str = "Your response was interrupted while writing this call; only the code shown ran. Continue from the existing state without replaying it.";
+
 pub struct PythonExec {
     pub(crate) id: ExecId,
     pub(crate) cell: u64,
@@ -28,28 +32,12 @@ impl PythonExec {
     }
 
     pub fn stream_progress(&self) -> PythonStreamProgress {
-        let state = self.link.lock().unwrap();
-        PythonStreamProgress {
-            returned: state.returned.is_some(),
-            ..state.stream
-        }
-    }
-
-    /// Snapshot recovery facts and acknowledge their notification together,
-    /// without acknowledging output or changing execution admission.
-    pub fn take_stream_report(&self) -> PythonStreamProgress {
-        let mut state = self.link.lock().unwrap();
-        let progress = PythonStreamProgress {
-            returned: state.returned.is_some(),
-            ..state.stream
-        };
-        state.stream.recovery = false;
-        progress
+        self.link.lock().unwrap().stream
     }
 
     pub fn feed(&self, source: String, eof: bool) -> Result<(), String> {
         let state = self.link.lock().unwrap();
-        if state.stream.stopped || state.returned.is_some() {
+        if state.stream_stopped || state.returned.is_some() {
             return Ok(());
         }
         self.shared.send(Input::StreamFeed {
@@ -68,7 +56,7 @@ impl PythonExec {
             return Ok(());
         };
         if state.returned.is_some()
-            || progress.stopped
+            || state.stream_stopped
             || progress.settled != progress.admitted
             || end <= progress.admitted
         {
@@ -79,10 +67,6 @@ impl PythonExec {
             cell: self.cell,
             end,
         });
-        if result.is_err() {
-            state.stream.stopped = true;
-            state.stream.recovery = true;
-        }
         drop(state);
         if result.is_err() {
             self.stop_stream();
@@ -92,15 +76,19 @@ impl PythonExec {
 
     /// Stop source admission, not the active unit or its managed commands.
     pub fn stop_stream(&self) {
-        self.link.lock().unwrap().stream.stopped = true;
+        self.link.lock().unwrap().stream_stopped = true;
         let _ = self.shared.send(Input::StreamStop { cell: self.cell });
     }
 
-    /// Provider interruption stops source admission, not execution. The
-    /// notebook owns the explanation in its first leased contribution.
-    pub fn interrupt_stream(&self) {
-        self.link.lock().unwrap().stream.interrupted = true;
+    /// The response stopped mid-call: admit nothing more, and let what ran
+    /// stand as the whole call. Returns how much source that is, or `None`
+    /// when nothing ran. Execution is not stopped; the notebook explains the
+    /// interruption in the call's first reply.
+    pub fn interrupt_stream(&self) -> Option<usize> {
         self.stop_stream();
+        let mut state = self.link.lock().unwrap();
+        state.interrupted = true;
+        Some(state.stream.admitted).filter(|admitted| *admitted > 0)
     }
 
     pub fn sequence(&self) -> u64 {
@@ -203,14 +191,10 @@ impl Cell {
         let Some(mut state) = self.state() else {
             return;
         };
-        let progress = &mut state.stream;
-        if end > progress.settled {
-            progress.settled = end;
-            progress.recovery |= progress.stopped;
-            if error.is_none() {
-                progress.completed = end;
-            } else {
-                progress.stopped = true;
+        if end > state.stream.settled {
+            state.stream.settled = end;
+            if error.is_some() {
+                state.stream_stopped = true;
             }
         }
         state.waker.wake();
@@ -349,16 +333,8 @@ impl PythonCell {
                 ToolOutputStatus::Success
             },
         );
-        if first && cell.stream.interrupted {
-            let execution = if result.status == ToolOutputStatus::Cancelled {
-                "Execution was cancelled."
-            } else {
-                "Execution was not cancelled."
-            };
-            result.output = Arc::new(format!(
-                "Your response was interrupted while generating this tool call. {execution} Continue from the existing state without replaying this call.\n\n{}",
-                result.output,
-            ));
+        if first && cell.interrupted {
+            result.output = Arc::new(format!("{INTERRUPTED}\n\n{}", result.output));
         }
         result.images = Arc::new(std::mem::take(&mut cell.images));
         Some(result)

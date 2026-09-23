@@ -52,20 +52,24 @@ struct HostTasks {
     failure: Option<String>,
 }
 
+/// How far a streamed cell's source has got, as byte ends of whole top-level
+/// statements.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PythonStreamProgress {
-    pub returned: bool,
+    /// Parsed and waiting for admission.
     pub ready: Option<usize>,
+    /// Allowed to run.
     pub admitted: usize,
+    /// Run, successfully or not.
     pub settled: usize,
-    pub completed: usize,
-    pub stopped: bool,
-    pub recovery: bool,
-    pub interrupted: bool,
 }
 
 pub(crate) struct ExecState {
     pub(crate) stream: PythonStreamProgress,
+    /// No more source is admitted.
+    pub(crate) stream_stopped: bool,
+    /// The response stopped mid-call; its first reply says so.
+    pub(crate) interrupted: bool,
     pub(crate) waker: SourceWaker,
     pub(crate) output: BoundedOutput,
     /// Oldest unsent output.
@@ -207,6 +211,8 @@ impl PythonNotebook {
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
             stream: PythonStreamProgress::default(),
+            stream_stopped: false,
+            interrupted: false,
             waker,
             output: BoundedOutput::for_tokens(Some(10000)),
             since: None,

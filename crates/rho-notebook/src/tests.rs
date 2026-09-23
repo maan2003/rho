@@ -675,9 +675,7 @@ async fn python_registration_settles_startup_failure_and_preserves_exit_metadata
     );
     until(&wake, &failed, Signal::Ended).await;
     assert!(
-        jobs(&failed)
-            .iter()
-            .all(|job| job.finished.unwrap().failed),
+        jobs(&failed).iter().all(|job| job.finished.unwrap().failed),
         "a spawn failure and a write into it both fail"
     );
     let output = failed.first_output();
@@ -1449,13 +1447,9 @@ async fn benchmark_awaited_command() {
     .unwrap();
 }
 
-async fn stream_until(
-    wake: &Arc<Notify>,
-    cell: &PythonCell,
-    want: impl Fn(&crate::PythonStreamProgress) -> bool,
-) {
+async fn stream_until(wake: &Arc<Notify>, cell: &PythonCell, want: impl Fn(&PythonCell) -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !want(&cell.stream_progress()) {
+        while !want(cell) {
             wake.notified().await;
         }
     })
@@ -1479,11 +1473,17 @@ async fn streaming_progress_settles_after_stop_without_agent_reconciliation() {
         false,
     )
     .unwrap();
-    stream_until(&wake, &cell, |p| p.ready == Some(setup.len())).await;
+    stream_until(&wake, &cell, |c| {
+        c.stream_progress().ready == Some(setup.len())
+    })
+    .await;
     assert_eq!(cell.stream_progress().admitted, 0);
     cell.admit_stream_unit().unwrap();
-    stream_until(&wake, &cell, |p| p.ready == Some(prefix.len())).await;
-    assert_eq!(cell.stream_progress().completed, setup.len());
+    stream_until(&wake, &cell, |c| {
+        c.stream_progress().ready == Some(prefix.len())
+    })
+    .await;
+    assert_eq!(cell.stream_progress().settled, setup.len());
     cell.admit_stream_unit().unwrap();
     cell.admit_stream_unit().unwrap();
     assert_eq!(cell.stream_progress().admitted, prefix.len());
@@ -1493,20 +1493,16 @@ async fn streaming_progress_settles_after_stop_without_agent_reconciliation() {
         call("release", json!("gate.set()")),
         SourceWaker::new(wake.clone()),
     );
-    stream_until(&wake, &cell, |p| p.returned).await;
-    let report = cell.take_stream_report();
-    assert!(report.stopped);
-    assert!(report.recovery);
-    assert_eq!(report.admitted, prefix.len());
-    assert_eq!(report.settled, prefix.len());
-    assert_eq!(report.completed, prefix.len());
-    assert!(!cell.take_stream_report().recovery);
+    stream_until(&wake, &cell, |c| c.facts().returned.is_some()).await;
+    let progress = cell.stream_progress();
+    assert_eq!(progress.admitted, prefix.len());
+    assert_eq!(progress.settled, prefix.len());
     assert!(!directory.path().join("wrong").exists());
     until(&wake, &release, Signal::Ended).await;
 }
 
 #[tokio::test]
-async fn failed_stream_unit_stops_admission_and_keeps_successful_prefix_distinct() {
+async fn failed_stream_unit_stops_admission() {
     let directory = tempfile::tempdir().unwrap();
     let notebook = python(shell_in(&directory), Vec::new());
     let wake = Arc::new(Notify::new());
@@ -1520,15 +1516,16 @@ async fn failed_stream_unit_stops_admission_and_keeps_successful_prefix_distinct
         false,
     )
     .unwrap();
-    stream_until(&wake, &cell, |p| p.ready == Some(failed.len())).await;
+    stream_until(&wake, &cell, |c| {
+        c.stream_progress().ready == Some(failed.len())
+    })
+    .await;
     cell.admit_stream_unit().unwrap();
-    stream_until(&wake, &cell, |p| p.returned).await;
+    stream_until(&wake, &cell, |c| c.facts().returned.is_some()).await;
     cell.admit_stream_unit().unwrap();
     let progress = cell.stream_progress();
-    assert!(progress.stopped);
     assert_eq!(progress.admitted, failed.len());
     assert_eq!(progress.settled, failed.len());
-    assert_eq!(progress.completed, 0);
     assert!(!directory.path().join("wrong").exists());
 }
 
@@ -1544,9 +1541,9 @@ async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
         );
         cell.feed("await asyncio.Event().wait()\n".into(), false)
             .unwrap();
-        stream_until(&wake, &cell, |p| p.ready.is_some()).await;
+        stream_until(&wake, &cell, |c| c.stream_progress().ready.is_some()).await;
         cell.admit_stream_unit().unwrap();
-        cell.interrupt_stream();
+        assert!(cell.interrupt_stream().is_some());
         if cancel_before_read {
             cell.cancel();
             until(&wake, &cell, Signal::Ended).await;
@@ -1559,12 +1556,11 @@ async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
                 .count(),
             1
         );
-        assert!(first.output.contains(if cancel_before_read {
-            "Execution was cancelled."
-        } else {
-            "Execution was not cancelled."
-        }));
-        assert!(first.output.contains("without replaying this call"));
+        assert!(first.output.starts_with(crate::INTERRUPTED));
+        assert_eq!(
+            first.status == ToolOutputStatus::Cancelled,
+            cancel_before_read
+        );
         if !cancel_before_read {
             cell.cancel();
             until(&wake, &cell, Signal::Ended).await;

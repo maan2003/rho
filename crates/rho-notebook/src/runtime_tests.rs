@@ -243,7 +243,7 @@ async fn streaming_requires_each_permit_and_stop_does_not_finish_the_suffix() {
     exec.admit_stream_unit().unwrap();
     until(&wake, || {
         let progress = exec.stream_progress();
-        progress.completed == first.len() && progress.ready > Some(first.len())
+        progress.settled == first.len() && progress.ready > Some(first.len())
     })
     .await;
     exec.stop_stream();
@@ -286,7 +286,7 @@ async fn stream_loss_allows_admitted_await_to_settle_without_admitting_more() {
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
     let progress = exec.stream_progress();
     assert_eq!(
-        (progress.completed, progress.admitted),
+        (progress.settled, progress.admitted),
         (first.len(), first.len())
     );
     run_ok(&notebook, "assert seen == ['settled']").await;

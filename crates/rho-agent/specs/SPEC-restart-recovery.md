@@ -140,8 +140,8 @@ those sources. A pending `await` remains running, not uncertain execution.
 Failures before any Python admission retain bounded transport-retry backoff and
 add no call, result, or recovery notice to model history, including after restart.
 For admitted code, the first tool result includes one concise annotation that the
-response was interrupted while generating the call, execution was not cancelled,
-and the call must not be replayed. Do not add separate user-role interruption
+response was interrupted while writing the call, only the code shown ran, and the
+call must not be replayed. Do not add separate user-role interruption
 messages, discarded-source explanations, or source-range reports. Ordinary tool
 output remains authoritative; restart recovery separately reports uncertainty
 about execution whose live state has been lost.

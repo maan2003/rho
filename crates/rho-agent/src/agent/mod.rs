@@ -1326,7 +1326,6 @@ impl Agent {
                 .into(),
             });
         }
-        self.collect_stream_notes(Some(&delivered));
         let history = self.provider_history.as_ref().unwrap();
         if !owed.is_empty() {
             blocks.extend(owed.iter().map(|id| {
@@ -1523,7 +1522,7 @@ impl Agent {
         }
         self.execs
             .retain(|id, exec| !delivered.contains(id) || !exec.session.done());
-        self.acknowledge_streams(&delivered);
+        self.retire_streams();
         let input = self.provider_input().await?;
         self.surface
             .get_if_ready()
@@ -1632,8 +1631,7 @@ impl Agent {
             },
         });
         if let Some(call) = call {
-            if let Some(stream) = self.streams.get_mut(&call.id) {
-                stream.canonical = true;
+            if let Some(stream) = self.streams.get(&call.id) {
                 self.latest_python_exec = Some((call.id.clone(), stream.exec.clone()));
             } else {
                 self.start_exec(call, now);

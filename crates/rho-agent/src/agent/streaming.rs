@@ -1,6 +1,7 @@
 //! Streaming admission and settlement are in-memory execution state. Only
 //! complete conversation boundaries are persisted. Provider EOF and transport
-//! loss are deliberately different operations.
+//! loss are deliberately different operations: a response that stops
+//! mid-call leaves history the part of the call that ran, as the whole call.
 #[cfg(test)]
 use rho_core::StreamingContextItem;
 use rho_inference::exec::set_source;
@@ -12,27 +13,6 @@ pub(super) struct Stream {
     item: InferenceResponseItem,
     index: usize,
     source: String,
-    pub canonical: bool,
-}
-
-pub(super) fn progress_note(
-    id: &ToolCallId,
-    source: &str,
-    completed: usize,
-    admitted: usize,
-    pending_status: &str,
-) -> String {
-    let id = id.as_str();
-    format!(
-        "Streaming Python call {id}: successfully evaluated UTF-8 source bytes 0..{completed}. \
-         Bytes {completed}..{admitted}: {pending_status}. Do not replay admitted statements. \
-         Source bytes after {admitted} were not admitted. Evaluation is not command completion: \
-         existing command handles and their fresh output remain authoritative. Continue with new code.\n\
-         Successfully evaluated source:\n```python\n{}\n```\n\
-         Admitted but not confirmed successful:\n```python\n{}\n```",
-        &source[..completed],
-        &source[completed..admitted],
-    )
 }
 
 impl Agent {
@@ -118,7 +98,6 @@ impl Agent {
                 item: identity,
                 index,
                 source: incoming.source.clone(),
-                canonical: false,
             },
         );
         let Phase::Requesting(in_flight) = &mut self.phase else {
@@ -174,20 +153,18 @@ impl Agent {
         let Some(id) = in_flight.stream.take() else {
             return Ok(false);
         };
-        let stream = self.streams.get_mut(&id).unwrap();
-        stream.exec.interrupt_stream();
-        let progress = stream.exec.stream_progress();
-        if progress.admitted == 0 {
-            self.streams.remove(&id);
+        let stream = self.streams.remove(&id).unwrap();
+        let Some(ran) = stream.exec.interrupt_stream() else {
             self.execs.remove(&id);
             self.latest_python_exec = None;
             return Ok(false);
-        }
-        let mut item = stream.item.clone();
-        set_source(&mut item, stream.source[..progress.admitted].to_owned());
-        stream.canonical = true;
-        // Give the admitted, syntactically complete prefix its one place in
-        // history before the normal boundary drains its result.
+        };
+        // What ran becomes the call, so its result has a place in history
+        // and the model sees exactly the code that executed.
+        let source = stream.source[..ran].to_owned();
+        self.execs.get_mut(&id).unwrap().call.source = source.clone();
+        let mut item = stream.item;
+        set_source(&mut item, source);
         self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
             output: vec![ContextBlock::InferenceResponse {
                 items: vec![item],
@@ -201,54 +178,16 @@ impl Agent {
         Ok(true)
     }
 
-    /// Retire live stream state after the boundary has accepted its output.
-    pub(super) fn acknowledge_streams(
-        &mut self,
-        delivered: &std::collections::BTreeSet<ToolCallId>,
-    ) {
-        let ids = self
-            .streams
-            .iter()
-            .filter(|(id, stream)| {
-                delivered.contains(*id)
-                    && stream.exec.stream_progress().returned
-                    && stream.canonical
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in ids {
-            self.streams.remove(&id);
-        }
-    }
-
-    pub(super) fn collect_stream_notes(
-        &mut self,
-        delivered: Option<&std::collections::BTreeSet<ToolCallId>>,
-    ) {
-        for (id, stream) in &mut self.streams {
-            if delivered.is_some_and(|ids| !ids.contains(id)) {
-                continue;
-            }
-            let progress = stream.exec.take_stream_report();
-            if !progress.interrupted
-                && (progress.recovery
-                    || (progress.returned && progress.completed != stream.source.len()))
-            {
-                self.recovery_notes.push(progress_note(
-                    id,
-                    &stream.source,
-                    progress.completed,
-                    progress.admitted,
-                    if progress.completed == progress.admitted {
-                        "no outstanding admitted statement"
-                    } else if progress.settled < progress.admitted && !progress.returned {
-                        "admitted and still running or waiting to run"
-                    } else {
-                        "did not complete successfully; any side effects remain"
-                    },
-                ));
-            }
-        }
+    /// Forget streams whose code has returned: nothing more will be admitted.
+    /// The one still arriving stays, whatever its code did.
+    pub(super) fn retire_streams(&mut self) {
+        let arriving = match &self.phase {
+            Phase::Requesting(in_flight) => in_flight.stream.clone(),
+            Phase::Idle { .. } => None,
+        };
+        self.streams.retain(|id, stream| {
+            arriving.as_ref() == Some(id) || stream.exec.facts().returned.is_none()
+        });
     }
 }
 
@@ -402,6 +341,10 @@ pub(in crate::agent) mod tests {
         })
     }
 
+    fn exec(agent: &Agent) -> &rho_notebook::PythonExec {
+        &agent.execs.values().next().unwrap().session
+    }
+
     async fn until(agent: &mut Agent, predicate: impl Fn(&Agent) -> bool) {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -549,15 +492,7 @@ pub(in crate::agent) mod tests {
         // settlement must never need the writer, including the very first unit.
         let writer = db.write().await;
         until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .completed
-                == source.len()
+            exec(agent).stream_progress().settled == source.len()
         })
         .await;
         drop(writer);
@@ -598,15 +533,7 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .completed
-                > 0
+            exec(agent).stream_progress().settled > 0
         })
         .await;
         let cell = agent.latest_python_exec.as_ref().unwrap().1.sequence();
@@ -636,17 +563,7 @@ pub(in crate::agent) mod tests {
             }))
             .await
             .unwrap();
-        until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .returned
-        })
-        .await;
+        until(&mut agent, |agent| exec(agent).facts().returned.is_some()).await;
         assert_eq!(
             agent.latest_python_exec.as_ref().unwrap().1.sequence(),
             cell
@@ -682,15 +599,7 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .completed
-                == prefix.len()
+            exec(agent).stream_progress().settled == prefix.len()
         })
         .await;
         agent
@@ -708,7 +617,7 @@ pub(in crate::agent) mod tests {
             }
         ));
         until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().exec.stream_progress().returned
+            exec(agent).facts().returned.is_some()
             && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
                 matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
             )
@@ -728,10 +637,17 @@ pub(in crate::agent) mod tests {
         );
         assert!(agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
-        assert!(agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
+        assert!(
+            agent
+                .provider_input()
+                .await
+                .unwrap()
+                .iter()
+                .any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result|
-                result.body.output.contains("Your response was interrupted while generating this tool call.")
-                && result.body.output.contains("fresh-output")))));
+                result.body.output.starts_with(rho_notebook::INTERRUPTED)
+                && result.body.output.contains("fresh-output"))))
+        );
         assert!(!agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::UserMessage { content, .. } if rho_core::text_content(content).contains("stream disconnected"))));
         assert!(agent.recovery_notes.is_empty());
@@ -745,15 +661,7 @@ pub(in crate::agent) mod tests {
             let prefix = "Path('marker').write_text('x')\n";
             agent.handle(update("one", prefix)).await.unwrap();
             until(&mut agent, |agent| {
-                agent
-                    .streams
-                    .values()
-                    .next()
-                    .unwrap()
-                    .exec
-                    .stream_progress()
-                    .completed
-                    == prefix.len()
+                exec(agent).stream_progress().settled == prefix.len()
             })
             .await;
             let bad = match fault {
@@ -777,17 +685,7 @@ pub(in crate::agent) mod tests {
                     ..
                 }
             ));
-            until(&mut agent, |agent| {
-                agent
-                    .streams
-                    .values()
-                    .next()
-                    .unwrap()
-                    .exec
-                    .stream_progress()
-                    .returned
-            })
-            .await;
+            until(&mut agent, |agent| exec(agent).facts().returned.is_some()).await;
             assert_eq!(
                 std::fs::read_to_string(directory.path().join("marker")).unwrap(),
                 "x"
@@ -806,16 +704,7 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
-            while agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .ready
-                .is_none()
-            {
+            while exec(&agent).stream_progress().ready.is_none() {
                 agent.wake.notified().await;
             }
         })
@@ -834,21 +723,11 @@ pub(in crate::agent) mod tests {
         let decision = agent.decide(UnixMs::now());
         assert_eq!(decision, Boundary::AbortAndResend);
         agent.advance_streams(decision != Boundary::AbortAndResend);
-        assert_eq!(
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .admitted,
-            0
-        );
-        let exec = agent.streams.values().next().unwrap().exec.clone();
+        assert_eq!(exec(&agent).stream_progress().admitted, 0);
+        let exec = agent.execs.values().next().unwrap().session.execution();
         agent.abandon_stream(UnixMs::now()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
-            while !exec.stream_progress().returned {
+            while exec.facts().returned.is_none() {
                 agent.wake.notified().await;
             }
         })
@@ -867,15 +746,7 @@ pub(in crate::agent) mod tests {
         let source = "import asyncio\ngate = asyncio.Event()\nawait gate.wait()\n";
         agent.handle(update("one", source)).await.unwrap();
         until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .admitted
-                == source.len()
+            exec(agent).stream_progress().admitted == source.len()
         })
         .await;
         agent
@@ -917,28 +788,26 @@ pub(in crate::agent) mod tests {
                 .get(&ToolCallId::try_from("one").unwrap())
                 .unwrap()
                 .exec
-                .stream_progress()
+                .facts()
                 .returned
+                .is_some()
         })
         .await;
         agent.flush_events().await.unwrap();
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
+        assert!(replay::replay(events).recovery_notes.is_empty());
+        agent.retire_streams();
         assert!(
-            replay::replay(events)
-                .recovery_notes
-                .iter()
-                .all(|note| !note.contains("bytes 0.."))
+            !agent
+                .streams
+                .contains_key(&ToolCallId::try_from("one").unwrap()),
+            "a returned stream is retired"
         );
-        let old = ToolCallId::try_from("one").unwrap();
-        agent.acknowledge_streams(&Default::default());
         assert!(
-            agent.streams.contains_key(&old),
-            "held stream evidence must survive preparation"
-        );
-        agent.acknowledge_streams(&std::collections::BTreeSet::from([old.clone()]));
-        assert!(
-            !agent.streams.contains_key(&old),
-            "delivered settled evidence may be retired"
+            agent
+                .streams
+                .contains_key(&ToolCallId::try_from("two").unwrap()),
+            "the stream still arriving is kept"
         );
     }
     #[tokio::test]
@@ -963,17 +832,7 @@ pub(in crate::agent) mod tests {
             }))
             .await
             .unwrap();
-        until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .returned
-        })
-        .await;
+        until(&mut agent, |agent| exec(agent).facts().returned.is_some()).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !agent.execs.is_empty() {
                 agent.start_request(UnixMs::now(), None).await.unwrap();
@@ -1011,15 +870,7 @@ pub(in crate::agent) mod tests {
         let source = "assert survives_rewind == 42\nPath('survived').write_text('yes')\n";
         agent.handle(update("two", source)).await.unwrap();
         until(&mut agent, |agent| {
-            agent
-                .streams
-                .values()
-                .next()
-                .unwrap()
-                .exec
-                .stream_progress()
-                .completed
-                == source.len()
+            exec(agent).stream_progress().settled == source.len()
         })
         .await;
         assert_eq!(
@@ -1047,15 +898,7 @@ pub(in crate::agent) mod tests {
                     .await
                     .unwrap();
                 until(&mut agent, |agent| {
-                    agent
-                        .streams
-                        .values()
-                        .next()
-                        .unwrap()
-                        .exec
-                        .stream_progress()
-                        .admitted
-                        == prefix.len()
+                    exec(agent).stream_progress().admitted == prefix.len()
                 })
                 .await;
                 agent
@@ -1096,17 +939,7 @@ pub(in crate::agent) mod tests {
                 );
 
                 if !await_job {
-                    until(&mut agent, |agent| {
-                        agent
-                            .streams
-                            .values()
-                            .next()
-                            .unwrap()
-                            .exec
-                            .stream_progress()
-                            .returned
-                    })
-                    .await;
+                    until(&mut agent, |agent| exec(agent).facts().returned.is_some()).await;
                 }
                 // Transport retry used to force a request after one second.
                 // Neither an unawaited command nor `await job` permits that.
@@ -1116,13 +949,9 @@ pub(in crate::agent) mod tests {
                         recheck: Some(turn.spoke_at + Duration::from_secs(600))
                     },
                 );
-                if await_job {
-                    agent.collect_stream_notes(None);
-                    assert!(agent.recovery_notes.is_empty());
-                }
                 std::fs::write(directory.path().join("release"), "").unwrap();
                 until(&mut agent, |agent| {
-                    agent.streams.values().next().unwrap().exec.stream_progress().returned
+                    exec(agent).facts().returned.is_some()
                         && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
                             matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
                         })

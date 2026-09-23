@@ -35,7 +35,7 @@ mod tool;
 
 use std::sync::Arc;
 
-pub use cell::{PythonCell, PythonExec};
+pub use cell::{INTERRUPTED, PythonCell, PythonExec};
 pub use notebook::{Export, PythonNotebook, PythonStreamProgress, ToolCx, detached, operation};
 use rho_core::{ToolOutput, ToolOutputStatus};
 pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, SourceFacts, SourceWaker};
