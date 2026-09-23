@@ -10,7 +10,6 @@
 //! open, the same decision says when an idle model is woken with a message
 //! instead. Nothing here decides anything of its own.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rho_claude::mcp::{reply, text_item, tool_result};
@@ -20,11 +19,10 @@ use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
 use serde_json::Value;
 use tokio::sync::Notify;
 
-use crate::agent::ReplyState;
 use crate::boundary::{
     Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
 };
-use crate::python::{PythonCell, PythonExec, PythonNotebook, SourceWaker};
+use crate::python::{Cells, PythonNotebook};
 
 /// One exec call the CLI is waiting on.
 #[derive(Clone, Debug)]
@@ -34,14 +32,6 @@ pub(crate) struct PendingExec {
     /// The JSON-RPC id of the `tools/call`.
     pub rpc_id: Value,
     pub exec_id: ExecId,
-    cell: u64,
-}
-
-/// The core's bookkeeping for one cell, as the native runtime keeps it for a
-/// call: how much of its story the model has.
-struct Cell {
-    session: Box<PythonCell>,
-    answer: ReplyState,
 }
 
 /// One notebook, its cells, and the exec call (if any) the CLI is waiting on.
@@ -49,12 +39,8 @@ pub(crate) struct PythonHost {
     tool: PythonNotebook,
     /// Woken by any cell with something new; the loop asks the boundary.
     notify: Arc<Notify>,
-    cells: BTreeMap<u64, Cell>,
-    next_cell: u64,
+    cells: Cells,
     pending: Option<PendingExec>,
-    /// The newest exec, whose check-in sets the pace even after its session
-    /// is reaped, as in the native runtime.
-    latest: Option<(u64, Arc<PythonExec>)>,
     /// What the model's latest turn settled: an open call, or prose.
     turn: Option<ModelTurn>,
     /// When each pending event was first seen by a decision that could act.
@@ -89,18 +75,16 @@ impl PythonHost {
         self.tool.shutdown().await.map_err(anyhow::Error::msg)?;
         self.cells.clear();
         self.pending = None;
-        self.latest = None;
         Ok(())
     }
 
     pub(crate) fn new(tool: PythonNotebook) -> Self {
+        let notify = Arc::new(Notify::new());
         Self {
             tool,
-            notify: Arc::new(Notify::new()),
-            cells: BTreeMap::new(),
-            next_cell: 1,
+            cells: Cells::new(Arc::clone(&notify)),
+            notify,
             pending: None,
-            latest: None,
             turn: None,
             observations: Observations::default(),
             standing: Standing::Nothing,
@@ -133,28 +117,15 @@ impl PythonHost {
                 ),
             ));
         }
-        let cell = self.next_cell;
-        self.next_cell += 1;
         let call = ExecCall {
             id: exec_id.clone(),
             source,
         };
-        let session = self
-            .tool
-            .exec(call, SourceWaker::new(Arc::clone(&self.notify)));
-        self.latest = Some((cell, session.execution()));
-        self.cells.insert(
-            cell,
-            Cell {
-                session,
-                answer: ReplyState::Owed,
-            },
-        );
+        self.cells.exec(&self.tool, call, now);
         self.pending = Some(PendingExec {
             request_id,
             rpc_id,
             exec_id,
-            cell,
         });
         self.turn = Some(ModelTurn {
             spoke_at: now,
@@ -191,28 +162,7 @@ impl PythonHost {
                 newest_at: None,
             },
         ];
-        for (id, cell) in &self.cells {
-            let latest = self.latest.as_ref().is_some_and(|(latest, _)| latest == id);
-            sources.extend(
-                cell.session
-                    .sources()
-                    .into_iter()
-                    .map(|(_, facts)| match facts {
-                        crate::python::SourceFacts::Cell(facts) => {
-                            SourceKind::Cell { facts, latest }
-                        }
-                        crate::python::SourceFacts::Job(facts) => SourceKind::Job { facts },
-                    }),
-            );
-        }
-        if let Some((id, exec)) = &self.latest
-            && !self.cells.contains_key(id)
-        {
-            sources.push(SourceKind::Cell {
-                facts: exec.facts(),
-                latest: true,
-            });
-        }
+        sources.extend(self.cells.sources());
         sources
     }
 
@@ -257,7 +207,7 @@ impl PythonHost {
     /// Answers the open call with everything waiting.
     pub(crate) fn answer_pending(&mut self) -> Option<(PendingExec, Drained)> {
         let pending = self.pending.clone()?;
-        let drained = self.drain(Some(pending.cell));
+        let drained = self.drain(Some(&pending.exec_id));
         Some((pending, drained))
     }
 
@@ -266,36 +216,18 @@ impl PythonHost {
         self.drain(None)
     }
 
-    /// Every cell's contribution, the open call's cell first, as the native
-    /// drain does it: a first contribution answers the call and every later
-    /// one is an update.
-    fn drain(&mut self, own: Option<u64>) -> Drained {
+    /// Every cell's contribution: the open call's first one answers it, and
+    /// everything else is an update.
+    fn drain(&mut self, own: Option<&ExecId>) -> Drained {
         let mut drained = Drained {
             own: None,
             updates: Vec::new(),
         };
-        let mut order = self.cells.keys().copied().collect::<Vec<_>>();
-        order.sort_by_key(|id| Some(*id) != own);
-        for id in order {
-            let cell = self.cells.get_mut(&id).expect("listed above");
-            match cell.answer {
-                ReplyState::Owed => {
-                    let output = cell.session.first_output();
-                    if Some(id) == own {
-                        drained.own = Some((cell.session.execution().id().clone(), output));
-                    } else {
-                        drained
-                            .updates
-                            .push((cell.session.execution().id().clone(), output));
-                    }
-                }
-                ReplyState::Sent => {
-                    if let Some(output) = cell.session.more_output() {
-                        drained
-                            .updates
-                            .push((cell.session.execution().id().clone(), output));
-                    }
-                }
+        for reply in self.cells.drain() {
+            if reply.first && Some(&reply.id) == own {
+                drained.own = Some((reply.id, reply.output));
+            } else {
+                drained.updates.push((reply.id, reply.output));
             }
         }
         drained
@@ -303,12 +235,7 @@ impl PythonHost {
 
     /// The transport (or durable outbox) now owns the leased contributions.
     pub(crate) fn acknowledge(&mut self) {
-        for cell in self.cells.values_mut() {
-            if cell.session.acknowledge_output() {
-                cell.answer = ReplyState::Sent;
-            }
-        }
-        self.cells.retain(|_, cell| !cell.session.done());
+        self.cells.acknowledge();
         self.pending = None;
         self.observations.clear();
     }
@@ -317,9 +244,7 @@ impl PythonHost {
     /// or lets the CLI abandon. Until the user speaks again, nothing the
     /// cells say on their way out wakes the model.
     pub(crate) fn cancel(&mut self, now: UnixMs) -> Option<PendingExec> {
-        for cell in self.cells.values_mut() {
-            cell.session.cancel();
-        }
+        self.cells.cancel();
         self.standing = Standing::Cancelled { at: now };
         self.pending.take()
     }

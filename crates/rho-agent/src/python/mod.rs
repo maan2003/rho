@@ -21,6 +21,7 @@
 //! other process-global operations retain their normal in-process semantics.
 
 mod cell;
+mod cells;
 mod commands;
 mod history;
 pub(crate) mod host;
@@ -37,9 +38,10 @@ mod tool;
 use std::sync::Arc;
 
 pub use cell::{INTERRUPTED, PythonCell, PythonExec};
+pub(crate) use cells::Cells;
 pub use notebook::{Export, PythonNotebook, PythonStreamProgress, ToolCx, detached, operation};
 use rho_core::{ToolOutput, ToolOutputStatus};
-pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, SourceFacts, SourceWaker};
+pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin, SourceWaker};
 
 pub(crate) fn output(text: impl Into<String>, status: ToolOutputStatus) -> ToolOutput {
     ToolOutput {

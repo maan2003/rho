@@ -341,17 +341,14 @@ impl PythonCell {
     }
 }
 impl PythonCell {
-    pub fn sources(&self) -> Vec<(u64, crate::python::SourceFacts)> {
-        use crate::python::SourceFacts;
-        // Keep the cell marker distinct from zero-based host request IDs.
-        let mut sources = vec![(u64::MAX, SourceFacts::Cell(self.facts()))];
+    /// The facts of each job the cell started and has not finished
+    /// reporting, in the order they started.
+    pub fn jobs(&self) -> Vec<crate::python::JobFacts> {
         let cell = self.link.lock().unwrap();
-        sources.extend(
-            cell.sources
-                .iter()
-                .map(|source| (source.id, SourceFacts::Job(source.facts(self.cell)))),
-        );
-        sources
+        cell.sources
+            .iter()
+            .map(|source| source.facts(self.cell))
+            .collect()
     }
     pub fn execution(&self) -> Arc<PythonExec> {
         self.0.clone()

@@ -12,9 +12,7 @@ use rho_tool_shell::ShellTools;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::python::{
-    Export, JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker, ToolCx,
-};
+use crate::python::{Export, JobFacts, PythonCell, PythonNotebook, SourceWaker, ToolCx};
 
 pub(crate) fn shell() -> ShellTools {
     ShellTools::in_directory(
@@ -127,14 +125,7 @@ async fn until(wake: &Arc<Notify>, session: &PythonCell, want: Signal) {
 }
 
 fn jobs(session: &PythonCell) -> Vec<JobFacts> {
-    session
-        .sources()
-        .into_iter()
-        .filter_map(|(_, facts)| match facts {
-            SourceFacts::Job(job) => Some(job),
-            SourceFacts::Cell(_) => None,
-        })
-        .collect()
+    session.jobs()
 }
 
 #[tokio::test]
@@ -952,11 +943,7 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
         exec.facts().checkin.map(|checkin| checkin.after),
         Some(Duration::from_secs(300))
     );
-    assert_eq!(
-        cell.sources().len(),
-        3,
-        "exec and two independent operations"
-    );
+    assert_eq!(cell.jobs().len(), 2, "two independent operations");
     assert_eq!(exec.facts().foreground_cell, exec.facts().cell);
     cell.cancel();
     until(&wake, &cell, Signal::Ended).await;

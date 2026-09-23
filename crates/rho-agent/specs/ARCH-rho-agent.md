@@ -67,7 +67,9 @@ Every role exposes only the Python notebook, with at most one new exec per
 model response. Earlier cells and jobs can remain live across later responses.
 The `python` module owns the concrete notebook, cells, jobs, and leased output;
 host tools are callable inside Python, not through a top-level tool registry.
-`python::host` builds the host tools for both runtimes.
+`python::host` builds the host tools for both runtimes, and both hold their cells
+in `python::Cells`, which reports them to the boundary, drains them, and forgets
+them once acknowledged; the runtimes differ only in how a reply reaches the model.
 
 The provider call identity is the `ExecId` of the notebook execution. Command
 identities and transport correlation IDs are separate. Claude MCP admission uses

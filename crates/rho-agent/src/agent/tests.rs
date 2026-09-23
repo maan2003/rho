@@ -958,7 +958,7 @@ fn the_wake_records_the_room() {
 #[tokio::test]
 async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
     let notify = Arc::new(Notify::new());
-    let waker = SourceWaker::new(Arc::clone(&notify));
+    let waker = crate::python::SourceWaker::new(Arc::clone(&notify));
 
     // The tool signals before anyone is listening.
     waker.wake();
@@ -979,31 +979,35 @@ fn python_tool(directory: &tempfile::TempDir) -> crate::python::PythonNotebook {
     .unwrap()
 }
 
-/// The call's sources as the loop reports them for the model's latest cell.
-fn latest_sources(running: &RunningExec) -> Vec<SourceKind> {
-    running
+fn job_facts(cells: &Cells) -> Vec<JobFacts> {
+    cells
         .sources()
-        .map(|source| match source {
-            SourceKind::Cell { facts, .. } => SourceKind::Cell {
-                facts,
-                latest: true,
-            },
-            other => other,
+        .into_iter()
+        .filter_map(|source| match source {
+            SourceKind::Job { facts } => Some(facts),
+            _ => None,
         })
         .collect()
 }
 
-async fn until_jobs_registered(running: &RunningExec, wake: &Arc<Notify>, count: usize) {
+async fn until_jobs_registered(cells: &Cells, wake: &Arc<Notify>, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while job_facts(cells).len() < count {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn until_job_ends(cells: &Cells, wake: &Arc<Notify>, registered_index: usize) -> UnixMs {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let jobs = running
-                .session
-                .sources()
-                .into_iter()
-                .filter(|(_, facts)| matches!(facts, crate::python::SourceFacts::Job(_)))
-                .count();
-            if jobs >= count {
-                break;
+            if let Some(end) = job_facts(cells)
+                .get(registered_index)
+                .and_then(|job| job.finished)
+            {
+                break end.at;
             }
             wake.notified().await;
         }
@@ -1012,25 +1016,13 @@ async fn until_jobs_registered(running: &RunningExec, wake: &Arc<Notify>, count:
     .unwrap()
 }
 
-async fn until_job_ends(
-    running: &RunningExec,
-    wake: &Arc<Notify>,
-    registered_index: usize,
-) -> UnixMs {
+async fn until_cell(cells: &Cells, wake: &Arc<Notify>, done: impl Fn(&CellFacts) -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let jobs = running
-                .session
-                .sources()
-                .into_iter()
-                .filter_map(|(_, facts)| match facts {
-                    crate::python::SourceFacts::Job(job) => Some(job),
-                    crate::python::SourceFacts::Cell(_) => None,
-                })
-                .collect::<Vec<_>>();
-            if let Some(end) = jobs.get(registered_index).and_then(|job| job.finished) {
-                break end.at;
-            }
+        while !cells
+            .sources()
+            .iter()
+            .any(|source| matches!(source, SourceKind::Cell { facts, .. } if done(facts)))
+        {
             wake.notified().await;
         }
     })
@@ -1043,28 +1035,21 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     let directory = tempfile::tempdir().unwrap();
     let tool = python_tool(&directory);
     let wake = Arc::new(Notify::new());
-    let mut invocation = call("python-sources");
-    invocation.arguments = "command('echo first')\nsecond = command('while [ ! -f release ]; do sleep 0.01; done; echo second')\nawait second\ncommand('while [ ! -f finish ]; do sleep 0.01; done; echo third')".into();
-    let mut running = RunningExec {
-        session: tool.exec(
-            rho_core::ExecCall {
-                id: invocation.id.clone(),
-                source: invocation.arguments.clone(),
-            },
-            SourceWaker::new(wake.clone()),
-        ),
-        call: rho_core::ExecCall {
+    let mut cells = Cells::new(wake.clone());
+    let invocation = call("python-sources");
+    cells.exec(
+        &tool,
+        rho_core::ExecCall {
             id: invocation.id,
-            source: invocation.arguments,
+            source: "command('echo first')\nsecond = command('while [ ! -f release ]; do sleep 0.01; done; echo second')\nawait second\ncommand('while [ ! -f finish ]; do sleep 0.01; done; echo third')".into(),
         },
-        first_block_at: UnixMs::now(),
-        answer: ReplyState::Owed,
-    };
+        UnixMs::now(),
+    );
     // The cell registers its second command a moment after the first, which
     // can end before then; the announcement below needs both on the books.
-    until_jobs_registered(&running, &wake, 2).await;
-    let first_at = until_job_ends(&running, &wake, 0).await;
-    let mut schedule = ask(latest_sources(&running));
+    until_jobs_registered(&cells, &wake, 2).await;
+    let first_at = until_job_ends(&cells, &wake, 0).await;
+    let mut schedule = ask(cells.sources());
     schedule.turn = None;
     let due = first_at + FOREGROUND_PATIENCE;
     assert_eq!(
@@ -1076,44 +1061,34 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
 
     // Exactly the normal request drain: the provider gets one exec result,
     // and each source has contributed what it had.
-    running.answer = ReplyState::Sent;
-    let first = running.session.first_output();
-    running.session.acknowledge_output();
+    let first = cells.drain().remove(0);
+    cells.acknowledge();
+    assert!(first.first);
     assert!(
         first
+            .output
             .output
             .contains("Process exited with code 0\nOutput:\nfirst"),
         "{}",
-        first.output
+        first.output.output
     );
     assert!(
         first
             .output
+            .output
             .contains("Command running in background with session ID"),
         "the sibling is announced: {}",
-        first.output
+        first.output.output
     );
     assert!(
-        running.sources().all(|source| matches!(
-            source,
-            SourceKind::Cell { .. }
-                | SourceKind::Job {
-                    facts: JobFacts { finished: None, .. }
-                }
-        )),
+        job_facts(&cells).iter().all(|job| job.finished.is_none()),
         "a delivered job is forgotten; the rest is still running"
     );
 
     std::fs::write(directory.path().join("release"), "").unwrap();
-    let second_at = until_job_ends(&running, &wake, 0).await;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while running.session.execution().facts().returned.is_none() {
-            wake.notified().await;
-        }
-    })
-    .await
-    .unwrap();
-    let mut schedule = ask(latest_sources(&running));
+    let second_at = until_job_ends(&cells, &wake, 0).await;
+    until_cell(&cells, &wake, |facts| facts.returned.is_some()).await;
+    let mut schedule = ask(cells.sources());
     schedule.turn = None;
     assert_eq!(
         schedule.recheck(second_at),
@@ -1123,64 +1098,54 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
 
     std::fs::write(directory.path().join("finish"), "").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !running.session.execution().quiescent() {
+        while job_facts(&cells).iter().any(|job| job.finished.is_none()) {
             wake.notified().await;
         }
     })
     .await
     .unwrap();
-    let mut schedule = ask(latest_sources(&running));
+    let mut schedule = ask(cells.sources());
     schedule.turn = None;
     assert!(
         schedule.boundary(UnixMs::now()).is_now(),
         "nothing to batch once every command ends"
     );
-    let last = running.session.more_output().unwrap();
-    running.session.acknowledge_output();
+    let last = cells.drain().remove(0);
+    cells.acknowledge();
+    assert!(!last.first);
     assert_eq!(
-        last.output.matches("Process exited with code 0").count(),
+        last.output
+            .output
+            .matches("Process exited with code 0")
+            .count(),
         2,
         "{}",
-        last.output
+        last.output.output
     );
-    assert!(running.session.done());
+    assert!(cells.is_empty(), "a cell with nothing left is forgotten");
 }
 
 #[tokio::test]
 async fn python_output_order_puts_latest_first_then_older_cells_in_execution_order() {
     let directory = tempfile::tempdir().unwrap();
     let tool = python_tool(&directory);
-    let mut running = Vec::new();
-    // Deliberately oppose call-ID order. Some calls already have a reply:
-    // that must not move their updates behind an older unacknowledged call.
+    let mut cells = Cells::new(Default::default());
+    // Deliberately oppose call-ID order.
     for id in ["z-oldest", "a-older", "m-latest"] {
-        let invocation = call(id);
-        running.push(RunningExec {
-            session: tool.exec(
-                rho_core::ExecCall {
-                    id: invocation.id.clone(),
-                    source: invocation.arguments.clone(),
-                },
-                SourceWaker::new(Default::default()),
-            ),
-            call: rho_core::ExecCall {
-                id: invocation.id,
-                source: invocation.arguments,
+        cells.exec(
+            &tool,
+            rho_core::ExecCall {
+                id: call(id).id,
+                source: "print('x')".into(),
             },
-            first_block_at: UnixMs(0),
-            answer: if id == "z-oldest" {
-                ReplyState::Owed
-            } else {
-                ReplyState::Sent
-            },
-        });
+            UnixMs(0),
+        );
     }
-    let latest = running[2].call.id.clone();
-    running.sort_by_key(|tool| tool.output_order(Some(&latest)));
     assert_eq!(
-        running
+        cells
+            .drain()
             .iter()
-            .map(|tool| tool.call.id.as_str())
+            .map(|reply| reply.id.as_str())
             .collect::<Vec<_>>(),
         ["m-latest", "z-oldest", "a-older"],
     );

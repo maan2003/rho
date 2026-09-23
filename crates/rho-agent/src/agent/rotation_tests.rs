@@ -53,15 +53,7 @@ async fn reply(agent: &mut Agent, items: Vec<InferenceResponseItem>, used: u64) 
 async fn cell_returned(agent: &Agent) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if agent
-                .latest_python_exec
-                .as_ref()
-                .unwrap()
-                .1
-                .facts()
-                .returned
-                .is_some()
-            {
+            if agent.cells.latest().unwrap().facts().returned.is_some() {
                 return;
             }
             agent.wake.notified().await;
@@ -151,12 +143,13 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
     {
         cell_returned(&agent).await;
         assert!(
-            !agent.latest_python_exec.as_ref().unwrap().1.facts().failed,
+            !agent.cells.latest().unwrap().facts().failed,
             "switch {index}: {:?}",
             agent
-                .execs
-                .values_mut()
-                .map(|tool| tool.session.first_output())
+                .cells
+                .drain()
+                .into_iter()
+                .map(|reply| reply.output)
                 .collect::<Vec<_>>()
         );
         // Drain tool output, then settle the synthetic provider response.
@@ -165,7 +158,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
                 agent.start_request(UnixMs::now(), None).await.unwrap();
                 agent.session.abort();
                 reply(&mut agent, vec![message("done")], 100).await;
-                if agent.execs.is_empty() {
+                if agent.cells.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -204,7 +197,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
         .await;
     }
     cell_returned(&agent).await;
-    assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
+    assert!(!agent.cells.latest().unwrap().facts().failed);
 }
 
 #[test]

@@ -48,8 +48,8 @@ use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTx
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::Team;
 use crate::native::NativeEvent;
+use crate::python::Cells;
 use crate::python::host::host_tools;
-use crate::python::{PythonCell, SourceWaker};
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
     ToolPreview, View, final_answer_text, prompt,
@@ -180,6 +180,7 @@ impl AgentHandle {
         let head = Arc::new(RwLock::new(head));
         let (control, control_rx) = mpsc::unbounded_channel();
         host.observe(&status);
+        let wake = Arc::new(Notify::new());
         let mut agent = Agent {
             writer: persistence::Writer::new(host.clone()),
             pending_events: Vec::new(),
@@ -201,17 +202,16 @@ impl AgentHandle {
             },
             user: replayed.user,
             mail: replayed.mail,
-            execs: BTreeMap::new(),
+            cells: Cells::new(Arc::clone(&wake)),
             observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: replayed.recovery_notes,
             context_used: replayed.context_used,
             turn: None,
-            latest_python_exec: None,
             total_usage,
             name_updates,
             working: false,
-            wake: Arc::new(Notify::new()),
+            wake,
             status: Arc::clone(&status),
             head: Arc::clone(&head),
             control_rx,
@@ -454,46 +454,6 @@ pub(crate) enum Phase {
     Requesting(InFlight),
 }
 
-/// Whether a call or one of its nested sources has been drained. The core
-/// owns this bookkeeping; what the source is doing is the tool's to report.
-/// For the outer call this also selects the provider's result/update shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReplyState {
-    /// Still awaiting its first contribution at a request boundary.
-    Owed,
-    /// Already drained; subsequent output is an update.
-    Sent,
-}
-
-/// The core's bookkeeping for one call: which tool, how much of its story the
-/// model has, and since when it has been holding something. The output itself
-/// lives in the session, which is asked for it at every boundary.
-struct RunningExec {
-    call: rho_core::ExecCall,
-    first_block_at: UnixMs,
-    session: Box<PythonCell>,
-    answer: ReplyState,
-}
-
-impl RunningExec {
-    fn output_order(&self, latest: Option<&ToolCallId>) -> (bool, u64) {
-        (Some(&self.call.id) != latest, self.session.sequence())
-    }
-
-    fn sources(&self) -> impl Iterator<Item = SourceKind> + '_ {
-        self.session
-            .sources()
-            .into_iter()
-            .map(|(_, facts)| match facts {
-                crate::python::SourceFacts::Cell(facts) => SourceKind::Cell {
-                    facts,
-                    latest: false,
-                },
-                crate::python::SourceFacts::Job(facts) => SourceKind::Job { facts },
-            })
-    }
-}
-
 /// The in-flight provider response. Its streamed Python call may already have
 /// live work; abandoning the response preserves
 /// that call before the next boundary drains its output.
@@ -535,8 +495,9 @@ pub(crate) struct Agent {
     user: Vec<QueuedInput>,
     /// Everyone's mail, in arrival order.
     mail: Vec<MailItem>,
-    /// One entry per call the model has made and nothing has answered.
-    execs: BTreeMap<ToolCallId, RunningExec>,
+    /// The cells of the calls the model has made, until each has said
+    /// everything.
+    cells: Cells,
     /// When each pending event was first seen: the clocks the boundary's
     /// patiences run on.
     observations: Observations,
@@ -548,7 +509,6 @@ pub(crate) struct Agent {
     /// until it has spoken once — after a restart included, which is safe
     /// because no tool survives one.
     turn: Option<ModelTurn>,
-    latest_python_exec: Option<(ToolCallId, Arc<crate::python::PythonExec>)>,
     /// Cumulative provider-reported usage across this agent's requests.
     total_usage: AgentUsageBucket,
     name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
@@ -626,9 +586,7 @@ impl Agent {
         for stream in self.streams.values() {
             stream.exec.stop_stream();
         }
-        for exec in self.execs.values_mut() {
-            exec.session.cancel();
-        }
+        self.cells.cancel();
         if let Some(surface) = self.surface.get_if_ready() {
             surface
                 .notebook
@@ -637,8 +595,7 @@ impl Agent {
                 .map_err(anyhow::Error::msg)?;
         }
         self.streams.clear();
-        self.execs.clear();
-        self.latest_python_exec = None;
+        self.cells.clear();
         self.flush_events().await?;
         Ok(())
     }
@@ -765,26 +722,7 @@ impl Agent {
         // What each call is, with nothing decided about it: every one of
         // these is something the tool observed, and what any of them is
         // worth is `boundary`'s business.
-        for tool in self.execs.values() {
-            let latest = self
-                .latest_python_exec
-                .as_ref()
-                .is_some_and(|(id, _)| *id == tool.call.id);
-            sources.extend(tool.sources().map(|source| match source {
-                SourceKind::Cell { facts, .. } => SourceKind::Cell { facts, latest },
-                other => other,
-            }));
-        }
-        // A quiet completed exec may leave the transcript session, but its
-        // check-in remains authoritative for this model turn.
-        if let Some((id, exec)) = &self.latest_python_exec
-            && !self.execs.contains_key(id)
-        {
-            sources.push(SourceKind::Cell {
-                facts: exec.facts(),
-                latest: true,
-            });
-        }
+        sources.extend(self.cells.sources());
         sources
     }
 
@@ -988,9 +926,7 @@ impl Agent {
                 // does not kill tools, so a tool still chooses its own last
                 // words.
                 self.abandon_stream(now).await?;
-                for tool in self.execs.values_mut() {
-                    tool.session.cancel();
-                }
+                self.cells.cancel();
                 // A cancel is not an answer, so what is owed outlives it.
                 let owed = match &mut self.phase {
                     Phase::Idle { owed, .. } => std::mem::take(owed),
@@ -1085,7 +1021,7 @@ impl Agent {
             "{what} is not available with queued inputs"
         );
         anyhow::ensure!(
-            self.execs.is_empty() && !self.session.has_active_request(),
+            self.cells.is_empty() && !self.session.has_active_request(),
             "{what} is not available while work is running"
         );
         Ok(())
@@ -1185,7 +1121,7 @@ impl Agent {
         self.usage_caps = replayed.usage_caps;
         self.recovery_notes = replayed.recovery_notes;
         self.streams.clear();
-        self.latest_python_exec = None;
+        self.cells.set_latest(None);
         self.user = replayed.user;
         self.mail = replayed.mail;
         self.context_used = replayed.context_used;
@@ -1310,11 +1246,6 @@ impl Agent {
             Phase::Idle { owed, .. } => std::mem::take(owed),
             Phase::Requesting(_) => Vec::new(),
         };
-        let delivered = self
-            .execs
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
         let mut blocks: Vec<ContextBlock> = Vec::new();
         if cancel_rotation {
             blocks.push(ContextBlock::DeveloperMessage {
@@ -1359,38 +1290,21 @@ impl Agent {
         // first contribution becomes its `ToolResult` and every later one a
         // `ToolUpdate`, because a provider accepts exactly one result per call
         // id: `REQ-provider-transcript-protocol`.
-        let latest = self.latest_python_exec.as_ref().map(|(id, _)| id);
-        let mut tools = self.execs.values_mut().collect::<Vec<_>>();
-        tools.sort_by_key(|tool| tool.output_order(latest));
-        for tool in tools {
-            if !delivered.contains(&tool.call.id) {
-                continue;
-            }
-            // Whatever the tool is reporting: a request that leaves one call
-            // unanswered is rejected whole, so the first drain after a call is
-            // made answers it and the tool says what it has, even if that is
-            // nothing yet. The facts are for `boundary` and are not read
-            // here, nor is `done`, which is asked below.
-            match tool.answer {
-                ReplyState::Owed => {
-                    let body = tool.session.first_output();
-                    blocks.push(rho_inference::exec::output(&rho_core::ExecOutput::Reply {
-                        id: tool.call.id.clone(),
-                        body,
-                        first_block_at: tool.first_block_at,
-                        at: now,
-                    }));
+        for reply in self.cells.drain() {
+            blocks.push(rho_inference::exec::output(&if reply.first {
+                rho_core::ExecOutput::Reply {
+                    id: reply.id,
+                    body: reply.output,
+                    first_block_at: reply.started_at,
+                    at: now,
                 }
-                ReplyState::Sent => {
-                    if let Some(output) = tool.session.more_output() {
-                        blocks.push(rho_inference::exec::output(&rho_core::ExecOutput::Report {
-                            id: tool.call.id.clone(),
-                            body: output,
-                            at: now,
-                        }));
-                    }
+            } else {
+                rho_core::ExecOutput::Report {
+                    id: reply.id,
+                    body: reply.output,
+                    at: now,
                 }
-            }
+            }));
         }
         // Everything pending went into this request; the next event's clock
         // starts fresh.
@@ -1450,7 +1364,7 @@ impl Agent {
             // reaches the target replaces it; never persist a partial plan.
             compact = true;
             if notes_rotation {
-                let active = self.execs.keys().cloned().collect();
+                let active = self.cells.iter().map(|(id, _)| id.clone()).collect();
                 let notice = ContextBlock::DeveloperMessage {
                     text: context::EVICTED.into(),
                 };
@@ -1515,13 +1429,7 @@ impl Agent {
             self.context_used = used;
             self.session.abort();
         }
-        for (id, exec) in &mut self.execs {
-            if delivered.contains(id) && exec.session.acknowledge_output() {
-                exec.answer = ReplyState::Sent;
-            }
-        }
-        self.execs
-            .retain(|id, exec| !delivered.contains(id) || !exec.session.done());
+        self.cells.acknowledge();
         self.retire_streams();
         let input = self.provider_input().await?;
         self.surface
@@ -1621,7 +1529,7 @@ impl Agent {
 
         // A turn that issues no calls buys no further look-in: whatever is
         // still running speaks for itself.
-        self.latest_python_exec = None;
+        self.cells.set_latest(None);
         self.turn = Some(ModelTurn {
             spoke_at: now,
             asked: if call.is_some() {
@@ -1631,8 +1539,8 @@ impl Agent {
             },
         });
         if let Some(call) = call {
-            if let Some(stream) = self.streams.get(&call.id) {
-                self.latest_python_exec = Some((call.id.clone(), stream.exec.clone()));
+            if self.streams.contains_key(&call.id) {
+                self.cells.set_latest(Some(&call.id));
             } else {
                 self.start_exec(call, now);
             }
@@ -1663,22 +1571,12 @@ impl Agent {
     // -- tools --------------------------------------------------------------
 
     fn start_exec(&mut self, call: rho_core::ExecCall, now: UnixMs) {
-        let session = self
+        let notebook = &self
             .surface
             .get_if_ready()
             .expect("the notebook is initialized before inference")
-            .notebook
-            .exec(call.clone(), SourceWaker::new(Arc::clone(&self.wake)));
-        self.latest_python_exec = Some((call.id.clone(), session.execution()));
-        self.execs.insert(
-            call.id.clone(),
-            RunningExec {
-                first_block_at: now,
-                call,
-                session,
-                answer: ReplyState::Owed,
-            },
-        );
+            .notebook;
+        self.cells.exec(notebook, call, now);
     }
 
     // -- plumbing -----------------------------------------------------------
@@ -1775,28 +1673,22 @@ impl Agent {
             },
             // The model is waiting on a call, or asked to be woken, or
             // something queued is about to go: a turn is running.
-            Phase::Idle { .. }
-                if self
-                    .execs
-                    .values()
-                    .any(|tool| tool.answer == ReplyState::Owed)
-                    || deadline.is_some() =>
-            {
+            Phase::Idle { .. } if self.cells.owe_reply() || deadline.is_some() => {
                 AgentStateKind::ToolCalling {
                     previews: self
-                        .execs
+                        .cells
                         .iter()
-                        .map(|(id, tool)| {
+                        .map(|(id, held)| {
                             (
                                 id.clone(),
                                 ToolPreview {
                                     call: ToolCall {
-                                        id: tool.call.id.clone(),
+                                        id: id.clone(),
                                         name: ToolName::try_from("exec").unwrap(),
                                         tool_type: rho_core::ToolType::Custom,
-                                        arguments: tool.call.source.clone(),
+                                        arguments: held.source.clone(),
                                     },
-                                    started_at: tool.first_block_at,
+                                    started_at: held.started_at,
                                     metadata: None,
                                 },
                             )

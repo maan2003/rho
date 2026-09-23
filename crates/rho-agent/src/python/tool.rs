@@ -85,12 +85,6 @@ pub struct JobEnd {
     pub failed: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceFacts {
-    Cell(CellFacts),
-    Job(JobFacts),
-}
-
 /// Tell the core that something changed.
 ///
 /// Deliberately carries no payload: what changed is discovered by asking, at a

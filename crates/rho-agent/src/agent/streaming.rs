@@ -53,7 +53,7 @@ impl Agent {
             }
             let fragment = incoming.source[stream.source.len()..].to_owned();
             stream.source = incoming.source;
-            self.execs.get_mut(id).unwrap().call.source = stream.source.clone();
+            self.cells.get_mut(id).unwrap().source = stream.source.clone();
             if !fragment.is_empty() {
                 stream
                     .exec
@@ -67,9 +67,15 @@ impl Agent {
                 "Provider reused an earlier tool call identity"
             ));
         }
-        let tool = &self.surface.get_if_ready().unwrap().notebook;
-        let session = tool.start_stream(incoming.id.clone(), SourceWaker::new(self.wake.clone()));
-        let exec = session.execution();
+        let notebook = &self.surface.get_if_ready().unwrap().notebook;
+        let exec = self.cells.start_stream(
+            notebook,
+            rho_core::ExecCall {
+                id: incoming.id.clone(),
+                source: incoming.source.clone(),
+            },
+            now,
+        );
         let mut identity = item;
         set_source(&mut identity, String::new());
         self.persist(AgentEvent::ExecObserved {
@@ -78,19 +84,6 @@ impl Agent {
             at: now,
         })
         .await?;
-        self.execs.insert(
-            incoming.id.clone(),
-            RunningExec {
-                call: rho_core::ExecCall {
-                    id: incoming.id.clone(),
-                    source: incoming.source.clone(),
-                },
-                first_block_at: now,
-                session,
-                answer: ReplyState::Owed,
-            },
-        );
-        self.latest_python_exec = Some((incoming.id.clone(), exec.clone()));
         self.streams.insert(
             incoming.id.clone(),
             Stream {
@@ -155,14 +148,14 @@ impl Agent {
         };
         let stream = self.streams.remove(&id).unwrap();
         let Some(ran) = stream.exec.interrupt_stream() else {
-            self.execs.remove(&id);
-            self.latest_python_exec = None;
+            self.cells.remove(&id);
+            self.cells.set_latest(None);
             return Ok(false);
         };
         // What ran becomes the call, so its result has a place in history
         // and the model sees exactly the code that executed.
         let source = stream.source[..ran].to_owned();
-        self.execs.get_mut(&id).unwrap().call.source = source.clone();
+        self.cells.get_mut(&id).unwrap().source = source.clone();
         let mut item = stream.item;
         set_source(&mut item, source);
         self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
@@ -289,6 +282,7 @@ pub(in crate::agent) mod tests {
             queued: 0,
         }));
         host.observe(&status);
+        let wake = Arc::new(Notify::new());
         TestAgent {
             db,
             agent_id: id,
@@ -307,16 +301,15 @@ pub(in crate::agent) mod tests {
                 phase: Phase::Requesting(InFlight::default()),
                 user: Vec::new(),
                 mail: Vec::new(),
-                execs: BTreeMap::new(),
+                cells: Cells::new(Arc::clone(&wake)),
                 observations: Observations::default(),
                 streams: BTreeMap::new(),
                 recovery_notes: Vec::new(),
                 context_used: None,
                 turn: None,
-                latest_python_exec: None,
                 total_usage: Default::default(),
                 working: false,
-                wake: Arc::new(Notify::new()),
+                wake,
                 status,
                 head: Arc::new(RwLock::new(head)),
                 control_rx,
@@ -341,8 +334,8 @@ pub(in crate::agent) mod tests {
         })
     }
 
-    fn exec(agent: &Agent) -> &crate::python::PythonExec {
-        &agent.execs.values().next().unwrap().session
+    fn exec(agent: &Agent) -> &crate::python::PythonCell {
+        &agent.cells.iter().next().unwrap().1.cell
     }
 
     async fn until(agent: &mut Agent, predicate: impl Fn(&Agent) -> bool) {
@@ -536,13 +529,11 @@ pub(in crate::agent) mod tests {
             exec(agent).stream_progress().settled > 0
         })
         .await;
-        let cell = agent.latest_python_exec.as_ref().unwrap().1.sequence();
+        let cell = agent.cells.latest().unwrap().sequence();
         // The response is still in flight, but the command is already running.
         assert!(matches!(agent.phase, Phase::Requesting(_)));
         until(&mut agent, |agent| {
-            agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-            matches!(facts, crate::python::SourceFacts::Job(facts) if facts.finished.is_some())
-        )
+            exec(agent).jobs().iter().any(|job| job.finished.is_some())
         })
         .await;
         assert_eq!(
@@ -564,10 +555,7 @@ pub(in crate::agent) mod tests {
             .await
             .unwrap();
         until(&mut agent, |agent| exec(agent).facts().returned.is_some()).await;
-        assert_eq!(
-            agent.latest_python_exec.as_ref().unwrap().1.sequence(),
-            cell
-        );
+        assert_eq!(agent.cells.latest().unwrap().sequence(), cell);
         assert_eq!(
             std::fs::read_to_string(directory.path().join("marker")).unwrap(),
             "x"
@@ -618,9 +606,7 @@ pub(in crate::agent) mod tests {
         ));
         until(&mut agent, |agent| {
             exec(agent).facts().returned.is_some()
-            && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-                matches!(facts, crate::python::SourceFacts::Job(facts) if facts.finished.is_some())
-            )
+                && exec(agent).jobs().iter().any(|job| job.finished.is_some())
         })
         .await;
         agent.flush_events().await.unwrap();
@@ -691,7 +677,7 @@ pub(in crate::agent) mod tests {
                 "x"
             );
             assert!(!directory.path().join("wrong").exists());
-            assert_eq!(agent.execs.len(), 1);
+            assert_eq!(agent.cells.iter().count(), 1);
         }
     }
 
@@ -724,7 +710,7 @@ pub(in crate::agent) mod tests {
         assert_eq!(decision, Boundary::AbortAndResend);
         agent.advance_streams(decision != Boundary::AbortAndResend);
         assert_eq!(exec(&agent).stream_progress().admitted, 0);
-        let exec = agent.execs.values().next().unwrap().session.execution();
+        let exec = exec(&agent).execution();
         agent.abandon_stream(UnixMs::now()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
             while exec.facts().returned.is_none() {
@@ -734,7 +720,7 @@ pub(in crate::agent) mod tests {
         .await
         .unwrap();
         assert!(agent.streams.is_empty());
-        assert!(agent.execs.is_empty());
+        assert!(agent.cells.is_empty());
         assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(!directory.path().join("wrong").exists());
     }
@@ -834,7 +820,7 @@ pub(in crate::agent) mod tests {
             .unwrap();
         until(&mut agent, |agent| exec(agent).facts().returned.is_some()).await;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !agent.execs.is_empty() {
+            while !agent.cells.is_empty() {
                 agent.start_request(UnixMs::now(), None).await.unwrap();
                 agent.session.abort();
                 agent.phase = Phase::Idle {
@@ -952,10 +938,9 @@ pub(in crate::agent) mod tests {
                 std::fs::write(directory.path().join("release"), "").unwrap();
                 until(&mut agent, |agent| {
                     exec(agent).facts().returned.is_some()
-                        && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
-                            matches!(facts, crate::python::SourceFacts::Job(facts) if facts.finished.is_some())
-                        })
-                }).await;
+                        && exec(agent).jobs().iter().any(|job| job.finished.is_some())
+                })
+                .await;
                 let decision = agent.decide(UnixMs::now());
                 if wake_on_tools {
                     assert!(decision.is_now(), "{decision:?}");
@@ -991,7 +976,7 @@ pub(in crate::agent) mod tests {
             }
         ));
         assert!(agent.streams.is_empty());
-        assert!(agent.execs.is_empty());
+        assert!(agent.cells.is_empty());
         assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(agent.recovery_notes.is_empty());
         agent.flush_events().await.unwrap();
