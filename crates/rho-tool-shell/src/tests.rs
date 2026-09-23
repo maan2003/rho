@@ -1,5 +1,6 @@
-use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
+use rho_agent_host_proto::ToolOutputStatus;
 use rho_fs_view::PathOverrides;
+use rho_inference::types::{ToolCall, ToolCallId, ToolName, ToolType};
 
 use super::*;
 

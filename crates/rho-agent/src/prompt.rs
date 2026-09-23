@@ -1914,7 +1914,7 @@ mod tests {
                 None,
                 None,
                 AgentRole::Advisor {
-                    intelligence: rho_core::AdvisorIntelligence::Medium,
+                    intelligence: rho_agent_host_proto::AdvisorIntelligence::Medium,
                 },
             ),
         ] {
@@ -1932,7 +1932,7 @@ mod tests {
                 None,
                 None,
                 AgentRole::Advisor {
-                    intelligence: rho_core::AdvisorIntelligence::Medium,
+                    intelligence: rho_agent_host_proto::AdvisorIntelligence::Medium,
                 },
             ),
         ] {
@@ -1960,7 +1960,7 @@ mod tests {
                 None,
                 None,
                 AgentRole::Advisor {
-                    intelligence: rho_core::AdvisorIntelligence::Medium,
+                    intelligence: rho_agent_host_proto::AdvisorIntelligence::Medium,
                 },
             ),
         ] {
@@ -1992,7 +1992,7 @@ mod tests {
         for role in [
             AgentRole::default(),
             AgentRole::Advisor {
-                intelligence: rho_core::AdvisorIntelligence::Medium,
+                intelligence: rho_agent_host_proto::AdvisorIntelligence::Medium,
             },
         ] {
             let team = Team {

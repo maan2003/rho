@@ -11,12 +11,14 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use rho_core::{
-    ApplyPatchMetadata, ContentPart, ContextBlock, InferenceResponseItem, PendingInferenceResponse,
-    ToolCall, ToolCallId, ToolResult, ToolSpec, UnixMs,
-};
-pub use rho_core::{MessageDelivery, MessageSender};
+pub use rho_agent_host_proto::MessageDelivery;
+use rho_agent_host_proto::{ContentPart, UnixMs};
 pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
+pub use rho_inference::types::MessageSender;
+use rho_inference::types::{
+    ApplyPatchMetadata, ContextBlock, InferenceResponseItem, PendingInferenceResponse, ToolCall,
+    ToolCallId, ToolResult, ToolSpec,
+};
 use senax_encoder::{Decode, Encode};
 
 use crate::db::{
@@ -35,7 +37,6 @@ pub mod db;
 mod image_tool;
 mod lazy;
 pub mod live;
-pub mod mirror;
 pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
@@ -43,6 +44,7 @@ pub mod prompt;
 pub mod shell;
 pub mod terminal;
 mod title;
+pub mod transcript;
 mod worker;
 pub use worker::{
     Process as WorksetProcess, WorksetAction, WorksetAttach, WorksetClient, WorksetReply,
@@ -136,7 +138,7 @@ pub enum AgentEvent<'a> {
         place: Place,
         spawned_by: AgentSpawnedBy,
         spawn_name: Option<String>,
-        created_at: rho_core::UnixMs,
+        created_at: rho_agent_host_proto::UnixMs,
         /// The agent that spawned this one.
         #[senax(default)]
         parent: Option<AgentId>,
@@ -174,14 +176,14 @@ pub enum AgentEvent<'a> {
     /// It neither changes native context nor claims ownership of Claude
     /// history.
     ExecObserved {
-        id: rho_core::ExecId,
-        milestone: rho_core::ExecMilestone,
+        id: rho_inference::types::ExecId,
+        milestone: rho_agent_host_proto::ExecMilestone,
         at: UnixMs,
     },
     /// Claude owns its conversation; this records only Rho's permission to
     /// execute a cell, committed before the notebook can perform side effects.
     ClaudeExecAdmitted {
-        call: rho_core::ExecCall,
+        call: rho_inference::types::ExecCall,
         at: UnixMs,
     },
     /// Canonical native conversation records; legacy block rows are read-only.
@@ -200,7 +202,10 @@ pub enum AgentEvent<'a> {
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ClaudeOutputBatch {
     pub id: uuid::Uuid,
-    pub outputs: Vec<(rho_core::ExecId, rho_core::ToolOutput)>,
+    pub outputs: Vec<(
+        rho_inference::types::ExecId,
+        rho_inference::types::ToolOutput,
+    )>,
     pub wake: WakeFacts,
     pub at: UnixMs,
 }
@@ -358,7 +363,9 @@ pub enum TranscriptLine {
         context_used: Option<u64>,
     },
     /// What the calls came back with.
-    ToolResults { results: Vec<rho_core::ToolResult> },
+    ToolResults {
+        results: Vec<rho_inference::types::ToolResult>,
+    },
     /// Claude compacted the context here.
     Compacted { context_used: Option<u64> },
 }
@@ -472,7 +479,7 @@ pub enum AgentStateKind {
     /// Loaded from a log that ended with calls nobody answered: the next
     /// request owes them placeholder results and a note.
     UnfinishedTurn {
-        outstanding_calls: Arc<[rho_core::ExecId]>,
+        outstanding_calls: Arc<[rho_inference::types::ExecId]>,
     },
     // Permanent error, thread is paused
     Error(FailedInferenceResponse),
@@ -602,7 +609,8 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
             .iter()
             .filter_map(|item| match item {
                 InferenceResponseItem::AssistantMessage { content, phase, .. }
-                    if !want_final || *phase == Some(rho_core::MessagePhase::FinalAnswer) =>
+                    if !want_final
+                        || *phase == Some(rho_agent_host_proto::MessagePhase::FinalAnswer) =>
                 {
                     Some(content.iter().filter_map(|part| match part {
                         ContentPart::Text { text } => Some(text.as_str()),

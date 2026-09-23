@@ -6,14 +6,13 @@
 //! Agent ids are already unique across machines, so the id is
 //! for routing — which socket a command goes down — not for disambiguation.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use camino::Utf8PathBuf;
-use gpui::App;
-use rho_ui_proto::ClientMessage;
 
 use crate::connection::Connection;
-use crate::{AttachTarget, HostId, HostSink};
+use crate::{AttachTarget, HostId, HostSink, HostStream};
 
 /// Where a host is in its connection lifecycle. Only `Online` accepts
 /// commands; the rest exist so the chrome can say which host is unwell
@@ -52,7 +51,7 @@ pub struct Host {
     pub name: String,
     pub target: AttachTarget,
     pub status: HostStatus,
-    pub auth: Option<rho_ui_proto::AuthState>,
+    pub auth: Option<rho_agent_host_proto::AuthState>,
     connection: Connection,
 }
 
@@ -86,19 +85,19 @@ pub struct HostWorkdir {
 pub struct Hosts {
     hosts: Vec<Host>,
     next_id: u32,
-    events: std::sync::Arc<dyn HostSink>,
+    events: Arc<dyn HostSink>,
     /// Registered workdirs from every attached daemon. Fed by whoever reads
     /// the store; named and qualified here, because what a workdir is
     /// called depends on how many machines are attached.
     workdirs: Vec<HostWorkdir>,
-    quota_summaries: std::collections::HashMap<HostId, Vec<rho_ui_proto::QuotaSummary>>,
-    quota_history: std::collections::HashMap<HostId, Vec<rho_ui_proto::QuotaSeries>>,
+    quota_summaries: std::collections::HashMap<HostId, Vec<rho_agent_host_proto::QuotaSummary>>,
+    quota_history: std::collections::HashMap<HostId, Vec<rho_agent_host_proto::QuotaSeries>>,
 }
 
 impl Hosts {
-    /// Nothing is attached yet. Every connection's frames go to the sink,
-    /// whatever the reader behind it makes of them.
-    pub fn new(events: std::sync::Arc<dyn HostSink>) -> Self {
+    /// Nothing is attached yet. Every connection's control events go to
+    /// `events`, whatever the reader behind it makes of them.
+    pub fn new(events: Arc<dyn HostSink>) -> Self {
         Self {
             hosts: Vec::new(),
             next_id: 0,
@@ -112,19 +111,24 @@ impl Hosts {
     /// Dials a daemon and starts feeding its events into the shared stream.
     /// Attaching is fire-and-forget: the host appears immediately as
     /// `Connecting` and reports its own progress through the stream.
-    /// The caller is handed the id and the connection's command channel, so
-    /// that whoever keeps a copy of a host's state can be told about it
-    /// before a frame arrives. This crate does not know who that is.
+    /// `streams` is handed the new id and returns the streams the host
+    /// carries beside its control stream, opened again on every reconnect.
     pub fn attach(
         &mut self,
         name: String,
         target: AttachTarget,
-        cx: &App,
-    ) -> (HostId, crate::connection::Commands) {
+        streams: impl FnOnce(HostId) -> Vec<Arc<dyn HostStream>>,
+        runtime: &tokio::runtime::Handle,
+    ) -> HostId {
         let id = HostId(self.next_id);
         self.next_id += 1;
-        let connection = crate::connection::spawn(id, target.clone(), self.events.clone(), cx);
-        let commands = connection.commands();
+        let connection = crate::connection::spawn(
+            id,
+            target.clone(),
+            self.events.clone(),
+            streams(id),
+            runtime,
+        );
         self.hosts.push(Host {
             id,
             name,
@@ -133,7 +137,7 @@ impl Hosts {
             auth: None,
             connection,
         });
-        (id, commands)
+        id
     }
 
     /// Drops a host and tears its connection down. Surfaces and transcripts
@@ -201,20 +205,6 @@ impl Hosts {
     /// pick their own host later.
     pub fn any_online(&self) -> bool {
         self.hosts.iter().any(|host| host.status.is_online())
-    }
-
-    pub fn send(&self, host: HostId, message: ClientMessage) {
-        if let Some(connection) = self.connection(host) {
-            connection.send(message);
-        }
-    }
-
-    /// Sends the same command to every attached host. Used only for queries
-    /// whose answers the workspace merges, never for mutations.
-    pub fn broadcast(&self, message: impl Fn() -> ClientMessage) {
-        for host in &self.hosts {
-            host.connection.send(message());
-        }
     }
 
     /// Every host id, in the order they were added.
@@ -333,21 +323,28 @@ impl Hosts {
     pub fn set_quota_summaries(
         &mut self,
         host: HostId,
-        summaries: Vec<rho_ui_proto::QuotaSummary>,
+        summaries: Vec<rho_agent_host_proto::QuotaSummary>,
     ) {
         self.quota_summaries.insert(host, summaries);
     }
 
-    pub fn set_quota_history(&mut self, host: HostId, series: Vec<rho_ui_proto::QuotaSeries>) {
+    pub fn set_quota_history(
+        &mut self,
+        host: HostId,
+        series: Vec<rho_agent_host_proto::QuotaSeries>,
+    ) {
         self.quota_history.insert(host, series);
     }
 
-    pub fn quota_summaries_of(&self, host: HostId) -> Option<&[rho_ui_proto::QuotaSummary]> {
+    pub fn quota_summaries_of(
+        &self,
+        host: HostId,
+    ) -> Option<&[rho_agent_host_proto::QuotaSummary]> {
         self.quota_summaries.get(&host).map(Vec::as_slice)
     }
 
-    pub fn merged_quota_summaries(&self) -> Vec<rho_ui_proto::QuotaSummary> {
-        let mut merged: Vec<rho_ui_proto::QuotaSummary> = Vec::new();
+    pub fn merged_quota_summaries(&self) -> Vec<rho_agent_host_proto::QuotaSummary> {
+        let mut merged: Vec<rho_agent_host_proto::QuotaSummary> = Vec::new();
         for (host, summaries) in &self.quota_summaries {
             for summary in summaries {
                 let Some(namespace) = &summary.auth_namespace else {
@@ -385,8 +382,8 @@ impl Hosts {
 
     /// ChatGPT history is one line per host/namespace. Claude history keeps
     /// the previous tightest-host merge because it has no named auth scope.
-    pub fn merged_quota_history(&self) -> Vec<rho_ui_proto::QuotaSeries> {
-        let mut merged: Vec<rho_ui_proto::QuotaSeries> = Vec::new();
+    pub fn merged_quota_history(&self) -> Vec<rho_agent_host_proto::QuotaSeries> {
+        let mut merged: Vec<rho_agent_host_proto::QuotaSeries> = Vec::new();
         for (host, series_set) in &self.quota_history {
             for series in series_set {
                 if series.model == "gpt" {

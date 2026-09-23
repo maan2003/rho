@@ -10,7 +10,7 @@
 //! answers at that moment in whatever shape it judges best.
 //! `DECISION-pull-based-sources`.
 
-use rho_core::UnixMs;
+use rho_agent_host_proto::UnixMs;
 
 /// What a cell's wait controls asked for: how long the model is left alone,
 /// and whether the notebook may wake it sooner.

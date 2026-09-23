@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use rho_core::{
-    ContentPart, ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem,
-    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate, UnixMs,
-};
+use rho_agent_host_proto::{ContentPart, ToolOutputStatus, UnixMs};
 use rho_fs_view::PathOverrides;
+use rho_inference::types::{
+    ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem, ToolCallId, ToolName,
+    ToolOutput, ToolResult, ToolType, ToolUpdate,
+};
 use rho_tool_shell::ShellTools;
 use serde_json::json;
 use tokio::sync::Notify;
@@ -133,7 +134,7 @@ async fn history_is_a_lazy_read_only_snapshot_sequence() {
     let notebook = python(shell(), Vec::new());
     notebook.set_history(vec![
         Arc::new(ContextBlock::UserMessage {
-            sender: rho_core::MessageSender::User,
+            sender: rho_inference::types::MessageSender::User,
             content: vec![
                 ContentPart::Text {
                     text: "before".into(),
@@ -217,7 +218,7 @@ async fn history_preserves_tool_and_provider_transcript_fields() {
     notebook.set_history(vec![
         Arc::new(ContextBlock::InferenceResponse {
             items: vec![InferenceResponseItem::ToolCall {
-                provider_specific: Box::new(rho_core::UnknownProviderSpecificData {
+                provider_specific: Box::new(rho_inference::types::UnknownProviderSpecificData {
                     tag: "test.provider".into(),
                     body: bytes::Bytes::from_static(b"opaque-data"),
                 }),
@@ -244,8 +245,8 @@ async fn history_preserves_tool_and_provider_transcript_fields() {
                 },
                 started_at: UnixMs(10),
                 finished_at: UnixMs(20),
-                metadata: Some(rho_core::ToolResultMetadata::ApplyPatch(
-                    rho_core::ApplyPatchMetadata {
+                metadata: Some(rho_inference::types::ToolResultMetadata::ApplyPatch(
+                    rho_inference::types::ApplyPatchMetadata {
                         changes: Vec::new(),
                     },
                 )),

@@ -318,7 +318,7 @@ impl AgentPool {
     }
 
     pub async fn record_agent_usage(&self, agent_id: AgentId, mut usage: AgentUsageBucket) {
-        let now = rho_core::UnixMs::now().0;
+        let now = rho_agent_host_proto::UnixMs::now().0;
         usage.bucket_start_ms = now / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
         let mut pending = self.usage.lock().await;
         pending
@@ -559,7 +559,7 @@ impl AgentPool {
                 .clone();
             let loading = lock.lock_owned().await;
             write.create_agent(
-                rho_core::UnixMs::now(),
+                rho_agent_host_proto::UnixMs::now(),
                 agent_id,
                 display_name,
                 place,
@@ -1243,7 +1243,7 @@ mod tests {
                         crate::AgentEvent::Accepted(crate::QueuedInput {
                             kind: crate::InputKind::Message { content },
                             ..
-                        }) => Some(rho_core::text_content(&content)),
+                        }) => Some(rho_inference::types::text_content(&content)),
                         _ => None,
                     })
                     .collect::<Vec<_>>();

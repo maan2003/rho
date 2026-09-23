@@ -1,0 +1,851 @@
+//! The provider-neutral language of talking to a model: context blocks,
+//! requests, streamed events, tools and their results.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use rho_agent_host_proto::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+mod append_string;
+mod util;
+
+pub use self::append_string::{AStr, AppendString, Diff};
+use self::util::validated_string_type;
+
+senax_encoder::declare_senax_tagged_trait!(
+    pub trait ProviderSpecificData,
+    unknown = UnknownProviderSpecificData,
+);
+
+validated_string_type!(
+    /// Provider-issued identity of an exec, shared with its notebook cell and reports.
+    pub ExecId,
+    self::util::validate_identifier
+);
+
+/// Legacy protocol vocabulary; encoded identically to the exec identity.
+pub type ToolCallId = ExecId;
+
+validated_string_type!(
+    /// Name of a tool, shared by [`ToolSpec`] and the [`ToolCall`] that invokes it.
+    pub ToolName,
+    self::util::validate_identifier
+);
+
+validated_string_type!(
+    pub ProviderResponseId,
+    self::util::validate_identifier
+);
+
+validated_string_type!(
+    pub ProviderResponseItemId,
+    self::util::validate_identifier
+);
+
+/// Who authored a message entering an agent's context. Providers render both
+/// as user-role input; UIs render agent mail distinctly from user messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum MessageSender {
+    User,
+    Agent { id: AgentId },
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum ContextBlock {
+    // intentionally limiting to prevent misuse
+    UserMessage {
+        sender: MessageSender,
+        content: Vec<ContentPart>,
+    },
+    ToolResults {
+        results: Vec<ToolResult>,
+    },
+    /// An out-of-band extra output for an earlier tool call: the call's
+    /// result closes the call, updates annotate it while it (or work it
+    /// started) is still running.
+    ToolUpdate(ToolUpdate),
+    InferenceResponse {
+        items: Vec<InferenceResponseItem>,
+        provider_response_id: Option<ProviderResponseId>,
+    },
+    CompactionTrigger,
+    /// Activate a new provider window without deleting transcript history.
+    /// `retain_from` is an inclusive index into the complete block history
+    /// (including control blocks), no later than this block. Cutoffs may only
+    /// advance. This item emits no provider content and invalidates all
+    /// provider continuations established before it.
+    ContextRotation {
+        retain_from: u64,
+    },
+    /// Harness-authored context, distinct from user input and tool output.
+    DeveloperMessage {
+        text: String,
+    },
+    /// Remove completed tool exchanges from provider replay only. Original
+    /// blocks remain available in transcript history. Invalidates continuations
+    /// established before this item.
+    ToolHistoryEvicted {
+        call_ids: Vec<ToolCallId>,
+    },
+}
+
+/// Interpret harness-authored rotation items in complete, append-only history.
+/// Earlier blocks remain available for tool identity lookup, not model replay.
+/// Panics for invalid forward references or a cutoff that reopens discarded
+/// history: these are caller contract violations, not provider input.
+pub fn context_window_start(history: &[Arc<ContextBlock>]) -> usize {
+    let mut start = 0;
+    for (index, block) in history.iter().enumerate() {
+        if let ContextBlock::ContextRotation { retain_from } = &**block {
+            let next = usize::try_from(*retain_from).expect("context index fits usize");
+            assert!(
+                next >= start && next <= index,
+                "invalid context rotation boundary"
+            );
+            start = next;
+        }
+    }
+    start
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum InferenceResponseItem {
+    AssistantMessage {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        content: Vec<ContentPart>,
+        phase: Option<MessagePhase>,
+    },
+    ToolCall {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        id: ToolCallId,
+        name: ToolName,
+        tool_type: ToolType,
+        // arbitrary could be json!
+        arguments: String,
+    },
+    EncryptedReasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        summary: Vec<String>,
+    },
+    RawReasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        content: String,
+        summary: Vec<String>,
+    },
+    Compaction {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
+    Unknown {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
+}
+
+/// A decoded and normalized image suitable for provider input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
+pub struct ImageContent {
+    pub media_type: String,
+    pub data: Vec<u8>,
+    #[senax(default)]
+    pub detail: ImageDetail,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageDetail {
+    #[default]
+    High,
+    Original,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ToolSpec {
+    pub name: ToolName,
+    pub tool_type: ToolType,
+    pub description: String,
+    pub input_schema: Value,
+    pub format: Option<ToolFormat>,
+}
+
+/// The only model-issued action in either Rho runtime. Host operations remain
+/// independently callable inside its Python source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ExecCall {
+    pub id: ExecId,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ToolCall {
+    pub id: ToolCallId,
+    pub name: ToolName,
+    pub tool_type: ToolType,
+    // arbitrary could be json!
+    pub arguments: String,
+}
+
+/// Turn-local context available to tools without placing it in model-authored
+/// arguments. Tools should retain only the bounded parts they actually need.
+#[derive(Clone, Debug, Default)]
+pub struct ToolExecutionContext {
+    pub model: Arc<str>,
+    pub input: Arc<[Arc<ContextBlock>]>,
+    pub max_output_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ToolOutput {
+    /// Bounded rendering sent to the model verbatim.
+    pub output: Arc<String>,
+    /// Complete textual record for persistence and readers. `None` means the
+    /// model-facing output is already the complete record.
+    #[serde(default)]
+    #[senax(default)]
+    pub full_output: Option<Arc<String>>,
+    /// Typed image items sent to the model after the textual output.
+    #[senax(default)]
+    pub images: Arc<Vec<ImageContent>>,
+    /// Harness/UI metadata only; not included in the provider wire payload.
+    pub status: ToolOutputStatus,
+}
+
+impl ToolOutput {
+    pub fn recorded_output(&self) -> &str {
+        self.full_output.as_deref().unwrap_or(&self.output)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ToolResult {
+    /// Matches the [`ToolCall`] this result answers.
+    pub call_id: ToolCallId,
+    /// Wire shape for replaying this result to the provider.
+    pub tool_type: ToolType,
+    pub body: ToolOutput,
+    /// Historical call display start. Exec lifecycle observations are
+    /// authoritative.
+    pub started_at: UnixMs,
+    /// Historical first-result timestamp, not proof that Python or its jobs
+    /// finished.
+    pub finished_at: UnixMs,
+    /// Tool-specific UI/runtime metadata. Not sent to providers.
+    pub metadata: Option<ToolResultMetadata>,
+}
+
+/// Complete notebook contributions, independent of provider wire tool types.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum ExecOutput {
+    Reply {
+        id: ExecId,
+        body: ToolOutput,
+        first_block_at: UnixMs,
+        at: UnixMs,
+    },
+    Report {
+        id: ExecId,
+        body: ToolOutput,
+        at: UnixMs,
+    },
+}
+
+/// An extra output item for a tool call that has (or will have) its own
+/// result — a progress note, not an execution summary. Responses serializes
+/// updates as named standalone outputs without a provider call id; the local
+/// call id retains transcript attribution across compaction.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct ToolUpdate {
+    /// Status of this contribution when recorded natively; unknown on old
+    /// wire-only reports.
+    #[senax(default)]
+    pub status: Option<ToolOutputStatus>,
+    /// The [`ToolCall`] this update annotates.
+    pub call_id: ToolCallId,
+    /// Wire shape for replaying this update to the provider.
+    pub tool_type: ToolType,
+    pub output: Arc<String>,
+    /// Complete textual record when `output` is a bounded model view.
+    #[senax(default)]
+    pub full_output: Option<Arc<String>>,
+    /// When the tool emitted the update (a single instant; updates have no
+    /// duration).
+    pub at: UnixMs,
+    #[senax(default)]
+    pub images: Arc<Vec<ImageContent>>,
+}
+
+impl ToolUpdate {
+    pub fn recorded_output(&self) -> &str {
+        self.full_output.as_deref().unwrap_or(&self.output)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub enum ToolType {
+    Function,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolGrammarSyntax {
+    Lark,
+    Regex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolFormat {
+    Text,
+    Grammar {
+        syntax: ToolGrammarSyntax,
+        definition: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub enum ToolResultMetadata {
+    ApplyPatch(ApplyPatchMetadata),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ApplyPatchMetadata {
+    pub changes: Vec<ToolFileChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct ToolFileChange {
+    pub path: String,
+    pub status: ToolFileStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub enum ToolFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Moved,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InferenceRequest {
+    pub instructions: Arc<str>,
+    // arc is used to avoid cloning context blocks too much between requests
+    pub input: Vec<Arc<ContextBlock>>,
+    pub agent_id_labels: std::collections::BTreeMap<AgentId, Arc<str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum StreamingContextItem {
+    AssistantMessage {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        content: Vec<AStr>,
+        phase: Option<MessagePhase>,
+    },
+    ToolCall {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        id: ToolCallId,
+        name: ToolName,
+        tool_type: ToolType,
+        arguments: AStr,
+    },
+    RawReasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        content: AStr,
+        summary: Vec<AStr>,
+    },
+    EncryptedReasoning {
+        provider_specific: Box<dyn ProviderSpecificData>,
+        summary: Vec<AStr>,
+    },
+    Compaction {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
+    Unknown {
+        provider_specific: Box<dyn ProviderSpecificData>,
+    },
+}
+
+impl StreamingContextItem {
+    pub fn to_context_item(&self) -> anyhow::Result<InferenceResponseItem> {
+        Ok(match self {
+            StreamingContextItem::AssistantMessage {
+                provider_specific,
+                content,
+                phase,
+            } => InferenceResponseItem::AssistantMessage {
+                provider_specific: provider_specific.clone(),
+                content: content
+                    .iter()
+                    .map(|text| ContentPart::Text {
+                        text: text.to_string(),
+                    })
+                    .collect(),
+                phase: *phase,
+            },
+            StreamingContextItem::ToolCall {
+                provider_specific,
+                id,
+                name,
+                tool_type,
+                arguments,
+            } => InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific.clone(),
+                id: id.clone(),
+                name: name.clone(),
+                tool_type: *tool_type,
+                arguments: arguments.to_string(),
+            },
+            StreamingContextItem::RawReasoning {
+                provider_specific,
+                content,
+                summary,
+            } => InferenceResponseItem::RawReasoning {
+                provider_specific: provider_specific.clone(),
+                content: content.to_string(),
+                summary: summary.iter().map(AStr::to_string).collect(),
+            },
+            StreamingContextItem::EncryptedReasoning {
+                provider_specific,
+                summary,
+            } => InferenceResponseItem::EncryptedReasoning {
+                provider_specific: provider_specific.clone(),
+                summary: summary.iter().map(AStr::to_string).collect(),
+            },
+            StreamingContextItem::Compaction { provider_specific } => {
+                InferenceResponseItem::Compaction {
+                    provider_specific: provider_specific.clone(),
+                }
+            }
+            StreamingContextItem::Unknown { provider_specific } => InferenceResponseItem::Unknown {
+                provider_specific: provider_specific.clone(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum StreamingContextItemState {
+    Empty,
+    Pending(StreamingContextItem),
+    Finished(StreamingContextItem),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
+pub struct PendingInferenceResponse {
+    pub items: Vec<StreamingContextItemState>,
+}
+
+impl PendingInferenceResponse {
+    pub fn apply(&mut self, index: usize, event: ContextItemEvent) {
+        match event {
+            ContextItemEvent::Update(item) => {
+                if self.items.len() <= index {
+                    self.items
+                        .resize(index + 1, StreamingContextItemState::Empty);
+                }
+                self.items[index] = StreamingContextItemState::Pending(item);
+            }
+            // The slot already holds the final snapshot from the preceding
+            // `Update`; `Finish` just promotes it to `Finished`.
+            ContextItemEvent::Finish => {
+                if let Some(slot @ StreamingContextItemState::Pending(_)) =
+                    self.items.get_mut(index)
+                {
+                    let StreamingContextItemState::Pending(item) =
+                        std::mem::replace(slot, StreamingContextItemState::Empty)
+                    else {
+                        unreachable!()
+                    };
+                    *slot = StreamingContextItemState::Finished(item);
+                }
+            }
+        }
+    }
+
+    pub fn finish(&self) -> anyhow::Result<Vec<InferenceResponseItem>> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| match slot {
+                StreamingContextItemState::Empty => {
+                    anyhow::bail!("response is incomplete: gap at index {index}")
+                }
+                StreamingContextItemState::Pending(_) => {
+                    anyhow::bail!("response is incomplete: item at index {index} never finished")
+                }
+                StreamingContextItemState::Finished(item) => item.to_context_item(),
+            })
+            .collect()
+    }
+}
+
+/// A change to the pending item at some `output_index`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContextItemEvent {
+    /// The pending item advanced; carries its latest snapshot. The producer
+    /// accumulates into [`AppendString`] buffers and emits the whole refreshed
+    /// snapshot, so a single `Update` covers both first-sight and every
+    /// subsequent delta.
+    Update(StreamingContextItem),
+    /// No more updates will arrive for this index — the value is whatever the
+    /// last `Update` delivered. Lets a consumer act on a finished item (e.g.
+    /// dispatch a tool call) before the whole response completes.
+    Finish,
+}
+
+#[derive(Debug, Clone)]
+pub enum InferenceEvent {
+    /// Provider argument generation ended; not item completion or Python EOF.
+    ExecArgumentsFinished { id: ExecId },
+    ContextItem {
+        index: usize,
+        event: ContextItemEvent,
+    },
+    Finished {
+        usage: Option<TokenUsage>,
+        provider_response_id: Option<ProviderResponseId>,
+    },
+    /// Recoverable failure. With agent-owned retries the attempt is over;
+    /// the caller must rebuild context and schedule another request.
+    /// Other sessions may retry internally at `retrying_at`.
+    TemporaryFailure {
+        error: Arc<anyhow::Error>,
+        retrying_at: Instant,
+    },
+    /// We have sent the request
+    RequestSent,
+    /// server has started sending tokens
+    StreamingStarted,
+    /// turn has failed due to some reason
+    /// Not automatically retryable.
+    Failed {
+        // TODO: specific error message if needed if future
+        error: Arc<anyhow::Error>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Concatenate the text parts of a message.
+pub fn text_content(parts: &[ContentPart]) -> String {
+    let mut output = String::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text } => output.push_str(text),
+            ContentPart::Image { media_type, .. } => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(match media_type.as_str() {
+                    "image/png" => "[image: PNG]",
+                    "image/jpeg" => "[image: JPEG]",
+                    "image/webp" => "[image: WebP]",
+                    "image/gif" => "[image: GIF]",
+                    _ => "[image]",
+                });
+            }
+        }
+    }
+    output
+}
+
+impl From<ToolType> for rho_agent_host_proto::transcript::ArgumentsFormat {
+    fn from(tool_type: ToolType) -> Self {
+        match tool_type {
+            ToolType::Function => Self::Json,
+            ToolType::Custom => Self::Text,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_rotation_is_an_append_only_window_boundary() {
+        let mut history = vec![
+            Arc::new(ContextBlock::DeveloperMessage { text: "old".into() }),
+            Arc::new(ContextBlock::DeveloperMessage {
+                text: "early marker".into(),
+            }),
+        ];
+        assert_eq!(context_window_start(&history), 0);
+        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
+        assert_eq!(context_window_start(&history), 1);
+        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 2 }));
+        assert_eq!(context_window_start(&history), 2);
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid context rotation boundary")]
+    fn rotation_rejects_forward_references() {
+        context_window_start(&[Arc::new(ContextBlock::ContextRotation { retain_from: 1 })]);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid context rotation boundary")]
+    fn rotation_cannot_reopen_discarded_history() {
+        context_window_start(&[
+            Arc::new(ContextBlock::DeveloperMessage { text: "old".into() }),
+            Arc::new(ContextBlock::ContextRotation { retain_from: 1 }),
+            Arc::new(ContextBlock::ContextRotation { retain_from: 0 }),
+        ]);
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    struct TestProviderSpecificData {
+        item_id: String,
+    }
+
+    senax_encoder::register_senax_tagged!(
+        trait = ProviderSpecificData,
+        type = TestProviderSpecificData,
+        tag = "rho-core-test.provider-data",
+    );
+
+    fn test_provider_specific_data() -> Box<dyn ProviderSpecificData> {
+        Box::new(TestProviderSpecificData {
+            item_id: "item_1".to_owned(),
+        })
+    }
+
+    #[test]
+    fn tool_output_without_images_decodes_from_legacy_shape() {
+        #[derive(Encode)]
+        struct LegacyToolOutput {
+            output: Arc<String>,
+            status: ToolOutputStatus,
+        }
+
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(
+            &LegacyToolOutput {
+                output: Arc::new("done".to_owned()),
+                status: ToolOutputStatus::Success,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded = <ToolOutput as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded.output.as_str(), "done");
+        assert!(decoded.full_output.is_none());
+        assert!(decoded.images.is_empty());
+        assert_eq!(decoded.status, ToolOutputStatus::Success);
+    }
+
+    #[test]
+    fn tool_output_round_trips_its_complete_record() {
+        let output = ToolOutput {
+            output: Arc::new("bounded".to_owned()),
+            full_output: Some(Arc::new("complete".to_owned())),
+            images: Arc::new(Vec::new()),
+            status: ToolOutputStatus::Success,
+        };
+
+        let mut encoded = senax_encoder::encode(&output).unwrap();
+        let decoded = senax_encoder::decode::<ToolOutput>(&mut encoded).unwrap();
+        assert_eq!(decoded, output);
+        assert_eq!(decoded.recorded_output(), "complete");
+    }
+
+    #[test]
+    fn tool_update_without_complete_record_decodes_from_legacy_shape() {
+        #[derive(Encode)]
+        struct LegacyToolUpdate {
+            call_id: ToolCallId,
+            tool_type: ToolType,
+            output: Arc<String>,
+            at: UnixMs,
+        }
+
+        let mut encoded = senax_encoder::encode(&LegacyToolUpdate {
+            call_id: "call-1".try_into().unwrap(),
+            tool_type: ToolType::Custom,
+            output: Arc::new("done".to_owned()),
+            at: UnixMs(1),
+        })
+        .unwrap();
+        let decoded = senax_encoder::decode::<ToolUpdate>(&mut encoded).unwrap();
+        assert_eq!(decoded.output.as_str(), "done");
+        assert_eq!(decoded.status, None);
+        assert!(decoded.full_output.is_none());
+    }
+
+    #[test]
+    fn tool_call_id_converts_and_borrows_as_str() {
+        let from_str = ToolCallId::try_from("call-1").unwrap();
+        assert_eq!(from_str.as_ref(), "call-1");
+
+        let arc: Arc<str> = Arc::from("call-2");
+        let from_arc = ToolCallId::try_from(arc.clone()).unwrap();
+        assert_eq!(from_arc.as_str(), "call-2");
+    }
+
+    #[test]
+    fn validated_string_type_rejects_invalid_characters() {
+        let error = ToolName::try_from("bad name").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid character"),
+            "unexpected error: {error}"
+        );
+        assert!(ToolCallId::try_from("").is_err());
+    }
+
+    #[test]
+    fn validated_string_type_validates_on_deserialize() {
+        let ok: ToolName = serde_json::from_str("\"shell_command\"").unwrap();
+        assert_eq!(ok.as_str(), "shell_command");
+
+        let err = serde_json::from_str::<ToolName>("\"bad name\"").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid character"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn pending_message(text: &str) -> StreamingContextItem {
+        StreamingContextItem::AssistantMessage {
+            provider_specific: test_provider_specific_data(),
+            content: vec![AStr::from(text)],
+            phase: None,
+        }
+    }
+
+    fn message_item(text: &str) -> InferenceResponseItem {
+        InferenceResponseItem::AssistantMessage {
+            provider_specific: test_provider_specific_data(),
+            content: vec![ContentPart::Text {
+                text: text.to_owned(),
+            }],
+            phase: None,
+        }
+    }
+
+    #[test]
+    fn apply_keeps_latest_snapshot_per_index() {
+        let mut response = PendingInferenceResponse::default();
+
+        // Each streamed snapshot supersedes the previous one for that index;
+        // there is no accumulation here, the producer already did it.
+        response.apply(0, ContextItemEvent::Update(pending_message("hel")));
+        response.apply(0, ContextItemEvent::Update(pending_message("hello")));
+        response.apply(0, ContextItemEvent::Finish);
+
+        assert_eq!(response.finish().unwrap(), vec![message_item("hello")]);
+    }
+
+    #[test]
+    fn finish_event_marks_slot_without_disturbing_snapshot() {
+        let mut response = PendingInferenceResponse::default();
+
+        response.apply(0, ContextItemEvent::Update(pending_message("done")));
+        assert_eq!(
+            response.items[0],
+            StreamingContextItemState::Pending(pending_message("done"))
+        );
+
+        // `Finish` promotes the slot but leaves the snapshot untouched.
+        response.apply(0, ContextItemEvent::Finish);
+        assert_eq!(
+            response.items[0],
+            StreamingContextItemState::Finished(pending_message("done"))
+        );
+
+        assert_eq!(response.finish().unwrap(), vec![message_item("done")]);
+    }
+
+    #[test]
+    fn finalizes_unknown_provider_item() {
+        let mut response = PendingInferenceResponse::default();
+
+        response.apply(
+            0,
+            ContextItemEvent::Update(StreamingContextItem::Unknown {
+                provider_specific: test_provider_specific_data(),
+            }),
+        );
+        response.apply(0, ContextItemEvent::Finish);
+
+        assert_eq!(
+            response.finish().unwrap(),
+            vec![InferenceResponseItem::Unknown {
+                provider_specific: test_provider_specific_data()
+            }]
+        );
+    }
+
+    #[test]
+    fn finish_collects_items_in_index_order() {
+        let mut response = PendingInferenceResponse::default();
+
+        response.apply(0, ContextItemEvent::Update(pending_message("hi")));
+        response.apply(
+            1,
+            ContextItemEvent::Update(StreamingContextItem::ToolCall {
+                provider_specific: test_provider_specific_data(),
+                id: ToolCallId::try_from("call-1").unwrap(),
+                name: ToolName::try_from("shell").unwrap(),
+                tool_type: ToolType::Function,
+                arguments: AStr::from(r#"{"cmd":"ls"}"#),
+            }),
+        );
+        response.apply(0, ContextItemEvent::Finish);
+        response.apply(1, ContextItemEvent::Finish);
+
+        assert_eq!(
+            response.finish().unwrap(),
+            vec![
+                message_item("hi"),
+                InferenceResponseItem::ToolCall {
+                    provider_specific: test_provider_specific_data(),
+                    id: ToolCallId::try_from("call-1").unwrap(),
+                    name: ToolName::try_from("shell").unwrap(),
+                    tool_type: ToolType::Function,
+                    arguments: r#"{"cmd":"ls"}"#.to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_rejects_item_without_finish() {
+        let mut response = PendingInferenceResponse::default();
+
+        // Updated but never signalled finished.
+        response.apply(0, ContextItemEvent::Update(pending_message("partial")));
+
+        let error = response.finish().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "response is incomplete: item at index 0 never finished"
+        );
+    }
+
+    #[test]
+    fn finish_rejects_absent_gap() {
+        let mut response = PendingInferenceResponse::default();
+
+        // Only index 1 is filled; index 0 stays a gap.
+        response.apply(
+            1,
+            ContextItemEvent::Update(StreamingContextItem::Unknown {
+                provider_specific: test_provider_specific_data(),
+            }),
+        );
+
+        let error = response.finish().unwrap_err();
+        assert_eq!(error.to_string(), "response is incomplete: gap at index 0");
+    }
+}

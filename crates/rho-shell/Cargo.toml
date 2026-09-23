@@ -14,7 +14,7 @@ brush-builtins.workspace = true
 brush-core.workspace = true
 libc.workspace = true
 rand.workspace = true
-rho-shell-proto.workspace = true
+rho-agent-host-proto.workspace = true
 rustix-openpty.workspace = true
 tokio.workspace = true
 

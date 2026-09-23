@@ -6,8 +6,12 @@
 
 use std::time::Duration;
 
-use rho_ui_proto::term::{ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, WireScreen};
-use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, StartMode, read_frame, write_frame};
+use rho_agent_host_proto::term::{
+    ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalOpen, WireScreen,
+};
+use rho_agent_host_proto::{
+    AgentCommand, AgentId, Open, Opened, Reply, Request, StartMode, read_frame, write_frame,
+};
 
 fn main() -> anyhow::Result<()> {
     let unshare = std::process::Command::new("unshare")
@@ -75,39 +79,33 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
         extra_before_path: None,
         extra_after_path: None,
     }));
-    let mut control = loop {
+    loop {
         match rho_rpc::connect_unix(&socket_path).await {
-            Ok(stream) => break stream,
+            Ok(_) => break,
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
-    };
+    }
 
     // Create an agent on a clone of the temp repository.
-    write_frame(&mut control, &ClientMessage::Subscribe).await?;
-    let ServerMessage::Ready { .. } =
-        tokio::time::timeout(Duration::from_secs(30), read_frame(&mut control)).await??
-    else {
-        panic!("daemon did not greet with Ready");
-    };
-    write_frame(
-        &mut control,
-        &ClientMessage::NewAgent {
-            role: Default::default(),
-            start: StartMode::NewOn {
-                repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
-                revset: "@".to_owned(),
-            },
-            mode: rho_ui_proto::WorksetMode::View,
-            content: None,
-        },
+    let created = tokio::time::timeout(
+        Duration::from_secs(30),
+        rho_agent_host_proto::client::request(
+            &socket_path,
+            Request::Agent(AgentCommand::New {
+                role: Default::default(),
+                start: StartMode::NewOn {
+                    repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
+                    revset: "@".to_owned(),
+                },
+                mode: rho_agent_host_proto::WorksetMode::View,
+                content: None,
+            }),
+        ),
     )
-    .await?;
-    let agent_id = loop {
-        match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut control)).await?? {
-            ServerMessage::AgentCreated { agent_id, .. } => break agent_id,
-            ServerMessage::Error { message } => panic!("agent creation failed: {message}"),
-            _ => {}
-        }
+    .await??;
+    let agent_id = match created {
+        Reply::AgentCreated { agent_id } => agent_id,
+        other => panic!("agent creation failed: {other:?}"),
     };
 
     // Attaching before anything was created must be refused.
@@ -125,16 +123,14 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     wait_for_line(&mut stream, "e2e-done").await?;
 
     // The listing sees the running terminal.
-    let mut list = rho_rpc::connect_unix(&socket_path).await?;
-    write_frame(
-        &mut list,
-        &ClientMessage::TerminalList {
+    let list = rho_agent_host_proto::client::request(
+        &socket_path,
+        Request::TerminalList {
             agent: Some(agent_id.encoded()),
         },
-    )
-    .await?;
-    match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut list)).await?? {
-        ServerMessage::TerminalList { terminals } => {
+    );
+    match tokio::time::timeout(Duration::from_secs(30), list).await?? {
+        Reply::TerminalList { terminals } => {
             assert_eq!(terminals.len(), 1, "one terminal should be running");
             assert_eq!(terminals[0].terminal_id, 7);
             assert_eq!(terminals[0].clients, 1);
@@ -160,27 +156,21 @@ async fn open_terminal(
     create: bool,
 ) -> anyhow::Result<rho_rpc::Stream> {
     let mut stream = rho_rpc::connect_unix(socket_path).await?;
-    let open = if create {
-        ClientMessage::TerminalCreate {
-            agent: agent_id.encoded(),
-            terminal_id: 7,
-            attach: true,
-            cols: 80,
-            rows: 24,
-        }
-    } else {
-        ClientMessage::TerminalAttach {
-            agent: agent_id.encoded(),
-            terminal_id: 7,
-            cols: 80,
-            rows: 24,
-        }
+    let open = Open::Terminal {
+        agent: agent_id.encoded(),
+        terminal_id: 7,
+        open: if create {
+            TerminalOpen::Create { attach: true }
+        } else {
+            TerminalOpen::Attach
+        },
+        cols: 80,
+        rows: 24,
     };
     write_frame(&mut stream, &open).await?;
     match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream)).await?? {
-        ServerMessage::TerminalOpened { .. } => Ok(stream),
-        ServerMessage::TerminalRefused { reason } => anyhow::bail!("refused: {reason}"),
-        other => panic!("unexpected handshake reply: {other:?}"),
+        Opened::Ready => Ok(stream),
+        Opened::Refused { reason } => anyhow::bail!("refused: {reason}"),
     }
 }
 

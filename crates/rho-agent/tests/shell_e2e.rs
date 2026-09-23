@@ -8,8 +8,8 @@ use std::sync::Arc;
 mod common;
 
 use rho_agent::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
-use rho_ui_proto::AgentId;
-use rho_ui_proto::shell::{ShellColor, ShellServerFrame};
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::shell::{ShellColor, ShellServerFrame};
 
 /// This binary is the sidecar when started with this argument.
 const CHILD_FLAG: &str = "--rho-shell-child";
@@ -60,7 +60,7 @@ async fn shell_end_to_end_over_registry(
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].agent_id, agent_id);
     assert_eq!(entries[0].clients, 1);
-    let mut first_state = rho_ui_proto::shell::ShellState::default();
+    let mut first_state = rho_agent_host_proto::shell::ShellState::default();
 
     let initial_token = "shell-e2e-23";
     let initial_command = shell_token(initial_token);
@@ -221,15 +221,15 @@ async fn shell_end_to_end_over_registry(
 
     let line_token = "line-limit-ok";
     let long_line = format!("{} #{}", shell_token(line_token), "x".repeat(8192));
-    assert!(rho_ui_proto::shell::command_fits(&long_line));
+    assert!(rho_agent_host_proto::shell::command_fits(&long_line));
     first.submit.send(long_line).await.unwrap();
     wait_for_text(&mut first, &mut first_state, line_token).await;
 
     let too_long = format!(
         "touch oversized-command-ran #{}",
-        "x".repeat(rho_ui_proto::shell::MAX_COMMAND_BYTES)
+        "x".repeat(rho_agent_host_proto::shell::MAX_COMMAND_BYTES)
     );
-    assert!(!rho_ui_proto::shell::command_fits(&too_long));
+    assert!(!rho_agent_host_proto::shell::command_fits(&too_long));
     assert!(first.submit.send(too_long).await.is_err());
     let after_oversized_token = "after-oversized-ok";
     first
@@ -268,7 +268,7 @@ async fn shell_end_to_end_over_registry(
     // A later attachment receives the canonical structured snapshot.
     let mut second = registry.attach(agent_id).await.unwrap();
     assert_eq!(registry.list().await[0].clients, 2);
-    let mut second_state = rho_ui_proto::shell::ShellState::default();
+    let mut second_state = rho_agent_host_proto::shell::ShellState::default();
     wait_for_text(&mut second, &mut second_state, initial_token).await;
     assert_eq!(second_state, first_state);
 
@@ -301,7 +301,7 @@ async fn shell_end_to_end_over_registry(
     assert!(final_execution.output.contains(final_token));
     assert_eq!(
         final_execution.state,
-        rho_ui_proto::shell::ShellExecutionState::Finished { status: 7 }
+        rho_agent_host_proto::shell::ShellExecutionState::Finished { status: 7 }
     );
     drop(exit);
     assert_eq!(
@@ -379,7 +379,7 @@ async fn wait_for_idle(client: &ShellClient) {
 
 async fn wait_for_text(
     client: &mut ShellClient,
-    state: &mut rho_ui_proto::shell::ShellState,
+    state: &mut rho_agent_host_proto::shell::ShellState,
     needle: &str,
 ) {
     if render_state(state).contains(needle) {
@@ -402,15 +402,15 @@ async fn wait_for_text(
 
 async fn wait_for_running(
     client: &mut ShellClient,
-    state: &mut rho_ui_proto::shell::ShellState,
+    state: &mut rho_agent_host_proto::shell::ShellState,
     execution: u64,
 ) {
-    let running = |state: &rho_ui_proto::shell::ShellState| {
+    let running = |state: &rho_agent_host_proto::shell::ShellState| {
         state.executions.iter().any(|block| {
             block.execution == execution
                 && matches!(
                     block.state,
-                    rho_ui_proto::shell::ShellExecutionState::Running
+                    rho_agent_host_proto::shell::ShellExecutionState::Running
                 )
         })
     };
@@ -431,15 +431,15 @@ async fn wait_for_running(
 
 async fn wait_for_finished(
     client: &mut ShellClient,
-    state: &mut rho_ui_proto::shell::ShellState,
+    state: &mut rho_agent_host_proto::shell::ShellState,
     execution: u64,
 ) {
-    let finished = |state: &rho_ui_proto::shell::ShellState| {
+    let finished = |state: &rho_agent_host_proto::shell::ShellState| {
         state.executions.iter().any(|block| {
             block.execution == execution
                 && matches!(
                     block.state,
-                    rho_ui_proto::shell::ShellExecutionState::Finished { .. }
+                    rho_agent_host_proto::shell::ShellExecutionState::Finished { .. }
                 )
         })
     };
@@ -458,8 +458,8 @@ async fn wait_for_finished(
     .expect("execution did not finish");
 }
 
-fn apply_test_frame(state: &mut rho_ui_proto::shell::ShellState, frame: ShellServerFrame) {
-    use rho_ui_proto::shell::ShellExecutionState;
+fn apply_test_frame(state: &mut rho_agent_host_proto::shell::ShellState, frame: ShellServerFrame) {
+    use rho_agent_host_proto::shell::ShellExecutionState;
     match frame {
         ShellServerFrame::Snapshot { state: snapshot } => *state = snapshot,
         ShellServerFrame::ExecutionQueued { execution } => {
@@ -549,12 +549,12 @@ fn apply_test_frame(state: &mut rho_ui_proto::shell::ShellState, frame: ShellSer
     }
 }
 
-fn render_state(state: &rho_ui_proto::shell::ShellState) -> String {
+fn render_state(state: &rho_agent_host_proto::shell::ShellState) -> String {
     let mut text = state.terminal_output.clone();
     for execution in &state.executions {
         if matches!(
             execution.state,
-            rho_ui_proto::shell::ShellExecutionState::Queued
+            rho_agent_host_proto::shell::ShellExecutionState::Queued
         ) {
             continue;
         }

@@ -13,7 +13,7 @@ use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockSt
 use gpui::prelude::*;
 use gpui::{App, FontWeight, HighlightStyle, Hsla, div};
 use multi_buffer::Anchor;
-use rho_core::ContentPart;
+use rho_agent_host_proto::ContentPart;
 use theme::ActiveTheme as _;
 
 /// How much larger a user message renders than everything around it.

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_core::AgentId;
+use rho_agent_host_proto::AgentId;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::mpsc;
@@ -78,7 +78,7 @@ impl Services {
         // statements ran. Record only that coarse lifecycle fact.
         let mut write = self.db.write().await;
         write.tell_turn(
-            rho_core::UnixMs::now(),
+            rho_agent_host_proto::UnixMs::now(),
             self.agent,
             TurnEdge::Ended(TurnOutcome::Errored { message: error }),
         );
@@ -87,7 +87,7 @@ impl Services {
             pool.settle_turn(self.agent).await;
             if pool.is_live(self.agent) {
                 for live in crate::live::Teller::default().tell(&status.kind) {
-                    crate::mirror::tell_live(&self.db, self.agent, live);
+                    crate::transcript::tell_live(&self.db, self.agent, live);
                 }
             }
         }
@@ -178,10 +178,10 @@ impl Services {
                                     if let Some(queue) = queue
                                         && let Some(live) = teller.tell_queue(&queue)
                                     {
-                                        crate::mirror::tell_live(&self.db, self.agent, live);
+                                        crate::transcript::tell_live(&self.db, self.agent, live);
                                     }
                                     for live in teller.tell(&status.kind) {
-                                        crate::mirror::tell_live(&self.db, self.agent, live);
+                                        crate::transcript::tell_live(&self.db, self.agent, live);
                                     }
                                 } else {
                                     teller.reset();
@@ -436,7 +436,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::UnixMs;
+    use rho_agent_host_proto::UnixMs;
 
     use super::*;
     use crate::AgentEvent;

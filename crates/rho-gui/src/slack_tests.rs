@@ -3070,7 +3070,7 @@ async fn workspace_with_slack(
 async fn wait_for_reasons(
     cx: &mut TestAppContext,
     workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
-    wanted: &[rho_desk::cells::SlackUnit],
+    wanted: &[rho_agent_host_proto::desk::cells::SlackUnit],
 ) {
     for _ in 0..300 {
         cx.run_until_parked();
@@ -3090,8 +3090,8 @@ async fn wait_for_reasons(
     panic!("the fake's units never asked for the reader");
 }
 
-fn slack_unit(channel: &str, thread: Option<&str>) -> rho_desk::cells::SlackUnit {
-    rho_desk::cells::SlackUnit {
+fn slack_unit(channel: &str, thread: Option<&str>) -> rho_agent_host_proto::desk::cells::SlackUnit {
+    rho_agent_host_proto::desk::cells::SlackUnit {
         workspace: "acme".to_owned(),
         channel: channel.to_owned(),
         thread: thread.map(str::to_owned),
@@ -3101,7 +3101,7 @@ fn slack_unit(channel: &str, thread: Option<&str>) -> rho_desk::cells::SlackUnit
 fn reason_of(
     workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
     cx: &mut TestAppContext,
-    unit: &rho_desk::cells::SlackUnit,
+    unit: &rho_agent_host_proto::desk::cells::SlackUnit,
 ) -> Option<rho_slack::model::Attention> {
     workspace
         .update(cx, |workspace, _, cx| {
@@ -3236,16 +3236,16 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
 
     let closed = workspace
         .update(cx, |workspace, window, cx| {
-            let cursor = |ts: &str| rho_desk::cells::SlackTs(ts.to_owned());
+            let cursor = |ts: &str| rho_agent_host_proto::desk::cells::SlackTs(ts.to_owned());
             workspace.mark_cards_done(
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 vec![
                     (
-                        rho_desk::cells::Id::Slack(direct.clone()),
+                        rho_agent_host_proto::desk::cells::Id::Slack(direct.clone()),
                         cursor("1800000100.000000"),
                     ),
                     (
-                        rho_desk::cells::Id::Slack(mention.clone()),
+                        rho_agent_host_proto::desk::cells::Id::Slack(mention.clone()),
                         cursor("1800000200.000000"),
                     ),
                 ],
@@ -3308,19 +3308,19 @@ fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppCo
     let asking = desk.thread_row(None, "C1", "500.0");
     // Stale: no source, and one cell, the cursor a version of rho before
     // 8 Sep wrote when the user pressed `d`.
-    let stale = rho_desk::cells::Id::Slack(slack_unit("C2", Some("300.0")));
+    let stale = rho_agent_host_proto::desk::cells::Id::Slack(slack_unit("C2", Some("300.0")));
     desk.set(
         stale.clone(),
-        rho_desk::cells::Property::SlackHandledThrough(rho_desk::cells::SlackTs(
-            "300.5".to_owned(),
-        )),
+        rho_agent_host_proto::desk::cells::Property::SlackHandledThrough(
+            rho_agent_host_proto::desk::cells::SlackTs("300.5".to_owned()),
+        ),
     );
     // Named: no source either, but the name is a fact Slack has nowhere to
     // keep, so the unit is a node of rho's own.
-    let named = rho_desk::cells::Id::Slack(slack_unit("C3", Some("400.0")));
+    let named = rho_agent_host_proto::desk::cells::Id::Slack(slack_unit("C3", Some("400.0")));
     desk.set(
         named.clone(),
-        rho_desk::cells::Property::Name("the release".to_owned()),
+        rho_agent_host_proto::desk::cells::Property::Name("the release".to_owned()),
     );
 
     let workspace = test_workspace(cx);
@@ -3328,20 +3328,20 @@ fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppCo
         .update(cx, |workspace, window, cx| {
             crate::tests::story::feed(
                 workspace,
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 desk.synced(),
                 window,
                 cx,
             );
             workspace.set_slack_sources_for_test(
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 desk.slack_sources(),
                 window,
                 cx,
             );
             let rows = workspace
-                .desk_cells
-                .nodes(rho_agents::HostId::default())
+                .desk
+                .nodes(rho_agents_client::HostId::default())
                 .iter()
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
@@ -3550,7 +3550,7 @@ async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
         .update(cx, |workspace, window, cx| {
             crate::tests::story::feed(
                 workspace,
-                rho_agents::HostId::default(),
+                rho_agents_client::HostId::default(),
                 desk.synced(),
                 window,
                 cx,
@@ -3633,17 +3633,17 @@ async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
 /// what the other host holds, and the second host draws no row of its own.
 #[gpui::test]
 fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut TestAppContext) {
-    let owner = rho_agents::HostId::default();
-    let other = rho_agents::HostId(1);
+    let owner = rho_agents_client::HostId::default();
+    let other = rho_agents_client::HostId(1);
     let unit = slack_unit("C1", None);
-    let id = rho_desk::cells::Id::Slack(unit.clone());
+    let id = rho_agent_host_proto::desk::cells::Id::Slack(unit.clone());
 
     // What the write made while the owner was away left behind: a name is a
     // fact Slack has nowhere to keep, so it is the unit's own row.
     let mut elsewhere = crate::tests::DeskFixture::new();
     elsewhere.set(
         id.clone(),
-        rho_desk::cells::Property::Name("the release".to_owned()),
+        rho_agent_host_proto::desk::cells::Property::Name("the release".to_owned()),
     );
     let here = crate::tests::DeskFixture::new();
 
@@ -3657,10 +3657,12 @@ fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut Test
 
             let rows = |host| {
                 workspace
-                    .desk_cells
+                    .desk
                     .nodes(host)
                     .iter()
-                    .filter(|node| matches!(node.id, rho_desk::cells::Id::Slack(_)))
+                    .filter(|node| {
+                        matches!(node.id, rho_agent_host_proto::desk::cells::Id::Slack(_))
+                    })
                     .map(|node| (node.id.clone(), node.name.clone()))
                     .collect::<Vec<_>>()
             };
@@ -3675,7 +3677,7 @@ fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut Test
             );
             assert_eq!(
                 workspace
-                    .desk_cells
+                    .desk
                     .facts_of_slack_unit(Some(owner), &unit)
                     .and_then(|facts| facts.name),
                 Some("the release".to_owned()),
@@ -3694,7 +3696,7 @@ fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut Test
 fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return(
     cx: &mut TestAppContext,
 ) {
-    let host = rho_agents::HostId::default();
+    let host = rho_agents_client::HostId::default();
     let mut desk = crate::tests::DeskFixture::new();
     let node = desk.thread_row(None, "C1", "500.0");
     let unit = slack_unit("C1", Some("500.0"));
@@ -3709,10 +3711,10 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
                 workspace.apply_verdict_for_test(
                     host,
                     &node,
-                    crate::desk_view::DeskVerdict::Defer {
-                        until: rho_desk::cells::Timestamp {
+                    rho_desk_client::desk::DeskVerdict::Defer {
+                        until: rho_agent_host_proto::desk::cells::Timestamp {
                             unix_ms: 4_000_000_000_000,
-                            precision: rho_desk::cells::TimestampPrecision::Day,
+                            precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
                         },
                     },
                     window,
@@ -3722,12 +3724,12 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
             );
             assert!(
                 workspace
-                    .desk_cells
+                    .desk
                     .facts_of_slack_unit(Some(host), &unit)
                     .is_some_and(|facts| facts.defer_until.is_some()),
                 "it is in the owner's own replica while the owner is away"
             );
-            workspace.take_host_messages_for_test(host);
+            workspace.clear_sent_for_test(host);
 
             // The owner returns and says where it stands, which is before
             // the write.
@@ -3735,10 +3737,10 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
             crate::tests::story::feed(workspace, host, desk.synced(), window, cx);
             assert!(
                 workspace
-                    .take_host_messages_for_test(host)
+                    .take_desk_frames_for_test(host)
                     .iter()
-                    .any(|message| match message {
-                        rho_ui_proto::ClientMessage::DeskCellsApply { cells } =>
+                    .any(|frame| match frame {
+                        rho_agent_host_proto::desk::stream::ClientFrame::CellsApply { cells } =>
                             cells.cells.iter().any(|cell| cell.id == node),
                         _ => false,
                     }),

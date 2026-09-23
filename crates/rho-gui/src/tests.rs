@@ -11,13 +11,13 @@ use gpui::{
     point, px, size,
 };
 use language::InlayId;
-use rho_agents::state::{
+use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
+use rho_agent_host_proto::{AgentId, UnixMs};
+use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
-use rho_core::UnixMs;
+use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 use rho_hosts::connection::ConnEvent;
-use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
@@ -48,7 +48,7 @@ mod syntax_parsed_in_frame;
 mod tool_output_not_drawn;
 mod wrap_rows;
 mod wrap_under_tab;
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
@@ -434,7 +434,7 @@ fn a_fold_placeholder_wears_the_buffer_s_face(cx: &mut TestAppContext) {
         let buffer_font = theme_settings::ThemeSettings::get_global(cx)
             .buffer_font
             .clone();
-        let mut row = rho_agents::transcript::elisions::elision_row("2 tools", cx);
+        let mut row = rho_agents_view::transcript::elisions::elision_row("2 tools", cx);
         let style = gpui::Styled::text_style(&mut row);
         assert_eq!(style.font_family, Some(buffer_font.family));
     });
@@ -832,11 +832,9 @@ fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext)
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             assert_eq!(
-                workspace
-                    .desk_cells
-                    .row_after_delete(HostId::default(), &first),
+                workspace.desk.row_after_delete(HostId::default(), &first),
                 Some(second)
             );
         })
@@ -907,7 +905,7 @@ fn a_snooze_lands_on_its_unit_and_says_the_time() {
     );
     assert_eq!(
         at.precision,
-        rho_desk::cells::TimestampPrecision::Millisecond
+        rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond
     );
     assert_eq!(said, "snooze until 15:15");
 
@@ -920,7 +918,10 @@ fn a_snooze_lands_on_its_unit_and_says_the_time() {
 
     // Days and weeks land on a date, as a defer always has.
     let (at, said) = snooze_target(SnoozeUnit::Days, 2, now);
-    assert_eq!(at.precision, rho_desk::cells::TimestampPrecision::Day);
+    assert_eq!(
+        at.precision,
+        rho_agent_host_proto::desk::cells::TimestampPrecision::Day
+    );
     assert_eq!(said, "snooze until Sat 5 Sep");
     let (_, said) = snooze_target(SnoozeUnit::Weeks, 1, now);
     assert_eq!(said, "snooze until Thu 10 Sep");
@@ -1010,13 +1011,13 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     // The daemon validates the log entry against exactly these three
     // changes, and rejects the whole mutation otherwise: a todo that only
     // logged the new note's arrival never reached the tree.
-    use rho_desk::cells::{Property, PropertyKey};
+    use rho_agent_host_proto::desk::cells::{Property, PropertyKey};
 
     let mut desk = DeskFixture::new();
     let note = desk.note(None, "Named card");
-    let woke = rho_desk::cells::Timestamp {
+    let woke = rho_agent_host_proto::desk::cells::Timestamp {
         unix_ms: 1_577_836_800_000,
-        precision: rho_desk::cells::TimestampPrecision::Day,
+        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
     };
     desk.set(note.clone(), Property::DeferUntil(Some(woke)));
     desk.set(note.clone(), Property::PaceDays(1));
@@ -1026,7 +1027,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -1038,7 +1039,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("todo mutation");
             let Some((
                 verdict_node,
-                rho_desk::cells::VerdictEvent::Applied {
+                rho_agent_host_proto::desk::cells::VerdictEvent::Applied {
                     verdict, changes, ..
                 },
             )) = mutation.verdict.clone()
@@ -1046,7 +1047,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
                 panic!("the todo verdict did not log an applied entry");
             };
             assert_eq!(verdict_node, note, "the entry hangs off the dealt heading");
-            let rho_desk::cells::Verdict::Todo { note: created } = verdict else {
+            let rho_agent_host_proto::desk::cells::Verdict::Todo { note: created } = verdict else {
                 panic!("the entry is not a todo");
             };
             assert_eq!(changes.len(), 4);
@@ -1073,10 +1074,13 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             assert_eq!(state.id, note);
             assert_eq!(
                 state.after,
-                Some(Property::State(rho_desk::cells::State::Done))
+                Some(Property::State(
+                    rho_agent_host_proto::desk::cells::State::Done
+                ))
             );
             assert!(mutation.writes.iter().any(|write| write.id == note
-                && write.property == Property::State(rho_desk::cells::State::Done)));
+                && write.property
+                    == Property::State(rho_agent_host_proto::desk::cells::State::Done)));
             // The new note is parented on the heading it was written on.
             assert!(mutation.writes.iter().any(|write| write.id == created
                 && write.property == Property::Parent(Some(note.clone()))));
@@ -1089,7 +1093,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     workspace
         .update(cx, |workspace, _, cx| {
             let buffer = workspace
-                .desk_cells
+                .desk_buffers
                 .buffer(HostId::default(), &created)
                 .expect("the todo note has a buffer")
                 .clone();
@@ -1151,7 +1155,7 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -1166,17 +1170,15 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("first note mutation");
             assert!(
-                mutation
-                    .writes
-                    .iter()
-                    .any(|write| matches!(write.id, rho_desk::cells::Id::Note(_))),
+                mutation.writes.iter().any(|write| matches!(
+                    write.id,
+                    rho_agent_host_proto::desk::cells::Id::Note(_)
+                )),
                 "the first row on an empty desk is not a note"
             );
             assert!(
-                mutation
-                    .writes
-                    .iter()
-                    .any(|write| write.property == rho_desk::cells::Property::Parent(None)),
+                mutation.writes.iter().any(|write| write.property
+                    == rho_agent_host_proto::desk::cells::Property::Parent(None)),
                 "the first row on an empty desk is not a root"
             );
         })
@@ -1287,7 +1289,7 @@ fn modal_overlays_preserve_surface_mode(cx: &mut TestAppContext) {
 }
 
 fn agent(id: u64) -> AgentId {
-    AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap()
+    AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).unwrap()
 }
 
 /// The transcript the workspace holds for this agent, to edit and feed back.
@@ -1730,7 +1732,7 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::Log {
+                rho_agents_client::stream::AgentFrame::Log {
                     entries: story::head_entries(story::UiAgentHead {
                         generated_title: Some("renamed".to_owned()),
                         ..ui_head(agents[2])
@@ -1785,7 +1787,7 @@ async fn a_burst_of_quiet_cells_costs_its_own_rows(cx: &mut TestAppContext) {
                 assert!(workspace.apply_verdict_for_test(
                     HostId::default(),
                     note,
-                    crate::desk_view::DeskVerdict::Done,
+                    rho_desk_client::desk::DeskVerdict::Done,
                     window,
                     cx,
                 ));
@@ -1830,7 +1832,7 @@ async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppCont
     // The cell the daemon could hand over: the row filed under itself.
     desk.set(
         looped.clone(),
-        rho_desk::cells::Property::Parent(Some(looped.clone())),
+        rho_agent_host_proto::desk::cells::Property::Parent(Some(looped.clone())),
     );
 
     let workspace = test_workspace(cx);
@@ -1843,7 +1845,7 @@ async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppCont
 
     workspace
         .update(cx, |workspace, _, _| {
-            let nodes = workspace.desk_cells.nodes(HostId::default()).to_vec();
+            let nodes = workspace.desk.nodes(HostId::default()).to_vec();
             let loop_node = nodes
                 .iter()
                 .find(|node| node.id == looped)
@@ -1892,7 +1894,7 @@ async fn filing_a_note_moves_the_shape_and_takes_the_source(cx: &mut TestAppCont
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &notes[3],
-                crate::desk_view::DeskVerdict::File {
+                rho_desk_client::desk::DeskVerdict::File {
                     parent: other.clone()
                 },
                 window,
@@ -1948,7 +1950,7 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &notes[7],
-                crate::desk_view::DeskVerdict::Done,
+                rho_desk_client::desk::DeskVerdict::Done,
                 window,
                 cx,
             ));
@@ -1973,12 +1975,12 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             let node = workspace
-                .desk_cells
+                .desk
                 .node(HostId::default(), &notes[7])
                 .expect("the note is still on the map");
             assert_eq!(
                 node.state,
-                rho_desk::cells::State::Done,
+                rho_agent_host_proto::desk::cells::State::Done,
                 "the row the verdict named says so"
             );
         })
@@ -2050,7 +2052,7 @@ fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::Log {
+                rho_agents_client::stream::AgentFrame::Log {
                     entries: story::head_entries(story::UiAgentHead {
                         generated_title: Some("renamed".to_owned()),
                         ..ui_head(agents[2])
@@ -2139,7 +2141,7 @@ fn tool(
         id: id.to_owned(),
         name: "shell_command".to_owned(),
         arguments: "echo ok".to_owned(),
-        format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
         preview: None,
         status,
         output: None,
@@ -2548,7 +2550,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     id: format!("t1.{}", blocks_count - 1),
                     name: "shell_command".to_owned(),
                     arguments: format!("echo {tick}"),
-                    format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+                    format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                     preview: None,
                     status: UiToolStatus::Running,
                     output: None,
@@ -3374,7 +3376,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 id: "tool-1".to_owned(),
                 name: "shell_command".to_owned(),
                 arguments: "echo".to_owned(),
-                format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -3456,7 +3458,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),
-                format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -3816,7 +3818,7 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
                     rho_window::style::StyleClass::SystemImportant,
                     "important".to_owned(),
                 ))
-                .chain((1..rho_agents::messages::LOG_CAP).map(|index| {
+                .chain((1..rho_agents_view::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("ordinary-{index}"),
@@ -3852,13 +3854,13 @@ fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..=rho_agents::messages::LOG_CAP {
+            for index in 0..=rho_agents_view::messages::LOG_CAP {
                 workspace.append_test_log_entry(format!("message-{index}"), cx);
             }
             let messages = workspace.message_log_texts(cx);
-            assert_eq!(messages.len(), rho_agents::messages::LOG_CAP);
+            assert_eq!(messages.len(), rho_agents_view::messages::LOG_CAP);
             assert_eq!(messages.first().map(String::as_str), Some("message-1"));
-            let expected_last = format!("message-{}", rho_agents::messages::LOG_CAP);
+            let expected_last = format!("message-{}", rho_agents_view::messages::LOG_CAP);
             assert_eq!(messages.last(), Some(&expected_last));
         })
         .expect("fill message log");
@@ -3870,7 +3872,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
     let original = workspace
         .update(cx, |workspace, _, cx| {
             workspace.seed_messages_for_test(
-                (0..rho_agents::messages::LOG_CAP).map(|index| {
+                (0..rho_agents_view::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("initial-{index}"),
@@ -3883,7 +3885,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
         .expect("seed capped messages");
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..rho_agents::messages::REBASE_EVICTIONS {
+            for index in 0..rho_agents_view::messages::REBASE_EVICTIONS {
                 workspace.append_test_message(
                     format!("replacement-{index}"),
                     rho_window::style::StyleClass::SystemInfo,
@@ -3898,38 +3900,10 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
             assert_ne!(workspace.messages_buffer_id(cx), original);
             assert_eq!(
                 workspace.message_log_texts(cx).len(),
-                rho_agents::messages::LOG_CAP
+                rho_agents_view::messages::LOG_CAP
             );
         })
         .expect("inspect rebased messages");
-}
-
-#[gpui::test]
-fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        state(vec![user("first")], Vec::new()),
-    );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::TurnCancelled,
-                window,
-                cx,
-            );
-        })
-        .expect("handle cancellation acknowledgement");
-
-    let text = display_text(&workspace, cx);
-    assert!(
-        !text.contains("[turn cancelled]"),
-        "turn cancellation acknowledgement should not become persistent transcript text: {text:?}"
-    );
 }
 
 #[gpui::test]
@@ -4180,9 +4154,9 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
         },
     );
     feed_edit(&workspace, cx, agent(1), |state| {
-        state.usage = rho_agents::state::UiAgentUsage {
+        state.usage = rho_agents_client::state::UiAgentUsage {
             provider: "fable".to_owned(),
-            total: rho_ui_proto::AgentUsageBucket {
+            total: rho_agent_host_proto::AgentUsageBucket {
                 input_tokens: 1_000_000,
                 cache_read_tokens: 1_000_000,
                 cache_write_tokens: 1_000_000,
@@ -4206,7 +4180,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_ui_proto::Place;
+    use rho_agent_host_proto::Place;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
@@ -4242,9 +4216,9 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
-            usage: rho_agents::state::UiAgentUsage {
+            usage: rho_agents_client::state::UiAgentUsage {
                 provider: "fable".to_owned(),
-                total: rho_ui_proto::AgentUsageBucket {
+                total: rho_agent_host_proto::AgentUsageBucket {
                     input_tokens: 1_000_000,
                     ..Default::default()
                 },
@@ -4297,8 +4271,12 @@ fn filing_completion_keeps_duplicate_heading_identity() {
         0,
         "filing completion replaces the whole partial title"
     );
-    let first = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([1_u8; 16]));
-    let second = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([2_u8; 16]));
+    let first = rho_agent_host_proto::desk::cells::Id::Note(
+        rho_agent_host_proto::desk::cells::Uuid([1_u8; 16]),
+    );
+    let second = rho_agent_host_proto::desk::cells::Id::Note(
+        rho_agent_host_proto::desk::cells::Uuid([2_u8; 16]),
+    );
     let destinations = vec![
         (
             "Project Alpha".into(),
@@ -4339,7 +4317,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -4368,7 +4346,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
             assert!(
                 mutation.writes.iter().any(|write| write.id == dealt
                     && write.property
-                        == rho_desk::cells::Property::Labeled {
+                        == rho_agent_host_proto::desk::cells::Property::Labeled {
                             label: destination.clone(),
                             present: true,
                         }),
@@ -4392,7 +4370,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
             assert!(
                 mutation.writes.iter().any(|write| write.id == dealt
                     && write.property
-                        == rho_desk::cells::Property::Labeled {
+                        == rho_agent_host_proto::desk::cells::Property::Labeled {
                             label: destination.clone(),
                             present: false,
                         }),
@@ -4418,7 +4396,7 @@ fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -4442,7 +4420,9 @@ fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("done mutation");
             assert!(mutation.writes.iter().any(|write| write.id == dealt
                 && write.property
-                    == rho_desk::cells::Property::State(rho_desk::cells::State::Done)));
+                    == rho_agent_host_proto::desk::cells::Property::State(
+                        rho_agent_host_proto::desk::cells::State::Done
+                    )));
         })
         .unwrap();
 }
@@ -4496,7 +4476,7 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
             assert_eq!(kind, crate::dashboard::DealCardKind::Agent);
             assert_eq!(
                 identity.node_id,
-                rho_desk::cells::Id::Agent(agent_id),
+                rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
                 "the card stands for the agent itself, not a note over it"
             );
             // Opening it must reach the transcript. With no note behind the
@@ -4538,7 +4518,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
             .update(cx, |workspace, window, cx| {
                 story::feed(workspace, HostId::default(), desk.synced(), window, cx);
                 workspace.pull_card(window, cx);
-                workspace.take_host_messages_for_test(HostId::default());
+                workspace.clear_sent_for_test(HostId::default());
             })
             .unwrap();
         cx.run_until_parked();
@@ -4559,7 +4539,9 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
                     .writes
                     .iter()
                     .find_map(|write| match &write.property {
-                        rho_desk::cells::Property::DeferUntil(Some(at)) => Some(*at),
+                        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(at)) => {
+                            Some(*at)
+                        }
                         _ => None,
                     })
                     .unwrap_or_else(|| panic!("{keys}: a snooze writes a wake time"));
@@ -5004,7 +4986,10 @@ fn a_second_tab_leaves_the_card_for_home(cx: &mut TestAppContext) {
 fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let dealt = desk.due_note(None, "Paced card");
-    desk.set(dealt.clone(), rho_desk::cells::Property::PaceDays(7));
+    desk.set(
+        dealt.clone(),
+        rho_agent_host_proto::desk::cells::Property::PaceDays(7),
+    );
 
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
@@ -5012,7 +4997,7 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -5024,8 +5009,8 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("snooze mutation");
             assert!(mutation.writes.iter().any(|write| write.id == dealt
-                && write.property == rho_desk::cells::Property::PaceDays(0)));
-            let Some((_, rho_desk::cells::VerdictEvent::Applied { changes, .. })) =
+                && write.property == rho_agent_host_proto::desk::cells::Property::PaceDays(0)));
+            let Some((_, rho_agent_host_proto::desk::cells::VerdictEvent::Applied { changes, .. })) =
                 mutation.verdict
             else {
                 panic!("the snooze records an applied verdict");
@@ -5033,10 +5018,10 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
             // The entry says what it put back, so an undo restores the pace.
             let paced = changes
                 .iter()
-                .find(|change| change.key == rho_desk::cells::PropertyKey::PaceDays)
+                .find(|change| change.key == rho_agent_host_proto::desk::cells::PropertyKey::PaceDays)
                 .expect("the pace is part of the verdict");
-            assert_eq!(paced.before, Some(rho_desk::cells::Property::PaceDays(7)));
-            assert_eq!(paced.after, Some(rho_desk::cells::Property::PaceDays(0)));
+            assert_eq!(paced.before, Some(rho_agent_host_proto::desk::cells::Property::PaceDays(7)));
+            assert_eq!(paced.after, Some(rho_agent_host_proto::desk::cells::Property::PaceDays(0)));
         })
         .unwrap();
 }
@@ -5053,7 +5038,7 @@ fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestApp
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -5097,22 +5082,25 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     // cells the verdict replaced.
     let mut desk = DeskFixture::new();
     let note = desk.note(None, "Named card");
-    let woke = rho_desk::cells::Timestamp {
+    let woke = rho_agent_host_proto::desk::cells::Timestamp {
         unix_ms: 1_577_836_800_000,
-        precision: rho_desk::cells::TimestampPrecision::Day,
+        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
     };
     desk.set(
         note.clone(),
-        rho_desk::cells::Property::DeferUntil(Some(woke)),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(woke)),
     );
-    desk.set(note.clone(), rho_desk::cells::Property::PaceDays(1));
+    desk.set(
+        note.clone(),
+        rho_agent_host_proto::desk::cells::Property::PaceDays(1),
+    );
 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -5126,7 +5114,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                         .expect("verdict mutation");
                     assert!(matches!(
                         mutation.verdict,
-                        Some((_, rho_desk::cells::VerdictEvent::Applied { .. }))
+                        Some((_, rho_agent_host_proto::desk::cells::VerdictEvent::Applied { .. }))
                     ));
                     // Said as the verdict is made, not a round trip later.
                     assert_eq!(workspace.echo_text_for_test(), Some($echo));
@@ -5141,14 +5129,14 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                     // Undo is the log's own inverse, not a replayed edit.
                     assert!(matches!(
                         mutation.verdict,
-                        Some((_, rho_desk::cells::VerdictEvent::Undone { of })) if of == stamp
+                        Some((_, rho_agent_host_proto::desk::cells::VerdictEvent::Undone { of })) if of == stamp
                     ));
                     let node = workspace
                         .desk_cells_snapshot_for_test(HostId::default())
                         .into_iter()
                         .find(|candidate| candidate.id == note)
                         .unwrap();
-                    assert_eq!(node.state, rho_desk::cells::State::Open);
+                    assert_eq!(node.state, rho_agent_host_proto::desk::cells::State::Open);
                     assert_eq!(node.defer_until, Some(woke));
                     assert_eq!(node.pace_days, 1);
                 })
@@ -6089,13 +6077,13 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: r#"{"command":"echo **bold** and _under_"}"#.to_owned(),
-        format: rho_ui_proto::mirror::ArgumentsFormat::Json,
+        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
         preview: None,
         status: UiToolStatus::Success,
         output: None,
         error: None,
-        started_at: Some(rho_core::UnixMs(10)),
-        finished_at: Some(rho_core::UnixMs(20)),
+        started_at: Some(rho_agent_host_proto::UnixMs(10)),
+        finished_at: Some(rho_agent_host_proto::UnixMs(20)),
         metadata: None,
     });
     feed_frame(
@@ -6493,10 +6481,12 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     let note = desk.note(None, "Written while the daemon was away");
     desk.set(
         note.clone(),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 1_577_836_800_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 1_577_836_800_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
 
     let workspace = test_workspace(cx);
@@ -6504,7 +6494,7 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -6523,10 +6513,10 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace
-                .take_host_messages_for_test(HostId::default())
+                .take_desk_frames_for_test(HostId::default())
                 .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskCellsApply { cells } => Some(cells),
+                .find_map(|frame| match frame {
+                    DeskClientFrame::CellsApply { cells } => Some(cells),
                     _ => None,
                 })
         })
@@ -6534,7 +6524,10 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
         .expect("the client sends the cells the daemon's frontier lacks");
     assert!(
         sent_back.cells.iter().any(|cell| cell.id == note
-            && cell.property == rho_desk::cells::Property::State(rho_desk::cells::State::Done)),
+            && cell.property
+                == rho_agent_host_proto::desk::cells::Property::State(
+                    rho_agent_host_proto::desk::cells::State::Done
+                )),
         "the verdict the daemon never heard is in what goes back: {:?}",
         sent_back.cells
     );
@@ -6544,7 +6537,7 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     desk.store.merge(sent_back).unwrap();
     assert_eq!(
         desk.store.facts(&note).state,
-        rho_desk::cells::State::Done,
+        rho_agent_host_proto::desk::cells::State::Done,
         "the daemon holds the write it missed"
     );
 }
@@ -6557,10 +6550,12 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
     let note = desk.note(None, "Shared card");
     desk.set(
         note.clone(),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 1_577_836_800_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 1_577_836_800_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
 
     let first = test_workspace(cx);
@@ -6570,7 +6565,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
             .update(cx, |workspace, window, cx| {
                 story::feed(workspace, HostId::default(), desk.synced(), window, cx);
                 workspace.pull_card(window, cx);
-                workspace.take_host_messages_for_test(HostId::default());
+                workspace.clear_sent_for_test(HostId::default());
             })
             .unwrap();
     }
@@ -6595,20 +6590,20 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
                     .into_iter()
                     .find(|node| node.id == note)
                     .map(|node| node.state),
-                Some(rho_desk::cells::State::Open),
+                Some(rho_agent_host_proto::desk::cells::State::Open),
                 "the poke has not arrived yet"
             );
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::DeskCellsAvailable { frontier },
+                rho_desk_client::stream::DeskFrame::CellsAvailable { frontier },
                 window,
                 cx,
             );
             let sync = workspace
-                .take_host_messages_for_test(HostId::default())
+                .take_desk_frames_for_test(HostId::default())
                 .into_iter()
-                .any(|message| matches!(message, rho_ui_proto::ClientMessage::DeskSync { .. }));
+                .any(|frame| matches!(frame, DeskClientFrame::Sync { .. }));
             assert!(sync, "a poke asks for the delta rather than carrying it");
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             assert_eq!(
@@ -6617,7 +6612,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
                     .into_iter()
                     .find(|node| node.id == note)
                     .map(|node| node.state),
-                Some(rho_desk::cells::State::Done),
+                Some(rho_agent_host_proto::desk::cells::State::Done),
                 "the verdict from the other device is visible here"
             );
         })
@@ -6625,33 +6620,28 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
 }
 
 #[gpui::test]
-fn unnamed_legacy_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
+fn unnamed_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
+    let summary = rho_agent_host_proto::QuotaSummary {
+        model: "gpt".to_owned(),
+        auth_namespace: None,
+        remaining_percent: 40,
+        burn_10m: 0,
+        burn_2h: 0,
+        burn_1d: 0,
+        burn_3d: 0,
+        reset_at_unix: Some(1),
+    };
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::ChatGptUsage {
-                    used_percent: 60.,
-                    reset_at_unix: 1,
-                },
+                ConnEvent::QuotaUsage(vec![summary.clone()]),
                 window,
                 cx,
             );
-            assert_eq!(
-                workspace.merged_quota_summaries_for_test(),
-                vec![rho_ui_proto::QuotaSummary {
-                    model: "gpt".to_owned(),
-                    auth_namespace: None,
-                    remaining_percent: 40,
-                    burn_10m: 0,
-                    burn_2h: 0,
-                    burn_1d: 0,
-                    burn_3d: 0,
-                    reset_at_unix: Some(1),
-                }]
-            );
+            assert_eq!(workspace.merged_quota_summaries_for_test(), vec![summary]);
         })
         .unwrap();
 }
@@ -7145,7 +7135,10 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(workspace.dashboard_deal_mode_for_test(cx));
-            desk.set(dealt, rho_desk::cells::Property::DeferUntil(None));
+            desk.set(
+                dealt,
+                rho_agent_host_proto::desk::cells::Property::DeferUntil(None),
+            );
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
@@ -7221,7 +7214,7 @@ fn a_slack_unit_the_crate_has_stopped_asking_about_is_not_a_card(cx: &mut TestAp
                 .map(|source| match source.unit.thread.as_deref() {
                     // Dealt with: `d` here, or read on the phone. Either
                     // way the crate has stopped asking.
-                    Some("600.0") => crate::desk_view::SlackSource {
+                    Some("600.0") => rho_desk_client::desk::SlackSource {
                         reason: None,
                         ..source
                     },
@@ -7285,7 +7278,7 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
                 !areas.iter().any(|(path, _)| path == "the area in view"),
                 "a note is not an area a thing can be filed under: {areas:?}"
             );
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -7301,7 +7294,7 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
                 take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_desk::cells::Property::Labeled {
+                    == rho_agent_host_proto::desk::cells::Property::Labeled {
                         label: here.clone(),
                         present: true,
                     }),
@@ -7310,7 +7303,7 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
             assert!(
                 !mutation.writes.iter().any(|write| matches!(
                     write.property,
-                    rho_desk::cells::Property::Parent(Some(_))
+                    rho_agent_host_proto::desk::cells::Property::Parent(Some(_))
                 )),
                 "nothing is placed by a parent: {:?}",
                 mutation.writes
@@ -7352,7 +7345,7 @@ fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut Te
             // message's own surface names the same node, which is what
             // `here` reads.
             workspace.open_note(HostId::default(), node.clone(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -7377,16 +7370,14 @@ fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut Te
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
             assert!(
-                mutation
-                    .writes
-                    .iter()
-                    .any(|write| write.property == rho_desk::cells::Property::About(node.clone())),
+                mutation.writes.iter().any(|write| write.property
+                    == rho_agent_host_proto::desk::cells::Property::About(node.clone())),
                 "the note says what it came from: {:?}",
                 mutation.writes
             );
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_desk::cells::Property::Labeled {
+                    == rho_agent_host_proto::desk::cells::Property::Labeled {
                         label: label.clone(),
                         present: true,
                     }),
@@ -7396,7 +7387,7 @@ fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut Te
             assert!(
                 !mutation.writes.iter().any(|write| matches!(
                     write.property,
-                    rho_desk::cells::Property::Parent(Some(_))
+                    rho_agent_host_proto::desk::cells::Property::Parent(Some(_))
                 )),
                 "nothing is placed by a parent: {:?}",
                 mutation.writes
@@ -7729,7 +7720,7 @@ fn notes_for_this_makes_a_note_about_the_surfaces_node(cx: &mut TestAppContext) 
                 panic!("notes for this opens the note surface");
             };
             let facts = workspace
-                .desk_cells
+                .desk
                 .facts(HostId::default(), &node_id)
                 .expect("the note the key just made");
             assert_eq!(
@@ -7776,9 +7767,9 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
     story::UiAgentHead {
         agent_id,
         story_pos: story::UiStoryPos(0),
-        role: rho_ui_proto::AgentRole::default(),
+        role: rho_agent_host_proto::AgentRole::default(),
         runtime_kind: story::UiRuntimeKind::Rho,
-        place: rho_ui_proto::Place {
+        place: rho_agent_host_proto::Place {
             workset: "0123456789ab".into(),
             cwd: "/src/tmp".into(),
             mode: Default::default(),
@@ -7796,7 +7787,7 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
 
 /// The whole story of an agent that has finished a turn and asked for the
 /// user: the least a card needs to rank as waiting on a reply.
-fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
+fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::AgentFrame {
     use story::UiStoryEvent;
     story::story(
         agent_id,
@@ -7820,12 +7811,12 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
 }
 
 pub(super) struct DeskFixture {
-    store: rho_desk::cells::Store,
-    bodies: Vec<rho_desk::cells::BodySnapshot>,
+    store: rho_agent_host_proto::desk::cells::Store,
+    bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
     next_node: u64,
     /// The Slack units the fixture made rows for, with the newest message
     /// the mirror would report for each.
-    slack_units: Vec<(rho_desk::cells::SlackUnit, String)>,
+    slack_units: Vec<(rho_agent_host_proto::desk::cells::SlackUnit, String)>,
 }
 
 impl DeskFixture {
@@ -7835,21 +7826,26 @@ impl DeskFixture {
     /// The store the fixture's daemon answers as. Cells are only news
     /// about a desk when they are counted in the store the client holds,
     /// so every sync says which one that is.
-    pub(super) const STORE: rho_desk::cells::DeviceId = rho_desk::cells::DeviceId([5; 16]);
+    pub(super) const STORE: rho_agent_host_proto::desk::cells::DeviceId =
+        rho_agent_host_proto::desk::cells::DeviceId([5; 16]);
 
     pub(super) fn new() -> Self {
-        let device = rho_desk::cells::DeviceId([9; 16]);
+        let device = rho_agent_host_proto::desk::cells::DeviceId([9; 16]);
         Self {
-            store: rho_desk::cells::Store::new(device),
+            store: rho_agent_host_proto::desk::cells::Store::new(device),
             bodies: Vec::new(),
             next_node: 0,
             slack_units: Vec::new(),
         }
     }
 
-    fn note(&mut self, parent: Option<rho_desk::cells::Id>, text: &str) -> rho_desk::cells::Id {
+    fn note(
+        &mut self,
+        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+        text: &str,
+    ) -> rho_agent_host_proto::desk::cells::Id {
         self.next_node += 1;
-        let id = rho_desk::cells::Id::Note(Self::uuid(self.next_node));
+        let id = rho_agent_host_proto::desk::cells::Id::Note(Self::uuid(self.next_node));
         self.file(id.clone(), parent);
         if !text.is_empty() {
             let mut buffer = text::Buffer::new(
@@ -7857,26 +7853,34 @@ impl DeskFixture {
                 text::BufferId::new(self.next_node + 1).unwrap(),
                 "",
             );
-            let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, text)]));
-            self.bodies.push(rho_desk::cells::BodySnapshot {
-                id: id.clone(),
-                operations: vec![operation],
-                transactions: Vec::new(),
-            });
+            let operation =
+                rho_agent_host_proto::desk::TextOperation::from_text(&buffer.edit([(0..0, text)]));
+            self.bodies
+                .push(rho_agent_host_proto::desk::cells::BodySnapshot {
+                    id: id.clone(),
+                    operations: vec![operation],
+                    transactions: Vec::new(),
+                });
         }
         id
     }
 
     /// A note the dealer will deal. A plain note is never dealt, so the
     /// mark that makes it want attention is part of the seed.
-    fn due_note(&mut self, parent: Option<rho_desk::cells::Id>, text: &str) -> rho_desk::cells::Id {
+    fn due_note(
+        &mut self,
+        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+        text: &str,
+    ) -> rho_agent_host_proto::desk::cells::Id {
         let id = self.note(parent, text);
         self.set(
             id.clone(),
-            rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-                unix_ms: 1_600_000_000_000,
-                precision: rho_desk::cells::TimestampPrecision::Day,
-            })),
+            rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+                rho_agent_host_proto::desk::cells::Timestamp {
+                    unix_ms: 1_600_000_000_000,
+                    precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                },
+            )),
         );
         id
     }
@@ -7885,17 +7889,17 @@ impl DeskFixture {
     /// id, and filing it is the only fact the store holds.
     pub(super) fn thread_row(
         &mut self,
-        parent: Option<rho_desk::cells::Id>,
+        parent: Option<rho_agent_host_proto::desk::cells::Id>,
         channel: &str,
         thread_ts: &str,
-    ) -> rho_desk::cells::Id {
-        let unit = rho_desk::cells::SlackUnit {
+    ) -> rho_agent_host_proto::desk::cells::Id {
+        let unit = rho_agent_host_proto::desk::cells::SlackUnit {
             workspace: "acme".to_owned(),
             channel: channel.to_owned(),
             thread: Some(thread_ts.to_owned()),
         };
         self.slack_units.push((unit.clone(), thread_ts.to_owned()));
-        let id = rho_desk::cells::Id::Slack(unit);
+        let id = rho_agent_host_proto::desk::cells::Id::Slack(unit);
         self.file(id.clone(), parent);
         id
     }
@@ -7903,14 +7907,14 @@ impl DeskFixture {
     /// What the mirror says about the rows `thread_row` made: every unit
     /// has one message from someone else and nothing handled yet, which is
     /// the state a card is dealt in.
-    pub(super) fn slack_sources(&self) -> Vec<crate::desk_view::SlackSource> {
+    pub(super) fn slack_sources(&self) -> Vec<rho_desk_client::desk::SlackSource> {
         self.slack_units
             .iter()
-            .map(|(unit, newest)| crate::desk_view::SlackSource {
+            .map(|(unit, newest)| rho_desk_client::desk::SlackSource {
                 unit: unit.clone(),
                 title: "any update?".to_owned(),
-                newest: rho_desk::cells::SlackTs(newest.clone()),
-                newest_from_other: Some(rho_desk::cells::SlackTs(newest.clone())),
+                newest: rho_agent_host_proto::desk::cells::SlackTs(newest.clone()),
+                newest_from_other: Some(rho_agent_host_proto::desk::cells::SlackTs(newest.clone())),
                 reason: Some(rho_slack::model::Attention::FollowedThread),
             })
             .collect()
@@ -7919,34 +7923,46 @@ impl DeskFixture {
     /// A registered project: a label that names a workdir. Projects live
     /// in the store rather than on the wire, so this is where a test says
     /// one exists.
-    fn project(&mut self, name: &str, url: &str) -> rho_desk::cells::Id {
+    fn project(&mut self, name: &str, url: &str) -> rho_agent_host_proto::desk::cells::Id {
         self.next_node += 1;
-        let id = rho_desk::cells::Id::Label(Self::uuid(self.next_node));
+        let id = rho_agent_host_proto::desk::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
-        self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
         self.set(
             id.clone(),
-            rho_desk::cells::Property::Repository(Some(rho_desk::cells::Repository {
-                url: url.to_owned(),
-            })),
+            rho_agent_host_proto::desk::cells::Property::Name(name.to_owned()),
+        );
+        self.set(
+            id.clone(),
+            rho_agent_host_proto::desk::cells::Property::Repository(Some(
+                rho_agent_host_proto::desk::cells::Repository {
+                    url: url.to_owned(),
+                },
+            )),
         );
         id
     }
 
     /// A label the user made, and the act of putting one on a row. A label
     /// is placement: the row keeps whatever parent it already had.
-    fn label(&mut self, name: &str) -> rho_desk::cells::Id {
+    fn label(&mut self, name: &str) -> rho_agent_host_proto::desk::cells::Id {
         self.next_node += 1;
-        let id = rho_desk::cells::Id::Label(Self::uuid(self.next_node));
+        let id = rho_agent_host_proto::desk::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
-        self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
+        self.set(
+            id.clone(),
+            rho_agent_host_proto::desk::cells::Property::Name(name.to_owned()),
+        );
         id
     }
 
-    fn labelled(&mut self, id: rho_desk::cells::Id, label: rho_desk::cells::Id) {
+    fn labelled(
+        &mut self,
+        id: rho_agent_host_proto::desk::cells::Id,
+        label: rho_agent_host_proto::desk::cells::Id,
+    ) {
         self.set(
             id,
-            rho_desk::cells::Property::Labeled {
+            rho_agent_host_proto::desk::cells::Property::Labeled {
                 label,
                 present: true,
             },
@@ -7954,8 +7970,12 @@ impl DeskFixture {
     }
 
     /// An agent the user filed under a note.
-    fn agent_row(&mut self, parent: rho_desk::cells::Id, agent_id: AgentId) -> rho_desk::cells::Id {
-        let id = rho_desk::cells::Id::Agent(agent_id);
+    fn agent_row(
+        &mut self,
+        parent: rho_agent_host_proto::desk::cells::Id,
+        agent_id: AgentId,
+    ) -> rho_agent_host_proto::desk::cells::Id {
+        let id = rho_agent_host_proto::desk::cells::Id::Agent(agent_id);
         self.file(id.clone(), Some(parent));
         id
     }
@@ -7963,23 +7983,35 @@ impl DeskFixture {
     /// A page the user filed under a note.
     fn page_row(
         &mut self,
-        parent: rho_desk::cells::Id,
+        parent: rho_agent_host_proto::desk::cells::Id,
         page_id: rho_browser::PageId,
-    ) -> rho_desk::cells::Id {
-        let id = rho_desk::cells::Id::Page(rho_desk::PageId(*page_id.0.as_bytes()));
+    ) -> rho_agent_host_proto::desk::cells::Id {
+        let id = rho_agent_host_proto::desk::cells::Id::Page(rho_agent_host_proto::desk::PageId(
+            *page_id.0.as_bytes(),
+        ));
         self.file(id.clone(), Some(parent));
         id
     }
 
     /// The two facts a filing is: where the user put it, and when.
-    fn file(&mut self, id: rho_desk::cells::Id, parent: Option<rho_desk::cells::Id>) {
+    fn file(
+        &mut self,
+        id: rho_agent_host_proto::desk::cells::Id,
+        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+    ) {
         self.next_node += 1;
-        let created_at = rho_desk::cells::Timestamp {
+        let created_at = rho_agent_host_proto::desk::cells::Timestamp {
             unix_ms: 1_600_000_000_000 + self.next_node as i64,
-            precision: rho_desk::cells::TimestampPrecision::Millisecond,
+            precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
         };
-        self.set(id.clone(), rho_desk::cells::Property::Parent(parent));
-        self.set(id, rho_desk::cells::Property::CreatedAt(created_at));
+        self.set(
+            id.clone(),
+            rho_agent_host_proto::desk::cells::Property::Parent(parent),
+        );
+        self.set(
+            id,
+            rho_agent_host_proto::desk::cells::Property::CreatedAt(created_at),
+        );
     }
 
     /// A distinct id for every row, however many there are.
@@ -7989,20 +8021,24 @@ impl DeskFixture {
     /// the root's id, and filing it under the root made the root its own
     /// parent. Every walk up the tree then ran forever, which read as the
     /// desk hanging above a certain size rather than as an id collision.
-    fn uuid(counter: u64) -> rho_desk::cells::Uuid {
+    fn uuid(counter: u64) -> rho_agent_host_proto::desk::cells::Uuid {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&counter.to_be_bytes());
-        rho_desk::cells::Uuid(bytes)
+        rho_agent_host_proto::desk::cells::Uuid(bytes)
     }
 
-    pub(super) fn set(&mut self, id: rho_desk::cells::Id, property: rho_desk::cells::Property) {
+    pub(super) fn set(
+        &mut self,
+        id: rho_agent_host_proto::desk::cells::Id,
+        property: rho_agent_host_proto::desk::cells::Property,
+    ) {
         self.store.write(id, property).unwrap();
     }
 
     /// The same desk as the replica on disk holds it, for a client that
     /// opens with nothing to talk to.
-    pub(super) fn held(&self) -> rho_mirror::desk::HeldDesk {
-        rho_mirror::desk::HeldDesk {
+    pub(super) fn held(&self) -> rho_desk_client::cache::HeldDesk {
+        rho_desk_client::cache::HeldDesk {
             known: true,
             namespace: Self::NAMESPACE,
             store: Self::STORE,
@@ -8011,8 +8047,8 @@ impl DeskFixture {
         }
     }
 
-    pub(super) fn synced(&self) -> ConnEvent {
-        ConnEvent::DeskSynced {
+    pub(super) fn synced(&self) -> rho_desk_client::stream::DeskFrame {
+        rho_desk_client::stream::DeskFrame::Synced {
             store: Self::STORE,
             node_namespace: Self::NAMESPACE,
             delta: self.store.snapshot(),
@@ -8025,12 +8061,12 @@ impl DeskFixture {
 fn take_desk_mutation(
     workspace: &mut Workspace,
     host: HostId,
-) -> Option<rho_desk::cells::CellMutation> {
+) -> Option<rho_agent_host_proto::desk::cells::CellMutation> {
     workspace
-        .take_host_messages_for_test(host)
+        .take_desk_frames_for_test(host)
         .into_iter()
-        .find_map(|message| match message {
-            rho_ui_proto::ClientMessage::DeskMutationApply { mutation } => Some(mutation),
+        .find_map(|frame| match frame {
+            DeskClientFrame::MutationApply { mutation } => Some(mutation),
             _ => None,
         })
 }
@@ -8051,7 +8087,7 @@ fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
 
     let card = |node: u64| crate::dashboard::DealCardId {
         host: HostId::default(),
-        node_id: rho_desk::cells::Id::Note(DeskFixture::uuid(node)),
+        node_id: rho_agent_host_proto::desk::cells::Id::Note(DeskFixture::uuid(node)),
     };
     let rows = crate::home::HomeRows {
         next: vec![crate::home::HomeRow {
@@ -8193,10 +8229,12 @@ fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mu
         .update(cx, |workspace, window, cx| {
             desk.set(
                 note.clone(),
-                rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-                    unix_ms: 1_600_086_400_000,
-                    precision: rho_desk::cells::TimestampPrecision::Day,
-                })),
+                rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+                    rho_agent_host_proto::desk::cells::Timestamp {
+                        unix_ms: 1_600_086_400_000,
+                        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                    },
+                )),
             );
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
@@ -8262,7 +8300,7 @@ fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppCo
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -8284,7 +8322,9 @@ fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppCo
             assert!(
                 mutation.writes.iter().any(|write| write.id == top
                     && write.property
-                        == rho_desk::cells::Property::State(rho_desk::cells::State::Done)),
+                        == rho_agent_host_proto::desk::cells::Property::State(
+                            rho_agent_host_proto::desk::cells::State::Done
+                        )),
                 "the row under the cursor is what closes"
             );
             assert_eq!(
@@ -8378,7 +8418,9 @@ fn a_muted_agent_is_not_offered_as_a_start_target(cx: &mut TestAppContext) {
     desk.agent_row(topic, seen);
     desk.set(
         hidden_node,
-        rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
+        rho_agent_host_proto::desk::cells::Property::State(
+            rho_agent_host_proto::desk::cells::State::Muted,
+        ),
     );
 
     let workspace = test_workspace(cx);
@@ -8434,7 +8476,9 @@ fn a_muted_agent_asking_for_the_user_is_not_a_card(cx: &mut TestAppContext) {
     desk.agent_row(topic, seen);
     desk.set(
         hidden_node,
-        rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
+        rho_agent_host_proto::desk::cells::Property::State(
+            rho_agent_host_proto::desk::cells::State::Muted,
+        ),
     );
 
     let workspace = test_workspace(cx);
@@ -8500,10 +8544,12 @@ fn a_snoozed_agent_is_off_home_when_its_turn_runs(cx: &mut TestAppContext) {
     desk.agent_row(topic, seen);
     desk.set(
         snoozed_node,
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 4_000_000_000_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 4_000_000_000_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
 
     let workspace = test_workspace(cx);
@@ -8758,7 +8804,9 @@ fn a_muted_agent_is_off_home_even_while_its_turn_runs(cx: &mut TestAppContext) {
     // Muting an agent is a state on its node; that is the whole of it.
     desk.set(
         hidden_node,
-        rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
+        rho_agent_host_proto::desk::cells::Property::State(
+            rho_agent_host_proto::desk::cells::State::Muted,
+        ),
     );
 
     let workspace = test_workspace(cx);
@@ -8867,7 +8915,10 @@ fn the_verdicts_open_over_an_unfiled_running_agents_home_row(cx: &mut TestAppCon
         .update(cx, |workspace, window, cx| {
             assert_eq!(
                 workspace.context_area(cx),
-                Some((HostId::default(), rho_desk::cells::Id::Agent(running))),
+                Some((
+                    HostId::default(),
+                    rho_agent_host_proto::desk::cells::Id::Agent(running)
+                )),
                 "the row names the agent it watches, filed or not"
             );
             assert!(
@@ -9204,7 +9255,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
                 Some((HostId::default(), context.clone())),
                 "Enter alone is create-from-here: the thing in view, not a place picked for it"
             );
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -9223,8 +9274,12 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
         .update(cx, |workspace, _, _| {
             let sent = workspace.take_host_messages_for_test(HostId::default());
             assert!(
-                sent.iter()
-                    .any(|message| matches!(message, rho_ui_proto::ClientMessage::NewAgent { .. })),
+                sent.iter().any(|message| matches!(
+                    message,
+                    rho_agent_host_proto::Request::Agent(
+                        rho_agent_host_proto::AgentCommand::New { .. }
+                    )
+                )),
                 "the draft started an agent"
             );
             // The daemon is never told where to file it: the client writes
@@ -9241,10 +9296,12 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
                 Some(&(HostId::default(), context.clone())),
             );
             assert!(
-                cells.contains(&rho_desk::cells::Property::Labeled {
+                cells.contains(&rho_agent_host_proto::desk::cells::Property::Labeled {
                     label: area.clone(),
                     present: true,
-                }) && cells.contains(&rho_desk::cells::Property::About(context.clone())),
+                }) && cells.contains(&rho_agent_host_proto::desk::cells::Property::About(
+                    context.clone()
+                )),
                 "the agent wears the note's label and says what it is about: {cells:?}"
             );
         })
@@ -9326,7 +9383,7 @@ fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
 fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let node = desk.thread_row(None, "C1", "500.0");
-    let unit = rho_desk::cells::SlackUnit {
+    let unit = rho_agent_host_proto::desk::cells::SlackUnit {
         workspace: "acme".to_owned(),
         channel: "C1".to_owned(),
         thread: Some("500.0".to_owned()),
@@ -9336,11 +9393,13 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
         node_id: node.clone(),
     };
     let source = |from_other: &str| {
-        vec![crate::desk_view::SlackSource {
+        vec![rho_desk_client::desk::SlackSource {
             unit: unit.clone(),
             title: "any update?".to_owned(),
-            newest: rho_desk::cells::SlackTs("600.0".to_owned()),
-            newest_from_other: Some(rho_desk::cells::SlackTs(from_other.to_owned())),
+            newest: rho_agent_host_proto::desk::cells::SlackTs("600.0".to_owned()),
+            newest_from_other: Some(rho_agent_host_proto::desk::cells::SlackTs(
+                from_other.to_owned(),
+            )),
             reason: Some(rho_slack::model::Attention::FollowedThread),
         }]
     };
@@ -9353,17 +9412,17 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &node,
-                crate::desk_view::DeskVerdict::Defer {
-                    until: rho_desk::cells::Timestamp {
+                rho_desk_client::desk::DeskVerdict::Defer {
+                    until: rho_agent_host_proto::desk::cells::Timestamp {
                         unix_ms: 4_000_000_000_000,
-                        precision: rho_desk::cells::TimestampPrecision::Day,
+                        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
                     },
                 },
                 window,
                 cx,
             ));
             let facts = workspace
-                .desk_cells
+                .desk
                 .facts_of_slack_unit(Some(HostId::default()), &unit)
                 .unwrap();
             assert_eq!(
@@ -9515,7 +9574,7 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
                 &identity.node_id,
-                crate::desk_view::DeskVerdict::Done,
+                rho_desk_client::desk::DeskVerdict::Done,
                 window,
                 cx,
             ));
@@ -9591,20 +9650,22 @@ fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
                 cx,
             );
             let (writes, (_, event)) = workspace
-                .desk_cells
+                .desk
                 .verdict_writes(
                     HostId::default(),
                     &node,
-                    crate::desk_view::DeskVerdict::Todo {
-                        defer_until: rho_desk::cells::Timestamp {
+                    rho_desk_client::desk::DeskVerdict::Todo {
+                        defer_until: rho_agent_host_proto::desk::cells::Timestamp {
                             unix_ms: 1_000,
-                            precision: rho_desk::cells::TimestampPrecision::Minute,
+                            precision:
+                                rho_agent_host_proto::desk::cells::TimestampPrecision::Minute,
                         },
                         pace: 3,
                     },
                 )
                 .expect("the unit has a source, so it can take a verdict");
-            let rho_desk::cells::VerdictEvent::Applied { changes, .. } = event else {
+            let rho_agent_host_proto::desk::cells::VerdictEvent::Applied { changes, .. } = event
+            else {
                 panic!("a dealt verdict is applied");
             };
             for change in &changes {
@@ -9649,7 +9710,7 @@ fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let body = |workspace: &Workspace, node_id, cx: &gpui::App| {
         workspace
-            .desk_cells
+            .desk_buffers
             .buffer(HostId::default(), node_id)
             .expect("the note has a body")
             .read(cx)
@@ -9686,7 +9747,7 @@ fn a_new_note_from_home_opens_the_note_itself(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
@@ -9759,7 +9820,7 @@ fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
 /// the place it was in.
 #[gpui::test]
 fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext) {
-    use rho_desk::cells::{Id, Property};
+    use rho_agent_host_proto::desk::cells::{Id, Property};
 
     let mut desk = DeskFixture::new();
     let area = desk.note(None, "Verdict agent");
@@ -9770,7 +9831,7 @@ fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext)
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
         })
         .unwrap();
@@ -9907,7 +9968,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -9923,7 +9984,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
             let agent = workspace
-                .desk_cells
+                .desk
                 .label_paths(HostId::default())
                 .into_iter()
                 .find(|(_, path)| path == "rho/agent")
@@ -9932,7 +9993,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
             assert!(
                 mutation.writes.iter().any(|write| write.id == dealt
                     && write.property
-                        == rho_desk::cells::Property::Labeled {
+                        == rho_agent_host_proto::desk::cells::Property::Labeled {
                             label: rho.clone(),
                             present: false,
                         }),
@@ -9947,11 +10008,11 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
-            let wrote = |label: &rho_desk::cells::Id, present: bool| {
+            let wrote = |label: &rho_agent_host_proto::desk::cells::Id, present: bool| {
                 mutation.writes.iter().any(|write| {
                     write.id == dealt
                         && write.property
-                            == rho_desk::cells::Property::Labeled {
+                            == rho_agent_host_proto::desk::cells::Property::Labeled {
                                 label: label.clone(),
                                 present,
                             }
@@ -9987,7 +10048,7 @@ fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppConte
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
         })
         .unwrap();
@@ -9995,14 +10056,14 @@ fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppConte
 
     let carried = |workspace: &mut Workspace| {
         let mut paths = workspace
-            .desk_cells
+            .desk
             .facts(HostId::default(), &thing)
             .expect("the thing has facts")
             .labels
             .iter()
             .filter_map(|label| {
                 workspace
-                    .desk_cells
+                    .desk
                     .label_paths(HostId::default())
                     .into_iter()
                     .find(|(id, _)| id == label)
@@ -10022,7 +10083,7 @@ fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppConte
 
             // The shallower one again is a no-op: the thing is already
             // under it, and the picker says so instead of growing the set.
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho", window, cx);
         })
         .unwrap();
@@ -10090,7 +10151,7 @@ fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.label_card(HostId::default(), area.clone(), "rho", window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -10105,7 +10166,7 @@ fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
                     .iter()
                     .any(|(path, kind, _, id)| path == "rho"
                         && *kind == "label"
-                        && matches!(id, rho_desk::cells::Id::Label(_))),
+                        && matches!(id, rho_agent_host_proto::desk::cells::Id::Label(_))),
                 "the label is a place to file under"
             );
             assert!(
@@ -10125,7 +10186,7 @@ fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
 /// as many labels as the user says while sitting in one place.
 #[gpui::test]
 fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestAppContext) {
-    use rho_desk::cells::{Id, Property};
+    use rho_agent_host_proto::desk::cells::{Id, Property};
 
     let mut desk = DeskFixture::new();
     let dealt = desk.due_note(None, "Deal QA note");
@@ -10136,7 +10197,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -10208,7 +10269,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
 /// row in between, so the path a new agent inherits is the label's own.
 #[gpui::test]
 fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContext) {
-    use rho_desk::cells::{Id, Property, Repository, Uuid};
+    use rho_agent_host_proto::desk::cells::{Id, Property, Repository, Uuid};
 
     let mut desk = DeskFixture::new();
     let label = Id::Label(Uuid([7; 16]));
@@ -10386,14 +10447,15 @@ fn find_reaches_an_unfiled_agent_by_what_the_user_said(cx: &mut TestAppContext) 
 /// live; nothing about a tab is ever written to the store.
 #[gpui::test]
 fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
-    use rho_desk::cells::Id;
+    use rho_agent_host_proto::desk::cells::Id;
 
     let page = |last: u8| {
         rho_browser::PageId(uuid::Uuid::from_bytes([
             1, 2, 3, 4, 5, 6, 0x47, 8, 0x89, 10, 11, 12, 13, 14, 15, last,
         ]))
     };
-    let desk_page = |id: rho_browser::PageId| Id::Page(rho_desk::PageId(*id.0.as_bytes()));
+    let desk_page =
+        |id: rho_browser::PageId| Id::Page(rho_agent_host_proto::desk::PageId(*id.0.as_bytes()));
     let origin = page(1);
     let burst = [page(2), page(3), page(4)];
     let alone = page(5);
@@ -10521,14 +10583,15 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
 /// dealt surface holds is never taken by a cursor sitting somewhere else.
 #[gpui::test]
 fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppContext) {
-    use rho_desk::cells::{Id, Property};
+    use rho_agent_host_proto::desk::cells::{Id, Property};
 
     let page = |last: u8| {
         rho_browser::PageId(uuid::Uuid::from_bytes([
             2, 3, 4, 5, 6, 7, 0x47, 9, 0x8a, 11, 12, 13, 14, 15, 16, last,
         ]))
     };
-    let desk_page = |id: rho_browser::PageId| Id::Page(rho_desk::PageId(*id.0.as_bytes()));
+    let desk_page =
+        |id: rho_browser::PageId| Id::Page(rho_agent_host_proto::desk::PageId(*id.0.as_bytes()));
     let origin = page(1);
     let tab = page(2);
     let announce = |id: rho_browser::PageId, opened_from: Option<rho_browser::PageId>| {
@@ -10627,7 +10690,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                 workspace.open_verdict_transient(window, cx),
                 "the tap opens over a thing the dealer has no card for"
             );
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
 
@@ -10722,7 +10785,7 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
 /// running agent has no card.
 #[test]
 fn an_agents_state_comes_from_its_head() {
-    use rho_agents::AgentFacts;
+    use rho_agents_client::AgentFacts;
 
     let now = chrono::Local::now().fixed_offset();
     let running = AgentFacts {
@@ -10789,16 +10852,14 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
+        .update(cx, |workspace, _, _| {
+            workspace.answer_host_request_for_test(
                 HostId::default(),
-                ConnEvent::ServerError("create workspace: no such repository".to_owned()),
-                window,
-                cx,
+                Err(anyhow::anyhow!("create workspace: no such repository")),
             );
         })
         .expect("the daemon refuses");
+    cx.run_until_parked();
 
     let refusal = workspace
         .update(cx, |workspace, _, cx| {
@@ -10822,14 +10883,14 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
 /// parent to write instead.
 #[test]
 fn a_new_thing_is_filed_by_its_label_and_never_by_a_parent() {
-    use rho_desk::cells::{Id, Property};
+    use rho_agent_host_proto::desk::cells::{Id, Property};
 
-    let label = Id::Label(rho_desk::cells::Uuid([3; 16]));
+    let label = Id::Label(rho_agent_host_proto::desk::cells::Uuid([3; 16]));
     assert!(matches!(
         crate::workspace::filing_property(label),
         Some(Property::Labeled { present: true, .. })
     ));
-    let note = Id::Note(rho_desk::cells::Uuid([4; 16]));
+    let note = Id::Note(rho_agent_host_proto::desk::cells::Uuid([4; 16]));
     assert_eq!(crate::workspace::filing_property(note), None);
 }
 
@@ -10853,7 +10914,7 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
         })
         .expect("type the first message");
 
-    cx.dispatch_action(*workspace, rho_agents::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycle);
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(
@@ -10889,19 +10950,19 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
 
     // From the body, backwards is the filesystem row, then the start row,
     // then the role row.
-    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_filesystem_field_for_test(cx));
         })
         .expect("filesystem row");
-    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_start_field_for_test(cx));
         })
         .expect("start row");
-    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_role_field_for_test(cx));
@@ -10921,7 +10982,7 @@ fn a_draft_wears_no_other_cards_label(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -10999,8 +11060,8 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("seed the workdir row");
 
     cx.simulate_keystrokes(*workspace, "escape");
-    cx.dispatch_action(*workspace, rho_agents::RoleCycle);
-    cx.dispatch_action(*workspace, rho_agents::DraftFieldClear);
+    cx.dispatch_action(*workspace, rho_agents_view::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents_view::DraftFieldClear);
     cx.simulate_keystrokes(*workspace, "o k");
     cx.run_until_parked();
 
@@ -11052,7 +11113,7 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -11262,7 +11323,7 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
             cx.subscribe(&model, move |model, event, cx| {
                 if !matches!(
                     event,
-                    rho_agents::agent_view::AgentModelEvent::HistoryComposed(_)
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(_)
                 ) {
                     return;
                 }
@@ -11569,11 +11630,13 @@ fn a_dealt_card_leaves_the_hand_when_the_desk_says_it_was_put_down(cx: &mut Test
 
     // The user's snooze, arriving from the store after the card went out.
     desk.set(
-        rho_desk::cells::Id::Agent(waiting),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 4_000_000_000_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Id::Agent(waiting),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 4_000_000_000_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
     workspace
         .update(cx, |workspace, window, cx| {
@@ -11623,7 +11686,7 @@ fn the_verdict_menu_names_the_card_in_view(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.pull_card(window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
+            workspace.clear_sent_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
@@ -11642,11 +11705,11 @@ fn the_verdict_menu_names_the_card_in_view(cx: &mut TestAppContext) {
             let wrote = mutation
                 .writes
                 .iter()
-                .find(|write| write.id == rho_desk::cells::Id::Agent(waiting))
+                .find(|write| write.id == rho_agent_host_proto::desk::cells::Id::Agent(waiting))
                 .expect("the name lands on the agent of the card in view");
             assert_eq!(
                 wrote.property,
-                rho_desk::cells::Property::Name("fix the linker".to_owned())
+                rho_agent_host_proto::desk::cells::Property::Name("fix the linker".to_owned())
             );
         })
         .unwrap();
@@ -11664,13 +11727,18 @@ fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppCont
     let heading = desk.note(None, "rho");
     desk.agent_row(heading, put_away);
     let label = desk.label("linker");
-    desk.labelled(rho_desk::cells::Id::Agent(put_away), label);
+    desk.labelled(
+        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
+        label,
+    );
     desk.set(
-        rho_desk::cells::Id::Agent(put_away),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 4_000_000_000_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 4_000_000_000_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
 
     let workspace = test_workspace(cx);
@@ -11722,7 +11790,7 @@ fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppCont
 #[gpui::test]
 fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppContext) {
     let put_away = agent(41);
-    let held_store = rho_desk::cells::DeviceId([9; 16]);
+    let held_store = rho_agent_host_proto::desk::cells::DeviceId([9; 16]);
 
     // What the copy handed back: a snoozed agent, counted in a store that
     // is no longer the one answering.
@@ -11730,15 +11798,17 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
     let heading = old.note(None, "rho");
     old.agent_row(heading, put_away);
     old.set(
-        rho_desk::cells::Id::Agent(put_away),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 4_000_000_000_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 4_000_000_000_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
     let held = match old.synced() {
-        ConnEvent::DeskSynced { delta, bodies, .. } => (delta, bodies),
-        _ => unreachable!("the fixture's sync is a DeskSynced"),
+        rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
+        _ => unreachable!("the fixture's sync is a Synced"),
     };
 
     // The store now answering has the same agent filed, and says nothing
@@ -11799,7 +11869,7 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
     // The daemon answers under a name the client has never counted in.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), now.synced(), window, cx);
+            workspace.handle_desk_event(HostId::default(), now.synced(), window, cx);
         })
         .unwrap();
     next_frame(cx, workspace);
@@ -11834,17 +11904,19 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
     let heading = desk.note(None, "rho");
     desk.agent_row(heading, put_away);
     desk.set(
-        rho_desk::cells::Id::Agent(put_away),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 4_000_000_000_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 4_000_000_000_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
     // What the replica would have handed back: the cells of a previous
     // session, with no daemon behind them.
     let held = match desk.synced() {
-        ConnEvent::DeskSynced { delta, bodies, .. } => (delta, bodies),
-        _ => unreachable!("the fixture's sync is a DeskSynced"),
+        rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
+        _ => unreachable!("the fixture's sync is a Synced"),
     };
 
     let workspace = test_workspace(cx);
@@ -11948,15 +12020,20 @@ fn a_cold_open_draws_home_from_the_replica_with_no_host_reachable(cx: &mut TestA
     let note = desk.note(None, "release notes");
     desk.set(
         note.clone(),
-        rho_desk::cells::Property::Name("release notes".into()),
+        rho_agent_host_proto::desk::cells::Property::Name("release notes".into()),
     );
-    desk.set(note.clone(), rho_desk::cells::Property::PaceDays(1));
     desk.set(
         note.clone(),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 1_000_000_000_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
+        rho_agent_host_proto::desk::cells::Property::PaceDays(1),
+    );
+    desk.set(
+        note.clone(),
+        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
+            rho_agent_host_proto::desk::cells::Timestamp {
+                unix_ms: 1_000_000_000_000,
+                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+            },
+        )),
     );
 
     let workspace = test_workspace(cx);
@@ -12014,31 +12091,31 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
                 .desk_replica_for_test
                 .insert("local".to_owned(), desk.held());
             workspace.open_desk_from_replica(HostId::default(), window, cx);
-            let timestamp = rho_desk::TreeClock {
+            let timestamp = rho_agent_host_proto::desk::TreeClock {
                 value: 9,
                 replica_id: 7,
             };
-            let operation = rho_desk::TextOperation::Edit {
+            let operation = rho_agent_host_proto::desk::TextOperation::Edit {
                 timestamp,
                 version: Vec::new(),
                 ranges: vec![(0, 0)],
                 new_text: vec!["typed here".into()],
             };
-            workspace.desk_cells.keep_text(
+            workspace.desk.keep_text(
                 HostId::default(),
                 note.clone(),
                 &operation,
-                &rho_desk::TextTransaction {
+                &rho_agent_host_proto::desk::TextTransaction {
                     id: timestamp,
                     edit_ids: vec![timestamp],
                 },
             );
-            workspace.desk_cells.sync(HostId::default())
+            workspace.desk.sync(HostId::default())
         })
         .unwrap();
 
-    let rho_ui_proto::ClientMessage::DeskSync { bodies, .. } = sync else {
-        panic!("the handshake is a DeskSync");
+    let DeskClientFrame::Sync { bodies, .. } = sync else {
+        panic!("the handshake is a Sync");
     };
     assert_eq!(
         bodies.get(&note).and_then(|held| held.get(&7)).copied(),
@@ -12064,12 +12141,12 @@ fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppC
                 .desk_replica_for_test
                 .insert("local".to_owned(), desk.held());
             workspace.open_desk_from_replica(HostId::default(), window, cx);
-            workspace.desk_cells.sync(HostId::default())
+            workspace.desk.sync(HostId::default())
         })
         .unwrap();
 
-    let rho_ui_proto::ClientMessage::DeskSync { bodies, .. } = sync else {
-        panic!("the handshake is a DeskSync");
+    let DeskClientFrame::Sync { bodies, .. } = sync else {
+        panic!("the handshake is a Sync");
     };
     let held = bodies
         .get(&note)
@@ -12091,7 +12168,7 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
                 (agent(1), "browser"),
             ]
             .into_iter()
-            .map(|(agent, name)| rho_ui_proto::DesktopSession {
+            .map(|(agent, name)| rho_agent_host_proto::DesktopSession {
                 agent: agent.encoded(),
                 name: name.into(),
             })
@@ -12111,7 +12188,7 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::DesktopSessions(vec![rho_ui_proto::DesktopSession {
+                ConnEvent::DesktopSessions(vec![rho_agent_host_proto::DesktopSession {
                     agent: agent(1).encoded(),
                     name: "preview".into(),
                 }]),

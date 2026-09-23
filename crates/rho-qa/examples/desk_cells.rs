@@ -13,8 +13,10 @@
 //! prints their cells whether they are put away or not.
 
 use redb::TableDefinition;
+use rho_agent_host_proto::desk::cells::{
+    Cell, DeviceId, Id, Property, PropertyKey, Stamp, Version,
+};
 use rho_db::{RecordedTypeName, RhoDb, SenAs};
-use rho_ui_proto::desk_tree::cells::{Cell, DeviceId, Id, Property, PropertyKey, Stamp, Version};
 use senax_encoder::{Decode, Encode};
 
 /// The daemon's own key and metadata shapes, redeclared: they are private

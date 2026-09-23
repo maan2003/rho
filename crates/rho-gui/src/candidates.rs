@@ -6,7 +6,7 @@
 //! buffers and folds and inlays, standing between the store and a question
 //! about what is in it. The map is going; the question is not.
 //!
-//! So the candidates come from `DeskCells` — the store client — with the
+//! So the candidates come from `Desk` — the store client — with the
 //! agent registry and the Slack facts beside it. Nothing here draws
 //! anything, holds an editor, or needs one to have been drawn: the same
 //! answer comes back on a window that has never opened the map.
@@ -19,10 +19,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gpui::App;
-use rho_agents::{AgentMap, HostId};
-use rho_desk::cells::Id;
+use rho_agent_host_proto::desk::cells::Id;
+use rho_agents_client::{AgentMap, HostId};
+use rho_desk_client::Desk;
+use rho_desk_client::desk::DeskNode;
 
-use crate::desk_view::{DeskCells, DeskNode};
+use crate::desk_view::DeskBuffers;
 use crate::find::{FindCandidate, FindTarget};
 
 /// One host's nodes with the lookups a path needs, built once per question.
@@ -39,14 +41,14 @@ pub(crate) struct HostNodes {
     /// find one node's children is quadratic in a desk that only grows,
     /// which is what made dealing one expensive; it is an index instead.
     children: HashMap<Id, Vec<usize>>,
-    by_agent: HashMap<rho_core::AgentId, usize>,
-    by_page: HashMap<rho_desk::PageId, usize>,
+    by_agent: HashMap<rho_agent_host_proto::AgentId, usize>,
+    by_page: HashMap<rho_agent_host_proto::desk::PageId, usize>,
     titles: HashMap<Id, String>,
     /// Every label's full filing path, `rho/agent`.
     label_paths: HashMap<Id, String>,
     /// The agents filed under each heading, for ranking a heading by how
     /// recently anything under it was touched.
-    heading_agents: HashMap<Id, Vec<rho_core::AgentId>>,
+    heading_agents: HashMap<Id, Vec<rho_agent_host_proto::AgentId>>,
     /// Whether the client held the host's desk when these nodes were
     /// read, from its own replica or from the daemon. An empty desk and a
     /// desk nobody has loaded yet look identical from the nodes alone, and
@@ -63,11 +65,11 @@ impl HostNodes {
     /// why this belongs to a keystroke and not to a sync, and why it takes
     /// the store client by shared reference: asking what there is must not
     /// be able to change anything.
-    pub(crate) fn of(desk: &DeskCells, host: HostId, cx: &App) -> Self {
+    pub(crate) fn of(desk: &Desk, buffers: &DeskBuffers, host: HostId, cx: &App) -> Self {
         let nodes = desk.nodes(host).to_vec();
         let mut titles = HashMap::with_capacity(nodes.len());
         for node in &nodes {
-            if let Some(buffer) = desk.buffer(host, &node.id) {
+            if let Some(buffer) = buffers.buffer(host, &node.id) {
                 titles.insert(
                     node.id.clone(),
                     crate::dashboard::note_title(&buffer.read(cx).text()).to_owned(),
@@ -90,10 +92,10 @@ impl HostNodes {
     /// never look at. The store client already keeps the note titles and
     /// refreshes them by comparing buffer versions, so this costs the
     /// nodes and the indexes and nothing else.
-    pub(crate) fn of_notes(desk: &mut DeskCells, host: HostId, cx: &App) -> Self {
+    pub(crate) fn of_notes(desk: &Desk, buffers: &mut DeskBuffers, host: HostId, cx: &App) -> Self {
         let nodes = desk.nodes(host).to_vec();
-        let titles = desk
-            .note_titles(host, cx)
+        let titles = buffers
+            .note_titles(host, desk, cx)
             .map(|titles| (*titles).clone())
             .unwrap_or_default();
         let desk_loaded = desk.is_loaded(host);
@@ -161,7 +163,7 @@ impl HostNodes {
     /// The order an agent's own row sits at, or after everything when the
     /// agent has no row. Filing decides where a card is shown, never
     /// whether it exists, so an unfiled agent still gets a number.
-    pub(crate) fn agent_order(&self, agent: rho_core::AgentId) -> usize {
+    pub(crate) fn agent_order(&self, agent: rho_agent_host_proto::AgentId) -> usize {
         self.by_agent.get(&agent).copied().unwrap_or(usize::MAX)
     }
 
@@ -173,12 +175,12 @@ impl HostNodes {
             .map(|at| &self.nodes[*at])
     }
 
-    pub(crate) fn agent_node(&self, agent: rho_core::AgentId) -> Option<&DeskNode> {
+    pub(crate) fn agent_node(&self, agent: rho_agent_host_proto::AgentId) -> Option<&DeskNode> {
         self.by_agent.get(&agent).map(|at| &self.nodes[*at])
     }
 
     /// The row a page is filed as, if it is filed at all.
-    pub(crate) fn page_node(&self, page: rho_desk::PageId) -> Option<&DeskNode> {
+    pub(crate) fn page_node(&self, page: rho_agent_host_proto::desk::PageId) -> Option<&DeskNode> {
         self.by_page.get(&page).map(|index| &self.nodes[*index])
     }
 
@@ -200,7 +202,7 @@ impl HostNodes {
     }
 
     /// The agents filed anywhere under a heading, in the store's order.
-    pub(crate) fn agents_under(&self, heading: &Id) -> &[rho_core::AgentId] {
+    pub(crate) fn agents_under(&self, heading: &Id) -> &[rho_agent_host_proto::AgentId] {
         self.heading_agents
             .get(heading)
             .map_or(&[], |agents| agents.as_slice())
@@ -267,8 +269,8 @@ impl HostNodes {
     /// The map kept this as it composed. Derived here instead by walking
     /// each agent up to its nearest heading, which is the same answer from
     /// the side that does not need a row to have been drawn.
-    fn build_heading_agents(&self) -> HashMap<Id, Vec<rho_core::AgentId>> {
-        let mut under: HashMap<Id, Vec<rho_core::AgentId>> = HashMap::new();
+    fn build_heading_agents(&self) -> HashMap<Id, Vec<rho_agent_host_proto::AgentId>> {
+        let mut under: HashMap<Id, Vec<rho_agent_host_proto::AgentId>> = HashMap::new();
         for node in &self.nodes {
             let Some(agent_id) = node.agent() else {
                 continue;
@@ -293,14 +295,15 @@ impl HostNodes {
 /// mirror it already reads, because what is findable about a conversation
 /// is its name in Slack and not where anyone filed it.
 pub(crate) fn find_candidates(
-    desk: &DeskCells,
+    desk: &Desk,
+    buffers: &DeskBuffers,
     registry: &AgentMap,
     cx: &App,
 ) -> Vec<FindCandidate> {
     let mut candidates = Vec::new();
     let mut filed = HashSet::new();
     for host in desk.hosts() {
-        let source = HostNodes::of(desk, host, cx);
+        let source = HostNodes::of(desk, buffers, host, cx);
         for node in &source.nodes {
             crate::find::charge_walk(1);
             if let Some(agent_id) = node.agent() {
@@ -354,7 +357,7 @@ pub(crate) fn find_candidates(
                     };
                     // Which names an agent answers to is the agent crate's;
                     // where it sits in the tree is this node's.
-                    let hit = rho_agents::find::hit(
+                    let hit = rho_agents_client::find::hit(
                         registry,
                         agent_id,
                         source.shown_title(&node.id.clone()),
@@ -408,7 +411,7 @@ pub(crate) fn find_candidates(
         {
             continue;
         }
-        let hit = rho_agents::find::hit(registry, agent_id, None);
+        let hit = rho_agents_client::find::hit(registry, agent_id, None);
         candidates.push(FindCandidate {
             labels: Vec::new(),
             aka: hit.aka,

@@ -3,8 +3,8 @@
 use std::future::Future;
 
 use futures::StreamExt as _;
+use rho_agent_host_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
 use rho_rtc::{RtcEvent, RtcSession, SdpAnswer};
-use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
 
 use crate::connection::{ChannelDialer, dial_realtime};
 

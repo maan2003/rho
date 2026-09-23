@@ -8,6 +8,7 @@ readme.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rho-rpc.workspace = true
 anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
@@ -21,21 +22,21 @@ dirs.workspace = true
 flate2 = "1"
 redb.workspace = true
 reqwest.workspace = true
-rho-core.workspace = true
+rho-agent-host-proto.workspace = true
 rho-fake-model.workspace = true
-rho-ui-proto.workspace = true
 rustls.workspace = true
 rho-slack = { workspace = true, features = ["fake", "ui"] }
 rho-gui = { path = "../rho-gui", features = ["walk-support"] }
 serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync"] }
 tempfile.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
 rho-db.workspace = true
-rho-mirror.workspace = true
+rho-agents-client.workspace = true
+rho-desk-client.workspace = true
 senax-encoder.workspace = true
 text.workspace = true

@@ -47,3 +47,6 @@ use subscriber::*;
 #[allow(unused_imports)]
 pub use track::*;
 pub use version::Version;
+
+pub use publisher::publish_fixed;
+pub use subscriber::receive_fixed_group;

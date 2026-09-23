@@ -58,20 +58,19 @@ redb-derive = { workspace = true }
 prefix-id = { workspace = true, features = ["redb"] }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-browser = { workspace = true }
-rho-core.workspace = true
+rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
-rho-desk.workspace = true
 rho-files = { workspace = true }
-rho-agents = { workspace = true }
+rho-agents-client = { workspace = true }
+rho-agents-view = { workspace = true }
 rho-hosts = { workspace = true }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
-rho-mirror = { workspace = true }
+rho-desk-client = { workspace = true }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
-rho-ui-proto.workspace = true
 rho-slack = { workspace = true, features = ["ui"] }
 rho-shell-view = { workspace = true }
 rho-terminal = { workspace = true }
@@ -132,6 +131,7 @@ rho-slack = { workspace = true, features = ["ui", "fake"] }
 # be at the scale the user runs at rather than at a scale chosen here.
 rho-fake-slack.workspace = true
 rho-hosts = { workspace = true, features = ["test-support"] }
+rho-desk-client = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
 editor = { path = "../../vendor/zed/crates/editor", features = [
   "wrap-test-support",

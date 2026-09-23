@@ -6,7 +6,7 @@
 
 use anyhow::Context as _;
 use gpui::AppContext as _;
-use rho_desk::cells::SlackUnit;
+use rho_agent_host_proto::desk::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, NextUnread, Unit};
@@ -182,8 +182,8 @@ impl Workspace {
     /// a rho that has not said where its state lives — a test — has no
     /// Slack session rather than the user's.
     pub(crate) fn slack_paths(&self) -> anyhow::Result<rho_slack::config::Paths> {
-        let state_dir =
-            rho_mirror::mirror::state_dir().context("the client state directory is not set")?;
+        let state_dir = rho_agents_client::cache::state_dir()
+            .context("the client state directory is not set")?;
         let mut paths = rho_slack::config::Paths::under(state_dir);
         // The override exists so an isolated run (QA, a second profile)
         // cannot touch the real workspaces.
@@ -771,7 +771,7 @@ impl Workspace {
         if session.read(cx).handled_seeded() {
             return;
         }
-        let cells = self.desk_cells.slack_handled_cells();
+        let cells = self.desk.slack_handled_cells();
         session.update(cx, |session, _| {
             for (unit, ts) in cells {
                 session.seed_handled(&model_unit(&unit), &Ts(ts.0));
@@ -2001,23 +2001,26 @@ impl Workspace {
         // arrived since is still theirs.
         let host = self.hosts.owner();
         let workspace_name = session.read(cx).model().workspace().clone();
-        let mut nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> = plan
+        let mut nodes: Vec<(
+            rho_agent_host_proto::desk::cells::Id,
+            rho_agent_host_proto::desk::cells::SlackTs,
+        )> = plan
             .conversations
             .iter()
             .map(|(channel, ts)| {
                 (
-                    rho_desk::cells::Id::Slack(SlackUnit {
+                    rho_agent_host_proto::desk::cells::Id::Slack(SlackUnit {
                         workspace: workspace_name.0.clone(),
                         channel: channel.0.clone(),
                         thread: None,
                     }),
-                    rho_desk::cells::SlackTs(ts.0.clone()),
+                    rho_agent_host_proto::desk::cells::SlackTs(ts.0.clone()),
                 )
             })
             .chain(plan.threads.iter().map(|(key, ts)| {
                 (
-                    rho_desk::cells::Id::Slack(store_unit_of(key)),
-                    rho_desk::cells::SlackTs(ts.0.clone()),
+                    rho_agent_host_proto::desk::cells::Id::Slack(store_unit_of(key)),
+                    rho_agent_host_proto::desk::cells::SlackTs(ts.0.clone()),
                 )
             }))
             .collect();
@@ -3198,15 +3201,21 @@ impl Workspace {
 fn cards_before(
     cards: Vec<(crate::dashboard::DealCardId, SlackUnit)>,
     model: &Model,
-    host: Option<rho_agents::HostId>,
+    host: Option<rho_agents_client::HostId>,
     before: f64,
-) -> Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> {
+) -> Vec<(
+    rho_agent_host_proto::desk::cells::Id,
+    rho_agent_host_proto::desk::cells::SlackTs,
+)> {
     cards
         .into_iter()
         .filter(|(card, _)| Some(card.host) == host)
         .filter_map(|(card, thread)| {
             let closed = model.closed_by(&model_unit(&thread), before)?;
-            Some((card.node_id, rho_desk::cells::SlackTs(closed.0)))
+            Some((
+                card.node_id,
+                rho_agent_host_proto::desk::cells::SlackTs(closed.0),
+            ))
         })
         .collect()
 }
@@ -3468,8 +3477,12 @@ mod tests {
         for ts in ["100.0", "900.0"] {
             model.note_message(&message(ts, Some(ts), "U1", "any update?"), 0);
         }
-        let host = rho_agents::HostId::default();
-        let node = |counter: u8| rho_desk::cells::Id::Note(rho_desk::cells::Uuid([counter; 16]));
+        let host = rho_agents_client::HostId::default();
+        let node = |counter: u8| {
+            rho_agent_host_proto::desk::cells::Id::Note(rho_agent_host_proto::desk::cells::Uuid(
+                [counter; 16],
+            ))
+        };
         let card = |node_id| crate::dashboard::DealCardId { host, node_id };
         let cards = vec![
             (card(node(1)), thread_ref_of("100.0")),
@@ -3479,7 +3492,10 @@ mod tests {
 
         assert_eq!(
             cards_before(cards, &model, Some(host), 500.0),
-            vec![(node(1), rho_desk::cells::SlackTs("100.0".to_owned()))],
+            vec![(
+                node(1),
+                rho_agent_host_proto::desk::cells::SlackTs("100.0".to_owned())
+            )],
             "the newer thread stays, and one the mirror has nothing on is left alone"
         );
     }

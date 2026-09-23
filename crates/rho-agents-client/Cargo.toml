@@ -1,0 +1,27 @@
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-agents-client"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+camino.workspace = true
+collections = { path = "../../vendor/zed/crates/collections" }
+futures.workspace = true
+prefix-id = { workspace = true, default-features = false, features = ["redb"] }
+redb = { workspace = true }
+rho-agent-host-proto.workspace = true
+rho-db = { workspace = true }
+rho-hosts = { workspace = true }
+senax-encoder.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rho-hosts = { workspace = true, features = ["test-support"] }

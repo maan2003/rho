@@ -2,9 +2,9 @@
 //! complete conversation boundaries are persisted. Provider EOF and transport
 //! loss are deliberately different operations: a response that stops
 //! mid-call leaves history the part of the call that ran, as the whole call.
-#[cfg(test)]
-use rho_core::StreamingContextItem;
 use rho_inference::exec::set_source;
+#[cfg(test)]
+use rho_inference::types::StreamingContextItem;
 
 use super::*;
 
@@ -72,7 +72,7 @@ impl Agent {
         let notebook = &self.surface.get_if_ready().unwrap().notebook;
         let exec = self.cells.start_stream(
             notebook,
-            rho_core::ExecCall {
+            rho_inference::types::ExecCall {
                 id: incoming.id.clone(),
                 source: incoming.source.clone(),
             },
@@ -82,7 +82,7 @@ impl Agent {
         set_source(&mut identity, String::new());
         self.persist(AgentEvent::ExecObserved {
             id: incoming.id.clone(),
-            milestone: rho_core::ExecMilestone::FirstBlock,
+            milestone: rho_agent_host_proto::ExecMilestone::FirstBlock,
             at: now,
         })
         .await?;
@@ -178,8 +178,8 @@ impl Agent {
 
 #[cfg(test)]
 pub(in crate::agent) mod tests {
-    use rho_core::{AppendString, ContextItemEvent, ProviderResponseItemId, ToolType};
     use rho_inference::OpenAiResponsesProviderData;
+    use rho_inference::types::{AppendString, ContextItemEvent, ProviderResponseItemId, ToolType};
     use rho_tool_shell::ShellTools;
 
     use super::*;
@@ -352,7 +352,7 @@ pub(in crate::agent) mod tests {
             agent
                 .persist(AgentEvent::Native(
                     crate::native::NativeEvent::RequestStarted {
-                        input: vec![rho_core::ContextBlock::DeveloperMessage {
+                        input: vec![rho_inference::types::ContextBlock::DeveloperMessage {
                             text: format!("round {index}"),
                         }],
                         context: None,
@@ -383,7 +383,7 @@ pub(in crate::agent) mod tests {
             agent
                 .persist(AgentEvent::Native(
                     crate::native::NativeEvent::RequestStarted {
-                        input: vec![rho_core::ContextBlock::DeveloperMessage {
+                        input: vec![rho_inference::types::ContextBlock::DeveloperMessage {
                             text: "queued".into(),
                         }],
                         context: None,
@@ -396,7 +396,7 @@ pub(in crate::agent) mod tests {
             agent
                 .persist(AgentEvent::Native(
                     crate::native::NativeEvent::ResponseFinished {
-                        output: vec![rho_core::ContextBlock::InferenceResponse {
+                        output: vec![rho_inference::types::ContextBlock::InferenceResponse {
                             items: Vec::new(),
                             provider_response_id: None,
                         }],
@@ -626,7 +626,7 @@ pub(in crate::agent) mod tests {
                 && result.body.output.contains("fresh-output"))))
         );
         assert!(!agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
-            ContextBlock::UserMessage { content, .. } if rho_core::text_content(content).contains("stream disconnected"))));
+            ContextBlock::UserMessage { content, .. } if rho_inference::types::text_content(content).contains("stream disconnected"))));
         assert!(agent.recovery_notes.is_empty());
         assert!(matches!(&agent.phase, Phase::Requesting(in_flight) if in_flight.retry.is_none()));
     }

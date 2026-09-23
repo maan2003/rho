@@ -28,7 +28,7 @@ use brush_core::{
 };
 use rand::RngCore as _;
 use rand::rngs::OsRng;
-use rho_shell_proto::{
+use rho_agent_host_proto::shell_kernel::{
     MAX_ACTIVE_PAGERS, MAX_PAGER_BYTES, MAX_PAGER_LINES, MAX_PROMPT_BYTES, PROTOCOL_VERSION,
     PagerAction, PagerMessage, PagerReply, Request, Response,
 };
@@ -70,7 +70,10 @@ impl PagerControl {
             .unwrap()
             .remove(&(execution, pager, page))
         {
-            let _ = rho_shell_proto::write_pager_frame(&mut control, &PagerReply::from(action));
+            let _ = rho_agent_host_proto::shell_kernel::write_pager_frame(
+                &mut control,
+                &PagerReply::from(action),
+            );
         }
     }
 }
@@ -234,7 +237,7 @@ fn serve_pager(
         protocol,
         token,
         execution_token,
-    }) = rho_shell_proto::read_pager_frame(&mut stream)
+    }) = rho_agent_host_proto::shell_kernel::read_pager_frame(&mut stream)
     else {
         return;
     };
@@ -256,12 +259,14 @@ fn serve_pager(
     // pager that waits here cannot have its execution retired out from under
     // it - which is how a pager short enough to finish in one page used to
     // lose its whole session.
-    if rho_shell_proto::write_pager_frame(&mut stream, &PagerReply::Attached).is_err() {
+    if rho_agent_host_proto::shell_kernel::write_pager_frame(&mut stream, &PagerReply::Attached)
+        .is_err()
+    {
         let _ = responses.send(Response::PagerFinished { execution, pager });
         return;
     }
     let mut last_page = 0;
-    while let Ok(message) = rho_shell_proto::read_pager_frame(&mut stream) {
+    while let Ok(message) = rho_agent_host_proto::shell_kernel::read_pager_frame(&mut stream) {
         let PagerMessage::Paused { page, lines, bytes } = message else {
             break;
         };
@@ -291,7 +296,7 @@ fn serve_pager(
         let Some(action) = wait_for_pager_action(&stream, &mut actions_rx) else {
             break;
         };
-        if rho_shell_proto::write_pager_frame(&mut stream, &action).is_err() {
+        if rho_agent_host_proto::shell_kernel::write_pager_frame(&mut stream, &action).is_err() {
             break;
         }
         if responses
@@ -335,7 +340,7 @@ fn wait_for_pager_action(stream: &UnixStream, actions: &mut UnixStream) -> Optio
             return None;
         }
         if descriptors[1].revents != 0 {
-            return rho_shell_proto::read_pager_frame(actions).ok();
+            return rho_agent_host_proto::shell_kernel::read_pager_frame(actions).ok();
         }
     }
 }
@@ -386,7 +391,9 @@ pub async fn run() -> anyhow::Result<()> {
             let mut writer = control_writer.as_ref();
             while let Ok(response) = responses_rx.recv() {
                 let exiting = matches!(response, Response::Exited { .. });
-                if rho_shell_proto::write_frame(&mut writer, &response).is_err() || exiting {
+                if rho_agent_host_proto::shell_kernel::write_frame(&mut writer, &response).is_err()
+                    || exiting
+                {
                     break;
                 }
             }
@@ -468,7 +475,8 @@ fn read_requests(
     responses: &mpsc::SyncSender<Response>,
 ) {
     loop {
-        let request = match rho_shell_proto::read_frame::<Request>(&mut control) {
+        let request = match rho_agent_host_proto::shell_kernel::read_frame::<Request>(&mut control)
+        {
             Ok(request) => request,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(error) => {
@@ -605,7 +613,7 @@ async fn run_kernel(
         let Request::Execute { execution, command } = request else {
             return 0;
         };
-        if !rho_shell_proto::command_fits(&command) {
+        if !rho_agent_host_proto::shell_kernel::command_fits(&command) {
             let _ = responses.send(Response::Error {
                 execution: Some(execution),
                 message: "command exceeds the shell input limit".into(),
@@ -799,7 +807,7 @@ fn connect_pager_control() -> Option<UnixStream> {
     let token = env::var(PAGER_TOKEN_ENV).ok()?;
     let execution_token = env::var(PAGER_EXECUTION_TOKEN_ENV).ok()?;
     let mut stream = UnixStream::connect(socket).ok()?;
-    rho_shell_proto::write_pager_frame(
+    rho_agent_host_proto::shell_kernel::write_pager_frame(
         &mut stream,
         &PagerMessage::Hello {
             protocol: PAGER_PROTOCOL_VERSION,
@@ -812,7 +820,8 @@ fn connect_pager_control() -> Option<UnixStream> {
     // closes the connection instead, and both that and a silent sidecar leave
     // the caller with no control stream, which is plain `cat`.
     stream.set_read_timeout(Some(PAGER_ATTACH_TIMEOUT)).ok()?;
-    let attached = rho_shell_proto::read_pager_frame::<PagerReply>(&mut stream).ok()?;
+    let attached =
+        rho_agent_host_proto::shell_kernel::read_pager_frame::<PagerReply>(&mut stream).ok()?;
     if attached != PagerReply::Attached {
         return None;
     }
@@ -892,8 +901,10 @@ fn relay_paged_with_lines(
             lines: lines as u32,
             bytes: bytes as u64,
         };
-        let action = rho_shell_proto::write_pager_frame(stream, &paused)
-            .and_then(|()| rho_shell_proto::read_pager_frame::<PagerReply>(stream));
+        let action = rho_agent_host_proto::shell_kernel::write_pager_frame(stream, &paused)
+            .and_then(|()| {
+                rho_agent_host_proto::shell_kernel::read_pager_frame::<PagerReply>(stream)
+            });
         match action {
             Ok(PagerReply::Continue) => {
                 page = page.saturating_add(1);
@@ -970,14 +981,19 @@ mod tests {
         let (mut pager, mut shell) = UnixStream::pair().unwrap();
         let controller = thread::spawn(move || {
             assert_eq!(
-                rho_shell_proto::read_pager_frame::<PagerMessage>(&mut shell).unwrap(),
+                rho_agent_host_proto::shell_kernel::read_pager_frame::<PagerMessage>(&mut shell)
+                    .unwrap(),
                 PagerMessage::Paused {
                     page: 1,
                     lines: 2,
                     bytes: 4,
                 }
             );
-            rho_shell_proto::write_pager_frame(&mut shell, &PagerReply::Continue).unwrap();
+            rho_agent_host_proto::shell_kernel::write_pager_frame(
+                &mut shell,
+                &PagerReply::Continue,
+            )
+            .unwrap();
         });
         let mut input = io::Cursor::new(b"a\nb\nc\n".to_vec());
         let mut output = Vec::new();
@@ -990,8 +1006,10 @@ mod tests {
     fn quitting_a_page_stops_reading_the_producer() {
         let (mut pager, mut shell) = UnixStream::pair().unwrap();
         let controller = thread::spawn(move || {
-            let _: PagerMessage = rho_shell_proto::read_pager_frame(&mut shell).unwrap();
-            rho_shell_proto::write_pager_frame(&mut shell, &PagerReply::Quit).unwrap();
+            let _: PagerMessage =
+                rho_agent_host_proto::shell_kernel::read_pager_frame(&mut shell).unwrap();
+            rho_agent_host_proto::shell_kernel::write_pager_frame(&mut shell, &PagerReply::Quit)
+                .unwrap();
         });
         let source = b"a\n".repeat(PAGER_CHUNK);
         let mut input = io::Cursor::new(source);

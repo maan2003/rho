@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use rho_core::{InferenceEvent, InferenceRequest};
 use senax_encoder::{Decode, Encode};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -13,6 +12,7 @@ use super::ws::{self, WebSocketConnection};
 use crate::accounts::SelectedAuth;
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::inference::Inference;
+use crate::types::{InferenceEvent, InferenceRequest};
 
 #[derive(Debug)]
 struct AuthFailure(anyhow::Error);

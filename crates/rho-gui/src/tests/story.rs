@@ -4,15 +4,18 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use rho_core::{MessageDelivery, UnixMs};
+use rho_agent_host_proto::transcript::{
+    AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
+};
+use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
+use rho_agents_client::stream::AgentFrame;
+use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::ConnEvent;
-use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge};
-use rho_ui_proto::{AgentId, AgentRole, Place};
 
-pub type UiRuntimeKind = rho_ui_proto::mirror::RuntimeKind;
-pub type UiSpawnedBy = rho_ui_proto::mirror::SpawnedBy;
-pub type UiAgentWant = rho_ui_proto::mirror::AgentWant;
-pub type UiTurnOutcome = rho_ui_proto::mirror::TurnOutcome;
+pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
+pub type UiSpawnedBy = rho_agent_host_proto::transcript::SpawnedBy;
+pub type UiAgentWant = rho_agent_host_proto::transcript::AgentWant;
+pub type UiTurnOutcome = rho_agent_host_proto::transcript::TurnOutcome;
 
 /// A position in an agent's story, as the old `Ready` named it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,23 +61,23 @@ pub enum UiStoryEvent {
 }
 
 impl UiStoryEvent {
-    fn mirror(self) -> MirrorEvent {
+    fn mirror(self) -> TranscriptEvent {
         match self {
-            Self::UserMessage { text, at } => MirrorEvent::Message {
+            Self::UserMessage { text, at } => TranscriptEvent::Message {
                 from: None,
                 text,
                 delivery: MessageDelivery::Immediate,
                 at,
             },
-            Self::TurnStarted { at } => MirrorEvent::Turn {
+            Self::TurnStarted { at } => TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at,
             },
-            Self::TurnEnded { outcome, at } => MirrorEvent::Turn {
+            Self::TurnEnded { outcome, at } => TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(outcome),
                 at,
             },
-            Self::Wants { want, summary, at } => MirrorEvent::Wants { want, summary, at },
+            Self::Wants { want, summary, at } => TranscriptEvent::Wants { want, summary, at },
         }
     }
 }
@@ -96,7 +99,7 @@ fn known(agent_id: AgentId) -> bool {
     NEXT_POS.with(|next| next.borrow().contains_key(&agent_id))
 }
 
-fn entry(agent_id: AgentId, pos: u64, event: MirrorEvent) -> LogEntry {
+fn entry(agent_id: AgentId, pos: u64, event: TranscriptEvent) -> LogEntry {
     let seq = NEXT_SEQ.with(|next| {
         let seq = next.get();
         next.set(seq + 1);
@@ -124,7 +127,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
     if known(agent_id) {
         let mut events = Vec::new();
         if head.generated_title.is_some() || head.activity.is_some() {
-            events.push(MirrorEvent::Presented {
+            events.push(TranscriptEvent::Presented {
                 title: head
                     .generated_title
                     .map_or(PresentationField::Unchanged, PresentationField::Set),
@@ -135,7 +138,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
             });
         }
         if head.turn_running {
-            events.push(MirrorEvent::Turn {
+            events.push(TranscriptEvent::Turn {
                 edge: TurnEdge::Started,
                 at: head.created_at,
             });
@@ -148,7 +151,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
             })
             .collect();
     }
-    let mut events = vec![MirrorEvent::Created {
+    let mut events = vec![TranscriptEvent::Created {
         role: head.role,
         runtime: head.runtime_kind,
         place: head.place,
@@ -159,7 +162,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         at: head.created_at,
     }];
     if head.generated_title.is_some() || head.activity.is_some() {
-        events.push(MirrorEvent::Presented {
+        events.push(TranscriptEvent::Presented {
             title: head
                 .generated_title
                 .map_or(PresentationField::Unchanged, PresentationField::Set),
@@ -170,7 +173,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         });
     }
     if head.turn_running {
-        events.push(MirrorEvent::Turn {
+        events.push(TranscriptEvent::Turn {
             edge: TurnEdge::Started,
             at: head.created_at,
         });
@@ -179,7 +182,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
     if head.story_pos.0 >= told {
         // The head stood past what these rows say; a row that changes
         // nothing carries the position.
-        events.push(MirrorEvent::Presented {
+        events.push(TranscriptEvent::Presented {
             title: PresentationField::Unchanged,
             activity: PresentationField::Unchanged,
             at: head.created_at,
@@ -200,29 +203,35 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
         .collect()
 }
 
-/// `Ready` followed by the log rows these heads stand for.
-pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> ConnEvent {
+/// `Ready`, then an agents stream opening on the log rows these heads stand
+/// for.
+pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
     let entries = heads.into_iter().flat_map(head_entries).collect();
     // The head is the newest row handed out: a client that has heard every
     // row so far is caught up.
     let journal_head = NEXT_SEQ.with(|next| Seq(next.get() - 1));
-    ConnEvent::Many(vec![
+    Frame::Many(vec![
         ConnEvent::Ready {
-            auth: rho_ui_proto::AuthState {
+            auth: rho_agent_host_proto::AuthState {
                 namespaces: Vec::new(),
                 disabled_namespaces: Vec::new(),
                 active_namespace: None,
             },
             machine_seed: 0,
             agent_counter,
+        }
+        .into(),
+        AgentFrame::JournalHead {
+            machine_seed: 0,
             journal_head,
-        },
-        ConnEvent::Log { entries },
+        }
+        .into(),
+        AgentFrame::Log { entries }.into(),
     ])
 }
 
 /// A run of one agent's story, each row past the last one told.
-pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
+pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> AgentFrame {
     let entries = events
         .into_iter()
         .map(|event| {
@@ -230,34 +239,72 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
             entry(agent_id, pos, event.mirror())
         })
         .collect();
-    ConnEvent::Log { entries }
+    AgentFrame::Log { entries }
 }
 
 thread_local! {
     /// The model this test drives. One per test thread, so a test's own
     /// fold and cursor are its own.
-    static MODEL: RefCell<(rho_mirror::model::Model, std::collections::HashSet<rho_agents::HostId>)> =
-        RefCell::new((rho_mirror::model::Model::new(), std::collections::HashSet::new()));
+    static MODEL: RefCell<(rho_agents_client::model::Model, std::collections::HashSet<rho_agents_client::HostId>)> =
+        RefCell::new((rho_agents_client::model::Model::new(), std::collections::HashSet::new()));
 }
 
-/// One frame, through the model and then into the workspace: the same
-/// `ingest` the model thread runs, called inline so a test stays in one
-/// thread and can assert in the frame it fed.
+/// What a host says, on any of its streams.
+pub enum Frame {
+    Control(ConnEvent),
+    Agents(AgentFrame),
+    Desk(DeskFrame),
+    Many(Vec<Frame>),
+}
+
+impl From<ConnEvent> for Frame {
+    fn from(event: ConnEvent) -> Self {
+        Self::Control(event)
+    }
+}
+
+impl From<AgentFrame> for Frame {
+    fn from(frame: AgentFrame) -> Self {
+        Self::Agents(frame)
+    }
+}
+
+impl From<DeskFrame> for Frame {
+    fn from(frame: DeskFrame) -> Self {
+        Self::Desk(frame)
+    }
+}
+
+/// One frame into the workspace: a control- or desk-stream event straight in,
+/// an agents-stream frame through the same `ingest` the model thread runs,
+/// called inline so a test stays in one thread and can assert in the frame
+/// it fed.
 pub fn feed(
     workspace: &mut crate::workspace::Workspace,
-    host: rho_agents::HostId,
-    event: ConnEvent,
+    host: rho_agents_client::HostId,
+    frame: impl Into<Frame>,
     window: &mut gpui::Window,
     cx: &mut gpui::Context<crate::workspace::Workspace>,
 ) {
-    let followed = workspace.followed();
-    let events = MODEL.with(|model| {
-        let (model, attached) = &mut *model.borrow_mut();
-        if attached.insert(host) {
-            model.attach(host, format!("host-{}", attached.len()));
+    match frame.into() {
+        Frame::Control(event) => workspace.handle_event(host, event, window, cx),
+        Frame::Desk(frame) => workspace.handle_desk_event(host, frame, window, cx),
+        Frame::Agents(frame) => {
+            let followed = workspace.followed();
+            let events = MODEL.with(|model| {
+                let (model, attached) = &mut *model.borrow_mut();
+                if attached.insert(host) {
+                    model.attach(host, format!("host-{}", attached.len()));
+                }
+                model.command(rho_agents_client::model::ModelCommand::Follow(followed));
+                model.ingest(host, frame)
+            });
+            workspace.handle_model_events(events, window, cx);
         }
-        model.command(rho_mirror::model::ModelCommand::Follow(followed));
-        model.ingest(host, event)
-    });
-    workspace.handle_model_events(events, window, cx);
+        Frame::Many(frames) => {
+            for frame in frames {
+                feed(workspace, host, frame, window, cx);
+            }
+        }
+    }
 }

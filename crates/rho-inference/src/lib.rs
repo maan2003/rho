@@ -8,6 +8,7 @@ pub mod exec;
 mod inference;
 pub use credentials::{CredentialSnapshot, CredentialState};
 mod responses;
+pub mod types;
 
 pub use accounts::{
     InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState, SelectedAuth,

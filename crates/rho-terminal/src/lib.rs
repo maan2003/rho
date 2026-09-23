@@ -30,11 +30,11 @@ use gpui::{
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollDelta,
     ScrollWheelEvent, Styled as _, StyledText, Subscription, TextStyle, Window, canvas, div, px,
 };
-use rho_hosts::connection::TerminalChannel;
-use rho_ui_proto::term::{
+use rho_agent_host_proto::term::{
     FrameApplied, ScrollbackItem, TermCell, TermCellFlags, TermClientFrame, TermColor,
     TermKeystroke, TermRow, TermServerFrame, WireScreen,
 };
+use rho_hosts::connection::TerminalChannel;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;

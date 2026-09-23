@@ -35,7 +35,7 @@ impl Visualization {
             return;
         }
         self.state = State::Loading;
-        let request = self.client.get(self.id.clone(), cx);
+        let request = self.client.get(self.id.clone());
         let renderer = cx.svg_renderer();
         let executor = cx.background_executor().clone();
         self.task = Some(cx.spawn_in(window, async move |this, cx| {

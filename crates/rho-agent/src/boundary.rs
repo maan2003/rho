@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_core::UnixMs;
+use rho_agent_host_proto::UnixMs;
 
 use crate::python::{CellFacts, JobFacts};
 use crate::{WakeEvent, WakeFacts, WakeKind, WakeTrigger};

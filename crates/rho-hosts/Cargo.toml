@@ -19,16 +19,13 @@ octo-types = { workspace = true }
 senax-encoder = { workspace = true }
 camino.workspace = true
 futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
-gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 iroh = { workspace = true }
 redb = { workspace = true }
 rho-db = { workspace = true }
-rho-desk = { workspace = true }
+rho-agent-host-proto.workspace = true
 rho-iroh-auth = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc = { workspace = true }
-rho-ui-proto = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -39,7 +36,6 @@ tracing = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-rho-core = { workspace = true }
 tempfile = { workspace = true }
 
 [dependencies.rho-desktop-media]

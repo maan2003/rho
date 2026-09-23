@@ -17,13 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alacritty_terminal::vte::{self, Params, Perform};
 use anyhow::Context as _;
-use rho_shell_proto::{
+use rho_agent_host_proto::AgentId;
+use rho_agent_host_proto::shell::{
+    MAX_STYLE_SPANS, ShellColor, ShellServerFrame, ShellStyleSpan, ShellTextStyle,
+};
+use rho_agent_host_proto::shell_kernel::{
     MAX_ACTIVE_PAGERS, MAX_PAGER_BYTES, MAX_PAGER_LINES, MAX_PROMPT_BYTES, PROTOCOL_VERSION,
     PagerAction, Request, Response,
-};
-use rho_ui_proto::AgentId;
-use rho_ui_proto::shell::{
-    MAX_STYLE_SPANS, ShellColor, ShellServerFrame, ShellStyleSpan, ShellTextStyle,
 };
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -71,7 +71,7 @@ pub enum ShellSubmitError {
 #[allow(clippy::result_unit_err)]
 impl ShellSubmitter {
     pub fn try_send(&self, command: String) -> Result<u64, ShellSubmitError> {
-        if !rho_ui_proto::shell::command_fits(&command) {
+        if !rho_agent_host_proto::shell::command_fits(&command) {
             return Err(ShellSubmitError::TooLarge);
         }
         let mut next = self.next_execution.lock().unwrap();
@@ -88,7 +88,7 @@ impl ShellSubmitter {
     /// [`Self::try_send`] that waits for queue room; for tests.
     #[doc(hidden)]
     pub async fn send(&self, command: String) -> Result<u64, ()> {
-        if !rho_ui_proto::shell::command_fits(&command) {
+        if !rho_agent_host_proto::shell::command_fits(&command) {
             return Err(());
         }
         let permit = self.tx.reserve().await.map_err(|_| ())?;
@@ -107,7 +107,7 @@ struct QueuedSubmission {
 
 #[derive(Clone)]
 pub struct ShellExit {
-    pub state: rho_ui_proto::shell::ShellState,
+    pub state: rho_agent_host_proto::shell::ShellState,
     pub status: Option<i32>,
 }
 
@@ -312,7 +312,7 @@ struct ClientState {
 }
 
 struct State {
-    shell: rho_ui_proto::shell::ShellState,
+    shell: rho_agent_host_proto::shell::ShellState,
     execution_outputs: HashMap<u64, PlainOutput>,
     terminal_output: PlainOutput,
     clients: Vec<ClientState>,
@@ -390,12 +390,12 @@ impl State {
     fn queued(&mut self, execution: u64, command: String) {
         self.execution_outputs
             .insert(execution, PlainOutput::default());
-        let block = rho_ui_proto::shell::ShellExecution {
+        let block = rho_agent_host_proto::shell::ShellExecution {
             execution,
             command,
             prompt: String::new(),
             cwd: String::new(),
-            state: rho_ui_proto::shell::ShellExecutionState::Queued,
+            state: rho_agent_host_proto::shell::ShellExecutionState::Queued,
             output: String::new(),
             styles: Vec::new(),
         };
@@ -413,7 +413,7 @@ impl State {
         else {
             return;
         };
-        block.state = rho_ui_proto::shell::ShellExecutionState::Running;
+        block.state = rho_agent_host_proto::shell::ShellExecutionState::Running;
         let prompt = self.shell.prompt.clone();
         let cwd = self.shell.cwd.clone();
         block.prompt.clone_from(&prompt);
@@ -464,7 +464,7 @@ impl State {
     }
 
     fn pager_paused(&mut self, execution: u64, pager: u64, page: u64, lines: u32, bytes: u64) {
-        let state = rho_ui_proto::shell::ShellPager {
+        let state = rho_agent_host_proto::shell::ShellPager {
             execution,
             pager,
             page,
@@ -518,7 +518,7 @@ impl State {
             .iter_mut()
             .find(|block| block.execution == execution)
         {
-            block.state = rho_ui_proto::shell::ShellExecutionState::Finished { status };
+            block.state = rho_agent_host_proto::shell::ShellExecutionState::Finished { status };
         }
         self.send_state_frame(ShellServerFrame::ExecutionFinished { execution, status });
         self.trim_shell_state();
@@ -531,7 +531,7 @@ impl State {
                 .iter_mut()
                 .find(|block| block.execution == execution)
         }) {
-            block.state = rho_ui_proto::shell::ShellExecutionState::Failed;
+            block.state = rho_agent_host_proto::shell::ShellExecutionState::Failed;
         }
         self.send_state_frame(ShellServerFrame::ExecutionFailed { execution });
         self.trim_shell_state();
@@ -544,7 +544,7 @@ impl State {
             .iter_mut()
             .find(|block| block.execution == execution)
         {
-            block.state = rho_ui_proto::shell::ShellExecutionState::Cancelled;
+            block.state = rho_agent_host_proto::shell::ShellExecutionState::Cancelled;
         }
         for client in &mut self.clients {
             client.needs_snapshot = true;
@@ -575,7 +575,7 @@ impl State {
     }
 
     fn trim_shell_state(&mut self) {
-        let retained_bytes = |block: &rho_ui_proto::shell::ShellExecution| {
+        let retained_bytes = |block: &rho_agent_host_proto::shell::ShellExecution| {
             block.command.len()
                 + block.prompt.len()
                 + block.cwd.len()
@@ -593,9 +593,9 @@ impl State {
             let Some(index) = self.shell.executions.iter().position(|block| {
                 matches!(
                     block.state,
-                    rho_ui_proto::shell::ShellExecutionState::Finished { .. }
-                        | rho_ui_proto::shell::ShellExecutionState::Failed
-                        | rho_ui_proto::shell::ShellExecutionState::Cancelled
+                    rho_agent_host_proto::shell::ShellExecutionState::Finished { .. }
+                        | rho_agent_host_proto::shell::ShellExecutionState::Failed
+                        | rho_agent_host_proto::shell::ShellExecutionState::Cancelled
                 )
             }) else {
                 break;
@@ -1104,7 +1104,7 @@ impl Session {
         let active_execution = Arc::new(AtomicU64::new(0));
         let (exit_tx, _exit_rx) = watch::channel(None);
         let state = State {
-            shell: rho_ui_proto::shell::ShellState {
+            shell: rho_agent_host_proto::shell::ShellState {
                 prompt: "> ".into(),
                 cwd: String::new(),
                 executions: Vec::new(),
@@ -1673,7 +1673,8 @@ async fn read_responses(
     responses: mpsc::Sender<Response>,
 ) {
     loop {
-        let Ok(response) = rho_shell_proto::read_frame_async(&mut reader).await else {
+        let Ok(response) = rho_agent_host_proto::shell_kernel::read_frame_async(&mut reader).await
+        else {
             break;
         };
         if responses.send(response).await.is_err() {
@@ -1687,7 +1688,7 @@ async fn write_requests(
     mut requests: mpsc::Receiver<Request>,
 ) {
     while let Some(request) = requests.recv().await {
-        if rho_shell_proto::write_frame_async(&mut writer, &request)
+        if rho_agent_host_proto::shell_kernel::write_frame_async(&mut writer, &request)
             .await
             .is_err()
         {
@@ -1706,8 +1707,8 @@ mod tests {
         let (control_tx, _control_rx) = mpsc::channel(1);
         let (exit_tx, exit_rx) = watch::channel(None);
         let mut state = State {
-            shell: rho_ui_proto::shell::ShellState {
-                pagers: vec![rho_ui_proto::shell::ShellPager {
+            shell: rho_agent_host_proto::shell::ShellState {
+                pagers: vec![rho_agent_host_proto::shell::ShellPager {
                     execution: 1,
                     pager: 1,
                     page: 1,

@@ -1,7 +1,7 @@
 //! Small, append-only reports about friction encountered while using Rho.
 
 use redb::TableDefinition;
-use rho_core::{AgentId, UnixMs};
+use rho_agent_host_proto::{AgentId, UnixMs};
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
@@ -59,7 +59,7 @@ impl PapercutTool {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::AgentIdDomain;
+    use rho_agent_host_proto::AgentIdDomain;
 
     use super::*;
 

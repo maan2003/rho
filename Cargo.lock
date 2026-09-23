@@ -5127,7 +5127,7 @@ dependencies = [
  "anyhow",
  "octo-types",
  "reqwest 0.12.28",
- "rho-ui-proto",
+ "rho-agent-host-proto",
  "tokio",
 ]
 
@@ -12510,18 +12510,16 @@ dependencies = [
  "rand 0.8.7",
  "redb",
  "redb-derive",
+ "rho-agent-host-proto",
  "rho-claude",
  "rho-context-config",
- "rho-core",
  "rho-db",
  "rho-fs-view",
  "rho-image",
  "rho-inference",
  "rho-rpc",
  "rho-shell",
- "rho-shell-proto",
  "rho-tool-shell",
- "rho-ui-proto",
  "rho-web-search",
  "rustix 1.1.4",
  "rustix-openpty",
@@ -12536,31 +12534,67 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-agents"
+name = "rho-agent-host-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-stream",
  "bytes",
  "camino",
  "chrono",
+ "clock",
+ "dirs",
+ "futures",
+ "prefix-id",
+ "rand 0.8.7",
+ "rho-rpc",
+ "senax-encoder",
+ "serde",
+ "text",
+ "tokio",
+]
+
+[[package]]
+name = "rho-agents-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "camino",
+ "collections",
+ "futures",
+ "prefix-id",
+ "redb",
+ "rho-agent-host-proto",
+ "rho-db",
+ "rho-hosts",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rho-agents-view"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "collections",
  "editor",
- "futures",
  "gpui",
  "json-stream",
  "language",
  "multi_buffer",
- "prefix-id",
- "rho-core",
+ "rho-agent-host-proto",
+ "rho-agents-client",
  "rho-hosts",
- "rho-ui-proto",
  "rho-window",
  "rustc-hash 2.1.3",
- "senax-encoder",
  "serde_json",
  "settings",
  "text",
- "theme",
  "theme_settings",
+ "tracing",
  "tree-sitter",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
  "ui",
@@ -12624,8 +12658,9 @@ dependencies = [
  "bytes",
  "camino",
  "libc",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-fs-view",
+ "rho-inference",
  "rustix 1.1.4",
  "senax-encoder",
  "serde",
@@ -12660,14 +12695,12 @@ dependencies = [
  "libc",
  "prefix-id",
  "rho-agent",
+ "rho-agent-host-proto",
  "rho-claude",
- "rho-core",
  "rho-daemon",
  "rho-db",
- "rho-desk",
  "rho-fs-view",
  "rho-inference",
- "rho-ui-proto",
  "rho-visualizations",
  "serde",
  "serde_json",
@@ -12688,19 +12721,6 @@ dependencies = [
  "dirs",
  "serde_yaml",
  "tempfile",
-]
-
-[[package]]
-name = "rho-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "inventory",
- "prefix-id",
- "senax-encoder",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -12728,11 +12748,11 @@ dependencies = [
  "redb",
  "reqwest 0.12.28",
  "rho-agent",
+ "rho-agent-host-proto",
  "rho-claude",
  "rho-claude-usage",
- "rho-core",
  "rho-db",
- "rho-desk",
+ "rho-desk-server",
  "rho-desktop-media",
  "rho-desktop-proto",
  "rho-fs-view",
@@ -12744,8 +12764,6 @@ dependencies = [
  "rho-profiling",
  "rho-rpc",
  "rho-shell",
- "rho-shell-proto",
- "rho-ui-proto",
  "rho-visualizations",
  "rustix-openpty",
  "senax-encoder",
@@ -12753,7 +12771,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "text",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -12775,17 +12792,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-desk"
+name = "rho-desk-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "camino",
  "chrono",
- "clock",
- "rand 0.8.7",
- "rho-core",
+ "futures",
+ "prefix-id",
+ "redb",
+ "rho-agent-host-proto",
+ "rho-agents-client",
+ "rho-db",
+ "rho-hosts",
+ "rho-slack",
  "senax-encoder",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rho-desk-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "redb",
+ "rho-agent-host-proto",
+ "rho-db",
+ "senax-encoder",
+ "tempfile",
  "text",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -12878,9 +12921,9 @@ dependencies = [
  "language",
  "multi_buffer",
  "path",
+ "rho-agent-host-proto",
  "rho-hosts",
  "rho-rpc",
- "rho-ui-proto",
  "rho-window",
  "text",
  "theme",
@@ -12896,10 +12939,10 @@ dependencies = [
  "camino",
  "dirs",
  "libc",
+ "rho-agent-host-proto",
  "rho-git-client",
  "rho-git-proto",
  "rho-git-server",
- "rho-workspaces-types",
  "senax-encoder",
  "serde_json",
  "tempfile",
@@ -12969,18 +13012,18 @@ dependencies = [
  "redb",
  "redb-derive",
  "release_channel",
- "rho-agents",
+ "rho-agent-host-proto",
+ "rho-agents-client",
+ "rho-agents-view",
  "rho-browser",
- "rho-core",
  "rho-db",
- "rho-desk",
+ "rho-desk-client",
  "rho-desktop-proto",
  "rho-fake-slack",
  "rho-files",
  "rho-hosts",
  "rho-iroh-auth",
  "rho-journal",
- "rho-mirror",
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
@@ -12988,7 +13031,6 @@ dependencies = [
  "rho-slack",
  "rho-terminal",
  "rho-transcript",
- "rho-ui-proto",
  "rho-window",
  "rodio",
  "rust-embed",
@@ -13024,21 +13066,17 @@ dependencies = [
  "bytes",
  "camino",
  "futures",
- "gpui",
- "gpui_tokio",
  "iroh",
  "moq-net",
  "octo-types",
  "redb",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-db",
- "rho-desk",
  "rho-desktop-media",
  "rho-desktop-proto",
  "rho-iroh-auth",
  "rho-rpc",
  "rho-rtc",
- "rho-ui-proto",
  "senax-encoder",
  "tempfile",
  "tokio",
@@ -13051,7 +13089,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
- "rho-core",
+ "rho-inference",
  "tokio",
 ]
 
@@ -13067,11 +13105,12 @@ dependencies = [
  "fnv",
  "futures",
  "futures-util",
+ "inventory",
  "notify",
  "rand 0.8.7",
  "redb",
  "reqwest 0.12.28",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-db",
  "rpassword",
  "rustls",
@@ -13110,32 +13149,11 @@ dependencies = [
  "chrono",
  "futures",
  "redb",
+ "rho-agent-host-proto",
  "rho-db",
- "rho-desk",
- "rho-ui-proto",
  "senax-encoder",
  "serde",
  "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rho-mirror"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "futures",
- "prefix-id",
- "redb",
- "rho-agents",
- "rho-core",
- "rho-db",
- "rho-hosts",
- "rho-ui-proto",
- "senax-encoder",
  "tempfile",
  "tokio",
  "tracing",
@@ -13166,7 +13184,7 @@ dependencies = [
  "redb",
  "reqwest 0.12.28",
  "rho-agent",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-db",
  "rustls",
  "senax-encoder",
@@ -13206,13 +13224,14 @@ dependencies = [
  "flate2",
  "redb",
  "reqwest 0.12.28",
- "rho-core",
+ "rho-agent-host-proto",
+ "rho-agents-client",
  "rho-db",
+ "rho-desk-client",
  "rho-fake-model",
  "rho-gui",
- "rho-mirror",
+ "rho-rpc",
  "rho-slack",
- "rho-ui-proto",
  "rustls",
  "senax-encoder",
  "serde",
@@ -13263,18 +13282,9 @@ dependencies = [
  "brush-core",
  "libc",
  "rand 0.8.7",
- "rho-shell-proto",
+ "rho-agent-host-proto",
  "rustix-openpty",
  "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "rho-shell-proto"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "senax-encoder",
  "tokio",
 ]
 
@@ -13287,9 +13297,9 @@ dependencies = [
  "gpui",
  "language",
  "multi_buffer",
+ "rho-agent-host-proto",
  "rho-hosts",
  "rho-terminal",
- "rho-ui-proto",
  "rho-window",
  "text",
  "theme",
@@ -13338,8 +13348,8 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "gpui",
+ "rho-agent-host-proto",
  "rho-hosts",
- "rho-ui-proto",
  "settings",
  "theme",
  "theme_settings",
@@ -13351,9 +13361,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-db",
  "rho-fs-view",
+ "rho-inference",
  "rustix 1.1.4",
  "senax-encoder",
  "serde",
@@ -13393,35 +13404,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-ui-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "bytes",
- "camino",
- "chrono",
- "clock",
- "dirs",
- "futures",
- "rho-core",
- "rho-desk",
- "rho-rpc",
- "rho-shell-proto",
- "rho-workspaces-types",
- "senax-encoder",
- "text",
- "tokio",
-]
-
-[[package]]
 name = "rho-visualizations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
  "redb",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-db",
  "senax-encoder",
  "sha2 0.10.9",
@@ -13435,7 +13424,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "reqwest 0.12.28",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-inference",
  "serde",
  "serde_json",
@@ -13455,20 +13444,11 @@ dependencies = [
  "languages",
  "multi_buffer",
  "node_runtime",
- "rho-core",
+ "rho-agent-host-proto",
  "rho-hosts",
  "text",
  "theme",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
-]
-
-[[package]]
-name = "rho-workspaces-types"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "camino",
- "senax-encoder",
 ]
 
 [[package]]

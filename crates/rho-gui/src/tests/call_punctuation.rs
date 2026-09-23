@@ -18,13 +18,13 @@ fn ran(command: &str) -> UiBlock {
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: serde_json::json!({ "command": command }).to_string(),
-        format: rho_ui_proto::mirror::ArgumentsFormat::Json,
+        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
         preview: None,
         status: UiToolStatus::Success,
         output: None,
         error: None,
-        started_at: Some(rho_core::UnixMs(10)),
-        finished_at: Some(rho_core::UnixMs(20)),
+        started_at: Some(rho_agent_host_proto::UnixMs(10)),
+        finished_at: Some(rho_agent_host_proto::UnixMs(20)),
         metadata: None,
     })
 }
@@ -95,12 +95,12 @@ fn exec_provider_phases_reach_the_editor_without_execution_duration(cx: &mut Tes
     };
     tool.name = "exec".into();
     tool.arguments = "print('hello')".into();
-    tool.timing = rho_core::ExecTiming {
-        first_block_at: Some(rho_core::UnixMs(100)),
-        arguments_finished_at: Some(rho_core::UnixMs(2100)),
-        response_finished_at: Some(rho_core::UnixMs(2600)),
-        boundary_at: Some(rho_core::UnixMs(5600)),
-        handed_off_at: Some(rho_core::UnixMs(5620)),
+    tool.timing = rho_agent_host_proto::ExecTiming {
+        first_block_at: Some(rho_agent_host_proto::UnixMs(100)),
+        arguments_finished_at: Some(rho_agent_host_proto::UnixMs(2100)),
+        response_finished_at: Some(rho_agent_host_proto::UnixMs(2600)),
+        boundary_at: Some(rho_agent_host_proto::UnixMs(5600)),
+        handed_off_at: Some(rho_agent_host_proto::UnixMs(5620)),
     };
     feed_frame(
         &workspace,

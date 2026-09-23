@@ -12,16 +12,16 @@ pub enum Action {
     TerminalList,
     ShellList,
     ShellStart {
-        agent: rho_core::AgentId,
+        agent: rho_agent_host_proto::AgentId,
         cwd: camino::Utf8PathBuf,
         program: std::path::PathBuf,
         pager: std::path::PathBuf,
     },
     ShellClose {
-        agent: rho_core::AgentId,
+        agent: rho_agent_host_proto::AgentId,
     },
     Desktop {
-        agent: rho_core::AgentId,
+        agent: rho_agent_host_proto::AgentId,
         session: String,
     },
     DesktopList,
@@ -30,7 +30,7 @@ pub enum Action {
 #[derive(Encode, Decode)]
 pub enum Attach {
     Terminal {
-        agent: rho_core::AgentId,
+        agent: rho_agent_host_proto::AgentId,
         terminal: u64,
         create: bool,
         cols: u16,
@@ -39,18 +39,18 @@ pub enum Attach {
         shell: String,
     },
     Shell {
-        agent: rho_core::AgentId,
+        agent: rho_agent_host_proto::AgentId,
     },
 }
 
 #[derive(Encode, Decode)]
 pub enum Reply {
     Done,
-    Terminals(Vec<rho_ui_proto::term::TerminalInfo>),
-    Shells(Vec<rho_ui_proto::shell::ShellInfo>),
+    Terminals(Vec<rho_agent_host_proto::term::TerminalInfo>),
+    Shells(Vec<rho_agent_host_proto::shell::ShellInfo>),
     Error(String),
     Desktop { socket: String },
-    DesktopSessions(Vec<rho_ui_proto::DesktopSession>),
+    DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
 }
 
 #[derive(Encode, Decode)]
@@ -94,9 +94,11 @@ impl Client {
         O: senax_encoder::Decoder + senax_encoder::Packer,
     {
         let input = async {
-            while let Some((frame, _)) =
-                rho_rpc::read_frame_optional::<_, I>(&mut reader, rho_ui_proto::MAX_FRAME_LEN)
-                    .await?
+            while let Some((frame, _)) = rho_rpc::read_frame_optional::<_, I>(
+                &mut reader,
+                rho_agent_host_proto::MAX_FRAME_LEN,
+            )
+            .await?
             {
                 self.sender.send(self.port, encode(&frame)?).await?;
             }
@@ -105,7 +107,8 @@ impl Client {
         let output = async {
             while let Some(bytes) = self.incoming.recv().await {
                 let frame: O = decode(&bytes)?;
-                rho_rpc::write_frame(&mut writer, &frame, rho_ui_proto::MAX_FRAME_LEN).await?;
+                rho_rpc::write_frame(&mut writer, &frame, rho_agent_host_proto::MAX_FRAME_LEN)
+                    .await?;
             }
             tokio::io::AsyncWriteExt::shutdown(&mut writer).await?;
             Ok::<(), anyhow::Error>(())
@@ -175,7 +178,7 @@ impl Execution {
                     .list()
                     .await
                     .into_iter()
-                    .map(|entry| rho_ui_proto::term::TerminalInfo {
+                    .map(|entry| rho_agent_host_proto::term::TerminalInfo {
                         agent: entry.agent_id.encoded(),
                         terminal_id: entry.terminal_id,
                         title: entry.title.unwrap_or_default(),
@@ -190,7 +193,7 @@ impl Execution {
                     .list()
                     .await
                     .into_iter()
-                    .map(|entry| rho_ui_proto::shell::ShellInfo {
+                    .map(|entry| rho_agent_host_proto::shell::ShellInfo {
                         agent: entry.agent_id.encoded(),
                         clients: entry.clients as u32,
                     })
@@ -275,7 +278,7 @@ impl Execution {
                 };
                 let input = async {
                     while let Some(bytes) = incoming.recv().await {
-                        use rho_ui_proto::term::TermClientFrame as F;
+                        use rho_agent_host_proto::term::TermClientFrame as F;
 
                         use crate::terminal::ClientInput as I;
                         let input = match decode::<F>(&bytes)? {
@@ -333,7 +336,7 @@ async fn serve_shell(
     sender: Sender,
     port: Port,
 ) -> anyhow::Result<()> {
-    use rho_ui_proto::shell::{ShellClientFrame as C, ShellServerFrame as S};
+    use rho_agent_host_proto::shell::{ShellClientFrame as C, ShellServerFrame as S};
 
     use crate::shell::{ShellControl, ShellSubmitError};
     let crate::shell::ShellClient {
@@ -434,7 +437,7 @@ async fn serve_shell(
 // Advertisements are ephemeral: starting a desktop atomically publishes one,
 // orderly stop removes it, and the lifetime lock excludes leftovers after a
 // crash.
-async fn desktop_sessions() -> anyhow::Result<Vec<rho_ui_proto::DesktopSession>> {
+async fn desktop_sessions() -> anyhow::Result<Vec<rho_agent_host_proto::DesktopSession>> {
     let mut sessions = Vec::new();
     #[cfg(target_os = "linux")]
     {
@@ -492,7 +495,7 @@ async fn desktop_sessions() -> anyhow::Result<Vec<rho_ui_proto::DesktopSession>>
                 if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
                 {
-                    sessions.push(rho_ui_proto::DesktopSession {
+                    sessions.push(rho_agent_host_proto::DesktopSession {
                         agent: owner.to_owned(),
                         name: name.to_owned(),
                     });

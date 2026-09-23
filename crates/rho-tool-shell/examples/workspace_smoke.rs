@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use camino::Utf8Path;
-use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_fs_view::{Mode, StoreRefresh, StoreService, UserEnvironment, Worksets};
+use rho_inference::types::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
 
 fn shell_call(command: &str) -> ToolCall {

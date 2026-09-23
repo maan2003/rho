@@ -6,7 +6,8 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
-  "crates/rho-agents",
+  "crates/rho-agents-client",
+  "crates/rho-agents-view",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
   "crates/rho-ci",
@@ -14,12 +15,10 @@ members = [
   "crates/rho-claude-usage",
   "crates/rho-cli",
   "crates/rho-context-config",
-  "crates/rho-core",
   "crates/rho-daemon",
   "crates/rho-desktop-proto",
   "crates/rho-desktop-media",
   "crates/rho-db",
-  "crates/rho-desk",
   "crates/rho-fake-model",
   "crates/rho-fake-slack",
   "crates/rho-files",
@@ -32,7 +31,8 @@ members = [
   "crates/rho-inference",
   "crates/rho-iroh-auth",
   "crates/rho-journal",
-  "crates/rho-mirror",
+  "crates/rho-desk-client",
+  "crates/rho-desk-server",
   "crates/rho-devshell-builder",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
@@ -42,18 +42,16 @@ members = [
   "crates/rho-rtc",
   "crates/rho-shell",
   "crates/rho-terminal",
-  "crates/rho-shell-proto",
   "crates/rho-shell-view",
   "crates/rho-slack",
   "crates/rho-tool-shell",
   "crates/rho-transcript",
   "crates/rho-touch-keyboard",
-  "crates/rho-ui-proto",
+  "crates/rho-agent-host-proto",
   "crates/rho-window",
   "crates/rho-visualizations",
   "crates/rho-web-search",
   "crates/rho-fs-view",
-  "crates/rho-workspaces-types",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
@@ -123,7 +121,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "stream",
 ] }
 rho-agent = { path = "crates/rho-agent", default-features = false }
-rho-agents = { path = "crates/rho-agents" }
+rho-agents-client = { path = "crates/rho-agents-client" }
+rho-agents-view = { path = "crates/rho-agents-view" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }
 rho-ci = { path = "crates/rho-ci" }
@@ -131,10 +130,8 @@ rho-claude = { path = "crates/rho-claude" }
 rho-claude-usage = { path = "crates/rho-claude-usage" }
 rho-cli = { path = "crates/rho-cli" }
 rho-context-config = { path = "crates/rho-context-config" }
-rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
-rho-desk = { path = "crates/rho-desk" }
 rho-fake-model = { path = "crates/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
@@ -145,7 +142,8 @@ rho-image = { path = "crates/rho-image" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
-rho-mirror = { path = "crates/rho-mirror" }
+rho-desk-client = { path = "crates/rho-desk-client" }
+rho-desk-server = { path = "crates/rho-desk-server" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
@@ -161,16 +159,14 @@ rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }
 rho-shell = { path = "crates/rho-shell" }
 rho-terminal = { path = "crates/rho-terminal" }
-rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-shell-view = { path = "crates/rho-shell-view" }
 rho-slack = { path = "crates/rho-slack", default-features = false }
 rho-transcript = { path = "crates/rho-transcript" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
-rho-ui-proto = { path = "crates/rho-ui-proto" }
+rho-agent-host-proto = { path = "crates/rho-agent-host-proto" }
 rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-fs-view = { path = "crates/rho-fs-view" }
-rho-workspaces-types = { path = "crates/rho-workspaces-types" }
 rpassword = "7"
 rustix-openpty = "0.2"
 rustls = { version = "0.23", default-features = false, features = [

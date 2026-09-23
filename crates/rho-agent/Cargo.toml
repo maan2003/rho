@@ -12,7 +12,7 @@ rho-rpc.workspace = true
 alacritty_terminal.workspace = true
 rustix-openpty.workspace = true
 libc.workspace = true
-rho-shell-proto.workspace = true
+rho-agent-host-proto.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 base64.workspace = true
@@ -30,12 +30,10 @@ rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
 redb-derive = "0.1"
 rho-claude.workspace = true
 rho-context-config.workspace = true
-rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-image.workspace = true
 rho-tool-shell.workspace = true
-rho-ui-proto.workspace = true
 rho-fs-view.workspace = true
 rho-web-search.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }

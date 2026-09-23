@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rho_core::{ImageContent, ImageDetail};
+use rho_inference::types::{ImageContent, ImageDetail};
 
 use crate::View;
 

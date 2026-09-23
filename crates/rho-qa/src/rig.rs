@@ -19,16 +19,19 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_core::{AgentRole, ContentPart};
-use rho_ui_proto::client::Client;
-use rho_ui_proto::mirror::MirrorEvent;
-use rho_ui_proto::{ClientMessage, JoinTarget, ServerMessage, StartMode};
+use rho_agent_host_proto::agents::{
+    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
+};
+use rho_agent_host_proto::client::Client;
+use rho_agent_host_proto::transcript::TranscriptEvent;
+use rho_agent_host_proto::{AgentCommand, AgentRole, ContentPart, JoinTarget, Reply, StartMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::paths;
 use crate::profile::{self, Summary};
 use crate::snapshot::human;
+use crate::streams::{Incoming, Streams};
 
 /// How long to wait for the daemon's socket and the fake's readiness line.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1141,34 +1144,30 @@ async fn probe_async(name: &str) -> Result<()> {
         }
     }
 
-    let mut client = Client::connect(&socket)
+    let client = Client::connect(&socket)
         .await
         .with_context(|| format!("connect to the running rig at {}", socket.display()))?;
-    client.send(&ClientMessage::Subscribe).await?;
-    let head = loop {
-        match client.recv().await? {
-            ServerMessage::Ready { journal_head, .. } => break journal_head,
-            ServerMessage::Error { message } => bail!("daemon readiness error: {message}"),
-            _ => {}
-        }
-    };
-    client.send(&ClientMessage::Follow { since: head }).await?;
+    let mut client = Streams::open(client, &socket).await?;
+    let head = client.journal_head;
     client
-        .send(&ClientMessage::NewAgent {
-            role: AgentRole::default(),
-            start: StartMode::Join(JoinTarget::User {
-                repo: workspace.try_into().context("rig workspace is not UTF-8")?,
-            }),
-            mode: rho_ui_proto::WorksetMode::View,
-            content: Some(vec![ContentPart::Text {
-                text: "Complete one deterministic rig probe turn.".to_owned(),
-            }]),
-        })
+        .send_agents(&AgentsClientFrame::Follow { since: head })
         .await?;
+    client.send(AgentCommand::New {
+        role: AgentRole::default(),
+        start: StartMode::Join(JoinTarget::User {
+            repo: workspace.try_into().context("rig workspace is not UTF-8")?,
+        }),
+        mode: rho_agent_host_proto::WorksetMode::View,
+        content: Some(vec![ContentPart::Text {
+            text: "Complete one deterministic rig probe turn.".to_owned(),
+        }]),
+    });
     // Follow has no acknowledgement. Let the deliberately fast fake finish,
     // then replay from the pre-creation head so setup cannot race the turn.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    client.send(&ClientMessage::Follow { since: head }).await?;
+    client
+        .send_agents(&AgentsClientFrame::Follow { since: head })
+        .await?;
 
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     let mut replies = 0_u64;
@@ -1178,16 +1177,16 @@ async fn probe_async(name: &str) -> Result<()> {
             .await
             .context("rig probe timed out")??;
         match message {
-            ServerMessage::Log { entries } => {
+            Incoming::Agents(AgentsServerFrame::Log { entries }) => {
                 for entry in entries {
                     if !seen.insert(entry.seq) {
                         continue;
                     }
                     let completed_reply = matches!(
                         &entry.event,
-                        MirrorEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_ui_proto::mirror::Item::ToolCall { .. }))
+                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agent_host_proto::transcript::Item::ToolCall { .. }))
                     );
-                    if matches!(&entry.event, MirrorEvent::Replied { .. }) {
+                    if matches!(&entry.event, TranscriptEvent::Replied { .. }) {
                         replies += 1;
                     }
                     if completed_reply {
@@ -1213,7 +1212,9 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                 }
             }
-            ServerMessage::Error { message } => bail!("rig probe failed: {message}"),
+            Incoming::Reply(Reply::Failed { reason }) => {
+                bail!("rig probe failed: {reason}")
+            }
             _ => {}
         }
     }

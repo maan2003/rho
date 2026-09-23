@@ -26,7 +26,7 @@
 //! default fake Slack world is 300 conversations, and the count comes from
 //! that world's own seed rather than from a number written down here.
 
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 use story::ready_with;
 
 use super::{DeskFixture, agent, next_frame, overview_workspace, story, ui_head};

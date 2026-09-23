@@ -22,6 +22,7 @@ mod profile;
 mod rig;
 mod slack;
 mod snapshot;
+mod streams;
 mod telemetry;
 mod walk;
 

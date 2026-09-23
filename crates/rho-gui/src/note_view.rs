@@ -10,7 +10,7 @@ use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec, SectionSpec};
-use rho_agents::HostId;
+use rho_agents_client::HostId;
 use text::{BufferId, ReplicaId};
 
 use crate::workspace::Workspace;
@@ -28,7 +28,7 @@ fn next_row_buffer_id() -> BufferId {
 
 pub struct NoteView {
     host: HostId,
-    node_id: rho_desk::cells::Id,
+    node_id: rho_agent_host_proto::desk::cells::Id,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     composition: Composition,
@@ -36,14 +36,14 @@ pub struct NoteView {
     /// out a new buffer for the node rebuilds the surface.
     body: Entity<Buffer>,
     /// One generated line per child, in the order the children are shown.
-    rows: Vec<(rho_desk::cells::Id, Entity<Buffer>)>,
+    rows: Vec<(rho_agent_host_proto::desk::cells::Id, Entity<Buffer>)>,
     headers_disabled: std::collections::HashSet<BufferId>,
 }
 
 impl NoteView {
     pub fn new(
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         body: Entity<Buffer>,
         window: &mut gpui::Window,
         cx: &mut Context<Workspace>,
@@ -85,7 +85,7 @@ impl NoteView {
         self.host
     }
 
-    pub fn node_id(&self) -> rho_desk::cells::Id {
+    pub fn node_id(&self) -> rho_agent_host_proto::desk::cells::Id {
         self.node_id.clone()
     }
 
@@ -103,7 +103,7 @@ impl NoteView {
     }
 
     /// The children shown under the body, as of the last sync.
-    pub fn children(&self) -> Vec<rho_desk::cells::Id> {
+    pub fn children(&self) -> Vec<rho_agent_host_proto::desk::cells::Id> {
         self.rows
             .iter()
             .map(|(node_id, _)| node_id.clone())
@@ -111,7 +111,7 @@ impl NoteView {
     }
 
     /// What the cursor is on: a child row, or `None` when it is in the body.
-    pub fn child_at_cursor(&self, cx: &gpui::App) -> Option<rho_desk::cells::Id> {
+    pub fn child_at_cursor(&self, cx: &gpui::App) -> Option<rho_agent_host_proto::desk::cells::Id> {
         let editor = self.editor.read(cx);
         let head = editor.selections.newest_anchor().head();
         let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -128,8 +128,8 @@ impl NoteView {
     /// cursor and the scroll position.
     pub fn sync(
         &mut self,
-        nodes: &[crate::desk_view::DeskNode],
-        titles: &std::collections::HashMap<rho_desk::cells::Id, String>,
+        nodes: &[rho_desk_client::desk::DeskNode],
+        titles: &std::collections::HashMap<rho_agent_host_proto::desk::cells::Id, String>,
         cx: &mut Context<Workspace>,
     ) {
         let children = nodes

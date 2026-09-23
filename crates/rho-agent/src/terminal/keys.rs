@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 
 use alacritty_terminal::term::TermMode;
-use rho_ui_proto::term::TermKeystroke;
+use rho_agent_host_proto::term::TermKeystroke;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Modifiers {

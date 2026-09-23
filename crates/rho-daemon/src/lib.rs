@@ -8,32 +8,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent::MessageDelivery;
-use rho_agent::db::{
-    AgentId, AgentReadTxnExt as _, AgentRole, AgentUsageModel, AgentWriteTxnExt as _, QuotaModel,
-    QuotaObservationRecord, QuotaProvider,
-};
+use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentRole, AgentWriteTxnExt as _};
 use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_core::ContentPart;
+use rho_agent_host_proto::control::{
+    ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
+};
+use rho_agent_host_proto::server::{Server, ServerConnection};
+use rho_agent_host_proto::{
+    AgentCommand, AuthState, ContentPart, GitProvided, JoinTarget, Open, Opened, Place, Reply,
+    Request, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
+};
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_ui_proto::server::{Server, ServerConnection};
-use rho_ui_proto::{
-    AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
-    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, Place, QuotaPoint, QuotaSeries,
-    QuotaSummary, ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
-};
-use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
 
 pub mod debug;
-mod desk_cells;
 mod realtime;
 mod secret_store;
+mod usage;
 pub mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    rho_ui_proto::socket_path()
+    rho_agent_host_proto::socket_path()
 }
 
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
@@ -235,7 +233,9 @@ fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
     }
 }
 
-fn lock_runtime_directory(paths: &rho_ui_proto::RuntimePaths) -> anyhow::Result<std::fs::File> {
+fn lock_runtime_directory(
+    paths: &rho_agent_host_proto::RuntimePaths,
+) -> anyhow::Result<std::fs::File> {
     let path = paths.daemon_lock();
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -255,7 +255,7 @@ fn lock_runtime_directory(paths: &rho_ui_proto::RuntimePaths) -> anyhow::Result<
 }
 
 struct RuntimeSockets {
-    paths: rho_ui_proto::RuntimePaths,
+    paths: rho_agent_host_proto::RuntimePaths,
     server: Server,
     _lock: std::fs::File,
 }
@@ -280,7 +280,7 @@ fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
 ) -> anyhow::Result<RuntimeSockets> {
-    let paths = rho_ui_proto::RuntimePaths::new(socket_path)?;
+    let paths = rho_agent_host_proto::RuntimePaths::new(socket_path)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
@@ -405,7 +405,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let mut user_environment = login_environment()?;
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
-        rho_ui_proto::RuntimePaths::SOCKET_ENV.into(),
+        rho_agent_host_proto::RuntimePaths::SOCKET_ENV.into(),
         runtime.paths.socket().as_os_str().to_owned(),
     ));
     configure_octo_git_transport(&mut user_environment)?;
@@ -473,7 +473,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
     let iroh = if args.iroh {
         let (listener, auth) =
-            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_ui_proto::IROH_ALPN).await?;
+            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_agent_host_proto::IROH_ALPN)
+                .await?;
         eprintln!("rho daemon iroh endpoint: {}", listener.endpoint_id());
         Some((listener, auth))
     } else {
@@ -502,7 +503,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         let quota_environment = services.user_environment.clone();
         let quota_path_overrides = quota_path_overrides.clone();
         let account_dir = claude.account_dir(&account)?;
-        spawn_claude_quota_recorder(
+        usage::spawn_claude_quota_recorder(
             rho_claude_usage::spawn_poller(
                 move || {
                     let mut command = tokio::process::Command::new("claude");
@@ -594,8 +595,8 @@ async fn run_iroh_listener(
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
             let uni_task = tokio::spawn(async move { uni.receive_uni().await });
-            // One UI control session per iroh connection; the rest of its
-            // streams are dedicated (files, shells, one-shot queries).
+            // One control stream per iroh connection; every other stream
+            // is opened for one thing of its own.
             let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let services = services.clone();
@@ -609,47 +610,29 @@ async fn run_iroh_listener(
                         else {
                             return Ok(());
                         };
-                        let first = tokio::time::timeout(
+                        let open = tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            read_frame::<_, ClientMessage>(&mut recv),
+                            read_frame::<_, Open>(&mut recv),
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
-                        if let ClientMessage::WaylandOpen {
+                        if let Open::Wayland {
                             media_id,
                             agent,
                             session,
-                        } = first
+                        } = open
                         {
                             let transport = media.session(media_id)?;
                             send.set_priority(100)?;
                             let mut writer = rho_rpc::Writer::new(send);
-                            write_frame(&mut writer, &ServerMessage::WaylandOpened).await?;
+                            write_frame(&mut writer, &Opened::Ready).await?;
                             return serve_wayland(
                                 services, transport, recv, writer, agent, session,
                             )
                             .await;
                         }
-                        // Dedicated streams (workspace files, shells,
-                        // terminals, one-shot queries) are not the UI control
-                        // session and must not claim it.
-                        let dedicated = matches!(
-                            &first,
-                            ClientMessage::ChannelOpen { .. }
-                                | ClientMessage::RealtimeOpen { .. }
-                                | ClientMessage::DiffSnapshot { .. }
-                                | ClientMessage::GuiTelemetryUpload { .. }
-                                | ClientMessage::VisualizationGet { .. }
-                                | ClientMessage::WaylandOpen { .. }
-                                | ClientMessage::TerminalCreate { .. }
-                                | ClientMessage::TerminalAttach { .. }
-                                | ClientMessage::TerminalList { .. }
-                                | ClientMessage::ShellAttach { .. }
-                                | ClientMessage::GitTransportRequest { .. }
-                                | ClientMessage::GitTransportProvide { .. }
-                                | ClientMessage::GitTransportQuery { .. }
-                        );
-                        let control = if !dedicated {
+                        let control = matches!(open, Open::Control);
+                        if control {
                             anyhow::ensure!(
                                 control_claimed
                                     .compare_exchange(
@@ -659,34 +642,20 @@ async fn run_iroh_listener(
                                         Ordering::Relaxed
                                     )
                                     .is_ok(),
-                                "iroh connection already has a UI control session"
+                                "iroh connection already has a control stream"
                             );
                             send.set_priority(1)
                                 .context("set iroh control stream priority")?;
-                            true
-                        } else {
-                            false
-                        };
+                        }
                         if matches!(
-                            &first,
-                            ClientMessage::TerminalCreate { .. }
-                                | ClientMessage::TerminalAttach { .. }
-                                | ClientMessage::ShellAttach { .. }
-                                | ClientMessage::RealtimeOpen { .. }
+                            open,
+                            Open::Terminal { .. } | Open::Shell { .. } | Open::Realtime { .. }
                         ) {
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
                         let writer = rho_rpc::Writer::new(send);
-                        let result = serve_connection_io(
-                            services,
-                            iroh_auth,
-                            recv,
-                            writer,
-                            None,
-                            Some(first),
-                        )
-                        .await;
+                        let result = serve_stream(services, iroh_auth, open, recv, writer).await;
                         if control {
                             control_claimed.store(false, Ordering::Release);
                         }
@@ -710,13 +679,13 @@ type BoxGitStream = Box<dyn GitStream>;
 
 #[derive(Default)]
 struct GitTransportState {
-    providers: HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+    providers: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
     pending: HashMap<u64, PendingGitTransport>,
 }
 
 struct PendingGitTransport {
     response: oneshot::Sender<Result<BoxGitStream, String>>,
-    recipients: HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+    recipients: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
     remaining: HashSet<u64>,
 }
 
@@ -733,7 +702,7 @@ enum GitProviderClaim {
 }
 
 impl GitTransportBroker {
-    async fn register(&self, provider: mpsc::UnboundedSender<ServerMessage>) {
+    async fn register(&self, provider: mpsc::UnboundedSender<ControlFrame>) {
         let provider_id = self.next_provider_id.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.providers.retain(|_, provider| !provider.is_closed());
@@ -742,7 +711,7 @@ impl GitTransportBroker {
 
     async fn request(
         &self,
-        request: rho_ui_proto::GitTransportRequest,
+        request: rho_agent_host_proto::GitTransportRequest,
     ) -> anyhow::Result<BoxGitStream> {
         self.request_with_timeout(request, std::time::Duration::from_secs(60))
             .await
@@ -750,7 +719,7 @@ impl GitTransportBroker {
 
     async fn request_with_timeout(
         &self,
-        request: rho_ui_proto::GitTransportRequest,
+        request: rho_agent_host_proto::GitTransportRequest,
         timeout: std::time::Duration,
     ) -> anyhow::Result<BoxGitStream> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -779,7 +748,7 @@ impl GitTransportBroker {
             let mut disconnected = Vec::new();
             for (&provider_id, provider) in &recipients {
                 if provider
-                    .send(ServerMessage::GitTransportRequested {
+                    .send(ControlFrame::GitTransportRequested {
                         request_id,
                         provider_id,
                         request: request.clone(),
@@ -855,44 +824,15 @@ impl GitTransportBroker {
 
     fn notify_done(
         request_id: u64,
-        recipients: &HashMap<u64, mpsc::UnboundedSender<ServerMessage>>,
+        recipients: &HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
         except: Option<u64>,
     ) {
         for (&provider_id, provider) in recipients {
             if Some(provider_id) != except {
-                let _ = provider.send(ServerMessage::GitTransportDone { request_id });
+                let _ = provider.send(ControlFrame::GitTransportDone { request_id });
             }
         }
     }
-}
-
-/// One GUI's hold on a desk device.
-///
-/// A device is one GUI, and the CRDT gives each device its own namespace, so
-/// two live writers under one device id would collide on versions. The hold
-/// is therefore exclusive — but exclusive to the *newest* connection: a GUI
-/// that died without closing leaves its hold behind, and the GUI the user
-/// just restarted must not be the one that is refused.
-struct DeskBinding {
-    /// Which connection holds it, so a connection ending only lets go of a
-    /// hold that is still its own.
-    connection: u64,
-    /// The displaced connection's writer, to tell it why it is going.
-    outgoing: mpsc::UnboundedSender<ServerMessage>,
-    /// Set when a newer connection takes the device. A displaced connection
-    /// may not write: its mutations are refused from this moment, whether or
-    /// not its socket has noticed yet.
-    displaced: AtomicBool,
-    /// Wakes the displaced connection's read loop so it ends rather than
-    /// sitting on a socket nobody is reading.
-    closed: Notify,
-}
-
-/// What a connection holds after `DeskSync`.
-struct DeskSession {
-    device: rho_desk::cells::DeviceId,
-    node_namespace: u16,
-    binding: Arc<DeskBinding>,
 }
 
 /// Everything the daemon owns that a connection may need: the agent pool,
@@ -902,16 +842,13 @@ struct DeskSession {
 struct Services {
     pool: Arc<AgentPool>,
     db: RhoDb,
-    desk_cells: desk_cells::DeskCellStore,
-    desk_devices: Mutex<HashMap<rho_desk::cells::DeviceId, Arc<DeskBinding>>>,
+    /// The host's copy of the desk, which serves every desk stream.
+    desk: rho_desk_server::DeskServer,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
-    land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
-    land_statuses: Mutex<HashMap<Utf8PathBuf, (Option<AgentId>, LandStatus)>>,
     /// Stateless PR, CI, review, and comment operations.
     pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Sealed platform secret store used by Octo.
@@ -919,7 +856,7 @@ struct Services {
     /// Daemon-wide fanout for messages every client must hear regardless of
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
-    events: broadcast::Sender<ServerMessage>,
+    events: broadcast::Sender<ControlFrame>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
     /// The Claude configuration this daemon runs against, resolved in `run`.
@@ -944,21 +881,15 @@ impl Services {
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
-        let desk_cells = desk_cells::DeskCellStore::new(db.clone())
-            .await
-            .map_err(anyhow::Error::msg)?;
+        let desk = rho_desk_server::DeskServer::open(db.clone()).await?;
         let registry = Self {
             pool,
             db,
             claude,
-            desk_cells,
-            desk_devices: Mutex::new(HashMap::new()),
+            desk,
             visualizations,
             inference,
             machine_seed,
-            land_locks: Mutex::new(HashMap::new()),
-            land_holders: Mutex::new(HashMap::new()),
-            land_statuses: Mutex::new(HashMap::new()),
             pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
@@ -982,47 +913,13 @@ impl Services {
         self.inference.set_account_enabled(name, enabled).await;
     }
 
-    async fn ready_message(&self) -> ServerMessage {
+    async fn ready_message(&self) -> ControlFrame {
         let read = self.db.read();
-        ServerMessage::Ready {
+        ControlFrame::Ready {
             auth: self.auth_state(),
             machine_seed: self.machine_seed,
             agent_counter: read.last_agent_counter(),
-            journal_head: read.journal_head(),
         }
-    }
-
-    async fn land_lock(&self, repo: Utf8PathBuf) -> Arc<TokioMutex<()>> {
-        let mut locks = self.land_locks.lock().await;
-        Arc::clone(
-            locks
-                .entry(repo)
-                .or_insert_with(|| Arc::new(TokioMutex::new(()))),
-        )
-    }
-
-    async fn land_holder(&self, repo: &Utf8PathBuf) -> Option<LandLeaseHolder> {
-        self.land_holders.lock().await.get(repo).cloned()
-    }
-
-    async fn set_land_holder(&self, repo: Utf8PathBuf, holder: LandLeaseHolder) {
-        self.land_holders.lock().await.insert(repo, holder);
-    }
-
-    async fn clear_land_holder(&self, repo: &Utf8PathBuf) {
-        self.land_holders.lock().await.remove(repo);
-    }
-
-    async fn set_land_status(
-        &self,
-        repo: Utf8PathBuf,
-        agent_id: Option<AgentId>,
-        status: LandStatus,
-    ) {
-        self.land_statuses
-            .lock()
-            .await
-            .insert(repo, (agent_id, status));
     }
 
     /// `mode` is the agent's own: how it sees the filesystem around the
@@ -1135,177 +1032,119 @@ async fn serve_connection(
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     connection: ServerConnection,
 ) -> anyhow::Result<()> {
-    let land_holder = connection.peer_cred().ok().map(|cred| LandLeaseHolder {
-        pid: cred.pid().and_then(|pid| u32::try_from(pid).ok()),
-        uid: cred.uid(),
-        gid: cred.gid(),
-    });
     let stream = connection.into_stream();
-    let (reader, writer) = stream.into_split();
-    serve_connection_io(services, iroh_auth, reader, writer, land_holder, None).await
+    let (mut reader, writer) = stream.into_split();
+    let open = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_frame::<_, Open>(&mut reader),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??;
+    serve_stream(services, iroh_auth, open, reader, writer).await
 }
 
-/// One UI protocol session over any framed byte stream (Unix socket or an
-/// iroh bi-stream from an enrolled remote client).
-async fn serve_connection_io<R, W>(
+/// One stream over any framed byte stream (a Unix socket connection or an
+/// iroh bi-stream from an enrolled remote client), serving what its first
+/// frame opened.
+async fn serve_stream<R, W>(
     services: Arc<Services>,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    open: Open,
     reader: R,
-    writer: W,
-    land_holder: Option<LandLeaseHolder>,
-    first: Option<ClientMessage>,
+    mut writer: W,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // The first client frame chooses the stream's protocol: `ChannelOpen`
-    // dedicates the whole stream to one workspace channel, anything else starts a
-    // normal UI session (every UI client speaks first — Subscribe or a
-    // command — so waiting here never deadlocks).
-    let mut reader = reader;
-    let first = match first {
-        Some(first) => first,
-        None => tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            read_frame::<_, ClientMessage>(&mut reader),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??,
-    };
-    if let ClientMessage::ChannelOpen { workspace } = first {
-        return serve_workspace_channel(services, reader, writer, workspace).await;
-    }
-    if let ClientMessage::RealtimeOpen { offer_sdp } = first {
-        return realtime::serve(services, reader, writer, offer_sdp).await;
-    }
-    if let ClientMessage::DiffSnapshot {
-        workspace,
-        known_commit_id,
-        include_paths,
-    } = first
-    {
-        return serve_diff_snapshot(services, writer, workspace, known_commit_id, include_paths)
-            .await;
-    }
-    if let ClientMessage::DiffBaseContents {
-        workspace,
-        operation_id,
-        commit_id,
-        paths,
-    } = first
-    {
-        return serve_diff_base_contents(
-            services,
-            writer,
-            workspace,
-            operation_id,
-            commit_id,
-            paths,
-        )
-        .await;
-    }
-    if let ClientMessage::GuiTelemetryUpload { snapshot } = first {
-        return serve_gui_telemetry_upload(writer, snapshot).await;
-    }
-    if let ClientMessage::VisualizationGet { id } = first {
-        let mut writer = writer;
-        let response = match services.visualizations.get(&id) {
-            Some(visualization) => ServerMessage::VisualizationContent {
-                id,
-                mime_type: visualization.mime_type,
-                content: visualization.content,
-            },
-            None => ServerMessage::VisualizationRefused {
-                reason: format!("visualization {id} does not exist"),
-            },
-        };
-        write_frame(&mut writer, &response).await?;
-        return Ok(());
-    }
-    if let ClientMessage::TerminalCreate {
-        agent,
-        terminal_id,
-        attach,
-        cols,
-        rows,
-    } = first
-    {
-        let open = TerminalOpenKind::Create { attach };
-        return serve_terminal(
-            services,
-            reader,
-            writer,
+    match open {
+        Open::Control => serve_control(services, reader, writer).await,
+        Open::Agents => serve_agents(services, reader, writer).await,
+        Open::Desk => services.desk.serve(reader, writer).await,
+        Open::Workspace { workspace } => {
+            serve_workspace_channel(services, reader, writer, workspace).await
+        }
+        Open::Realtime { offer_sdp } => realtime::serve(services, reader, writer, offer_sdp).await,
+        Open::Terminal {
             agent,
             terminal_id,
             open,
             cols,
             rows,
-        )
-        .await;
-    }
-    if let ClientMessage::TerminalAttach {
-        agent,
-        terminal_id,
-        cols,
-        rows,
-    } = first
-    {
-        let open = TerminalOpenKind::Attach;
-        return serve_terminal(
-            services,
-            reader,
-            writer,
-            agent,
-            terminal_id,
-            open,
-            cols,
-            rows,
-        )
-        .await;
-    }
-    if let ClientMessage::TerminalList { agent } = first {
-        return serve_terminal_list(services, writer, agent).await;
-    }
-    if let ClientMessage::ShellAttach { agent } = first {
-        return serve_shell(services, reader, writer, agent).await;
-    }
-    if let ClientMessage::GitTransportRequest { request } = first {
-        return serve_git_transport_request(services, reader, writer, request).await;
-    }
-    if let ClientMessage::GitTransportProvide {
-        request_id,
-        provider_id,
-        claim,
-    } = first
-    {
-        return serve_git_transport_provider(
-            services,
-            reader,
-            writer,
+        } => {
+            serve_terminal(
+                services,
+                reader,
+                writer,
+                agent,
+                terminal_id,
+                open,
+                cols,
+                rows,
+            )
+            .await
+        }
+        Open::Shell { agent } => serve_shell(services, reader, writer, agent).await,
+        Open::Wayland { .. } => {
+            write_frame(
+                &mut writer,
+                &Opened::Refused {
+                    reason: "Wayland streams need an iroh connection".to_owned(),
+                },
+            )
+            .await
+        }
+        Open::GitTransport { request } => {
+            serve_git_transport_request(services, reader, writer, request).await
+        }
+        Open::GitProvide {
             request_id,
             provider_id,
             claim,
-        )
-        .await;
+        } => {
+            serve_git_transport_provider(services, reader, writer, request_id, provider_id, claim)
+                .await
+        }
+        Open::Request(request) => {
+            let reply = match handle_request(&services, iroh_auth.as_ref(), request).await {
+                Ok((reply, refresh)) => {
+                    if let Refresh::Ready = refresh {
+                        // Registry changes show on every client (GUI rails
+                        // and a waiting CLI), so the refreshed snapshot goes
+                        // through the daemon-wide event fanout.
+                        let _ = services.events.send(services.ready_message().await);
+                    }
+                    reply
+                }
+                // The whole chain, not just the outermost context: a new
+                // agent that failed said "create managed workspace" and
+                // kept the reason to itself, which is not something a
+                // reader can act on.
+                Err(error) => Reply::Failed {
+                    reason: format!("{error:#}"),
+                },
+            };
+            write_frame(&mut writer, &reply).await
+        }
     }
-    if let ClientMessage::GitTransportQuery { host } = first {
-        let pat_available =
-            host == "github.com" && services.platform_secrets.contains_nonempty("GITHUB_TOKEN");
-        let mut writer = writer;
-        write_frame(
-            &mut writer,
-            &ServerMessage::GitTransportPolicy { pat_available },
-        )
-        .await?;
-        return Ok(());
-    }
+}
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerMessage>();
+/// The control stream: host-wide state pushed to one client, and its
+/// offer to carry SSH Git transport.
+async fn serve_control<R, W>(
+    services: Arc<Services>,
+    mut reader: R,
+    writer: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ControlFrame>();
     tokio::spawn(async move {
         let mut writer = writer;
-        while let Some(message) = outgoing_rx.recv().await {
-            if write_frame(&mut writer, &message).await.is_err() {
+        while let Some(frame) = outgoing_rx.recv().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
                 break;
             }
         }
@@ -1317,15 +1156,10 @@ where
     let mut created_rx = services.pool.subscribe_created();
     let mut events_rx = services.events.subscribe();
     let _ = outgoing_tx.send(services.ready_message().await);
-    // Names this connection's wants in the pool's live set, so they leave
-    // with it.
-    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-    let mut log_follow: Option<tokio::task::JoinHandle<()>> = None;
-    let mut desk_session = None;
 
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
-    {
+    let created_task = {
         let services = Arc::clone(&services);
         let outgoing_tx = outgoing_tx.clone();
         tokio::spawn(async move {
@@ -1333,7 +1167,7 @@ where
                 match created_rx.recv().await {
                     Ok(created) => {
                         if outgoing_tx
-                            .send(ServerMessage::AgentCreated {
+                            .send(ControlFrame::AgentCreated {
                                 agent_id: created.agent_id,
                             })
                             .is_err()
@@ -1350,34 +1184,38 @@ where
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
-    }
+        })
+    };
 
     // Daemon-wide events fan out to every client, not just the connection
-    // whose action produced them; aborted on disconnect so the writer channel
-    // can close.
-    let events_tx = outgoing_tx.clone();
-    let events_task = tokio::spawn(async move {
-        loop {
-            match events_rx.recv().await {
-                Ok(message) => {
-                    if events_tx.send(message).is_err() {
-                        break;
+    // whose action produced them.
+    let events_task = {
+        let services = Arc::clone(&services);
+        let outgoing_tx = outgoing_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match events_rx.recv().await {
+                    Ok(frame) => {
+                        if outgoing_tx.send(frame).is_err() {
+                            break;
+                        }
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if events_tx.send(ServerMessage::DeskResyncRequired).is_err() {
-                        break;
+                    // Most of what fans out is a piece of `Ready`; the whole
+                    // of it stands in for whatever was missed.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if outgoing_tx.send(services.ready_message().await).is_err() {
+                            break;
+                        }
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
-        }
-    });
+        })
+    };
 
     // Reconcile ephemeral advertisements in workset namespaces. Only changes
     // cross the authenticated GUI stream; discovery never starts an encoder.
-    let desktop_task = matches!(&first, ClientMessage::Subscribe).then(|| {
+    let desktop_task = {
         let services = services.clone();
         let outgoing = outgoing_tx.clone();
         tokio::spawn(async move {
@@ -1403,7 +1241,7 @@ where
                 if sessions != previous {
                     previous = sessions.clone();
                     if outgoing
-                        .send(ServerMessage::DesktopSessions { sessions })
+                        .send(ControlFrame::DesktopSessions { sessions })
                         .is_err()
                     {
                         break;
@@ -1411,107 +1249,21 @@ where
                 }
             }
         })
-    });
+    };
 
-    let mut land_leases: Vec<(Utf8PathBuf, OwnedMutexGuard<()>)> = Vec::new();
-    let mut first = Some(first);
     let result = loop {
-        let message = match first.take() {
-            Some(message) => message,
-            None => {
-                // A displaced connection stops here rather than sitting on a
-                // socket nobody is reading: the GUI that held this device has
-                // been told, and the window that took it is the live one.
-                let displaced = desk_session
-                    .as_ref()
-                    .map(|session: &DeskSession| Arc::clone(&session.binding));
-                let frame = rho_ui_proto::read_frame_optional::<_, ClientMessage>(&mut reader);
-                let read = match displaced {
-                    Some(binding) => {
-                        tokio::select! {
-                            biased;
-                            () = binding.closed.notified() => None,
-                            read = frame => Some(read),
-                        }
-                    }
-                    None => Some(frame.await),
-                };
-                match read {
-                    None => {
-                        for (repo, _) in &land_leases {
-                            services.clear_land_holder(repo).await;
-                        }
-                        break Ok(());
-                    }
-                    Some(Ok(Some(message))) => message,
-                    Some(Ok(None)) => {
-                        for (repo, _) in &land_leases {
-                            services.clear_land_holder(repo).await;
-                        }
-                        break Ok(());
-                    }
-                    Some(Err(error)) => {
-                        for (repo, _) in &land_leases {
-                            services.clear_land_holder(repo).await;
-                        }
-                        break Err(error);
-                    }
-                }
-            }
-        };
-        match handle_message(
-            &services,
-            iroh_auth.as_ref(),
-            &outgoing_tx,
-            &mut land_leases,
-            land_holder.clone(),
-            connection_id,
-            &mut log_follow,
-            &mut desk_session,
-            message,
-        )
-        .await
+        match rho_agent_host_proto::read_frame_optional::<_, ControlClientFrame>(&mut reader).await
         {
-            Ok(Refresh::Ready) => {
-                // Registry changes show on every client (GUI rails and a
-                // waiting CLI), so the refreshed snapshot goes through
-                // the daemon-wide event fanout, not just this connection.
-                let _ = services.events.send(services.ready_message().await);
+            Ok(Some(ControlClientFrame::ProvideGitTransport)) => {
+                services.git_transport.register(outgoing_tx.clone()).await;
             }
-            Ok(Refresh::None) => {}
-            Err(error) => {
-                // The whole chain, not just the outermost context: a new
-                // agent that failed said "create managed workspace" and
-                // kept the reason to itself, which is not something a
-                // reader can act on.
-                let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: format!("{error:#}"),
-                });
-            }
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
         }
     };
-    // Let go of the device only if the hold is still this connection's: a
-    // newer window may have taken it, and ending must not unbind theirs.
-    if let Some(session) = desk_session {
-        let mut devices = services.desk_devices.lock().await;
-        if devices
-            .get(&session.device)
-            .is_some_and(|held| Arc::ptr_eq(held, &session.binding))
-        {
-            devices.remove(&session.device);
-        }
-    }
+    created_task.abort();
     events_task.abort();
-    if let Some(task) = desktop_task {
-        task.abort();
-    }
-    if let Some(log_follow) = log_follow {
-        log_follow.abort();
-    }
-    services
-        .pool
-        .set_live_wants(connection_id, HashSet::new())
-        .await;
+    desktop_task.abort();
     result
 }
 
@@ -1521,7 +1273,7 @@ async fn serve_git_transport_request<R, W>(
     services: Arc<Services>,
     reader: R,
     mut writer: W,
-    request: rho_ui_proto::GitTransportRequest,
+    request: rho_agent_host_proto::GitTransportRequest,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1532,7 +1284,7 @@ where
         Err(error) => {
             write_frame(
                 &mut writer,
-                &ServerMessage::GitTransportRefused {
+                &Opened::Refused {
                     reason: error.to_string(),
                 },
             )
@@ -1540,7 +1292,7 @@ where
             return Ok(());
         }
     };
-    write_frame(&mut writer, &ServerMessage::GitTransportReady).await?;
+    write_frame(&mut writer, &Opened::Ready).await?;
     let requester = tokio::io::join(reader, writer);
     rho_rpc::relay_bidirectional(requester, provider).await?;
     Ok(())
@@ -1564,10 +1316,10 @@ where
         .await?
     {
         GitProviderClaim::Done => {
-            write_frame(&mut writer, &ServerMessage::GitTransportDone { request_id }).await?;
+            write_frame(&mut writer, &GitProvided::Done).await?;
         }
         GitProviderClaim::Selected(response) => {
-            if let Err(error) = write_frame(&mut writer, &ServerMessage::GitTransportReady).await {
+            if let Err(error) = write_frame(&mut writer, &GitProvided::Ready).await {
                 let _ = response.send(Err(format!(
                     "selected GUI SSH Git client disconnected: {error}"
                 )));
@@ -1594,360 +1346,30 @@ fn spawn_inference_projection(services: Arc<Services>) {
                 break;
             };
             let _ = state.borrow_and_update();
-            let _ = services.events.send(ServerMessage::AuthState {
+            let _ = services.events.send(ControlFrame::AuthState {
                 auth: services.auth_state(),
             });
-            let _ = services.events.send(ServerMessage::QuotaUsage {
-                summaries: combined_quota_summaries(&services.db, &services.inference),
+            let _ = services.events.send(ControlFrame::QuotaUsage {
+                summaries: usage::quota_summaries(&services.db, &services.inference),
             });
         }
     });
-}
-
-fn combined_quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSummary> {
-    let mut summaries = quota_summaries(db);
-    summaries.extend(
-        inference
-            .state()
-            .quotas
-            .into_iter()
-            .map(|summary| QuotaSummary {
-                model: "gpt".to_owned(),
-                auth_namespace: Some(summary.auth_namespace),
-                remaining_percent: summary.remaining_percent,
-                burn_10m: summary.burn_10m,
-                burn_2h: summary.burn_2h,
-                burn_1d: summary.burn_1d,
-                burn_3d: summary.burn_3d,
-                reset_at_unix: summary.reset_at_unix,
-            }),
-    );
-    summaries
-}
-
-fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
-    let now = rho_core::UnixMs::now().0;
-    let since = rho_core::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
-    quota_observation_groups(db, since)
-        .into_iter()
-        .filter_map(|((model, auth_namespace), observations)| {
-            let samples = observations.iter().collect::<Vec<_>>();
-            let latest = samples.last()?;
-            let reset_expired = latest
-                .reset_at_unix
-                .is_some_and(|reset| reset <= (now / 1_000) as i64);
-            let burn = |duration| {
-                if reset_expired {
-                    0
-                } else {
-                    quota_burn(&samples, now, duration)
-                }
-            };
-            Some(QuotaSummary {
-                model: model.name().to_owned(),
-                auth_namespace,
-                remaining_percent: if reset_expired {
-                    100
-                } else {
-                    100u8.saturating_sub(latest.used_percent)
-                },
-                burn_10m: burn(10 * 60 * 1_000),
-                burn_2h: burn(2 * 60 * 60 * 1_000),
-                burn_1d: burn(24 * 60 * 60 * 1_000),
-                burn_3d: burn(3 * 24 * 60 * 60 * 1_000),
-                reset_at_unix: if reset_expired {
-                    None
-                } else {
-                    latest.reset_at_unix
-                },
-            })
-        })
-        .collect()
-}
-
-fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsageBucket {
-    UiAgentUsageBucket {
-        bucket_start_ms: bucket.bucket_start_ms,
-        input_tokens: bucket.input_tokens,
-        cache_read_tokens: bucket.cache_read_tokens,
-        cache_write_tokens: bucket.cache_write_tokens,
-        cache_write_1h_tokens: bucket.cache_write_1h_tokens,
-        output_tokens: bucket.output_tokens,
-        requests: bucket.requests,
-        approximate: bucket.approximate,
-    }
-}
-
-/// Reduces the indexed five-minute usage records to the hourly samples the
-/// usage-share chart renders. The persisted key begins with time, so the
-/// preceding database query is already a bounded range scan.
-fn hourly_global_usage_series(
-    usage: Vec<(AgentUsageModel, rho_agent::db::AgentUsageBucket)>,
-) -> Vec<AgentUsageSeries> {
-    const HOUR_MS: u64 = 60 * 60 * 1_000;
-
-    let mut hourly = BTreeMap::<(AgentUsageModel, u64), rho_agent::db::AgentUsageBucket>::new();
-    for (model, bucket) in usage {
-        let bucket_start_ms = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
-        hourly
-            .entry((model, bucket_start_ms))
-            .or_insert_with(|| rho_agent::db::AgentUsageBucket {
-                bucket_start_ms,
-                model,
-                ..rho_agent::db::AgentUsageBucket::default()
-            })
-            .add(&bucket);
-    }
-
-    [
-        AgentUsageModel::FABLE,
-        AgentUsageModel::GPT,
-        AgentUsageModel::OPUS,
-        AgentUsageModel::TERRA,
-        AgentUsageModel::LUNA,
-        AgentUsageModel::ASTRA,
-    ]
-    .into_iter()
-    .map(|model| AgentUsageSeries {
-        model: model.name().to_owned(),
-        buckets: hourly
-            .iter()
-            .filter(|((candidate, _), _)| *candidate == model)
-            .map(|(_, bucket)| ui_agent_usage_bucket(bucket.clone()))
-            .collect(),
-    })
-    .collect()
-}
-
-fn hourly_agent_cost_series(
-    db: &RhoDb,
-    since: rho_core::UnixMs,
-) -> anyhow::Result<Vec<AgentCostSeries>> {
-    const MAX_HOURLY_AGENT_COST_BUCKETS: usize = 500_000;
-
-    let read = db.read();
-    let mut hourly = BTreeMap::new();
-    for agent_id in read.list_agent_ids() {
-        for bucket in read.agent_usage(agent_id, since) {
-            if !matches!(
-                bucket.model,
-                AgentUsageModel::GPT
-                    | AgentUsageModel::ASTRA
-                    | AgentUsageModel::TERRA
-                    | AgentUsageModel::LUNA
-                    | AgentUsageModel::UNKNOWN
-            ) {
-                continue;
-            }
-            merge_hourly_agent_cost_bucket(
-                &mut hourly,
-                agent_id,
-                bucket,
-                MAX_HOURLY_AGENT_COST_BUCKETS,
-            )?;
-        }
-    }
-
-    let mut series = BTreeMap::<(AgentId, AgentUsageModel), Vec<UiAgentUsageBucket>>::new();
-    for ((agent_id, model, _), bucket) in hourly {
-        series
-            .entry((agent_id, model))
-            .or_default()
-            .push(ui_agent_usage_bucket(bucket));
-    }
-    Ok(series
-        .into_iter()
-        .map(|((agent_id, model), buckets)| AgentCostSeries {
-            agent_id,
-            model: model.name().to_owned(),
-            buckets,
-        })
-        .collect())
-}
-
-fn merge_hourly_agent_cost_bucket(
-    hourly: &mut BTreeMap<(AgentId, AgentUsageModel, u64), rho_agent::db::AgentUsageBucket>,
-    agent_id: AgentId,
-    bucket: rho_agent::db::AgentUsageBucket,
-    max_buckets: usize,
-) -> anyhow::Result<()> {
-    const HOUR_MS: u64 = 60 * 60 * 1_000;
-
-    let bucket_start_ms = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
-    hourly
-        .entry((agent_id, bucket.model, bucket_start_ms))
-        .or_insert_with(|| rho_agent::db::AgentUsageBucket {
-            bucket_start_ms,
-            model: bucket.model,
-            ..rho_agent::db::AgentUsageBucket::default()
-        })
-        .add(&bucket);
-    anyhow::ensure!(
-        hourly.len() <= max_buckets,
-        "agent cost history exceeds {max_buckets} hourly buckets"
-    );
-    Ok(())
-}
-
-fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
-    let mut series = claude_quota_history(db);
-    let since = rho_core::UnixMs(
-        rho_core::UnixMs::now()
-            .0
-            .saturating_sub(30 * 24 * 60 * 60 * 1_000),
-    );
-    for history in inference.quota_history(since) {
-        series.push(QuotaSeries {
-            model: "gpt".to_owned(),
-            auth_namespace: Some(history.auth_namespace),
-            points: history
-                .points
-                .into_iter()
-                .map(|point| rho_ui_proto::QuotaPoint {
-                    observed_at_ms: point.observed_at.0,
-                    remaining_percent: point.remaining_percent,
-                    reset_at_unix: point.reset_at_unix,
-                })
-                .collect(),
-        });
-    }
-    series
-}
-
-fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
-    let now = rho_core::UnixMs::now().0;
-    let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
-    quota_observation_groups(db, since)
-        .into_iter()
-        .filter_map(|((model, auth_namespace), observations)| {
-            let points = observations
-                .into_iter()
-                .map(|sample| QuotaPoint {
-                    observed_at_ms: sample.observed_at.0,
-                    remaining_percent: 100u8.saturating_sub(sample.used_percent),
-                    reset_at_unix: sample.reset_at_unix,
-                })
-                .collect::<Vec<_>>();
-            (!points.is_empty()).then(|| QuotaSeries {
-                model: model.name().to_owned(),
-                auth_namespace,
-                points,
-            })
-        })
-        .collect()
-}
-
-fn quota_observation_groups(
-    db: &RhoDb,
-    since: rho_core::UnixMs,
-) -> BTreeMap<(QuotaModel, Option<String>), Vec<QuotaObservationRecord>> {
-    let read = db.read();
-    let mut groups = BTreeMap::new();
-    for model in [QuotaModel::OPUS, QuotaModel::FABLE] {
-        for observation in read.quota_observations(model, since) {
-            groups
-                .entry((model, observation.auth_namespace.clone()))
-                .or_insert_with(Vec::new)
-                .push(observation);
-        }
-    }
-    groups
-}
-
-fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -> u16 {
-    let cutoff = now.saturating_sub(duration_ms);
-    let start = samples
-        .partition_point(|sample| sample.observed_at.0 < cutoff)
-        .saturating_sub(1);
-    let Some((first, rest)) = samples
-        .get(start..)
-        .and_then(|samples| samples.split_first())
-    else {
-        return 0;
-    };
-
-    let mut epoch_start = *first;
-    let mut epoch_end = *first;
-    let mut burn = 0u16;
-    for sample in rest {
-        let same_epoch = match (epoch_end.reset_at_unix, sample.reset_at_unix) {
-            (Some(old), Some(new)) => old.abs_diff(new) <= 60,
-            (None, None) => true,
-            _ => false,
-        };
-        if same_epoch {
-            epoch_end = sample;
-        } else {
-            burn += epoch_end
-                .used_percent
-                .saturating_sub(epoch_start.used_percent) as u16;
-            epoch_start = sample;
-            epoch_end = sample;
-        }
-    }
-    burn + epoch_end
-        .used_percent
-        .saturating_sub(epoch_start.used_percent) as u16
 }
 
 fn claude_accounts_message(
     db: &RhoDb,
     claude: &rho_claude::accounts::ClaudePaths,
-) -> anyhow::Result<ServerMessage> {
-    Ok(ServerMessage::ClaudeAccounts {
+) -> anyhow::Result<Reply> {
+    Ok(Reply::ClaudeAccounts {
         accounts: claude.list()?,
         current: db.read().claude_account(),
     })
 }
 
-fn spawn_claude_quota_recorder(
-    mut updates: tokio::sync::mpsc::Receiver<anyhow::Result<rho_claude_usage::ClaudeUsage>>,
-    account: String,
-    db: RhoDb,
-    inference: Inference,
-    events: broadcast::Sender<ServerMessage>,
-) {
-    tokio::spawn(async move {
-        while let Some(update) = updates.recv().await {
-            let usage = match update {
-                Ok(usage) => usage,
-                Err(error) => {
-                    tracing::warn!(%error, %account, "Claude quota probe failed");
-                    continue;
-                }
-            };
-            let observed_at = rho_core::UnixMs::now();
-            let mut write = db.write().await;
-            let mut changed = write.record_quota_observation(QuotaObservationRecord {
-                provider: QuotaProvider::Claude,
-                model: QuotaModel::OPUS,
-                auth_namespace: Some(account.clone()),
-                observed_at,
-                used_percent: usage.all_models.used_percent,
-                reset_at_unix: Some(usage.all_models.reset_at_unix),
-            });
-            changed |= write.record_quota_observation(QuotaObservationRecord {
-                provider: QuotaProvider::Claude,
-                model: QuotaModel::FABLE,
-                auth_namespace: Some(account.clone()),
-                observed_at,
-                used_percent: usage.fable.used_percent,
-                reset_at_unix: Some(usage.fable.reset_at_unix),
-            });
-            write.commit();
-            if changed {
-                let _ = events.send(ServerMessage::QuotaUsage {
-                    summaries: combined_quota_summaries(&db, &inference),
-                });
-            }
-        }
-    });
-}
-
 /// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
 /// level. Harmless if the disposition changed meanwhile — it just sends the
 /// then-current level.
-/// How many journal entries travel in one [`ServerMessage::Log`] while a
+/// How many journal entries travel in one `ServerFrame::Log` while a
 /// client is catching up. A cold client's first copy is a whole history,
 /// so it goes in pages the connection can interleave.
 const LOG_PAGE: usize = 512;
@@ -1956,6 +1378,95 @@ const LOG_PAGE: usize = 512;
 /// the feed: each new row as it is appended, on any agent, and every live
 /// delta any loop tells, in the order they happened.
 ///
+/// A connection's agents stream: whose journal this is and how far it
+/// runs, then the rows past wherever the client's copy stops, every append
+/// after them and the live tails, until the client goes. A stream of its
+/// own so that a catch-up of thousands of pages queues behind nothing and
+/// holds nothing up. A second `Follow` starts the follow again from its
+/// `since`.
+async fn serve_agents<R, W>(services: Arc<Services>, mut reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ServerFrame>();
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(frame) = outgoing_rx.recv().await {
+            if write_frame(&mut writer, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let journal_head = services.db.read().journal_head();
+    let _ = outgoing_tx.send(ServerFrame::JournalHead {
+        machine_seed: services.machine_seed,
+        journal_head,
+    });
+    // Names this stream's focus in the pool's live set, so it leaves with
+    // the stream.
+    let stream_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut follow: Option<tokio::task::JoinHandle<()>> = None;
+    let result = loop {
+        let frame =
+            match rho_agent_host_proto::read_frame_optional::<_, ClientFrame>(&mut reader).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            };
+        match frame {
+            ClientFrame::Follow { since } => {
+                if let Some(previous) = follow.take() {
+                    previous.abort();
+                }
+                follow = Some(spawn_log_follow(
+                    Arc::clone(&services),
+                    outgoing_tx.clone(),
+                    since,
+                ));
+            }
+            ClientFrame::Focus { agent_ids } => {
+                if agent_ids.len() > 64 {
+                    break Err(anyhow::anyhow!("too many focused agents"));
+                }
+                // Focus is what this client is looking at, nothing more: it
+                // never loads an agent. The pool unions it across streams
+                // into the live set; a loaded agent in it tells its tail.
+                services
+                    .pool
+                    .set_live_wants(stream_id, agent_ids.into_iter().collect())
+                    .await;
+            }
+            ClientFrame::Detail {
+                agent_id,
+                pos,
+                more,
+            } => {
+                // One answer per position, each naming its own `pos`. A chunk
+                // asks once and is answered as many times as it asked for.
+                for pos in std::iter::once(pos).chain(more) {
+                    let body = agent_detail(&services.db, agent_id, pos);
+                    let _ = outgoing_tx.send(ServerFrame::Detail {
+                        agent_id,
+                        pos,
+                        body,
+                    });
+                }
+            }
+        }
+    };
+    if let Some(follow) = follow {
+        follow.abort();
+    }
+    services
+        .pool
+        .set_live_wants(stream_id, HashSet::new())
+        .await;
+    writer_task.abort();
+    result
+}
+
 /// Contiguous by seq is the whole contract for rows. The daemon remembers
 /// the last seq it sent; an append that is not the next one, or a lagged
 /// subscription, sends it back to the journal from there. Rows the
@@ -1968,14 +1479,14 @@ const LOG_PAGE: usize = 512;
 /// After a lag the same is done again, since deltas were lost.
 fn spawn_log_follow(
     services: Arc<Services>,
-    outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
-    since: rho_ui_proto::mirror::Seq,
+    outgoing_tx: mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
+    since: rho_agent_host_proto::transcript::Seq,
 ) -> tokio::task::JoinHandle<()> {
-    use rho_agent::mirror::Feed;
+    use rho_agent::transcript::Feed;
     tokio::spawn(async move {
         // Subscribed before the catch-up read, so a row appended during it
         // is queued rather than lost; the seq drops the duplicates.
-        let mut feed = rho_agent::mirror::feed(&services.db);
+        let mut feed = rho_agent::transcript::feed(&services.db);
         let mut sent = since;
         if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
             return;
@@ -1991,15 +1502,15 @@ fn spawn_log_follow(
                     if !told {
                         told = !matches!(
                             live,
-                            rho_ui_proto::mirror::Live::Item { .. }
-                                | rho_ui_proto::mirror::Live::Appended { .. }
+                            rho_agent_host_proto::transcript::Live::Item { .. }
+                                | rho_agent_host_proto::transcript::Live::Appended { .. }
                         );
                         if !told {
                             continue;
                         }
                     }
                     if outgoing_tx
-                        .send(ServerMessage::Live { agent_id, live })
+                        .send(rho_agent_host_proto::agents::ServerFrame::Live { agent_id, live })
                         .is_err()
                     {
                         return;
@@ -2018,7 +1529,7 @@ fn spawn_log_follow(
                     sent = appended.seq;
                     if let Some(entry) = appended.entry()
                         && outgoing_tx
-                            .send(ServerMessage::Log {
+                            .send(rho_agent_host_proto::agents::ServerFrame::Log {
                                 entries: vec![entry],
                             })
                             .is_err()
@@ -2043,8 +1554,8 @@ fn spawn_log_follow(
 /// when the connection is gone.
 async fn send_journal_from(
     db: &RhoDb,
-    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    sent: &mut rho_ui_proto::mirror::Seq,
+    outgoing_tx: &mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
+    sent: &mut rho_agent_host_proto::transcript::Seq,
 ) -> bool {
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
@@ -2055,15 +1566,19 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
-                Some(rho_ui_proto::mirror::LogEntry {
+                Some(rho_agent_host_proto::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: rho_agent::mirror::strip(&event)?,
+                    event: rho_agent::transcript::strip(&event)?,
                 })
             })
             .collect::<Vec<_>>();
-        if !entries.is_empty() && outgoing_tx.send(ServerMessage::Log { entries }).is_err() {
+        if !entries.is_empty()
+            && outgoing_tx
+                .send(rho_agent_host_proto::agents::ServerFrame::Log { entries })
+                .is_err()
+        {
             return false;
         }
         // Catching up must never starve the connection's own traffic.
@@ -2071,206 +1586,24 @@ async fn send_journal_from(
     }
 }
 
-/// Whether a handled message changed registry state that clients see through
-/// `Ready` (agents and workdirs); `Ready` refreshes every
-/// connection, so all clients converge on the change at once.
+/// Whether a handled request changed registry state that clients see through
+/// `Ready` (agents and workdirs); `Ready` refreshes every control stream,
+/// so all clients converge on the change at once.
 enum Refresh {
     Ready,
     None,
 }
 
-/// One client request. `Err` becomes a [`ServerMessage::Error`]; extra replies
-/// (creation events, pongs) are sent inline before the caller's `Ready`.
-#[allow(clippy::too_many_arguments)]
-async fn handle_message(
+/// One request stream's request. `Err` becomes a [`Reply::Failed`].
+async fn handle_request(
     services: &Arc<Services>,
     iroh_auth: Option<&rho_iroh_auth::IrohAuth>,
-    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
-    land_holder: Option<LandLeaseHolder>,
-    connection_id: u64,
-    log_follow: &mut Option<tokio::task::JoinHandle<()>>,
-    desk_session: &mut Option<DeskSession>,
-    message: ClientMessage,
-) -> anyhow::Result<Refresh> {
-    match message {
-        ClientMessage::Ping => {
-            let _ = outgoing_tx.send(ServerMessage::Pong);
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskSync {
-            device,
-            known,
-            store,
-            bodies,
-        } => {
-            if desk_session
-                .as_ref()
-                .is_some_and(|session| session.device != device)
-            {
-                anyhow::bail!("Desk connection is already bound to another device");
-            }
-            let node_namespace = services
-                .desk_cells
-                .node_namespace(device)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            // The client says which store it counted `known` in. If that
-            // is not this store, the answer is the whole of this one: the
-            // client's numbers were counted elsewhere, and a difference
-            // taken from them would leave it holding a desk made of two
-            // stores at once.
-            let (store, delta) = services
-                .desk_cells
-                .sync_for(store, &known)
-                .map_err(anyhow::Error::msg)?;
-            let binding = match desk_session.take() {
-                // This connection already holds the device: syncing again is
-                // a resync, not a second writer.
-                Some(session) => session.binding,
-                None => {
-                    let binding = Arc::new(DeskBinding {
-                        connection: connection_id,
-                        outgoing: outgoing_tx.clone(),
-                        displaced: AtomicBool::new(false),
-                        closed: Notify::new(),
-                    });
-                    // Newest wins. A device is one GUI, so a hold that is
-                    // still standing belongs to a GUI that has died or is
-                    // stale — the user has just restarted theirs, and
-                    // refusing it would leave them with no desk until the
-                    // transport gave up on the old connection, which over
-                    // iroh is the ten minutes of
-                    // `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`.
-                    if let Some(held) = services
-                        .desk_devices
-                        .lock()
-                        .await
-                        .insert(device, Arc::clone(&binding))
-                        && held.connection != connection_id
-                    {
-                        held.displaced.store(true, Ordering::SeqCst);
-                        let _ = held.outgoing.send(ServerMessage::Error {
-                            message: "The desk moved to a newer window on this device".into(),
-                        });
-                        held.closed.notify_one();
-                    }
-                    binding
-                }
-            };
-            *desk_session = Some(DeskSession {
-                device,
-                node_namespace,
-                binding,
-            });
-            let _ = outgoing_tx.send(ServerMessage::DeskSynced {
-                store,
-                node_namespace,
-                delta,
-                bodies: services.desk_cells.bodies_since(&bodies),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskCellsApply { cells } => {
-            // The other half of the handshake. The same two conditions as a
-            // mutation, and for the same reason: they are about this
-            // connection, not about what the cells say.
-            let Some(session) = desk_session.as_ref() else {
-                anyhow::bail!("Desk connection must sync before writing");
-            };
-            anyhow::ensure!(
-                !session.binding.displaced.load(Ordering::SeqCst),
-                "The desk moved to a newer window on this device"
-            );
-            match services.desk_cells.apply_cells(cells).await {
-                Ok(()) => {
-                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                    let _ = services
-                        .events
-                        .send(ServerMessage::DeskCellsAvailable { frontier });
-                }
-                Err(error) => {
-                    tracing::warn!(%error, device = ?session.device,
-                        "a client's catch-up cells did not merge");
-                }
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskMutationApply { mutation } => {
-            let stamp = mutation.stamp;
-            // Nothing here is a verdict on what the user wrote: the two
-            // conditions below are about this connection, and they break it
-            // the same way the text path does. The desk is the client's, and
-            // the daemon holds a copy so that clients can sync through it.
-            let Some(session) = desk_session.as_ref() else {
-                anyhow::bail!("Desk connection must sync before writing");
-            };
-            // Displaced, so this connection's device id belongs to another
-            // window now: writing under it would put two authors in one
-            // CRDT namespace.
-            anyhow::ensure!(
-                !session.binding.displaced.load(Ordering::SeqCst),
-                "The desk moved to a newer window on this device"
-            );
-            let device = session.device;
-            match services.desk_cells.apply_mutation(device, mutation).await {
-                // No answer goes back. The write was done on the client
-                // when the client made it; what the other devices need is
-                // the poke that says there is something to sync.
-                Ok(()) => {
-                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                    let _ = services
-                        .events
-                        .send(ServerMessage::DeskCellsAvailable { frontier });
-                }
-                // What is left is a mutation that could not be decoded into
-                // the store at all. There is no answer for it any more, and
-                // the client is not waiting for one; the log is where it
-                // goes.
-                Err(error) => {
-                    tracing::warn!(%error, device = ?device, version = stamp.version,
-                        "a desk mutation did not merge");
-                }
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTextApply {
-            id,
-            operation,
-            transaction,
-        } => {
-            let Some(session) = desk_session.as_ref() else {
-                anyhow::bail!("Desk connection must sync before writing text");
-            };
-            anyhow::ensure!(
-                !session.binding.displaced.load(Ordering::SeqCst),
-                "The desk moved to a newer window on this device"
-            );
-            let namespace = session.node_namespace;
-            if services
-                .desk_cells
-                .apply_body(
-                    namespace,
-                    id.clone(),
-                    operation.clone(),
-                    transaction.clone(),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?
-            {
-                let _ = services.events.send(ServerMessage::DeskTextApplied {
-                    id,
-                    operation,
-                    transaction,
-                });
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::ClaudeAccounts => {
-            let _ = outgoing_tx.send(claude_accounts_message(&services.db, &services.claude)?);
-            Ok(Refresh::None)
-        }
-        ClientMessage::SetClaudeAccount { name } => {
+    request: Request,
+) -> anyhow::Result<(Reply, Refresh)> {
+    let reply = match request {
+        Request::Agent(command) => return handle_agent_command(services, command).await,
+        Request::ClaudeAccounts => claude_accounts_message(&services.db, &services.claude)?,
+        Request::SetClaudeAccount { name } => {
             // The account has to be there before an agent tries to mount it;
             // a switch to a name with no directory would fail at the next
             // turn of every agent at once.
@@ -2278,101 +1611,67 @@ async fn handle_message(
             let mut write = services.db.write().await;
             write.set_claude_account(&name);
             write.commit();
-            let _ = outgoing_tx.send(claude_accounts_message(&services.db, &services.claude)?);
-            Ok(Refresh::None)
+            claude_accounts_message(&services.db, &services.claude)?
         }
-        ClientMessage::RecordVisualization { mime_type, content } => {
+        Request::SetAuthAccountEnabled { name, enabled } => {
+            services.set_auth_account_enabled(&name, enabled).await;
+            Reply::Done
+        }
+        Request::Visualization { id } => {
+            let visualization = services
+                .visualizations
+                .get(&id)
+                .with_context(|| format!("visualization {id} does not exist"))?;
+            Reply::Visualization {
+                id,
+                mime_type: visualization.mime_type,
+                content: visualization.content,
+            }
+        }
+        Request::RecordVisualization { mime_type, content } => {
             let id = services.visualizations.record(mime_type, content).await?;
-            let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });
-            Ok(Refresh::None)
+            Reply::VisualizationRecorded { id }
         }
-        ClientMessage::ChatGptUsage => {
-            let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
-                summaries: combined_quota_summaries(&services.db, &services.inference),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::QuotaHistory => {
-            let _ = outgoing_tx.send(ServerMessage::QuotaHistory {
-                series: quota_history(&services.db, &services.inference),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::GlobalUsage { since_ms } => {
+        Request::QuotaUsage => Reply::QuotaUsage {
+            summaries: usage::quota_summaries(&services.db, &services.inference),
+        },
+        Request::QuotaHistory => Reply::QuotaHistory {
+            series: usage::quota_history(&services.db, &services.inference),
+        },
+        Request::GlobalUsage { since_ms } => {
             services.pool.flush_agent_usage(None).await;
-            let usage = services
-                .db
-                .read()
-                .global_agent_usage(rho_core::UnixMs(since_ms));
-            let series = hourly_global_usage_series(usage);
-            let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
-            Ok(Refresh::None)
+            Reply::GlobalUsage {
+                series: usage::global_usage(&services.db, since_ms),
+            }
         }
-        ClientMessage::AgentCostDistribution { since_ms } => {
-            const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
-            const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_ui_proto::AGENT_COST_WINDOW_DAYS;
-
+        Request::AgentCostDistribution { since_ms } => {
             services.pool.flush_agent_usage(None).await;
-            let now = rho_core::UnixMs::now().0;
-            let earliest = since_ms
-                .saturating_sub(rho_ui_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
-                .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
-            let response = match hourly_agent_cost_series(&services.db, rho_core::UnixMs(earliest))
-            {
-                Ok(series) => ServerMessage::AgentCostDistribution { series },
-                Err(error) => ServerMessage::Error {
-                    message: error.to_string(),
-                },
-            };
-            let _ = outgoing_tx.send(response);
-            Ok(Refresh::None)
+            Reply::AgentCostDistribution {
+                series: usage::agent_costs(&services.db, since_ms)?,
+            }
         }
-        ClientMessage::ShellStart { request_id, agent } => {
-            let services = Arc::clone(services);
-            let outgoing_tx = outgoing_tx.clone();
-            tokio::spawn(async move {
-                let response = match shell_start(&services, &agent).await {
-                    Ok(()) => ServerMessage::ShellStarted { request_id },
-                    Err(error) => ServerMessage::ShellRequestFailed {
-                        request_id,
-                        reason: format!("{error:#}"),
-                    },
-                };
-                let _ = outgoing_tx.send(response);
-            });
-            Ok(Refresh::None)
+        Request::TerminalList { agent } => Reply::TerminalList {
+            terminals: terminal_list(services, agent.as_deref()).await?,
+        },
+        Request::ShellStart { agent } => {
+            shell_start(services, &agent).await?;
+            Reply::Done
         }
-        ClientMessage::ShellList { request_id, agent } => {
-            let response = match shell_list(services, agent.as_deref()).await {
-                Ok(shells) => ServerMessage::ShellList { request_id, shells },
-                Err(error) => ServerMessage::ShellRequestFailed {
-                    request_id,
-                    reason: format!("{error:#}"),
-                },
-            };
-            let _ = outgoing_tx.send(response);
-            Ok(Refresh::None)
+        Request::ShellList { agent } => Reply::ShellList {
+            shells: shell_list(services, agent.as_deref()).await?,
+        },
+        Request::ShellClose { agent } => {
+            shell_close(services, &agent).await?;
+            Reply::Done
         }
-        ClientMessage::ShellClose { request_id, agent } => {
-            let services = Arc::clone(services);
-            let outgoing_tx = outgoing_tx.clone();
-            tokio::spawn(async move {
-                let response = match shell_close(&services, &agent).await {
-                    Ok(()) => ServerMessage::ShellClosed { request_id },
-                    Err(error) => ServerMessage::ShellRequestFailed {
-                        request_id,
-                        reason: format!("{error:#}"),
-                    },
-                };
-                let _ = outgoing_tx.send(response);
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::GitTransportRegister => {
-            services.git_transport.register(outgoing_tx.clone()).await;
-            Ok(Refresh::None)
-        }
-        ClientMessage::PlatformSecretsSet { secrets } => {
+        Request::GitTransportPolicy { host } => Reply::GitTransportPolicy {
+            pat_available: host == "github.com"
+                && services.platform_secrets.contains_nonempty("GITHUB_TOKEN"),
+        },
+        Request::GuiTelemetryUpload { snapshot } => Reply::GuiTelemetryStored {
+            path: store_gui_telemetry(snapshot).await?,
+        },
+        Request::PlatformSecretsSet { secrets } => {
             let wants_octo = secrets.iter().any(|(key, _)| key == "GITHUB_TOKEN");
             let (running, detail) = match services.platform_secrets.install_merge(secrets) {
                 Ok((store, stashed)) => {
@@ -2389,17 +1688,15 @@ async fn handle_message(
                 }
                 Err(error) => (false, format!("{error:#}")),
             };
-            let _ = outgoing_tx.send(ServerMessage::PlatformStatus { running, detail });
-            Ok(Refresh::None)
+            Reply::PlatformStatus { running, detail }
         }
-        ClientMessage::PrCommand {
-            request_id,
+        Request::Pr {
             agent_id: _,
             command,
         } => {
             let result = async {
                 match command {
-                    rho_ui_proto::PrCommand::Create {
+                    rho_agent_host_proto::PrCommand::Create {
                         owner,
                         repo,
                         head,
@@ -2419,22 +1716,22 @@ async fn handle_message(
                         })
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Subscribe { .. } => Ok((
+                    rho_agent_host_proto::PrCommand::Subscribe { .. } => Ok((
                         "persistent PR subscriptions were removed; poll `rho pr status` instead"
                             .to_owned(),
                         Vec::new(),
                     )),
-                    rho_ui_proto::PrCommand::Status { url } => services
+                    rho_agent_host_proto::PrCommand::Status { url } => services
                         .pr_monitor
                         .status(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
-                    rho_ui_proto::PrCommand::Stop { .. } => Ok((
+                    rho_agent_host_proto::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
+                    rho_agent_host_proto::PrCommand::Stop { .. } => Ok((
                         "persistent PR subscriptions were removed".to_owned(),
                         Vec::new(),
                     )),
-                    rho_ui_proto::PrCommand::Comment {
+                    rho_agent_host_proto::PrCommand::Comment {
                         url,
                         reply_comment,
                         body,
@@ -2443,17 +1740,17 @@ async fn handle_message(
                         .comment(&url, reply_comment, &body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Comments { url } => services
+                    rho_agent_host_proto::PrCommand::Comments { url } => services
                         .pr_monitor
                         .comments(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Checks { url } => services
+                    rho_agent_host_proto::PrCommand::Checks { url } => services
                         .pr_monitor
                         .checks(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Edit {
+                    rho_agent_host_proto::PrCommand::Edit {
                         url,
                         base,
                         title,
@@ -2463,12 +1760,12 @@ async fn handle_message(
                         .edit(&url, base, title, body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Rerun { url, run_id } => services
+                    rho_agent_host_proto::PrCommand::Rerun { url, run_id } => services
                         .pr_monitor
                         .rerun(&url, run_id)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Logs { url, run_id } => {
+                    rho_agent_host_proto::PrCommand::Logs { url, run_id } => {
                         services.pr_monitor.logs(&url, run_id).await.map(|data| {
                             (format!("downloaded logs for run {run_id}"), data.to_vec())
                         })
@@ -2476,20 +1773,71 @@ async fn handle_message(
                 }
             }
             .await;
-            let (output, data, is_error) = match result {
-                Ok((output, data)) => (output, data, false),
-                Err(error) => (format!("{error:#}"), Vec::new(), true),
-            };
-            let _ = outgoing_tx.send(ServerMessage::PrCommandResult {
-                request_id,
-                output,
-                data,
-                is_error,
-            });
-            Ok(Refresh::None)
+            match result {
+                Ok((output, data)) => Reply::Pr {
+                    output,
+                    data,
+                    is_error: false,
+                },
+                Err(error) => Reply::Pr {
+                    output: format!("{error:#}"),
+                    data: Vec::new(),
+                    is_error: true,
+                },
+            }
         }
-        ClientMessage::Subscribe => Ok(Refresh::None),
-        ClientMessage::NewAgent {
+        Request::Snapshot => Reply::Snapshotted {
+            path: debug::daemon_snapshot(&services.db).await?,
+        },
+        Request::IrohApprove { code } => {
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
+            let code = code
+                .parse::<rho_iroh_auth::EnrollmentCode>()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let endpoint_id = auth
+                .approve_code(&code)
+                .await
+                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
+            Reply::IrohApproved {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        }
+        Request::IrohTrustInMemory { endpoint_id } => {
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
+            let endpoint_id = endpoint_id
+                .parse::<iroh::EndpointId>()
+                .context("invalid iroh client endpoint id")?;
+            auth.trust_in_memory(endpoint_id).await;
+            Reply::IrohApproved {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        }
+        Request::IrohRevoke { endpoint_id } => {
+            let auth =
+                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
+            let endpoint_id = endpoint_id
+                .parse::<iroh::EndpointId>()
+                .context("invalid iroh client endpoint id")?;
+            anyhow::ensure!(
+                auth.revoke(endpoint_id).await,
+                "iroh client is not enrolled"
+            );
+            Reply::IrohRevoked {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        }
+    };
+    Ok((reply, Refresh::None))
+}
+
+async fn handle_agent_command(
+    services: &Arc<Services>,
+    command: AgentCommand,
+) -> anyhow::Result<(Reply, Refresh)> {
+    match command {
+        AgentCommand::New {
             role,
             start,
             mode,
@@ -2498,105 +1846,18 @@ async fn handle_message(
             if let Some(content) = content.as_mut() {
                 prepare_image_content(content).await?;
             }
-            // Subscription and the AgentCreated announcement ride the pool's
-            // creation broadcast (all connections, including this one).
-            let (_, agent) = services.create(role, start, mode).await?;
+            // Control streams hear of the agent from the pool's creation
+            // broadcast; the reply tells this client which one is its own.
+            let (agent_id, agent) = services.create(role, start, mode).await?;
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
                 agent
                     .send_user_content_accepted(content, MessageDelivery::NextRequest)
                     .await?;
             }
-            Ok(Refresh::Ready)
+            Ok((Reply::AgentCreated { agent_id }, Refresh::Ready))
         }
-        ClientMessage::AcquireLandLease { repo, agent_id } => {
-            let lock = services.land_lock(repo.clone()).await;
-            let lease = match lock.clone().try_lock_owned() {
-                Ok(lease) => lease,
-                Err(_) => {
-                    services
-                        .set_land_status(repo.clone(), agent_id, LandStatus::Queued)
-                        .await;
-                    let holder = services.land_holder(&repo).await;
-                    let _ = outgoing_tx.send(ServerMessage::LandLeaseQueued {
-                        repo: repo.clone(),
-                        holder,
-                    });
-                    lock.lock_owned().await
-                }
-            };
-            if let Some(holder) = land_holder {
-                services.set_land_holder(repo.clone(), holder).await;
-            }
-            land_leases.push((repo.clone(), lease));
-            let _ = outgoing_tx.send(ServerMessage::LandLeaseGranted { repo });
-            Ok(Refresh::None)
-        }
-        ClientMessage::LandStatus {
-            repo,
-            agent_id,
-            status,
-        } => {
-            services
-                .set_land_status(repo.clone(), agent_id, status.clone())
-                .await;
-            let _ = services.events.send(ServerMessage::LandStatus {
-                repo,
-                agent_id,
-                status,
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::ReleaseLandLease { repo, agent_id: _ } => {
-            if let Some(index) = land_leases
-                .iter()
-                .position(|(leased_repo, _)| *leased_repo == repo)
-            {
-                land_leases.swap_remove(index);
-                services.clear_land_holder(&repo).await;
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::AgentStreamFocus { agent_ids } => {
-            anyhow::ensure!(agent_ids.len() <= 64, "too many focused agents");
-            // Focus is what this client is looking at, nothing more: it
-            // never loads an agent. The pool unions it across connections
-            // into the live set; a loaded agent in it tells its tail.
-            services
-                .pool
-                .set_live_wants(connection_id, agent_ids.into_iter().collect())
-                .await;
-            Ok(Refresh::None)
-        }
-        ClientMessage::Follow { since } => {
-            if let Some(previous) = log_follow.take() {
-                previous.abort();
-            }
-            *log_follow = Some(spawn_log_follow(
-                Arc::clone(services),
-                outgoing_tx.clone(),
-                since,
-            ));
-            Ok(Refresh::None)
-        }
-        ClientMessage::Detail {
-            agent_id,
-            pos,
-            more,
-        } => {
-            // One answer per position, each naming its own `pos`. A chunk
-            // asks once and is answered as many times as it asked for.
-            for pos in std::iter::once(pos).chain(more) {
-                let body = agent_detail(&services.db, agent_id, pos);
-                let _ = outgoing_tx.send(ServerMessage::Detail {
-                    agent_id,
-                    pos,
-                    body,
-                });
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::SendUserMessage {
+        AgentCommand::Send {
             agent_id,
             mut content,
             delivery,
@@ -2608,30 +1869,30 @@ async fn handle_message(
             // message is accepted, the log when the message's row lands.
             let notice = agent.head().pending_notice;
             if let Some(text) = notice.clone() {
-                content.insert(0, rho_core::ContentPart::Text { text });
+                content.insert(0, rho_agent_host_proto::ContentPart::Text { text });
             }
             agent.send_user_content_accepted(content, delivery).await?;
             if notice.is_some() {
                 agent.notice_carried();
             }
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
         // A compaction rides the next request whichever lane the client
         // named; the lane is not a thing the runtime reads for it.
-        ClientMessage::CompactAgent {
+        AgentCommand::Compact {
             agent_id,
             delivery: _,
         } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.compact();
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
-        ClientMessage::ChangeAgentRole { agent_id, role } => {
+        AgentCommand::ChangeRole { agent_id, role } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_role(role).await?;
-            Ok(Refresh::Ready)
+            Ok((Reply::Done, Refresh::Ready))
         }
-        ClientMessage::ChangeAgentMode { agent_id, mode } => {
+        AgentCommand::ChangeMode { agent_id, mode } => {
             let changed = services.pool.change_mode(agent_id, mode).await?;
             for id in changed {
                 if id != agent_id && services.pool.is_live(id) {
@@ -2640,101 +1901,27 @@ async fn handle_message(
             }
             // Back at once, in the new view, for whoever is looking.
             services.load(agent_id).await?;
-            Ok(Refresh::Ready)
+            Ok((Reply::Done, Refresh::Ready))
         }
-        ClientMessage::ChangePromptCacheKey { agent_id } => {
+        AgentCommand::ChangePromptCacheKey { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_prompt_cache_key()?;
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
-        ClientMessage::SetAuthAccountEnabled { name, enabled } => {
-            services.set_auth_account_enabled(&name, enabled).await;
-            Ok(Refresh::None)
-        }
-        ClientMessage::CancelTurn { agent_id } => {
+        AgentCommand::Cancel { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.cancel();
-            let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
-            Ok(Refresh::None)
+            Ok((Reply::Done, Refresh::None))
         }
-        ClientMessage::RewindAgent { agent_id, turns } => {
+        AgentCommand::Rewind { agent_id, turns } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.rewind(turns).await?;
-            Ok(Refresh::Ready)
+            Ok((Reply::Done, Refresh::Ready))
         }
-        ClientMessage::ContinueTurn { agent_id } => {
+        AgentCommand::Continue { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.retry();
-            Ok(Refresh::None)
-        }
-        ClientMessage::Snapshot => {
-            let path = debug::daemon_snapshot(&services.db).await?;
-            let _ = outgoing_tx.send(ServerMessage::Snapshotted { path });
-            Ok(Refresh::None)
-        }
-        ClientMessage::IrohApprove { code } => {
-            let auth =
-                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
-            let code = code
-                .parse::<rho_iroh_auth::EnrollmentCode>()
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            let endpoint_id = auth
-                .approve_code(&code)
-                .await
-                .map_err(|_| anyhow::anyhow!("no pending enrollment has this code"))?;
-            let _ = outgoing_tx.send(ServerMessage::IrohApproved {
-                endpoint_id: endpoint_id.to_string(),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::IrohTrustInMemory { endpoint_id } => {
-            let auth =
-                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
-            let endpoint_id = endpoint_id
-                .parse::<iroh::EndpointId>()
-                .context("invalid iroh client endpoint id")?;
-            auth.trust_in_memory(endpoint_id).await;
-            let _ = outgoing_tx.send(ServerMessage::IrohApproved {
-                endpoint_id: endpoint_id.to_string(),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::IrohRevoke { endpoint_id } => {
-            let auth =
-                iroh_auth.context("daemon is not listening over iroh (start it with --iroh)")?;
-            let endpoint_id = endpoint_id
-                .parse::<iroh::EndpointId>()
-                .context("invalid iroh client endpoint id")?;
-            anyhow::ensure!(
-                auth.revoke(endpoint_id).await,
-                "iroh client is not enrolled"
-            );
-            let _ = outgoing_tx.send(ServerMessage::IrohRevoked {
-                endpoint_id: endpoint_id.to_string(),
-            });
-            Ok(Refresh::None)
-        }
-        // Only valid as a stream's first frame (see `serve_connection_io`);
-        // inside a UI session it is a protocol error.
-        ClientMessage::ChannelOpen { .. } => {
-            anyhow::bail!("ChannelOpen must be the first frame on a dedicated stream")
-        }
-        ClientMessage::RealtimeOpen { .. } => {
-            anyhow::bail!("RealtimeOpen must be the first frame on a dedicated stream")
-        }
-        ClientMessage::DiffSnapshot { .. }
-        | ClientMessage::DiffBaseContents { .. }
-        | ClientMessage::GuiTelemetryUpload { .. }
-        | ClientMessage::VisualizationGet { .. }
-        | ClientMessage::WaylandOpen { .. }
-        | ClientMessage::TerminalCreate { .. }
-        | ClientMessage::TerminalAttach { .. }
-        | ClientMessage::TerminalList { .. }
-        | ClientMessage::ShellAttach { .. }
-        | ClientMessage::GitTransportRequest { .. }
-        | ClientMessage::GitTransportProvide { .. }
-        | ClientMessage::GitTransportQuery { .. } => {
-            anyhow::bail!("channel messages must be the first frame on a dedicated stream")
+            Ok((Reply::Done, Refresh::None))
         }
     }
 }
@@ -2756,7 +1943,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ShellAttachRefused {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -2764,8 +1951,8 @@ where
             return Err(error);
         }
     };
-    write_frame(&mut writer, &ServerMessage::ShellOpened).await?;
-    client.relay::<_, _, rho_ui_proto::shell::ShellClientFrame, rho_ui_proto::shell::ShellServerFrame>(reader, writer).await
+    write_frame(&mut writer, &Opened::Ready).await?;
+    client.relay::<_, _, rho_agent_host_proto::shell::ShellClientFrame, rho_agent_host_proto::shell::ShellServerFrame>(reader, writer).await
 }
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
@@ -2799,7 +1986,7 @@ async fn shell_attach(
 async fn shell_list(
     services: &Arc<Services>,
     agent: Option<&str>,
-) -> anyhow::Result<Vec<rho_ui_proto::shell::ShellInfo>> {
+) -> anyhow::Result<Vec<rho_agent_host_proto::shell::ShellInfo>> {
     let filter = match agent {
         Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,
@@ -2860,84 +2047,30 @@ fn rho_pager_program() -> std::ffi::OsString {
     "rho-pager".into()
 }
 
-/// Loads one bounded parent-content batch from an already immutable diff
-/// operation. This intentionally does not snapshot the working copy.
-async fn serve_diff_base_contents<W>(
-    services: Arc<Services>,
-    mut writer: W,
-    workspace: WorkspaceInfo,
-    operation_id: String,
-    commit_id: String,
-    paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let (workset, checkout) = open_checkout(&services, &workspace).await?;
-        workset
-            .diff_base_contents(&checkout, &operation_id, &commit_id, &paths)
-            .await
+async fn store_gui_telemetry(snapshot: Vec<u8>) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
+        "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
+        snapshot.len(),
+        rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
+    );
+    let path = tokio::task::spawn_blocking(move || {
+        let state = dirs::state_dir().context("state directory not available")?;
+        persist_gui_telemetry(&state.join("rho"), &snapshot)
     })
     .await
-    .context("deferred diff content timed out after 30 seconds")
-    .and_then(|result| result);
-    match result {
-        Ok(contents) => {
-            write_frame(&mut writer, &ServerMessage::DiffBaseContents { contents }).await
-        }
-        Err(error) => {
-            write_frame(
-                &mut writer,
-                &ServerMessage::DiffRefused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await
-        }
-    }
-}
-
-async fn serve_gui_telemetry_upload<W>(mut writer: W, snapshot: Vec<u8>) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let response = if snapshot.len() > rho_ui_proto::MAX_GUI_TELEMETRY_BYTES {
-        ServerMessage::GuiTelemetryRefused {
-            reason: format!(
-                "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
-                snapshot.len(),
-                rho_ui_proto::MAX_GUI_TELEMETRY_BYTES
-            ),
-        }
-    } else {
-        let result = tokio::task::spawn_blocking(move || {
-            let state = dirs::state_dir().context("state directory not available")?;
-            persist_gui_telemetry(&state.join("rho"), &snapshot)
-        })
-        .await
-        .context("GUI telemetry storage task failed")?;
-        match result {
-            Ok(path) => ServerMessage::GuiTelemetryStored {
-                path: path.display().to_string(),
-            },
-            Err(error) => ServerMessage::GuiTelemetryRefused {
-                reason: format!("failed to store GUI telemetry: {error:#}"),
-            },
-        }
-    };
-    write_frame(&mut writer, &response).await
+    .context("GUI telemetry storage task failed")?
+    .context("failed to store GUI telemetry")?;
+    Ok(path.display().to_string())
 }
 
 fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyhow::Result<PathBuf> {
     use std::io::Write as _;
 
     anyhow::ensure!(
-        snapshot.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot exceeds the {} byte limit",
-        rho_ui_proto::MAX_GUI_TELEMETRY_BYTES
+        rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
     );
     let directory = state_root.join("gui-telemetry");
     std::fs::create_dir_all(&directory)
@@ -2970,64 +2103,10 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
     anyhow::bail!("could not allocate a unique GUI telemetry filename")
 }
 
-/// Serves one working-copy diff snapshot and its bounded parent-side
-/// manifest on a dedicated stream, avoiding control-session head-of-line
-/// blocking. (Taking the snapshot itself is a TODO in `rho-fs-view`.)
-async fn serve_diff_snapshot<W>(
-    services: Arc<Services>,
-    mut writer: W,
-    workspace: WorkspaceInfo,
-    known_commit_id: Option<String>,
-    include_paths: Vec<Utf8PathBuf>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let (workset, checkout) = open_checkout(&services, &workspace).await?;
-        workset
-            .diff_snapshot(&checkout, known_commit_id.as_deref(), &include_paths)
-            .await
-    })
-    .await
-    .context("diff snapshot timed out after 30 seconds")
-    .and_then(|result| result);
-    match result {
-        Ok(Some(snapshot)) => {
-            write_frame(&mut writer, &ServerMessage::DiffSnapshot { snapshot }).await
-        }
-        Ok(None) => {
-            write_frame(
-                &mut writer,
-                &ServerMessage::DiffUnchanged {
-                    commit_id: known_commit_id.unwrap_or_default(),
-                },
-            )
-            .await
-        }
-        Err(error) => {
-            write_frame(
-                &mut writer,
-                &ServerMessage::DiffRefused {
-                    reason: format!("{error:#}"),
-                },
-            )
-            .await
-        }
-    }
-}
-
-/// How a terminal stream's first frame opens its terminal.
-enum TerminalOpenKind {
-    Create { attach: bool },
-    Attach,
-}
-
 /// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
-/// (per [`TerminalOpenKind`]), replies `TerminalOpened`, then pumps
-/// [`rho_ui_proto::term`] frames until either side closes. Closing only
+/// (per [`TerminalOpen`](rho_agent_host_proto::term::TerminalOpen)), replies
+/// `Opened::Ready`, then pumps
+/// [`rho_agent_host_proto::term`] frames until either side closes. Closing only
 /// detaches; the terminal keeps running. A headless create replies and
 /// returns without attaching.
 #[expect(clippy::too_many_arguments)]
@@ -3037,7 +2116,7 @@ async fn serve_terminal<R, W>(
     mut writer: W,
     agent: String,
     terminal_id: u64,
-    open: TerminalOpenKind,
+    open: rho_agent_host_proto::term::TerminalOpen,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()>
@@ -3045,14 +2124,17 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let create = matches!(open, TerminalOpenKind::Create { .. });
+    let create = matches!(
+        open,
+        rho_agent_host_proto::term::TerminalOpen::Create { .. }
+    );
     let attached = terminal_attach(&services, &agent, terminal_id, create, cols, rows).await;
     let client = match attached {
         Ok(attached) => attached,
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::TerminalRefused {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -3060,14 +2142,17 @@ where
             return Err(error);
         }
     };
-    write_frame(&mut writer, &ServerMessage::TerminalOpened { terminal_id }).await?;
-    if matches!(open, TerminalOpenKind::Create { attach: false }) {
+    write_frame(&mut writer, &Opened::Ready).await?;
+    if matches!(
+        open,
+        rho_agent_host_proto::term::TerminalOpen::Create { attach: false }
+    ) {
         // Headless create: the terminal keeps running with no clients.
         return Ok(());
     }
 
     client
-        .relay::<_, _, rho_ui_proto::term::TermClientFrame, rho_ui_proto::term::TermServerFrame>(
+        .relay::<_, _, rho_agent_host_proto::term::TermClientFrame, rho_agent_host_proto::term::TermServerFrame>(
             reader, writer,
         )
         .await
@@ -3107,33 +2192,16 @@ async fn terminal_attach(
         .await
 }
 
-/// Answers a [`ClientMessage::TerminalList`] one-shot stream.
-async fn serve_terminal_list<W>(
-    services: Arc<Services>,
-    mut writer: W,
-    agent: Option<String>,
-) -> anyhow::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let filter = match &agent {
-        Some(agent) => match services.resolve_display_agent_id(agent).await {
-            Ok(agent_id) => Some(agent_id),
-            Err(error) => {
-                let _ = write_frame(
-                    &mut writer,
-                    &ServerMessage::TerminalRefused {
-                        reason: format!("{error:#}"),
-                    },
-                )
-                .await;
-                return Err(error);
-            }
-        },
+/// The daemon's terminals, or one agent's.
+async fn terminal_list(
+    services: &Arc<Services>,
+    agent: Option<&str>,
+) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
+    let filter = match agent {
+        Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,
     };
     let mut terminals = Vec::new();
-    let filter = filter.map(|id| id.encoded());
     for process in services.pool.executions().await {
         if let rho_agent::WorksetReply::Terminals(entries) = process
             .action(rho_agent::WorksetAction::TerminalList)
@@ -3146,7 +2214,7 @@ where
             );
         }
     }
-    write_frame(&mut writer, &ServerMessage::TerminalList { terminals }).await
+    Ok(terminals)
 }
 
 /// Serves a bounded typed file channel rooted in one workspace checkout.
@@ -3165,7 +2233,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ChannelClosed {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -3178,7 +2246,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ChannelClosed {
+                &Opened::Refused {
                     reason: format!("{error:#}"),
                 },
             )
@@ -3191,7 +2259,7 @@ where
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
-                &ServerMessage::ChannelClosed {
+                &Opened::Refused {
                     reason: format!("watch workspace: {error:#}"),
                 },
             )
@@ -3199,9 +2267,9 @@ where
             return Err(error);
         }
     };
-    write_frame(&mut writer, &ServerMessage::ChannelOpened).await?;
+    write_frame(&mut writer, &Opened::Ready).await?;
 
-    use rho_ui_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
+    use rho_agent_host_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
     let mut changes = watcher_setup.changes;
     let changes_overflowed = watcher_setup.overflowed;
     let mut watcher_ready = Some(watcher_setup.ready);
@@ -3237,19 +2305,19 @@ where
                 // registration completed. Treat that window like overflow; the
                 // GUI already reconciles it by reloading open buffers and
                 // scheduling a fresh semantic barrier.
-                rho_ui_proto::write_frame_limited(
+                rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed {
                         paths: Vec::new(),
                         rescan: true,
                     },
-                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
-            frame = rho_ui_proto::read_frame_limited::<_, WorkspaceClientFrame>(
+            frame = rho_agent_host_proto::read_frame_limited::<_, WorkspaceClientFrame>(
                 &mut reader,
-                rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
             ) => {
                 let frame = match frame {
                     Ok(frame) => frame,
@@ -3277,10 +2345,10 @@ where
                         WorkspaceServerFrame::Saved { request_id, path, result }
                     }
                 };
-                rho_ui_proto::write_frame_limited(
+                rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &response,
-                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
@@ -3297,10 +2365,10 @@ where
                 }
                 let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
                 let rescan = explicit_rescan || overflowed;
-                rho_ui_proto::write_frame_limited(
+                rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed { paths, rescan },
-                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
@@ -3313,9 +2381,9 @@ where
 fn agent_detail(
     db: &RhoDb,
     agent_id: AgentId,
-    pos: rho_ui_proto::mirror::AgentPos,
-) -> rho_ui_proto::mirror::DetailBody {
-    use rho_ui_proto::mirror::DetailBody;
+    pos: rho_agent_host_proto::transcript::AgentPos,
+) -> rho_agent_host_proto::transcript::DetailBody {
+    use rho_agent_host_proto::transcript::DetailBody;
     let event = db.read().agent_event(agent_id, pos.into());
     if let Some(native) = event.as_ref().and_then(rho_agent::AgentEvent::native_event) {
         use rho_agent::native::NativeEvent;
@@ -3324,10 +2392,12 @@ fn agent_detail(
                 input
                     .iter()
                     .flat_map(|item| match item {
-                        rho_core::ContextBlock::ToolResults { results } => {
+                        rho_inference::types::ContextBlock::ToolResults { results } => {
                             results.iter().map(detail_result).collect::<Vec<_>>()
                         }
-                        rho_core::ContextBlock::ToolUpdate(update) => vec![detail_update(&update)],
+                        rho_inference::types::ContextBlock::ToolUpdate(update) => {
+                            vec![detail_update(&update)]
+                        }
                         _ => Vec::new(),
                     })
                     .collect(),
@@ -3336,11 +2406,13 @@ fn agent_detail(
                 output
                     .iter()
                     .filter_map(|entry| match entry {
-                        rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items),
+                        rho_inference::types::ContextBlock::InferenceResponse { items, .. } => {
+                            Some(items)
+                        }
                         _ => None,
                     })
                     .flatten()
-                    .filter_map(rho_agent::mirror::item)
+                    .filter_map(rho_agent::transcript::item)
                     .collect(),
             ),
             NativeEvent::RequestFailed { partial, .. } => DetailBody::Response(
@@ -3348,11 +2420,11 @@ fn agent_detail(
                     .items
                     .iter()
                     .filter_map(|slot| match slot {
-                        rho_core::StreamingContextItemState::Pending(item)
-                        | rho_core::StreamingContextItemState::Finished(item) => item
+                        rho_inference::types::StreamingContextItemState::Pending(item)
+                        | rho_inference::types::StreamingContextItemState::Finished(item) => item
                             .to_context_item()
                             .ok()
-                            .and_then(|item| rho_agent::mirror::item(&item)),
+                            .and_then(|item| rho_agent::transcript::item(&item)),
                         _ => None,
                     })
                     .collect(),
@@ -3363,18 +2435,16 @@ fn agent_detail(
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
                 (!text.is_empty())
-                    .then_some(rho_ui_proto::mirror::Item::Text { text, phase: None })
+                    .then_some(rho_agent_host_proto::transcript::Item::Text { text, phase: None })
                     .into_iter()
-                    .chain(
-                        calls
-                            .into_iter()
-                            .map(|call| rho_ui_proto::mirror::Item::ToolCall {
-                                id: call.id,
-                                name: call.name,
-                                arguments: call.arguments,
-                                format: rho_ui_proto::mirror::ArgumentsFormat::Json,
-                            }),
-                    )
+                    .chain(calls.into_iter().map(|call| {
+                        rho_agent_host_proto::transcript::Item::ToolCall {
+                            id: call.id,
+                            name: call.name,
+                            arguments: call.arguments,
+                            format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
+                        }
+                    }))
                     .collect(),
             ),
             rho_agent::TranscriptLine::ToolResults { results } => {
@@ -3388,11 +2458,11 @@ fn agent_detail(
                 .items
                 .iter()
                 .filter_map(|slot| match slot {
-                    rho_core::StreamingContextItemState::Pending(item)
-                    | rho_core::StreamingContextItemState::Finished(item) => {
+                    rho_inference::types::StreamingContextItemState::Pending(item)
+                    | rho_inference::types::StreamingContextItemState::Finished(item) => {
                         rho_agent::live::to_item(item)
                     }
-                    rho_core::StreamingContextItemState::Empty => None,
+                    rho_inference::types::StreamingContextItemState::Empty => None,
                 })
                 .collect(),
         ),
@@ -3400,24 +2470,28 @@ fn agent_detail(
     }
 }
 
-fn detail_result(result: &rho_core::ToolResult) -> rho_ui_proto::mirror::DetailResult {
-    use rho_ui_proto::mirror::ToolStatus;
-    rho_ui_proto::mirror::DetailResult {
+fn detail_result(
+    result: &rho_inference::types::ToolResult,
+) -> rho_agent_host_proto::transcript::DetailResult {
+    use rho_agent_host_proto::transcript::ToolStatus;
+    rho_agent_host_proto::transcript::DetailResult {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_core::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_core::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_core::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_host_proto::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_host_proto::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         output: result.body.recorded_output().to_owned(),
         error: None,
     }
 }
 
-fn detail_update(update: &rho_core::ToolUpdate) -> rho_ui_proto::mirror::DetailResult {
-    rho_ui_proto::mirror::DetailResult {
+fn detail_update(
+    update: &rho_inference::types::ToolUpdate,
+) -> rho_agent_host_proto::transcript::DetailResult {
+    rho_agent_host_proto::transcript::DetailResult {
         id: update.call_id.as_str().to_owned(),
-        status: rho_ui_proto::mirror::ToolStatus::Success,
+        status: rho_agent_host_proto::transcript::ToolStatus::Success,
         output: update.recorded_output().to_owned(),
         error: None,
     }
@@ -3460,7 +2534,7 @@ fn validate_image_content(content: &[ContentPart]) -> anyhow::Result<()> {
         }
         encoded_total = encoded_total.saturating_add(encoded);
     }
-    if encoded_total > rho_ui_proto::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
+    if encoded_total > rho_agent_host_proto::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
         anyhow::bail!("image attachments exceed the protocol aggregate size limit");
     }
     Ok(())
@@ -3573,50 +2647,45 @@ mod daemon_directory_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
-    use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
-    use rho_core::ContentPart;
-    use rho_db::RhoDb;
-    use rho_ui_proto::ServerMessage;
+    use rho_agent_host_proto::ContentPart;
+    use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 
     use super::{
-        AgentPool, AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim,
-        GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets, Services,
-        claude_quota_history, configure_octo_git_transport, hourly_global_usage_series,
-        merge_hourly_agent_cost_bucket, persist_gui_telemetry, prepare_image_content, quota_burn,
-        quota_summaries, start_runtime_sockets, validate_image_content,
+        GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
+        PlatformSecrets, configure_octo_git_transport, persist_gui_telemetry,
+        prepare_image_content, start_runtime_sockets, validate_image_content,
     };
 
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
-        let result = rho_core::ToolResult {
-            call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_core::ToolType::Custom,
-            body: rho_core::ToolOutput {
+        let result = rho_inference::types::ToolResult {
+            call_id: rho_inference::types::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_inference::types::ToolType::Custom,
+            body: rho_inference::types::ToolOutput {
                 output: Arc::new("bounded model view".to_owned()),
                 full_output: Some(Arc::new("complete host record".to_owned())),
                 images: Arc::new(Vec::new()),
-                status: rho_core::ToolOutputStatus::Success,
+                status: rho_agent_host_proto::ToolOutputStatus::Success,
             },
-            started_at: rho_core::UnixMs(1),
-            finished_at: rho_core::UnixMs(2),
+            started_at: rho_agent_host_proto::UnixMs(1),
+            finished_at: rho_agent_host_proto::UnixMs(2),
             metadata: None,
         };
 
         assert_eq!(super::detail_result(&result).output, "complete host record");
 
-        let update = rho_core::ToolUpdate {
+        let update = rho_inference::types::ToolUpdate {
             status: None,
             images: Default::default(),
-            call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_core::ToolType::Custom,
+            call_id: rho_inference::types::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_inference::types::ToolType::Custom,
             output: Arc::new("bounded update".to_owned()),
             full_output: Some(Arc::new("complete update".to_owned())),
-            at: rho_core::UnixMs(3),
+            at: rho_agent_host_proto::UnixMs(3),
         };
         assert_eq!(super::detail_update(&update).output, "complete update");
     }
@@ -3649,7 +2718,8 @@ mod tests {
     #[tokio::test]
     async fn second_daemon_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths =
+            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let first =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();
@@ -3677,7 +2747,8 @@ mod tests {
     #[tokio::test]
     async fn stale_socket_files_are_removed_and_rebound() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths =
+            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         drop(std::os::unix::net::UnixListener::bind(paths.socket()).unwrap());
         drop(std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap());
 
@@ -3693,7 +2764,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_lock_remains_held_after_socket_setup_returns() {
         let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let paths =
+            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let sockets =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();
@@ -3710,221 +2782,6 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         drop(sockets);
-    }
-
-    #[test]
-    fn global_usage_response_rolls_five_minute_buckets_up_to_hours() {
-        let bucket = |model, bucket_start_ms, input_tokens| rho_agent::db::AgentUsageBucket {
-            bucket_start_ms,
-            model,
-            input_tokens,
-            requests: 1,
-            ..Default::default()
-        };
-        let series = hourly_global_usage_series(vec![
-            (
-                AgentUsageModel::FABLE,
-                bucket(AgentUsageModel::FABLE, 5 * 60 * 1_000, 10),
-            ),
-            (
-                AgentUsageModel::FABLE,
-                bucket(AgentUsageModel::FABLE, 55 * 60 * 1_000, 20),
-            ),
-            (
-                AgentUsageModel::GPT,
-                bucket(AgentUsageModel::GPT, 60 * 60 * 1_000, 30),
-            ),
-        ]);
-
-        assert_eq!(series.len(), 6);
-        assert_eq!(series[0].model, "fable");
-        assert_eq!(series[0].buckets.len(), 1);
-        assert_eq!(series[0].buckets[0].bucket_start_ms, 0);
-        assert_eq!(series[0].buckets[0].input_tokens, 30);
-        assert_eq!(series[0].buckets[0].requests, 2);
-        assert_eq!(series[1].model, "gpt");
-        assert_eq!(series[1].buckets[0].bucket_start_ms, 60 * 60 * 1_000);
-        assert_eq!(series[5].model, "astra");
-        assert!(series[5].buckets.is_empty());
-    }
-
-    #[test]
-    fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
-        let agent_id =
-            rho_agent::db::AgentId::from_counter(1, &rho_core::AgentIdDomain(0)).unwrap();
-        let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
-            bucket_start_ms,
-            model: AgentUsageModel::GPT,
-            requests: 1,
-            ..Default::default()
-        };
-        let mut hourly = BTreeMap::new();
-        merge_hourly_agent_cost_bucket(&mut hourly, agent_id, bucket(0), 1).unwrap();
-        assert!(
-            merge_hourly_agent_cost_bucket(&mut hourly, agent_id, bucket(60 * 60 * 1_000), 1,)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn quota_burn_uses_net_change_within_each_reset_epoch() {
-        let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            auth_namespace: None,
-            observed_at: rho_core::UnixMs(at),
-            used_percent,
-            reset_at_unix,
-        };
-        let records = [
-            sample(0, 10, Some(100)),
-            sample(100, 15, Some(100)),
-            sample(200, 13, Some(100)),
-            sample(300, 3, Some(200)),
-            sample(400, 6, Some(200)),
-        ];
-        let samples = records.iter().collect::<Vec<_>>();
-        assert_eq!(quota_burn(&samples, 400, 1_000), 6);
-        assert_eq!(quota_burn(&samples, 400, 150), 3);
-    }
-
-    #[test]
-    fn quota_burn_does_not_sum_sample_jitter() {
-        let sample = |at, used_percent| QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            auth_namespace: None,
-            observed_at: rho_core::UnixMs(at),
-            used_percent,
-            reset_at_unix: Some(100),
-        };
-        let records = [
-            sample(0, 50),
-            sample(100, 48),
-            sample(200, 50),
-            sample(300, 49),
-            sample(400, 50),
-        ];
-        let samples = records.iter().collect::<Vec<_>>();
-
-        assert_eq!(quota_burn(&samples, 400, 1_000), 0);
-    }
-
-    #[test]
-    fn quota_burn_tolerates_reset_target_jitter() {
-        let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            auth_namespace: None,
-            observed_at: rho_core::UnixMs(at),
-            used_percent,
-            reset_at_unix: Some(reset_at_unix),
-        };
-        let records = [
-            sample(0, 17, 1_000),
-            sample(100, 15, 1_001),
-            sample(200, 17, 999),
-            sample(300, 16, 1_000),
-            sample(400, 17, 1_002),
-        ];
-        let samples = records.iter().collect::<Vec<_>>();
-
-        assert_eq!(quota_burn(&samples, 400, 1_000), 0);
-    }
-
-    #[tokio::test]
-    async fn claude_quota_history_includes_every_stored_point() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_core::UnixMs::now().0;
-        let mut write = db.write().await;
-        for index in 0..5 {
-            assert!(write.record_quota_observation(QuotaObservationRecord {
-                provider: QuotaProvider::Claude,
-                model: QuotaModel::OPUS,
-                auth_namespace: Some("default".to_owned()),
-                observed_at: rho_core::UnixMs(now - (4 - index) * 1_000),
-                used_percent: index as u8,
-                reset_at_unix: Some(123),
-            }));
-        }
-        assert!(write.record_quota_observation(QuotaObservationRecord {
-            provider: QuotaProvider::Claude,
-            model: QuotaModel::FABLE,
-            auth_namespace: None,
-            observed_at: rho_core::UnixMs(now),
-            used_percent: 25,
-            reset_at_unix: Some(456),
-        }));
-        write.commit();
-
-        let history = claude_quota_history(&db);
-        let opus = history
-            .iter()
-            .find(|series| series.model == "opus")
-            .unwrap();
-        assert_eq!(opus.points.len(), 5);
-        assert_eq!(
-            opus.points
-                .iter()
-                .map(|point| point.remaining_percent)
-                .collect::<Vec<_>>(),
-            [100, 99, 98, 97, 96]
-        );
-        let fable = history
-            .iter()
-            .find(|series| series.model == "fable")
-            .unwrap();
-        assert_eq!(fable.points[0].remaining_percent, 75);
-    }
-
-    #[tokio::test]
-    async fn inference_migrates_legacy_scoped_gpt_history() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        assert!(write.record_quota_observation(QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            auth_namespace: Some("work".to_owned()),
-            observed_at: rho_core::UnixMs(123),
-            used_percent: 42,
-            reset_at_unix: Some(456),
-        }));
-        write.commit();
-
-        let inference = rho_inference::Inference::new(db).await.unwrap();
-        let history = inference.quota_history(rho_core::UnixMs(0));
-
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].auth_namespace, "work");
-        assert_eq!(history[0].points[0].remaining_percent, 58);
-    }
-
-    #[tokio::test]
-    async fn quota_summary_expires_stale_provider_window() {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_core::UnixMs::now();
-        let mut write = db.write().await;
-        assert!(write.record_quota_observation(QuotaObservationRecord {
-            provider: QuotaProvider::Claude,
-            model: QuotaModel::FABLE,
-            auth_namespace: None,
-            observed_at: now,
-            used_percent: 99,
-            reset_at_unix: Some(1),
-        }));
-        write.commit();
-
-        let summary = quota_summaries(&db)
-            .into_iter()
-            .find(|summary| summary.model == "fable")
-            .unwrap();
-        assert_eq!(summary.remaining_percent, 100);
-        assert_eq!(summary.burn_10m, 0);
-        assert_eq!(summary.reset_at_unix, None);
     }
 
     fn environment_value<'a>(
@@ -3990,12 +2847,12 @@ mod tests {
         let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
         broker.register(first_tx).await;
         broker.register(second_tx).await;
-        let request = rho_ui_proto::GitTransportRequest {
+        let request = rho_agent_host_proto::GitTransportRequest {
             host: "git.example".to_owned(),
             port: 22,
             user: "git".to_owned(),
             repository: "team/repo.git".to_owned(),
-            service: rho_ui_proto::GitService::ReceivePack,
+            service: rho_agent_host_proto::GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         let waiting = {
@@ -4003,7 +2860,7 @@ mod tests {
             tokio::spawn(async move { broker.request(request).await })
         };
         let (request_id, first_provider) = match first_rx.recv().await.unwrap() {
-            ServerMessage::GitTransportRequested {
+            ControlFrame::GitTransportRequested {
                 request_id,
                 provider_id,
                 ..
@@ -4011,7 +2868,7 @@ mod tests {
             message => panic!("unexpected provider message: {message:?}"),
         };
         let second_provider = match second_rx.recv().await.unwrap() {
-            ServerMessage::GitTransportRequested {
+            ControlFrame::GitTransportRequested {
                 request_id: second_request,
                 provider_id,
                 ..
@@ -4041,7 +2898,7 @@ mod tests {
         waiting.await.unwrap().unwrap();
         assert!(matches!(
             first_rx.recv().await,
-            Some(ServerMessage::GitTransportDone {
+            Some(ControlFrame::GitTransportDone {
                 request_id: done_request
             }) if done_request == request_id
         ));
@@ -4050,12 +2907,12 @@ mod tests {
     #[tokio::test]
     async fn git_transport_broker_rejects_without_registered_clients() {
         let result = GitTransportBroker::default()
-            .request(rho_ui_proto::GitTransportRequest {
+            .request(rho_agent_host_proto::GitTransportRequest {
                 host: "git.example".to_owned(),
                 port: 22,
                 user: "git".to_owned(),
                 repository: "team/repo.git".to_owned(),
-                service: rho_ui_proto::GitService::UploadPack,
+                service: rho_agent_host_proto::GitService::UploadPack,
                 planned_refs: None,
             })
             .await;
@@ -4076,12 +2933,12 @@ mod tests {
             tokio::spawn(async move {
                 broker
                     .request_with_timeout(
-                        rho_ui_proto::GitTransportRequest {
+                        rho_agent_host_proto::GitTransportRequest {
                             host: "git.example".to_owned(),
                             port: 22,
                             user: "git".to_owned(),
                             repository: "team/repo.git".to_owned(),
-                            service: rho_ui_proto::GitService::UploadPack,
+                            service: rho_agent_host_proto::GitService::UploadPack,
                             planned_refs: None,
                         },
                         std::time::Duration::from_millis(10),
@@ -4090,7 +2947,7 @@ mod tests {
             })
         };
         let request_id = match provider_rx.recv().await.unwrap() {
-            ServerMessage::GitTransportRequested { request_id, .. } => request_id,
+            ControlFrame::GitTransportRequested { request_id, .. } => request_id,
             message => panic!("unexpected provider message: {message:?}"),
         };
         let error = match waiting.await.unwrap() {
@@ -4100,7 +2957,7 @@ mod tests {
         assert!(error.to_string().contains("within 60 seconds"));
         assert!(matches!(
             provider_rx.recv().await,
-            Some(ServerMessage::GitTransportDone {
+            Some(ControlFrame::GitTransportDone {
                 request_id: done_request
             }) if done_request == request_id
         ));
@@ -4181,178 +3038,17 @@ mod tests {
         assert!(
             persist_gui_telemetry(
                 temp.path(),
-                &vec![0; rho_ui_proto::MAX_GUI_TELEMETRY_BYTES + 1]
+                &vec![0; rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES + 1]
             )
             .unwrap_err()
             .to_string()
             .contains("exceeds")
         );
     }
-
-    /// A device is one GUI, and the newest window wins it.
-    ///
-    /// The user's GUI panicked and restarted; the daemon still held the old
-    /// connection's binding, and the restarted GUI was refused with "Desk
-    /// device already has an active writer connection" until the transport
-    /// gave up on the dead one — over iroh that is the ten minutes of
-    /// `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`. So a second `DeskSync`
-    /// displaces the first. The guard itself stays real: the displaced
-    /// connection may not write afterwards, because two writers under one
-    /// device id would collide in the CRDT's per-device namespace.
-    #[tokio::test]
-    async fn a_newer_window_takes_the_device_and_the_displaced_one_may_not_write() {
-        use rho_desk::cells::{
-            CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
-        };
-
-        let temp = tempfile::tempdir().unwrap();
-        let services = test_services(temp.path()).await;
-        let device = DeviceId([7; 16]);
-
-        let (older_tx, mut older_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (newer_tx, _newer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut older: Option<DeskSession> = None;
-        let mut newer: Option<DeskSession> = None;
-
-        let sync = |device| ClientMessage::DeskSync {
-            bodies: std::collections::BTreeMap::new(),
-            device,
-            known: Version::default(),
-            store: None,
-        };
-        desk_message(&services, &older_tx, 1, &mut older, sync(device))
-            .await
-            .expect("the first window binds the device");
-        desk_message(&services, &newer_tx, 2, &mut newer, sync(device))
-            .await
-            .expect("and the window the user just restarted binds it too");
-
-        // The older connection is told why it is going, in words it can show.
-        let told = std::iter::from_fn(|| older_rx.try_recv().ok())
-            .filter_map(|message| match message {
-                ServerMessage::Error { message } => Some(message),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            told,
-            ["The desk moved to a newer window on this device"],
-            "the displaced window is told, and not left guessing"
-        );
-
-        let mutation = CellMutation {
-            stamp: Stamp { device, version: 1 },
-            writes: vec![CellWrite {
-                id: Id::Note(Uuid([9; 16])),
-                property: Property::State(State::Open),
-            }],
-            verdict: None,
-        };
-        // The daemon no longer answers a write with a refusal, so the one
-        // condition that is about the connection rather than about what the
-        // user wrote breaks the connection, the way the text path already
-        // did. Two authors in one CRDT namespace is not a thing to carry on
-        // through.
-        let broken = desk_message(
-            &services,
-            &older_tx,
-            1,
-            &mut older,
-            ClientMessage::DeskMutationApply {
-                mutation: mutation.clone(),
-            },
-        )
-        .await
-        .expect_err("it may not write under a device id that is another window's now");
-        assert_eq!(
-            broken.to_string(),
-            "The desk moved to a newer window on this device"
-        );
-
-        // The window that took the device writes.
-        desk_message(
-            &services,
-            &newer_tx,
-            2,
-            &mut newer,
-            ClientMessage::DeskMutationApply { mutation },
-        )
-        .await
-        .unwrap();
-        // Nothing is sent back for it, so the store is where the answer is.
-        assert_eq!(
-            services
-                .desk_cells
-                .frontier()
-                .unwrap()
-                .get(&device)
-                .copied(),
-            Some(1),
-            "the live window's write lands"
-        );
-    }
-
-    /// One desk message through the daemon's own handler, with everything a
-    /// desk message does not use left empty.
-    async fn desk_message(
-        services: &Arc<Services>,
-        outgoing: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
-        connection: u64,
-        session: &mut Option<DeskSession>,
-        message: ClientMessage,
-    ) -> anyhow::Result<()> {
-        let mut log_follow = None;
-        super::handle_message(
-            services,
-            None,
-            outgoing,
-            &mut Vec::new(),
-            None,
-            connection,
-            &mut log_follow,
-            session,
-            message,
-        )
-        .await
-        .map(|_| ())
-    }
-
-    async fn test_services(root: &std::path::Path) -> Arc<Services> {
-        let db = RhoDb::open(root.join("rho.redb"));
-        db.write().await.init_agent_tables();
-        let inference = rho_inference::Inference::new(db.clone()).await.unwrap();
-        // The test's own directory: nothing here reads the user's.
-        let claude = rho_claude::accounts::ClaudePaths::at(
-            camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
-        );
-        let user_environment = rho_fs_view::UserEnvironment::new(Default::default());
-        let worksets = rho_fs_view::Worksets::open(
-            root.join("state"),
-            user_environment.clone(),
-            Default::default(),
-            rho_fs_view::StoreService::None,
-        )
-        .await
-        .unwrap();
-        let pool = AgentPool::new(db.clone(), inference.clone(), worksets, claude.clone()).await;
-        Arc::new(
-            Services::new(
-                db,
-                inference,
-                pool,
-                claude,
-                user_environment,
-                PlatformSecrets::default(),
-                root.join("octo.sock"),
-            )
-            .await
-            .unwrap(),
-        )
-    }
 }
 
 /// Authenticate before reading even the media-open request. No video capture
-/// exists until the remote subscribes to the track.
+/// exists until the authenticated desktop-open requests the fixed video track.
 async fn serve_wayland<R, W>(
     services: Arc<Services>,
     transport: rho_rpc::media::Session,
@@ -4384,6 +3080,24 @@ where
             };
             let desktop = rho_desktop_proto::local::Desktop::open(&socket).await?;
             let mut control = desktop.control;
+            // Desktop-open itself requests a fresh keyframe, including late joins
+            // to a static desktop whose cached keyframe has expired.
+            anyhow::ensure!(
+                matches!(
+                    rho_desktop_proto::local::request(
+                        &mut control,
+                        Request::Input {
+                            input: Input::Quality {
+                                bitrate: 2_000_000,
+                                keyframe: true
+                            },
+                        },
+                    )
+                    .await?,
+                    Response::Done
+                ),
+                "unexpected desktop quality reply"
+            );
             let from_gui = async {
                 loop {
                     let (input, _) =
@@ -4408,12 +3122,10 @@ where
                 let local = rho_desktop_media::media::SessionGuard(
                     rho_desktop_media::media::local_client(desktop.media, origin.clone()).await?,
                 );
-                let remote = rho_desktop_media::media::SessionGuard(
-                    rho_desktop_media::media::publish(transport, &origin).await?,
-                );
+                let remote = rho_desktop_media::media::publish(transport, &origin).await?;
                 tokio::select! {
                     error=local.0.closed()=>anyhow::bail!("desktop media closed: {error}"),
-                    _=remote.0.closed()=>Ok::<(),anyhow::Error>(()),
+                    _=remote.closed()=>Ok::<(),anyhow::Error>(()),
                 }
             };
             tokio::select! {result=from_gui=>result,result=media=>result}

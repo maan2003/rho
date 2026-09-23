@@ -1,13 +1,10 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, bail};
-use rho_ui_proto::{ClientMessage, PrCommand, ServerMessage};
+use rho_agent_host_proto::{PrCommand, Reply, Request};
 
-use crate::{PrArgs, PrCliCommand, connect_or_start_daemon};
-
-static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+use crate::{PrArgs, PrCliCommand, daemon_request};
 
 pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
@@ -29,51 +26,42 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
         _ => None,
     };
     let command = command(args.command)?;
-    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let runtime_paths = rho_ui_proto::RuntimePaths::new(Some(socket_path.clone()))?;
-    let mut daemon = connect_or_start_daemon(&socket_path).await?;
+    let runtime_paths = rho_agent_host_proto::RuntimePaths::new(Some(socket_path.clone()))?;
     loop {
-        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        daemon
-            .send(&ClientMessage::PrCommand {
-                request_id,
-                agent_id: None,
-                command: command.clone(),
-            })
-            .await?;
-        loop {
-            if let ServerMessage::PrCommandResult {
-                request_id: response_id,
-                output,
-                data,
-                is_error,
-            } = daemon.recv().await?
-                && response_id == request_id
-            {
-                if is_error {
-                    bail!(output);
-                }
-                if data.is_empty() {
-                    println!("{output}");
-                } else {
-                    extract_logs(
-                        &data,
-                        response_run_id.context("binary response for non-log command")?,
-                        &runtime_paths,
-                    )?;
-                }
-                if let Some(interval) = watch_interval {
-                    if !checks_pending(&output)? {
-                        return Ok(());
-                    }
-                    tokio::time::sleep(interval).await;
-                    break;
-                }
-                return Ok(());
-            }
+        let request = Request::Pr {
+            agent_id: None,
+            command: command.clone(),
+        };
+        let Reply::Pr {
+            output,
+            data,
+            is_error,
+        } = daemon_request(&socket_path, request).await?
+        else {
+            bail!("unexpected reply from the daemon");
+        };
+        if is_error {
+            bail!(output);
         }
+        if data.is_empty() {
+            println!("{output}");
+        } else {
+            extract_logs(
+                &data,
+                response_run_id.context("binary response for non-log command")?,
+                &runtime_paths,
+            )?;
+        }
+        let Some(interval) = watch_interval else {
+            return Ok(());
+        };
+        if !checks_pending(&output)? {
+            return Ok(());
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -143,31 +131,22 @@ fn checks_pending(output: &str) -> anyhow::Result<bool> {
 
 async fn init(args: PrArgs) -> anyhow::Result<()> {
     let token = prompt_token("GitHub token (ghp_/github_pat_/...): ")?;
-    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let mut daemon = connect_or_start_daemon(&socket_path).await?;
-    daemon
-        .send(&ClientMessage::PlatformSecretsSet {
-            secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
-        })
-        .await?;
-    loop {
-        match daemon.recv().await? {
-            ServerMessage::PlatformStatus {
-                running: true,
-                detail,
-            } => {
-                eprintln!("GitHub configured: {detail}");
-                return Ok(());
-            }
-            ServerMessage::PlatformStatus {
-                running: false,
-                detail,
-            }
-            | ServerMessage::Error { message: detail } => bail!(detail),
-            _ => {}
+    let request = Request::PlatformSecretsSet {
+        secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
+    };
+    match daemon_request(&socket_path, request).await? {
+        Reply::PlatformStatus {
+            running: true,
+            detail,
+        } => {
+            eprintln!("GitHub configured: {detail}");
+            Ok(())
         }
+        Reply::PlatformStatus { detail, .. } => bail!(detail),
+        _ => bail!("unexpected reply from the daemon"),
     }
 }
 
@@ -250,7 +229,7 @@ fn resolve_default_base_branch() -> anyhow::Result<String> {
 fn extract_logs(
     bytes: &[u8],
     run_id: u64,
-    runtime_paths: &rho_ui_proto::RuntimePaths,
+    runtime_paths: &rho_agent_host_proto::RuntimePaths,
 ) -> anyhow::Result<()> {
     const MAX_FILES: usize = 1_000;
     const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;

@@ -30,7 +30,7 @@ pub mod walk;
 pub mod workspace;
 
 use gpui::{App, KeyBinding, actions};
-use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
+use rho_agents_view::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
 pub use rho_files::FileSave;
 pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{
@@ -262,7 +262,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoDraft > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
-        KeyBinding::new("ctrl-s", FileSave, Some("RhoDiffView")),
         // Preserve Vim's normal-mode Ctrl-V (visual block). Clipboard paste
         // is intercepted only while editing a prompt.
         KeyBinding::new(

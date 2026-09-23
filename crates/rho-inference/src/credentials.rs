@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use notify::{Config, EventKindMask, RecommendedWatcher, RecursiveMode, Watcher as _};
-use rho_core::UnixMs;
+use rho_agent_host_proto::UnixMs;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::watch;
 

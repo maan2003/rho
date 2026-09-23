@@ -16,7 +16,6 @@ mod phone;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
@@ -28,32 +27,37 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
-use rho_agents::agent_view::AgentModel;
-use rho_agents::create::{
+#[cfg(test)]
+use rho_agent_host_proto::AdvisorIntelligence;
+use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
+use rho_agent_host_proto::{
+    AgentCommand, AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, Reply,
+    Request,
+};
+use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
 };
-use rho_agents::draft::DraftModel;
-use rho_agents::messages::MessageLog;
-use rho_agents::session::ActiveAgents;
-use rho_agents::store::FrameSummary;
-use rho_agents::{
-    AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
-    RoleCycleGroup, TranscriptFrame,
+use rho_agents_client::session::ActiveAgents;
+use rho_agents_client::store::FrameSummary;
+use rho_agents_client::{AgentMap, HostId};
+use rho_agents_view::agent_view::AgentModel;
+use rho_agents_view::draft::DraftModel;
+use rho_agents_view::messages::MessageLog;
+use rho_agents_view::{
+    DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
 };
-use rho_core::ContentPart;
+use rho_desk_client::Desk;
+use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
-#[cfg(test)]
-use rho_ui_proto::AdvisorIntelligence;
-use rho_ui_proto::{AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery};
 use rho_window::selection::{ActivePane, Selection};
 use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 
 use crate::chime::Chime;
-use crate::desk_view::DeskCells;
+use crate::desk_view::DeskBuffers;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
 use crate::search;
@@ -78,10 +82,10 @@ type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 pub(crate) struct DeskArrival {
     /// The store the cells were counted in. Cells under a name the client
     /// was not holding are a different desk, not this one running behind.
-    pub(crate) store: rho_desk::cells::DeviceId,
+    pub(crate) store: rho_agent_host_proto::desk::cells::DeviceId,
     pub(crate) node_namespace: u16,
-    pub(crate) delta: rho_desk::cells::Snapshot,
-    pub(crate) bodies: Vec<rho_desk::cells::BodySnapshot>,
+    pub(crate) delta: rho_agent_host_proto::desk::cells::Snapshot,
+    pub(crate) bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
     /// Where these cells came from, for the log: the daemon's answer or
     /// this client's own copy.
     pub(crate) from: &'static str,
@@ -145,7 +149,6 @@ pub(crate) enum SurfaceView {
         model: Entity<rho_shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
     },
-    Diff(Entity<rho_files::DiffView>),
     Terminal(Entity<rho_terminal::TerminalView>),
     Browser(Entity<rho_browser::PageView>),
     SlackList(Entity<rho_slack::ui::ListView>),
@@ -168,7 +171,6 @@ impl SurfaceView {
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
             Self::Shell { .. } => SurfaceKind::Shell,
-            Self::Diff(_) => SurfaceKind::Diff,
             Self::Terminal(_) => SurfaceKind::Terminal,
             Self::Browser(_) => SurfaceKind::Browser,
             Self::SlackList(_) => SurfaceKind::SlackList,
@@ -198,23 +200,6 @@ pub(crate) enum ContextId {
 }
 
 pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
-
-/// Where a host's events go from here: onto the model thread's queue, which
-/// is the one place that decides what a frame means. `rho-hosts` knows only
-/// that somebody is listening.
-struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_mirror::model::ToModel>);
-
-impl rho_hosts::HostSink for ModelSink {
-    fn send(&self, event: rho_hosts::HostEvent) -> Result<(), rho_hosts::SinkClosed> {
-        self.0
-            .unbounded_send(rho_mirror::model::ToModel::Event(event))
-            .map_err(|_| rho_hosts::SinkClosed)
-    }
-
-    fn is_closed(&self) -> bool {
-        self.0.is_closed()
-    }
-}
 
 #[derive(Clone)]
 struct PendingTreeVerdict {
@@ -311,7 +296,7 @@ pub(crate) fn snooze_target(
     unit: SnoozeUnit,
     count: i64,
     now: chrono::DateTime<chrono::Local>,
-) -> (rho_desk::cells::Timestamp, String) {
+) -> (rho_agent_host_proto::desk::cells::Timestamp, String) {
     match unit {
         SnoozeUnit::Minutes | SnoozeUnit::Hours => {
             let ahead = match unit {
@@ -320,9 +305,9 @@ pub(crate) fn snooze_target(
             };
             let at = now + ahead;
             (
-                rho_desk::cells::Timestamp {
+                rho_agent_host_proto::desk::cells::Timestamp {
                     unix_ms: at.timestamp_millis(),
-                    precision: rho_desk::cells::TimestampPrecision::Millisecond,
+                    precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
                 },
                 snooze_said(at, now),
             )
@@ -334,7 +319,7 @@ pub(crate) fn snooze_target(
             };
             let date = now.date_naive() + chrono::Duration::days(days);
             (
-                crate::desk_view::day_timestamp(date),
+                rho_desk_client::desk::day_timestamp(date),
                 format!("snooze until {}", date.format("%a %-d %b")),
             )
         }
@@ -368,15 +353,18 @@ enum VerdictUndoState {
         card: Box<crate::dashboard::DealCard>,
         verdict: crate::dashboard::DealerVerdict,
         host: HostId,
-        node: rho_desk::cells::Id,
-        at: rho_desk::cells::Stamp,
+        node: rho_agent_host_proto::desk::cells::Id,
+        at: rho_agent_host_proto::desk::cells::Stamp,
     },
     /// The done verdicts one `mark read before` wrote. It closed a backlog
     /// in one keystroke, so it comes back in one: `shift-u` undoes every
     /// node it touched, not the last of them.
     MarkedReadBefore {
         host: HostId,
-        nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::Stamp)>,
+        nodes: Vec<(
+            rho_agent_host_proto::desk::cells::Id,
+            rho_agent_host_proto::desk::cells::Stamp,
+        )>,
     },
 }
 
@@ -395,26 +383,26 @@ pub struct Workspace {
     /// Every transcript this client holds open, and the rendered state a
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
-    transcripts: rho_agents::Transcripts,
+    transcripts: rho_agents_view::Transcripts,
     pub(crate) registry: AgentMap,
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
     models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by daemon-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
-    /// Artifact surfaces hold the strong references; when the last file/diff
+    /// Artifact surfaces hold the strong references; when the last file
     /// closes, the remote channel and cache entry naturally expire.
     remote_projects: HashMap<
-        (HostId, rho_ui_proto::WorkspaceInfo),
+        (HostId, rho_agent_host_proto::WorkspaceInfo),
         gpui::WeakEntity<rho_files::RemoteProjectState>,
     >,
-    pending_diff_loads: HashMap<AgentId, Task<()>>,
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
-    model: futures_mpsc::UnboundedSender<rho_mirror::model::ToModel>,
+    agents_client: rho_agents_client::model::AgentsClient,
+    desk_streams: rho_desk_client::stream::DeskStreams,
     draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
@@ -424,7 +412,7 @@ pub struct Workspace {
     /// transient edits these; the writable dashboard row owns the message.
     /// Where `n a` files the agent the draft page is composing. `None`
     /// is the root, which is also what an ordinary draft sends.
-    draft_area: Option<(HostId, rho_desk::cells::Id)>,
+    draft_area: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -439,7 +427,7 @@ pub struct Workspace {
     /// The area the next agent this client asks for is filed under. The
     /// daemon never writes it: the agent exists because the registry says
     /// so, and where it is shown is the user's own fact.
-    pending_agent_filing: Option<(HostId, rho_desk::cells::Id)>,
+    pending_agent_filing: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     /// Hosts that have delivered at least one `Ready`. A host attaches
     /// blind; until it answers, its agents do not exist for this client.
     ready_hosts: HashSet<HostId>,
@@ -481,7 +469,7 @@ pub struct Workspace {
     _dealer_signal_task: Task<()>,
     /// What the replica would hold, said by a test instead of a file.
     #[cfg(test)]
-    pub(crate) desk_replica_for_test: HashMap<String, rho_mirror::desk::HeldDesk>,
+    pub(crate) desk_replica_for_test: HashMap<String, rho_desk_client::cache::HeldDesk>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
     chime_above_threshold: bool,
@@ -493,15 +481,17 @@ pub struct Workspace {
     /// Compact Helix-style key guide shown on deal entry and `?`.
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
-    pub(crate) desk_cells: DeskCells,
+    pub(crate) desk: Desk,
+    pub(crate) desk_buffers: DeskBuffers,
     /// One note surface per node the reader has opened, kept so the body's
     /// cursor and scroll survive leaving and coming back.
-    note_views: HashMap<(HostId, rho_desk::cells::Id), crate::note_view::NoteView>,
+    note_views:
+        HashMap<(HostId, rho_agent_host_proto::desk::cells::Id), crate::note_view::NoteView>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
-    desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
+    desk_semantic_clipboard: Option<rho_desk_client::desk::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
-    desk_semantic_paste_target: Option<(HostId, rho_desk::cells::Id)>,
+    desk_semantic_paste_target: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     /// The browser pages the desk refers to, the ones on their way out, and
@@ -540,8 +530,13 @@ pub struct Workspace {
     /// What was last searched for and what is waiting to be searched, for
     /// every surface: see [`search`].
     search: search::Search,
-    pending_filing_destinations: Vec<(String, String, HostId, rho_desk::cells::Id)>,
-    pending_filing_selected: Option<(HostId, rho_desk::cells::Id)>,
+    pending_filing_destinations: Vec<(
+        String,
+        String,
+        HostId,
+        rho_agent_host_proto::desk::cells::Id,
+    )>,
+    pending_filing_selected: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
     /// What the finder's highlighted row opens, carried from the prompt to
     /// its submit handler: the submitted text cannot tell two rows with the
     /// same path apart.
@@ -569,7 +564,7 @@ pub struct Workspace {
     overlay_focus: crate::overlay::OverlayFocus,
     desktop: Option<Entity<crate::wayland_view::WaylandView>>,
     desktop_name: String,
-    desktop_sessions: HashMap<HostId, Vec<rho_ui_proto::DesktopSession>>,
+    desktop_sessions: HashMap<HostId, Vec<rho_agent_host_proto::DesktopSession>>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -580,6 +575,8 @@ pub struct Workspace {
     /// microphone is open: see [`crate::voice::Voice`].
     voice: crate::voice::Voice,
     _event_task: Task<()>,
+    _host_event_task: Task<()>,
+    _desk_event_task: Task<()>,
     _keystroke_subscription: gpui::Subscription,
     _transient_keystroke_interceptor: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
@@ -629,10 +626,10 @@ impl Workspace {
                 &model,
                 window,
                 |workspace, _, event, window, cx| match event {
-                    rho_agents::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                    rho_agents_view::agent_view::AgentModelEvent::Loaded(agent_id) => {
                         workspace.finish_initial_agent_load(*agent_id, cx);
                     }
-                    rho_agents::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
+                    rho_agents_view::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
                         workspace.finish_transcript_search(*agent_id, window, cx);
                     }
                 },
@@ -660,7 +657,7 @@ impl Workspace {
     /// a `Project`.
     fn refresh_workdirs(&mut self, host: HostId) {
         let repositories = self
-            .desk_cells
+            .desk
             .repositories(host)
             .into_iter()
             .map(|(name, repository)| (name, repository.url.into()))
@@ -681,8 +678,8 @@ impl Workspace {
     fn loaded(
         &mut self,
         host: HostId,
-        agents: Vec<rho_agents::MirroredAgent>,
-        verdicts: Vec<(AgentId, rho_agents::Verdict)>,
+        agents: Vec<rho_agents_client::MirroredAgent>,
+        verdicts: Vec<(AgentId, rho_agents_client::Verdict)>,
     ) {
         for agent_id in self.registry.host_agents(host) {
             self.transcripts.forget(agent_id);
@@ -705,11 +702,7 @@ impl Workspace {
     }
 
     fn note_followed(&self) {
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::Follow(self.followed()),
-            ));
+        self.agents_client.follow(self.followed());
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
@@ -723,10 +716,7 @@ impl Workspace {
         if self.transcripts.is_open(&agent_id) {
             return false;
         }
-        // The disk copy may trail the rows just heard by a queued write;
-        // waiting for it is what makes the fold whole.
-        rho_mirror::mirror::flush();
-        let events = rho_mirror::mirror::read_events(agent_id);
+        let events = self.agents_client.read_rows(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
             return false;
         }
@@ -741,8 +731,8 @@ impl Workspace {
         &mut self,
         agent_id: AgentId,
         rows: &[(
-            rho_ui_proto::mirror::AgentPos,
-            rho_ui_proto::mirror::MirrorEvent,
+            rho_agent_host_proto::transcript::AgentPos,
+            rho_agent_host_proto::transcript::TranscriptEvent,
         )],
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -869,17 +859,19 @@ impl Workspace {
         // A test drives the model inline from its story, so it gets channels
         // with nothing behind them; the crate's own cfg is the right one.
         #[cfg(not(test))]
-        let channels = rho_mirror::model::spawn();
+        let (agents_client, changes) = rho_agents_client::model::AgentsClient::spawn();
         #[cfg(test)]
-        let channels = rho_mirror::model::detached();
-        let rho_mirror::model::ModelChannels { incoming, changes } = channels;
-        let model_commands = incoming.clone();
-        let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
+        let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
+        // Each stream of a host has its own reader: the agents stream goes
+        // to the agents client, the control and desk streams come here.
+        let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_hosts::HostEvent>();
+        let (desk_streams, desk_events_rx) = rho_desk_client::stream::DeskStreams::new();
+        let hosts = Hosts::new(std::sync::Arc::new(host_events));
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
             DraftModel::new(
-                rho_agents::draft::Hooks::new(move |editor, fields, _, _| {
+                rho_agents_view::draft::Hooks::new(move |editor, fields, _, _| {
                     editor.set_completion_provider(Some(
                         crate::commands::WorkspaceCompletionProvider::new(
                             workspace.clone(),
@@ -895,11 +887,11 @@ impl Workspace {
         });
         let draft_subscription =
             cx.subscribe(&draft_model, |workspace, _, event, cx| match event {
-                rho_agents::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
+                rho_agents_view::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
             });
         let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {
-            let mut changes: UnboundedReceiver<rho_mirror::model::ModelEvent> = changes;
+            let mut changes: UnboundedReceiver<rho_agents_client::model::ModelEvent> = changes;
             while let Some(change) = changes.next().await {
                 let mut batch = vec![change];
                 while let Ok(change) = changes.try_recv() {
@@ -907,6 +899,40 @@ impl Workspace {
                 }
                 let updated = this.update_in(cx, |this, window, cx| {
                     this.handle_model_events(batch, window, cx);
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        let host_event_task = cx.spawn(async move |this, cx| {
+            let mut events = host_events_rx;
+            while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                let updated = this.update_in(cx, |this, window, cx| {
+                    for rho_hosts::HostEvent { host, event } in batch {
+                        this.handle_event(host, event, window, cx);
+                    }
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        let desk_event_task = cx.spawn(async move |this, cx| {
+            let mut events = desk_events_rx;
+            while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                let updated = this.update_in(cx, |this, window, cx| {
+                    for rho_desk_client::stream::DeskEvent { host, frame } in batch {
+                        this.handle_desk_event(host, frame, window, cx);
+                    }
                 });
                 if updated.is_err() {
                     break;
@@ -998,14 +1024,14 @@ impl Workspace {
         let mut this = Self {
             hosts,
             active: ActiveAgents::default(),
-            transcripts: rho_agents::Transcripts::default(),
+            transcripts: rho_agents_view::Transcripts::default(),
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
             remote_projects: HashMap::new(),
-            pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
-            model: model_commands,
+            agents_client,
+            desk_streams,
             draft_model,
             messages,
             draft_area: None,
@@ -1036,7 +1062,8 @@ impl Workspace {
             chime_above_threshold: false,
             dashboard,
             mode_indicator,
-            desk_cells: DeskCells::new(),
+            desk: Desk::new(),
+            desk_buffers: DeskBuffers::new(),
             note_views: HashMap::new(),
             verdict_undo: Vec::new(),
             next_verdict_undo_sequence: 0,
@@ -1069,6 +1096,8 @@ impl Workspace {
             git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
             _event_task: event_task,
+            _host_event_task: host_event_task,
+            _desk_event_task: desk_event_task,
             _keystroke_subscription: keystroke_subscription,
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
@@ -1127,24 +1156,21 @@ impl Workspace {
     /// that labels and chrome can qualify by host from the moment the host
     /// exists, not only once it answers.
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
-        let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
-        // The model is told the host exists, and how to speak to it, before
-        // any frame from it can arrive.
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::AttachHost {
-                    host,
-                    name: spec.name.clone(),
-                },
-            ));
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::HostCommands { host, commands },
-            ));
+        let agents_client = &self.agents_client;
+        let desk_streams = &self.desk_streams;
+        // The agents client is told the host exists, and gets its agents
+        // stream, before any frame from it can arrive.
+        let host = self.hosts.attach(
+            spec.name.clone(),
+            spec.target,
+            |host| {
+                agents_client.attach_host(host, spec.name.clone());
+                vec![agents_client.stream(host), desk_streams.stream(host)]
+            },
+            &gpui_tokio::Tokio::handle(cx),
+        );
         self.registry.attach_host(host, spec.name);
-        self.desk_cells.slack_owned_by(self.hosts.owner());
+        self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
         host
     }
@@ -1190,13 +1216,10 @@ impl Workspace {
             self.voice.stop();
         }
         self.hosts.detach(host);
-        self.desk_cells.slack_owned_by(self.hosts.owner());
+        self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
-        let _ = self
-            .model
-            .unbounded_send(rho_mirror::model::ToModel::Command(
-                rho_mirror::model::ModelCommand::DetachHost(host),
-            ));
+        self.agents_client.detach_host(host);
+        self.desk_streams.detach(host);
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.usage.forget_host(host);
@@ -1213,7 +1236,6 @@ impl Workspace {
             self.transcripts.forget(agent_id);
             self.models.remove(&agent_id);
             self.pending_syncs.remove(&agent_id);
-            self.pending_diff_loads.remove(&agent_id);
         }
         self.note_followed();
         self.forget_contexts(|context| !contexts.contains(context));
@@ -1240,16 +1262,44 @@ impl Workspace {
     /// Routes an agent-scoped command to the daemon that owns the agent.
     /// Commands for an agent whose host is unknown or gone are dropped: the
     /// daemon that could act on it is not there to hear them.
-    fn send_to_agent(&self, agent_id: AgentId, message: ClientMessage) {
-        if let Some(connection) = self.connection_for(agent_id) {
-            connection.send(message);
+    fn send_to_agent(&self, agent_id: AgentId, command: AgentCommand, cx: &mut Context<Self>) {
+        if let Some(host) = self.host_of(agent_id) {
+            self.request(host, Request::Agent(command), cx, |_, _, _| {});
         }
     }
 
-    pub(crate) fn send_to_host(&self, host: HostId, message: ClientMessage) {
-        if let Some(connection) = self.hosts.connection(host) {
-            connection.send(message);
-        }
+    /// Makes one request of a host. `on_reply` hears the answer; a refusal,
+    /// or a host that went before answering, is a notice instead.
+    fn request(
+        &self,
+        host: HostId,
+        request: Request,
+        cx: &mut Context<Self>,
+        on_reply: impl FnOnce(&mut Self, Reply, &mut Context<Self>) + 'static,
+    ) {
+        let Some(connection) = self.hosts.connection(host) else {
+            return;
+        };
+        let reply = connection.request(request);
+        cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            this.update(cx, |this, cx| match reply {
+                Ok(reply) => on_reply(this, reply, cx),
+                Err(error) => this.report_refusal(host, &format!("{error:#}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn report_refusal(&mut self, host: HostId, reason: &str, cx: &mut Context<Self>) {
+        let source = self.error_source(host);
+        let text = format!("[{source} error: {reason}]");
+        self.notice_on(None, &text, StyleClass::SystemImportant, cx);
+    }
+
+    pub(crate) fn send_desk(&self, host: HostId, frame: DeskClientFrame) {
+        self.desk_streams.send(host, frame);
     }
 
     /// Whether the daemon behind an agent is answering. Acting on an agent
@@ -1705,18 +1755,24 @@ impl Workspace {
                 .sum::<usize>(),
             "desk arrived"
         );
-        let (back, delta) = self.desk_cells.synced(
+        let synced = self.desk.synced(
             host,
             cells.store,
             cells.node_namespace,
             cells.delta,
             cells.bodies,
-            cx,
         );
-        for message in back {
-            self.send_to_host(host, message);
+        for frame in synced.back {
+            self.send_desk(host, frame);
         }
-        self.sync_tree_delta(host, &delta, window, cx);
+        if synced.reset {
+            self.desk_buffers.forget(host);
+        }
+        self.desk_buffers
+            .merge_bodies(host, &self.desk, &synced.bodies, cx);
+        self.desk_buffers
+            .give_buffers(host, &self.desk, &synced.delta, cx);
+        self.sync_tree_delta(host, &synced.delta, window, cx);
         // Both halves are here only when the cells are: the seed of rho's
         // Slack cursors from the store's old ones runs at the first sync
         // that has a session, once ever, and is a marker read afterwards.
@@ -1733,12 +1789,12 @@ impl Workspace {
     /// by the whole process, and a test that installed one would be
     /// writing every other test's verdicts into it.
     #[cfg(not(test))]
-    fn held_desk(&mut self, name: &str) -> rho_mirror::desk::HeldDesk {
-        rho_mirror::desk::load(name)
+    fn held_desk(&mut self, name: &str) -> rho_desk_client::cache::HeldDesk {
+        rho_desk_client::cache::load(name)
     }
 
     #[cfg(test)]
-    fn held_desk(&mut self, name: &str) -> rho_mirror::desk::HeldDesk {
+    fn held_desk(&mut self, name: &str) -> rho_desk_client::cache::HeldDesk {
         self.desk_replica_for_test.remove(name).unwrap_or_default()
     }
 
@@ -1748,14 +1804,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.desk_cells.is_loaded(host) {
+        if self.desk.is_loaded(host) {
             return;
         }
         let name = self.hosts.host_label(host);
         if name.is_empty() {
             return;
         }
-        self.desk_cells.host_named(host, name.clone());
+        self.desk.host_named(host, name.clone());
         let held = self.held_desk(&name);
         if !held.known {
             return;
@@ -1939,7 +1995,7 @@ impl Workspace {
 
     pub(crate) fn handle_model_events(
         &mut self,
-        events: Vec<rho_mirror::model::ModelEvent>,
+        events: Vec<rho_agents_client::model::ModelEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1950,7 +2006,7 @@ impl Workspace {
         // be divided by the events it reconciled.
         let start = std::time::Instant::now();
         let count = events.len() as u64;
-        for rho_mirror::model::ModelEvent { host, msg } in events {
+        for rho_agents_client::model::ModelEvent { host, msg } in events {
             self.handle_model_event(host, msg, window, cx);
         }
         gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
@@ -1964,19 +2020,19 @@ impl Workspace {
     pub(crate) fn handle_model_event(
         &mut self,
         host: HostId,
-        msg: rho_mirror::model::ModelMsg,
+        msg: rho_agents_client::model::ModelMsg,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match msg {
-            rho_mirror::model::ModelMsg::Loaded { agents, verdicts } => {
+            rho_agents_client::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Whole, cx);
                 self.refresh_dashboard(cx);
                 self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
             }
-            rho_mirror::model::ModelMsg::Changed { agents } => {
+            rho_agents_client::model::ModelMsg::Changed { agents } => {
                 let changed = self.registry.told(agents);
                 if changed.is_empty() {
                     return;
@@ -1993,10 +2049,12 @@ impl Workspace {
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(&changed), cx);
                 self.schedule_desk_sync(host, Some(changed), window, cx);
             }
-            rho_mirror::model::ModelMsg::Rows { agent_id, rows } => {
+            rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
             }
-            rho_mirror::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
+            rho_agents_client::model::ModelMsg::Live { agent_id, live } => {
+                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
+            }
         }
     }
 
@@ -2063,19 +2121,28 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn handle_event(
+    /// What a host says on its desk stream.
+    pub(crate) fn handle_desk_event(
         &mut self,
         host: HostId,
-        event: ConnEvent,
+        frame: DeskFrame,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            ConnEvent::DesktopSessions(sessions) => {
-                self.desktop_sessions.insert(host, sessions);
-                cx.notify();
+        match frame {
+            DeskFrame::Opened => {
+                // The copy comes first, so what the client already read is
+                // on screen before the daemon has said anything, and so
+                // that the handshake below asks from the version it holds
+                // rather than from nothing.
+                self.open_desk_from_replica(host, window, cx);
+                // The handshake belongs to the stream, not to the window:
+                // a reopened stream asks only for what it is missing, and
+                // the replica it asks from was open before the window was.
+                let sync = self.desk.sync(host);
+                self.send_desk(host, sync);
             }
-            ConnEvent::DeskSynced {
+            DeskFrame::Synced {
                 store,
                 node_namespace,
                 delta,
@@ -2092,42 +2159,53 @@ impl Workspace {
                 window,
                 cx,
             ),
-            ConnEvent::DeskCellsAvailable { frontier } => {
-                if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
-                    self.send_to_host(host, sync);
+            DeskFrame::CellsAvailable { frontier } => {
+                if let Some(sync) = self.desk.cells_available(host, frontier) {
+                    self.send_desk(host, sync);
                 }
             }
-            ConnEvent::DeskResyncRequired => {
-                let sync = self.desk_cells.resync_required(host);
-                self.send_to_host(host, sync);
+            DeskFrame::ResyncRequired => {
+                let sync = self.desk.resync_required(host);
+                self.send_desk(host, sync);
             }
-            ConnEvent::DeskTextApplied { id, operation } => {
+            DeskFrame::TextApplied { id, operation } => {
                 // A body edit from another device moves that note's words
                 // and the breadcrumbs made of them, which is its subtree
                 // and nothing else. Where the rows sit does not move, so
                 // nothing is composed.
-                self.desk_cells
-                    .text_applied(host, id.clone(), operation, cx);
+                self.desk_buffers.text_applied(host, &id, operation, cx);
                 let touched = self
                     .dashboard
                     .subtree_ids(host, &id)
                     .into_iter()
                     .collect::<BTreeSet<_>>();
-                let delta = crate::desk_view::DeskDelta {
+                let delta = rho_desk_client::desk::DeskDelta {
                     touched,
                     shape: false,
                 };
                 self.sync_tree_delta(host, &delta, window, cx);
             }
+        }
+    }
+
+    pub(crate) fn handle_event(
+        &mut self,
+        host: HostId,
+        event: ConnEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConnEvent::DesktopSessions(sessions) => {
+                self.desktop_sessions.insert(host, sessions);
+                cx.notify();
+            }
             ConnEvent::Ready {
                 auth,
                 machine_seed,
                 agent_counter,
-                journal_head: _,
             } => {
                 self.replay_hosts.remove(&host);
-                // The model asked for the journal this client lacks before
-                // this arrived: the cursor is its to keep.
                 let first_ready = self.apply_ready(host, machine_seed, agent_counter);
                 self.prune_contexts();
                 self.refresh_workdirs(host);
@@ -2160,127 +2238,18 @@ impl Workspace {
             }
             ConnEvent::AgentCreated { agent_id } => {
                 self.note_agent_created(host, agent_id);
-                if let Some(area) = self.pending_agent_filing.take() {
-                    let writes = self
-                        .new_thing_cells(host, Some(&area))
-                        .into_iter()
-                        .map(|property| rho_desk::cells::CellWrite {
-                            id: rho_desk::cells::Id::Agent(agent_id),
-                            property,
-                        })
-                        .collect::<Vec<_>>();
-                    if !writes.is_empty() {
-                        self.apply_desk_writes(host, writes, None, window, cx);
-                    }
-                }
-                if self.awaiting_draft_agent == Some(host) {
-                    self.awaiting_draft_agent = None;
-                    self.activate_agent(agent_id, cx);
-                    // The draft became this agent: reset the compose surface
-                    // and follow the new agent.
-                    let label = self
-                        .draft_default_workdir()
-                        .map(|path| self.hosts.workdir_label(&path))
-                        .unwrap_or_default();
-                    self.draft_model.update(cx, |view, cx| {
-                        view.set_body_text("", cx);
-                        view.clear_attachments(cx);
-                        view.set_workdir_text(&label, cx);
-                        view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
-                        view.set_start_text(rho_agents::create::DEFAULT_START, cx);
-                        view.set_filesystem_text(rho_agents::create::DEFAULT_FILESYSTEM, cx);
-                    });
-                    self.select_agent(Some(agent_id), window, cx);
-                }
                 cx.notify();
-            }
-            ConnEvent::Live { agent_id, live } => {
-                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
             }
             ConnEvent::Many(events) => {
                 for event in events {
                     self.handle_event(host, event, window, cx);
                 }
             }
-            // Rows never reach the main thread as rows: the model folds
-            // them and says which agents moved.
-            ConnEvent::Log { .. } => {}
-            // Nothing here asks for a detail body: the transcript draws a
-            // call's line and never its output, so an answer can only be
-            // one nobody is waiting for.
-            ConnEvent::Detail { .. } => {}
-            ConnEvent::ChatGptUsage {
-                used_percent,
-                reset_at_unix,
-            } => {
-                self.hosts.set_quota_summaries(
-                    host,
-                    vec![rho_ui_proto::QuotaSummary {
-                        model: "gpt".to_owned(),
-                        auth_namespace: None,
-                        remaining_percent: 100u8
-                            .saturating_sub(used_percent.clamp(0.0, 100.0).round() as u8),
-                        burn_10m: 0,
-                        burn_2h: 0,
-                        burn_1d: 0,
-                        burn_3d: 0,
-                        reset_at_unix: Some(reset_at_unix),
-                    }],
-                );
-                cx.notify();
-            }
             ConnEvent::QuotaUsage(summaries) => {
                 self.hosts.set_quota_summaries(host, summaries);
                 cx.notify();
             }
-            ConnEvent::QuotaHistory(series) => {
-                self.hosts.set_quota_history(host, series);
-                if let Some(view) = self.usage.opened_view() {
-                    let history = self.hosts.merged_quota_history();
-                    let active = self.hosts.active_quota_namespaces();
-                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
-                }
-                cx.notify();
-            }
-            ConnEvent::GlobalUsage(series) => {
-                self.usage.record_global(host, series);
-                if let Some(view) = self.usage.opened_view() {
-                    let usage = self.usage.merged_global();
-                    view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
-                }
-                cx.notify();
-            }
-            ConnEvent::AgentCostDistribution(series) => {
-                self.usage.record_agent_cost(host, series);
-                if let Some(view) = self.usage.opened_view() {
-                    let usage = self.usage.merged_agent_cost();
-                    view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
-                }
-                cx.notify();
-            }
-            ConnEvent::TurnCancelled => {
-                // Cancellation is an acknowledgement for an in-flight action,
-                // not transcript content. The system notice buffer is
-                // intentionally persistent, so rendering it there leaves
-                // "[turn cancelled]" visible forever.
-            }
-            ConnEvent::ServerError(message) => {
-                // A failed creation keeps the draft buffers; the user fixes
-                // the workdir and submits again. The daemon's whole cause is
-                // what the draft shows, so the reason a creation refused is
-                // readable for longer than an echo.
-                let refused_draft = self.awaiting_draft_agent == Some(host);
-                if refused_draft {
-                    self.awaiting_draft_agent = None;
-                }
-                let source = self.error_source(host);
-                let text = format!("[{source} error: {message}]");
-                if refused_draft {
-                    self.refuse_draft(&text, cx);
-                } else {
-                    self.notice_on(None, &text, StyleClass::SystemImportant, cx);
-                }
-            }
+            ConnEvent::ServerError(message) => self.report_refusal(host, &message, cx),
             ConnEvent::Recovering(elapsed) => {
                 let changed = !self
                     .hosts
@@ -2300,16 +2269,6 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
-                // The copy comes first, so what the client already read is
-                // on screen before the daemon has said anything, and so
-                // that the handshake below asks from the version it holds
-                // rather than from nothing.
-                self.open_desk_from_replica(host, window, cx);
-                // The Desk handshake belongs to the connection, not to the
-                // window: a reconnect asks only for what it is missing, and
-                // the replica it asks from was open before the window was.
-                let sync = self.desk_cells.sync(host);
-                self.send_to_host(host, sync);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
@@ -2532,17 +2491,14 @@ impl Workspace {
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice.muted());
-        let task = connection.start_native_realtime(stop_rx, input_muted_rx, cx);
+        let task = connection.start_native_realtime(stop_rx, input_muted_rx);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
         let session = cx.spawn(async move |this, cx| {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
-            };
+            let result = task.await;
             if result.is_err() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(2))
@@ -2572,7 +2528,7 @@ impl Workspace {
 
     fn shell_pager_action(
         &mut self,
-        action: rho_ui_proto::shell::PagerAction,
+        action: rho_agent_host_proto::shell::PagerAction,
         cx: &mut Context<Self>,
     ) {
         if let SurfaceView::Shell { model, .. } = &self.active_surface().view {
@@ -2597,11 +2553,12 @@ impl Workspace {
         }
         self.send_to_agent(
             agent_id,
-            ClientMessage::SendUserMessage {
+            AgentCommand::Send {
                 agent_id,
                 content,
                 delivery: MessageDelivery::NextRequest,
             },
+            cx,
         );
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the daemon persists the same timestamp).
@@ -2655,7 +2612,7 @@ impl Workspace {
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
         } else {
-            match rho_agents::create::resolve_workdir(&self.hosts, &field) {
+            match rho_agents_client::create::resolve_workdir(&self.hosts, &field) {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
                     self.refuse_draft(&message, cx);
@@ -2703,15 +2660,93 @@ impl Workspace {
             .draft_area
             .take()
             .and_then(|(area_host, node_id)| (area_host == host).then_some((host, node_id)));
-        self.hosts.send(
-            host,
-            ClientMessage::NewAgent {
-                role,
-                start,
-                mode,
-                content: Some(content),
-            },
-        );
+        let Some(connection) = self.hosts.connection(host) else {
+            return;
+        };
+        let reply = connection.request(Request::Agent(AgentCommand::New {
+            role,
+            start,
+            mode,
+            content: Some(content),
+        }));
+        cx.spawn_in(window, async move |this, cx| {
+            let reply = reply.await;
+            this.update_in(cx, |this, window, cx| {
+                this.draft_answered(host, reply, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The host's answer to the draft's submission: the agent it became,
+    /// filed and followed, or why there is none.
+    fn draft_answered(
+        &mut self,
+        host: HostId,
+        reply: anyhow::Result<Reply>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let awaited = self.awaiting_draft_agent == Some(host);
+        if awaited {
+            self.awaiting_draft_agent = None;
+        }
+        let filing = self
+            .pending_agent_filing
+            .take_if(|(filing_host, _)| *filing_host == host);
+        let agent_id = match reply {
+            Ok(Reply::AgentCreated { agent_id }) => agent_id,
+            Ok(_) => return,
+            // A failed creation keeps the draft buffers; the user fixes the
+            // workdir and submits again. The daemon's whole cause is what
+            // the draft shows, so the reason a creation refused is readable
+            // for longer than an echo.
+            Err(error) => {
+                let source = self.error_source(host);
+                let text = format!("[{source} error: {error:#}]");
+                if awaited {
+                    self.refuse_draft(&text, cx);
+                } else {
+                    self.notice_on(None, &text, StyleClass::SystemImportant, cx);
+                }
+                return;
+            }
+        };
+        self.note_agent_created(host, agent_id);
+        if let Some(area) = filing {
+            let writes = self
+                .new_thing_cells(host, Some(&area))
+                .into_iter()
+                .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
+                    id: rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
+                    property,
+                })
+                .collect::<Vec<_>>();
+            if !writes.is_empty() {
+                self.apply_desk_writes(host, writes, None, window, cx);
+            }
+        }
+        if awaited {
+            self.activate_agent(agent_id, cx);
+            // The draft became this agent: reset the compose surface and
+            // follow the new agent.
+            let label = self
+                .draft_default_workdir()
+                .map(|path| self.hosts.workdir_label(&path))
+                .unwrap_or_default();
+            self.draft_model.update(cx, |view, cx| {
+                view.set_body_text("", cx);
+                view.clear_attachments(cx);
+                view.set_workdir_text(&label, cx);
+                view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+                view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
+                view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
+            });
+            self.select_agent(Some(agent_id), window, cx);
+        }
+        self.refresh_dashboard(cx);
+        cx.notify();
     }
 
     fn paste_prompt(&mut self, _: &PastePrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -2862,7 +2897,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::CancelTurn { agent_id });
+            self.send_to_agent(agent_id, AgentCommand::Cancel { agent_id }, cx);
         }
     }
 
@@ -2871,7 +2906,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::RewindAgent { agent_id, turns });
+            self.send_to_agent(agent_id, AgentCommand::Rewind { agent_id, turns }, cx);
         }
     }
 
@@ -2880,7 +2915,7 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::ContinueTurn { agent_id });
+            self.send_to_agent(agent_id, AgentCommand::Continue { agent_id }, cx);
         }
     }
 
@@ -2891,10 +2926,11 @@ impl Workspace {
             }
             self.send_to_agent(
                 agent_id,
-                ClientMessage::CompactAgent {
+                AgentCommand::Compact {
                     agent_id,
-                    delivery: rho_ui_proto::MessageDelivery::NextRequest,
+                    delivery: rho_agent_host_proto::MessageDelivery::NextRequest,
                 },
+                cx,
             );
             self.notice_on(
                 Some(&agent_id),
@@ -2911,7 +2947,11 @@ impl Workspace {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
-            self.send_to_agent(agent_id, ClientMessage::ChangePromptCacheKey { agent_id });
+            self.send_to_agent(
+                agent_id,
+                AgentCommand::ChangePromptCacheKey { agent_id },
+                cx,
+            );
             self.notice_on(
                 Some(&agent_id),
                 "changed prompt cache key",
@@ -2935,16 +2975,17 @@ impl Workspace {
         }
         self.send_to_agent(
             agent_id,
-            ClientMessage::ChangeAgentRole {
+            AgentCommand::ChangeRole {
                 agent_id,
                 role: AgentRole::Engineer { intelligence },
             },
+            cx,
         );
     }
 
     pub(crate) fn cmd_change_agent_mode(
         &mut self,
-        mode: rho_ui_proto::WorksetMode,
+        mode: rho_agent_host_proto::WorksetMode,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -2954,7 +2995,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        self.send_to_agent(agent_id, ClientMessage::ChangeAgentMode { agent_id, mode });
+        self.send_to_agent(agent_id, AgentCommand::ChangeMode { agent_id, mode }, cx);
         self.notice_on(
             Some(&agent_id),
             &format!(
@@ -3135,9 +3176,9 @@ impl Workspace {
             self.echo("name: no host for this agent", StyleClass::SystemInfo, cx);
             return;
         };
-        let writes = vec![rho_desk::cells::CellWrite {
-            id: rho_desk::cells::Id::Agent(agent_id),
-            property: rho_desk::cells::Property::Name(name.clone()),
+        let writes = vec![rho_agent_host_proto::desk::cells::CellWrite {
+            id: rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
+            property: rho_agent_host_proto::desk::cells::Property::Name(name.clone()),
         }];
         if self
             .apply_desk_writes(host, writes, None, window, cx)
@@ -3164,7 +3205,7 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Done,
+            rho_desk_client::desk::DeskVerdict::Done,
             crate::dashboard::DealerVerdict::Done,
             "done".to_owned(),
             window,
@@ -3182,7 +3223,7 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Mute,
+            rho_desk_client::desk::DeskVerdict::Mute,
             crate::dashboard::DealerVerdict::Mute,
             "mute".to_owned(),
             window,
@@ -3208,8 +3249,8 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Todo {
-                defer_until: crate::desk_view::day_timestamp(today),
+            rho_desk_client::desk::DeskVerdict::Todo {
+                defer_until: rho_desk_client::desk::day_timestamp(today),
                 pace: days,
             },
             crate::dashboard::DealerVerdict::Done,
@@ -3243,8 +3284,8 @@ impl Workspace {
         };
         if !self.submit_tree_verdict(
             Some(room_node),
-            crate::desk_view::DeskVerdict::Defer {
-                until: crate::desk_view::day_timestamp(today + chrono::Duration::days(days)),
+            rho_desk_client::desk::DeskVerdict::Defer {
+                until: rho_desk_client::desk::day_timestamp(today + chrono::Duration::days(days)),
             },
             crate::dashboard::DealerVerdict::Defer,
             format!("snooze {days}d"),
@@ -3279,16 +3320,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let until = rho_desk::cells::Timestamp {
+        let until = rho_agent_host_proto::desk::cells::Timestamp {
             unix_ms: at.timestamp_millis(),
-            precision: rho_desk::cells::TimestampPrecision::Millisecond,
+            precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
         };
         self.deal_snooze_until(until, snooze_said(at, chrono::Local::now()), window, cx);
     }
 
     fn deal_snooze_until(
         &mut self,
-        until: rho_desk::cells::Timestamp,
+        until: rho_agent_host_proto::desk::cells::Timestamp,
         said: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3299,7 +3340,7 @@ impl Workspace {
         }
         if !self.submit_tree_verdict(
             None,
-            crate::desk_view::DeskVerdict::Defer { until },
+            rho_desk_client::desk::DeskVerdict::Defer { until },
             crate::dashboard::DealerVerdict::Defer,
             said,
             window,
@@ -3327,12 +3368,12 @@ impl Workspace {
         // A project is a label carrying the URL the daemon clones. A path
         // would have the daemon read the user's checkout, which it no
         // longer does.
-        if !rho_agents::create::is_repository_url(&path) {
+        if !rho_agents_client::create::is_repository_url(&path) {
             let message = format!("a project is a repository URL, not a path: `{path}`");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
         }
-        let workdir = match rho_agents::create::resolve_workdir(&self.hosts, &path) {
+        let workdir = match rho_agents_client::create::resolve_workdir(&self.hosts, &path) {
             Ok(workdir) => workdir,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -3350,10 +3391,10 @@ impl Workspace {
                 .map(|name| name.strip_suffix(".git").unwrap_or(name).to_owned())
                 .unwrap_or_else(|| workdir.path.to_string())
         });
-        let Some(writes) = self.desk_cells.repository_writes(
+        let Some(writes) = self.desk.repository_writes(
             workdir.host,
             &path_name,
-            Some(rho_desk::cells::Repository {
+            Some(rho_agent_host_proto::desk::cells::Repository {
                 url: workdir.path.to_string(),
             }),
         ) else {
@@ -3385,8 +3426,7 @@ impl Workspace {
                 else {
                     return;
                 };
-                let Some(writes) = self.desk_cells.repository_writes(workdir.host, &name, None)
-                else {
+                let Some(writes) = self.desk.repository_writes(workdir.host, &name, None) else {
                     return;
                 };
                 self.apply_desk_writes(workdir.host, writes, None, window, cx);
@@ -3437,7 +3477,7 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.close_shell_task(agent_id.encoded(), cx);
+        let task = connection.close_shell(agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
@@ -3514,7 +3554,7 @@ impl Workspace {
     pub(crate) fn create_browser_page(
         &mut self,
         url: String,
-        parent: Option<(HostId, rho_desk::cells::Id)>,
+        parent: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -3545,7 +3585,7 @@ impl Workspace {
     pub(crate) fn file_page(
         &mut self,
         page: rho_browser::PageId,
-        parent: Option<(HostId, rho_desk::cells::Id)>,
+        parent: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         method: rho_journal::CreateMethod,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3563,18 +3603,22 @@ impl Workspace {
             );
             return;
         };
-        let id = rho_desk::cells::Id::Page(rho_desk::PageId(*page.0.as_bytes()));
+        let id = rho_agent_host_proto::desk::cells::Id::Page(rho_agent_host_proto::desk::PageId(
+            *page.0.as_bytes(),
+        ));
         let at_root = parent.is_none();
         let filing = self
             .new_thing_cells(host, parent.as_ref())
             .into_iter()
-            .map(|property| rho_desk::cells::CellWrite {
+            .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
                 id: id.clone(),
                 property,
             });
-        let writes = std::iter::once(rho_desk::cells::CellWrite {
+        let writes = std::iter::once(rho_agent_host_proto::desk::cells::CellWrite {
             id: id.clone(),
-            property: rho_desk::cells::Property::CreatedAt(crate::desk_view::now_timestamp()),
+            property: rho_agent_host_proto::desk::cells::Property::CreatedAt(
+                rho_desk_client::desk::now_timestamp(),
+            ),
         })
         .chain(filing)
         .collect();
@@ -3592,25 +3636,6 @@ impl Workspace {
         });
         self.invalidate_dealer_signals(cx);
         self.refresh_dashboard(cx);
-    }
-
-    pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.subject_agent_or_notice("diff", window, cx) else {
-            return;
-        };
-        if !self.require_agent_online(agent_id, cx) {
-            return;
-        }
-        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
-            self.notice_on(
-                None,
-                "diff: agent has no workspace",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        self.open_diff_surface(agent_id, workspace, cx);
     }
 
     pub(crate) fn cmd_version(&mut self, cx: &mut Context<Self>) {
@@ -3646,7 +3671,7 @@ impl Workspace {
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
-        let task = connection.upload_gui_telemetry_task(snapshot, cx);
+        let task = connection.upload_gui_telemetry(snapshot);
         self.notice_on(
             None,
             "uploading GUI performance snapshot…",
@@ -3876,12 +3901,14 @@ impl Workspace {
                     .get(host)
                     .and_then(|host| host.auth.as_ref())
                     .is_some_and(|auth| auth.disabled_namespaces.iter().any(|item| item == name));
-                workspace.hosts.send(
+                workspace.request(
                     host,
-                    ClientMessage::SetAuthAccountEnabled {
+                    Request::SetAuthAccountEnabled {
                         name: name.to_owned(),
                         enabled,
                     },
+                    cx,
+                    |_, _, _| {},
                 );
                 workspace.notice_on(
                     None,
@@ -3916,14 +3943,16 @@ impl Workspace {
     ) {
         match working_directory {
             Some(argument) => {
-                let workdir =
-                    match rho_agents::create::resolve_workdir(&self.hosts, argument.as_str()) {
-                        Ok(workdir) => workdir,
-                        Err(message) => {
-                            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                            return;
-                        }
-                    };
+                let workdir = match rho_agents_client::create::resolve_workdir(
+                    &self.hosts,
+                    argument.as_str(),
+                ) {
+                    Ok(workdir) => workdir,
+                    Err(message) => {
+                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                };
                 let label = self.hosts.workdir_label(&workdir);
                 let editor = self.focused_draft_editor();
                 self.draft_model.update(cx, |view, cx| {
@@ -3979,8 +4008,7 @@ impl Workspace {
             .iter()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect();
-        self.hosts
-            .send(host, ClientMessage::AgentStreamFocus { agent_ids });
+        self.agents_client.focus(host, agent_ids);
     }
 
     /// Lets go of everything held for an agent that left the active set:
@@ -4257,14 +4285,19 @@ impl Workspace {
     pub(crate) fn desk_cells_snapshot_for_test(
         &self,
         host: HostId,
-    ) -> Vec<crate::desk_view::DeskNode> {
-        self.desk_cells.nodes(host).to_vec()
+    ) -> Vec<rho_desk_client::desk::DeskNode> {
+        self.desk.nodes(host).to_vec()
     }
 
     #[cfg(test)]
     pub(crate) fn filing_destinations_for_test(
         &self,
-    ) -> &[(String, String, HostId, rho_desk::cells::Id)] {
+    ) -> &[(
+        String,
+        String,
+        HostId,
+        rho_agent_host_proto::desk::cells::Id,
+    )] {
         &self.pending_filing_destinations
     }
 
@@ -4274,7 +4307,7 @@ impl Workspace {
     pub(crate) fn area_workdir_for_test(
         &self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
     ) -> Option<HostPath> {
         self.area_workdir(host, node_id)
     }
@@ -4362,9 +4395,6 @@ impl Workspace {
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_display_label(*agent_id))
             }
-            SurfaceKey::Diff { agent_id } => {
-                format!("changes {}", self.registry.agent_display_label(*agent_id))
-            }
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
@@ -4398,7 +4428,6 @@ impl Workspace {
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
-            SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
             SurfaceKey::Browser(_) => "browser",
             SurfaceKey::SlackList => "slack list",
@@ -4508,9 +4537,6 @@ impl Workspace {
             SurfaceKey::Shell(agent_id) => SurfaceIdentity::Shell {
                 agent_id: agent_id.into(),
             },
-            SurfaceKey::Diff { agent_id } => SurfaceIdentity::Diff {
-                agent_id: agent_id.into(),
-            },
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
@@ -4596,10 +4622,6 @@ impl Workspace {
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
                 SurfaceView::File(view) => {
-                    let editor = view.read(cx).editor().clone();
-                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
-                }
-                SurfaceView::Diff(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
@@ -4759,7 +4781,7 @@ impl Workspace {
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
-        workspace: rho_ui_proto::WorkspaceInfo,
+        workspace: rho_agent_host_proto::WorkspaceInfo,
         path: Utf8PathBuf,
         cx: &mut Context<Self>,
     ) {
@@ -4846,7 +4868,7 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.open_shell_task(agent_id.encoded(), cx);
+        let task = connection.open_shell(agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -4878,7 +4900,7 @@ impl Workspace {
     fn cached_remote_project(
         &mut self,
         host: HostId,
-        workspace: &rho_ui_proto::WorkspaceInfo,
+        workspace: &rho_agent_host_proto::WorkspaceInfo,
     ) -> Option<RemoteProject> {
         let key = (host, workspace.clone());
         let state = self.remote_projects.get(&key)?.clone();
@@ -4894,7 +4916,7 @@ impl Workspace {
     fn cache_remote_project(
         &mut self,
         host: HostId,
-        workspace: rho_ui_proto::WorkspaceInfo,
+        workspace: rho_agent_host_proto::WorkspaceInfo,
         opened: RemoteProject,
     ) -> RemoteProject {
         if let Some(existing) = self.cached_remote_project(host, &workspace) {
@@ -4903,101 +4925,6 @@ impl Workspace {
         self.remote_projects
             .insert((host, workspace), opened.state.downgrade());
         opened
-    }
-
-    /// Persists the agent's working-copy snapshot, then projects its
-    /// parent-side manifest over the workspace's shared live buffers.
-    /// Reopening refreshes the existing shared model.
-    fn open_diff_surface(
-        &mut self,
-        agent_id: AgentId,
-        workspace: rho_ui_proto::WorkspaceInfo,
-        cx: &mut Context<Self>,
-    ) {
-        let key = SurfaceKey::Diff { agent_id };
-        if let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() {
-            if let SurfaceView::Diff(view) = &surface.view {
-                view.update(cx, |view, cx| {
-                    view.model().update(cx, |model, cx| model.refresh_now(cx));
-                });
-            }
-            self.display_surface(surface, cx);
-            cx.notify();
-            return;
-        }
-
-        let Some(host) = self.host_of(agent_id) else {
-            return;
-        };
-        let Some(diff_client) = self.connection_for(agent_id).map(Connection::diff_client) else {
-            return;
-        };
-        let cached = self.cached_remote_project(host, &workspace);
-        let project_task = cached.is_none().then(|| {
-            let connection = self.connection_for(agent_id).expect("host still attached");
-            rho_files::open_remote_project(connection, workspace.clone(), cx)
-        });
-        let task = cx.spawn(async move |this, cx| {
-            let result: anyhow::Result<(RemoteProject, rho_files::PreparedDiff)> = async {
-                let opened = match cached {
-                    Some(project) => project,
-                    None => project_task
-                        .expect("missing project task")
-                        .await
-                        .context("project dial task failed")?,
-                };
-                let project = this
-                    .update(cx, |this, _| {
-                        this.cache_remote_project(host, workspace.clone(), opened)
-                    })
-                    .map_err(|_| anyhow::anyhow!("GUI closed while loading diff"))?;
-                let live_paths = cx.update(|cx| rho_files::dirty_paths(&project, cx));
-                let snapshot_task = cx.update(|cx| {
-                    diff_client.snapshot(workspace.clone(), None, live_paths.clone(), cx)
-                });
-                let snapshot = snapshot_task
-                    .await?
-                    .context("initial diff snapshot unexpectedly unchanged")?;
-                let prepared = rho_files::PreparedDiff::load(
-                    &project,
-                    &diff_client,
-                    workspace.clone(),
-                    snapshot,
-                    live_paths,
-                    None,
-                    cx,
-                )
-                .await?;
-                Ok((project, prepared))
-            }
-            .await;
-
-            match result {
-                Ok((project, prepared)) => {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        let model = cx.new(|cx| {
-                            rho_files::DiffModel::new(project, diff_client, workspace, prepared, cx)
-                        });
-                        let view = cx.new(|cx| rho_files::DiffView::new(model, window, cx));
-                        let surface = Self::wrap_surface(key, SurfaceView::Diff(view));
-                        this.display_surface(surface, cx);
-                        this.focus_active_surface(window, cx);
-                        cx.notify();
-                    });
-                }
-                Err(error) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.notice_on(
-                            None,
-                            &format!("diff failed: {error:#}"),
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    });
-                }
-            }
-        });
-        self.pending_diff_loads.insert(agent_id, task);
     }
 
     /// `:term`: dials a dedicated terminal stream for the agent (attaching
@@ -5017,7 +4944,7 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.open_terminal_task(agent_id.encoded(), new, 80, 24, cx);
+        let task = connection.open_terminal(agent_id.encoded(), new, 80, 24);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -5133,7 +5060,7 @@ impl Workspace {
     pub(crate) fn focus_tree_node_for_test(
         &mut self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5142,7 +5069,9 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_agent_filing_for_test(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub(crate) fn pending_agent_filing_for_test(
+        &self,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         self.pending_agent_filing.clone()
     }
 
@@ -5152,7 +5081,9 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn draft_area_for_test(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub(crate) fn draft_area_for_test(
+        &self,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         self.draft_area.clone()
     }
 
@@ -5172,11 +5103,31 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn take_host_messages_for_test(&self, host: HostId) -> Vec<ClientMessage> {
+    pub(crate) fn take_host_messages_for_test(&self, host: HostId) -> Vec<Request> {
         self.hosts
             .connection(host)
             .map(Connection::take_sent_for_test)
             .unwrap_or_default()
+    }
+
+    /// Answers the host's oldest unanswered request, as its daemon would.
+    #[cfg(test)]
+    pub(crate) fn answer_host_request_for_test(&self, host: HostId, reply: anyhow::Result<Reply>) {
+        if let Some(connection) = self.hosts.connection(host) {
+            connection.answer_for_test(reply);
+        }
+    }
+
+    /// Forgets everything sent to the host so far, on every stream.
+    #[cfg(test)]
+    pub(crate) fn clear_sent_for_test(&self, host: HostId) {
+        self.take_host_messages_for_test(host);
+        self.take_desk_frames_for_test(host);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_desk_frames_for_test(&self, host: HostId) -> Vec<DeskClientFrame> {
+        self.desk_streams.take_sent_for_test(host)
     }
 
     #[cfg(test)]
@@ -5185,7 +5136,9 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn merged_quota_summaries_for_test(&self) -> Vec<rho_ui_proto::QuotaSummary> {
+    pub(crate) fn merged_quota_summaries_for_test(
+        &self,
+    ) -> Vec<rho_agent_host_proto::QuotaSummary> {
         self.hosts.merged_quota_summaries()
     }
 
@@ -5236,8 +5189,8 @@ impl Workspace {
     pub(crate) fn note_children_for_test(
         &self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
-    ) -> Vec<rho_desk::cells::Id> {
+        node_id: rho_agent_host_proto::desk::cells::Id,
+    ) -> Vec<rho_agent_host_proto::desk::cells::Id> {
         self.note_views
             .get(&(host, node_id))
             .map(|view| view.children())
@@ -5399,7 +5352,7 @@ impl Workspace {
     fn sync_tree_delta(
         &mut self,
         host: HostId,
-        delta: &crate::desk_view::DeskDelta,
+        delta: &rho_desk_client::desk::DeskDelta,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5414,11 +5367,9 @@ impl Workspace {
             // every cell of a streaming turn takes.
             let patched = {
                 let Self {
-                    desk_cells,
-                    dashboard,
-                    ..
+                    desk, dashboard, ..
                 } = self;
-                let nodes = desk_cells.nodes(host);
+                let nodes = desk.nodes(host);
                 dashboard.deal_shape_held(host, nodes)
                     && dashboard.patch_deal_source(host, &delta.touched, nodes)
             };
@@ -5426,7 +5377,7 @@ impl Workspace {
                 // The user's own words about an agent — its name, its
                 // labels, whether it is put away — are on the rows this
                 // delta named, and a patch is the path they arrive by.
-                let filings = self.desk_cells.agent_filings_of(host, &delta.touched);
+                let filings = self.desk.agent_filings_of(host, &delta.touched);
                 self.registry.set_agent_filings(filings);
                 let touched = delta.touched.iter().cloned().collect::<Vec<_>>();
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Nodes(&touched), cx);
@@ -5484,14 +5435,14 @@ impl Workspace {
             self.refresh_desk_sources(host, moved, cx)
         });
         timed_desk_step("desk_sync/apply_source_change", work_units, || {
-            self.desk_cells.apply_source_change(host, change)
+            self.desk.apply_source_change(host, change)
         });
         // A row that exists only because a source says so — a tab the
         // browser has just opened, a unit the mirror has just raised — has
         // nothing written, so no store event will ever give it the buffer
         // the map draws it from. It gets one here.
         timed_desk_step("desk_sync/reconcile_buffers", work_units, || {
-            self.desk_cells.reconcile_buffers(host, cx)
+            self.desk_buffers.reconcile_buffers(host, &self.desk, cx)
         });
         // The desk's nodes are already to hand; asking the dealer whether
         // they sit where its source has them costs a walk of the ids and no
@@ -5508,16 +5459,14 @@ impl Workspace {
         let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
         let patched = timed_desk_step("desk_sync/deal_shape_and_patch", work_units, || {
             let Self {
-                desk_cells,
-                dashboard,
-                ..
+                desk, dashboard, ..
             } = self;
-            let nodes = desk_cells.nodes(host);
+            let nodes = desk.nodes(host);
             dashboard.deal_shape_held(host, nodes)
                 && moved.as_ref().is_some_and(|agents| {
                     let touched = agents
                         .iter()
-                        .map(|agent_id| rho_desk::cells::Id::Agent(*agent_id))
+                        .map(|agent_id| rho_agent_host_proto::desk::cells::Id::Agent(*agent_id))
                         .collect::<BTreeSet<_>>();
                     dashboard.patch_deal_source(host, &touched, nodes)
                 })
@@ -5538,7 +5487,12 @@ impl Workspace {
         // breadcrumb beneath it, so this reads the titles again; it is the
         // nodes and the indexes and no rope.
         timed_desk_step("desk_sync/set_deal_source", work_units, || {
-            let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
+            let source = crate::candidates::HostNodes::of_notes(
+                &self.desk,
+                &mut self.desk_buffers,
+                host,
+                cx,
+            );
             self.dashboard.set_deal_source(host, source);
         });
 
@@ -5559,18 +5513,24 @@ impl Workspace {
 
     /// What the desk knows of one agent, or nothing when the agent is not
     /// this host's or the user filed it away.
-    fn agent_source(&self, host: HostId, agent: AgentId) -> Option<crate::desk_view::AgentSource> {
+    fn agent_source(
+        &self,
+        host: HostId,
+        agent: AgentId,
+    ) -> Option<rho_desk_client::desk::AgentSource> {
         /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
-        fn story_pos(pos: rho_ui_proto::mirror::AgentPos) -> rho_desk::cells::StoryPos {
-            rho_desk::cells::StoryPos(pos.0)
+        fn story_pos(
+            pos: rho_agent_host_proto::transcript::AgentPos,
+        ) -> rho_agent_host_proto::desk::cells::StoryPos {
+            rho_agent_host_proto::desk::cells::StoryPos(pos.0)
         }
 
         if self.registry.host_of_agent(agent) != Some(host) || self.registry.agent_muted(agent) {
             return None;
         }
         let digest = self.registry.agent_digest(agent);
-        Some(crate::desk_view::AgentSource {
+        Some(rho_desk_client::desk::AgentSource {
             agent,
             spawned_by: self.registry.agent_parent(agent),
             workdir: self.registry.working_directory(agent),
@@ -5597,14 +5557,14 @@ impl Workspace {
         host: HostId,
         moved: Option<&BTreeSet<AgentId>>,
         cx: &Context<Self>,
-    ) -> crate::desk_view::SourceChange {
+    ) -> rho_desk_client::desk::SourceChange {
         // A filing that moved changes who is on the desk at all, so the
         // whole set is built again; otherwise only the agents named are.
         let filed = self
             .registry
-            .set_agent_filings(self.desk_cells.agent_filing(host));
+            .set_agent_filings(self.desk.agent_filing(host));
         let held = self
-            .desk_cells
+            .desk
             .sources(host)
             .map(|sources| sources.agents().to_vec());
         let agents = match (moved, held) {
@@ -5637,18 +5597,20 @@ impl Workspace {
         // not the same as saying every unit went quiet: the facts already
         // read from the mirror stand until a session replaces them.
         let slack = if !self.slack.started() {
-            self.desk_cells
+            self.desk
                 .sources(host)
                 .map(|sources| sources.slack().to_vec())
                 .unwrap_or_default()
         } else if self.hosts.owner() == Some(host) {
             self.slack_thread_facts(cx)
                 .into_iter()
-                .map(|(unit, facts)| crate::desk_view::SlackSource {
+                .map(|(unit, facts)| rho_desk_client::desk::SlackSource {
                     unit,
                     title: facts.title,
-                    newest: rho_desk::cells::SlackTs(facts.latest),
-                    newest_from_other: facts.newest_from_other.map(rho_desk::cells::SlackTs),
+                    newest: rho_agent_host_proto::desk::cells::SlackTs(facts.latest),
+                    newest_from_other: facts
+                        .newest_from_other
+                        .map(rho_agent_host_proto::desk::cells::SlackTs),
                     reason: facts.reason,
                 })
                 .collect()
@@ -5660,27 +5622,28 @@ impl Workspace {
         let pages = if self.hosts.primary() == Some(host) && rho_browser::is_configured(cx) {
             rho_browser::live_pages()
                 .into_iter()
-                .map(|(page, opened_from)| crate::desk_view::PageSource {
-                    page: rho_desk::PageId(*page.0.as_bytes()),
-                    opened_from: opened_from.map(|id| rho_desk::PageId(*id.0.as_bytes())),
+                .map(|(page, opened_from)| rho_desk_client::desk::PageSource {
+                    page: rho_agent_host_proto::desk::PageId(*page.0.as_bytes()),
+                    opened_from: opened_from
+                        .map(|id| rho_agent_host_proto::desk::PageId(*id.0.as_bytes())),
                 })
                 .collect()
         } else {
             Vec::new()
         };
-        let sources = crate::desk_view::Sources::new(
+        let sources = rho_desk_client::desk::Sources::new(
             self.registry.host_machine_seed(host),
             agents,
             slack,
             pages,
         );
-        let change = self.desk_cells.set_sources(host, sources);
+        let change = self.desk.set_sources(host, sources);
         // The user's verdicts are the one thing attention needs that no
         // row carries; the registry derives it from them and the digest,
         // and the mirror keeps them so a restart ranks the same way.
-        for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
+        for (agent_id, verdict) in self.desk.agent_verdicts(host) {
             if self.registry.set_agent_verdict(agent_id, verdict) {
-                rho_mirror::mirror::write_verdict(agent_id, verdict);
+                self.agents_client.set_verdict(agent_id, verdict);
             }
         }
         change
@@ -5693,7 +5656,7 @@ impl Workspace {
     pub(crate) fn seed_transcript_for_test(
         &mut self,
         agent_id: AgentId,
-        state: rho_agents::state::UiAgentState,
+        state: rho_agents_client::state::UiAgentState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5706,12 +5669,12 @@ impl Workspace {
     pub(crate) fn apply_verdict_for_test(
         &mut self,
         host: HostId,
-        id: &rho_desk::cells::Id,
-        verdict: crate::desk_view::DeskVerdict,
+        id: &rho_agent_host_proto::desk::cells::Id,
+        verdict: rho_desk_client::desk::DeskVerdict,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((writes, event)) = self.desk_cells.verdict_writes(host, id, verdict) else {
+        let Some((writes, event)) = self.desk.verdict_writes(host, id, verdict) else {
             return false;
         };
         self.apply_desk_writes(host, writes, Some(event), window, cx)
@@ -5725,18 +5688,18 @@ impl Workspace {
     pub(crate) fn set_slack_sources_for_test(
         &mut self,
         host: HostId,
-        slack: Vec<crate::desk_view::SlackSource>,
+        slack: Vec<rho_desk_client::desk::SlackSource>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let sources = self
-            .desk_cells
+            .desk
             .sources(host)
             .cloned()
             .unwrap_or_default()
             .with_slack(slack);
-        let change = self.desk_cells.set_sources(host, sources);
-        self.desk_cells.apply_source_change(host, change);
+        let change = self.desk.set_sources(host, sources);
+        self.desk.apply_source_change(host, change);
         self.sync_tree_dashboard(host, window, cx);
     }
 
@@ -5746,7 +5709,9 @@ impl Workspace {
         if self.note_views.is_empty() {
             return;
         }
-        let Some((nodes, buffers, note_titles)) = self.desk_cells.tree_source(host, cx) else {
+        let Some((nodes, buffers, note_titles)) =
+            self.desk_buffers.tree_source(host, &self.desk, cx)
+        else {
             return;
         };
         // A note's title is the first line of its body, which the desk
@@ -5777,11 +5742,11 @@ impl Workspace {
     fn note_view_for(
         &mut self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&crate::note_view::NoteView> {
-        let body = self.desk_cells.buffer(host, &node_id)?.clone();
+        let body = self.desk_buffers.buffer(host, &node_id)?.clone();
         // A resync can hand out a fresh buffer for the same node; the old
         // surface is then over text nothing writes to any more.
         if self
@@ -5805,7 +5770,7 @@ impl Workspace {
     pub(crate) fn open_tree_node(
         &mut self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -5836,7 +5801,7 @@ impl Workspace {
     pub(crate) fn open_note(
         &mut self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -5871,7 +5836,7 @@ impl Workspace {
             return;
         };
         if self
-            .desk_cells
+            .desk
             .node(host, &node_id)
             .is_some_and(|node| node.is_note())
         {
@@ -5879,15 +5844,15 @@ impl Workspace {
             return;
         }
         let notes = self
-            .desk_cells
-            .tree_source(host, cx)
+            .desk_buffers
+            .tree_source(host, &self.desk, cx)
             .into_iter()
             .flat_map(|(nodes, _, _)| nodes)
             .filter(|node| node.is_note())
             .map(|node| node.id)
             .collect::<Vec<_>>();
         let existing = notes.into_iter().find(|note| {
-            self.desk_cells
+            self.desk
                 .facts(host, note)
                 .is_some_and(|facts| facts.about.as_ref() == Some(&node_id))
         });
@@ -5898,7 +5863,7 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        let Some((created, mut writes)) = self.desk_cells.create_note_writes(host, None) else {
+        let Some((created, mut writes)) = self.desk.create_note_writes(host, None) else {
             return;
         };
         // Where the thing is, which is where its note belongs.
@@ -5908,18 +5873,18 @@ impl Workspace {
         // for a place is still about it.
         if !cells
             .iter()
-            .any(|cell| matches!(cell, rho_desk::cells::Property::About(_)))
+            .any(|cell| matches!(cell, rho_agent_host_proto::desk::cells::Property::About(_)))
         {
-            cells.push(rho_desk::cells::Property::About(node_id.clone()));
+            cells.push(rho_agent_host_proto::desk::cells::Property::About(
+                node_id.clone(),
+            ));
         }
-        writes.extend(
-            cells
-                .into_iter()
-                .map(|property| rho_desk::cells::CellWrite {
-                    id: created.clone(),
-                    property,
-                }),
-        );
+        writes.extend(cells.into_iter().map(|property| {
+            rho_agent_host_proto::desk::cells::CellWrite {
+                id: created.clone(),
+                property,
+            }
+        }));
         if self
             .apply_desk_writes(host, writes, None, window, cx)
             .is_none()
@@ -5959,8 +5924,8 @@ impl Workspace {
     pub(crate) fn new_thing_cells(
         &self,
         host: HostId,
-        area: Option<&(HostId, rho_desk::cells::Id)>,
-    ) -> Vec<rho_desk::cells::Property> {
+        area: Option<&(HostId, rho_agent_host_proto::desk::cells::Id)>,
+    ) -> Vec<rho_agent_host_proto::desk::cells::Property> {
         let Some((area_host, node_id)) = area else {
             return Vec::new();
         };
@@ -5970,26 +5935,32 @@ impl Workspace {
         if *area_host != host {
             return Vec::new();
         }
-        let mut cells = vec![rho_desk::cells::Property::About(node_id.clone())];
+        let mut cells = vec![rho_agent_host_proto::desk::cells::Property::About(
+            node_id.clone(),
+        )];
         cells.extend(
-            self.desk_cells
+            self.desk
                 .facts(host, node_id)
                 .into_iter()
                 .flat_map(|facts| facts.labels)
-                .map(|label| rho_desk::cells::Property::Labeled {
-                    label,
-                    present: true,
-                }),
+                .map(
+                    |label| rho_agent_host_proto::desk::cells::Property::Labeled {
+                        label,
+                        present: true,
+                    },
+                ),
         );
         cells
     }
 
-    pub(crate) fn surface_node(&self, cx: &App) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub(crate) fn surface_node(
+        &self,
+        cx: &App,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         let card = match &self.active_surface().key {
             SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
             SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
-            | SurfaceKey::Diff { agent_id }
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => self.dashboard.agent_card_id(*agent_id),
             SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
@@ -6002,7 +5973,10 @@ impl Workspace {
             // no node yet, and a verdict is what makes it one.
             SurfaceKey::SlackConversation(source) => {
                 let unit = self.slack_surface_unit(source, cx)?;
-                return Some((self.hosts.owner()?, rho_desk::cells::Id::Slack(unit)));
+                return Some((
+                    self.hosts.owner()?,
+                    rho_agent_host_proto::desk::cells::Id::Slack(unit),
+                ));
             }
             _ => None,
         }?;
@@ -6013,14 +5987,14 @@ impl Workspace {
     pub(crate) fn send_desk_text(
         &mut self,
         host: HostId,
-        id: rho_desk::cells::Id,
-        operation: rho_desk::TextOperation,
-        transaction: rho_desk::TextTransaction,
+        id: rho_agent_host_proto::desk::cells::Id,
+        operation: rho_agent_host_proto::desk::TextOperation,
+        transaction: rho_agent_host_proto::desk::TextTransaction,
         _cx: &mut Context<Self>,
     ) {
-        self.send_to_host(
+        self.send_desk(
             host,
-            ClientMessage::DeskTextApply {
+            DeskClientFrame::TextApply {
                 id,
                 operation,
                 transaction: Some(transaction),
@@ -6033,21 +6007,24 @@ impl Workspace {
     pub(crate) fn apply_desk_writes(
         &mut self,
         host: HostId,
-        writes: Vec<rho_desk::cells::CellWrite>,
-        verdict: Option<(rho_desk::cells::Id, rho_desk::cells::VerdictEvent)>,
+        writes: Vec<rho_agent_host_proto::desk::cells::CellWrite>,
+        verdict: Option<(
+            rho_agent_host_proto::desk::cells::Id,
+            rho_agent_host_proto::desk::cells::VerdictEvent,
+        )>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<rho_desk::cells::Stamp> {
-        let (message, delta) = self.desk_cells.apply(host, writes, verdict)?;
-        let ClientMessage::DeskMutationApply { mutation } = &message else {
+    ) -> Option<rho_agent_host_proto::desk::cells::Stamp> {
+        let (frame, delta) = self.desk.apply(host, writes, verdict)?;
+        let DeskClientFrame::MutationApply { mutation } = &frame else {
             return None;
         };
         let stamp = mutation.stamp;
         // A created note needs its buffer before anything can be typed into
         // it, and the daemon's answer may be a frame away.
-        self.desk_cells.give_buffers(host, &delta, cx);
+        self.desk_buffers.give_buffers(host, &self.desk, &delta, cx);
         self.sync_tree_delta(host, &delta, window, cx);
-        self.send_to_host(host, message);
+        self.send_desk(host, frame);
         Some(stamp)
     }
 
@@ -6057,11 +6034,11 @@ impl Workspace {
     pub(crate) fn fill_note_bodies(
         &mut self,
         host: HostId,
-        bodies: Vec<(rho_desk::cells::Id, String)>,
+        bodies: Vec<(rho_agent_host_proto::desk::cells::Id, String)>,
         cx: &mut Context<Self>,
     ) {
         for (node_id, text) in bodies {
-            let Some(buffer) = self.desk_cells.buffer(host, &node_id).cloned() else {
+            let Some(buffer) = self.desk_buffers.buffer(host, &node_id).cloned() else {
                 continue;
             };
             buffer.update(cx, |buffer, cx| {
@@ -6169,14 +6146,17 @@ impl Workspace {
     /// The transcript this workspace shows for an agent, for a test that
     /// feeds it back changed.
     #[cfg(test)]
-    pub(crate) fn transcript_for_test(&self, agent_id: AgentId) -> rho_agents::state::UiAgentState {
+    pub(crate) fn transcript_for_test(
+        &self,
+        agent_id: AgentId,
+    ) -> rho_agents_client::state::UiAgentState {
         self.transcripts
             .state(&agent_id)
             .cloned()
-            .unwrap_or_else(|| rho_agents::state::UiAgentState {
+            .unwrap_or_else(|| rho_agents_client::state::UiAgentState {
                 exec_timings: Default::default(),
                 blocks: Vec::new(),
-                status: rho_agents::state::UiAgentStatus::Idle,
+                status: rho_agents_client::state::UiAgentStatus::Idle,
                 context_used: None,
                 usage: Default::default(),
             })
@@ -6208,7 +6188,6 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
-            SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self.chrome_editor(),
             SurfaceView::Browser(_) => self.chrome_editor(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
@@ -6261,7 +6240,6 @@ impl Workspace {
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
-            SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
             SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
             SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
@@ -6279,7 +6257,6 @@ impl Workspace {
             SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
-            | SurfaceKey::Diff { agent_id }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
             SurfaceKey::Draft
             | SurfaceKey::Home
@@ -6366,9 +6343,6 @@ impl Workspace {
             SurfaceKey::Shell(_) => {
                 unreachable!("shell surfaces are created by open_shell_surface")
             }
-            SurfaceKey::Diff { .. } => {
-                unreachable!("diff surfaces are created by open_diff_surface")
-            }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
             }
@@ -6412,10 +6386,6 @@ impl Workspace {
                 Some(agent_id)
             }
             SurfaceKey::Browser(_) => None,
-            SurfaceKey::Diff { agent_id } => {
-                self.selection.select_agent(agent_id);
-                Some(agent_id)
-            }
             SurfaceKey::Draft => {
                 self.selection.enter_draft();
                 None
@@ -6962,7 +6932,6 @@ impl Workspace {
             Command::Wayland => self.open_desktop(window, cx),
             Command::Shell => self.cmd_shell(window, cx),
             Command::ShellClose => self.cmd_shell_close(window, cx),
-            Command::Changes => self.cmd_diff(window, cx),
             Command::Terminal => self.cmd_term(false, window, cx),
             Command::NewTerminal => self.cmd_term(true, window, cx),
             Command::UndoVerdict => window.dispatch_action(Box::new(crate::UndoVerdict), cx),
@@ -7152,7 +7121,7 @@ impl Workspace {
             return;
         };
         let target = self.models.get(&agent).cloned();
-        let task = connection.open_wayland_task(agent.encoded(), session.clone(), cx);
+        let task = connection.open_wayland(agent.encoded(), session.clone());
         cx.spawn_in(window, async move |this, cx| match task.await {
             Ok(viewer) => {
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -7390,7 +7359,7 @@ impl Workspace {
     pub(crate) fn label_target(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         // What the reader is on: the thing behind the surface in view, or
         // the row under the cursor when the map is what they are reading.
         // The card in hand is the target only when it is that thing, so
@@ -7416,7 +7385,10 @@ impl Workspace {
     /// the way filing does made those surfaces borrow whichever card the
     /// map's cursor had left behind: they wore its label and its why, and a
     /// verdict pressed over them landed on it.
-    fn card_target(&mut self, cx: &mut Context<Self>) -> Option<(HostId, rho_desk::cells::Id)> {
+    fn card_target(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
         // Home is a list of cards, so its cursor names one the same way the
         // map's does.
         if self.home_in_view() {
@@ -7472,7 +7444,7 @@ impl Workspace {
     pub(crate) fn label_card(
         &mut self,
         host: HostId,
-        id: rho_desk::cells::Id,
+        id: rho_agent_host_proto::desk::cells::Id,
         path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7483,19 +7455,19 @@ impl Workspace {
         }
         // The smallest set that says where the thing is: a label it already
         // carries a deeper one of says nothing, so it is not added.
-        if let Some(deeper) = self.desk_cells.label_deeper_than(host, &id, path) {
+        if let Some(deeper) = self.desk.label_deeper_than(host, &id, path) {
             let said = format!("already under {deeper}");
             self.echo(&said, StyleClass::SystemInfo, cx);
             return;
         }
-        let Some((writes, event)) = self.desk_cells.label_writes(host, &id, path) else {
+        let Some((writes, event)) = self.desk.label_writes(host, &id, path) else {
             self.echo("label: nothing to label", StyleClass::SystemInfo, cx);
             return;
         };
         let removed = matches!(
             &event.1,
-            rho_desk::cells::VerdictEvent::Applied {
-                verdict: rho_desk::cells::Verdict::Label { present: false, .. },
+            rho_agent_host_proto::desk::cells::VerdictEvent::Applied {
+                verdict: rho_agent_host_proto::desk::cells::Verdict::Label { present: false, .. },
                 ..
             }
         );
@@ -7562,12 +7534,12 @@ impl Workspace {
             return;
         };
         let carried = self
-            .desk_cells
+            .desk
             .facts(host, &target)
             .map(|facts| facts.labels)
             .unwrap_or_default();
         let destinations = self
-            .desk_cells
+            .desk
             .label_paths(host)
             .into_iter()
             .map(|(label, path)| {
@@ -7691,7 +7663,10 @@ impl Workspace {
     pub(crate) fn mark_cards_done(
         &mut self,
         host: HostId,
-        nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)>,
+        nodes: Vec<(
+            rho_agent_host_proto::desk::cells::Id,
+            rho_agent_host_proto::desk::cells::SlackTs,
+        )>,
         verb: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7702,7 +7677,7 @@ impl Workspace {
             // A Slack unit is done at the cutoff and no further: the cursor
             // lands on the newest message at or before the age the user
             // named, and anything newer is still theirs.
-            if let rho_desk::cells::Id::Slack(unit) = &node {
+            if let rho_agent_host_proto::desk::cells::Id::Slack(unit) = &node {
                 cursors.extend(self.advance_slack_cursor(
                     &unit.clone(),
                     Some(rho_slack::types::Ts(cursor.0)),
@@ -7714,8 +7689,8 @@ impl Workspace {
             // batch back and the daemon checks each cursor against the one
             // that was there.
             let Some((writes, event)) =
-                self.desk_cells
-                    .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
+                self.desk
+                    .verdict_writes(host, &node, rho_desk_client::desk::DeskVerdict::Done)
             else {
                 continue;
             };
@@ -7743,15 +7718,17 @@ impl Workspace {
         &mut self,
         entry: VerdictUndo,
         host: HostId,
-        nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::Stamp)>,
+        nodes: Vec<(
+            rho_agent_host_proto::desk::cells::Id,
+            rho_agent_host_proto::desk::cells::Stamp,
+        )>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut undone = entry.slack_cursors.len();
         self.restore_slack_cursors(&entry.slack_cursors.clone(), cx);
         for (node, at) in nodes {
-            let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
-            else {
+            let Some((writes, verdict)) = self.desk.undo_verdict_writes(host, &node, at) else {
                 continue;
             };
             if self
@@ -7818,8 +7795,7 @@ impl Workspace {
                 // Undo is the log's own inverse, and whether it can be made
                 // is asked here: a fact that has moved on since the verdict
                 // is nothing to put back.
-                let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
-                else {
+                let Some((writes, verdict)) = self.desk.undo_verdict_writes(host, &node, at) else {
                     self.restore_verdict_undo(entry);
                     self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
                     return;
@@ -7839,8 +7815,8 @@ impl Workspace {
 
     fn submit_tree_verdict(
         &mut self,
-        target_node: Option<rho_desk::cells::Id>,
-        dealt: crate::desk_view::DeskVerdict,
+        target_node: Option<rho_agent_host_proto::desk::cells::Id>,
+        dealt: rho_desk_client::desk::DeskVerdict,
         verdict: crate::dashboard::DealerVerdict,
         verb: String,
         window: &mut Window,
@@ -7866,18 +7842,18 @@ impl Workspace {
             .clone()
             .unwrap_or_else(|| card.identity.node_id.clone());
         let phone_verdict = self.phone.enabled.then_some(match dealt {
-            crate::desk_view::DeskVerdict::Done => rho_journal::PhoneVerdict::Done,
-            crate::desk_view::DeskVerdict::Mute => rho_journal::PhoneVerdict::Mute,
-            crate::desk_view::DeskVerdict::Defer { .. } => rho_journal::PhoneVerdict::Defer,
-            crate::desk_view::DeskVerdict::Todo { .. } => rho_journal::PhoneVerdict::Todo,
-            crate::desk_view::DeskVerdict::File { .. } => rho_journal::PhoneVerdict::File,
+            rho_desk_client::desk::DeskVerdict::Done => rho_journal::PhoneVerdict::Done,
+            rho_desk_client::desk::DeskVerdict::Mute => rho_journal::PhoneVerdict::Mute,
+            rho_desk_client::desk::DeskVerdict::Defer { .. } => rho_journal::PhoneVerdict::Defer,
+            rho_desk_client::desk::DeskVerdict::Todo { .. } => rho_journal::PhoneVerdict::Todo,
+            rho_desk_client::desk::DeskVerdict::File { .. } => rho_journal::PhoneVerdict::File,
         });
         // `x` on a Slack card is a mute in Slack and nothing here: a
         // thread is unfollowed, a channel or direct message is muted, and
         // the card closes because Slack has stopped asking. The room
         // snooze (`target_node`) is a verdict on the room and not on the
         // unit, so it is left alone.
-        if matches!(dealt, crate::desk_view::DeskVerdict::Mute)
+        if matches!(dealt, rho_desk_client::desk::DeskVerdict::Mute)
             && target_node.is_none()
             && let Some(unit) = self.dashboard.card_thread(card.identity.clone())
         {
@@ -7899,12 +7875,12 @@ impl Workspace {
         // filing do not, because neither says anything has been read.
         let moves_cursor = matches!(
             dealt,
-            crate::desk_view::DeskVerdict::Done
-                | crate::desk_view::DeskVerdict::Mute
-                | crate::desk_view::DeskVerdict::Todo { .. }
+            rho_desk_client::desk::DeskVerdict::Done
+                | rho_desk_client::desk::DeskVerdict::Mute
+                | rho_desk_client::desk::DeskVerdict::Todo { .. }
         );
         let slack_cursors = match (&node_id, moves_cursor) {
-            (rho_desk::cells::Id::Slack(unit), true) => self
+            (rho_agent_host_proto::desk::cells::Id::Slack(unit), true) => self
                 .advance_slack_cursor(&unit.clone(), None, cx)
                 .into_iter()
                 .collect(),
@@ -7916,8 +7892,8 @@ impl Workspace {
         // round trip later.
         if matches!(
             dealt,
-            crate::desk_view::DeskVerdict::Done | crate::desk_view::DeskVerdict::Mute
-        ) && matches!(node_id, rho_desk::cells::Id::Slack(_))
+            rho_desk_client::desk::DeskVerdict::Done | rho_desk_client::desk::DeskVerdict::Mute
+        ) && matches!(node_id, rho_agent_host_proto::desk::cells::Id::Slack(_))
         {
             let mut undo = self.next_verdict_undo(
                 verb,
@@ -7938,16 +7914,15 @@ impl Workspace {
         }
         // The cursor moved above, so a verdict that cannot be written puts
         // it back: half a verdict is not one.
-        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, &node_id, dealt)
-        else {
+        let Some((writes, applied)) = self.desk.verdict_writes(card.host, &node_id, dealt) else {
             self.restore_slack_cursors(&slack_cursors, cx);
             return false;
         };
         // A todo hangs a note under the card. Empty, it comes back in a week
         // reading only `defer …`, so it is given the card's own words.
         let todo_note = match &applied.1 {
-            rho_desk::cells::VerdictEvent::Applied {
-                verdict: rho_desk::cells::Verdict::Todo { note },
+            rho_agent_host_proto::desk::cells::VerdictEvent::Applied {
+                verdict: rho_agent_host_proto::desk::cells::Verdict::Todo { note },
                 ..
             } => Some(note.clone()),
             _ => None,
@@ -7990,7 +7965,7 @@ impl Workspace {
     /// so typing composes the first message straight away.
     pub(crate) fn new_agent_in_area(
         &mut self,
-        area: Option<(HostId, rho_desk::cells::Id)>,
+        area: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8008,9 +7983,9 @@ impl Workspace {
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
-            view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
-            view.set_start_text(rho_agents::create::DEFAULT_START, cx);
-            view.set_filesystem_text(rho_agents::create::DEFAULT_FILESYSTEM, cx);
+            view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
+            view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
+            view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
         // The draft exists to be written in, so it opens ready to type.
@@ -8033,14 +8008,18 @@ impl Workspace {
     /// file, the nearest ancestor with one, then the agent that owns the
     /// area (or the area itself when it is an agent node). The caller
     /// falls back to the host's only workdir.
-    fn area_workdir(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<HostPath> {
-        if let Some(repository) = self.desk_cells.inherited_workdir(host, &node_id) {
+    fn area_workdir(
+        &self,
+        host: HostId,
+        node_id: rho_agent_host_proto::desk::cells::Id,
+    ) -> Option<HostPath> {
+        if let Some(repository) = self.desk.inherited_workdir(host, &node_id) {
             return Some(HostPath {
                 host,
                 path: repository.url.into(),
             });
         }
-        let agent_id = self.desk_cells.nearest_agent(host, &node_id)?;
+        let agent_id = self.desk.nearest_agent(host, &node_id)?;
         self.agent_workdir(agent_id)
     }
 
@@ -8050,6 +8029,45 @@ impl Workspace {
     /// the screen what this client already holds so it draws at once, and
     /// display it. Picking another chart from the menu comes back through
     /// here and redraws the same surface.
+    /// Asks every host the same usage question; the answers merge as
+    /// they come.
+    fn ask_every_host(&self, request: Request, cx: &mut Context<Self>) {
+        for host in self.hosts.ids() {
+            self.request(host, request.clone(), cx, move |this, reply, cx| {
+                this.usage_arrived(host, reply, cx)
+            });
+        }
+    }
+
+    fn usage_arrived(&mut self, host: HostId, reply: Reply, cx: &mut Context<Self>) {
+        match reply {
+            Reply::QuotaHistory { series } => {
+                self.hosts.set_quota_history(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let history = self.hosts.merged_quota_history();
+                    let active = self.hosts.active_quota_namespaces();
+                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
+                }
+            }
+            Reply::GlobalUsage { series } => {
+                self.usage.record_global(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let usage = self.usage.merged_global();
+                    view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
+                }
+            }
+            Reply::AgentCostDistribution { series } => {
+                self.usage.record_agent_cost(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let usage = self.usage.merged_agent_cost();
+                    view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
+                }
+            }
+            _ => return,
+        }
+        cx.notify();
+    }
+
     pub(crate) fn open_usage_chart(
         &mut self,
         chart: crate::usage::Chart,
@@ -8064,20 +8082,18 @@ impl Workspace {
         // the answers come back.
         match crate::usage::Usage::request_for(chart, days, now_ms()) {
             crate::usage::Request::QuotaHistory => {
-                self.hosts.broadcast(|| ClientMessage::QuotaHistory);
+                self.ask_every_host(Request::QuotaHistory, cx);
                 let history = self.hosts.merged_quota_history();
                 let active = self.hosts.active_quota_namespaces();
                 view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
             }
             crate::usage::Request::GlobalUsage { since_ms } => {
-                self.hosts
-                    .broadcast(|| ClientMessage::GlobalUsage { since_ms });
+                self.ask_every_host(Request::GlobalUsage { since_ms }, cx);
                 let usage = self.usage.merged_global();
                 view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
             }
             crate::usage::Request::AgentCostDistribution { since_ms } => {
-                self.hosts
-                    .broadcast(|| ClientMessage::AgentCostDistribution { since_ms });
+                self.ask_every_host(Request::AgentCostDistribution { since_ms }, cx);
                 let usage = self.usage.merged_agent_cost();
                 view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
             }
@@ -8166,15 +8182,14 @@ impl Workspace {
     fn paste_desk_semantic_subtree(
         &mut self,
         host: HostId,
-        node_id: rho_desk::cells::Id,
+        node_id: rho_agent_host_proto::desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(capture) = self.desk_semantic_clipboard.clone() else {
             return;
         };
-        let Some((_root, writes, texts)) = self.desk_cells.paste_writes(host, &node_id, &capture)
-        else {
+        let Some((_root, writes, texts)) = self.desk.paste_writes(host, &node_id, &capture) else {
             return;
         };
         if self
@@ -8213,7 +8228,7 @@ impl Workspace {
         model.update(cx, |model, cx| {
             model.go_to_store_point(
                 &editor,
-                rho_agents::transcript::StorePoint {
+                rho_agents_view::transcript::StorePoint {
                     block: 0,
                     offset: 0,
                 },
@@ -8307,7 +8322,7 @@ impl Workspace {
             // through is composed while they do.
             self.echo("composing history", StyleClass::SystemInfo, cx);
             model.update(cx, |model, cx| {
-                model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
+                model.request_history(rho_agents_view::agent_view::HistoryWant::All, window, cx);
             });
         }
         self.prompt_for_query(
@@ -8339,7 +8354,7 @@ impl Workspace {
                 query,
             });
             model.update(cx, |model, cx| {
-                model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
+                model.request_history(rho_agents_view::agent_view::HistoryWant::All, window, cx);
             });
             return;
         }
@@ -8850,7 +8865,6 @@ impl Workspace {
             let focused_surface = self.active_surface().view.telemetry_kind();
             crate::telemetry::record_surfaces(focused_surface, focused_surface.bit());
         }
-        self.sync_diff_visibility(true, cx);
         let sidebar = if self.active_context == ContextId::Slack
             && !matches!(self.active_surface().view, SurfaceView::SlackList(_))
         {
@@ -8883,35 +8897,6 @@ impl Workspace {
     fn dashboard_mode(&self, _window: &Window, cx: &App) -> bool {
         let dashboard = self.dashboard.focus_handle(cx);
         self.overlay_focus.target() == Some(&dashboard)
-    }
-
-    /// Hidden surfaces stay alive as editor buffers, but they must not turn
-    /// worktree events into manifest traffic. Only the visible diff may
-    /// refresh.
-    fn sync_diff_visibility(&self, surface_visible: bool, cx: &mut Context<Self>) {
-        let visible = if surface_visible {
-            match &self.active_surface().view {
-                SurfaceView::Diff(view) => HashSet::from([view.read(cx).model().entity_id()]),
-                _ => HashSet::new(),
-            }
-        } else {
-            HashSet::new()
-        };
-        let models = self
-            .surfaces
-            .values()
-            .flatten()
-            .filter_map(|surface| match &surface.view {
-                SurfaceView::Diff(view) => Some(view.read(cx).model()),
-                _ => None,
-            })
-            .fold(HashMap::new(), |mut models, model| {
-                models.entry(model.entity_id()).or_insert(model);
-                models
-            });
-        for (id, model) in models {
-            model.update(cx, |model, cx| model.set_visible(visible.contains(&id), cx));
-        }
     }
 
     fn render_surface(&self, surface: &Surface) -> gpui::AnyElement {
@@ -8994,12 +8979,6 @@ impl Workspace {
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
-                .into_any_element(),
-            SurfaceView::Diff(view) => div()
-                .id("rho-surface-diff")
-                .size_full()
-                .overflow_hidden()
-                .child(view.clone())
                 .into_any_element(),
             SurfaceView::Terminal(view) => div()
                 .id("rho-surface-terminal")
@@ -9113,10 +9092,15 @@ impl Workspace {
 }
 
 pub(crate) fn resolve_filing_destination(
-    destinations: &[(String, String, HostId, rho_desk::cells::Id)],
+    destinations: &[(
+        String,
+        String,
+        HostId,
+        rho_agent_host_proto::desk::cells::Id,
+    )],
     candidate: &crate::minibuffer::Candidate,
     occurrence: usize,
-) -> Option<(HostId, rho_desk::cells::Id)> {
+) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
     destinations
         .iter()
         .filter(|(value, description, _, _)| {
@@ -9127,10 +9111,10 @@ pub(crate) fn resolve_filing_destination(
 }
 
 /// How a filesystem mode reads in a prompt: the draft field's words.
-fn mode_label(mode: rho_ui_proto::WorksetMode) -> &'static str {
+fn mode_label(mode: rho_agent_host_proto::WorksetMode) -> &'static str {
     match mode {
-        rho_ui_proto::WorksetMode::View => "view",
-        rho_ui_proto::WorksetMode::Exposed => "exposed",
+        rho_agent_host_proto::WorksetMode::View => "view",
+        rho_agent_host_proto::WorksetMode::Exposed => "exposed",
     }
 }
 
@@ -9402,13 +9386,13 @@ impl Render for Workspace {
                 this.open_find(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
-                this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);
+                this.shell_pager_action(rho_agent_host_proto::shell::PagerAction::Continue, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerAll, _, cx| {
-                this.shell_pager_action(rho_ui_proto::shell::PagerAction::Drain, cx);
+                this.shell_pager_action(rho_agent_host_proto::shell::PagerAction::Drain, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerQuit, _, cx| {
-                this.shell_pager_action(rho_ui_proto::shell::PagerAction::Quit, cx);
+                this.shell_pager_action(rho_agent_host_proto::shell::PagerAction::Quit, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentPrevious, window, cx| {
                 this.switch_agent_by_delta(-1, window, cx);
@@ -9736,12 +9720,16 @@ impl Render for Workspace {
 /// The label a new thing wears when the reader picked a label to make it
 /// in. Only a label is a filing; everything else on the desk is a thing,
 /// and a thing is not a place.
-pub(crate) fn filing_property(area: rho_desk::cells::Id) -> Option<rho_desk::cells::Property> {
+pub(crate) fn filing_property(
+    area: rho_agent_host_proto::desk::cells::Id,
+) -> Option<rho_agent_host_proto::desk::cells::Property> {
     match area {
-        label @ rho_desk::cells::Id::Label(_) => Some(rho_desk::cells::Property::Labeled {
-            label,
-            present: true,
-        }),
+        label @ rho_agent_host_proto::desk::cells::Id::Label(_) => {
+            Some(rho_agent_host_proto::desk::cells::Property::Labeled {
+                label,
+                present: true,
+            })
+        }
         _ => None,
     }
 }

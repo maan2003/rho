@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rho_agent_host_proto::{ToolOutputStatus, UnixMs};
 use rho_claude::protocol::{
     AssistantContent, AssistantMessage, OutputContent, SystemCompactMetadata, TokenUsage,
     UserOutputMessage,
 };
-use rho_core::{
-    ProviderSpecificData, StreamingContextItem, ToolCallId, ToolName, ToolOutput, ToolOutputStatus,
-    ToolResult, ToolType, UnixMs,
+use rho_inference::types::{
+    ProviderSpecificData, StreamingContextItem, ToolCallId, ToolName, ToolOutput, ToolResult,
+    ToolType,
 };
 use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde_json::Value;
@@ -23,7 +24,7 @@ impl TaggedSenax for ClaudeProviderSpecificData {
 }
 
 senax_encoder::__private::inventory::submit! {
-    rho_core::__SenaxProviderSpecificDataEntry::new(
+    rho_inference::types::__SenaxProviderSpecificDataEntry::new(
         ClaudeProviderSpecificData::TAG,
         |mut body: bytes::Bytes| -> senax_encoder::Result<Box<dyn ProviderSpecificData>> {
             use bytes::Buf as _;

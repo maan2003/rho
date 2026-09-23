@@ -24,7 +24,7 @@ multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 path = { path = "../../vendor/zed/crates/path" }
 rho-hosts = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
-rho-ui-proto.workspace = true
+rho-agent-host-proto.workspace = true
 rho-window = { workspace = true }
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }

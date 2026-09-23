@@ -1,11 +1,12 @@
 //! The machines this client can reach.
 //!
 //! One connection per attached daemon, the handshake that brings it up, and
-//! the events it produces, fanned out to whoever asked for that kind. The
-//! crate holds no agent state, no desk state and no window state: what it
-//! knows is which machines exist, whether they are answering, and how to say
-//! something to one of them. Everything that has an opinion about what was
-//! said goes through here rather than reaching a socket itself.
+//! the streams it carries. The control stream's events go to one reader
+//! ([`HostSink`]); every other long-lived stream belongs to a client that
+//! hands the host a [`HostStream`] to run, the agents client's and the
+//! desk's among them. The crate holds no agent state, no desk state and no
+//! window state: what it knows is which machines exist, whether they are
+//! answering, and how to reach one of them.
 
 pub mod connection;
 pub mod hosts;
@@ -13,6 +14,10 @@ pub mod realtime_client;
 pub mod saved;
 
 pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, spawn};
+
+/// How a stream reaches its host: another Unix connection, or another
+/// bi-stream on the host's authenticated iroh connection.
+pub type Dialer = rho_rpc::Dialer;
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
 
 /// Which attached daemon. Assigned in attachment order; agent ids are
@@ -117,6 +122,28 @@ pub trait HostSink: Send + Sync + 'static {
     /// Whether the reader has gone. A connection that finds nobody
     /// listening stops rather than dialling again for nothing.
     fn is_closed(&self) -> bool;
+}
+
+/// A channel is a sink: its receiver is the reader.
+impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
+    fn send(&self, event: HostEvent) -> Result<(), SinkClosed> {
+        self.unbounded_send(event).map_err(|_| SinkClosed)
+    }
+
+    fn is_closed(&self) -> bool {
+        futures::channel::mpsc::UnboundedSender::is_closed(self)
+    }
+}
+
+/// A stream a client keeps to one host beside the control stream. It opens
+/// once the host is ready and lasts the connection: when it ends, so does
+/// the connection, and on the next one every stream opens again.
+pub trait HostStream: Send + Sync + 'static {
+    /// What the stream is called when it is why a connection went.
+    fn name(&self) -> &'static str;
+
+    /// The stream for one connection, from its dial to its end.
+    fn run(&self, dialer: Dialer) -> futures::future::BoxFuture<'static, anyhow::Result<()>>;
 }
 
 /// A sink with no reader: for a `Hosts` that stands in a test for the

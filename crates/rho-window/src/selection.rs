@@ -10,7 +10,7 @@
 //! agent. As the desk and Slack screens move out of the workspace this
 //! grows their panes too; it is the window's list, not the agents crate's.
 
-use rho_core::AgentId;
+use rho_agent_host_proto::AgentId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActivePane {
@@ -62,7 +62,7 @@ impl Selection {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::AgentIdDomain;
+    use rho_agent_host_proto::AgentIdDomain;
 
     use super::*;
 

@@ -7,7 +7,7 @@
 
 use editor::display_map::{DisplayPoint, DisplayRow};
 use gpui::{Focusable as _, TestAppContext};
-use rho_agents::state::{UiBlock, UiTool, UiToolStatus};
+use rho_agents_client::state::{UiBlock, UiTool, UiToolStatus};
 
 use super::{
     active_editor, agent, bind_test_keymaps, display_text, feed_frame, has_display_elision, state,
@@ -27,13 +27,13 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
             id: format!("tool-{ix}"),
             name: "shell_command".to_owned(),
             arguments: format!("echo {ix}"),
-            format: rho_ui_proto::mirror::ArgumentsFormat::Text,
+            format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
             preview: None,
             status: UiToolStatus::Success,
             output: Some(format!("ok {ix}")),
             error: None,
-            started_at: Some(rho_core::UnixMs(1_000)),
-            finished_at: Some(rho_core::UnixMs(3_500)),
+            started_at: Some(rho_agent_host_proto::UnixMs(1_000)),
+            finished_at: Some(rho_agent_host_proto::UnixMs(3_500)),
             metadata: None,
         })
     }));

@@ -9,7 +9,7 @@ use std::io::Cursor;
 use anyhow::{Context as _, ensure};
 use image::imageops::FilterType;
 use image::{ImageDecoder as _, ImageReader};
-use rho_core::{ImageContent, ImageDetail};
+use rho_inference::types::{ImageContent, ImageDetail};
 use tokio::sync::Semaphore;
 
 pub const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;

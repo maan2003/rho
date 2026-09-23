@@ -69,7 +69,6 @@ pub(crate) enum Command {
     Shell,
     ShellClose,
     Wayland,
-    Changes,
     Terminal,
     NewTerminal,
     UndoVerdict,
@@ -302,17 +301,7 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
             "close shell",
             MenuAction::Command(Command::ShellClose),
         )
-        .when(
-            subject.has_agent(),
-            "d",
-            "changes",
-            MenuAction::Command(Command::Changes),
-        )
-        .item(
-            "w",
-            "agent desktop",
-            MenuAction::Command(Command::Wayland),
-        )
+        .item("w", "agent desktop", MenuAction::Command(Command::Wayland))
         .item("t", "terminal", MenuAction::Command(Command::Terminal))
         .item(
             "shift-t",

@@ -24,8 +24,7 @@
 //! happens or it does not, and the rows drawn again are counted, so this
 //! says the same thing on any machine.
 
-use rho_agents::HostId;
-use rho_hosts::connection::ConnEvent;
+use rho_agents_client::HostId;
 use story::ready_with;
 
 use super::{DeskFixture, agent, next_frame, overview_workspace, story, ui_head};
@@ -38,7 +37,7 @@ fn desk_of_agents(
     count: u64,
 ) -> (
     gpui::WindowHandle<crate::workspace::Workspace>,
-    Vec<rho_ui_proto::AgentId>,
+    Vec<rho_agent_host_proto::AgentId>,
 ) {
     let mut desk = DeskFixture::new();
     let parent = desk.note(None, "Desk");
@@ -89,13 +88,13 @@ fn cost_of_one_agent_s_news(
     cx: &mut gpui::TestAppContext,
     count: u64,
 ) -> (usize, usize, usize, usize, std::time::Duration) {
-    crate::desk_view::take_source_scans();
+    rho_desk_client::desk::take_source_scans();
     let (workspace, agents) = desk_of_agents(cx, count);
     // The build is the walk, and the walk is where a lookup that scans
     // costs the nodes times the sources. Read before the event's own count
     // is started, so the two questions stay separate: this one is the
     // index, the one below is that the walk did not run at all.
-    let built = crate::desk_view::take_source_scans();
+    let built = rho_desk_client::desk::take_source_scans();
     let (taken, patched) = workspace
         .update(cx, |workspace, _, _| {
             workspace.dashboard.deal_work_for_test()
@@ -108,7 +107,7 @@ fn cost_of_one_agent_s_news(
     // both a steadier number and a stronger question: cost must not
     // accumulate across events either.
     const EVENTS: u32 = 32;
-    crate::desk_view::take_source_scans();
+    rho_desk_client::desk::take_source_scans();
     let started = std::time::Instant::now();
     for nth in 0..EVENTS {
         workspace
@@ -116,7 +115,7 @@ fn cost_of_one_agent_s_news(
                 story::feed(
                     workspace,
                     HostId::default(),
-                    ConnEvent::Log {
+                    rho_agents_client::stream::AgentFrame::Log {
                         entries: story::head_entries(story::UiAgentHead {
                             generated_title: Some(format!("renamed {nth}")),
                             ..ui_head(agents[2])
@@ -131,7 +130,7 @@ fn cost_of_one_agent_s_news(
         next_frame(cx, workspace);
     }
     let took = started.elapsed() / EVENTS;
-    let scans = crate::desk_view::take_source_scans() / EVENTS as usize;
+    let scans = rho_desk_client::desk::take_source_scans() / EVENTS as usize;
 
     let (taken_after, patched_after) = workspace
         .update(cx, |workspace, _, _| {
