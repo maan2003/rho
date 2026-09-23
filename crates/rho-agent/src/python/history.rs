@@ -5,7 +5,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple};
-use rho_core::{
+use rho_agent_types::{
     ContentPart, ContextBlock, InferenceResponseItem, MessageSender, ProviderSpecificData,
     ToolOutputStatus, ToolType,
 };
@@ -103,14 +103,14 @@ impl<'py> Item<'py> {
         self.set("text", text)?.set("content", parts)
     }
 
-    fn images(self, images: &[rho_core::ImageContent]) -> PyResult<Self> {
+    fn images(self, images: &[rho_agent_types::ImageContent]) -> PyResult<Self> {
         let make = self.kernel.getattr("HistoryImage")?;
         let images = images
             .iter()
             .map(|image| {
                 let detail = match image.detail {
-                    rho_core::ImageDetail::High => "high",
-                    rho_core::ImageDetail::Original => "original",
+                    rho_agent_types::ImageDetail::High => "high",
+                    rho_agent_types::ImageDetail::Original => "original",
                 };
                 make.call1((
                     &image.media_type,
@@ -235,8 +235,8 @@ fn history_item<'py>(
                     .set(
                         "phase",
                         phase.map(|phase| match phase {
-                            rho_core::MessagePhase::Commentary => "commentary",
-                            rho_core::MessagePhase::FinalAnswer => "final_answer",
+                            rho_agent_types::MessagePhase::Commentary => "commentary",
+                            rho_agent_types::MessagePhase::FinalAnswer => "final_answer",
                         }),
                     )?
                     .build(),

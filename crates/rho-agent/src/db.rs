@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-use rho_core::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_fs_view::{Place, WorksetMode};
 use rho_inference::PromptCacheKey;
@@ -255,7 +255,9 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
         }
 }
 
-pub use rho_core::{AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence};
+pub use rho_agent_types::{
+    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
+};
 
 /// A position in one agent's log: dense from zero, never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
@@ -588,8 +590,8 @@ pub trait AgentReadTxnExt {
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch>;
     /// Admission is an external-effects fact, never undone by transcript
     /// rewind.
-    fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_core::ExecId) -> bool;
-    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_core::ExecId>;
+    fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_agent_types::ExecId) -> bool;
+    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_agent_types::ExecId>;
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
     /// Newest text-bearing visible rows, read backward and bounded before
@@ -862,7 +864,7 @@ impl AgentReadTxnExt for ReadTxn {
         pending
     }
 
-    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_core::ExecId> {
+    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_agent_types::ExecId> {
         let log = self.open_table(AGENT_LOG);
         let mut ids = Vec::new();
         // All branches, not only visible history: rewind must not reuse identities.
@@ -874,9 +876,9 @@ impl AgentReadTxnExt for ReadTxn {
                 event.native_event()
             {
                 for block in output {
-                    if let rho_core::ContextBlock::InferenceResponse { items, .. } = block {
+                    if let rho_agent_types::ContextBlock::InferenceResponse { items, .. } = block {
                         ids.extend(items.iter().filter_map(|item| match item {
-                            rho_core::InferenceResponseItem::ToolCall { id, .. } => {
+                            rho_agent_types::InferenceResponseItem::ToolCall { id, .. } => {
                                 Some(id.clone())
                             }
                             _ => None,
@@ -888,7 +890,7 @@ impl AgentReadTxnExt for ReadTxn {
         ids
     }
 
-    fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_core::ExecId) -> bool {
+    fn agent_exec_was_admitted(&self, agent_id: AgentId, exec: &rho_agent_types::ExecId) -> bool {
         let log = self.open_table(AGENT_LOG);
         rows(log.range(agent_range(agent_id))).any(|(_, event)| {
             if let AgentEvent::ClaudeExecAdmitted { call, .. } = &event {
@@ -896,7 +898,7 @@ impl AgentReadTxnExt for ReadTxn {
             }
             match event.native_event() {
                 Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =>
-                    output.iter().filter_map(|entry| match entry { rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None }).flatten().any(|item| matches!(item, rho_core::InferenceResponseItem::ToolCall { id, .. } if id == exec)),
+                    output.iter().filter_map(|entry| match entry { rho_agent_types::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None }).flatten().any(|item| matches!(item, rho_agent_types::InferenceResponseItem::ToolCall { id, .. } if id == exec)),
                 _ => false,
             }
         })
@@ -1357,7 +1359,7 @@ fn carries_notice(event: &AgentEvent<'_>) -> bool {
     matches!(
         event,
         AgentEvent::Accepted(crate::QueuedInput {
-            source: rho_core::MessageSender::User,
+            source: rho_agent_types::MessageSender::User,
             kind: crate::InputKind::Message { .. },
             ..
         }) | AgentEvent::Transcript {

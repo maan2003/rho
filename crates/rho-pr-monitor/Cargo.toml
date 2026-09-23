@@ -17,7 +17,7 @@ redb.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 rho-agent.workspace = true
-rho-core.workspace = true
+rho-agent-types.workspace = true
 rustls.workspace = true
 rho-db.workspace = true
 senax-encoder.workspace = true

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use redb::{TableDefinition, TableHandle as _};
-use rho_core::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::watch;

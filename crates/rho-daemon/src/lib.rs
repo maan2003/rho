@@ -13,7 +13,7 @@ use rho_agent::db::{
     QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_core::ContentPart;
+use rho_agent_types::ContentPart;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use rho_ui_proto::server::{Server, ServerConnection};
@@ -1635,8 +1635,8 @@ fn combined_quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSumma
 }
 
 fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
-    let now = rho_core::UnixMs::now().0;
-    let since = rho_core::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
+    let now = rho_agent_types::UnixMs::now().0;
+    let since = rho_agent_types::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
         .into_iter()
         .filter_map(|((model, auth_namespace), observations)| {
@@ -1730,7 +1730,7 @@ fn hourly_global_usage_series(
 
 fn hourly_agent_cost_series(
     db: &RhoDb,
-    since: rho_core::UnixMs,
+    since: rho_agent_types::UnixMs,
 ) -> anyhow::Result<Vec<AgentCostSeries>> {
     const MAX_HOURLY_AGENT_COST_BUCKETS: usize = 500_000;
 
@@ -1800,8 +1800,8 @@ fn merge_hourly_agent_cost_bucket(
 
 fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
     let mut series = claude_quota_history(db);
-    let since = rho_core::UnixMs(
-        rho_core::UnixMs::now()
+    let since = rho_agent_types::UnixMs(
+        rho_agent_types::UnixMs::now()
             .0
             .saturating_sub(30 * 24 * 60 * 60 * 1_000),
     );
@@ -1824,8 +1824,8 @@ fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
 }
 
 fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
-    let now = rho_core::UnixMs::now().0;
-    let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
+    let now = rho_agent_types::UnixMs::now().0;
+    let since = rho_agent_types::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
         .into_iter()
         .filter_map(|((model, auth_namespace), observations)| {
@@ -1848,7 +1848,7 @@ fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
 
 fn quota_observation_groups(
     db: &RhoDb,
-    since: rho_core::UnixMs,
+    since: rho_agent_types::UnixMs,
 ) -> BTreeMap<(QuotaModel, Option<String>), Vec<QuotaObservationRecord>> {
     let read = db.read();
     let mut groups = BTreeMap::new();
@@ -1925,7 +1925,7 @@ fn spawn_claude_quota_recorder(
                     continue;
                 }
             };
-            let observed_at = rho_core::UnixMs::now();
+            let observed_at = rho_agent_types::UnixMs::now();
             let mut write = db.write().await;
             let mut changed = write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
@@ -2312,7 +2312,7 @@ async fn handle_message(
             let usage = services
                 .db
                 .read()
-                .global_agent_usage(rho_core::UnixMs(since_ms));
+                .global_agent_usage(rho_agent_types::UnixMs(since_ms));
             let series = hourly_global_usage_series(usage);
             let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
             Ok(Refresh::None)
@@ -2322,17 +2322,17 @@ async fn handle_message(
             const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_ui_proto::AGENT_COST_WINDOW_DAYS;
 
             services.pool.flush_agent_usage(None).await;
-            let now = rho_core::UnixMs::now().0;
+            let now = rho_agent_types::UnixMs::now().0;
             let earliest = since_ms
                 .saturating_sub(rho_ui_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
                 .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
-            let response = match hourly_agent_cost_series(&services.db, rho_core::UnixMs(earliest))
-            {
-                Ok(series) => ServerMessage::AgentCostDistribution { series },
-                Err(error) => ServerMessage::Error {
-                    message: error.to_string(),
-                },
-            };
+            let response =
+                match hourly_agent_cost_series(&services.db, rho_agent_types::UnixMs(earliest)) {
+                    Ok(series) => ServerMessage::AgentCostDistribution { series },
+                    Err(error) => ServerMessage::Error {
+                        message: error.to_string(),
+                    },
+                };
             let _ = outgoing_tx.send(response);
             Ok(Refresh::None)
         }
@@ -2617,7 +2617,7 @@ async fn handle_message(
             // message is accepted, the log when the message's row lands.
             let notice = agent.head().pending_notice;
             if let Some(text) = notice.clone() {
-                content.insert(0, rho_core::ContentPart::Text { text });
+                content.insert(0, rho_agent_types::ContentPart::Text { text });
             }
             agent.send_user_content_accepted(content, delivery).await?;
             if notice.is_some() {
@@ -3333,10 +3333,12 @@ fn agent_detail(
                 input
                     .iter()
                     .flat_map(|item| match item {
-                        rho_core::ContextBlock::ToolResults { results } => {
+                        rho_agent_types::ContextBlock::ToolResults { results } => {
                             results.iter().map(detail_result).collect::<Vec<_>>()
                         }
-                        rho_core::ContextBlock::ToolUpdate(update) => vec![detail_update(&update)],
+                        rho_agent_types::ContextBlock::ToolUpdate(update) => {
+                            vec![detail_update(&update)]
+                        }
                         _ => Vec::new(),
                     })
                     .collect(),
@@ -3345,7 +3347,9 @@ fn agent_detail(
                 output
                     .iter()
                     .filter_map(|entry| match entry {
-                        rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items),
+                        rho_agent_types::ContextBlock::InferenceResponse { items, .. } => {
+                            Some(items)
+                        }
                         _ => None,
                     })
                     .flatten()
@@ -3357,8 +3361,8 @@ fn agent_detail(
                     .items
                     .iter()
                     .filter_map(|slot| match slot {
-                        rho_core::StreamingContextItemState::Pending(item)
-                        | rho_core::StreamingContextItemState::Finished(item) => item
+                        rho_agent_types::StreamingContextItemState::Pending(item)
+                        | rho_agent_types::StreamingContextItemState::Finished(item) => item
                             .to_context_item()
                             .ok()
                             .and_then(|item| rho_agent::mirror::item(&item)),
@@ -3397,11 +3401,11 @@ fn agent_detail(
                 .items
                 .iter()
                 .filter_map(|slot| match slot {
-                    rho_core::StreamingContextItemState::Pending(item)
-                    | rho_core::StreamingContextItemState::Finished(item) => {
+                    rho_agent_types::StreamingContextItemState::Pending(item)
+                    | rho_agent_types::StreamingContextItemState::Finished(item) => {
                         rho_agent::live::to_item(item)
                     }
-                    rho_core::StreamingContextItemState::Empty => None,
+                    rho_agent_types::StreamingContextItemState::Empty => None,
                 })
                 .collect(),
         ),
@@ -3409,21 +3413,21 @@ fn agent_detail(
     }
 }
 
-fn detail_result(result: &rho_core::ToolResult) -> rho_ui_proto::mirror::DetailResult {
+fn detail_result(result: &rho_agent_types::ToolResult) -> rho_ui_proto::mirror::DetailResult {
     use rho_ui_proto::mirror::ToolStatus;
     rho_ui_proto::mirror::DetailResult {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_core::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_core::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_core::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_types::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_types::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         output: result.body.recorded_output().to_owned(),
         error: None,
     }
 }
 
-fn detail_update(update: &rho_core::ToolUpdate) -> rho_ui_proto::mirror::DetailResult {
+fn detail_update(update: &rho_agent_types::ToolUpdate) -> rho_ui_proto::mirror::DetailResult {
     rho_ui_proto::mirror::DetailResult {
         id: update.call_id.as_str().to_owned(),
         status: rho_ui_proto::mirror::ToolStatus::Success,
@@ -3588,7 +3592,7 @@ mod tests {
     use std::sync::Arc;
 
     use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
-    use rho_core::ContentPart;
+    use rho_agent_types::ContentPart;
     use rho_db::RhoDb;
     use rho_ui_proto::ServerMessage;
 
@@ -3602,30 +3606,30 @@ mod tests {
 
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
-        let result = rho_core::ToolResult {
-            call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_core::ToolType::Custom,
-            body: rho_core::ToolOutput {
+        let result = rho_agent_types::ToolResult {
+            call_id: rho_agent_types::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_agent_types::ToolType::Custom,
+            body: rho_agent_types::ToolOutput {
                 output: Arc::new("bounded model view".to_owned()),
                 full_output: Some(Arc::new("complete host record".to_owned())),
                 images: Arc::new(Vec::new()),
-                status: rho_core::ToolOutputStatus::Success,
+                status: rho_agent_types::ToolOutputStatus::Success,
             },
-            started_at: rho_core::UnixMs(1),
-            finished_at: rho_core::UnixMs(2),
+            started_at: rho_agent_types::UnixMs(1),
+            finished_at: rho_agent_types::UnixMs(2),
             metadata: None,
         };
 
         assert_eq!(super::detail_result(&result).output, "complete host record");
 
-        let update = rho_core::ToolUpdate {
+        let update = rho_agent_types::ToolUpdate {
             status: None,
             images: Default::default(),
-            call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_core::ToolType::Custom,
+            call_id: rho_agent_types::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_agent_types::ToolType::Custom,
             output: Arc::new("bounded update".to_owned()),
             full_output: Some(Arc::new("complete update".to_owned())),
-            at: rho_core::UnixMs(3),
+            at: rho_agent_types::UnixMs(3),
         };
         assert_eq!(super::detail_update(&update).output, "complete update");
     }
@@ -3760,7 +3764,7 @@ mod tests {
     #[test]
     fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
         let agent_id =
-            rho_agent::db::AgentId::from_counter(1, &rho_core::AgentIdDomain(0)).unwrap();
+            rho_agent::db::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
             bucket_start_ms,
             model: AgentUsageModel::GPT,
@@ -3781,7 +3785,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_core::UnixMs(at),
+            observed_at: rho_agent_types::UnixMs(at),
             used_percent,
             reset_at_unix,
         };
@@ -3803,7 +3807,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_core::UnixMs(at),
+            observed_at: rho_agent_types::UnixMs(at),
             used_percent,
             reset_at_unix: Some(100),
         };
@@ -3825,7 +3829,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_core::UnixMs(at),
+            observed_at: rho_agent_types::UnixMs(at),
             used_percent,
             reset_at_unix: Some(reset_at_unix),
         };
@@ -3845,14 +3849,14 @@ mod tests {
     async fn claude_quota_history_includes_every_stored_point() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_core::UnixMs::now().0;
+        let now = rho_agent_types::UnixMs::now().0;
         let mut write = db.write().await;
         for index in 0..5 {
             assert!(write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,
                 auth_namespace: Some("default".to_owned()),
-                observed_at: rho_core::UnixMs(now - (4 - index) * 1_000),
+                observed_at: rho_agent_types::UnixMs(now - (4 - index) * 1_000),
                 used_percent: index as u8,
                 reset_at_unix: Some(123),
             }));
@@ -3861,7 +3865,7 @@ mod tests {
             provider: QuotaProvider::Claude,
             model: QuotaModel::FABLE,
             auth_namespace: None,
-            observed_at: rho_core::UnixMs(now),
+            observed_at: rho_agent_types::UnixMs(now),
             used_percent: 25,
             reset_at_unix: Some(456),
         }));
@@ -3897,14 +3901,14 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: Some("work".to_owned()),
-            observed_at: rho_core::UnixMs(123),
+            observed_at: rho_agent_types::UnixMs(123),
             used_percent: 42,
             reset_at_unix: Some(456),
         }));
         write.commit();
 
         let inference = rho_inference::Inference::new(db).await.unwrap();
-        let history = inference.quota_history(rho_core::UnixMs(0));
+        let history = inference.quota_history(rho_agent_types::UnixMs(0));
 
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].auth_namespace, "work");
@@ -3915,7 +3919,7 @@ mod tests {
     async fn quota_summary_expires_stale_provider_window() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_core::UnixMs::now();
+        let now = rho_agent_types::UnixMs::now();
         let mut write = db.write().await;
         assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,

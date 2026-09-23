@@ -600,7 +600,9 @@ async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 async fn delete_agents(db_path: Option<PathBuf>, agents: &[String]) -> anyhow::Result<()> {
     let agents = agents
         .iter()
-        .map(|id| rho_core::AgentId::from_encoded(id).with_context(|| format!("agent id {id}")))
+        .map(|id| {
+            rho_agent_types::AgentId::from_encoded(id).with_context(|| format!("agent id {id}"))
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let path = db_path
         .map(Ok)

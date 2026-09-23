@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_core::{AgentRole, ContentPart};
+use rho_agent_types::{AgentRole, ContentPart};
 use rho_ui_proto::client::Client;
 use rho_ui_proto::mirror::MirrorEvent;
 use rho_ui_proto::{ClientMessage, JoinTarget, ServerMessage, StartMode};

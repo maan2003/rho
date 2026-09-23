@@ -14,7 +14,7 @@ members = [
   "crates/rho-claude-usage",
   "crates/rho-cli",
   "crates/rho-context-config",
-  "crates/rho-core",
+  "crates/rho-agent-types",
   "crates/rho-daemon",
   "crates/rho-desktop-proto",
   "crates/rho-desktop-media",
@@ -126,7 +126,7 @@ rho-claude = { path = "crates/rho-claude" }
 rho-claude-usage = { path = "crates/rho-claude-usage" }
 rho-cli = { path = "crates/rho-cli" }
 rho-context-config = { path = "crates/rho-context-config" }
-rho-core = { path = "crates/rho-core" }
+rho-agent-types = { path = "crates/rho-agent-types" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-desk = { path = "crates/rho-desk" }

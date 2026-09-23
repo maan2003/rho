@@ -698,7 +698,7 @@ fn json_text_field(arguments: &str, key: &str, format: ArgumentsFormat) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use rho_core::UnixMs;
+    use rho_agent_types::UnixMs;
 
     use super::*;
 
@@ -1068,7 +1068,7 @@ mod tests {
     #[test]
     fn exec_timing_names_provider_phases_not_python_duration() {
         let mut exec = tool(UiToolStatus::Success);
-        exec.timing = rho_core::ExecTiming {
+        exec.timing = rho_agent_types::ExecTiming {
             first_block_at: Some(UnixMs(100)),
             arguments_finished_at: Some(UnixMs(2100)),
             response_finished_at: Some(UnixMs(2600)),

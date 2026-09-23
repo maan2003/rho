@@ -13,7 +13,7 @@ base64.workspace = true
 bytes.workspace = true
 camino.workspace = true
 rho-fs-view.workspace = true
-rho-core.workspace = true
+rho-agent-types.workspace = true
 rustix = { version = "1", features = ["process"] }
 senax-encoder.workspace = true
 serde.workspace = true

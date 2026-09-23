@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use rho_core::{InferenceEvent, InferenceRequest};
+use rho_agent_types::{InferenceEvent, InferenceRequest};
 use senax_encoder::{Decode, Encode};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 

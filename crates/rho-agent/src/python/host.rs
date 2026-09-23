@@ -9,7 +9,7 @@ use pyo3::PyClassInitializer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rho_core::{AgentId, ImageDetail, ToolExecutionContext};
+use rho_agent_types::{AgentId, ImageDetail, ToolExecutionContext};
 use rho_inference::Inference;
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::{WebRequest, WebSearchTools};
@@ -247,7 +247,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use rho_core::{AdvisorIntelligence, ExecCall, ToolOutputStatus};
+    use rho_agent_types::{AdvisorIntelligence, ExecCall, ToolOutputStatus};
 
     use super::*;
     use crate::python::PythonNotebook;
@@ -288,7 +288,7 @@ mod tests {
         })
     }
 
-    async fn run(exports: Vec<Export>, source: &str) -> rho_core::ToolOutput {
+    async fn run(exports: Vec<Export>, source: &str) -> rho_agent_types::ToolOutput {
         let directory = tempfile::tempdir().unwrap();
         let shell = ShellTools::in_directory(
             Duration::from_secs(5),

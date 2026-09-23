@@ -217,7 +217,7 @@ impl PrMonitor {
         tokio::time::timeout(
             DELIVERY_TIMEOUT,
             agent.send_user_content_accepted(
-                vec![rho_core::ContentPart::Text { text: message }],
+                vec![rho_agent_types::ContentPart::Text { text: message }],
                 MessageDelivery::NextRequest,
             ),
         )

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentRole, EngineerIntelligence, TurnEdge, TurnOutcome};
 use rho_agent::{AgentEvent, MessageDelivery, StartPlace};
-use rho_core::{ContextBlock, InferenceResponseItem};
+use rho_agent_types::{ContextBlock, InferenceResponseItem};
 use rho_fs_view::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
@@ -208,8 +208,8 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                                 InferenceResponseItem::AssistantMessage {
                                     content, phase, ..
                                 } => {
-                                    let text: String = rho_core::text_content(content);
-                                    if *phase != Some(rho_core::MessagePhase::Commentary) {
+                                    let text: String = rho_agent_types::text_content(content);
+                                    if *phase != Some(rho_agent_types::MessagePhase::Commentary) {
                                         if !final_answer.is_empty() {
                                             final_answer.push('\n');
                                         }

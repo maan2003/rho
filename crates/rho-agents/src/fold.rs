@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use rho_core::{AgentId, AgentRole, UnixMs};
+use rho_agent_types::{AgentId, AgentRole, UnixMs};
 use rho_ui_proto::mirror::{
     AgentPos, AgentWant, MirrorEvent, PresentationField, RuntimeKind, SpawnedBy, Speaker,
     ToolOutcome, ToolStatus, TurnEdge, TurnOutcome,
@@ -341,8 +341,8 @@ pub fn transcript(events: &[(AgentPos, MirrorEvent)]) -> UiAgentState {
 /// entry costs what it changes and never a walk of the whole mirror.
 #[derive(Clone, Debug, Default)]
 pub struct TranscriptFold {
-    exec_timings: Arc<std::collections::BTreeMap<String, rho_core::ExecTiming>>,
-    timing_events: Vec<(AgentPos, String, rho_core::ExecMilestone, UnixMs)>,
+    exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
+    timing_events: Vec<(AgentPos, String, rho_agent_types::ExecMilestone, UnixMs)>,
     /// One past the newest position folded.
     next: AgentPos,
     /// Shared with every state handed out, so a row costs the blocks it
@@ -370,7 +370,7 @@ pub struct TranscriptFold {
 /// already was, so a reader replaces a suffix rather than a state.
 #[derive(Clone, Debug)]
 pub struct FoldDelta {
-    pub exec_timings: Arc<std::collections::BTreeMap<String, rho_core::ExecTiming>>,
+    pub exec_timings: Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
@@ -720,7 +720,7 @@ fn delivered(queued: UiBlock) -> UiBlock {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::MessageDelivery;
+    use rho_agent_types::MessageDelivery;
     use rho_ui_proto::mirror::{ArgumentsFormat, Item, ToolOutcome, Usage};
 
     use super::*;
@@ -1365,7 +1365,7 @@ mod tests {
     }
     #[test]
     fn exec_observations_survive_commit_and_rewind_without_retiming() {
-        use rho_core::ExecMilestone::*;
+        use rho_agent_types::ExecMilestone::*;
         let mut fold = TranscriptFold::default();
         let tell = |fold: &mut TranscriptFold, pos, milestone, at| {
             fold.tell(

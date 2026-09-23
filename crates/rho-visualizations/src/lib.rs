@@ -1,7 +1,7 @@
 //! Immutable visualization artifacts stored in RhoDB.
 
 use redb::TableDefinition;
-use rho_core::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 use sha2::{Digest as _, Sha256};

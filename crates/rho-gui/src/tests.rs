@@ -11,11 +11,11 @@ use gpui::{
     point, px, size,
 };
 use language::InlayId;
+use rho_agent_types::UnixMs;
 use rho_agents::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
 use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
-use rho_core::UnixMs;
 use rho_hosts::connection::ConnEvent;
 use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
@@ -6094,8 +6094,8 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         status: UiToolStatus::Success,
         output: None,
         error: None,
-        started_at: Some(rho_core::UnixMs(10)),
-        finished_at: Some(rho_core::UnixMs(20)),
+        started_at: Some(rho_agent_types::UnixMs(10)),
+        finished_at: Some(rho_agent_types::UnixMs(20)),
         metadata: None,
     });
     feed_frame(

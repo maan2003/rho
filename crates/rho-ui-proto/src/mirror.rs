@@ -9,7 +9,7 @@
 //! This vocabulary is shared with the daemon's raw log: the runtimes write
 //! these very types, so there are no twins to keep in step.
 
-use rho_core::{AgentId, AgentRole, MessageDelivery, UnixMs};
+use rho_agent_types::{AgentId, AgentRole, MessageDelivery, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::{Place, WorksetMode};
@@ -243,7 +243,7 @@ pub enum MirrorEvent {
     },
     ExecObserved {
         id: String,
-        milestone: rho_core::ExecMilestone,
+        milestone: rho_agent_types::ExecMilestone,
         at: UnixMs,
     },
 }
@@ -353,11 +353,11 @@ pub enum ArgumentsFormat {
     Text,
 }
 
-impl From<rho_core::ToolType> for ArgumentsFormat {
-    fn from(tool_type: rho_core::ToolType) -> Self {
+impl From<rho_agent_types::ToolType> for ArgumentsFormat {
+    fn from(tool_type: rho_agent_types::ToolType) -> Self {
         match tool_type {
-            rho_core::ToolType::Function => Self::Json,
-            rho_core::ToolType::Custom => Self::Text,
+            rho_agent_types::ToolType::Function => Self::Json,
+            rho_agent_types::ToolType::Custom => Self::Text,
         }
     }
 }

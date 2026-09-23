@@ -1864,7 +1864,10 @@ fn outcome_label(facts: &rho_agents::AgentFacts, wait_days: f64) -> String {
     }
 }
 
-fn reply_wait_days(ended: rho_core::UnixMs, now: chrono::DateTime<chrono::FixedOffset>) -> f64 {
+fn reply_wait_days(
+    ended: rho_agent_types::UnixMs,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> f64 {
     (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0
 }
 

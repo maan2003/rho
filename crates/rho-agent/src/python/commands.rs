@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use rho_core::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, watch};

@@ -12,16 +12,16 @@ pub enum Action {
     TerminalList,
     ShellList,
     ShellStart {
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
         cwd: camino::Utf8PathBuf,
         program: std::path::PathBuf,
         pager: std::path::PathBuf,
     },
     ShellClose {
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
     },
     Desktop {
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
         session: String,
     },
     DesktopList,
@@ -30,7 +30,7 @@ pub enum Action {
 #[derive(Encode, Decode)]
 pub enum Attach {
     Terminal {
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
         terminal: u64,
         create: bool,
         cols: u16,
@@ -39,7 +39,7 @@ pub enum Attach {
         shell: String,
     },
     Shell {
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
     },
 }
 

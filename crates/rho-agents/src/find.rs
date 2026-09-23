@@ -55,7 +55,7 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 
 #[cfg(test)]
 mod tests {
-    use rho_core::{MessageDelivery, UnixMs};
+    use rho_agent_types::{MessageDelivery, UnixMs};
     use rho_hosts::HostId;
     use rho_ui_proto::AgentIdDomain;
     use rho_ui_proto::mirror::{

@@ -79,10 +79,10 @@ impl HostDeskCells {
 /// this; it is read from the registry every time a view is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSource {
-    pub agent: rho_core::AgentId,
+    pub agent: rho_agent_types::AgentId,
     /// Who asked for this agent. The store's `Parent` is the user's
     /// filing and beats it; this is where the agent came from.
-    pub spawned_by: Option<rho_core::AgentId>,
+    pub spawned_by: Option<rho_agent_types::AgentId>,
     pub workdir: Option<camino::Utf8PathBuf>,
     /// One past the newest story event this client holds: the cursor a
     /// verdict on this agent writes.
@@ -146,7 +146,7 @@ pub struct Sources {
     /// agent, one unit or one page per node it builds, and asking by
     /// scanning made a walk cost the nodes times the sources. The lists
     /// are private so these cannot drift from them.
-    by_agent: HashMap<rho_core::AgentId, usize>,
+    by_agent: HashMap<rho_agent_types::AgentId, usize>,
     by_unit: HashMap<rho_desk::cells::SlackUnit, usize>,
     by_page: HashMap<rho_desk::PageId, usize>,
 }
@@ -228,7 +228,7 @@ impl Sources {
         &self.pages
     }
 
-    fn agent(&self, agent: rho_core::AgentId) -> Option<&AgentSource> {
+    fn agent(&self, agent: rho_agent_types::AgentId) -> Option<&AgentSource> {
         charge_scan(1);
         self.by_agent.get(&agent).map(|at| &self.agents[*at])
     }
@@ -388,7 +388,7 @@ impl DeskNode {
         matches!(self.id, Id::Note(_))
     }
 
-    pub fn agent(&self) -> Option<rho_core::AgentId> {
+    pub fn agent(&self) -> Option<rho_agent_types::AgentId> {
         match &self.id {
             Id::Agent(agent) => Some(*agent),
             _ => None,
@@ -1323,7 +1323,10 @@ impl DeskCells {
     /// the registry; this is where the registry gets it.
     /// The user's verdict on each agent of this host, for the registry
     /// to derive attention from.
-    pub fn agent_verdicts(&self, host: HostId) -> Vec<(rho_core::AgentId, rho_agents::Verdict)> {
+    pub fn agent_verdicts(
+        &self,
+        host: HostId,
+    ) -> Vec<(rho_agent_types::AgentId, rho_agents::Verdict)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1340,7 +1343,10 @@ impl DeskCells {
     /// How the user filed each agent of this host: muted, the names of the
     /// labels on it, and the name they gave it. The registry hides, groups
     /// and titles by this.
-    pub fn agent_filing(&self, host: HostId) -> Vec<(rho_core::AgentId, rho_agents::AgentFiling)> {
+    pub fn agent_filing(
+        &self,
+        host: HostId,
+    ) -> Vec<(rho_agent_types::AgentId, rho_agents::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1375,7 +1381,7 @@ impl DeskCells {
         &self,
         host: HostId,
         touched: &std::collections::BTreeSet<Id>,
-    ) -> Vec<(rho_core::AgentId, rho_agents::AgentFiling)> {
+    ) -> Vec<(rho_agent_types::AgentId, rho_agents::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -2178,7 +2184,7 @@ impl DeskCells {
 
     /// The agent that owns an area: the thing itself when it is an agent,
     /// else the nearest ancestor that is one.
-    pub fn nearest_agent(&self, host: HostId, id: &Id) -> Option<rho_core::AgentId> {
+    pub fn nearest_agent(&self, host: HostId, id: &Id) -> Option<rho_agent_types::AgentId> {
         let nodes = self.nodes(host);
         let mut cursor = Some(id.clone());
         for _ in 0..MAX_ANCESTRY {

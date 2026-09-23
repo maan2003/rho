@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rho_core::ToolType;
+use rho_agent_types::ToolType;
 
 use super::*;
 use crate::boundary::{
@@ -1027,7 +1027,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     let invocation = call("python-sources");
     cells.exec(
         &tool,
-        rho_core::ExecCall {
+        rho_agent_types::ExecCall {
             id: invocation.id,
             source: "command('echo first')\nsecond = command('while [ ! -f release ]; do sleep 0.01; done; echo second')\nawait second\ncommand('while [ ! -f finish ]; do sleep 0.01; done; echo third')".into(),
         },
@@ -1122,7 +1122,7 @@ async fn python_output_order_puts_latest_first_then_older_cells_in_execution_ord
     for id in ["z-oldest", "a-older", "m-latest"] {
         cells.exec(
             &tool,
-            rho_core::ExecCall {
+            rho_agent_types::ExecCall {
                 id: call(id).id,
                 source: "print('x')".into(),
             },

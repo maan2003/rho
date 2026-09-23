@@ -644,17 +644,17 @@ mod tests {
                 spawn_name: Some("the deploy".to_owned()),
                 parent: None,
                 model: "sol".to_owned(),
-                at: rho_core::UnixMs(1_000),
+                at: rho_agent_types::UnixMs(1_000),
             },
             MirrorEvent::Message {
                 from: None,
                 text: "have a look".to_owned(),
-                delivery: rho_core::MessageDelivery::Immediate,
-                at: rho_core::UnixMs(1_000),
+                delivery: rho_agent_types::MessageDelivery::Immediate,
+                at: rho_agent_types::UnixMs(1_000),
             },
             MirrorEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Completed),
-                at: rho_core::UnixMs(2_000),
+                at: rho_agent_types::UnixMs(2_000),
             },
         ]
         .into_iter()

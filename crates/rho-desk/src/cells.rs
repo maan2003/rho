@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
-use rho_core::AgentId;
+use rho_agent_types::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::PageId;
@@ -1168,7 +1168,7 @@ fn wins(new: &Cell, old: &Cell) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::AgentIdDomain;
+    use rho_agent_types::AgentIdDomain;
 
     use super::*;
 

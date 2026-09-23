@@ -134,7 +134,7 @@ impl Transcripts {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::{MessageDelivery, UnixMs};
+    use rho_agent_types::{MessageDelivery, UnixMs};
 
     use super::*;
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rho_core::ToolOutput;
+use rho_agent_types::ToolOutput;
 
 use super::*;
 use crate::inference::Inference;
@@ -128,7 +128,7 @@ fn text_completion_declares_no_tools() {
 #[test]
 fn renders_text_and_image_user_content() {
     let request = inference_request(vec![Arc::new(ContextBlock::UserMessage {
-        sender: rho_core::MessageSender::User,
+        sender: rho_agent_types::MessageSender::User,
         content: vec![
             ContentPart::Text {
                 text: "inspect".to_owned(),
@@ -160,13 +160,14 @@ fn renders_text_and_image_user_content() {
 #[test]
 fn renders_agent_mail_with_supplied_short_label() {
     let session = test_inference_service("gpt-test");
-    let agent_id = rho_core::AgentId::from_counter(1, &rho_core::AgentIdDomain(0)).unwrap();
+    let agent_id =
+        rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
     let mut agent_id_labels = std::collections::BTreeMap::new();
     agent_id_labels.insert(agent_id, Arc::from("eng-h6u7"));
     let request = InferenceRequest {
         instructions: Arc::from("You are rho."),
         input: vec![Arc::new(ContextBlock::UserMessage {
-            sender: rho_core::MessageSender::Agent { id: agent_id },
+            sender: rho_agent_types::MessageSender::Agent { id: agent_id },
             content: vec![ContentPart::Text {
                 text: "done".to_owned(),
             }],
@@ -542,7 +543,7 @@ fn skips_compaction_without_encrypted_content() {
             Some("resp_compaction"),
             vec![InferenceResponseItem::Compaction {
                 provider_specific: Box::new(OpenAiResponsesProviderData::Compaction {
-                    item_id: rho_core::ProviderResponseItemId::try_from("cmp_1").unwrap(),
+                    item_id: rho_agent_types::ProviderResponseItemId::try_from("cmp_1").unwrap(),
                     encrypted_content: String::new(),
                 }),
             }],
@@ -596,16 +597,16 @@ fn serializes_custom_tool_calls_and_results() {
         tool_type: ToolType::Custom,
         body: ToolOutput {
             full_output: None,
-            images: Arc::new(vec![rho_core::ImageContent {
+            images: Arc::new(vec![rho_agent_types::ImageContent {
                 media_type: "image/png".to_owned(),
                 data: vec![1, 2, 3],
-                detail: rho_core::ImageDetail::Original,
+                detail: rho_agent_types::ImageDetail::Original,
             }]),
             output: Arc::from("custom output".to_owned()),
-            status: rho_core::ToolOutputStatus::Success,
+            status: rho_agent_types::ToolOutputStatus::Success,
         },
-        started_at: rho_core::UnixMs(1),
-        finished_at: rho_core::UnixMs(2),
+        started_at: rho_agent_types::UnixMs(1),
+        finished_at: rho_agent_types::UnixMs(2),
         metadata: None,
     };
     let request = inference_request(vec![
@@ -682,25 +683,25 @@ fn exec_updates_are_named_and_unpaired_across_compaction_and_incremental_replay(
                 full_output: None,
                 images: Arc::new(Vec::new()),
                 output: Arc::new("Running".to_owned()),
-                status: rho_core::ToolOutputStatus::Success,
+                status: rho_agent_types::ToolOutputStatus::Success,
             },
-            started_at: rho_core::UnixMs(1),
-            finished_at: rho_core::UnixMs(2),
+            started_at: rho_agent_types::UnixMs(1),
+            finished_at: rho_agent_types::UnixMs(2),
             metadata: None,
         }],
     });
-    let update = Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+    let update = Arc::new(ContextBlock::ToolUpdate(rho_agent_types::ToolUpdate {
         status: None,
-        images: Arc::new(vec![rho_core::ImageContent {
+        images: Arc::new(vec![rho_agent_types::ImageContent {
             media_type: "image/png".into(),
             data: vec![1, 2, 3],
-            detail: rho_core::ImageDetail::Original,
+            detail: rho_agent_types::ImageDetail::Original,
         }]),
         call_id: tool_call_id("call-exec"),
         tool_type: ToolType::Custom,
         output: Arc::new("Command completed".to_owned()),
         full_output: None,
-        at: rho_core::UnixMs(3),
+        at: rho_agent_types::UnixMs(3),
     }));
     let compact = inference_response(
         Some("resp-compact"),
@@ -856,23 +857,23 @@ fn current_exec_reply_precedes_background_updates_and_is_only_paired_once() {
                     full_output: None,
                     images: Arc::new(Vec::new()),
                     output: Arc::new(text.to_owned()),
-                    status: rho_core::ToolOutputStatus::Success,
+                    status: rho_agent_types::ToolOutputStatus::Success,
                 },
-                started_at: rho_core::UnixMs(1),
-                finished_at: rho_core::UnixMs(2),
+                started_at: rho_agent_types::UnixMs(1),
+                finished_at: rho_agent_types::UnixMs(2),
                 metadata: None,
             }],
         })
     };
     let update = |id: &str, text: &str| {
-        Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+        Arc::new(ContextBlock::ToolUpdate(rho_agent_types::ToolUpdate {
             status: None,
             images: Default::default(),
             call_id: tool_call_id(id),
             tool_type: ToolType::Custom,
             output: Arc::new(text.to_owned()),
             full_output: None,
-            at: rho_core::UnixMs(3),
+            at: rho_agent_types::UnixMs(3),
         }))
     };
     let blocks = vec![
@@ -954,10 +955,10 @@ fn rotated_context_keeps_developer_notices_and_old_tool_output_without_orphan_ca
     );
     let mut result = tool_result_success(tool_call_id("old-call"), "late output");
     result.tool_type = ToolType::Custom;
-    result.body.images = Arc::new(vec![rho_core::ImageContent {
+    result.body.images = Arc::new(vec![rho_agent_types::ImageContent {
         media_type: "image/png".into(),
         data: vec![1, 2, 3],
-        detail: rho_core::ImageDetail::High,
+        detail: rho_agent_types::ImageDetail::High,
     }]);
     let mut request = inference_request(vec![
         user_block("discard this old request"),
@@ -968,7 +969,7 @@ fn rotated_context_keeps_developer_notices_and_old_tool_output_without_orphan_ca
         Arc::new(ContextBlock::ToolResults {
             results: vec![result],
         }),
-        Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+        Arc::new(ContextBlock::ToolUpdate(rho_agent_types::ToolUpdate {
             status: None,
             images: Default::default(),
             call_id: tool_call_id("old-call"),
@@ -1175,13 +1176,13 @@ fn eviction_removes_only_selected_tool_exchanges_and_invalidates_old_continuatio
                 tool_result_success(tool_call_id("recent"), "recent-result"),
             ],
         }),
-        Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+        Arc::new(ContextBlock::ToolUpdate(rho_agent_types::ToolUpdate {
             call_id: tool_call_id("old"),
             tool_type: ToolType::Function,
             output: Arc::new("old-late-output".into()),
             full_output: None,
-            status: Some(rho_core::ToolOutputStatus::Success),
-            at: rho_core::UnixMs(1),
+            status: Some(rho_agent_types::ToolOutputStatus::Success),
+            at: rho_agent_types::UnixMs(1),
             images: Default::default(),
         })),
         Arc::new(ContextBlock::ToolHistoryEvicted {

@@ -39,7 +39,7 @@ tracing = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-rho-core = { workspace = true }
+rho-agent-types = { workspace = true }
 tempfile = { workspace = true }
 
 [dependencies.rho-desktop-media]

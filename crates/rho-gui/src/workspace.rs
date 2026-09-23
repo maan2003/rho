@@ -28,6 +28,7 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
+use rho_agent_types::ContentPart;
 use rho_agents::agent_view::AgentModel;
 use rho_agents::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
@@ -41,7 +42,6 @@ use rho_agents::{
     AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
     RoleCycleGroup, TranscriptFrame,
 };
-use rho_core::ContentPart;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]

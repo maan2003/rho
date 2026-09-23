@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
-use rho_core::{AgentId, AgentRole, ContentPart, MessageDelivery};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, MessageDelivery};
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use rho_ui_proto::client::Client;
 use rho_ui_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};

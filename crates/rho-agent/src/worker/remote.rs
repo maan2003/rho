@@ -207,18 +207,18 @@ impl Remote {
         self.send(Control::Retry);
     }
     pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        self.send_user_content(vec![rho_core::ContentPart::Text { text }], delivery);
+        self.send_user_content(vec![rho_agent_types::ContentPart::Text { text }], delivery);
     }
     pub fn send_user_content(
         &self,
-        content: Vec<rho_core::ContentPart>,
+        content: Vec<rho_agent_types::ContentPart>,
         delivery: MessageDelivery,
     ) {
         self.send(Control::User { content, delivery });
     }
     pub async fn send_user_content_accepted(
         &self,
-        content: Vec<rho_core::ContentPart>,
+        content: Vec<rho_agent_types::ContentPart>,
         delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         self.request(Control::User { content, delivery }).await

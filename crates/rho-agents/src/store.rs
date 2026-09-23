@@ -159,7 +159,7 @@ enum Phase {
     #[default]
     Unknown,
     Requesting,
-    Waiting(Option<rho_core::UnixMs>),
+    Waiting(Option<rho_agent_types::UnixMs>),
     Idle,
 }
 
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
-        use rho_core::{ExecMilestone, UnixMs};
+        use rho_agent_types::{ExecMilestone, UnixMs};
         use rho_ui_proto::mirror::{AgentPos, MirrorEvent};
 
         use crate::fold::TranscriptFold;

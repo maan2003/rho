@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use editor::Editor;
 use gpui::{App, Entity, TestAppContext, TestDispatcher, WindowHandle, point, px, size};
+use rho_agent_types::UnixMs;
 use rho_agents::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
-use rho_core::UnixMs;
 use rho_ui_proto::{AgentId, AgentIdDomain};
 use serde::{Deserialize, Serialize};
 use settings::SettingsStore;

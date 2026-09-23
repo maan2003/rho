@@ -1,4 +1,4 @@
-use rho_core::MessagePhase;
+use rho_agent_types::MessagePhase;
 
 use super::streaming::tests::agent as standard_agent;
 use super::*;
@@ -14,7 +14,7 @@ async fn high_agent(directory: &std::path::Path) -> super::streaming::tests::Tes
 fn message(text: &str) -> InferenceResponseItem {
     InferenceResponseItem::AssistantMessage {
         provider_specific: Box::new(rho_inference::OpenAiResponsesProviderData::Message {
-            item_id: rho_core::ProviderResponseItemId::try_from("message").unwrap(),
+            item_id: rho_agent_types::ProviderResponseItemId::try_from("message").unwrap(),
         }),
         content: vec![ContentPart::Text { text: text.into() }],
         phase: Some(MessagePhase::FinalAnswer),
@@ -24,11 +24,11 @@ fn message(text: &str) -> InferenceResponseItem {
 fn exec(id: &str, source: &str) -> InferenceResponseItem {
     InferenceResponseItem::ToolCall {
         provider_specific: Box::new(rho_inference::OpenAiResponsesProviderData::CustomToolCall {
-            item_id: rho_core::ProviderResponseItemId::try_from(id).unwrap(),
+            item_id: rho_agent_types::ProviderResponseItemId::try_from(id).unwrap(),
         }),
         id: ToolCallId::try_from(id).unwrap(),
         name: ToolName::try_from("exec").unwrap(),
-        tool_type: rho_core::ToolType::Custom,
+        tool_type: rho_agent_types::ToolType::Custom,
         arguments: source.into(),
     }
 }
@@ -38,7 +38,7 @@ async fn reply(agent: &mut Agent, items: Vec<InferenceResponseItem>, used: u64) 
         .finish_request(
             items,
             None,
-            Some(rho_core::TokenUsage {
+            Some(rho_agent_types::TokenUsage {
                 input_tokens: used,
                 cached_input_tokens: 0,
                 cache_write_input_tokens: 0,
@@ -207,9 +207,9 @@ fn eviction_is_oldest_first_bounded_and_preserves_live_unanswered_and_recent_cal
     };
     let result = |id: &str, count: usize| {
         Arc::new(ContextBlock::ToolResults {
-            results: vec![rho_core::ToolResult {
+            results: vec![rho_agent_types::ToolResult {
                 call_id: ToolCallId::try_from(id).unwrap(),
-                tool_type: rho_core::ToolType::Custom,
+                tool_type: rho_agent_types::ToolType::Custom,
                 body: ToolOutput {
                     output: Arc::new("x".repeat(count)),
                     full_output: None,
@@ -284,7 +284,8 @@ fn eviction_does_not_count_summarized_tools_or_evict_a_recent_late_result() {
             InferenceResponseItem::Compaction {
                 provider_specific: Box::new(
                     rho_inference::OpenAiResponsesProviderData::Compaction {
-                        item_id: rho_core::ProviderResponseItemId::try_from("compact").unwrap(),
+                        item_id: rho_agent_types::ProviderResponseItemId::try_from("compact")
+                            .unwrap(),
                         encrypted_content: "summary".into(),
                     },
                 ),
@@ -300,9 +301,9 @@ fn eviction_does_not_count_summarized_tools_or_evict_a_recent_late_result() {
             }));
         }
         history.push(Arc::new(ContextBlock::ToolResults {
-            results: vec![rho_core::ToolResult {
+            results: vec![rho_agent_types::ToolResult {
                 call_id: ToolCallId::try_from(id).unwrap(),
-                tool_type: rho_core::ToolType::Custom,
+                tool_type: rho_agent_types::ToolType::Custom,
                 body: ToolOutput {
                     output: Arc::new("x".repeat(150000)),
                     full_output: None,
@@ -318,15 +319,17 @@ fn eviction_does_not_count_summarized_tools_or_evict_a_recent_late_result() {
     history.push(Arc::new(ContextBlock::DeveloperMessage {
         text: "r".repeat(120000),
     }));
-    history.push(Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
-        call_id: ToolCallId::try_from("late").unwrap(),
-        tool_type: rho_core::ToolType::Custom,
-        output: Arc::new("finished only recently".into()),
-        full_output: None,
-        status: Some(ToolOutputStatus::Success),
-        images: Default::default(),
-        at: UnixMs(10),
-    })));
+    history.push(Arc::new(ContextBlock::ToolUpdate(
+        rho_agent_types::ToolUpdate {
+            call_id: ToolCallId::try_from("late").unwrap(),
+            tool_type: rho_agent_types::ToolType::Custom,
+            output: Arc::new("finished only recently".into()),
+            full_output: None,
+            status: Some(ToolOutputStatus::Success),
+            images: Default::default(),
+            at: UnixMs(10),
+        },
+    )));
     assert!(
         context::evict_tools(&history, &Default::default(), 100000, &Default::default())
             .call_ids
@@ -366,9 +369,9 @@ fn measured_output_events(delta: i64) -> Vec<AgentEvent<'static>> {
                 ContextBlock::ToolResults {
                     results: [("first", 2976), ("second", 5976)]
                         .into_iter()
-                        .map(|(id, size)| rho_core::ToolResult {
+                        .map(|(id, size)| rho_agent_types::ToolResult {
                             call_id: ToolCallId::try_from(id).unwrap(),
-                            tool_type: rho_core::ToolType::Custom,
+                            tool_type: rho_agent_types::ToolType::Custom,
                             body: ToolOutput {
                                 output: Arc::new("x".repeat(size)),
                                 full_output: None,
@@ -381,9 +384,9 @@ fn measured_output_events(delta: i64) -> Vec<AgentEvent<'static>> {
                         })
                         .collect(),
                 },
-                ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+                ContextBlock::ToolUpdate(rho_agent_types::ToolUpdate {
                     call_id: ToolCallId::try_from("first").unwrap(),
-                    tool_type: rho_core::ToolType::Custom,
+                    tool_type: rho_agent_types::ToolType::Custom,
                     output: Arc::new("y".repeat(2976)),
                     full_output: None,
                     images: Default::default(),

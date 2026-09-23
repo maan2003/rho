@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Sink, Stream};
-use rho_core::{
+use rho_agent_types::{
     ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
     InferenceResponseItem, MessagePhase, PendingInferenceResponse, ProviderResponseId,
     StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolName, ToolOutput, ToolOutputStatus,
@@ -111,10 +111,11 @@ fn assistant_message_with_phase(text: &str, phase: MessagePhase) -> InferenceRes
     }
 }
 
-fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_core::ProviderSpecificData> {
-    let item_id =
-        rho_core::ProviderResponseItemId::try_from(payload["id"].as_str().unwrap_or("test_item"))
-            .unwrap();
+fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_agent_types::ProviderSpecificData> {
+    let item_id = rho_agent_types::ProviderResponseItemId::try_from(
+        payload["id"].as_str().unwrap_or("test_item"),
+    )
+    .unwrap();
     Box::new(match payload["type"].as_str().unwrap_or_default() {
         "message" => OpenAiResponsesProviderData::Message { item_id },
         "function_call" => OpenAiResponsesProviderData::FunctionCall { item_id },
@@ -140,7 +141,7 @@ fn provider_specific(_tag: &str, payload: Value) -> Box<dyn rho_core::ProviderSp
 /// A `ContextBlock::UserMessage` carrying a single text part.
 fn user_block(text: &str) -> Arc<ContextBlock> {
     Arc::new(ContextBlock::UserMessage {
-        sender: rho_core::MessageSender::User,
+        sender: rho_agent_types::MessageSender::User,
         content: content_parts(text),
     })
 }

@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rho_core::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::Semaphore;
@@ -132,7 +132,7 @@ fn first_task_text(history: &[AgentEvent<'_>], current: &str) -> Option<String> 
             AgentEvent::Accepted(QueuedInput {
                 kind: InputKind::Message { content },
                 ..
-            }) => Some(rho_core::text_content(content)),
+            }) => Some(rho_agent_types::text_content(content)),
             AgentEvent::Transcript {
                 line: TranscriptLine::User { text },
                 wake: None,
@@ -153,13 +153,13 @@ mod tests {
     use super::*;
     use crate::db::{AgentProfileWriteTxnExt as _, AgentRole, SessionBinding};
 
-    fn user(text: &str, source: rho_core::MessageSender) -> AgentEvent<'static> {
+    fn user(text: &str, source: rho_agent_types::MessageSender) -> AgentEvent<'static> {
         AgentEvent::Accepted(QueuedInput {
             source,
             kind: InputKind::Message {
-                content: vec![rho_core::ContentPart::Text { text: text.into() }],
+                content: vec![rho_agent_types::ContentPart::Text { text: text.into() }],
             },
-            delivery: rho_core::MessageDelivery::Immediate,
+            delivery: rho_agent_types::MessageDelivery::Immediate,
             at: UnixMs(1),
         })
     }
@@ -172,9 +172,12 @@ mod tests {
                 &[
                     user(
                         "first peer task",
-                        rho_core::MessageSender::Agent { id: peer }
+                        rho_agent_types::MessageSender::Agent { id: peer }
                     ),
-                    user("unrelated later request", rho_core::MessageSender::User),
+                    user(
+                        "unrelated later request",
+                        rho_agent_types::MessageSender::User
+                    ),
                 ],
                 "current"
             )
@@ -194,7 +197,7 @@ mod tests {
             Some("real Claude task")
         );
         assert_eq!(
-            first_task_text(&[user(" ", rho_core::MessageSender::User)], "later"),
+            first_task_text(&[user(" ", rho_agent_types::MessageSender::User)], "later"),
             None
         );
         let bounded = first_task_text(&[], &"é".repeat(1000)).unwrap();
@@ -223,7 +226,7 @@ mod tests {
             );
             let first = write.append_agent_event(
                 agent,
-                &user("name this task", rho_core::MessageSender::User),
+                &user("name this task", rho_agent_types::MessageSender::User),
             );
             write.commit();
             let inference = Inference::new_with_config(

@@ -1,7 +1,7 @@
 //! How a client draws an agent: the block list and status it folds from
 //! the mirror and the live tail. Nothing here crosses the wire.
 
-use rho_core::{MessagePhase, ToolOutputStatus, UnixMs};
+use rho_agent_types::{MessagePhase, ToolOutputStatus, UnixMs};
 use rho_ui_proto::MessageDelivery;
 use rho_ui_proto::mirror::{ArgumentsFormat, TextPhase};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -22,7 +22,8 @@ pub struct UiAgentState {
     #[senax(default)]
     pub usage: UiAgentUsage,
     #[senax(default)]
-    pub exec_timings: std::sync::Arc<std::collections::BTreeMap<String, rho_core::ExecTiming>>,
+    pub exec_timings:
+        std::sync::Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -126,7 +127,7 @@ pub struct UiTool {
     pub finished_at: Option<UnixMs>,
     pub metadata: Option<UiToolMetadata>,
     #[senax(default)]
-    pub timing: rho_core::ExecTiming,
+    pub timing: rho_agent_types::ExecTiming,
     /// Whether `arguments` is JSON or the raw text the model wrote. A text
     /// tool's arguments are shown as they are and never parsed.
     pub format: ArgumentsFormat,

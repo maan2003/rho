@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use rho_core::{ExecCall, ToolOutput, ToolOutputStatus};
+use rho_agent_types::{ExecCall, ToolOutput, ToolOutputStatus};
 use tokio::sync::Notify;
 
 use crate::python::tests::{shell, shell_in};

@@ -1,10 +1,10 @@
-//! Translation between rho-core's provider-neutral types and the OpenAI
+//! Translation between rho-agent-types' provider-neutral types and the OpenAI
 //! Responses API wire format.
 
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use rho_core::{
+use rho_agent_types::{
     AppendString, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
     InferenceResponseItem, MessagePhase, ProviderResponseId, ProviderResponseItemId,
     ProviderSpecificData, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolName,
@@ -106,7 +106,7 @@ impl senax_encoder::TaggedSenax for OpenAiResponsesProviderData {
 }
 
 senax_encoder::__private::inventory::submit! {
-    rho_core::__SenaxProviderSpecificDataEntry::new(
+    rho_agent_types::__SenaxProviderSpecificDataEntry::new(
         OpenAiResponsesProviderData::TAG,
         |mut body: bytes::Bytes| -> senax_encoder::Result<Box<dyn ProviderSpecificData>> {
             use bytes::Buf as _;
@@ -211,7 +211,7 @@ impl ResponsesRequest {
         request: &InferenceRequest,
         cached_response_id: Option<&str>,
     ) -> Self {
-        let context_start = rho_core::context_window_start(&request.input);
+        let context_start = rho_agent_types::context_window_start(&request.input);
         let mut previous_response = None;
         if let Some(cached_response_id) = cached_response_id {
             for (index, block) in request.input.iter().enumerate().skip(context_start).rev() {
@@ -353,15 +353,17 @@ impl ResponsesRequest {
                     "content": [{"type": "input_text", "text": text}],
                 })),
                 ContextBlock::UserMessage { sender, content } => match sender {
-                    rho_core::MessageSender::User => convert_user_message(content, &mut input),
-                    rho_core::MessageSender::Agent { id } => {
+                    rho_agent_types::MessageSender::User => {
+                        convert_user_message(content, &mut input)
+                    }
+                    rho_agent_types::MessageSender::Agent { id } => {
                         let sender = request
                             .agent_id_labels
                             .get(id)
                             .map_or_else(|| id.encoded(), ToString::to_string);
                         let text = format!(
                             "Message Type: MESSAGE\nSender: {sender}\nPayload:\n{}",
-                            rho_core::text_content(content)
+                            rho_agent_types::text_content(content)
                         );
                         convert_user_message(&[ContentPart::Text { text }], &mut input);
                     }
@@ -765,7 +767,7 @@ fn message_phase_wire(phase: MessagePhase) -> &'static str {
     }
 }
 
-fn output_content(text: &str, images: &[rho_core::ImageContent]) -> Value {
+fn output_content(text: &str, images: &[rho_agent_types::ImageContent]) -> Value {
     if images.is_empty() {
         return json!(text);
     }
@@ -803,7 +805,7 @@ fn convert_tool_result(result: ToolResult, call: Option<&(ToolName, ToolType)>) 
 
 /// Updates are standalone events, not additional replies to a historical call.
 /// They retain their name even when compaction removes the call from the input.
-fn convert_tool_update(update: &rho_core::ToolUpdate, name: Option<&ToolName>) -> Value {
+fn convert_tool_update(update: &rho_agent_types::ToolUpdate, name: Option<&ToolName>) -> Value {
     let mut item = json!({
         "type": "function_call_output",
         "namespace": "functions",
@@ -1193,7 +1195,7 @@ fn openai_provider_data_from_item(item: &Value) -> OpenAiResponsesProviderData {
 }
 
 fn pending_openai_provider_data() -> Box<dyn ProviderSpecificData> {
-    Box::new(rho_core::UnknownProviderSpecificData {
+    Box::new(rho_agent_types::UnknownProviderSpecificData {
         body: bytes::Bytes::new(),
         tag: "openai.responses.pending".to_owned(),
     })

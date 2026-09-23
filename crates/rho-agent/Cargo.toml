@@ -30,7 +30,7 @@ rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
 redb-derive = "0.1"
 rho-claude.workspace = true
 rho-context-config.workspace = true
-rho-core.workspace = true
+rho-agent-types.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-image.workspace = true

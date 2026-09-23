@@ -25,7 +25,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_core::{
+use rho_agent_types::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageDelivery, MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall,
     ToolCallId, ToolName, ToolOutput, ToolOutputStatus, UnixMs,
@@ -446,7 +446,7 @@ pub(crate) enum Phase {
     /// calls nothing is going to answer, which after a restart is every call
     /// history left hanging (`SPEC-restart-recovery`). Ordinarily empty.
     Idle {
-        owed: Vec<rho_core::ExecId>,
+        owed: Vec<rho_agent_types::ExecId>,
         standing: Standing,
     },
     /// A request is in flight, and nothing but an interrupt may disturb it.
@@ -458,7 +458,7 @@ pub(crate) enum Phase {
 /// that call before the next boundary drains its output.
 #[derive(Clone, Default)]
 pub(crate) struct InFlight {
-    handoff: Vec<rho_core::ExecId>,
+    handoff: Vec<rho_agent_types::ExecId>,
     pending: PendingInferenceResponse,
     /// The prior attempt's failure, displayed while its fresh continuation
     /// runs.
@@ -731,7 +731,7 @@ impl Agent {
                         for id in handed_off {
                             self.persist(AgentEvent::ExecObserved {
                                 id,
-                                milestone: rho_core::ExecMilestone::HandedOff,
+                                milestone: rho_agent_types::ExecMilestone::HandedOff,
                                 at: now,
                             })
                             .await?;
@@ -741,7 +741,7 @@ impl Agent {
                     InferenceEvent::ExecArgumentsFinished { id } => {
                         self.persist(AgentEvent::ExecObserved {
                             id,
-                            milestone: rho_core::ExecMilestone::ArgumentsFinished,
+                            milestone: rho_agent_types::ExecMilestone::ArgumentsFinished,
                             at: now,
                         })
                         .await?;
@@ -812,7 +812,7 @@ impl Agent {
                         if let Some(id) = exec {
                             self.persist(AgentEvent::ExecObserved {
                                 id,
-                                milestone: rho_core::ExecMilestone::ResponseFinished,
+                                milestone: rho_agent_types::ExecMilestone::ResponseFinished,
                                 at: now,
                             })
                             .await?;
@@ -862,9 +862,9 @@ impl Agent {
             Control::User(input, done) => {
                 self.persist(AgentEvent::Accepted(input.clone())).await?;
                 if let InputKind::Message { content } = &input.kind
-                    && !rho_core::text_content(content).trim().is_empty()
+                    && !rho_agent_types::text_content(content).trim().is_empty()
                 {
-                    self.name(&rho_core::text_content(content)).await?;
+                    self.name(&rho_agent_types::text_content(content)).await?;
                 }
                 // Queueing it is the whole of it. Whether this revives an
                 // agent that had stopped is `Standing::stopped`'s reading of
@@ -890,8 +890,8 @@ impl Agent {
                     at,
                 }))
                 .await?;
-                if !rho_core::text_content(&content).trim().is_empty() {
-                    self.name(&rho_core::text_content(&content)).await?;
+                if !rho_agent_types::text_content(&content).trim().is_empty() {
+                    self.name(&rho_agent_types::text_content(&content)).await?;
                 }
                 self.mail.push(MailItem {
                     sender,
@@ -1188,7 +1188,7 @@ impl Agent {
         let history = self.provider_history.as_ref().unwrap();
         let pending_compaction = history
             .iter()
-            .skip(rho_core::context_window_start(history))
+            .skip(rho_agent_types::context_window_start(history))
             .rev()
             .find_map(|block| match &**block {
                 ContextBlock::CompactionTrigger => Some(true),
@@ -1241,7 +1241,7 @@ impl Agent {
         let history = self.provider_history.as_ref().unwrap();
         if !owed.is_empty() {
             blocks.extend(owed.iter().map(|id| {
-                rho_inference::exec::output(&rho_core::ExecOutput::Reply {
+                rho_inference::exec::output(&rho_agent_types::ExecOutput::Reply {
                     id: id.clone(),
                     body: ToolOutput {
                         full_output: None,
@@ -1273,14 +1273,14 @@ impl Agent {
         // id: `REQ-provider-transcript-protocol`.
         for reply in self.cells.drain() {
             blocks.push(rho_inference::exec::output(&if reply.first {
-                rho_core::ExecOutput::Reply {
+                rho_agent_types::ExecOutput::Reply {
                     id: reply.id,
                     body: reply.output,
                     first_block_at: reply.started_at,
                     at: now,
                 }
             } else {
-                rho_core::ExecOutput::Report {
+                rho_agent_types::ExecOutput::Report {
                     id: reply.id,
                     body: reply.output,
                     at: now,
@@ -1389,7 +1389,7 @@ impl Agent {
         for id in &handoff {
             self.persist(AgentEvent::ExecObserved {
                 id: id.clone(),
-                milestone: rho_core::ExecMilestone::Boundary,
+                milestone: rho_agent_types::ExecMilestone::Boundary,
                 at: now,
             })
             .await?;
@@ -1439,7 +1439,7 @@ impl Agent {
         &mut self,
         items: Vec<InferenceResponseItem>,
         provider_response_id: Option<ProviderResponseId>,
-        usage: Option<rho_core::TokenUsage>,
+        usage: Option<rho_agent_types::TokenUsage>,
         now: UnixMs,
     ) -> anyhow::Result<()> {
         if let Err(error) = self.finish_stream(&items) {
@@ -1550,7 +1550,7 @@ impl Agent {
 
     // -- tools --------------------------------------------------------------
 
-    fn start_exec(&mut self, call: rho_core::ExecCall, now: UnixMs) {
+    fn start_exec(&mut self, call: rho_agent_types::ExecCall, now: UnixMs) {
         let notebook = &self
             .surface
             .get_if_ready()
@@ -1665,7 +1665,7 @@ impl Agent {
                                     call: ToolCall {
                                         id: id.clone(),
                                         name: ToolName::try_from("exec").unwrap(),
-                                        tool_type: rho_core::ToolType::Custom,
+                                        tool_type: rho_agent_types::ToolType::Custom,
                                         arguments: held.source.clone(),
                                     },
                                     started_at: held.started_at,

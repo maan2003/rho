@@ -2,7 +2,7 @@
 //! intact.
 use std::sync::Arc;
 
-use rho_core::{ContextBlock, InferenceResponseItem, ToolCallId};
+use rho_agent_types::{ContextBlock, InferenceResponseItem, ToolCallId};
 
 use crate::ContextChange;
 
@@ -138,7 +138,7 @@ pub(super) fn evict_tools(
     caps: &UsageCaps,
 ) -> Eviction {
     use std::collections::{BTreeMap, BTreeSet};
-    let start = rho_core::context_window_start(history);
+    let start = rho_agent_types::context_window_start(history);
     let mut first_block = start;
     let mut first_item = 0;
     for (i, block) in history.iter().enumerate().skip(start) {
@@ -266,12 +266,12 @@ pub(super) fn estimate(block: &ContextBlock) -> u64 {
 }
 
 fn estimate_visible(block: &ContextBlock, removed: &std::collections::BTreeSet<ToolCallId>) -> u64 {
-    fn parts(parts: &[rho_core::ContentPart]) -> u64 {
+    fn parts(parts: &[rho_agent_types::ContentPart]) -> u64 {
         parts
             .iter()
             .map(|part| match part {
-                rho_core::ContentPart::Text { text } => text_tokens(text),
-                rho_core::ContentPart::Image { .. } => 10000,
+                rho_agent_types::ContentPart::Text { text } => text_tokens(text),
+                rho_agent_types::ContentPart::Image { .. } => 10000,
             })
             .sum()
     }

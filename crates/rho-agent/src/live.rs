@@ -3,7 +3,7 @@
 //! place that knows what changed, so it says so here instead of a
 //! reader diffing snapshots.
 
-use rho_core::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
+use rho_agent_types::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
 use rho_ui_proto::mirror::{Item, Live, QueuedItem, TextPhase};
 
 use crate::AgentStateKind;
@@ -25,7 +25,7 @@ pub struct Teller {
 #[derive(PartialEq, Eq)]
 enum Phase {
     Requesting,
-    Waiting(Option<rho_core::UnixMs>),
+    Waiting(Option<rho_agent_types::UnixMs>),
     Idle,
 }
 
@@ -175,10 +175,10 @@ pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
     })
 }
 
-pub fn text_phase(phase: rho_core::MessagePhase) -> TextPhase {
+pub fn text_phase(phase: rho_agent_types::MessagePhase) -> TextPhase {
     match phase {
-        rho_core::MessagePhase::Commentary => TextPhase::Commentary,
-        rho_core::MessagePhase::FinalAnswer => TextPhase::FinalAnswer,
+        rho_agent_types::MessagePhase::Commentary => TextPhase::Commentary,
+        rho_agent_types::MessagePhase::FinalAnswer => TextPhase::FinalAnswer,
     }
 }
 
@@ -292,7 +292,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::Arc;
 
-    use rho_core::{AppendString, MessagePhase, PendingInferenceResponse};
+    use rho_agent_types::{AppendString, MessagePhase, PendingInferenceResponse};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
@@ -467,7 +467,7 @@ mod tests {
         let queue = vec![QueuedItem::Message {
             from: None,
             text: "later".to_owned(),
-            delivery: rho_core::MessageDelivery::NextRequest,
+            delivery: rho_agent_types::MessageDelivery::NextRequest,
         }];
         assert_eq!(
             teller.tell_queue(&queue),

@@ -1,6 +1,6 @@
 //! Native model action contract. Wire tool names and shapes do not leak into
 //! the notebook's execution API.
-use rho_core::{ExecCall, InferenceResponseItem, ToolFormat, ToolName, ToolSpec, ToolType};
+use rho_agent_types::{ExecCall, InferenceResponseItem, ToolFormat, ToolName, ToolSpec, ToolType};
 
 pub fn spec() -> ToolSpec {
     ToolSpec {
@@ -42,9 +42,9 @@ pub fn call(items: &[InferenceResponseItem]) -> Result<Option<ExecCall>, &'stati
 /// here does not close Python input; the runtime separately validates response
 /// EOF.
 pub fn stream(
-    pending: &rho_core::PendingInferenceResponse,
+    pending: &rho_agent_types::PendingInferenceResponse,
 ) -> Result<Option<(usize, InferenceResponseItem, ExecCall)>, String> {
-    use rho_core::{StreamingContextItem, StreamingContextItemState};
+    use rho_agent_types::{StreamingContextItem, StreamingContextItemState};
     let mut selected = None;
     for (index, state) in pending.items.iter().enumerate() {
         if let StreamingContextItemState::Pending(item) | StreamingContextItemState::Finished(item) =
@@ -70,8 +70,8 @@ pub fn set_source(item: &mut InferenceResponseItem, source: String) {
     *arguments = source;
 }
 
-pub fn output(output: &rho_core::ExecOutput) -> rho_core::ContextBlock {
-    use rho_core::{ContextBlock, ExecOutput, ToolResult, ToolUpdate};
+pub fn output(output: &rho_agent_types::ExecOutput) -> rho_agent_types::ContextBlock {
+    use rho_agent_types::{ContextBlock, ExecOutput, ToolResult, ToolUpdate};
     match output {
         ExecOutput::Reply {
             id,

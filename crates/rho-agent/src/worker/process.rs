@@ -25,7 +25,7 @@ pub struct Process {
     pending: super::workset::Pending,
     pub(super) sender: transport::Sender,
     pub(super) agents:
-        Arc<Mutex<HashMap<rho_core::AgentId, mpsc::UnboundedSender<transport::Packet>>>>,
+        Arc<Mutex<HashMap<rho_agent_types::AgentId, mpsc::UnboundedSender<transport::Packet>>>>,
     pub(super) next: Arc<AtomicU64>,
     pub(crate) closed: watch::Receiver<bool>,
     pub(crate) mode: rho_fs_view::WorksetMode,
@@ -40,7 +40,7 @@ impl Drop for Process {
 
 impl Process {
     #[cfg(test)]
-    pub(crate) fn fail_agent_service(&self, agent: rho_core::AgentId) {
+    pub(crate) fn fail_agent_service(&self, agent: rho_agent_types::AgentId) {
         self.agents.lock().expect("poison").remove(&agent);
     }
 
@@ -52,7 +52,7 @@ impl Process {
     #[cfg(test)]
     pub(crate) fn pause_agent_route(
         &self,
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
     ) -> (
         mpsc::UnboundedSender<transport::Packet>,
         mpsc::UnboundedReceiver<transport::Packet>,
@@ -70,7 +70,7 @@ impl Process {
     #[cfg(test)]
     pub(crate) fn restore_agent_route(
         &self,
-        agent: rho_core::AgentId,
+        agent: rho_agent_types::AgentId,
         route: mpsc::UnboundedSender<transport::Packet>,
         blocked: &mut mpsc::UnboundedReceiver<transport::Packet>,
     ) {
@@ -82,7 +82,7 @@ impl Process {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_shutdown_reply(&self, agent: rho_core::AgentId) {
+    pub(crate) fn fail_shutdown_reply(&self, agent: rho_agent_types::AgentId) {
         self.agents.lock().expect("poison")[&agent]
             .send(transport::Packet::for_test(
                 transport::Port::Agent(agent),
@@ -247,7 +247,7 @@ impl Process {
         let (stop, stopped) = oneshot::channel();
         let (closed, closed_rx) = watch::channel(false);
         let agents: Arc<
-            Mutex<HashMap<rho_core::AgentId, mpsc::UnboundedSender<transport::Packet>>>,
+            Mutex<HashMap<rho_agent_types::AgentId, mpsc::UnboundedSender<transport::Packet>>>,
         > = Arc::default();
         let clients: super::workset::Clients = Arc::default();
         let pending: super::workset::Pending = Arc::default();

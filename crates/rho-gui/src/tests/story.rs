@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use rho_core::{MessageDelivery, UnixMs};
+use rho_agent_types::{MessageDelivery, UnixMs};
 use rho_hosts::connection::ConnEvent;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge};
 use rho_ui_proto::{AgentId, AgentRole, Place};

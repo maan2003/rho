@@ -23,8 +23,8 @@ fn ran(command: &str) -> UiBlock {
         status: UiToolStatus::Success,
         output: None,
         error: None,
-        started_at: Some(rho_core::UnixMs(10)),
-        finished_at: Some(rho_core::UnixMs(20)),
+        started_at: Some(rho_agent_types::UnixMs(10)),
+        finished_at: Some(rho_agent_types::UnixMs(20)),
         metadata: None,
     })
 }
@@ -95,12 +95,12 @@ fn exec_provider_phases_reach_the_editor_without_execution_duration(cx: &mut Tes
     };
     tool.name = "exec".into();
     tool.arguments = "print('hello')".into();
-    tool.timing = rho_core::ExecTiming {
-        first_block_at: Some(rho_core::UnixMs(100)),
-        arguments_finished_at: Some(rho_core::UnixMs(2100)),
-        response_finished_at: Some(rho_core::UnixMs(2600)),
-        boundary_at: Some(rho_core::UnixMs(5600)),
-        handed_off_at: Some(rho_core::UnixMs(5620)),
+    tool.timing = rho_agent_types::ExecTiming {
+        first_block_at: Some(rho_agent_types::UnixMs(100)),
+        arguments_finished_at: Some(rho_agent_types::UnixMs(2100)),
+        response_finished_at: Some(rho_agent_types::UnixMs(2600)),
+        boundary_at: Some(rho_agent_types::UnixMs(5600)),
+        handed_off_at: Some(rho_agent_types::UnixMs(5620)),
     };
     feed_frame(
         &workspace,

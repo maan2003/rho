@@ -148,7 +148,7 @@ pub(super) async fn run(
     let agents: Arc<
         std::sync::Mutex<
             HashMap<
-                rho_core::AgentId,
+                rho_agent_types::AgentId,
                 tokio::sync::mpsc::UnboundedSender<super::transport::Packet>,
             >,
         >,

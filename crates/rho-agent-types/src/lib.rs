@@ -93,6 +93,8 @@ pub struct AgentIdDomain(pub u64);
 
 impl PrefixIdDomain for AgentIdDomain {
     const KIND: &'static str = "agent-id";
+    // Where the domain lived when the first tables were written.
+    const RECORDED_NAME: &'static str = "rho_core::AgentIdDomain";
 
     fn machine_seed(&self) -> u64 {
         self.0

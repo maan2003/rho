@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use futures::future::BoxFuture;
-use rho_core::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::RhoDb;
 use tokio::sync::watch;
 
@@ -187,7 +187,7 @@ impl Inference {
     /// A single text-only exchange. The caller owns its deadline and any retry.
     /// Dropping this future drops the session and cancels its socket task.
     pub async fn text(&self, instructions: Arc<str>, input: String) -> anyhow::Result<String> {
-        use rho_core::{
+        use rho_agent_types::{
             ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
             MessageSender, PendingInferenceResponse,
         };
@@ -209,7 +209,7 @@ impl Inference {
                     for item in pending.finish()? {
                         match item {
                             InferenceResponseItem::AssistantMessage { content, .. } => {
-                                text.push_str(&rho_core::text_content(&content));
+                                text.push_str(&rho_agent_types::text_content(&content));
                             }
                             InferenceResponseItem::ToolCall { .. } => {
                                 anyhow::bail!("text completion returned a tool call")

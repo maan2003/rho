@@ -50,6 +50,12 @@ pub trait PrefixIdDomain {
     /// Distinguishes ID families (agents vs topics); part of every hash key.
     const KIND: &'static str;
 
+    /// The domain's name in the type redb records for a table keyed by
+    /// these IDs. Written out rather than taken from the Rust path, so
+    /// moving the domain to another crate keeps existing tables
+    /// openable.
+    const RECORDED_NAME: &'static str;
+
     /// Wide random identity of the generating machine, persisted once per
     /// database. It keys all character scrambling, so it must be
     /// full-entropy random, not a small assigned number.
@@ -292,10 +298,7 @@ impl<D: PrefixIdDomain> redb::Value for PrefixId<D> {
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new(&format!(
-            "prefix_id::PrefixId<{}>",
-            std::any::type_name::<D>()
-        ))
+        redb::TypeName::new(&format!("prefix_id::PrefixId<{}>", D::RECORDED_NAME))
     }
 }
 
@@ -430,6 +433,7 @@ mod tests {
 
     impl PrefixIdDomain for TestDomain {
         const KIND: &'static str = "test-id";
+        const RECORDED_NAME: &'static str = "TestDomain";
 
         fn machine_seed(&self) -> u64 {
             0x746573742d6d6163
@@ -442,6 +446,7 @@ mod tests {
 
     impl PrefixIdDomain for TestMachine {
         const KIND: &'static str = "test-id";
+        const RECORDED_NAME: &'static str = "TestMachine";
 
         fn machine_seed(&self) -> u64 {
             self.0
@@ -559,6 +564,7 @@ mod tests {
 
     impl PrefixIdDomain for OtherDomain {
         const KIND: &'static str = "other-id";
+        const RECORDED_NAME: &'static str = "OtherDomain";
 
         fn machine_seed(&self) -> u64 {
             0x746573742d6d6163

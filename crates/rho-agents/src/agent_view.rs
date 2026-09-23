@@ -22,7 +22,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use rho_core::ContentPart;
+use rho_agent_types::ContentPart;
 use rho_ui_proto::AgentId;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};

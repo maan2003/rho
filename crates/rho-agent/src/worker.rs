@@ -20,7 +20,7 @@ pub use remote::Remote;
 pub(crate) fn local_services(
     db: rho_db::RhoDb,
     inference: rho_inference::Inference,
-    agent: rho_core::AgentId,
+    agent: rho_agent_types::AgentId,
     pool: std::sync::Weak<crate::pool::AgentPool>,
 ) -> std::sync::Arc<Host> {
     let (client, server) = testing::pair();

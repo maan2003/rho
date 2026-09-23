@@ -26,8 +26,8 @@
 //! scorer noticing.
 
 use gpui::{App, Context, Window};
+use rho_agent_types::AgentId;
 use rho_agents::HostId;
-use rho_core::AgentId;
 
 use crate::minibuffer::Candidate;
 use crate::workspace::Workspace;

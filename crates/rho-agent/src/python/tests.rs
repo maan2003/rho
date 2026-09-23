@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use rho_core::{
+use rho_agent_types::{
     ContentPart, ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem,
     ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, ToolUpdate, UnixMs,
 };
@@ -133,7 +133,7 @@ async fn history_is_a_lazy_read_only_snapshot_sequence() {
     let notebook = python(shell(), Vec::new());
     notebook.set_history(vec![
         Arc::new(ContextBlock::UserMessage {
-            sender: rho_core::MessageSender::User,
+            sender: rho_agent_types::MessageSender::User,
             content: vec![
                 ContentPart::Text {
                     text: "before".into(),
@@ -217,7 +217,7 @@ async fn history_preserves_tool_and_provider_transcript_fields() {
     notebook.set_history(vec![
         Arc::new(ContextBlock::InferenceResponse {
             items: vec![InferenceResponseItem::ToolCall {
-                provider_specific: Box::new(rho_core::UnknownProviderSpecificData {
+                provider_specific: Box::new(rho_agent_types::UnknownProviderSpecificData {
                     tag: "test.provider".into(),
                     body: bytes::Bytes::from_static(b"opaque-data"),
                 }),
@@ -244,8 +244,8 @@ async fn history_preserves_tool_and_provider_transcript_fields() {
                 },
                 started_at: UnixMs(10),
                 finished_at: UnixMs(20),
-                metadata: Some(rho_core::ToolResultMetadata::ApplyPatch(
-                    rho_core::ApplyPatchMetadata {
+                metadata: Some(rho_agent_types::ToolResultMetadata::ApplyPatch(
+                    rho_agent_types::ApplyPatchMetadata {
                         changes: Vec::new(),
                     },
                 )),

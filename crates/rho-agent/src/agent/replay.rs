@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rho_core::{ContextBlock, InferenceResponseItem, MessageSender};
+use rho_agent_types::{ContextBlock, InferenceResponseItem, MessageSender};
 
 use super::MailItem;
 use crate::{AgentEvent, InputKind, QueuedInput};
@@ -16,7 +16,7 @@ pub(crate) struct Replayed {
     pub recovery_notes: Vec<String>,
     /// Calls history left hanging: every one of them gets a placeholder
     /// result in the next request (`SPEC-restart-recovery`).
-    pub owed: Vec<rho_core::ExecId>,
+    pub owed: Vec<rho_agent_types::ExecId>,
     pub user: Vec<QueuedInput>,
     pub mail: Vec<MailItem>,
     pub context_used: Option<u64>,
@@ -171,8 +171,8 @@ fn queue(input: QueuedInput, user: &mut Vec<QueuedInput>, mail: &mut Vec<MailIte
 }
 
 /// Every call in history that no result answers, in the order made.
-pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_core::ExecId> {
-    let mut unanswered: Vec<rho_core::ExecId> = Vec::new();
+pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_agent_types::ExecId> {
+    let mut unanswered: Vec<rho_agent_types::ExecId> = Vec::new();
     for block in history {
         match &**block {
             ContextBlock::InferenceResponse { items, .. } => {
@@ -198,7 +198,7 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_core::ExecId>
 #[cfg(test)]
 mod tests {
 
-    use rho_core::{ContentPart, MessageDelivery, UnixMs};
+    use rho_agent_types::{ContentPart, MessageDelivery, UnixMs};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
@@ -213,7 +213,7 @@ mod tests {
         const TAG: &'static str = "rho-agent-replay-test.provider-data";
     }
 
-    fn provider_data() -> Box<dyn rho_core::ProviderSpecificData> {
+    fn provider_data() -> Box<dyn rho_agent_types::ProviderSpecificData> {
         Box::new(TestProviderData {
             item_id: "item".to_owned(),
         })
@@ -232,9 +232,9 @@ mod tests {
     fn tool_call(id: &str) -> InferenceResponseItem {
         InferenceResponseItem::ToolCall {
             provider_specific: provider_data(),
-            id: rho_core::ToolCallId::try_from(id).unwrap(),
-            name: rho_core::ToolName::try_from("shell_command").unwrap(),
-            tool_type: rho_core::ToolType::Function,
+            id: rho_agent_types::ToolCallId::try_from(id).unwrap(),
+            name: rho_agent_types::ToolName::try_from("shell_command").unwrap(),
+            tool_type: rho_agent_types::ToolType::Function,
             arguments: String::new(),
         }
     }
@@ -299,7 +299,7 @@ mod tests {
                     sender: MessageSender::User,
                     content: text_parts("go"),
                 }]),
-                at: rho_core::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
                 wake: None,
                 context: None,
             }),
@@ -310,7 +310,7 @@ mod tests {
                 }]),
                 context_used: Some(40),
                 usage: None,
-                at: rho_core::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
             }),
         ]);
         assert!(replayed.user.is_empty());
@@ -339,13 +339,13 @@ mod tests {
             crate::native::NativeEvent::RequestStarted {
                 input: vec![ContextBlock::UserMessage {
                     sender: MessageSender::User,
-                    content: vec![rho_core::ContentPart::Text {
+                    content: vec![rho_agent_types::ContentPart::Text {
                         text: "saved conversation".into(),
                     }],
                 }],
                 context: None,
                 wake: None,
-                at: rho_core::UnixMs(1),
+                at: rho_agent_types::UnixMs(1),
             },
         )];
         assert!(replay(events.clone()).recovery_notes.is_empty());
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn recovery_uses_canonical_calls_without_interpreter_progress() {
         use crate::native::NativeEvent;
-        let id = rho_core::ExecId::try_from("c").unwrap();
+        let id = rho_agent_types::ExecId::try_from("c").unwrap();
         let mut events = Vec::new();
         events.push(AgentEvent::Native(NativeEvent::ResponseFinished {
             output: vec![ContextBlock::InferenceResponse {
@@ -371,27 +371,29 @@ mod tests {
             }],
             context_used: None,
             usage: None,
-            at: rho_core::UnixMs(1),
+            at: rho_agent_types::UnixMs(1),
         }));
         let recovered = replay(events.clone());
         assert_eq!(recovered.history.len(), 1);
         assert_eq!(recovered.owed, vec![id.clone()]);
 
         events.push(AgentEvent::Native(NativeEvent::RequestStarted {
-            input: vec![rho_inference::exec::output(&rho_core::ExecOutput::Reply {
-                id: id.clone(),
-                body: rho_core::ToolOutput {
-                    output: Arc::new(String::new()),
-                    full_output: None,
-                    images: Default::default(),
-                    status: rho_core::ToolOutputStatus::Cancelled,
+            input: vec![rho_inference::exec::output(
+                &rho_agent_types::ExecOutput::Reply {
+                    id: id.clone(),
+                    body: rho_agent_types::ToolOutput {
+                        output: Arc::new(String::new()),
+                        full_output: None,
+                        images: Default::default(),
+                        status: rho_agent_types::ToolOutputStatus::Cancelled,
+                    },
+                    first_block_at: rho_agent_types::UnixMs(2),
+                    at: rho_agent_types::UnixMs(2),
                 },
-                first_block_at: rho_core::UnixMs(2),
-                at: rho_core::UnixMs(2),
-            })],
+            )],
             context: None,
             wake: None,
-            at: rho_core::UnixMs(2),
+            at: rho_agent_types::UnixMs(2),
         }));
         let recovered = replay(events);
         assert!(recovered.owed.is_empty());

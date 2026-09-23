@@ -2072,11 +2072,11 @@ mod tests {
                             &rho_ui_proto::AgentIdDomain(0),
                         )
                         .unwrap(),
-                        content: vec![rho_core::ContentPart::Image {
+                        content: vec![rho_agent_types::ContentPart::Image {
                             media_type: "image/png".to_owned(),
                             data: vec![0; rho_ui_proto::MAX_FRAME_LEN + 1],
                         }],
-                        delivery: rho_core::MessageDelivery::NextRequest,
+                        delivery: rho_agent_types::MessageDelivery::NextRequest,
                     })
                     .unwrap();
                 commands_tx.unbounded_send(ClientMessage::Ping).unwrap();

@@ -32,8 +32,8 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
             status: UiToolStatus::Success,
             output: Some(format!("ok {ix}")),
             error: None,
-            started_at: Some(rho_core::UnixMs(1_000)),
-            finished_at: Some(rho_core::UnixMs(3_500)),
+            started_at: Some(rho_agent_types::UnixMs(1_000)),
+            finished_at: Some(rho_agent_types::UnixMs(3_500)),
             metadata: None,
         })
     }));

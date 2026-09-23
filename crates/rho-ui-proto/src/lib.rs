@@ -6,8 +6,8 @@
 
 use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
-use rho_core::ContentPart;
-pub use rho_core::{
+use rho_agent_types::ContentPart;
+pub use rho_agent_types::{
     AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, MessageDelivery,
 };
 pub use rho_workspaces_types::{
@@ -1368,7 +1368,7 @@ mod tests {
                 text: "lo".to_owned(),
             },
             mirror::Live::Waiting {
-                until: Some(rho_core::UnixMs(5)),
+                until: Some(rho_agent_types::UnixMs(5)),
             },
             mirror::Live::Idle,
         ] {

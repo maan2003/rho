@@ -82,9 +82,9 @@ pub struct AgentFiling {
 pub struct AgentFacts {
     pub turn_running: bool,
     /// When the running turn began, when the client saw it start.
-    pub turn_started_at: Option<rho_core::UnixMs>,
-    pub last_turn_ended: Option<rho_core::UnixMs>,
-    pub last_user_message_at: rho_core::UnixMs,
+    pub turn_started_at: Option<rho_agent_types::UnixMs>,
+    pub last_turn_ended: Option<rho_agent_types::UnixMs>,
+    pub last_user_message_at: rho_agent_types::UnixMs,
     /// The last turn said it wants something only the user can give.
     pub needs_you_hint: bool,
     /// The last turn died. Nobody but the user can restart it, so this
@@ -118,7 +118,7 @@ pub struct AgentMap {
     /// as what to add, and the fold holds only what the agent is now, so
     /// this holds what it was indexed as. Nothing else reads it.
     indexed_as: BTreeMap<AgentId, (Option<AgentId>, &'static str)>,
-    last_active: BTreeMap<AgentId, rho_core::UnixMs>,
+    last_active: BTreeMap<AgentId, rho_agent_types::UnixMs>,
     hosts: BTreeMap<HostId, HostSnapshot>,
 
     // The indexes. Every one of them is kept as the agents that changed
@@ -420,7 +420,7 @@ impl AgentMap {
         let active = self
             .last_active
             .entry(agent_id)
-            .or_insert(rho_core::UnixMs(0));
+            .or_insert(rho_agent_types::UnixMs(0));
         *active = (*active).max(last_active);
 
         let was = self.indexed_as.get(&agent_id).copied();
@@ -555,7 +555,7 @@ impl AgentMap {
     }
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
-            .insert(agent_id, rho_core::UnixMs(now_ms()));
+            .insert(agent_id, rho_agent_types::UnixMs(now_ms()));
     }
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
         // Hidden agents are excluded from the result but still walked,
@@ -696,7 +696,7 @@ impl AgentMap {
             })
             .filter(|reason| !reason.trim().is_empty())
     }
-    pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_core::UnixMs> {
+    pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_agent_types::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }
     /// The chronology, folded from the story rather than sent.
@@ -841,7 +841,7 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::UnixMs;
+    use rho_agent_types::UnixMs;
     use rho_ui_proto::AgentIdDomain;
     use rho_ui_proto::mirror::{
         AgentPos, MirrorEvent, RuntimeKind, Seq, SpawnedBy, TurnEdge, TurnOutcome,
@@ -1013,7 +1013,7 @@ mod tests {
                         MirrorEvent::Message {
                             from: None,
                             text: "do the thing\nand then some".to_owned(),
-                            delivery: rho_core::MessageDelivery::Immediate,
+                            delivery: rho_agent_types::MessageDelivery::Immediate,
                             at: UnixMs(10),
                         },
                         MirrorEvent::Turn {

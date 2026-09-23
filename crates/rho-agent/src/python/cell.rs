@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use rho_core::{ExecId, ToolOutput, ToolOutputStatus, UnixMs};
+use rho_agent_types::{ExecId, ToolOutput, ToolOutputStatus, UnixMs};
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
 
 use crate::python::history::HistorySnapshot;

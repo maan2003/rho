@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_core::AgentId;
+use rho_agent_types::AgentId;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::mpsc;
@@ -78,7 +78,7 @@ impl Services {
         // statements ran. Record only that coarse lifecycle fact.
         let mut write = self.db.write().await;
         write.tell_turn(
-            rho_core::UnixMs::now(),
+            rho_agent_types::UnixMs::now(),
             self.agent,
             TurnEdge::Ended(TurnOutcome::Errored { message: error }),
         );
@@ -436,7 +436,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::UnixMs;
+    use rho_agent_types::UnixMs;
 
     use super::*;
     use crate::AgentEvent;
