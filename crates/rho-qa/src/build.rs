@@ -21,8 +21,8 @@
 //! that day, but it is not the way through this one: gold did not link the
 //! optimised binary and wild 0.10.0 did, first try. A shell that has not
 //! reloaded since main 227c1e0e still has wild 0.9.0 and will fail the same
-//! way; `direnv reload` is the real fix and removes the need for `RHO_QA_LD`
-//! altogether. Until the shell is reloaded, point it at wild 0.10.0 in the
+//! way; re-entering the dev shell is the real fix and removes the need for
+//! `RHO_QA_LD` altogether. Until then, point it at wild 0.10.0 in the
 //! nix store (a `wild-unwrapped-wrapper-0.10.0/bin/wild` path).
 
 use std::ffi::OsString;
@@ -151,8 +151,8 @@ pub fn build(profile: &str, repo: &Path) -> Result<()> {
             bail!(
                 "building {} failed.\nIf it failed in the linker, the dev shell's linker is \
                  the suspect: a shell that has not been reloaded since main 227c1e0e still \
-                 has wild 0.9.0, which cannot link an optimised binary. `direnv reload` is \
-                 the fix; until then point RHO_QA_LD at wild 0.10.0 in the nix store.",
+                 has wild 0.9.0, which cannot link an optimised binary. Re-entering the dev \
+                 shell is the fix; until then point RHO_QA_LD at wild 0.10.0 in the nix store.",
                 args.join(" ")
             );
         }

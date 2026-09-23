@@ -53,6 +53,27 @@ pub fn git_dir() -> PathBuf {
         .and_then(|git| git.parent().map(Path::to_owned))
         .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
 }
+
+/// `rho-devshell-builder`, which runs programs in flake dev shells:
+/// `$RHO_DEVSHELL_BUILDER`, else installed next to this executable (or, for a
+/// cargo test binary, next to its `deps` directory), else from `PATH`. A view
+/// binds a development executable's directory, so the path holds there too.
+pub fn devshell_builder() -> PathBuf {
+    const NAME: &str = "rho-devshell-builder";
+    if let Some(program) = std::env::var_os("RHO_DEVSHELL_BUILDER") {
+        return program.into();
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return NAME.into();
+    };
+    let dir = exe.parent().unwrap_or(Path::new("/"));
+    [Some(dir), dir.parent().filter(|_| dir.ends_with("deps"))]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(NAME))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| NAME.into())
+}
 pub use rho_git_server::Refresh as StoreRefresh;
 pub use rho_workspaces_types::{
     Place, WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
@@ -534,9 +555,8 @@ impl Workset {
     }
 
     /// The workset's state directory, `<state>/worksets/<id>/state`,
-    /// bound into the view at this same path: direnv's layout and the nix
-    /// GC roots it registers live here, so they resolve on the host and die
-    /// with the workset.
+    /// bound into the view at this same path, so that nix GC roots registered
+    /// here resolve on the host and die with the workset.
     pub fn state_dir(&self) -> anyhow::Result<Utf8PathBuf> {
         Ok(self
             .owner()?

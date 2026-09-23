@@ -179,25 +179,24 @@ test -f /etc/nix/registry.json
 test "$XDG_STATE_HOME" = /home/agent/.local/state
 test "$GIT_CONFIG_SYSTEM" = /etc/gitconfig
 test "$(git config --get core.pager)" = cat
-test "$DIRENV_CONFIG" = /etc/rho/direnv
-test "$RHO_DIRENV_LAYOUT_DIR" = {state}/direnv
+test "$RHO_DEVSHELL_CACHE" = {cache}/rho-devshell/cache.sqlite
+test -n "$RHO_DEVSHELL_BUILDER"
 test "$INSIDE_AGENT" = 1
 test "$CARGO_HOME" = /home/agent/.cache/cargo
 touch /home/agent/.cache/from-view
-mkdir -p "$RHO_DIRENV_LAYOUT_DIR" && touch "$RHO_DIRENV_LAYOUT_DIR/from-view"
+touch {state}/from-view "$RHO_DEVSHELL_CACHE"
 git clone -q -- {remote} second
 test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
 git -C /src/second fetch -q
 if touch {base}/bin/x 2>/dev/null; then echo "base is writable"; exit 1; fi
 git -C /src/second commit -q --allow-empty -m identity
 test "$(git -C /src/second log -1 --format=%an)" = "Test Agent"
-printf 'export FOO=bar\n' > /src/second/.envrc
-test "$(direnv exec /src/second sh -c 'echo $FOO' 2>/dev/null)" = bar
 test "$(bash -c 'cat <(echo substituted)')" = substituted
 test "$(echo piped | cat /dev/stdin)" = piped
 "#,
         base = rho_fs_view::AGENT_BASE,
         state = workset.state_dir().unwrap(),
+        cache = root.cache_dir(),
         store = store.display(),
     );
     let script = format!(
@@ -264,9 +263,10 @@ test ! -e /src/.stores
         workset
             .state_dir()
             .unwrap()
-            .join("direnv/from-view")
+            .join("from-view")
             .exists()
     );
+    assert!(root.cache_dir().join("rho-devshell/cache.sqlite").exists());
     assert_eq!(workset.repos().unwrap(), vec!["project", "second"]);
     assert_eq!(only_store(temp.path()), store);
 

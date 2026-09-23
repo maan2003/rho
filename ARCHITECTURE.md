@@ -369,12 +369,12 @@ security, resource-isolation, or rollback boundary.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-fs-view` for daemon-owned commands. Workset-control
   subprocesses use that environment directly. Agent commands use watched
-  environment generations built from the nearest flake's dev shell; Claude
-  processes use `direnv exec` directly.
-  The GUI's Comint-style surface instead starts `rho-shell` through the agent
+  environment generations built from the nearest flake's dev shell; the
+  terminal, Claude processes and the `rho-shell` sidecar start once in that
+  dev shell through `rho-devshell-builder exec`.
+  The GUI's Comint-style surface starts `rho-shell` through the agent
   View and lets Brush load normal Bash-compatible interactive configuration
-  (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
-  hook. Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
+  (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`). Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
   `vendor/brush` as a squashed Git subtree and linked only into the sidecar.
   The daemon treats the sidecar
   protocol as untrusted: it assigns execution ids, retains accepted command
@@ -427,7 +427,11 @@ security, resource-isolation, or rollback boundary.
   against exactly what evaluation read (reported by the Nix fork); commands
   outside a flake get the base environment. Kernel watches over those inputs
   and over flake discovery validate reuse; when they fire, one builder check
-  decides whether the shell actually changed before its activation reruns. A generation uses a native,
+  decides whether the shell actually changed before its activation reruns.
+  The builder links the Nix C API of cachix's Nix carrying
+  `nix/patches/nix-*.patch` (flake input `nix`), is installed next to the
+  daemon, and also serves `rho-devshell-builder exec` and the agent base's
+  `nix develop`. A generation uses a native,
   single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
   namespace. It keeps up to five pristine children of the initialized variable/builtin image
   ready for one-shot cwd/stdio specialization, replenishing when idle and falling

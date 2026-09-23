@@ -66,7 +66,7 @@ const MAX_DIM: u16 = 1000;
 /// caller (which knows agents and views), used when no session is running.
 pub struct TerminalSpawn {
     pub view: Arc<rho_fs_view::Namespace>,
-    /// Program run through `direnv exec .` in the agent's working directory.
+    /// Program run in the dev shell of the agent's working directory.
     pub shell: String,
 }
 
@@ -332,11 +332,8 @@ impl Session {
         let slave = pty.user;
         set_nonblocking(&master)?;
 
-        let mut command = tokio::process::Command::new("direnv");
-        command.args(["exec", ".", &spawn.shell]);
-        for var in ["DIRENV_DIFF", "DIRENV_DIR", "DIRENV_FILE", "DIRENV_WATCHES"] {
-            command.env_remove(var);
-        }
+        let mut command = tokio::process::Command::new(rho_fs_view::devshell_builder());
+        command.args(["exec", "--", &spawn.shell]);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         spawn.view.prepare_command(&mut command, None).await?;

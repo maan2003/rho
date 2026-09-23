@@ -1,0 +1,360 @@
+From 6ea394208f5415ac7813c915b4983a302248b850 Mon Sep 17 00:00:00 2001
+From: maan2003 <manmeetmann2003@gmail.com>
+Date: Wed, 23 Sep 2026 18:42:57 +0000
+Subject: [PATCH 2/2] libexpr: record observed reads of mounted local inputs; C
+ API for eval settings
+
+With record-input-reads, mounted local inputs are wrapped in an accessor that
+reports what each read observed (BLAKE3 of contents and listings, stat types,
+symlink targets) as eval effects, so a caller can validate a cached result
+against exactly what the evaluator read. The accessor hides its fingerprint
+and physical path so copies are always walked through it.
+
+nix_eval_state_builder_eval_settings_as_abstract_settings lets C API users
+set evaluator settings such as pure-eval. HashSink takes experimental-feature
+settings like hashString, so observations can use BLAKE3 without enabling
+blake3-hashes for user code.
+---
+ src/libexpr-c/nix_api_expr.cc                 |  13 ++
+ src/libexpr-c/nix_api_expr.h                  |  17 +++
+ src/libexpr/eval-effect.hh                    |  21 +++
+ src/libexpr/include/nix/expr/eval-settings.hh |  15 ++
+ src/libexpr/paths.cc                          | 135 +++++++++++++++++-
+ src/libutil/hash.cc                           |   7 +-
+ src/libutil/include/nix/util/hash.hh          |   3 +-
+ 7 files changed, 206 insertions(+), 5 deletions(-)
+
+diff --git a/src/libexpr-c/nix_api_expr.cc b/src/libexpr-c/nix_api_expr.cc
+index 5fe7e746e..c60149b3d 100644
+--- a/src/libexpr-c/nix_api_expr.cc
++++ b/src/libexpr-c/nix_api_expr.cc
+@@ -193,6 +193,19 @@ nix_eval_state_builder_fetch_settings_as_abstract_settings(nix_c_context * conte
+     NIXC_CATCH_ERRS_NULL
+ }
+ 
++nix_abstract_settings *
++nix_eval_state_builder_eval_settings_as_abstract_settings(nix_c_context * context, nix_eval_state_builder * builder)
++{
++    if (context)
++        context->last_err_code = NIX_OK;
++    try {
++        return new nix_abstract_settings{
++            .config = &builder->settings,
++        };
++    }
++    NIXC_CATCH_ERRS_NULL
++}
++
+ EvalState * nix_eval_state_build(nix_c_context * context, nix_eval_state_builder * builder)
+ {
+     if (context)
+diff --git a/src/libexpr-c/nix_api_expr.h b/src/libexpr-c/nix_api_expr.h
+index 7e7f0ad47..45b3aa3da 100644
+--- a/src/libexpr-c/nix_api_expr.h
++++ b/src/libexpr-c/nix_api_expr.h
+@@ -278,6 +278,23 @@ nix_err nix_eval_state_builder_set_env_override(
+ nix_abstract_settings *
+ nix_eval_state_builder_fetch_settings_as_abstract_settings(nix_c_context * context, nix_eval_state_builder * builder);
+ 
++/**
++ * @brief Get a settings view for the builder's evaluator settings.
++ *
++ * The returned view targets the `EvalSettings` that the built EvalState will
++ * use. Use it with nix_abstract_settings_set() to override a setting such as
++ * "pure-eval" before calling nix_eval_state_build(). Call it after
++ * nix_eval_state_builder_load(), which would otherwise override the values set
++ * here. Free the view with nix_abstract_settings_free(); this does not free
++ * @p builder, which must outlive the view.
++ *
++ * @param[out] context Optional, stores error information
++ * @param[in] builder The builder whose evaluator settings to view
++ * @return A settings view, or NULL on error
++ */
++nix_abstract_settings *
++nix_eval_state_builder_eval_settings_as_abstract_settings(nix_c_context * context, nix_eval_state_builder * builder);
++
+ /**
+  * @brief Create a new Nix language evaluator state
+  * @ingroup libexpr_init
+diff --git a/src/libexpr/eval-effect.hh b/src/libexpr/eval-effect.hh
+index bdc9fbeda..fc4d25258 100644
+--- a/src/libexpr/eval-effect.hh
++++ b/src/libexpr/eval-effect.hh
+@@ -22,6 +22,10 @@ enum class EvalEffect {
+     CopySource,
+     MountInput,
+     InputAttr,
++    ObservedStat,
++    ObservedFile,
++    ObservedDir,
++    ObservedLink,
+ };
+ 
+ inline std::string_view evalEffectName(EvalEffect effect)
+@@ -49,6 +53,14 @@ inline std::string_view evalEffectName(EvalEffect effect)
+         return "mount-input";
+     case EvalEffect::InputAttr:
+         return "input-attr";
++    case EvalEffect::ObservedStat:
++        return "observed-stat";
++    case EvalEffect::ObservedFile:
++        return "observed-file";
++    case EvalEffect::ObservedDir:
++        return "observed-dir";
++    case EvalEffect::ObservedLink:
++        return "observed-link";
+     }
+     std::unreachable();
+ }
+@@ -67,6 +79,15 @@ inline std::string_view evalEffectName(EvalEffect effect)
+  * destination store path), `mount-input` (subject is the virtual store path
+  * an input is mounted at, detail is the input URL), and `input-attr`
+  * (subject is the input URL, detail is the forced metadata attribute).
++ *
++ * With `record-input-reads`, reads of mounted local inputs report what was
++ * observed, with the subject being the path under the input's virtual store
++ * path: `observed-stat` (detail is `regular`, `executable`, `directory`,
++ * `symlink`, `other` or `missing`), `observed-file` (detail is the BLAKE3 of
++ * the contents in base16), `observed-dir` (detail is the BLAKE3 of the entry
++ * names, each followed by a NUL byte, in sorted order), and `observed-link`
++ * (detail is the symlink target). A path is reported again only if a later
++ * read observes something different.
+  */
+ inline void evalEffect(EvalEffect kind, std::string_view subject, std::optional<std::string_view> detail = std::nullopt)
+ {
+diff --git a/src/libexpr/include/nix/expr/eval-settings.hh b/src/libexpr/include/nix/expr/eval-settings.hh
+index 4613017d7..90667d960 100644
+--- a/src/libexpr/include/nix/expr/eval-settings.hh
++++ b/src/libexpr/include/nix/expr/eval-settings.hh
+@@ -494,6 +494,21 @@ public:
+           The default value is chosen to balance performance and memory usage. On 32 bit systems
+           where memory is scarce, the default is a large value to reduce the amount of allocations.
+     )"};
++
++    Setting<bool> recordInputReads{
++        this,
++        false,
++        "record-input-reads",
++        R"(
++          Report every read of a mounted local input as an eval effect carrying
++          what was observed: the BLAKE3 hash of file contents and directory
++          listings, the type of stat'd paths, and symlink targets.
++
++          This lets a caller decide whether an evaluation result is still valid
++          by comparing the file system against exactly what the evaluator read.
++          Reads bypass the fetcher cache, so copies of local inputs are always
++          walked.
++        )"};
+ };
+ 
+ /**
+diff --git a/src/libexpr/paths.cc b/src/libexpr/paths.cc
+index 8a623cf44..1be5698e3 100644
+--- a/src/libexpr/paths.cc
++++ b/src/libexpr/paths.cc
+@@ -3,9 +3,134 @@
+ #include "eval-effect.hh"
+ #include "nix/util/mounted-source-accessor.hh"
+ #include "nix/fetchers/fetch-to-store.hh"
++#include "nix/util/hash.hh"
++
++#include <mutex>
++#include <unordered_map>
+ 
+ namespace nix {
+ 
++namespace {
++
++/* Observations are hashed with BLAKE3 whether or not users may. */
++const ExperimentalFeatureSettings & observationXpSettings()
++{
++    static const ExperimentalFeatureSettings & settings = *[] {
++        auto settings = new ExperimentalFeatureSettings;
++        settings->set("experimental-features", "blake3-hashes");
++        return settings;
++    }();
++    return settings;
++}
++
++/**
++ * Reports every read of a mounted local input, with what the read observed,
++ * as an eval effect. See `record-input-reads`.
++ */
++class RecordingSourceAccessor : public SourceAccessor
++{
++    ref<SourceAccessor> next;
++    std::string mountPoint;
++
++    std::mutex mutex;
++    /* Last reported observation per (kind, subject). */
++    std::unordered_map<std::string, std::string> reported;
++
++    void anchor() override {};
++
++    void report(EvalEffect kind, const CanonPath & path, std::string detail)
++    {
++        auto subject = path.isRoot() ? mountPoint : mountPoint + path.abs();
++        {
++            std::lock_guard lock(mutex);
++            auto [it, inserted] = reported.try_emplace(std::string(evalEffectName(kind)) + '\0' + subject, detail);
++            if (!inserted) {
++                if (it->second == detail)
++                    return;
++                it->second = detail;
++            }
++        }
++        evalEffect(kind, subject, detail);
++    }
++
++public:
++    RecordingSourceAccessor(ref<SourceAccessor> next_, std::string mountPoint)
++        : next(std::move(next_))
++        , mountPoint(std::move(mountPoint))
++    {
++        displayPrefix.clear();
++    }
++
++    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
++    {
++        HashSink hashSink(HashAlgorithm::BLAKE3, observationXpSettings());
++        TeeSink tee(sink, hashSink);
++        next->readFile(path, tee, sizeCallback);
++        report(EvalEffect::ObservedFile, path, hashSink.finish().hash.to_string(HashFormat::Base16, false));
++    }
++
++    std::optional<Stat> maybeLstat(const CanonPath & path) override
++    {
++        auto st = next->maybeLstat(path);
++        std::string type = !st                           ? "missing"
++                           : st->type == tRegular        ? (st->isExecutable ? "executable" : "regular")
++                           : st->type == tDirectory      ? "directory"
++                           : st->type == tSymlink        ? "symlink"
++                                                         : "other";
++        report(EvalEffect::ObservedStat, path, std::move(type));
++        return st;
++    }
++
++    DirEntries readDirectory(const CanonPath & path) override
++    {
++        auto entries = next->readDirectory(path);
++        std::string names;
++        for (auto & [name, _] : entries) {
++            names += name;
++            names += '\0';
++        }
++        report(
++            EvalEffect::ObservedDir, path, hashString(HashAlgorithm::BLAKE3, names, observationXpSettings()).to_string(HashFormat::Base16, false));
++        return entries;
++    }
++
++    std::string readLink(const CanonPath & path) override
++    {
++        auto target = next->readLink(path);
++        report(EvalEffect::ObservedLink, path, target);
++        return target;
++    }
++
++    std::string showPath(const CanonPath & path) override
++    {
++        return next->showPath(path);
++    }
++
++    void invalidateCache() override
++    {
++        next->invalidateCache();
++    }
++
++    /* Hide the physical path and fingerprint so that nothing reads the input
++       behind our back, whether from disk or from the fetcher cache. */
++    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
++    {
++        return std::nullopt;
++    }
++
++    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
++    {
++        return {path, std::nullopt};
++    }
++
++    std::optional<time_t> getLastModified() override
++    {
++        return next->getLastModified();
++    }
++};
++
++} // namespace
++
+ SourcePath EvalState::rootPath(CanonPath path)
+ {
+     return {rootFS, std::move(path)};
+@@ -75,7 +200,15 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
+ 
+     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
+ 
+-    storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
++    auto mountPoint = store->printStorePath(storePath);
++    if (settings.recordInputReads) {
++        /* Inputs in the store are immutable and identified by their lock. */
++        auto sourcePath = input.getSourcePath(fetchSettings);
++        if (sourcePath && !store->isInStore(sourcePath->string()))
++            accessor = make_ref<RecordingSourceAccessor>(accessor, mountPoint);
++    }
++
++    storeFS->mount(CanonPath(mountPoint), accessor);
+ 
+     evalEffect(EvalEffect::MountInput, store->printStorePath(storePath), originalInput.to_string());
+ 
+diff --git a/src/libutil/hash.cc b/src/libutil/hash.cc
+index ee5f28ffe..48b363a8e 100644
+--- a/src/libutil/hash.cc
++++ b/src/libutil/hash.cc
+@@ -380,8 +380,9 @@ Hash hashFile(HashAlgorithm ha, const std::filesystem::path & path)
+     return sink.finish().hash;
+ }
+ 
+-HashSink::HashSink(HashAlgorithm ha)
++HashSink::HashSink(HashAlgorithm ha, const ExperimentalFeatureSettings & xpSettings)
+     : ha(ha)
++    , xpSettings(&xpSettings)
+ {
+     ctx = new Hash::Ctx;
+     bytes = 0;
+@@ -403,7 +404,7 @@ void HashSink::writeUnbuffered(std::string_view data)
+ HashResult HashSink::finish()
+ {
+     flush();
+-    Hash hash(ha);
++    Hash hash(ha, *xpSettings);
+     nix::finish(ha, *ctx, hash.hash);
+     return HashResult(hash, bytes);
+ }
+@@ -412,7 +413,7 @@ HashResult HashSink::currentHash()
+ {
+     flush();
+     Hash::Ctx ctx2 = *ctx;
+-    Hash hash(ha);
++    Hash hash(ha, *xpSettings);
+     nix::finish(ha, ctx2, hash.hash);
+     return HashResult(hash, bytes);
+ }
+diff --git a/src/libutil/include/nix/util/hash.hh b/src/libutil/include/nix/util/hash.hh
+index 2dab25ea9..255020ccf 100644
+--- a/src/libutil/include/nix/util/hash.hh
++++ b/src/libutil/include/nix/util/hash.hh
+@@ -228,11 +228,12 @@ private:
+     HashAlgorithm ha;
+     Hash::Ctx * ctx;
+     uint64_t bytes;
++    const ExperimentalFeatureSettings * xpSettings;
+ 
+     void anchor() override;
+ 
+ public:
+-    HashSink(HashAlgorithm ha);
++    HashSink(HashAlgorithm ha, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
+     HashSink(const HashSink & h);
+     ~HashSink();
+     void writeUnbuffered(std::string_view data) override;
+-- 
+2.55.0
+

@@ -300,11 +300,7 @@ fn builder_program(base: &Environment) -> PathBuf {
     if let Some(program) = base.get(OsStr::new("RHO_DEVSHELL_BUILDER")) {
         return program.into();
     }
-    std::env::current_exe()
-        .ok()
-        .map(|exe| exe.with_file_name("rho-devshell-builder"))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| "rho-devshell-builder".into())
+    rho_fs_view::devshell_builder()
 }
 
 async fn build(key: &Key, flake: &Path) -> Result<(Built, Vec<u8>)> {

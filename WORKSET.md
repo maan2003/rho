@@ -14,8 +14,9 @@ no separate record of its contents.
   stores/              # mirror store root (CLONES.md), URL-keyed
   store.sock           # the mirror keeper's socket
   cache/               # every agent's ~/.cache (VIEW.md)
+  cache/rho-devshell/  # the dev shell cache and its GC roots, also at its host path
   worksets/<id>/src    # one directory per workset
-  worksets/<id>/state  # its direnv layout, nix GC roots, and shared notes
+  worksets/<id>/state  # its nix GC roots and shared notes
 ```
 
 `Worksets::open` creates the root and starts the mirror keeper
@@ -84,7 +85,8 @@ a plain directory or file except a handful of real mounts:
   optional skeleton. The host home is not mounted at all; `~/.cache` is
   the shared persistent cache.
 - The workset's state directory, read-write at its host path, so the
-  nix GC roots direnv registers there resolve on the host. Native context-rotation
+  nix GC roots registered there resolve on the host. The dev shell cache is
+  bound at its host path too, for the GC roots of cached shells. Native context-rotation
   notes live in `state/notes`, shared by all agents in the workset and removed
   with it.
 - `/dev`: the standard character devices bound in, plus a private
@@ -101,7 +103,7 @@ a plain directory or file except a handful of real mounts:
 
 The environment is an explicit allowlist, listed in `VIEW.md`: PATH is
 the agent's nix profile then the base, and the rest names the home, the
-caches, git's identity and configuration, direnv's configuration,
+caches, git's identity and configuration, the dev shell cache,
 `NIX_REMOTE=daemon` when the host has a nix daemon and
 `RHO_GIT_STORE_SOCKET` pointing git at the keeper. Exposed mode
 passes the user's environment through with Rho's git first on PATH.

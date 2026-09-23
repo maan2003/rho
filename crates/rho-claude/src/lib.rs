@@ -107,8 +107,9 @@ impl ClaudeCodeOptions {
     }
 
     pub async fn command(&self) -> Result<Command> {
-        let mut command = Command::new("direnv");
-        command.arg("exec").arg(&self.cwd);
+        // In the dev shell of the flake the caller's working directory is in.
+        let mut command = Command::new(rho_fs_view::devshell_builder());
+        command.arg("exec").arg("--");
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
         command.env("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION);
         command.env(

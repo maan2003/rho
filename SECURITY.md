@@ -528,12 +528,15 @@ AI APIs.
   automatically accepts Claude's trust prompt only for that verified-empty
   directory. The bounded PTY probe uses the snapshotted user environment and
   configured PATH overrides so it shares Claude's user auth without loading
-  project configuration or `direnv`; timeout cleanup terminates and reaps the
+  project configuration or a dev shell; timeout cleanup terminates and reaps the
   probe's process group.
 - Internal workspace-management commands receive only that user environment.
-  Agent shell commands and Claude Code additionally run through `direnv exec`
-  in their project directory. Project `.envrc` files are trusted local code and
-  have the same authority as the agent shell tools they configure.
+  Agent shell commands, terminals, the shell sidecar and Claude Code
+  additionally run in the dev shell of the nearest flake above their working
+  directory, built by `rho-devshell-builder`. A project's flake and its
+  `shellHook` are trusted local code with the same authority as the agent shell
+  tools they configure. Evaluation is pure, but building the shell can realise
+  derivations through the Nix daemon like any `nix develop`.
 - The GUI's editor-native shell is also a daemon-owned command surface with the
   agent workspace's authority. The daemon starts `rho-shell` through the agent
   View and gives it one private framed Unix socket as stdin. The sidecar makes a
@@ -555,7 +558,7 @@ AI APIs.
   `RHO_SHELL` and `RHO_PAGER` may override sibling/PATH executable lookup and
   are therefore trusted daemon-administrator input. `rho-shell` loads Bash-compatible
   interactive configuration from Brush, including `~/.bashrc`, `PS1`, and
-  `PROMPT_COMMAND`; any configuration or `.envrc` reached from those hooks is
+  `PROMPT_COMMAND`; any configuration reached from those hooks is
   trusted local code with the same authority. Sandboxed agents remain refused
   because their intentionally empty HOME has no trusted startup hook to activate
   the project environment.
@@ -845,10 +848,11 @@ own tools denied.
   lock; recovery is restarting the workset worker. Python can exhaust memory,
   catch cancellation, or block in native computation. Rust command and
   nested-tool cancellation do not depend on Python cooperation.
-- Managed commands use watched direnv environment generations and a native Bash
+- Managed commands use watched flake dev shell generations and a native Bash
   supervisor with immutable environment. Cache invalidation covers discovery,
-  symlinks, replacement, and direnv-declared inputs, not arbitrary undeclared
-  inputs read by envrc code. Resolution failure does not reuse stale values.
+  symlinks, replacement, and every source read the Nix evaluator reported, not
+  files read only by `shellHook` at activation. Resolution failure does not
+  reuse stale values.
   Up to five pristine pre-forked children wait for one command each. They receive
   cwd and stdio only at admission; no child that ran user code is reused. Idle
   children have parent-death protection and are killed/reaped at supervisor shutdown.

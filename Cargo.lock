@@ -12824,6 +12824,7 @@ dependencies = [
  "devenv-core",
  "devenv-eval-cache",
  "devenv-nix-backend",
+ "libc",
  "serde_json",
  "tracing-subscriber",
 ]

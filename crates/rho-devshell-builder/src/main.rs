@@ -3,14 +3,25 @@
 //!
 //! Evaluation is pure, and the Nix fork reports every read of the flake's
 //! sources with what it observed, so a cached shell stays valid while those
-//! observations still hold. This binary links libnix and therefore runs apart
-//! from the (musl) rho processes. For now it only has a command-line mode used
-//! to exercise the builder and cache:
+//! observations still hold. It links libnix, so rho runs it as a separate
+//! process rather than loading Nix into its own.
 //!
 //!     rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
+//!     rho-devshell-builder exec [--] PROGRAM [ARGS...]
+//!     rho-devshell-builder develop NIX [ARGS...]
+//!
+//! `shell` prints the shell as JSON, for the agent worker to activate and
+//! watch. `exec` runs a program in the dev shell of the nearest flake above
+//! the working directory, or as it is outside flakes. `develop` is
+//! `nix develop ARGS...` from the cache for a local flake's dev shell, with
+//! or without `--command`, and hands anything else to the real `NIX`.
 
+use std::ffi::OsString;
+use std::io::Write as _;
+use std::os::fd::{FromRawFd as _, OwnedFd};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use devenv_core::ObservedKind;
@@ -23,36 +34,76 @@ use devenv_nix_backend::{DevShellRequest, NIX_STACK_SIZE, NixRuntime};
 /// Changes whenever evaluation semantics change (evaluator, Nix fork patches).
 const EVALUATOR: &str = concat!("rho-devshell-builder/", env!("CARGO_PKG_VERSION"), " nix-2.35-rho2");
 
+const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]
+       rho-devshell-builder exec [--] PROGRAM [ARGS...]
+       rho-devshell-builder develop NIX [ARGS...]";
+
+/// Bash running a program after the shell's activation script, which it
+/// reads from the descriptor in `$1`. `shellHook` output goes to stderr so
+/// that stdout is the program's alone.
+const EXEC_SCRIPT: &str = r#"fd=$1; shift; . "/dev/fd/$fd" >&2; exec {fd}<&-; unset fd; exec "$@""#;
+
+enum Mode {
+    Shell(Args),
+    Exec(Vec<OsString>),
+    Develop { nix: OsString, args: Vec<OsString> },
+}
+
 struct Args {
     flake_dir: PathBuf,
     shell: String,
     cache: Option<PathBuf>,
 }
 
-fn parse_args() -> Result<Args> {
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("shell") {
-        bail!("usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--cache DB] [--no-cache]");
+impl Args {
+    fn new(flake_dir: PathBuf) -> Self {
+        Self {
+            flake_dir,
+            shell: "default".into(),
+            cache: Some(default_cache_path()),
+        }
     }
-    let flake_dir = args.next().context("missing flake directory")?;
+}
+
+fn parse_args() -> Result<Mode> {
+    let mut args = std::env::args_os().skip(1);
+    match args.next().as_ref().and_then(|mode| mode.to_str()) {
+        Some("shell") => {}
+        Some("exec") => {
+            let mut program: Vec<OsString> = args.collect();
+            if program.first().is_some_and(|arg| arg == "--") {
+                program.remove(0);
+            }
+            if program.is_empty() {
+                bail!("{USAGE}");
+            }
+            return Ok(Mode::Exec(program));
+        }
+        Some("develop") => {
+            let nix = args.next().context(USAGE)?;
+            return Ok(Mode::Develop { nix, args: args.collect() });
+        }
+        _ => bail!("{USAGE}"),
+    }
+    let mut args = args.map(|arg| arg.into_string().map_err(|arg| anyhow::anyhow!("non-UTF-8 argument {arg:?}")));
+    let flake_dir = args.next().context("missing flake directory")??;
     let flake_dir = std::fs::canonicalize(&flake_dir).with_context(|| flake_dir.clone())?;
-    let mut parsed = Args {
-        flake_dir,
-        shell: "default".into(),
-        cache: Some(default_cache_path()),
-    };
+    let mut parsed = Args::new(flake_dir);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--shell" => parsed.shell = args.next().context("--shell needs a value")?,
-            "--cache" => parsed.cache = Some(args.next().context("--cache needs a value")?.into()),
+        match arg?.as_str() {
+            "--shell" => parsed.shell = args.next().context("--shell needs a value")??,
+            "--cache" => parsed.cache = Some(args.next().context("--cache needs a value")??.into()),
             "--no-cache" => parsed.cache = None,
             other => bail!("unknown argument {other}"),
         }
     }
-    Ok(parsed)
+    Ok(Mode::Shell(parsed))
 }
 
 fn default_cache_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("RHO_DEVSHELL_CACHE") {
+        return path.into();
+    }
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
@@ -60,7 +111,7 @@ fn default_cache_path() -> PathBuf {
 }
 
 fn main() -> Result<()> {
-    let args = parse_args()?;
+    let mode = parse_args()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -74,9 +125,138 @@ fn main() -> Result<()> {
     // Evaluation recurses deeply; match the Nix CLI's stack.
     std::thread::Builder::new()
         .stack_size(NIX_STACK_SIZE)
-        .spawn(move || run(args))?
+        .spawn(move || match mode {
+            Mode::Shell(args) => report(&build(&args)?),
+            Mode::Exec(program) => exec(&program),
+            Mode::Develop { nix, args } => develop(&nix, &args),
+        })?
         .join()
         .expect("evaluator thread panicked")
+}
+
+/// Run `program` in the dev shell of the nearest flake above the working
+/// directory. A shell that fails to build is reported and the program runs
+/// without it, as it would outside the flake.
+fn exec(program: &[OsString]) -> Result<()> {
+    let cwd = std::env::current_dir().context("working directory")?;
+    let activation = match find_flake(&cwd) {
+        None => None,
+        Some(flake_dir) => match build(&Args::new(flake_dir)).and_then(|built| activation(&built.shell)) {
+            Ok(activation) => Some(activation),
+            Err(e) => {
+                eprintln!("rho: dev shell unavailable, running without it: {e:#}");
+                None
+            }
+        },
+    };
+    match activation {
+        Some(activation) => run_in_shell(&activation, program),
+        None => Err(std::process::Command::new(&program[0]).args(&program[1..]).exec())
+            .with_context(|| format!("exec {:?}", program[0])),
+    }
+}
+
+/// Exec Bash running `program` after `activation`.
+fn run_in_shell(activation: &str, program: &[OsString]) -> Result<()> {
+    let fd = script_fd(activation)?;
+    Err(std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-c", EXEC_SCRIPT, "bash"])
+        .arg(std::os::fd::AsRawFd::as_raw_fd(&fd).to_string())
+        .args(program)
+        .exec())
+    .context("exec bash")
+}
+
+/// `script` in an inheritable memfd: an activation script is too large for
+/// an argument.
+fn script_fd(script: &str) -> Result<OwnedFd> {
+    let fd = unsafe { libc::memfd_create(c"rho-devshell-activation".as_ptr(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("memfd_create");
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    std::fs::File::from(fd.try_clone()?).write_all(script.as_bytes())?;
+    Ok(fd)
+}
+
+/// `nix develop ARGS...` for the cases the cache answers: an optional local
+/// flake (`.`, `./dir`, `/dir`, with `#NAME` for another dev shell) and an
+/// optional `--command`/`-c`. Any other form, and any shell that fails to
+/// build here, goes to the real Nix, which also reports errors as Nix does.
+fn develop(nix: &OsString, args: &[OsString]) -> Result<()> {
+    let real_nix = || {
+        Err(std::process::Command::new(nix).arg("develop").args(args).exec())
+            .with_context(|| format!("exec {nix:?}"))
+    };
+    let Some((installable, command)) = parse_develop(args) else {
+        return real_nix();
+    };
+    let (path, shell) = match installable.split_once('#') {
+        Some((path, shell)) => (path, shell),
+        None => (installable, ""),
+    };
+    let Some(flake_dir) = find_flake(Path::new(if path.is_empty() { "." } else { path })) else {
+        return real_nix();
+    };
+    let mut build_args = Args::new(flake_dir);
+    if !shell.is_empty() {
+        build_args.shell = shell.to_owned();
+    }
+    let Ok(activation) = build(&build_args).and_then(|built| activation(&built.shell)) else {
+        return real_nix();
+    };
+    match command {
+        Some(command) => run_in_shell(&activation, command),
+        None => {
+            // Interactive, as `nix develop` starts it: the shell is the rc file.
+            let fd = script_fd(&activation)?;
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+            Err(std::process::Command::new("bash")
+                .arg("--rcfile")
+                .arg(format!("/dev/fd/{raw}"))
+                .exec())
+            .context("exec bash")
+        }
+    }
+}
+
+/// The installable (`.` when absent) and command of a `nix develop`
+/// invocation the cache can answer.
+fn parse_develop(args: &[OsString]) -> Option<(&str, Option<&[OsString]>)> {
+    let mut installable = None;
+    let mut command = None;
+    for (i, arg) in args.iter().enumerate() {
+        let arg = arg.to_str()?;
+        if matches!(arg, "-c" | "--command") {
+            command = Some(&args[i + 1..]).filter(|command| !command.is_empty());
+            command?;
+            break;
+        }
+        if arg.starts_with('-') || installable.is_some() {
+            return None;
+        }
+        installable = Some(arg);
+    }
+    let installable = installable.unwrap_or(".");
+    let (path, shell) = installable.split_once('#').unwrap_or((installable, ""));
+    // A bare word is a registry flake; a dotted fragment is an attribute path.
+    let local = path.is_empty() || path.starts_with('.') || path.starts_with('/');
+    (local && !path.contains(':') && !shell.contains('.')).then_some((installable, command))
+}
+
+/// The nearest directory with a `flake.nix`, looking no further up than the
+/// enclosing git checkout.
+fn find_flake(cwd: &Path) -> Option<PathBuf> {
+    let physical = cwd.canonicalize().ok()?;
+    for dir in physical.ancestors() {
+        if dir.join("flake.nix").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    None
 }
 
 /// What rho keeps of an evaluated shell; cached as JSON.
@@ -138,7 +318,19 @@ impl Source {
     }
 }
 
-fn run(args: Args) -> Result<()> {
+/// A shell and how it was obtained.
+struct Built {
+    outcome: &'static str,
+    shell: Shell,
+    /// The cache candidate, if the shell could be cached.
+    eval_id: Option<i64>,
+    watch: Watch,
+    started: Instant,
+    /// Lookup and evaluation time, inputs recorded and effects seen.
+    eval: Option<(Duration, Duration, usize, usize)>,
+}
+
+fn build(args: &Args) -> Result<Built> {
     let t0 = Instant::now();
     let system = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
     let source = Source::find(&args.flake_dir);
@@ -162,8 +354,14 @@ fn run(args: Args) -> Result<()> {
     if let Some(cache) = &cache {
         match lookup(cache, &key, &source) {
             Ok(Some((shell, eval_id, inputs))) => {
-                let watch = watch_paths(&source, &args.flake_dir, &inputs);
-                return report("hit", &shell, Some(eval_id), &watch, t0, None);
+                return Ok(Built {
+                    outcome: "hit",
+                    shell,
+                    eval_id: Some(eval_id),
+                    watch: watch_paths(&source, &args.flake_dir, &inputs),
+                    started: t0,
+                    eval: None,
+                });
             }
             Ok(None) => {}
             Err(e) => eprintln!("eval cache lookup failed, evaluating: {e}"),
@@ -194,8 +392,14 @@ fn run(args: Args) -> Result<()> {
         Ok((_, recorded)) => recorded,
         Err(e) => {
             eprintln!("not caching: {e}");
-            let stats = Some((lookup_done, eval_done, 0, eval.ops.len()));
-            return report("uncacheable", &shell, None, &Watch::default(), t0, stats);
+            return Ok(Built {
+                outcome: "uncacheable",
+                shell,
+                eval_id: None,
+                watch: Watch::default(),
+                started: t0,
+                eval: Some((lookup_done, eval_done, 0, eval.ops.len())),
+            });
         }
     };
     let flake_rev = recorded.flake_rev;
@@ -221,8 +425,14 @@ fn run(args: Args) -> Result<()> {
             Err(e) => eprintln!("failed to store eval result: {e}"),
         }
     }
-    let watch = watch_paths(&source, &args.flake_dir, &inputs);
-    report("miss", &shell, eval_id, &watch, t0, stats)
+    Ok(Built {
+        outcome: "miss",
+        shell,
+        eval_id,
+        watch: watch_paths(&source, &args.flake_dir, &inputs),
+        started: t0,
+        eval: stats,
+    })
 }
 
 /// A valid cached shell for `key`, dropping candidates whose store paths were
@@ -346,29 +556,30 @@ impl GitDirs {
     }
 }
 
-/// Print the result for the caller: the shell as a Bash activation script
-/// (which runs `shellHook`), the candidate it is cached as, and what to
-/// watch to know it may be stale.
-fn report(
-    outcome: &str,
-    shell: &Shell,
-    eval_id: Option<i64>,
-    watch: &Watch,
-    t0: Instant,
-    eval: Option<(std::time::Duration, std::time::Duration, usize, usize)>,
-) -> Result<()> {
-    let activation = BuildEnvironment::from_json(&shell.env_json)?.to_activation_script();
+/// Bash applying `shell` to the caller's environment, `shellHook` included.
+/// `RHO_DEVSHELL_PATH_PREFIX` then goes before the shell's `PATH`.
+fn activation(shell: &Shell) -> Result<String> {
+    let mut script = BuildEnvironment::from_json(&shell.env_json)?.to_activation_script();
+    script.push_str(
+        "\nif [ -n \"${RHO_DEVSHELL_PATH_PREFIX-}\" ]; then PATH=\"$RHO_DEVSHELL_PATH_PREFIX:$PATH\"; export PATH; fi\n",
+    );
+    Ok(script)
+}
+
+/// Print the result for the caller: the shell as a Bash activation script,
+/// the candidate it is cached as, and what to watch to know it may be stale.
+fn report(built: &Built) -> Result<()> {
     let mut out = serde_json::json!({
-        "outcome": outcome,
-        "eval_id": eval_id,
-        "drv_path": shell.drv_path,
-        "env_store_path": shell.env_store_path,
-        "activation": activation,
-        "watch": watch.contents,
-        "watch_names": watch.names,
-        "total_s": t0.elapsed().as_secs_f64(),
+        "outcome": built.outcome,
+        "eval_id": built.eval_id,
+        "drv_path": built.shell.drv_path,
+        "env_store_path": built.shell.env_store_path,
+        "activation": activation(&built.shell)?,
+        "watch": built.watch.contents,
+        "watch_names": built.watch.names,
+        "total_s": built.started.elapsed().as_secs_f64(),
     });
-    if let Some((lookup, eval, inputs, ops)) = eval {
+    if let Some((lookup, eval, inputs, ops)) = built.eval {
         out["lookup_s"] = lookup.as_secs_f64().into();
         out["eval_s"] = (eval - lookup).as_secs_f64().into();
         out["inputs"] = inputs.into();

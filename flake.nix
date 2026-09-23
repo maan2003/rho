@@ -17,6 +17,17 @@
       url = "github:maan2003/public-skills";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # cachix's devenv-2.35 Nix: the C API rho-devshell-builder evaluates
+    # through, patched with nix/patches/nix-*.patch. Only its packages are
+    # used; its development inputs are dropped.
+    nix = {
+      url = "github:cachix/nix/b9b81726b38469c55b9706d80d37d6c73cc7f76c";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixpkgs-regression.follows = "";
+      inputs.nixpkgs-23-11.follows = "";
+      inputs.flake-parts.follows = "";
+      inputs.git-hooks-nix.follows = "";
+    };
     selfci = {
       url = "git+https://radicle.dpc.pw/z2tDzYbAXxTQEKTGFVwiJPajkbeDU.git";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -34,6 +45,7 @@
       agent-desktop,
       flakebox,
       public-skills,
+      nix,
       selfci,
       ...
     }:
@@ -80,6 +92,26 @@
             exact = true;
           }];
         });
+        # `nix develop` of a local flake's dev shell answers from
+        # rho-devshell-builder's cache (VIEW.md 3); anything else is Nix.
+        # Only `bin/nix` is replaced; the legacy `nix-*` commands stay links
+        # into Nix itself.
+        agentNix = pkgs.symlinkJoin {
+          name = "rho-agent-nix";
+          paths = [ pkgs.nix ];
+          postBuild = ''
+            rm $out/bin/nix
+            cat > $out/bin/nix <<'EOF'
+        #!${pkgs.runtimeShell}
+        if [ "''${1-}" = develop ] && [ -n "''${RHO_DEVSHELL_BUILDER-}" ]; then
+          shift
+          exec "$RHO_DEVSHELL_BUILDER" develop ${pkgs.nix}/bin/nix "$@"
+        fi
+        exec ${pkgs.nix}/bin/nix "$@"
+        EOF
+            chmod +x $out/bin/nix
+          '';
+        };
         rhoBash = pkgs.bash.overrideAttrs (old: {
           pname = "rho-bash";
           # Pinned one-shot Bash spare pool, maintained in its own fork.
@@ -127,7 +159,7 @@
           # system-path.nix), minus what has no meaning in a view (acl,
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
           # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
-          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) ]
+          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) agentNix ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
             ++ (with pkgs; [
             bashInteractive bzip2
@@ -139,7 +171,6 @@
             ncurses netcat procps time util-linux which zstd
             perl rsync strace
             openssh
-            direnv nix-direnv nix
             ripgrep fd just python3 uv nodejs
             cacert agentRegistry
           ]);
@@ -256,6 +287,12 @@
         pythonPackages = pkgs.python3.withPackages (ps: [ ps.pyyaml ps.httpx ]);
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
+        # Evaluation in rho-devshell-builder: records what the evaluator read.
+        nixFork = nix.packages.${system}.nix.appendPatches [
+          ./nix/patches/nix-0001-libexpr-report-input-mounts-and-forced-source-info-m.patch
+          ./nix/patches/nix-0002-libexpr-record-observed-reads-of-mounted-local-input.patch
+        ];
+
         guiNativeBuildInputs = [
           pkgs.clang
           pkgs.cmake
@@ -284,9 +321,9 @@
             craneLibBase = craneLib'.overrideArgs {
               pname = projectName;
               src = buildSrc;
-              nativeBuildInputs = guiNativeBuildInputs;
+              nativeBuildInputs = guiNativeBuildInputs ++ [ pkgs.rustPlatform.bindgenHook ];
               # The notebook embeds this CPython; PyO3 links its libpython.
-              buildInputs = guiBuildInputs ++ [ pkgs.python3 ];
+              buildInputs = guiBuildInputs ++ [ pkgs.python3 nixFork.dev ];
               env.RUSTDOCFLAGS = "-D warnings";
               env.PYO3_PYTHON = "${pythonPackages}/bin/python3";
               env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
@@ -322,7 +359,7 @@
             craneLib = craneLibBase.overrideArgs {
               cargoVendorDir = craneLibBase.vendorCargoDeps { };
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-agent -p rho-shell -p git-remote-octo";
+            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-agent -p rho-shell -p rho-devshell-builder -p git-remote-octo";
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. Registry dependencies need the real APIs of
@@ -360,7 +397,7 @@
               cargoExtraArgs = packageCargoExtraArgs;
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
-              env.RHO_DIRENV_PATH_BEFORE = "${findutils}/bin";
+              env.RHO_FIND_BIN = "${findutils}/bin";
               postInstall = ''
                 mkdir -p $out/share/rho/skills
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
@@ -448,7 +485,7 @@
             ;
         };
 
-        legacyPackages = multiBuild // { inherit rhoGit agentBase rhoBash; };
+        legacyPackages = multiBuild // { inherit rhoGit agentBase rhoBash nixFork; };
 
         devShells = flakeboxLib.mkShells {
           channel = "latest";
@@ -476,10 +513,12 @@
             pkgs.pkg-config
             pkgs.protobuf
             pkgs.taplo
+            nixFork.dev
             selfciPkg
           ]
           ++ guiBuildInputs;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           LD_LIBRARY_PATH = guiLibraryPath;
           NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''

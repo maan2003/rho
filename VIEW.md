@@ -33,7 +33,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
    keeps the user's own config free to be as personal as they like.
 
 2. **The userland is a base plus a profile, both nix.** Rho names the
-   tools every agent gets (coreutils, bash, Rho's patched git, direnv,
+   tools every agent gets (coreutils, bash, Rho's patched git,
    nix, ripgrep, fd, just, python3, uv, node, …) as one `buildEnv` in
    the flake, `agentBase`, whose path is baked into the daemon at build
    time (`RHO_AGENT_BASE`). Anything else an agent wants it installs
@@ -50,34 +50,36 @@ security boundary (see `WORKSET.md`); it is a distribution.
    a profile lets an agent add a tool without anyone editing the list;
    and nothing is built at runtime, on tmpfs or anywhere else.
 
-3. **The project environment comes from the repository, evaluated by
-   direnv under Rho's configuration.** `.envrc` is the contract; direnv
-   plus nix-direnv evaluate it, and the terminal, the shell sidecar and
-   tool execution all run through it. Rho points `DIRENV_CONFIG` at a
-   generated directory with its own `direnv.toml` and `direnvrc`:
-   - The `/src` prefix is whitelisted; there is no `direnv allow` step.
-     *Why:* an agent already runs the repository's build scripts, so a
-     trust gate on `.envrc` protects nothing and only adds a failure
-     mode.
-   - The layout directory (what direnv calls `.direnv`) lives outside
-     the checkout, in the workset's state directory, which is bound
-     into the view at the same absolute path it has on the host.
-     *Why:* nix-direnv registers garbage-collection roots by absolute
-     path. Inside the checkout that path would be `/src/…`, which does
-     not exist on the host, so the roots would dangle and every GC would
-     delete the dev shell. At a host-valid path the roots resolve, and
-     they die with the workset when it is discarded — a better lifetime
-     than a `.direnv` that outlives its checkout. It also means two
-     worktrees of one repository do not share one cache directory.
-   - The `use_flake` wrapper that adds the shared cargo cache and
-     `RHO_DIRENV_PATH_BEFORE` is part of that `direnvrc`.
+3. **The project environment is the repository's flake dev shell.** A
+   command runs in `devShells.<system>.default` of the nearest
+   `flake.nix` above its working directory, looking no further than the
+   enclosing git checkout, as `nix develop` would set it up; outside a
+   flake it gets the base environment. Tool execution, the terminal, the
+   shell sidecar and Claude Code all get it from `rho-devshell-builder`
+   (ARCHITECTURE.md). There is no `.envrc`, no direnv and no trust step.
+   *Why:* an agent already runs the repository's build scripts, so a
+   trust gate protects nothing and only adds a failure mode. A flake
+   evaluates purely, so a built shell can be cached against exactly what
+   evaluation read and reused across checkouts and worksets.
+   - The builder's cache (`RHO_DEVSHELL_CACHE`) is shared by the
+     owner's worksets and bound into the view at its host path.
+     *Why:* the garbage-collection roots of cached shells live beside
+     it, and the nix daemon resolves them on the host. At a view-only
+     path the roots would dangle and every GC would delete the shells.
+   - After a dev shell is applied, `RHO_DEVSHELL_PATH_PREFIX` (the
+     daemon's find fork, then cargo's shared bin directory) goes before
+     its `PATH`.
+   - The base's `nix` sends `nix develop` of a local flake (`.`,
+     `./dir`, `/dir`, optionally `#NAME`, with or without `--command`)
+     to the builder (`RHO_DEVSHELL_BUILDER`), so it is answered from the
+     same cache; other forms and every other subcommand are Nix itself.
 
 4. **Nix works, through the daemon.** The daemon socket is bound,
    `NIX_REMOTE=daemon` is set, and `/etc/nix/nix.conf` is generated with
    flakes enabled (and whatever registry Rho wants pinned). The host's
    nix.conf is not copied.
-   *Why:* flakes are how projects here declare toolchains, so `use
-   flake` must work. With a read-only store the daemon is the only
+   *Why:* flakes are how projects here declare toolchains, so their dev
+   shells must build. With a read-only store the daemon is the only
    writer; without `NIX_REMOTE` nix sees a writable `/nix/var` on the
    tmpfs, picks a local store and fails. On NixOS `/etc/nix/nix.conf`
    is a symlink into `/etc/static`, so binding it gives a dangling link;
@@ -87,7 +89,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
    disposable.** A shared cache directory under the Rho state root is
    mounted as `$XDG_CACHE_HOME` (nix evaluation and fetcher caches,
    cargo registry and shared target directory, uv, npm, pip). The
-   per-workset state directory holds the direnv layout. The home itself
+   per-workset state directory holds per-workset GC roots. The home itself
    is never persisted.
    *Why:* a cold flake evaluation with an empty nix cache takes minutes;
    a cold cargo build takes longer. Those caches are designed for
@@ -107,7 +109,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 7. **Locale and terminal are fixed.** `LANG=C.UTF-8` (built into glibc,
    so no locale archive), `TERM` and `TZ` passed through, `COLORTERM`
    set. Shell initialisation is `/etc/bashrc` and `/etc/profile`, which
-   the nixpkgs bash reads; the direnv hook and prompt live there. Fish,
+   the nixpkgs bash reads; the prompt lives there. Fish,
    tmux and zoxide are not part of the distro.
 
 8. **Every checkout is a plain git repository, and `git` is git.** The
@@ -129,8 +131,8 @@ security boundary (see `WORKSET.md`); it is a distribution.
 
 9. **Anything the host must resolve has the same path in both frames.**
    The clone-store root and socket already appear at their host paths
-   inside the view; the per-workset state directory (direnv layout, GC
-   roots) joins them. Everything else lives at the view's own paths and
+   inside the view; the per-workset state directory and the dev shell
+   cache (both holding GC roots) join them. Everything else lives at the view's own paths and
    never at a host path.
    *Why:* git alternates and nix GC roots record absolute paths and are
    read by processes on the host side (the nix daemon, the store server).
@@ -144,7 +146,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 ## Deliberately not in the view
 
 - Dotfiles and home-manager output of any kind; a home skeleton.
-- The `direnv allow` database; the login-shell PATH filter; the
+- The login-shell PATH filter; the
   locale archive; a copy of the host's `/etc/nix`.
 - ssh keys, tailscale, gh, amp, codex and other credentials. Claude Code
   state is the one exception and is mounted explicitly by
@@ -158,13 +160,14 @@ security boundary (see `WORKSET.md`); it is a distribution.
 | `<base>` | the agent base, a store path already under `/nix/store` |
 | `/nix/store` | host store, read-only |
 | `/nix/var/nix/daemon-socket` | host nix daemon socket |
-| `/etc` | generated: passwd, group, hosts, resolv.conf, nsswitch, ssl, localtime, `nix/nix.conf`, `gitconfig`, `rho/direnv/`, `bashrc`, `profile` |
+| `/etc` | generated: passwd, group, hosts, resolv.conf, nsswitch, ssl, localtime, `nix/nix.conf`, `gitconfig`, `bashrc`, `profile` |
 | `/home/agent` | empty tmpfs; `~/.cache` is the shared persistent cache; `~/.claude` is the Claude home stack |
 | `/src` | the workset, read-write |
 | `<state>/stores`, `<state>/store.sock` | at host paths: mirrors read-only, the keeper's socket |
 | `/nix/var/nix/daemon-socket/socket` | the nix daemon, when the host has one (`NIX_REMOTE=daemon`) |
 | `/bin/sh`, `/usr/bin/env` | symlinks into the base |
-| `<state>/worksets/<id>/state` | at its host path, read-write: direnv layout and GC roots |
+| `<state>/worksets/<id>/state` | at its host path, read-write: GC roots and notes |
+| `<cache>/rho-devshell` | at its host path, read-write: dev shell cache and its GC roots |
 | `/proc`, `/dev`, `/tmp` | as today |
 
 ## Environment
@@ -175,11 +178,11 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under `~/.cache`;
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
 from the user's environment or git config, read once when the daemon
-starts; `DIRENV_CONFIG=/etc/rho/direnv` and `RHO_DIRENV_LAYOUT_DIR`
-under the workset's state directory; `FIND_DENY_ROOTS` for Rho's find;
+starts; `RHO_DEVSHELL_CACHE`, `RHO_DEVSHELL_PATH_PREFIX` and
+`RHO_DEVSHELL_BUILDER` (above);
+`FIND_DENY_ROOTS` for Rho's find;
 `NIX_REMOTE=daemon` when the host has a nix daemon;
-`RHO_GIT_STORE_SOCKET`. Passed through from the user: `TERM`, `TZ`,
-`RHO_DIRENV_PATH_BEFORE`. Variables the caller sets on a command
+`RHO_GIT_STORE_SOCKET`. Passed through from the user: `TERM`, `TZ`. Variables the caller sets on a command
 survive.
 
 ## Where it lives
@@ -194,15 +197,14 @@ All of it is `rho-fs-view`, in two places:
 - `layout.rs` builds the view per agent: the root tmpfs, the two shebang
   links, the generated `/etc` (passwd with the real uid, resolv.conf and
   localtime from the host, the CA bundle and registry from the base,
-  nix.conf, gitconfig, direnv's configuration and `direnvrc`, bashrc and
-  profile), the home with its XDG directories, and the mounts (`/src`,
-  the shared cache at `~/.cache`, the workset's state directory, the
-  store, the sockets). `ns.rs` sets the environment above.
+  nix.conf, gitconfig, bashrc and profile), the home with its XDG directories, and the mounts (`/src`,
+  the shared cache at `~/.cache`, the workset's state directory, the dev
+  shell cache, the store, the sockets). `ns.rs` sets the environment above.
 
 Nothing is assembled at daemon start and nothing is persisted: the
 base is a store path, and the rest is a few files per agent.
 
 ## Later, enabled by this layout
 
-- Evaluate `.envrc` in the background right after a clone, so the first
+- Build the dev shell in the background right after a clone, so the first
   agent command does not pay for the evaluation.

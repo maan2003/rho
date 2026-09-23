@@ -642,10 +642,6 @@ impl ShellTools {
 
     async fn spawn_process(&self, cmd: &str, workdir: Option<&str>) -> Result<ProcessSession> {
         let mut command = Command::new(format!("{}/bin/rho-bash", rho_fs_view::AGENT_BASE));
-        command.env_remove("DIRENV_DIFF");
-        command.env_remove("DIRENV_DIR");
-        command.env_remove("DIRENV_FILE");
-        command.env_remove("DIRENV_WATCHES");
         for (name, value) in &self.env {
             command.env(name, value);
         }

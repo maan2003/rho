@@ -106,6 +106,7 @@ impl WorksetLayout {
                 config.home_skeleton = home_skeleton.clone();
                 config.cache = Some(self.cache.clone().into_std_path_buf());
                 config.workset_state = Some(self.state.clone().into_std_path_buf());
+                config.devshell_cache = Some(devshell_cache(&self.cache).into_std_path_buf());
                 crate::layout::FsViewBuilder::new(config)?
                     .build_in_place(self.root.as_std_path())?;
             }
@@ -146,6 +147,7 @@ impl WorksetLayout {
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
             workset_state: self.state.clone(),
+            devshell_cache: devshell_cache(&self.cache),
         });
         let mut command = tokio::process::Command::new("");
         view.configure_environment(&mut command);
@@ -186,6 +188,14 @@ pub struct Namespace {
     store_environment: Vec<(OsString, OsString)>,
     identity: Vec<(OsString, OsString)>,
     workset_state: Utf8PathBuf,
+    devshell_cache: Utf8PathBuf,
+}
+
+/// Where rho-devshell-builder caches shells, shared by the owner's worksets.
+/// The view binds it at this host path because the GC roots of cached shells
+/// live in it and the Nix daemon resolves them on the host.
+fn devshell_cache(cache: &Utf8Path) -> Utf8PathBuf {
+    cache.join("rho-devshell")
 }
 
 impl Namespace {
@@ -203,6 +213,7 @@ impl Namespace {
         let store_environment = owner.store_environment();
         let identity = owner.identity_environment().to_vec();
         let workset_state = workset.state_dir()?;
+        let devshell_cache = devshell_cache(&owner.cache_dir());
         let environment = owner.environment.clone();
         let path_overrides = owner.path_overrides.clone();
         Ok(Arc::new(Self {
@@ -215,6 +226,7 @@ impl Namespace {
             store_environment,
             identity,
             workset_state,
+            devshell_cache,
         }))
     }
 
@@ -363,13 +375,24 @@ impl Namespace {
                 // The agent's own nix profile first, then the base userland
                 // (VIEW.md). Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
-                // Passed through from the user: the terminal, the timezone,
-                // and the daemon's own find-fork directory for direnvrc.
-                for name in ["TERM", "TZ", "RHO_DIRENV_PATH_BEFORE"] {
+                // Passed through from the user: the terminal and the timezone.
+                for name in ["TERM", "TZ"] {
                     if let Some(value) = self.environment.get(name) {
                         command.env(name, value);
                     }
                 }
+                // Ahead of a flake dev shell's own PATH (VIEW.md 3): the
+                // daemon's find fork, then cargo-installed binaries.
+                let mut prefix = OsString::new();
+                if let Some(find) = self.environment.get("RHO_FIND_BIN") {
+                    prefix.push(find);
+                    prefix.push(":");
+                }
+                prefix.push(format!("{home}/.cache/cargo/bin"));
+                command.env("RHO_DEVSHELL_PATH_PREFIX", prefix);
+                command.env("RHO_DEVSHELL_CACHE", self.devshell_cache.join("cache.sqlite"));
+                // For the base's `nix develop` (VIEW.md 3).
+                command.env("RHO_DEVSHELL_BUILDER", crate::devshell_builder());
                 command
                     .env(
                         "PATH",
@@ -390,8 +413,6 @@ impl Namespace {
                         format!("{home}/.cache/cargo-target"),
                     )
                     .env("GIT_CONFIG_SYSTEM", "/etc/gitconfig")
-                    .env("DIRENV_CONFIG", "/etc/rho/direnv")
-                    .env("RHO_DIRENV_LAYOUT_DIR", self.workset_state.join("direnv"))
                     .env("FIND_DENY_ROOTS", format!("/:/nix/store:{home}"));
                 command.envs(self.identity.iter().map(|(name, value)| (name, value)));
                 if Path::new(crate::layout::NIX_DAEMON_SOCKET).exists() {

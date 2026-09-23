@@ -1,4 +1,4 @@
-//! The terminal registry end to end: a shell under `direnv exec` inside a
+//! The terminal registry end to end: a shell under `rho-devshell-builder exec` inside a
 //! view-mode namespace over a temporary workset. Harness-free because the
 //! identity user namespace must precede every thread.
 
@@ -18,13 +18,22 @@ fn main() {
         eprintln!("skipping terminal_e2e: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    if !std::process::Command::new("direnv")
-        .arg("version")
-        .output()
-        .is_ok_and(|output| output.status.success())
-    {
-        eprintln!("skipping terminal_e2e: direnv unavailable");
+    // The view binds only this binary's directory; the builder runs from
+    // there, as it does next to an installed daemon.
+    let exe = std::env::current_exe().unwrap();
+    let Some(builder) = exe
+        .ancestors()
+        .map(|dir| dir.join("rho-devshell-builder"))
+        .find(|path| path.is_file())
+    else {
+        eprintln!("skipping terminal_e2e: build rho-devshell-builder first");
         return;
+    };
+    let sibling = exe.with_file_name("rho-devshell-builder");
+    if !sibling.exists() {
+        std::fs::hard_link(&builder, &sibling)
+            .or_else(|_| std::fs::copy(&builder, &sibling).map(drop))
+            .unwrap();
     }
     common::run("", terminal_end_to_end_over_registry);
     println!("terminal e2e passed");

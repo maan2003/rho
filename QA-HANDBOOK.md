@@ -209,7 +209,8 @@ that is where to look if a future toolchain does it again. Fixed by moving to
 mold; note that a shell started before that change still has the old linker's
 store path in `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, and a
 target-specific RUSTFLAGS variable shadows `.cargo/config.toml` outright.
-`direnv exec . cargo …` picks up the new one without restarting anything.
+An agent's next command picks up the new one on its own; on the host, re-enter
+`nix develop`.
 
 The same day gave the other half of that: `du` on a rig's state reports the
 snapshot's full size because `rig new` clones with `cp -a --reflink=auto` and
@@ -223,8 +224,9 @@ Three more things a run trips over, from the desk-parents deletion on 10 Sep.
 
 - **rho-daemon does not build outside the devshell.** `rho-agent`'s `python` module reads
   `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-daemon`
-  fails to compile before it ever reaches the daemon. `direnv exec . cargo …`
-  is the fix, and it is the fix for every crate that pulls the daemon in.
+  fails to compile before it ever reaches the daemon. Run cargo in the dev
+  shell (agent commands already are; on the host, `nix develop -c cargo …`);
+  the same holds for every crate that pulls the daemon in.
 - **A fresh rig carries no conversion markers.** `user-2026-09-06` predates the
   8 Sep parents conversion -- that is why it was the conversion's proof subject
   -- so a rig cloned from it has no `rho_desk_parent_labels_v1`. A case about a

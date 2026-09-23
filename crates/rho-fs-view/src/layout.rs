@@ -81,8 +81,11 @@ pub struct FsViewConfig {
     /// The shared persistent cache, mounted read-write as `~/.cache`.
     pub cache: Option<PathBuf>,
     /// The workset's state directory, mounted read-write at its host path
-    /// (direnv layout, nix GC roots).
+    /// (nix GC roots).
     pub workset_state: Option<PathBuf>,
+    /// rho-devshell-builder's shared cache, mounted read-write at its host
+    /// path: the GC roots of cached shells live in it.
+    pub devshell_cache: Option<PathBuf>,
     /// The directory holding this process's own executable when it lies
     /// outside `/nix/store` (a cargo build), bound read-only at its host
     /// path so a development daemon can launch its sibling sidecars.
@@ -98,6 +101,7 @@ impl FsViewConfig {
             base: PathBuf::from(crate::AGENT_BASE),
             cache: None,
             workset_state: None,
+            devshell_cache: None,
             own_binaries: own_binaries_dir()?,
         })
     }
@@ -304,6 +308,12 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
         bind(state, &target, false)?;
     }
+    if let Some(cache) = &config.devshell_cache {
+        fs::create_dir_all(cache).with_context(|| format!("create {}", cache.display()))?;
+        let target = host_path_in(root, cache);
+        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
+        bind(cache, &target, false)?;
+    }
     // A development executable may live below ~/.cache. Install it after
     // the cache/state mounts so those mounts cannot cover its executable.
     if let Some(dir) = &config.own_binaries {
@@ -360,42 +370,8 @@ fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         etc.join("gitconfig"),
         "[core]\n\tpager = cat\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n",
     )?;
-    // direnv under Rho's configuration (VIEW.md 3): everything under /src
-    // is trusted, the layout lives in the workset's state directory, and
-    // `use flake` puts the daemon's find fork and cargo's bin first.
-    fs::create_dir_all(etc.join("rho/direnv"))?;
-    fs::write(
-        etc.join("rho/direnv/direnv.toml"),
-        "[whitelist]\nprefix = [ \"/src\" ]\n",
-    )?;
-    fs::write(
-        etc.join("rho/direnv/direnvrc"),
-        format!(
-            r#"source {base}/share/nix-direnv/direnvrc
-eval "$(declare -f use_flake | sed '1s/use_flake/rho_nix_direnv_use_flake/')"
-
-direnv_layout_dir() {{
-    local checkout key
-    checkout="$(pwd -P)"
-    key="$(printf '%s' "$checkout" | sha256sum)"
-    printf '%s/%s
-' "${{RHO_DIRENV_LAYOUT_DIR:?RHO_DIRENV_LAYOUT_DIR is not set}}" "${{key%% *}}"
-}}
-
-use_flake() {{
-    rho_nix_direnv_use_flake "$@" || return
-    PATH="${{RHO_DIRENV_PATH_BEFORE:+${{RHO_DIRENV_PATH_BEFORE}}:}}${{CARGO_HOME:-$HOME/.cache/cargo}}/bin:${{PATH}}"
-    export PATH
-}}
-"#,
-            base = config.base.display()
-        ),
-    )?;
     // The nixpkgs bash reads these itself (SYS_BASHRC).
-    fs::write(
-        etc.join("bashrc"),
-        "eval \"$(direnv hook bash)\"\nPS1='agent:\\w\\$ '\n",
-    )?;
+    fs::write(etc.join("bashrc"), "PS1='agent:\\w\\$ '\n")?;
     fs::write(etc.join("profile"), "[ -r /etc/bashrc ] && . /etc/bashrc\n")?;
     Ok(())
 }
