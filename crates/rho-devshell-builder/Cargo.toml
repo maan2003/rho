@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+devenv-core.workspace = true
 devenv-eval-cache.workspace = true
 devenv-nix-backend.workspace = true
 serde_json.workspace = true

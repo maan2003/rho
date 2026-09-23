@@ -84,6 +84,7 @@ axum = "0.8"
 base64 = "0.22"
 brush-builtins = { path = "vendor/brush/brush-builtins" }
 brush-core = { path = "vendor/brush/brush-core" }
+devenv-core = { path = "vendor/devenv/devenv-core" }
 devenv-eval-cache = { path = "vendor/devenv/devenv-eval-cache" }
 devenv-nix-backend = { path = "vendor/devenv/devenv-nix-backend" }
 buffer_diff = { path = "vendor/zed/crates/buffer_diff" }

@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
+use devenv_core::ObservedKind;
 use devenv_eval_cache::{
     CachingEvalService, Checkout, EvalCacheKey, FlakeScheme, Input, RevInputDesc, record_inputs,
 };
+use devenv_nix_backend::build_environment::BuildEnvironment;
 use devenv_nix_backend::{DevShellRequest, NIX_STACK_SIZE, NixRuntime};
 
 /// Changes whenever evaluation semantics change (evaluator, Nix fork patches).
@@ -65,6 +67,9 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_target(false)
+        .without_time()
         .init();
     // Evaluation recurses deeply; match the Nix CLI's stack.
     std::thread::Builder::new()
@@ -156,9 +161,9 @@ fn run(args: Args) -> Result<()> {
     });
     if let Some(cache) = &cache {
         match lookup(cache, &key, &source) {
-            Ok(Some(shell)) => {
-                report("hit", &shell, t0, None);
-                return Ok(());
+            Ok(Some((shell, eval_id, inputs))) => {
+                let watch = watch_paths(&source, &args.flake_dir, &inputs);
+                return report("hit", &shell, Some(eval_id), &watch, t0, None);
             }
             Ok(None) => {}
             Err(e) => eprintln!("eval cache lookup failed, evaluating: {e}"),
@@ -189,8 +194,8 @@ fn run(args: Args) -> Result<()> {
         Ok((_, recorded)) => recorded,
         Err(e) => {
             eprintln!("not caching: {e}");
-            report("uncacheable", &shell, t0, Some((lookup_done, eval_done, 0, eval.ops.len())));
-            return Ok(());
+            let stats = Some((lookup_done, eval_done, 0, eval.ops.len()));
+            return report("uncacheable", &shell, None, &Watch::default(), t0, stats);
         }
     };
     let flake_rev = recorded.flake_rev;
@@ -200,33 +205,39 @@ fn run(args: Args) -> Result<()> {
         inputs.push(Input::FlakeRev(RevInputDesc::new(&checkout)?));
     }
     let stats = Some((lookup_done, eval_done, inputs.len(), eval.ops.len()));
+    let mut eval_id = None;
     if let (Some(cache), Some(cache_path)) = (&mut cache, &args.cache) {
         let stored = cache.store(&key, &shell.to_json(), &inputs).and_then(|eval_id| {
             Ok((eval_id, cache.eval_ids()?))
         });
         match stored {
-            Ok((eval_id, live)) => {
+            Ok((id, live)) => {
+                eval_id = Some(id);
                 let roots = gc_roots_dir(cache_path);
-                if let Err(e) = root_shell(&mut nix, &roots, eval_id, &shell, &live) {
+                if let Err(e) = root_shell(&mut nix, &roots, id, &shell, &live) {
                     eprintln!("failed to register GC root: {e}");
                 }
             }
             Err(e) => eprintln!("failed to store eval result: {e}"),
         }
     }
-    report("miss", &shell, t0, stats);
-    Ok(())
+    let watch = watch_paths(&source, &args.flake_dir, &inputs);
+    report("miss", &shell, eval_id, &watch, t0, stats)
 }
 
 /// A valid cached shell for `key`, dropping candidates whose store paths were
 /// garbage collected (as devenv does) and trying the next.
-fn lookup(cache: &CachingEvalService, key: &EvalCacheKey, source: &Source) -> Result<Option<Shell>> {
+fn lookup(
+    cache: &CachingEvalService,
+    key: &EvalCacheKey,
+    source: &Source,
+) -> Result<Option<(Shell, i64, Vec<Input>)>> {
     let checkout = Checkout::new(&source.root, source.scheme)?;
     while let Some(hit) = cache.get_cached(key, &checkout)? {
         let shell = Shell::from_json(&hit.json_output)?;
         // Only the environment is used; its GC root keeps its closure alive.
         if Path::new(&shell.env_store_path).exists() {
-            return Ok(Some(shell));
+            return Ok(Some((shell, hit.eval_id, hit.inputs)));
         }
         eprintln!("cached shell {} was garbage collected", shell.env_store_path);
         cache.remove(hit.eval_id)?;
@@ -263,17 +274,98 @@ fn root_shell(
     Ok(())
 }
 
+/// What to watch to know a shell with `inputs` may be stale.
+#[derive(Default)]
+struct Watch {
+    /// Paths whose contents matter: files read, directories listed,
+    /// `flake.lock` (part of the key), and the git state deciding which files
+    /// are visible and, if the shell used it, the revision.
+    contents: std::collections::BTreeSet<PathBuf>,
+    /// Paths only stat'd: replacing or deleting the entry matters, and so do
+    /// its attributes, but not what a directory contains.
+    names: std::collections::BTreeSet<PathBuf>,
+}
+
+fn watch_paths(source: &Source, flake_dir: &Path, inputs: &[Input]) -> Watch {
+    let mut watch = Watch::default();
+    watch.contents.insert(flake_dir.join("flake.lock"));
+    let absolute = |rel: &Path| {
+        if rel.as_os_str().is_empty() { source.root.clone() } else { source.root.join(rel) }
+    };
+    for input in inputs {
+        match input {
+            Input::Path(p) if p.kind == ObservedKind::Stat => {
+                watch.names.insert(absolute(&p.path));
+            }
+            Input::Path(p) => {
+                watch.contents.insert(absolute(&p.path));
+            }
+            Input::FlakeRev(_) => {
+                if let Some(git) = GitDirs::find(&source.root) {
+                    watch.contents.insert(git.dir.join("HEAD"));
+                    watch.contents.insert(git.common.join("packed-refs"));
+                    if let Some(head) = std::fs::read_to_string(git.dir.join("HEAD"))
+                        .ok()
+                        .and_then(|head| head.strip_prefix("ref: ").map(|r| r.trim().to_owned()))
+                    {
+                        watch.contents.insert(git.common.join(head));
+                    }
+                }
+            }
+        }
+    }
+    if source.scheme == FlakeScheme::Git
+        && let Some(git) = GitDirs::find(&source.root)
+    {
+        watch.contents.insert(git.dir.join("index"));
+    }
+    watch.names.retain(|path| !watch.contents.contains(path));
+    watch
+}
+
+/// A checkout's git directory, and the directory shared by its worktrees.
+struct GitDirs {
+    dir: PathBuf,
+    common: PathBuf,
+}
+
+impl GitDirs {
+    fn find(root: &Path) -> Option<Self> {
+        let dot_git = root.join(".git");
+        let dir = if dot_git.is_dir() {
+            dot_git
+        } else {
+            let file = std::fs::read_to_string(&dot_git).ok()?;
+            root.join(file.strip_prefix("gitdir:")?.trim())
+        };
+        let common = match std::fs::read_to_string(dir.join("commondir")) {
+            Ok(common) => dir.join(common.trim()),
+            Err(_) => dir.clone(),
+        };
+        Some(Self { dir, common })
+    }
+}
+
+/// Print the result for the caller: the shell as a Bash activation script
+/// (which runs `shellHook`), the candidate it is cached as, and what to
+/// watch to know it may be stale.
 fn report(
     outcome: &str,
     shell: &Shell,
+    eval_id: Option<i64>,
+    watch: &Watch,
     t0: Instant,
     eval: Option<(std::time::Duration, std::time::Duration, usize, usize)>,
-) {
+) -> Result<()> {
+    let activation = BuildEnvironment::from_json(&shell.env_json)?.to_activation_script();
     let mut out = serde_json::json!({
         "outcome": outcome,
+        "eval_id": eval_id,
         "drv_path": shell.drv_path,
         "env_store_path": shell.env_store_path,
-        "env_json_bytes": shell.env_json.len(),
+        "activation": activation,
+        "watch": watch.contents,
+        "watch_names": watch.names,
         "total_s": t0.elapsed().as_secs_f64(),
     });
     if let Some((lookup, eval, inputs, ops)) = eval {
@@ -283,4 +375,5 @@ fn report(
         out["effects"] = ops.into();
     }
     println!("{out}");
+    Ok(())
 }

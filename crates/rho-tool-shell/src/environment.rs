@@ -1,9 +1,11 @@
-//! Per-agent environment generations. Only cold/invalidated generations run
-//! direnv; command admission drains kernel watches before reusing a snapshot.
-//! Paths are absolute; resolver tasks inherit the workset process namespace.
+//! Per-agent environment generations. A command's environment is the dev
+//! shell of the nearest flake, built by `rho-devshell-builder`, or the base
+//! environment outside flakes. Only cold/invalidated generations run the
+//! builder; command admission drains kernel watches over what the shell was
+//! built from before reusing a snapshot. Paths are absolute; resolver tasks
+//! inherit the workset process namespace.
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
-use std::io::Read;
+use std::ffi::{OsStr, OsString};
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -12,16 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use base64::Engine;
 use rustix::fs::inotify::{self, ReadFlags, WatchFlags};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 pub(super) type Environment = BTreeMap<OsString, OsString>;
 const MAX_ENV_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INPUTS: usize = 4096;
 const CACHE_SIZE: usize = 32;
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(120);
+// A cold shell may build a toolchain.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug)]
 pub(super) struct Worker {
@@ -58,7 +60,17 @@ pub(super) struct Resolved {
 struct Snapshot {
     environment: Arc<Environment>,
     watches: Watches,
-    inputs: HashSet<PathBuf>,
+    /// Where the environment came from, to reuse it when a change turns out
+    /// not to affect the shell.
+    source: Option<Source>,
+}
+
+/// A cached shell an environment was activated from.
+struct Source {
+    flake: PathBuf,
+    eval_id: i64,
+    contents: HashSet<PathBuf>,
+    names: HashSet<PathBuf>,
 }
 
 impl Worker {
@@ -98,7 +110,7 @@ async fn serve(mut requests: mpsc::Receiver<Request>) {
             request = requests.recv(), if loading.len() < CACHE_SIZE => {
                 let Some(request) = request else { break };
                 if request.reply.is_closed() { continue; }
-                let mut inputs = HashSet::new();
+                let mut previous = None;
                 if let Some(index) = snapshots.iter().position(|(key, _)| key == &request.key) {
                     let (key, mut snapshot) = snapshots.remove(index).unwrap();
                     if matches!(snapshot.watches.changed(), Ok(false)) {
@@ -109,14 +121,14 @@ async fn serve(mut requests: mpsc::Receiver<Request>) {
                         snapshots.push_front((key, snapshot));
                         continue;
                     }
-                    inputs = snapshot.inputs;
+                    previous = Some(snapshot);
                 }
                 if let Some((_, waiters)) = loading.get_mut(&request.key) {
                     waiters.push(request);
                 } else {
                     let key = request.key.clone();
                     let task = tasks.spawn(async move {
-                        let result = tokio::time::timeout(RESOLVE_TIMEOUT, resolve(&key, inputs)).await
+                        let result = tokio::time::timeout(RESOLVE_TIMEOUT, resolve(&key, previous)).await
                             .map_err(|_| anyhow!("environment resolution timed out"))
                             .and_then(|result| result);
                         (key, result)
@@ -189,59 +201,152 @@ impl Drop for ResolverGroup {
 async fn bounded_output(
     reader: impl tokio::io::AsyncRead + Unpin,
     limit: usize,
+    what: &str,
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .await?;
-    ensure!(bytes.len() <= limit, "direnv output exceeds {limit} bytes");
+    ensure!(bytes.len() <= limit, "{what} output exceeds {limit} bytes");
     Ok(bytes)
 }
 
-async fn output(mut command: tokio::process::Command) -> Result<(Vec<u8>, Vec<u8>)> {
+/// Run `command` with `stdin`, returning its stdout and stderr.
+async fn output(
+    mut command: tokio::process::Command,
+    stdin: &[u8],
+    what: &str,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     command
         .kill_on_drop(true)
         .process_group(0)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     rho_fs_view::command_stdio_only(&mut command);
-    let mut child = command
-        .spawn()
-        .context("start direnv environment resolver")?;
+    let mut child = command.spawn().with_context(|| format!("start {what}"))?;
     let _group = ResolverGroup(rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap());
+    let mut input = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let (status, environment, diagnostics) = tokio::try_join!(
+    let (status, (), output, diagnostics) = tokio::try_join!(
         async { child.wait().await.map_err(anyhow::Error::from) },
-        bounded_output(stdout, MAX_ENV_BYTES),
-        bounded_output(stderr, 64 * 1024),
+        async {
+            // A child that exits without reading reports through its status.
+            match input.write_all(stdin).await {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                result => result?,
+            }
+            drop(input);
+            Ok(())
+        },
+        bounded_output(stdout, MAX_ENV_BYTES, what),
+        bounded_output(stderr, 64 * 1024, what),
     )?;
     ensure!(
         status.success(),
-        "direnv failed: {}",
+        "{what} failed: {}",
         String::from_utf8_lossy(&diagnostics)
     );
-    Ok((environment, diagnostics))
+    Ok((output, diagnostics))
 }
 
-async fn evaluate(key: &Key) -> Result<(Environment, Vec<u8>)> {
-    let mut command = tokio::process::Command::new("direnv");
-    // direnv routes envrc output to stderr; only `env -0` owns stdout.
+/// Where commands in a directory get their environment from.
+#[derive(PartialEq, Eq)]
+struct Discovery {
+    /// The nearest flake, found as Nix finds `.`: upward from the physical
+    /// directory, stopping at the repository root.
+    flake: Option<PathBuf>,
+    /// Entries whose appearance or removal changes the answer.
+    names: HashSet<PathBuf>,
+}
+
+fn discover(cwd: &Path) -> Result<Discovery> {
+    let physical = cwd.canonicalize().context("resolve environment cwd")?;
+    let mut names = HashSet::new();
+    let mut flake = None;
+    for dir in physical.ancestors() {
+        names.insert(dir.join("flake.nix"));
+        if dir.join("flake.nix").is_file() {
+            flake = Some(dir.to_path_buf());
+            break;
+        }
+        names.insert(dir.join(".git"));
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    // Retargeting a symlinked cwd changes the physical ancestors.
+    names.insert(cwd.to_path_buf());
+    Ok(Discovery { flake, names })
+}
+
+/// What `rho-devshell-builder` reports for a shell.
+#[derive(serde::Deserialize)]
+struct Built {
+    /// The cache candidate, if the shell could be cached.
+    eval_id: Option<i64>,
+    /// Bash applying the shell to the caller's environment, `shellHook`
+    /// included.
+    activation: String,
+    /// Paths whose contents the shell depends on.
+    watch: Vec<PathBuf>,
+    /// Paths the shell depends on existing as they are.
+    watch_names: Vec<PathBuf>,
+}
+
+fn builder_program(base: &Environment) -> PathBuf {
+    if let Some(program) = base.get(OsStr::new("RHO_DEVSHELL_BUILDER")) {
+        return program.into();
+    }
+    std::env::current_exe()
+        .ok()
+        .map(|exe| exe.with_file_name("rho-devshell-builder"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| "rho-devshell-builder".into())
+}
+
+async fn build(key: &Key, flake: &Path) -> Result<(Built, Vec<u8>)> {
+    let mut command = tokio::process::Command::new(builder_program(&key.base));
     command
-        .args(["exec", ".", "env", "-0"])
+        .arg("shell")
+        .arg(flake)
         .current_dir(&key.cwd)
         .env_clear()
         .envs(key.base.iter());
-    let (bytes, diagnostics) = output(command).await?;
+    let (bytes, diagnostics) = output(command, &[], "rho-devshell-builder").await?;
+    let built: Built = serde_json::from_slice(&bytes).context("parse rho-devshell-builder output")?;
+    ensure!(
+        built.watch.iter().chain(&built.watch_names).all(|path| path.is_absolute()),
+        "relative shell watch path"
+    );
+    Ok((built, diagnostics))
+}
+
+/// Apply `activation` to the base environment as `nix develop` would, in Bash.
+async fn activate(key: &Key, activation: &str) -> Result<(Environment, Vec<u8>)> {
+    let mut command = tokio::process::Command::new("bash");
+    // The script arrives on stdin; the shell hook's output goes to stderr so
+    // that only `env -0` owns stdout.
+    command
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            r#"script=$(cat) && exec 3>&1 1>&2 || exit; eval "$script"; exec env -0 >&3"#,
+        ])
+        .current_dir(&key.cwd)
+        .env_clear()
+        .envs(key.base.iter());
+    let (bytes, diagnostics) = output(command, activation.as_bytes(), "shell activation").await?;
     let mut environment = Environment::new();
     for item in bytes.split(|b| *b == 0).filter(|item| !item.is_empty()) {
         let separator = item
             .iter()
             .position(|b| *b == b'=')
-            .ok_or_else(|| anyhow!("invalid direnv environment entry"))?;
-        ensure!(separator > 0, "empty direnv environment key");
+            .ok_or_else(|| anyhow!("invalid shell environment entry"))?;
+        ensure!(separator > 0, "empty shell environment key");
         environment.insert(
             OsString::from_vec(item[..separator].to_vec()),
             OsString::from_vec(item[separator + 1..].to_vec()),
@@ -250,111 +355,48 @@ async fn evaluate(key: &Key) -> Result<(Environment, Vec<u8>)> {
     Ok((environment, diagnostics))
 }
 
-#[derive(serde::Deserialize)]
-struct Input {
-    path: PathBuf,
-    modtime: i64,
-    exists: bool,
-}
-
-fn declared_inputs(environment: &Environment) -> Result<Vec<Input>> {
-    let Some(encoded) = environment.get(std::ffi::OsStr::new("DIRENV_WATCHES")) else {
-        return Ok(Vec::new());
-    };
-    let bytes = base64::engine::general_purpose::URL_SAFE.decode(encoded.as_bytes())?;
-    let mut bytes_out = Vec::new();
-    flate2::read::ZlibDecoder::new(bytes.as_slice())
-        .take((MAX_ENV_BYTES + 1) as u64)
-        .read_to_end(&mut bytes_out)?;
-    ensure!(
-        bytes_out.len() <= MAX_ENV_BYTES,
-        "direnv watch list exceeds 4 MiB"
-    );
-    let inputs: Vec<Input> = serde_json::from_slice(&bytes_out)?;
-    ensure!(inputs.len() <= MAX_INPUTS, "too many environment inputs");
-    ensure!(
-        inputs.iter().all(|input| input.path.is_absolute()),
-        "relative direnv watch path"
-    );
-    Ok(inputs)
-}
-
-fn inputs(key: &Key, environment: &Environment) -> Result<HashSet<PathBuf>> {
-    let mut paths: HashSet<_> = declared_inputs(environment)?
-        .into_iter()
-        .map(|input| input.path)
-        .collect();
-    // Discovery is itself an input: a nearer envrc must invalidate a cached
-    // parent environment, including the no-envrc case.
-    let physical_cwd = key.cwd.canonicalize().context("resolve environment cwd")?;
-    for parent in key.cwd.ancestors().chain(physical_cwd.ancestors()) {
-        paths.insert(parent.join(".envrc"));
-        paths.insert(parent.join(".env"));
+async fn resolve(key: &Key, previous: Option<Snapshot>) -> Result<(Snapshot, Vec<u8>)> {
+    if let Some(previous) = previous
+        && let Some(reused) = reuse(key, previous).await?
+    {
+        return Ok(reused);
     }
-    if let Some(home) = key.base.get(std::ffi::OsStr::new("HOME")) {
-        paths.insert(Path::new(home).join(".direnvrc"));
-        let config = key
-            .base
-            .get(std::ffi::OsStr::new("DIRENV_CONFIG"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                key.base
-                    .get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| Path::new(home).join(".config"))
-                    .join("direnv")
-            });
-        paths.insert(config.join("lib"));
-        paths.insert(config.join("direnvrc"));
-        paths.insert(config.join("direnv.toml"));
-    }
-    ensure!(paths.len() <= MAX_INPUTS, "too many environment inputs");
-    Ok(paths)
-}
-
-async fn resolve(key: &Key, mut paths: HashSet<PathBuf>) -> Result<(Snapshot, Vec<u8>)> {
-    paths.extend(inputs(key, &Environment::new())?);
     for _ in 0..3 {
-        let mut known = Watches::new(&paths)?;
-        let before = states(&paths)?;
-        let (environment, diagnostics) = evaluate(key).await?;
-        paths.extend(inputs(key, &environment)?);
-        let mut watches = Watches::new(&paths)?;
-        // Newly discovered watch_file inputs carry direnv's own observation
-        // (existence and second-resolution mtime). Preserve that contract:
-        // arbitrary envrc code is not a transactional filesystem reader.
-        let declared_valid = declared_inputs(&environment)?.iter().all(|input| {
-            let metadata = [
-                std::fs::symlink_metadata(&input.path),
-                std::fs::metadata(&input.path),
-            ]
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(|m| m.modified().ok())
-            .max();
-            match metadata {
-                Some(time) => {
-                    input.exists
-                        && time
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .is_ok_and(|time| time.as_secs() as i64 == input.modtime)
-                }
-                None => !input.exists,
+        let discovery = discover(&key.cwd)?;
+        let mut contents = HashSet::new();
+        let mut names = discovery.names.clone();
+        let (environment, diagnostics, source) = match &discovery.flake {
+            None => ((*key.base).clone(), Vec::new(), None),
+            Some(flake) => {
+                let (built, mut diagnostics) = build(key, flake).await?;
+                let (environment, hook_output) = activate(key, &built.activation).await?;
+                diagnostics.extend(hook_output);
+                contents.extend(built.watch.iter().cloned());
+                names.extend(built.watch_names.iter().cloned());
+                let source = built.eval_id.map(|eval_id| Source {
+                    flake: flake.clone(),
+                    eval_id,
+                    contents: built.watch.into_iter().collect(),
+                    names: built.watch_names.into_iter().collect(),
+                });
+                (environment, diagnostics, source)
             }
-        });
-        let known_changed = known.changed()?;
-        let known_valid = !known_changed
-            || (!known.content_changed
-                && before.iter().all(|(path, state)| {
-                    states(&HashSet::from([path.clone()]))
-                        .is_ok_and(|current| current.get(path) == Some(state))
-                }));
-        if declared_valid && known_valid && !watches.changed()? {
+        };
+        let mut watches = Watches::new(&contents, &names)?;
+        // A change after the builder observed an input but before its watch
+        // existed is visible to neither; confirm the shell still holds now.
+        // An uncacheable shell cannot be confirmed and is kept as built.
+        let still_valid = discover(&key.cwd)? == discovery
+            && match &source {
+                Some(source) => build(key, &source.flake).await?.0.eval_id == Some(source.eval_id),
+                None => true,
+            };
+        if still_valid && !watches.changed()? {
             return Ok((
                 Snapshot {
                     environment: Arc::new(environment),
                     watches,
-                    inputs: paths,
+                    source,
                 },
                 diagnostics,
             ));
@@ -363,70 +405,71 @@ async fn resolve(key: &Key, mut paths: HashSet<PathBuf>) -> Result<(Snapshot, Ve
     bail!("environment inputs kept changing during resolution; retry the command")
 }
 
-#[derive(PartialEq, Eq)]
-enum State {
-    Missing,
-    File {
-        identity: (u64, u64, u32),
-    },
-    Other {
-        identity: (u64, u64, u32),
-        modified: std::time::SystemTime,
-    },
+/// Keep `previous`'s environment if the change its watches reported left the
+/// shell as it was, e.g. git rewriting its index or an editor saving
+/// unchanged contents. Watching the same inputs before asking the builder
+/// makes its answer hold until the next command drains the watches.
+async fn reuse(key: &Key, previous: Snapshot) -> Result<Option<(Snapshot, Vec<u8>)>> {
+    let Some(source) = previous.source else {
+        return Ok(None);
+    };
+    let discovery = discover(&key.cwd)?;
+    if discovery.flake.as_ref() != Some(&source.flake) {
+        return Ok(None);
+    }
+    let names = source.names.union(&discovery.names).cloned().collect();
+    let mut watches = Watches::new(&source.contents, &names)?;
+    let (built, diagnostics) = build(key, &source.flake).await?;
+    if built.eval_id != Some(source.eval_id) || discover(&key.cwd)? != discovery || watches.changed()? {
+        return Ok(None);
+    }
+    Ok(Some((
+        Snapshot {
+            environment: previous.environment,
+            watches,
+            source: Some(source),
+        },
+        diagnostics,
+    )))
 }
 
-fn states(paths: &HashSet<PathBuf>) -> Result<BTreeMap<PathBuf, State>> {
-    use std::os::unix::fs::MetadataExt;
-    paths
-        .iter()
-        .map(|path| {
-            let state = match std::fs::metadata(path) {
-                Ok(metadata) => {
-                    let identity = (metadata.dev(), metadata.ino(), metadata.mode());
-                    if metadata.is_file() {
-                        State::File { identity }
-                    } else {
-                        State::Other {
-                            identity,
-                            modified: metadata.modified()?,
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::Missing,
-                Err(error) => return Err(error.into()),
-            };
-            Ok((path.clone(), state))
-        })
-        .collect()
-}
-
+/// Kernel watches over a shell's inputs, drained at command admission.
 struct Watches {
     fd: OwnedFd,
     names: HashMap<i32, HashSet<OsString>>,
     directories: HashSet<i32>,
     files: HashSet<i32>,
-    content_changed: bool,
 }
 
 impl Watches {
-    fn new(paths: &HashSet<PathBuf>) -> Result<Self> {
+    /// Watch `contents` for any change, and `names` for being replaced,
+    /// removed or created, or having their attributes changed.
+    fn new(contents: &HashSet<PathBuf>, names: &HashSet<PathBuf>) -> Result<Self> {
         let mut watches = Self {
             fd: inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?,
             names: HashMap::new(),
             directories: HashSet::new(),
             files: HashSet::new(),
-            content_changed: false,
         };
         let mut seen = HashSet::new();
-        for path in paths {
-            watches.path(path, &mut seen, 0)?;
+        for path in contents {
+            watches.path(path, true, &mut seen, 0)?;
+        }
+        for path in names {
+            watches.path(path, false, &mut seen, 0)?;
         }
         Ok(watches)
     }
 
-    fn path(&mut self, path: &Path, seen: &mut HashSet<PathBuf>, depth: usize) -> Result<()> {
+    fn path(
+        &mut self,
+        path: &Path,
+        contents: bool,
+        seen: &mut HashSet<(PathBuf, bool)>,
+        depth: usize,
+    ) -> Result<()> {
         ensure!(depth < 64, "environment input symlink chain is too deep");
-        if !seen.insert(path.to_owned()) {
+        if !seen.insert((path.to_owned(), contents)) {
             return Ok(());
         }
         ensure!(seen.len() <= MAX_INPUTS, "too many environment watch paths");
@@ -451,10 +494,13 @@ impl Watches {
                 } else {
                     parent.parent().unwrap().join(target)
                 };
-                self.path(&target, seen, depth + 1)?;
+                self.path(&target, contents, seen, depth + 1)?;
             }
         }
-        if path.is_dir() {
+        if !contents {
+            // The parent's watch reports the entry's replacement and its
+            // attribute changes.
+        } else if path.is_dir() {
             let wd = self.add(path)?;
             self.directories.insert(wd);
         } else if path.is_file() {
@@ -498,26 +544,15 @@ impl Watches {
                             | ReadFlags::UNMOUNT
                             | ReadFlags::DELETE_SELF
                             | ReadFlags::MOVE_SELF,
-                    ) {
-                        self.content_changed = true;
-                        changed = true;
-                    } else if self.files.contains(&event.wd())
+                    ) || self.files.contains(&event.wd())
                         || self.directories.contains(&event.wd())
                         || event.file_name().is_some_and(|name| {
                             self.names.get(&event.wd()).is_some_and(|names| {
-                                names.contains(std::ffi::OsStr::from_bytes(name.to_bytes()))
+                                names.contains(OsStr::from_bytes(name.to_bytes()))
                             })
                         })
                     {
                         changed = true;
-                        self.content_changed |= flags.intersects(
-                            ReadFlags::MODIFY
-                                | ReadFlags::CLOSE_WRITE
-                                | ReadFlags::CREATE
-                                | ReadFlags::DELETE
-                                | ReadFlags::MOVED_FROM
-                                | ReadFlags::MOVED_TO,
-                        );
                     }
                 }
             }
@@ -535,31 +570,41 @@ mod tests {
 
     struct Fixture {
         root: TempDir,
+        _builder: TempDir,
         tools: ShellTools,
     }
 
     impl Fixture {
+        /// A flake at the root, built by a stand-in for `rho-devshell-builder`
+        /// whose shell sources the flake's `env.sh` and depends on `env.sh`
+        /// and an optional `extra`, and is cached by their contents.
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let config = root.path().join("config");
-            std::fs::create_dir(&config).unwrap();
-            std::fs::write(config.join("direnvrc"), "").unwrap();
+            let builder = tempfile::tempdir().unwrap();
+            let program = builder.path().join("rho-devshell-builder");
             std::fs::write(
-                config.join("direnv.toml"),
-                format!(
-                    "[whitelist]\nprefix = [{}]\n",
-                    serde_json::to_string(root.path()).unwrap()
-                ),
+                &program,
+                r#"#!/usr/bin/env bash
+id=$(cat "$2/env.sh" "$2/extra" 2>/dev/null | cksum | cut -d' ' -f1)
+printf '{"eval_id":%s,"activation":". %s/env.sh","watch":["%s/env.sh","%s/extra"],"watch_names":[]}' "$id" "$2" "$2" "$2"
+"#,
             )
             .unwrap();
+            std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+            std::fs::write(root.path().join("flake.nix"), "").unwrap();
             let tools = ShellTools::in_directory(
                 Duration::from_secs(5),
                 camino::Utf8PathBuf::from_path_buf(root.path().to_owned()).unwrap(),
                 PathOverrides::default(),
             )
-            .with_env("DIRENV_CONFIG", config.to_str().unwrap())
+            .with_env("RHO_DEVSHELL_BUILDER", program.to_str().unwrap())
             .with_env("RHO_CACHE_TEST_BASE", "base");
-            Self { root, tools }
+            Self {
+                root,
+                _builder: builder,
+                tools,
+            }
         }
 
         fn write(&self, name: &str, text: &str) {
@@ -586,7 +631,7 @@ mod tests {
     async fn warm_commands_do_not_evaluate_again_and_preserve_unsets() {
         let fixture = Fixture::new();
         fixture.write(
-            ".envrc",
+            "env.sh",
             "printf x >> evaluations\nexport RHO_CACHE_TEST_VALUE=one\nunset RHO_CACHE_TEST_BASE\n",
         );
         let command =
@@ -603,7 +648,7 @@ mod tests {
             b"x"
         );
         fixture.write(
-            ".envrc",
+            "env.sh",
             "printf x >> evaluations\nexport RHO_CACHE_TEST_VALUE=two\n",
         );
         assert!(
@@ -619,11 +664,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn optional_input_atomic_replace_delete_and_nearer_envrc_invalidate() {
+    async fn unwatched_files_do_not_invalidate() {
+        let fixture = Fixture::new();
+        fixture.write("env.sh", "printf x >> evaluations\n");
+        fixture.run("true", None).await;
+        fixture.write("unrelated", "x");
+        std::fs::create_dir(fixture.root.path().join("dir")).unwrap();
+        fixture.run("true", None).await;
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("evaluations")).unwrap(),
+            b"x"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_that_leave_the_shell_as_it_was_keep_the_environment() {
+        let fixture = Fixture::new();
+        fixture.write("env.sh", "printf x >> evaluations\n");
+        fixture.run("true", None).await;
+        // Same contents, new inode: the watch fires, the builder hits the
+        // same entry, and the shell hook does not run again.
+        fixture.write("replacement", "printf x >> evaluations\n");
+        std::fs::rename(
+            fixture.root.path().join("replacement"),
+            fixture.root.path().join("env.sh"),
+        )
+        .unwrap();
+        fixture.run("true", None).await;
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("evaluations")).unwrap(),
+            b"x"
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_flake_commands_get_the_base_environment() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(fixture.root.path().join("flake.nix")).unwrap();
+        // Nix stops looking for a flake at the repository root.
+        std::fs::create_dir(fixture.root.path().join("repo")).unwrap();
+        std::fs::create_dir(fixture.root.path().join("repo/.git")).unwrap();
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=flake\n");
+        let command = r#"printf '%s %s' "${RHO_CACHE_TEST_VALUE-unset}" "$RHO_CACHE_TEST_BASE""#;
+        assert!(fixture.run(command, None).await.ends_with("unset base"));
+        fixture.write("flake.nix", "");
+        assert!(fixture.run(command, None).await.ends_with("flake base"));
+        assert!(fixture.run(command, Some("repo")).await.ends_with("unset base"));
+    }
+
+    #[tokio::test]
+    async fn optional_input_atomic_replace_delete_and_nearer_flake_invalidate() {
         let fixture = Fixture::new();
         fixture.write(
-            ".envrc",
-            "export RHO_CACHE_TEST_VALUE=parent\nsource_env_if_exists extra\n",
+            "env.sh",
+            "export RHO_CACHE_TEST_VALUE=parent\n[ -e \"$(dirname \"$BASH_SOURCE\")/extra\" ] && . \"$(dirname \"$BASH_SOURCE\")/extra\"\n",
         );
         std::fs::create_dir(fixture.root.path().join("child")).unwrap();
         let command = r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#;
@@ -659,7 +753,8 @@ mod tests {
                 .await
                 .ends_with("parent")
         );
-        fixture.write("child/.envrc", "export RHO_CACHE_TEST_VALUE=nearer\n");
+        fixture.write("child/env.sh", "export RHO_CACHE_TEST_VALUE=nearer\n");
+        fixture.write("child/flake.nix", "");
         assert!(
             fixture
                 .run(command, Some("child"))
@@ -673,28 +768,34 @@ mod tests {
     async fn clones_with_different_overrides_do_not_share_environment_values() {
         let fixture = Fixture::new();
         fixture.write(
-            ".envrc",
+            "env.sh",
             "export RHO_CACHE_TEST_VALUE=\"$RHO_CACHE_TEST_BASE\"\n",
         );
-        let other = Fixture {
-            root: tempfile::tempdir().unwrap(),
-            tools: fixture
-                .tools
-                .clone()
-                .with_env("RHO_CACHE_TEST_BASE", "other"),
-        };
+        let other = fixture
+            .tools
+            .clone()
+            .with_env("RHO_CACHE_TEST_BASE", "other");
         let command = r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#;
         assert!(fixture.run(command, None).await.ends_with("base"));
-        assert!(other.run(command, None).await.ends_with("other"));
+        let mut process = other.spawn(command, None).await.unwrap();
+        let mut text = Vec::new();
+        loop {
+            match process.next().await {
+                crate::ProcessEvent::Output(bytes) => text.extend(bytes),
+                crate::ProcessEvent::Closed => break,
+                _ => {}
+            }
+        }
+        assert!(String::from_utf8(text).unwrap().ends_with("other"));
         assert_eq!(fixture.run(command, None).await, "base");
     }
 
     #[tokio::test]
     async fn resolver_failure_does_not_serve_the_previous_generation() {
         let fixture = Fixture::new();
-        fixture.write(".envrc", "export RHO_CACHE_TEST_VALUE=old\n");
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=old\n");
         fixture.run("true", None).await;
-        fixture.write(".envrc", "echo expected-failure >&2\nexit 1\n");
+        fixture.write("env.sh", "echo expected-failure >&2\nexit 1\n");
         let error = fixture
             .tools
             .spawn("touch must-not-run", None)
@@ -705,6 +806,15 @@ mod tests {
         assert!(!fixture.root.path().join("must-not-run").exists());
     }
 
+    #[tokio::test]
+    async fn shell_hook_output_and_status_do_not_break_activation() {
+        let fixture = Fixture::new();
+        fixture.write("env.sh", "echo noise\nexport RHO_CACHE_TEST_VALUE=ok\nfalse\n");
+        let output = fixture.run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None).await;
+        // The hook's output is a diagnostic, not the environment.
+        assert!(output.contains("noise") && output.ends_with("ok"), "{output}");
+    }
+
     #[test]
     fn watches_symlink_targets_retargeting_and_ancestor_replacement() {
         use std::os::unix::fs::symlink;
@@ -713,14 +823,14 @@ mod tests {
         std::fs::write(root.path().join("dir/value"), "one").unwrap();
         symlink("dir/value", root.path().join("link")).unwrap();
         let paths = HashSet::from([root.path().join("link")]);
-        let mut watches = Watches::new(&paths).unwrap();
+        let mut watches = Watches::new(&paths, &HashSet::new()).unwrap();
         assert!(!watches.changed().unwrap());
         std::fs::write(root.path().join("dir/value"), "two").unwrap();
         assert!(watches.changed().unwrap());
-        let mut watches = Watches::new(&paths).unwrap();
+        let mut watches = Watches::new(&paths, &HashSet::new()).unwrap();
         std::fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
         assert!(watches.changed().unwrap());
-        let mut watches = Watches::new(&paths).unwrap();
+        let mut watches = Watches::new(&paths, &HashSet::new()).unwrap();
         std::fs::remove_file(root.path().join("link")).unwrap();
         symlink("old/value", root.path().join("link")).unwrap();
         assert!(watches.changed().unwrap());
@@ -734,21 +844,22 @@ mod tests {
         let alias = root.path().join("other/alias");
         std::fs::write(&input, "one").unwrap();
         std::fs::hard_link(&input, &alias).unwrap();
-        let mut watches = Watches::new(&HashSet::from([input])).unwrap();
+        let mut watches = Watches::new(&HashSet::from([input]), &HashSet::new()).unwrap();
         assert!(!watches.changed().unwrap());
         std::fs::write(alias, "two").unwrap();
         assert!(watches.changed().unwrap());
     }
 
     #[tokio::test]
-    async fn symlinked_cwd_observes_new_physical_ancestor_envrc() {
+    async fn symlinked_cwd_observes_new_physical_ancestor_flake() {
         let fixture = Fixture::new();
-        fixture.write(".envrc", "export RHO_CACHE_TEST_VALUE=root\n");
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=root\n");
         std::fs::create_dir_all(fixture.root.path().join("actual/sub")).unwrap();
         std::os::unix::fs::symlink("actual/sub", fixture.root.path().join("link")).unwrap();
         let command = r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#;
         assert!(fixture.run(command, Some("link")).await.ends_with("root"));
-        fixture.write("actual/.envrc", "export RHO_CACHE_TEST_VALUE=nearer\n");
+        fixture.write("actual/env.sh", "export RHO_CACHE_TEST_VALUE=nearer\n");
+        fixture.write("actual/flake.nix", "");
         assert!(fixture.run(command, Some("link")).await.ends_with("nearer"));
     }
 
@@ -770,13 +881,13 @@ mod tests {
                 ),
             ])
             .env("SENTINEL", &sentinel);
-        output(command).await.unwrap();
+        output(command, &[], "test").await.unwrap();
     }
 
     #[tokio::test]
     async fn pending_callers_are_bounded_and_cancelled_loads_release_permits() {
         let fixture = Fixture::new();
-        fixture.write(".envrc", "touch started\nsleep 30\n");
+        fixture.write("env.sh", "touch started\nsleep 30\n");
         let mut callers = tokio::task::JoinSet::new();
         for _ in 0..100 {
             let tools = fixture.tools.clone();
@@ -802,7 +913,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!fixture.root.path().join("must-not-run").exists());
-        fixture.write(".envrc", "export RHO_CACHE_TEST_VALUE=replacement\n");
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=replacement\n");
         assert!(
             fixture
                 .run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None)
@@ -814,10 +925,11 @@ mod tests {
     #[tokio::test]
     async fn slow_resolution_does_not_block_another_warm_cwd() {
         let fixture = Fixture::new();
-        fixture.write(".envrc", "export RHO_CACHE_TEST_VALUE=warm\n");
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=warm\n");
         fixture.run("true", None).await;
         std::fs::create_dir(fixture.root.path().join("slow")).unwrap();
-        fixture.write("slow/.envrc", "touch started\nsleep 30\n");
+        fixture.write("slow/env.sh", "touch started\nsleep 30\n");
+        fixture.write("slow/flake.nix", "");
         let tools = fixture.tools.clone();
         let pending = tokio::spawn(async move { tools.spawn("true", Some("slow")).await });
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -844,7 +956,7 @@ mod tests {
     async fn bounded_resolver_output_fails_without_waiting_for_exit() {
         let mut command = tokio::process::Command::new("bash");
         command.args(["-c", "while :; do printf '%010000d' 0 >&2; done"]);
-        let error = tokio::time::timeout(Duration::from_secs(3), output(command))
+        let error = tokio::time::timeout(Duration::from_secs(3), output(command, &[], "test"))
             .await
             .expect("oversized stderr must not hang")
             .err()
@@ -876,9 +988,6 @@ mod latency {
             "git status --short",
         ] {
             let mut native = Vec::new();
-            let mut exec = Vec::new();
-            // Separate phases: nix-direnv touches watched cache metadata on
-            // every baseline exec, which would invalidate the warm generation.
             for _ in 0..51 {
                 let start = std::time::Instant::now();
                 let mut process = tools.spawn(source, None).await.unwrap();
@@ -892,25 +1001,51 @@ mod latency {
                 }
                 native.push(start.elapsed().as_secs_f64() * 1e6);
             }
-            for _ in 0..51 {
-                let start = std::time::Instant::now();
-                let mut command = tokio::process::Command::new("direnv");
-                command
-                    .args(["exec", ".", "bash", "-o", "pipefail", "-c", source])
-                    .current_dir(&cwd);
-                for name in ["DIRENV_DIFF", "DIRENV_DIR", "DIRENV_FILE", "DIRENV_WATCHES"] {
-                    command.env_remove(name);
-                }
-                let result = command.output().await.unwrap();
-                exec.push(start.elapsed().as_secs_f64() * 1e6);
-                assert!(result.status.success());
-            }
             native.sort_by(f64::total_cmp);
-            exec.sort_by(f64::total_cmp);
             eprintln!(
-                "{source:?}: native_median_us={} exec_median_us={} native_p95_us={} exec_p95_us={}",
-                native[25], exec[25], native[48], exec[48]
+                "{source:?}: median_us={} p95_us={}",
+                native[25], native[48]
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual: needs RHO_DEVSHELL_BUILDER and a flake checkout in RHO_TEST_FLAKE"]
+    async fn real_flake_admission() {
+        let flake = std::env::var("RHO_TEST_FLAKE").unwrap();
+        let tools = ShellTools::in_directory(
+            Duration::from_secs(600),
+            camino::Utf8PathBuf::from(flake.clone()),
+            PathOverrides::default(),
+        );
+        let run = |source: &'static str| {
+            let tools = tools.clone();
+            async move {
+                let start = std::time::Instant::now();
+                let mut process = tools.spawn(source, None).await.unwrap();
+                let mut text = Vec::new();
+                loop {
+                    match process.next().await {
+                        ProcessEvent::Output(bytes) => text.extend(bytes),
+                        ProcessEvent::Exited(status) => assert!(status.success()),
+                        ProcessEvent::Closed => break,
+                        ProcessEvent::Failed(error) => panic!("{error}"),
+                    }
+                }
+                let text = String::from_utf8_lossy(&text).into_owned();
+                eprintln!("{source:?} {:?}: {}", start.elapsed(), text.lines().last().unwrap_or(""));
+                text
+            }
+        };
+        assert!(run("command -v cargo").await.trim_end().ends_with("/bin/cargo"));
+        run("command -v cargo").await;
+        // Git rewrites its index after noticing the new mtime; the shell is
+        // unchanged, so the environment is kept after one builder check.
+        run("touch flake.nix && git status --short >/dev/null").await;
+        run("command -v cargo").await;
+        run("command -v cargo").await;
+        std::fs::write(Path::new(&flake).join("untracked-probe"), "").unwrap();
+        run("command -v cargo").await;
+        std::fs::remove_file(Path::new(&flake).join("untracked-probe")).unwrap();
     }
 }

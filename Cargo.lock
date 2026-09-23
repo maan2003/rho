@@ -12821,6 +12821,7 @@ name = "rho-devshell-builder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "devenv-core",
  "devenv-eval-cache",
  "devenv-nix-backend",
  "serde_json",
@@ -13348,9 +13349,7 @@ name = "rho-tool-shell"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "camino",
- "flate2",
  "rho-core",
  "rho-db",
  "rho-fs-view",

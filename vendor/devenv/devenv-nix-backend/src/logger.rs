@@ -38,7 +38,8 @@ pub fn setup_nix_logger() -> Result<NixLoggerSetup> {
 /// Nix passes raw daemon stderr at error level because it carries no level of
 /// its own, so level 0 lines that Nix itself printed as warnings stay warnings.
 fn log_message(level: i32, msg: &str) {
-    let msg = msg.trim_end();
+    let msg = strip_ansi(msg.trim_end());
+    let msg = msg.as_str();
     match level {
         0 if !msg.contains("warning:") => tracing::error!(target: "nix", "{msg}"),
         0 | 1 => tracing::warn!(target: "nix", "{msg}"),
@@ -47,9 +48,37 @@ fn log_message(level: i32, msg: &str) {
     }
 }
 
+/// Nix colours its messages whether or not anyone renders them; its CLI
+/// filters the escapes out at print time, which the C API does not.
+fn strip_ansi(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut chars = msg.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+        } else if chars.next() == Some('[') {
+            // CSI: parameters and intermediates up to a final byte.
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_colours() {
+        assert_eq!(
+            strip_ansi("\x1b[35;1mevaluation warning:\x1b[0m x is \x1b[1mdeprecated\x1b[0m"),
+            "evaluation warning: x is deprecated"
+        );
+    }
     use nix_bindings_expr::eval_state::gc_register_my_thread;
 
     #[test]

@@ -368,8 +368,9 @@ security, resource-isolation, or rollback boundary.
   shifted bindings can be pressed in the rig and screenshotted.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-fs-view` for daemon-owned commands. Workset-control
-  subprocesses use that environment directly. Agent commands use watched direnv
-  environment generations; Claude processes use `direnv exec` directly.
+  subprocesses use that environment directly. Agent commands use watched
+  environment generations built from the nearest flake's dev shell; Claude
+  processes use `direnv exec` directly.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent
   View and lets Brush load normal Bash-compatible interactive configuration
   (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
@@ -421,8 +422,12 @@ security, resource-isolation, or rollback boundary.
   `exec_command` yields a process session id when a command remains live and
   `write_stdin` writes to or polls that session. Command continuation state is
   per agent because each agent owns its `ShellTools` instance. Cold or invalidated
-  environment generations run direnv; kernel watches validate reuse, including
-  environment discovery and declared inputs. A generation uses a native,
+  environment generations run `rho-devshell-builder`, which evaluates the
+  nearest flake's dev shell in pure mode and caches the built environment
+  against exactly what evaluation read (reported by the Nix fork); commands
+  outside a flake get the base environment. Kernel watches over those inputs
+  and over flake discovery validate reuse; when they fire, one builder check
+  decides whether the shell actually changed before its activation reruns. A generation uses a native,
   single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
   namespace. It keeps up to five pristine children of the initialized variable/builtin image
   ready for one-shot cwd/stdio specialization, replenishing when idle and falling
