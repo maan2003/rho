@@ -1,7 +1,0 @@
----
-source: devenv-tui/tests/tui_tests.rs
-expression: output
----
-✓ Build completed [TIME]
-
- 1/1 tasks  ↑↓ j/k ^D/^U

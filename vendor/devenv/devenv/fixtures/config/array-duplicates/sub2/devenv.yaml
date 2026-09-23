@@ -1,3 +1,0 @@
-nixpkgs:
-  cuda_capabilities: ["7.5", "9.0"]  # 7.5 already in base
-  permitted_insecure_packages: ["pkg1", "pkg4", "pkg4"]  # pkg1 already in base, pkg4 duplicate

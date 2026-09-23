@@ -1,1 +1,0 @@
-This test verifies eval cache functionality outside of git repositories, which tests edge-cases related to flake restrictions and lazy-trees.

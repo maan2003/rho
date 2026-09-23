@@ -1,6 +1,0 @@
-inputs:
-  root:
-    url: ../
-    flake: false
-imports:
-- root/projectA

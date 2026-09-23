@@ -1,7 +1,0 @@
----
-source: devenv-tui/tests/tui_tests.rs
-expression: output
----
-✗ Tests failed failed [TIME]
-
- 0/1 tasks      ↑↓ j/k ^D/^U

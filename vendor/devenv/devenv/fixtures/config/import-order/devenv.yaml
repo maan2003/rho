@@ -1,5 +1,0 @@
-# A imports B and C, both import D (diamond pattern)
-imports:
-  - ./b
-  - ./c
-  - ./d

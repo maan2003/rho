@@ -1,4 +1,0 @@
-secretspec:
-  enable: true
-  profile: "dev"
-  provider: "aws"

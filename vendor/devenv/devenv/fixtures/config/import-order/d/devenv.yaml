@@ -1,4 +1,0 @@
-impure: true
-inputs:
-  shared-input:
-    url: "github:shared/repo"

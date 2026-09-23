@@ -1,7 +1,0 @@
-inputs:
-  root:
-    url: ../
-    flake: false
-  other:
-    url: path:../../other
-    flake: false

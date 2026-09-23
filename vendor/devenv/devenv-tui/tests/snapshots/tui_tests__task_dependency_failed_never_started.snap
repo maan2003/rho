@@ -1,8 +1,0 @@
----
-source: devenv-tui/tests/tui_tests.rs
-expression: output
----
-✗ test:dependent failed [TIME]
-  └ ✗ test:dep failed   [TIME]
-
- 0/2 tasks        ↑↓ j/k ^D/^U

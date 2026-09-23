@@ -1,8 +1,0 @@
----
-source: devenv-tui/tests/tui_tests.rs
-expression: output
----
-⠋ Building shell [TIME]
-  ✗ error: simple error
-
-           ↑↓ j/k ^D/^U

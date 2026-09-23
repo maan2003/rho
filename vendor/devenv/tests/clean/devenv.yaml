@@ -1,9 +1,0 @@
-inputs:
-  devenv:
-    url: path:../../?dir=src/modules
-clean:
-  enabled: true
-  keep:
-    - CLEAN_TEST_VAR
-    - PATH
-    - HOME

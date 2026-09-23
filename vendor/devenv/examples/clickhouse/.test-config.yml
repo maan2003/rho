@@ -1,5 +1,0 @@
-broken_systems:
-  # Broken lately
-  - aarch64-darwin
-  # Broken and probably EOL
-  - x86_64-darwin

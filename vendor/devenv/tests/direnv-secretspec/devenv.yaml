@@ -1,4 +1,0 @@
-secretspec:
-  enable: true
-  provider: dotenv
-  profile: default

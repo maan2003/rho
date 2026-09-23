@@ -1,3 +1,0 @@
-clean:
-  enabled: false
-  keep: ["build", "dist"]

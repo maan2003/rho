@@ -1,4 +1,0 @@
-imports:
-  - "../../../../../../../etc"
-  - "../../../../../../tmp"
-allow_unfree: true
