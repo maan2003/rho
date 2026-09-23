@@ -3275,3 +3275,44 @@ mod tests {
 		assert_eq!(probes[1].bitrate, None);
 	}
 }
+
+/// Serve an out-of-band agreed track using lite-05 GROUP streams only.
+/// The caller owns session authentication, track metadata, and cancellation.
+pub async fn publish_fixed<S: crate::transport::poll::Session + Unpin>(
+	session: S,
+	mut track: track::Subscriber,
+) -> Result<(), Error> {
+	let priority = kio::Producer::new(0u8);
+	let ctx = Subscription {
+		session,
+		id: 0,
+		track_name: track.name().into(),
+		priority: PriorityQueue::default(),
+		track_priority: priority.consume(),
+		track_priority_seen: 0,
+		version: Version::Lite05,
+		timescale: Some(track.info().timescale),
+	};
+	position_cursor(&mut track, Version::Lite05, None);
+	let mut children = Box::new(kio::Tasks::new());
+	let mut finished = false;
+	kio::wait(move |waiter| {
+		loop {
+			let drained = children.poll(waiter).is_ready();
+			if finished {
+				return if drained { Poll::Ready(Ok(())) } else { Poll::Pending };
+			}
+			let Some(mut group) = ready!(track.poll_recv_group(waiter))? else {
+				finished = true;
+				continue;
+			};
+			if !position_group(&mut group, None, None) {
+				continue;
+			}
+			let sequence = group.sequence;
+			let handle = ctx.priority.insert(Priority::new(0, 0, sequence));
+			children.push(GroupServe::new(ctx.clone(), sequence, 0, handle, group));
+		}
+	})
+	.await
+}

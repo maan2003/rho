@@ -139,9 +139,8 @@ layout { background-color "#315b97"; }
         let mut input=rho_rpc::Stream::new(recv,send);
         write_frame(&mut input,&C::WaylandOpen {media_id:1,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,S>(&mut input).await?,S::WaylandOpened),"open failed");
-        rho_rpc::write_frame(&mut input,&rho_desktop_proto::Input::Quality {bitrate:2_000_000,keyframe:true},65536).await?;
         let origin=rho_desktop_media::media::origin();
-        let media=rho_desktop_media::media::subscribe(transport,origin.clone()).await.context("MoQ handshake")?;
+        let media=rho_desktop_media::media::subscribe(transport,origin.clone()).await.context("fixed video stream")?;
         let mut announced=origin.consume().announced();
         announced.next().await.context("no app announcement")?;
         let broadcast=origin.consume().request_broadcast("app").await?;
@@ -172,17 +171,17 @@ layout { background-color "#315b97"; }
         // A late viewer must get a fresh independently decodable group even when
         // the desktop is static and the old keyframe has aged out.
         tokio::time::sleep(Duration::from_millis(900)).await;
+        let transport2=mux.session(2)?;
         let (send2,recv2)=connection.open_bi().await?;
         let mut input2=rho_rpc::Stream::new(recv2,send2);
         write_frame(&mut input2,&C::WaylandOpen {media_id:2,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,S>(&mut input2).await?,S::WaylandOpened),"second viewer open failed");
         let origin2=rho_desktop_media::media::origin();
-        let media2=rho_desktop_media::media::subscribe(mux.session(2)?,origin2.clone()).await?;
+        let media2=rho_desktop_media::media::subscribe(transport2,origin2.clone()).await?;
         let mut announcements2=origin2.consume().announced();
         announcements2.next().await.context("missing late-join broadcast")?;
         let broadcast2=origin2.consume().request_broadcast("app").await?;
         let mut video2=broadcast2.track("video")?.subscribe(None).await?.ordered();
-        rho_rpc::write_frame(&mut input2,&rho_desktop_proto::Input::Quality{bitrate:2_000_000,keyframe:true},65536).await?;
         tokio::time::timeout(Duration::from_secs(5),async {
             let mut group=video2.next_group().await?.context("late viewer has no keyframe group")?;
             let packet=group.read_frame().await?.context("late viewer has no frame")?;

@@ -1,6 +1,6 @@
-//! MoQ over an already authenticated, dedicated Iroh connection.
+//! Fixed MoQ video groups over the existing authenticated Iroh connection.
 //! Control/input uses a separate bidirectional stream, never the video queue.
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use bytes::Bytes;
@@ -19,36 +19,142 @@ pub fn origin() -> origin::Producer {
     origin
 }
 
+/// A fixed video stream: desktop-open supplies the subscription out of band.
+pub struct Session {
+    task: tokio::task::JoinHandle<()>,
+    done: tokio::sync::watch::Receiver<Option<String>>,
+}
+impl Session {
+    pub fn abort(&self, _: moq_net::Error) {
+        self.task.abort();
+    }
+    pub async fn closed(&self) -> String {
+        let mut done = self.done.clone();
+        loop {
+            if let Some(error) = done.borrow().clone() {
+                return error;
+            }
+            if done.changed().await.is_err() {
+                return "desktop media closed".into();
+            }
+        }
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(feature = "iroh")]
 pub async fn publish(
     transport: moq_tokio::shared_iroh::Session,
     origin: &origin::Producer,
-) -> Result<moq_net::Session> {
-    let (session, driver) = moq_net::Server::new()
-        .with_publisher(origin)
-        .accept_lite(
-            Instant::now(),
-            moq_tokio::transport::Session::new(transport),
-        )
-        .await?;
-    tokio::spawn(moq_net::time::run(driver));
-    Ok(session)
+) -> Result<Session> {
+    fixed_publish(transport, origin)
+}
+
+fn fixed_publish<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin + 'static>(
+    transport: S,
+    origin: &origin::Producer,
+) -> Result<Session> {
+    let origin = origin.clone();
+    Ok(fixed_session(async move {
+        use moq_net::web_transport_trait::RecvStream as _;
+        let _close = CloseTransport(transport.clone());
+        // This stream only signals lifetime. No request or response gates video.
+        let (_send, mut recv) = transport.open_bi().await?;
+        let mut byte = [0];
+        let video = async {
+            let broadcast = origin.consume().request_broadcast("app").await?;
+            let track = broadcast.track("video")?.subscribe(None).await?;
+            moq_net::publish_fixed(moq_tokio::transport::Session::new(transport.clone()), track)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            result = video => result,
+            _ = transport.closed() => Ok(()),
+            _ = recv.read(&mut byte) => Ok(()),
+        }
+    }))
 }
 
 #[cfg(feature = "iroh")]
 pub async fn subscribe(
     transport: moq_tokio::shared_iroh::Session,
     origin: origin::Producer,
-) -> Result<moq_net::Session> {
-    let (session, driver) = moq_net::Client::new()
-        .with_subscriber(origin)
-        .connect_lite(
-            Instant::now(),
-            moq_tokio::transport::Session::new(transport),
-        )
-        .await?;
-    tokio::spawn(moq_net::time::run(driver));
-    Ok(session)
+) -> Result<Session> {
+    fixed_subscribe(transport, origin)
+}
+
+fn fixed_subscribe<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin + 'static>(
+    transport: S,
+    origin: origin::Producer,
+) -> Result<Session> {
+    let broadcast = origin.create_broadcast("app")?;
+    let video = Video::new(&broadcast)?;
+    broadcast.announce(Default::default())?;
+    Ok(fixed_session(async move {
+        use moq_net::transport::poll::Session as _;
+        use moq_net::web_transport_trait::RecvStream as _;
+        let _close = CloseTransport(transport.clone());
+        let lifetime = async {
+            let (_send, mut recv) = transport.accept_bi().await?;
+            let mut byte = [0];
+            let _ = recv.read(&mut byte).await;
+            Ok::<(), anyhow::Error>(())
+        };
+        let receive = async {
+            let mut receiver = moq_tokio::transport::Session::new(transport.clone());
+            let mut groups = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    stream = receiver.accept_uni(), if groups.len() < 32 => {
+                        let stream = stream?;
+                        let track = video.track.clone();
+                        groups.spawn(async move {
+                            moq_net::receive_fixed_group(stream, track, moq_net::Timescale::MICRO).await
+                        });
+                    }
+                    _ = groups.join_next(), if !groups.is_empty() => {}
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        };
+        let result = tokio::select! {
+            result = lifetime => result,
+            result = receive => result,
+            _ = transport.closed() => Ok(()),
+        };
+        drop((video, broadcast, origin));
+        result
+    }))
+}
+
+// Pending adapter reads may own transport clones. Close explicitly rather than
+// waiting for their last clone to drop when the viewer task is cancelled.
+struct CloseTransport<S: moq_net::web_transport_trait::Session>(S);
+impl<S: moq_net::web_transport_trait::Session> Drop for CloseTransport<S> {
+    fn drop(&mut self) {
+        self.0.close(0, "desktop viewer closed");
+    }
+}
+
+fn fixed_session(future: impl Future<Output = Result<()>> + Send + 'static) -> Session {
+    let (done, receive) = tokio::sync::watch::channel(None);
+    let task = tokio::spawn(async move {
+        let result = future.await;
+        done.send_replace(Some(match result {
+            Ok(()) => "desktop media closed".into(),
+            Err(error) => format!("{error:#}"),
+        }));
+    });
+    Session {
+        task,
+        done: receive,
+    }
 }
 
 /// One keyframe-led group. Encoded dependent frames are never independently
@@ -90,6 +196,43 @@ mod tests {
     use moq_tokio::shared_iroh::Mux;
 
     use super::*;
+
+    #[tokio::test]
+    async fn local_fixed_stream_releases_capture_on_drop() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let producer = origin();
+            let consumer = origin();
+            let broadcast = producer.create_broadcast("app")?;
+            broadcast.announce(Default::default())?;
+            let mut video = Video::new(&broadcast)?;
+            let (server, client) = tokio::io::duplex(4096);
+            let (sending, receiving) = tokio::join!(
+                local_server(server, &producer),
+                local_client(client, consumer.clone()),
+            );
+            let sending = sending?;
+            let receiving = receiving?;
+            video.track.used().await?;
+            let remote = consumer.consume().request_broadcast("app").await?;
+            let mut track = remote.track("video")?.subscribe(None).await?.ordered();
+            video.write(true, 17_000, Bytes::from_static(b"keyframe"))?;
+            video.write(false, 18_250, Bytes::from_static(b"dependent"))?;
+            let mut group = track.next_group().await?.unwrap();
+            let first = group.read_frame().await?.unwrap();
+            assert_eq!(first.timestamp, moq_net::Timestamp::from_micros(17_000)?);
+            assert_eq!(&first.payload[..], b"keyframe");
+            let second = group.read_frame().await?.unwrap();
+            assert_eq!(second.timestamp, moq_net::Timestamp::from_micros(18_250)?);
+            assert_eq!(&second.payload[..], b"dependent");
+            drop(receiving);
+            // Keep the local model readers alive: the transport lifetime, not
+            // their accidental destruction, must release compositor demand.
+            video.track.unused().await?;
+            sending.closed().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
 
     async fn rpc_echo(connection: &iroh::endpoint::Connection, text: &str) -> Result<()> {
         let (send, recv) = connection.open_bi().await?;
@@ -168,16 +311,11 @@ mod tests {
             let broadcast = producer.create_broadcast("app")?;
             broadcast.announce(Default::default())?;
             let mut video = Video::new(&broadcast)?;
-            let (sending, receiving) = tokio::join!(
-                publish(send_transport, &producer),
-                subscribe(recv_transport, consumer.clone())
-            );
-            let sending = sending?;
-            let receiving = receiving?;
-            assert!(
-                !video.track.is_used(),
-                "advertisement must not demand encoding"
-            );
+            let sending = publish(send_transport, &producer).await?;
+            // The receiver has sent nothing and has not even started. Opening
+            // desktop video must demand encoding without a negotiation round trip.
+            tokio::time::timeout(Duration::from_secs(2), video.track.used()).await??;
+            let receiving = subscribe(recv_transport, consumer.clone()).await?;
             let mut announced = consumer.consume().announced();
             let update = announced
                 .next()
@@ -222,7 +360,6 @@ mod tests {
             sent?;
             read?;
             drop(subscribed);
-            video.track.unused().await?;
             receiving.abort(moq_net::Error::Cancel);
             video.track.unused().await?;
             sending.abort(moq_net::Error::Cancel);
@@ -242,42 +379,24 @@ mod tests {
 /// QMux only covers the local desktop-to-daemon byte transport. The remote GUI
 /// still uses independent QUIC streams on its existing authenticated Iroh
 /// connection.
-pub async fn local_client<S>(stream: S, origin: origin::Producer) -> Result<moq_net::Session>
+pub async fn local_client<S>(stream: S, origin: origin::Producer) -> Result<Session>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let transport = qmux_transport(stream, false).await?;
-    let (session, driver) = moq_net::Client::new()
-        .with_subscriber(origin)
-        .connect_lite(
-            Instant::now(),
-            moq_tokio::transport::Session::new(transport),
-        )
-        .await?;
-    tokio::spawn(moq_net::time::run(driver));
-    Ok(session)
+    fixed_subscribe(qmux_transport(stream, false).await?, origin)
 }
-pub async fn local_server<S>(stream: S, origin: &origin::Producer) -> Result<moq_net::Session>
+pub async fn local_server<S>(stream: S, origin: &origin::Producer) -> Result<Session>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let transport = qmux_transport(stream, true).await?;
-    let (session, driver) = moq_net::Server::new()
-        .with_publisher(origin)
-        .accept_lite(
-            Instant::now(),
-            moq_tokio::transport::Session::new(transport),
-        )
-        .await?;
-    tokio::spawn(moq_net::time::run(driver));
-    Ok(session)
+    fixed_publish(qmux_transport(stream, true).await?, origin)
 }
 async fn qmux_transport<S>(stream: S, server: bool) -> Result<qmux::Session>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut config = qmux::Config::new(qmux::Version::QMux01);
-    config.protocol = qmux::Protocol::Negotiate(vec!["moq-lite-05".into()]);
+    config.protocol = qmux::Protocol::Negotiated("rho-desktop-video-1".into());
     let stream = qmux::transport::Stream::new(stream, config.version, config.max_record_size);
     let session = if server {
         qmux::Session::accept(stream, config).await?
@@ -289,7 +408,7 @@ where
 
 /// Dropping a connection aborts only that MoQ session, not an enclosing Iroh
 /// connection.
-pub struct SessionGuard(pub moq_net::Session);
+pub struct SessionGuard(pub Session);
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.0.abort(moq_net::Error::Cancel);

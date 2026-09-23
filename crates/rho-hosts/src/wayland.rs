@@ -64,10 +64,6 @@ pub(crate) async fn open(
     let (errors, error_receive) = watch::channel(None);
     let (input, mut commands) = mpsc::channel(256);
     let feedback = input.clone();
-    let _ = input.try_send(Input::Quality {
-        bitrate: 2_000_000,
-        keyframe: true,
-    });
     let (motion, mut movement) = watch::channel(None);
     let (packets, mut decode) = mpsc::channel::<bytes::Bytes>(2);
     let decoded = images.clone();
@@ -104,13 +100,6 @@ pub(crate) async fn open(
         Ok(())
     });
     let task = tokio::spawn(async move {
-        struct Close(moq_net::Session);
-        impl Drop for Close {
-            fn drop(&mut self) {
-                self.0.abort(moq_net::Error::Cancel);
-            }
-        }
-        let _close = Close(session.clone());
         let receive = async {
             let mut announced = origin.consume().announced();
             loop {

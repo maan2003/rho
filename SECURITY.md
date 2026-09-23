@@ -1002,6 +1002,14 @@ Each connection admits at most 32 media sessions, with bounded incoming stream
 queues and header deadlines. Closing a viewer closes its media route, not the
 authenticated connection or sibling viewers.
 
+Desktop-open requests one fixed VP9 video track. Both hops send MoQ lite-05
+GROUP data directly, with microsecond timestamps and subscription id zero;
+there is no media setup, announcement, metadata, or subscription negotiation.
+A separate stream signals viewer lifetime without gating frame delivery on a
+reply. Each receiver admits at most 32 concurrent group handlers; cancellation
+aborts unfinished groups and releases the upstream subscription. Local desktop
+and remote UI protocol versions reject binaries using the old media handshake.
+
 Desktop JSON headers are capped at 64 KiB; dimensions are capped at 4096 in each
 axis and VP9 packets at 16 MiB. Raw/encoded queues are bounded. The MoQ cache
 uses a 32 MiB target and short retention; this target is not a hard process-memory
