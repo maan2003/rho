@@ -64,7 +64,7 @@ pub(crate) fn initialize() -> Result<(), String> {
 unsafe fn start() -> Result<(), String> {
     unsafe {
         if pyo3::ffi::Py_IsInitialized() != 0 {
-            return Err("Python was initialized outside rho-notebook".into());
+            return Err("Python was initialized outside rho's notebook runtime".into());
         }
         let config = PyInitConfig_Create();
         if config.is_null() {

@@ -11,10 +11,10 @@ use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, watch};
 
-use crate::cell::current;
-use crate::notebook::{ExecState, Shared, operation, register};
-use crate::runtime::{Build, Message};
-use crate::source::{CommandExit, Log, Process, Source, session_id};
+use crate::python::cell::current;
+use crate::python::notebook::{ExecState, Shared, operation, register};
+use crate::python::runtime::{Build, Message};
+use crate::python::source::{CommandExit, Log, Process, Source, session_id};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
@@ -104,7 +104,7 @@ pub(crate) fn command(
     let budget = budget(max_tokens)?;
     let exec = current(py, "Commands are available")?;
     let shared = &exec.shared;
-    let future = crate::runtime::future(py, shared)?;
+    let future = crate::python::runtime::future(py, shared)?;
     // Published synchronously: write_stdin in the same cell can refer to
     // a command whose process has not started yet.
     let job = new_job(shared, &cmd, budget).map_err(PyRuntimeError::new_err)?;
@@ -218,7 +218,7 @@ impl Command {
             .unwrap()
             .keys()
             .copied()
-            .filter(|id| u64::from(crate::source::session_id(*id)) == session_id)
+            .filter(|id| u64::from(crate::python::source::session_id(*id)) == session_id)
             .collect();
         match found.as_slice() {
             [id] => Ok(Self {

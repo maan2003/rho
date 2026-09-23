@@ -28,7 +28,6 @@ rand.workspace = true
 redb.workspace = true
 rustix = { version = "1", features = ["fs", "net", "process", "stdio"] }
 redb-derive = "0.1"
-rho-notebook.workspace = true
 rho-claude.workspace = true
 rho-context-config.workspace = true
 rho-core.workspace = true
@@ -50,6 +49,10 @@ uuid.workspace = true
 rho-shell.workspace = true
 tokio-tungstenite.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "python_workspace"
+harness = false
 
 [[test]]
 name = "shell_e2e"

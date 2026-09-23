@@ -34,7 +34,6 @@ use rho_core::{
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use rho_notebook::{PythonCell, SourceWaker};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::boundary::{
@@ -49,7 +48,8 @@ use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTx
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::Team;
 use crate::native::NativeEvent;
-use crate::notebook::host_tools;
+use crate::python::host::host_tools;
+use crate::python::{PythonCell, SourceWaker};
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
     ToolPreview, View, final_answer_text, prompt,
@@ -81,7 +81,7 @@ pub(crate) struct MailItem {
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
-    notebook: Arc<rho_notebook::PythonNotebook>,
+    notebook: Arc<crate::python::PythonNotebook>,
     prompt: PromptInputs,
 }
 
@@ -485,11 +485,11 @@ impl RunningExec {
             .sources()
             .into_iter()
             .map(|(_, facts)| match facts {
-                rho_notebook::SourceFacts::Cell(facts) => SourceKind::Cell {
+                crate::python::SourceFacts::Cell(facts) => SourceKind::Cell {
                     facts,
                     latest: false,
                 },
-                rho_notebook::SourceFacts::Job(facts) => SourceKind::Job { facts },
+                crate::python::SourceFacts::Job(facts) => SourceKind::Job { facts },
             })
     }
 }
@@ -548,7 +548,7 @@ pub(crate) struct Agent {
     /// until it has spoken once — after a restart included, which is safe
     /// because no tool survives one.
     turn: Option<ModelTurn>,
-    latest_python_exec: Option<(ToolCallId, Arc<rho_notebook::PythonExec>)>,
+    latest_python_exec: Option<(ToolCallId, Arc<crate::python::PythonExec>)>,
     /// Cumulative provider-reported usage across this agent's requests.
     total_usage: AgentUsageBucket,
     name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
@@ -1884,7 +1884,7 @@ fn surface(
 ) -> anyhow::Result<Surface> {
     let (shell, others) = host_tools(&view, role, agent_id, inference, team, host);
     let notebook = Arc::new(
-        rho_notebook::PythonNotebook::new(shell, others)
+        crate::python::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
     );
     Ok(Surface {

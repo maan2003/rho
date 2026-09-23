@@ -2,8 +2,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rho_agent::python::{PythonNotebook, SourceWaker};
 use rho_core::ExecCall;
-use rho_notebook::{PythonNotebook, SourceWaker};
 #[path = "../../rho-fs-view/tests/common/workset.rs"]
 mod common;
 use rho_tool_shell::ShellTools;

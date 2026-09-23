@@ -11,7 +11,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rho_core::{AgentId, ImageDetail, ToolExecutionContext};
 use rho_inference::Inference;
-use rho_notebook::{Export, detached, operation};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::{WebRequest, WebSearchTools};
 
@@ -20,6 +19,7 @@ use crate::db::AgentRole;
 use crate::image_tool::{ImageTools, ViewImageArgs};
 use crate::multi_agent_tools::{AdvisorArgs, AgentCall, InterruptArgs, SendArgs, SpawnArgs, Team};
 use crate::papercut::PapercutArgs;
+use crate::python::{Export, detached, operation};
 use crate::worker::{Host, SharedCall};
 
 /// What every runtime's tools are built from: the shell, and the host
@@ -244,9 +244,9 @@ mod tests {
     use std::time::Duration;
 
     use rho_core::{AdvisorIntelligence, ExecCall, ToolOutputStatus};
-    use rho_notebook::{PythonNotebook, SourceWaker};
 
     use super::*;
+    use crate::python::{PythonNotebook, SourceWaker};
 
     /// A daemon that answers every call with the call itself.
     fn echo_daemon(calls: Arc<Mutex<Vec<String>>>) -> Daemon {

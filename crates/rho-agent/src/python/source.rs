@@ -9,7 +9,7 @@ use rho_core::UnixMs;
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
 use tokio::sync::{Notify, watch};
 
-use crate::{JobEnd, JobFacts};
+use crate::python::{JobEnd, JobFacts};
 
 /// The session ID a source is reported under, so the pieces of one
 /// background job correlate across replies. Scrambled so the model does not

@@ -63,7 +63,7 @@ struct Item<'py> {
 impl<'py> Item<'py> {
     fn new(py: Python<'py>, kind: &str) -> PyResult<Self> {
         let item = Self {
-            kernel: crate::interpreter::kernel(py)?.clone(),
+            kernel: crate::python::interpreter::kernel(py)?.clone(),
             fields: PyDict::new(py),
         };
         item.set("kind", kind)
@@ -188,7 +188,10 @@ fn history_item<'py>(
                 Some(metadata) => {
                     let json = serde_json::to_string(metadata)
                         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-                    Some(crate::interpreter::kernel(py)?.call_method1("frozen_json", (json,))?)
+                    Some(
+                        crate::python::interpreter::kernel(py)?
+                            .call_method1("frozen_json", (json,))?,
+                    )
                 }
                 None => None,
             };

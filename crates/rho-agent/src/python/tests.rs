@@ -12,7 +12,9 @@ use rho_tool_shell::ShellTools;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::{Export, JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker, ToolCx};
+use crate::python::{
+    Export, JobFacts, PythonCell, PythonNotebook, SourceFacts, SourceWaker, ToolCx,
+};
 
 pub(crate) fn shell() -> ShellTools {
     ShellTools::in_directory(
@@ -54,7 +56,7 @@ impl Tool {
     #[pyo3(signature = (*args))]
     fn __call__(&self, py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyAny>> {
         let work = Arc::clone(&self.work);
-        crate::operation(py, self.name, move |cx| work(cx, args))
+        crate::python::operation(py, self.name, move |cx| work(cx, args))
     }
 }
 
@@ -1301,7 +1303,7 @@ await command("printf buffered-command")
     until(&wake, &cell, Signal::Ended).await;
     assert_eq!(
         cell.execution().facts().checkin,
-        Some(crate::PythonCheckin {
+        Some(crate::python::PythonCheckin {
             after: Duration::from_secs(300),
             wake_on_tools: false,
         })
@@ -1556,7 +1558,7 @@ async fn notebook_leases_interruption_annotation_once_with_the_first_output() {
                 .count(),
             1
         );
-        assert!(first.output.starts_with(crate::INTERRUPTED));
+        assert!(first.output.starts_with(crate::python::INTERRUPTED));
         assert_eq!(
             first.status == ToolOutputStatus::Cancelled,
             cancel_before_read

@@ -28,7 +28,7 @@ pub mod agent;
 mod boundary;
 mod claude;
 pub mod native;
-mod notebook;
+pub mod python;
 pub use agent::{AgentHandle, render_agent_surface};
 
 pub mod db;

@@ -8,8 +8,8 @@ use pyo3::prelude::*;
 use rho_core::{ExecCall, ToolOutput, ToolOutputStatus};
 use tokio::sync::Notify;
 
-use crate::tests::{shell, shell_in};
-use crate::{Export, PythonCell, PythonNotebook, SourceWaker};
+use crate::python::tests::{shell, shell_in};
+use crate::python::{Export, PythonCell, PythonNotebook, SourceWaker};
 
 fn notebook() -> PythonNotebook {
     PythonNotebook::new(shell(), Vec::new()).unwrap()
@@ -94,18 +94,18 @@ struct Tools {
 impl Tools {
     #[pyo3(signature = (text, *, count = 1))]
     fn echo(&self, py: Python<'_>, text: String, count: u64) -> PyResult<Py<PyAny>> {
-        crate::operation(py, "echo", move |_| async move { Ok((text, count)) })
+        crate::python::operation(py, "echo", move |_| async move { Ok((text, count)) })
     }
 
     fn broken(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        crate::operation(py, "broken", |_| async {
+        crate::python::operation(py, "broken", |_| async {
             Err::<(), _>("host failed".to_owned())
         })
     }
 
     fn detached(&self, py: Python<'_>) -> PyResult<()> {
         let detached = Arc::clone(&self.detached);
-        crate::detached(py, "detached", move |_| async move {
+        crate::python::detached(py, "detached", move |_| async move {
             detached.fetch_add(1, Ordering::Relaxed);
             Ok(())
         })

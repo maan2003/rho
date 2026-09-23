@@ -737,7 +737,7 @@ after the database commit. Cancellation before acquiring the write lock leaves
 no report; once writing starts, the short transaction completes atomically.
 Tests cover validation, concurrent appends, and reopening the database.
 
-## Python code mode (`rho-notebook`)
+## Python code mode (`rho-agent` `python` module)
 
 Every role works in the Python notebook: native agents have it as their only
 tool, and all Claude roles get it as an in-process MCP server with Claude's

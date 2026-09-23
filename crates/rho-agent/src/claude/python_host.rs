@@ -17,7 +17,6 @@ use rho_claude::mcp::{reply, text_item, tool_result};
 #[cfg(test)]
 use rho_core::ToolOutputStatus;
 use rho_core::{ExecCall, ExecId, ToolOutput, UnixMs};
-use rho_notebook::{PythonCell, PythonExec, PythonNotebook, SourceWaker};
 use serde_json::Value;
 use tokio::sync::Notify;
 
@@ -25,6 +24,7 @@ use crate::agent::ReplyState;
 use crate::boundary::{
     Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
 };
+use crate::python::{PythonCell, PythonExec, PythonNotebook, SourceWaker};
 
 /// One exec call the CLI is waiting on.
 #[derive(Clone, Debug)]
@@ -198,10 +198,10 @@ impl PythonHost {
                     .sources()
                     .into_iter()
                     .map(|(_, facts)| match facts {
-                        rho_notebook::SourceFacts::Cell(facts) => {
+                        crate::python::SourceFacts::Cell(facts) => {
                             SourceKind::Cell { facts, latest }
                         }
-                        rho_notebook::SourceFacts::Job(facts) => SourceKind::Job { facts },
+                        crate::python::SourceFacts::Job(facts) => SourceKind::Job { facts },
                     }),
             );
         }

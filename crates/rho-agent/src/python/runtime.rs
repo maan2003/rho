@@ -13,8 +13,8 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use crate::cell::{Cell, PythonExec};
-use crate::notebook::{Export, Shared};
+use crate::python::cell::{Cell, PythonExec};
+use crate::python::notebook::{Export, Shared};
 
 pub(crate) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
@@ -119,7 +119,7 @@ pub(crate) fn spawn(
     setup: Box<dyn FnOnce() -> Result<(), String> + Send>,
     exports: Vec<Export>,
 ) -> Result<(), String> {
-    crate::interpreter::initialize()?;
+    crate::python::interpreter::initialize()?;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("rho-python".into())
@@ -167,21 +167,21 @@ fn run(
         let mut objects = vec![
             (
                 "command",
-                pyo3::wrap_pyfunction!(crate::commands::command, py)?.into_any(),
+                pyo3::wrap_pyfunction!(crate::python::commands::command, py)?.into_any(),
             ),
             (
                 "write_stdin",
-                pyo3::wrap_pyfunction!(crate::commands::write_stdin, py)?.into_any(),
+                pyo3::wrap_pyfunction!(crate::python::commands::write_stdin, py)?.into_any(),
             ),
             (
                 "Command",
-                py.get_type::<crate::commands::Command>().into_any(),
+                py.get_type::<crate::python::commands::Command>().into_any(),
             ),
         ];
         for export in exports {
             objects.push((export.name, (export.build)(py)?.into_bound(py)));
         }
-        let notebook = crate::interpreter::kernel(py)?
+        let notebook = crate::python::interpreter::kernel(py)?
             .getattr("Notebook")?
             .call1((
                 Driver {

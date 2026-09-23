@@ -23,6 +23,7 @@
 mod cell;
 mod commands;
 mod history;
+pub(crate) mod host;
 mod interpreter;
 mod notebook;
 mod runtime;

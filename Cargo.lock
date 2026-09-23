@@ -12232,7 +12232,6 @@ dependencies = [
  "rho-fs-view",
  "rho-image",
  "rho-inference",
- "rho-notebook",
  "rho-rpc",
  "rho-shell",
  "rho-shell-proto",
@@ -12844,23 +12843,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "rho-notebook"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "camino",
- "libc",
- "pyo3",
- "rho-core",
- "rho-fs-view",
- "rho-tool-shell",
- "senax-encoder",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

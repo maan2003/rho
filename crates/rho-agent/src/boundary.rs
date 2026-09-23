@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_core::UnixMs;
-use rho_notebook::{CellFacts, JobFacts};
 
+use crate::python::{CellFacts, JobFacts};
 use crate::{WakeEvent, WakeFacts, WakeKind, WakeTrigger};
 
 /// The last thing to happen to an idle agent that bears on whether it should
@@ -129,7 +129,7 @@ pub(crate) const FAILURE_PATIENCE: Duration = Duration::from_secs(20);
 /// how the model finds out there is nothing to see and asks for longer next
 /// time. It is the most any event waits: a background job with nothing to
 /// hurry it is still delivered here.
-pub(crate) const DEFAULT_WAIT: Duration = rho_notebook::PythonCheckin::DEFAULT_MAX_WAIT;
+pub(crate) const DEFAULT_WAIT: Duration = crate::python::PythonCheckin::DEFAULT_MAX_WAIT;
 
 /// What the model's latest turn settled: when it spoke, and whether it made a
 /// call it is waiting on.

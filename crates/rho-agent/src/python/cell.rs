@@ -8,10 +8,10 @@ use pyo3::prelude::*;
 use rho_core::{ExecId, ToolOutput, ToolOutputStatus, UnixMs};
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
 
-use crate::history::HistorySnapshot;
-use crate::notebook::{ExecState, PythonStreamProgress, Shared};
-use crate::output;
-use crate::runtime::Input;
+use crate::python::history::HistorySnapshot;
+use crate::python::notebook::{ExecState, PythonStreamProgress, Shared};
+use crate::python::output;
+use crate::python::runtime::Input;
 
 /// Opens the first reply of a call whose response stopped part-way: the call
 /// history keeps is the part that ran.
@@ -101,9 +101,9 @@ impl PythonExec {
         self.link.lock().unwrap().closed()
     }
 
-    pub fn facts(&self) -> crate::CellFacts {
+    pub fn facts(&self) -> crate::python::CellFacts {
         let state = self.link.lock().unwrap();
-        crate::CellFacts {
+        crate::python::CellFacts {
             cell: self.cell,
             started: state.started,
             returned: state.returned,
@@ -134,7 +134,7 @@ impl std::ops::Deref for PythonCell {
 
 /// The running code's cell: every host call names the cell it belongs to.
 pub(crate) fn current(py: Python<'_>, purpose: &str) -> PyResult<Arc<PythonExec>> {
-    let owner = crate::interpreter::kernel(py)?
+    let owner = crate::python::interpreter::kernel(py)?
         .getattr("CELL")?
         .call_method0("get")?;
     if owner.is_none() {
@@ -341,8 +341,8 @@ impl PythonCell {
     }
 }
 impl PythonCell {
-    pub fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
-        use crate::SourceFacts;
+    pub fn sources(&self) -> Vec<(u64, crate::python::SourceFacts)> {
+        use crate::python::SourceFacts;
         // Keep the cell marker distinct from zero-based host request IDs.
         let mut sources = vec![(u64::MAX, SourceFacts::Cell(self.facts()))];
         let cell = self.link.lock().unwrap();

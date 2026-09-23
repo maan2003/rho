@@ -9,7 +9,7 @@ use rho_inference::exec::set_source;
 use super::*;
 
 pub(super) struct Stream {
-    pub exec: Arc<rho_notebook::PythonExec>,
+    pub exec: Arc<crate::python::PythonExec>,
     item: InferenceResponseItem,
     index: usize,
     source: String,
@@ -267,7 +267,7 @@ pub(in crate::agent) mod tests {
         write.commit();
         let head = db.read().get_agent(id);
         let notebook = Arc::new(
-            rho_notebook::PythonNotebook::new(
+            crate::python::PythonNotebook::new(
                 ShellTools::in_directory(
                     Duration::from_secs(5),
                     directory.to_str().unwrap().into(),
@@ -341,7 +341,7 @@ pub(in crate::agent) mod tests {
         })
     }
 
-    fn exec(agent: &Agent) -> &rho_notebook::PythonExec {
+    fn exec(agent: &Agent) -> &crate::python::PythonExec {
         &agent.execs.values().next().unwrap().session
     }
 
@@ -541,7 +541,7 @@ pub(in crate::agent) mod tests {
         assert!(matches!(agent.phase, Phase::Requesting(_)));
         until(&mut agent, |agent| {
             agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-            matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
+            matches!(facts, crate::python::SourceFacts::Job(facts) if facts.finished.is_some())
         )
         })
         .await;
@@ -619,7 +619,7 @@ pub(in crate::agent) mod tests {
         until(&mut agent, |agent| {
             exec(agent).facts().returned.is_some()
             && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-                matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
+                matches!(facts, crate::python::SourceFacts::Job(facts) if facts.finished.is_some())
             )
         })
         .await;
@@ -645,7 +645,7 @@ pub(in crate::agent) mod tests {
                 .iter()
                 .any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result|
-                result.body.output.starts_with(rho_notebook::INTERRUPTED)
+                result.body.output.starts_with(crate::python::INTERRUPTED)
                 && result.body.output.contains("fresh-output"))))
         );
         assert!(!agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
@@ -953,7 +953,7 @@ pub(in crate::agent) mod tests {
                 until(&mut agent, |agent| {
                     exec(agent).facts().returned.is_some()
                         && agent.execs.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
-                            matches!(facts, rho_notebook::SourceFacts::Job(facts) if facts.finished.is_some())
+                            matches!(facts, crate::python::SourceFacts::Job(facts) if facts.finished.is_some())
                         })
                 }).await;
                 let decision = agent.decide(UnixMs::now());

@@ -1170,7 +1170,7 @@ impl ClaudeLoop {
             return Ok(());
         }
         let team = self.host.team().await?;
-        let (shell, others) = crate::notebook::host_tools(
+        let (shell, others) = crate::python::host::host_tools(
             view,
             self.role,
             self.agent_id,
@@ -1178,7 +1178,7 @@ impl ClaudeLoop {
             team.as_ref(),
             Some(&self.host),
         );
-        let tool = rho_notebook::PythonNotebook::new(shell, others)
+        let tool = crate::python::PythonNotebook::new(shell, others)
             .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
         self.python = Some(python_host::PythonHost::new(tool));
         Ok(())

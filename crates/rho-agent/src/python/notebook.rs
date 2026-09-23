@@ -13,11 +13,11 @@ use pyo3::{IntoPyObjectExt, PyClass, PyClassInitializer};
 use rho_core::{ContextBlock, ExecCall, ExecId, UnixMs};
 use rho_tool_shell::{BoundedOutput, ShellTools};
 
-use crate::SourceWaker;
-use crate::cell::{PythonCell, PythonExec};
-use crate::history::HistorySnapshot;
-use crate::runtime::{Build, Inbox, Input, Message};
-use crate::source::Source;
+use crate::python::SourceWaker;
+use crate::python::cell::{PythonCell, PythonExec};
+use crate::python::history::HistorySnapshot;
+use crate::python::runtime::{Build, Inbox, Input, Message};
+use crate::python::source::Source;
 
 pub struct PythonNotebook {
     shared: Arc<Shared>,
@@ -85,7 +85,7 @@ pub(crate) struct ExecState {
     /// the status of its next answer.
     pub(crate) error: bool,
     pub(crate) delivered: bool,
-    pub(crate) checkin: Option<crate::PythonCheckin>,
+    pub(crate) checkin: Option<crate::python::PythonCheckin>,
     /// Operations and commands, in the order they started, until each
     /// has reported its end.
     pub(crate) sources: Vec<Arc<Source>>,
@@ -149,7 +149,7 @@ impl PythonNotebook {
             foreground_cell: AtomicU64::new(0),
             history: Mutex::default(),
         });
-        crate::runtime::spawn(
+        crate::python::runtime::spawn(
             Arc::clone(&shared),
             Box::new(move || {
                 unsafe { runtime.block_on(shell.enter_interpreter_thread()) }
@@ -332,8 +332,8 @@ where
     R: for<'py> IntoPyObject<'py> + Send + 'static,
     Fut: Future<Output = Result<R, String>> + Send + 'static,
 {
-    let exec = crate::cell::current(py, "Host functions are available")?;
-    let future = crate::runtime::future(py, &exec.shared)?;
+    let exec = crate::python::cell::current(py, "Host functions are available")?;
+    let future = crate::python::runtime::future(py, &exec.shared)?;
     let reply = future.clone_ref(py);
     let inbox = Arc::clone(&exec.shared.inbox);
     start(&exec, name, work, move |result: Result<R, String>| {
@@ -350,7 +350,7 @@ pub fn detached<Fut>(py: Python<'_>, name: &str, work: impl FnOnce(ToolCx) -> Fu
 where
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
-    let exec = crate::cell::current(py, "Host functions are available")?;
+    let exec = crate::python::cell::current(py, "Host functions are available")?;
     start(&exec, name, work, drop)
 }
 

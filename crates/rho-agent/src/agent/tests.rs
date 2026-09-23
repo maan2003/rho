@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use rho_core::ToolType;
-use rho_notebook::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 
 use super::*;
 use crate::boundary::{
     DEFAULT_WAIT, FAILURE_PATIENCE, FOREGROUND_PATIENCE, MAIL_BURST, MAIL_PATIENCE,
     NOTIFY_PATIENCE, Observations, USER_PATIENCE,
 };
+use crate::python::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 use crate::{WakeKind, WakeTrigger};
 
 fn call(id: &str) -> ToolCall {
@@ -967,8 +967,8 @@ async fn a_wake_that_lands_while_the_core_is_busy_is_not_lost() {
     assert!(woken.await.is_ok(), "the permit survives until awaited");
 }
 
-fn python_tool(directory: &tempfile::TempDir) -> rho_notebook::PythonNotebook {
-    rho_notebook::PythonNotebook::new(
+fn python_tool(directory: &tempfile::TempDir) -> crate::python::PythonNotebook {
+    crate::python::PythonNotebook::new(
         rho_tool_shell::ShellTools::in_directory(
             Duration::from_secs(20),
             directory.path().to_str().unwrap().into(),
@@ -1000,7 +1000,7 @@ async fn until_jobs_registered(running: &RunningExec, wake: &Arc<Notify>, count:
                 .session
                 .sources()
                 .into_iter()
-                .filter(|(_, facts)| matches!(facts, rho_notebook::SourceFacts::Job(_)))
+                .filter(|(_, facts)| matches!(facts, crate::python::SourceFacts::Job(_)))
                 .count();
             if jobs >= count {
                 break;
@@ -1024,8 +1024,8 @@ async fn until_job_ends(
                 .sources()
                 .into_iter()
                 .filter_map(|(_, facts)| match facts {
-                    rho_notebook::SourceFacts::Job(job) => Some(job),
-                    rho_notebook::SourceFacts::Cell(_) => None,
+                    crate::python::SourceFacts::Job(job) => Some(job),
+                    crate::python::SourceFacts::Cell(_) => None,
                 })
                 .collect::<Vec<_>>();
             if let Some(end) = jobs.get(registered_index).and_then(|job| job.finished) {

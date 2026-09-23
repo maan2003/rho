@@ -65,9 +65,9 @@ reassigned to a supported model.
 
 Every role exposes only the Python notebook, with at most one new exec per
 model response. Earlier cells and jobs can remain live across later responses.
-`rho-notebook` owns the concrete notebook, cells, jobs, and leased output;
+The `python` module owns the concrete notebook, cells, jobs, and leased output;
 host tools are callable inside Python, not through a top-level tool registry.
-`notebook` builds the host tools for both runtimes.
+`python::host` builds the host tools for both runtimes.
 
 The provider call identity is the `ExecId` of the notebook execution. Command
 identities and transport correlation IDs are separate. Claude MCP admission uses

@@ -114,7 +114,7 @@ security, resource-isolation, or rollback boundary.
   replayable, but no current role opts into the retired notes mode.
   Native `NativeEvent` records are canonical; provider context is a disposable
   replay projection. Claude Code owns its own history and compaction instead.
-  The two concrete runtimes share a pure boundary and `rho-notebook`'s concrete
+  The two concrete runtimes share a pure boundary and the `python` module's concrete
   notebook, jobs, and leased output—not a universal runtime or tool-session trait.
   `PythonExec` owns streaming-unit progress; the agent chooses admission and
   validates provider identity/source without maintaining a second progress ledger.
@@ -437,7 +437,7 @@ security, resource-isolation, or rollback boundary.
   `rho-agent` assembles it as a built-in tool and supplies the configured model,
   recent transcript, and output budget; the tool resolves the same ChatGPT
   OAuth credentials as inference and calls the first-party search endpoint.
-- `rho-notebook` embeds CPython (PyO3) inside the agent worker, not the daemon:
+- `rho-agent`'s `python` module embeds CPython (PyO3) inside the agent worker, not the daemon:
   one interpreter per worker, and per notebook its own globals, a dedicated
   thread and a stock asyncio selector loop that wakes on an inbox eventfd.
   `kernel.py` owns notebook semantics: a cell is a context variable that
@@ -455,7 +455,7 @@ security, resource-isolation, or rollback boundary.
   notebook is recovered by restarting the worker.
   Python runs with private cwd state inside the agent's workset view;
   this is path mapping, not a sandbox.
-  `rho-notebook` owns each `PythonExec` and its operations. The submitted code
+  The `python` module owns each `PythonExec` and its operations. The submitted code
   returning, remaining Python activity stopping, operations finishing, and
   transcript delivery are separate facts. Async task and callback tracking
   exists for attribution and cleanup, not wake policy.
