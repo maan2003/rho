@@ -9150,7 +9150,6 @@ fn agent_role_label(config: AgentRole) -> String {
             EngineerIntelligence::High => "high-eng",
             EngineerIntelligence::Medium1 => "med1-eng",
             EngineerIntelligence::High1 => "high1-eng",
-            EngineerIntelligence::LegacyGemini => "legacy Gemini (unsupported)",
         },
     }
     .to_owned()

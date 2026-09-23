@@ -5,7 +5,7 @@
 //! is stored: what an agent is now is folded from its log on read
 //! (`AGENT-LOG-DESIGN.md`, "the mirror is a pure function of the raw log").
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
@@ -420,26 +420,19 @@ pub enum SessionBinding {
     ResponsesAstra(InferenceProfile),
     /// Astra-backed advisor; distinct so its role survives session pinning.
     AdvisorAstra(InferenceProfile),
-    /// Retained historical configuration, never a runnable provider binding.
-    LegacyGemini(InferenceProfile),
 }
 
 pub(crate) trait AgentRoleSessionProfile {
-    fn session_profile(self) -> anyhow::Result<SessionBinding>;
+    fn session_profile(self) -> SessionBinding;
 }
 
 impl AgentRoleSessionProfile for AgentRole {
-    fn session_profile(self) -> anyhow::Result<SessionBinding> {
+    fn session_profile(self) -> SessionBinding {
         let deep = |effort| InferenceProfile {
             effort,
             fast_mode: false,
         };
-        Ok(match self {
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::LegacyGemini,
-            } => anyhow::bail!(
-                "Legacy Gemini agents are unsupported; create an agent with a supported role"
-            ),
+        match self {
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             } => SessionBinding::ResponsesLuna(deep(ReasoningEffort::Xhigh)),
@@ -470,7 +463,7 @@ impl AgentRoleSessionProfile for AgentRole {
             } => SessionBinding::ClaudeAdvisor {
                 effort: ClaudeEffort::Xhigh,
             },
-        })
+        }
     }
 }
 
@@ -501,9 +494,6 @@ impl SessionBinding {
             Self::ClaudeAdvisor { .. } => AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium1,
             },
-            Self::LegacyGemini(_) => AgentRole::Engineer {
-                intelligence: EngineerIntelligence::LegacyGemini,
-            },
         }
     }
 
@@ -514,10 +504,7 @@ impl SessionBinding {
             | Self::ResponsesAstra(config)
             | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config) => Some(config),
-            Self::ClaudeFable { .. }
-            | Self::ClaudeOpus { .. }
-            | Self::ClaudeAdvisor { .. }
-            | Self::LegacyGemini(_) => None,
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
 
@@ -526,10 +513,7 @@ impl SessionBinding {
             Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt6Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt6Luna),
             Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
-            Self::ClaudeFable { .. }
-            | Self::ClaudeOpus { .. }
-            | Self::ClaudeAdvisor { .. }
-            | Self::LegacyGemini(_) => None,
+            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
 
@@ -541,8 +525,7 @@ impl SessionBinding {
             | Self::ResponsesLuna(_)
             | Self::ResponsesAstra(_)
             | Self::AdvisorAstra(_)
-            | Self::AdvisorSol(_)
-            | Self::LegacyGemini(_) => None,
+            | Self::AdvisorSol(_) => None,
         }
     }
 
@@ -556,8 +539,7 @@ impl SessionBinding {
             | Self::ResponsesLuna(_)
             | Self::ResponsesAstra(_)
             | Self::AdvisorAstra(_)
-            | Self::AdvisorSol(_)
-            | Self::LegacyGemini(_) => None,
+            | Self::AdvisorSol(_) => None,
         }
     }
 }
@@ -1611,6 +1593,71 @@ pub async fn forget_savepoints(db: &rho_db::RhoDb) -> Vec<u64> {
     }
     write.commit();
     dropped
+}
+
+/// Removes every row the named agents own: their log, their journal
+/// entries, their subscriptions and their usage. Keys only; no value is
+/// decoded, so an agent this build can no longer read goes as well as
+/// any other. Returns how many log rows went, per agent.
+pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(AgentId, usize)> {
+    let doomed = agents.iter().copied().collect::<BTreeSet<_>>();
+    let mut write = db.write().await;
+    let mut deleted = Vec::new();
+    for &agent_id in &doomed {
+        let mut log = write.open_table(AGENT_LOG);
+        let keys = log
+            .range((agent_id, 0)..=(agent_id, u64::MAX))
+            .map(|(key, _)| key.value())
+            .collect::<Vec<_>>();
+        for key in &keys {
+            log.remove(key);
+        }
+        drop(log);
+        deleted.push((agent_id, keys.len()));
+
+        let mut usage = write.open_table(AGENT_USAGE_BUCKETS);
+        let keys = usage
+            .range(
+                AgentUsageKey {
+                    agent_id,
+                    bucket_start_ms: 0,
+                }..=AgentUsageKey {
+                    agent_id,
+                    bucket_start_ms: u64::MAX,
+                },
+            )
+            .map(|(key, _)| key.value())
+            .collect::<Vec<_>>();
+        for key in &keys {
+            usage.remove(key);
+        }
+        drop(usage);
+        write.open_table(AGENT_USAGE_TOTALS).remove(&agent_id);
+    }
+
+    let mut journal = write.open_table(JOURNAL);
+    let seqs = journal
+        .iter()
+        .filter(|(_, row)| doomed.contains(&row.value().0))
+        .map(|(seq, _)| seq.value())
+        .collect::<Vec<_>>();
+    for seq in &seqs {
+        journal.remove(seq);
+    }
+    drop(journal);
+
+    let mut subscriptions = write.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
+    let keys = subscriptions
+        .iter()
+        .map(|(key, _)| key.value())
+        .filter(|key| doomed.contains(&key.target) || doomed.contains(&key.subscriber))
+        .collect::<Vec<_>>();
+    for key in &keys {
+        subscriptions.remove(key);
+    }
+    drop(subscriptions);
+    write.commit();
+    deleted
 }
 
 /// Drops every persistent savepoint `prepare` did not record: leftovers

@@ -535,13 +535,6 @@ impl Agent {
         view: Arc<Lazy<Arc<View>>>,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
-        anyhow::ensure!(
-            !matches!(
-                head.config.binding,
-                crate::db::SessionBinding::LegacyGemini(_)
-            ),
-            "Legacy Gemini agents are unsupported; create an agent with a supported role"
-        );
 
         let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
             anyhow::bail!("agent does not use the Rho runtime");
@@ -1048,7 +1041,7 @@ impl Agent {
         if role == current {
             return Ok(());
         }
-        let binding = role.session_profile()?;
+        let binding = role.session_profile();
         let profile = binding
             .deep_config()
             .ok_or_else(|| anyhow::anyhow!("role change would leave the Rho runtime"))?;
@@ -1782,7 +1775,7 @@ pub fn render_agent_surface(
     view: Arc<View>,
     role: AgentRole,
 ) -> anyhow::Result<crate::RenderedAgentSurface> {
-    let binding = role.session_profile()?;
+    let binding = role.session_profile();
     if binding.claude_model().is_some() {
         return Ok(crate::RenderedAgentSurface {
             system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role),

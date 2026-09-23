@@ -230,7 +230,7 @@ pub(in crate::agent) mod tests {
         let role = AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
         };
-        let binding = role.session_profile().unwrap();
+        let binding = role.session_profile();
         let profile = binding.deep_config().unwrap();
         let model = binding.deep_model().unwrap();
         let key = PromptCacheKey::generate();

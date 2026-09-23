@@ -112,8 +112,6 @@ pub enum EngineerIntelligence {
     High,
     Medium1,
     High1,
-    /// Historical Gemini agents: readable, but no longer executable.
-    LegacyGemini,
 }
 
 impl AgentRole {

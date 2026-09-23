@@ -918,7 +918,7 @@ impl ClaudeLoop {
             return Ok(());
         }
 
-        let binding = role.session_profile()?;
+        let binding = role.session_profile();
         let model = binding
             .claude_model()
             .ok_or_else(|| anyhow::anyhow!("role change would leave the Claude runtime"))?;

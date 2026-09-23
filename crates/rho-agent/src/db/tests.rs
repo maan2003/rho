@@ -300,11 +300,7 @@ async fn quota_history_deduplicates_unchanged_samples() {
 
 #[test]
 fn agent_roles_resolve_the_current_model_matrix() {
-    let profile = |intelligence| {
-        AgentRole::Engineer { intelligence }
-            .session_profile()
-            .unwrap()
-    };
+    let profile = |intelligence| AgentRole::Engineer { intelligence }.session_profile();
     assert_eq!(
         profile(EngineerIntelligence::Mini),
         SessionBinding::ResponsesLuna(InferenceProfile {
@@ -342,8 +338,7 @@ fn agent_roles_resolve_the_current_model_matrix() {
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Low,
         }
-        .session_profile()
-        .unwrap(),
+        .session_profile(),
         SessionBinding::AdvisorSol(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
@@ -353,8 +348,7 @@ fn agent_roles_resolve_the_current_model_matrix() {
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         }
-        .session_profile()
-        .unwrap(),
+        .session_profile(),
         SessionBinding::AdvisorAstra(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
@@ -364,8 +358,7 @@ fn agent_roles_resolve_the_current_model_matrix() {
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium1,
         }
-        .session_profile()
-        .unwrap(),
+        .session_profile(),
         SessionBinding::ClaudeAdvisor {
             effort: ClaudeEffort::Xhigh,
         }
@@ -475,7 +468,7 @@ async fn a_mode_change_folds_into_the_agents_place() {
         None,
         test_workspace(),
         AgentRole::default(),
-        AgentRole::default().session_profile().unwrap(),
+        AgentRole::default().session_profile(),
         test_agent_runtime(),
         None,
     );
@@ -511,7 +504,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         None,
         test_workspace(),
         AgentRole::default(),
-        AgentRole::default().session_profile().unwrap(),
+        AgentRole::default().session_profile(),
         test_agent_runtime(),
         None,
     );
@@ -522,7 +515,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         None,
         test_workspace(),
         AgentRole::default(),
-        AgentRole::default().session_profile().unwrap(),
+        AgentRole::default().session_profile(),
         test_agent_runtime(),
         Some(pm),
     );
@@ -772,6 +765,44 @@ async fn the_head_folds_title_turns_and_user_contact() {
 }
 
 #[tokio::test]
+async fn deleting_an_agent_removes_every_row_it_owns() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let doomed = create(&mut write, None, None);
+    let kept = create(&mut write, None, None);
+    write.append_agent_event(doomed, &user_event("one"));
+    write.append_agent_event(kept, &user_event("two"));
+    write.set_agent_response_subscription(kept, doomed, true);
+    write.set_agent_response_subscription(doomed, kept, true);
+    let bucket = AgentUsageBucket {
+        bucket_start_ms: AGENT_USAGE_BUCKET_MS,
+        requests: 1,
+        ..Default::default()
+    };
+    write.add_agent_usage(doomed, &bucket);
+    write.add_agent_usage(kept, &bucket);
+    write.commit();
+
+    assert_eq!(delete_agents(&db, &[doomed]).await, [(doomed, 2)]);
+
+    let read = db.read();
+    assert_eq!(read.list_agent_ids(), [kept]);
+    let journal = read
+        .journal_since(Seq(0), 100)
+        .into_iter()
+        .map(|(_, agent_id, pos, _)| (agent_id, pos.pos))
+        .collect::<Vec<_>>();
+    assert_eq!(journal, [(kept, 0), (kept, 1)]);
+    assert!(read.agent_response_subscribers(doomed).is_empty());
+    assert!(read.agent_response_subscribers(kept).is_empty());
+    assert!(read.agent_usage(doomed, UnixMs(0)).is_empty());
+    assert_eq!(read.agent_usage_total(doomed).requests, 0);
+    assert_eq!(read.agent_usage(kept, UnixMs(0)).len(), 1);
+}
+
+#[tokio::test]
 async fn the_journal_names_every_row_in_write_order() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -995,33 +1026,4 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
     };
     assert_eq!(update.images.as_ref(), &[image]);
     assert_eq!(update.output.as_str(), "later");
-}
-
-#[test]
-fn retired_gemini_binding_preserves_configuration_without_a_runnable_model() {
-    let config = InferenceProfile::default();
-    let binding = SessionBinding::LegacyGemini(config);
-    assert_eq!(
-        binding.agent_role(),
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::LegacyGemini
-        }
-    );
-    assert!(binding.deep_model().is_none());
-    assert!(binding.deep_config().is_none());
-    assert!(binding.claude_model().is_none());
-    assert!(binding.claude_effort().is_none());
-    assert!(
-        binding
-            .agent_role()
-            .session_profile()
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported")
-    );
-    let mut bytes = senax_encoder::encode(&binding).unwrap();
-    assert_eq!(
-        senax_encoder::decode::<SessionBinding>(&mut bytes).unwrap(),
-        binding
-    );
 }

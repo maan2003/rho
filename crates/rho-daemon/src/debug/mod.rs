@@ -56,6 +56,12 @@ enum DebugCommand {
     /// any more. Needs every savepoint gone (`drop-stale-savepoints` after
     /// the last migration is done). Stop the daemon first.
     Compact,
+    /// Delete agents outright: their log, journal entries, subscriptions
+    /// and usage. Takes full agent ids. Stop the daemon first.
+    DeleteAgents {
+        #[arg(required = true)]
+        agents: Vec<String>,
+    },
     /// Print bytes stored per table and pages allocated overall for the
     /// real database. Stop the daemon first.
     Stats,
@@ -86,6 +92,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Compact => compact(args.db_path),
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
+        DebugCommand::DeleteAgents { agents } => delete_agents(args.db_path, &agents).await,
         DebugCommand::Context => print_context(args.db_path, &claude).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
@@ -590,6 +597,22 @@ async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn delete_agents(db_path: Option<PathBuf>, agents: &[String]) -> anyhow::Result<()> {
+    let agents = agents
+        .iter()
+        .map(|id| rho_core::AgentId::from_encoded(id).with_context(|| format!("agent id {id}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    for (agent_id, rows) in rho_agent::db::delete_agents(&db, &agents).await {
+        println!("{}: deleted {agent_id:?} ({rows} log rows)", path.display());
+    }
+    Ok(())
+}
+
 fn stats(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let path = db_path
         .map(Ok)
@@ -640,7 +663,6 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
             EngineerIntelligence::High => "high-eng",
             EngineerIntelligence::Medium1 => "med1-eng",
             EngineerIntelligence::High1 => "high1-eng",
-            EngineerIntelligence::LegacyGemini => "legacy-gemini (unsupported)",
         },
     }
     .to_owned()

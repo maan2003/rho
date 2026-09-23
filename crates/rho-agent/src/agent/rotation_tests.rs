@@ -180,10 +180,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
             .await
             .unwrap();
         assert!(!instructions.text.contains("# Notes and context rotation"));
-        assert_eq!(
-            agent.model,
-            role.session_profile().unwrap().deep_model().unwrap()
-        );
+        assert_eq!(agent.model, role.session_profile().deep_model().unwrap());
 
         agent.start_request(UnixMs::now(), None).await.unwrap();
         reply(

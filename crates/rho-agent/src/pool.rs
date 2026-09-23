@@ -536,17 +536,7 @@ impl AgentPool {
                     .all(|(_, head)| head.place().mode == start.place.mode),
                 "new agents must use the workset's filesystem mode"
             );
-            let mode = match config.session_profile() {
-                Ok(mode) => mode,
-                Err(error) => {
-                    if let Some(workset) = &start.owned_workset
-                        && let Err(discard) = pool.worksets.discard_workset(workset).await
-                    {
-                        eprintln!("rho-agent: discard workset {workset}: {discard:#}");
-                    }
-                    return Err(error);
-                }
-            };
+            let mode = config.session_profile();
             let runtime = match mode {
                 SessionBinding::ClaudeFable { .. }
                 | SessionBinding::ClaudeOpus { .. }

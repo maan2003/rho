@@ -456,7 +456,7 @@ mod tests {
             None,
             crate::db::tests::test_workspace(),
             role,
-            role.session_profile().unwrap(),
+            role.session_profile(),
             AgentRuntime::Rho {
                 prompt_cache_key: rho_inference::PromptCacheKey::generate(),
             },
