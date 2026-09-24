@@ -46,9 +46,9 @@ use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_agent_host_proto::AgentId;
 use rho_agents_client::elision::ElisionPlan;
+use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
-use rho_hosts::connection::VisualizationClient;
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use rho_window::visualization::Visualization;
@@ -107,7 +107,7 @@ pub struct TranscriptModel {
     // placeholder (id 0), so they start at 1. One counter serves every
     // attachment: ids only need uniqueness within an editor.
     next_inlay_id: usize,
-    visualization_client: VisualizationClient,
+    visualization_client: AgentsLink,
     visualization_cache: HashMap<String, Entity<Visualization>>,
     attachments: Vec<Attachment>,
 }
@@ -222,7 +222,7 @@ impl TranscriptModel {
     pub fn new(
         multi_buffer: Entity<MultiBuffer>,
         document_multi_buffer: Entity<MultiBuffer>,
-        visualization_client: VisualizationClient,
+        visualization_client: AgentsLink,
     ) -> Self {
         Self {
             multi_buffer,
@@ -2142,7 +2142,7 @@ fn reconcile_visualizations<V: 'static>(
     placed: &mut Vec<PlacedVisualization>,
     scope: Option<&HashSet<text::BufferId>>,
     cache: &mut HashMap<String, Entity<Visualization>>,
-    client: &VisualizationClient,
+    client: &AgentsLink,
     editor: &Entity<Editor>,
     cx: &mut Context<V>,
 ) {

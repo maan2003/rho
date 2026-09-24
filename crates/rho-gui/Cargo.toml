@@ -130,6 +130,7 @@ rho-slack = { workspace = true, features = ["ui", "fake"] }
 # The default Slack world's own numbers, for the one measurement that has to
 # be at the scale the user runs at rather than at a scale chosen here.
 rho-fake-slack.workspace = true
+rho-agents-client = { workspace = true, features = ["test-support"] }
 rho-hosts = { workspace = true, features = ["test-support"] }
 rho-desk-client = { workspace = true, features = ["test-support"] }
 criterion = "0.5"

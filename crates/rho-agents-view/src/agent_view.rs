@@ -149,7 +149,7 @@ impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
 impl AgentModel {
     pub fn new(
         completions: Rc<dyn editor::CompletionProvider>,
-        visualization_client: rho_hosts::connection::VisualizationClient,
+        visualization_client: rho_agents_client::remote::AgentsLink,
         cx: &mut Context<Self>,
     ) -> Self {
         let prompt_buffer = cx.new(|cx| Buffer::local("", cx));

@@ -1,10 +1,10 @@
 use std::io::Read as _;
 
 use anyhow::bail;
-use rho_agent_host_proto::{Reply, Request};
+use rho_agent_host_proto::agents::{Reply, Request};
 use rho_visualizations::{MAX_VISUALIZATION_BYTES, SVG_MIME_TYPE};
 
-use crate::{RecordVisualizationArgs, daemon_request};
+use crate::{RecordVisualizationArgs, agents_request};
 
 pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
     let mut content = Vec::new();
@@ -22,7 +22,7 @@ pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
         mime_type: SVG_MIME_TYPE.to_owned(),
         content,
     };
-    let Reply::VisualizationRecorded { id } = daemon_request(&socket_path, request).await? else {
+    let Reply::VisualizationRecorded { id } = agents_request(&socket_path, request).await? else {
         bail!("unexpected reply from the daemon");
     };
     println!("{id}");

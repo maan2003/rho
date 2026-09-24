@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 
 use anyhow::{Context as _, bail};
-use rho_agent_host_proto::{PrCommand, Reply, Request};
+use rho_agent_host_proto::PrCommand;
+use rho_agent_host_proto::host::{Reply, Request};
 
-use crate::{PrArgs, PrCliCommand, daemon_request};
+use crate::{PrArgs, PrCliCommand, host_request};
 
 pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
@@ -39,7 +40,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
             output,
             data,
             is_error,
-        } = daemon_request(&socket_path, request).await?
+        } = host_request(&socket_path, request).await?
         else {
             bail!("unexpected reply from the daemon");
         };
@@ -137,7 +138,7 @@ async fn init(args: PrArgs) -> anyhow::Result<()> {
     let request = Request::PlatformSecretsSet {
         secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
     };
-    match daemon_request(&socket_path, request).await? {
+    match host_request(&socket_path, request).await? {
         Reply::PlatformStatus {
             running: true,
             detail,

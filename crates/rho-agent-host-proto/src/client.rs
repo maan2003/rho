@@ -6,15 +6,37 @@ use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::{
-    Open, ProtocolLogDirection, Reply, Request, append_protocol_log_record, protocol_frame_bytes,
+    Open, ProtocolLogDirection, agents, append_protocol_log_record, host, protocol_frame_bytes,
     read_frame, write_frame,
 };
 
-/// One request on a stream of its own, over the daemon's Unix socket.
-pub async fn request(socket: impl AsRef<Path>, request: Request) -> anyhow::Result<Reply> {
+/// One request of the agents, on a stream of its own over the daemon's
+/// Unix socket. A refusal is an error.
+pub async fn agents(
+    socket: impl AsRef<Path>,
+    request: agents::Request,
+) -> anyhow::Result<agents::Reply> {
     let mut client = Client::connect(socket).await?;
-    client.send(&Open::Request(request)).await?;
-    client.recv().await
+    client
+        .send(&Open::Agents(agents::Open::Request(request)))
+        .await?;
+    match client.recv().await? {
+        agents::Reply::Failed { reason } => anyhow::bail!(reason),
+        reply => Ok(reply),
+    }
+}
+
+/// One request of the machine, on a stream of its own over the daemon's
+/// Unix socket. A refusal is an error.
+pub async fn host(socket: impl AsRef<Path>, request: host::Request) -> anyhow::Result<host::Reply> {
+    let mut client = Client::connect(socket).await?;
+    client
+        .send(&Open::Host(host::Open::Request(request)))
+        .await?;
+    match client.recv().await? {
+        host::Reply::Failed { reason } => anyhow::bail!(reason),
+        reply => Ok(reply),
+    }
 }
 
 /// Raw async client for one stream over the daemon's Unix socket. The first

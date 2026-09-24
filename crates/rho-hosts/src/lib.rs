@@ -13,7 +13,7 @@ pub mod hosts;
 pub mod realtime_client;
 pub mod saved;
 
-pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, spawn};
+pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, Link, spawn};
 
 /// How a stream reaches its host: another Unix connection, or another
 /// bi-stream on the host's authenticated iroh connection.

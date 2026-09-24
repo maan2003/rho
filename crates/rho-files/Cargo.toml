@@ -22,7 +22,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 path = { path = "../../vendor/zed/crates/path" }
-rho-hosts = { workspace = true }
+rho-agents-client = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-agent-host-proto.workspace = true
 rho-window = { workspace = true }

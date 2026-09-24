@@ -20,7 +20,7 @@ use language::{Buffer, BufferEvent, Capability};
 use rho_agent_host_proto::{
     FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceInfo, WorkspaceServerFrame,
 };
-use rho_hosts::connection::{Connection, WorkspaceChannel};
+use rho_agents_client::remote::{AgentsLink, WorkspaceChannel};
 use theme::ActiveTheme as _;
 
 #[derive(Clone, Copy, Debug)]
@@ -260,11 +260,11 @@ pub struct RemoteProject {
 }
 
 pub fn open_remote_project(
-    connection: &Connection,
+    agents: &AgentsLink,
     workspace: WorkspaceInfo,
     cx: &mut App,
 ) -> Task<Result<RemoteProject>> {
-    let channel_task = connection.open_channel(workspace);
+    let channel_task = agents.open_workspace(workspace);
     cx.spawn(async move |cx| {
         let WorkspaceChannel {
             outgoing,

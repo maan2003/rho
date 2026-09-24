@@ -34,7 +34,7 @@ use rho_agent_host_proto::term::{
     FrameApplied, ScrollbackItem, TermCell, TermCellFlags, TermClientFrame, TermColor,
     TermKeystroke, TermRow, TermServerFrame, WireScreen,
 };
-use rho_hosts::connection::TerminalChannel;
+use rho_agents_client::remote::TerminalChannel;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
@@ -71,7 +71,7 @@ pub struct TerminalModel {
     /// The stream ended without an `Exited` status (daemon or dial gone).
     disconnected: bool,
     _read_task: gpui::Task<()>,
-    _transport: rho_hosts::connection::ChannelTask,
+    _transport: rho_hosts::ChannelTask,
 }
 
 impl TerminalModel {

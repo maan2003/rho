@@ -111,13 +111,14 @@ impl Hosts {
     /// Dials a daemon and starts feeding its events into the shared stream.
     /// Attaching is fire-and-forget: the host appears immediately as
     /// `Connecting` and reports its own progress through the stream.
-    /// `streams` is handed the new id and returns the streams the host
-    /// carries beside its control stream, opened again on every reconnect.
+    /// `streams` is handed the new id and the host's [`crate::Link`], and
+    /// returns the streams the host carries beside its control stream,
+    /// opened again on every reconnect.
     pub fn attach(
         &mut self,
         name: String,
         target: AttachTarget,
-        streams: impl FnOnce(HostId) -> Vec<Arc<dyn HostStream>>,
+        streams: impl FnOnce(HostId, crate::Link) -> Vec<Arc<dyn HostStream>>,
         runtime: &tokio::runtime::Handle,
     ) -> HostId {
         let id = HostId(self.next_id);
@@ -126,7 +127,7 @@ impl Hosts {
             id,
             target.clone(),
             self.events.clone(),
-            streams(id),
+            |link| streams(id, link),
             runtime,
         );
         self.hosts.push(Host {

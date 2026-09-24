@@ -234,11 +234,11 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
 /// between commits, in a state that opens without repair.
 async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
     let reply =
-        rho_agent_host_proto::client::request(socket, rho_agent_host_proto::Request::Snapshot)
+        rho_agent_host_proto::client::host(socket, rho_agent_host_proto::host::Request::Snapshot)
             .await
             .context("the daemon holds the database, and its socket does not answer")?;
     match reply {
-        rho_agent_host_proto::Reply::Snapshotted { path } => {
+        rho_agent_host_proto::host::Reply::Snapshotted { path } => {
             let path = path.into_std_path_buf();
             let dir = path.parent().context("snapshot has no directory")?;
             Ok(Snapshot {
@@ -247,7 +247,6 @@ async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapsh
                 path,
             })
         }
-        rho_agent_host_proto::Reply::Failed { reason } => anyhow::bail!("{reason}"),
         reply => anyhow::bail!("unexpected reply to a snapshot request: {reply:?}"),
     }
 }

@@ -6,11 +6,12 @@
 
 use std::time::Duration;
 
+use rho_agent_host_proto::agents::{Reply, Request};
 use rho_agent_host_proto::term::{
     ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalOpen, WireScreen,
 };
 use rho_agent_host_proto::{
-    AgentCommand, AgentId, Open, Opened, Reply, Request, StartMode, read_frame, write_frame,
+    AgentCommand, AgentId, Open, Opened, StartMode, agents, read_frame, write_frame,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -89,9 +90,9 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     // Create an agent on a clone of the temp repository.
     let created = tokio::time::timeout(
         Duration::from_secs(30),
-        rho_agent_host_proto::client::request(
+        rho_agent_host_proto::client::agents(
             &socket_path,
-            Request::Agent(AgentCommand::New {
+            Request::Command(AgentCommand::New {
                 role: Default::default(),
                 start: StartMode::NewOn {
                     repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
@@ -123,7 +124,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     wait_for_line(&mut stream, "e2e-done").await?;
 
     // The listing sees the running terminal.
-    let list = rho_agent_host_proto::client::request(
+    let list = rho_agent_host_proto::client::agents(
         &socket_path,
         Request::TerminalList {
             agent: Some(agent_id.encoded()),
@@ -156,7 +157,7 @@ async fn open_terminal(
     create: bool,
 ) -> anyhow::Result<rho_rpc::Stream> {
     let mut stream = rho_rpc::connect_unix(socket_path).await?;
-    let open = Open::Terminal {
+    let open = Open::Agents(agents::Open::Terminal {
         agent: agent_id.encoded(),
         terminal_id: 7,
         open: if create {
@@ -166,7 +167,7 @@ async fn open_terminal(
         },
         cols: 80,
         rows: 24,
-    };
+    });
     write_frame(&mut stream, &open).await?;
     match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream)).await?? {
         Opened::Ready => Ok(stream),

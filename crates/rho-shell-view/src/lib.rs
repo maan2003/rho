@@ -20,7 +20,7 @@ use rho_agent_host_proto::shell::{
     MAX_STYLE_SPANS, ShellClientFrame, ShellColor, ShellServerFrame, ShellStyleSpan,
     ShellTextStyle, command_fits,
 };
-use rho_hosts::connection::{ShellChannel, ShellSubmission};
+use rho_agents_client::remote::{ShellChannel, ShellSubmission};
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use theme::ActiveTheme as _;

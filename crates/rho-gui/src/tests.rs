@@ -6634,10 +6634,11 @@ fn unnamed_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
     };
     workspace
         .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
+            workspace.handle_model_event(
                 HostId::default(),
-                ConnEvent::QuotaUsage(vec![summary.clone()]),
+                rho_agents_client::model::ModelMsg::QuotaUsage {
+                    summaries: vec![summary.clone()],
+                },
                 window,
                 cx,
             );
@@ -9276,7 +9277,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
             assert!(
                 sent.iter().any(|message| matches!(
                     message,
-                    rho_agent_host_proto::Request::Agent(
+                    rho_agent_host_proto::agents::Request::Command(
                         rho_agent_host_proto::AgentCommand::New { .. }
                     )
                 )),

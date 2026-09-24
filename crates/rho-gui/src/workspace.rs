@@ -29,15 +29,16 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 #[cfg(test)]
 use rho_agent_host_proto::AdvisorIntelligence;
+use rho_agent_host_proto::agents::{Reply, Request};
 use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agent_host_proto::{
-    AgentCommand, AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, Reply,
-    Request,
+    AgentCommand, AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery,
 };
 use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
 };
+use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, HostId};
@@ -49,7 +50,7 @@ use rho_agents_view::{
 };
 use rho_desk_client::Desk;
 use rho_desk_client::stream::DeskFrame;
-use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
+use rho_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
 use rho_window::selection::{ActivePane, Selection};
 use rho_window::style::StyleClass;
@@ -616,9 +617,8 @@ impl Workspace {
                 None,
             );
             let visualization_client = self
-                .connection_for(agent_id)
-                .map(Connection::visualization_client)
-                .unwrap_or_else(rho_hosts::connection::VisualizationClient::detached);
+                .agents_for(agent_id)
+                .unwrap_or_else(AgentsLink::detached);
             let model = cx.new(|cx| AgentModel::new(completions, visualization_client, cx));
             // The screen says when its transcript is composed; what that
             // means for the rest of the shell is decided here.
@@ -1163,9 +1163,9 @@ impl Workspace {
         let host = self.hosts.attach(
             spec.name.clone(),
             spec.target,
-            |host| {
+            |host, link| {
                 agents_client.attach_host(host, spec.name.clone());
-                vec![agents_client.stream(host), desk_streams.stream(host)]
+                vec![agents_client.stream(host, link), desk_streams.stream(host)]
             },
             &gpui_tokio::Tokio::handle(cx),
         );
@@ -1255,8 +1255,9 @@ impl Workspace {
         self.registry.host_of_agent(agent_id)
     }
 
-    fn connection_for(&self, agent_id: AgentId) -> Option<&Connection> {
-        self.hosts.connection(self.host_of(agent_id)?)
+    /// The agents of the host an agent lives on, while it is attached.
+    fn agents_for(&self, agent_id: AgentId) -> Option<AgentsLink> {
+        self.agents_client.link(self.host_of(agent_id)?)
     }
 
     /// Routes an agent-scoped command to the daemon that owns the agent.
@@ -1264,7 +1265,7 @@ impl Workspace {
     /// daemon that could act on it is not there to hear them.
     fn send_to_agent(&self, agent_id: AgentId, command: AgentCommand, cx: &mut Context<Self>) {
         if let Some(host) = self.host_of(agent_id) {
-            self.request(host, Request::Agent(command), cx, |_, _, _| {});
+            self.request(host, Request::Command(command), cx, |_, _, _| {});
         }
     }
 
@@ -1277,10 +1278,10 @@ impl Workspace {
         cx: &mut Context<Self>,
         on_reply: impl FnOnce(&mut Self, Reply, &mut Context<Self>) + 'static,
     ) {
-        let Some(connection) = self.hosts.connection(host) else {
+        let Some(agents) = self.agents_client.link(host) else {
             return;
         };
-        let reply = connection.request(request);
+        let reply = agents.request(request);
         cx.spawn(async move |this, cx| {
             let reply = reply.await;
             this.update(cx, |this, cx| match reply {
@@ -2055,6 +2056,14 @@ impl Workspace {
             rho_agents_client::model::ModelMsg::Live { agent_id, live } => {
                 self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
             }
+            rho_agents_client::model::ModelMsg::AgentCreated { agent_id } => {
+                self.note_agent_created(host, agent_id);
+                cx.notify();
+            }
+            rho_agents_client::model::ModelMsg::QuotaUsage { summaries } => {
+                self.hosts.set_quota_summaries(host, summaries);
+                cx.notify();
+            }
         }
     }
 
@@ -2236,18 +2245,10 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::AgentCreated { agent_id } => {
-                self.note_agent_created(host, agent_id);
-                cx.notify();
-            }
             ConnEvent::Many(events) => {
                 for event in events {
                     self.handle_event(host, event, window, cx);
                 }
-            }
-            ConnEvent::QuotaUsage(summaries) => {
-                self.hosts.set_quota_summaries(host, summaries);
-                cx.notify();
             }
             ConnEvent::ServerError(message) => self.report_refusal(host, &message, cx),
             ConnEvent::Recovering(elapsed) => {
@@ -2660,10 +2661,10 @@ impl Workspace {
             .draft_area
             .take()
             .and_then(|(area_host, node_id)| (area_host == host).then_some((host, node_id)));
-        let Some(connection) = self.hosts.connection(host) else {
+        let Some(agents) = self.agents_client.link(host) else {
             return;
         };
-        let reply = connection.request(Request::Agent(AgentCommand::New {
+        let reply = agents.request(Request::Command(AgentCommand::New {
             role,
             start,
             mode,
@@ -3474,10 +3475,10 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(connection) = self.connection_for(agent_id) else {
+        let Some(agents) = self.agents_for(agent_id) else {
             return;
         };
-        let task = connection.close_shell(agent_id.encoded());
+        let task = agents.close_shell(agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
@@ -4799,9 +4800,9 @@ impl Workspace {
         };
         let cached = self.cached_remote_project(host, &workspace);
         let project_task = cached.is_none().then(|| {
-            let connection = self.connection_for(agent_id)?;
+            let agents = self.agents_for(agent_id)?;
             Some(rho_files::open_remote_project(
-                connection,
+                &agents,
                 workspace.clone(),
                 cx,
             ))
@@ -4865,10 +4866,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let Some(connection) = self.connection_for(agent_id) else {
+        let Some(agents) = self.agents_for(agent_id) else {
             return;
         };
-        let task = connection.open_shell(agent_id.encoded());
+        let task = agents.open_shell(agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -4941,10 +4942,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let Some(connection) = self.connection_for(agent_id) else {
+        let Some(agents) = self.agents_for(agent_id) else {
             return;
         };
-        let task = connection.open_terminal(agent_id.encoded(), new, 80, 24);
+        let task = agents.open_terminal(agent_id.encoded(), new, 80, 24);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -5104,17 +5105,17 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn take_host_messages_for_test(&self, host: HostId) -> Vec<Request> {
-        self.hosts
-            .connection(host)
-            .map(Connection::take_sent_for_test)
+        self.agents_client
+            .link(host)
+            .map(|agents| agents.take_sent_for_test())
             .unwrap_or_default()
     }
 
     /// Answers the host's oldest unanswered request, as its daemon would.
     #[cfg(test)]
     pub(crate) fn answer_host_request_for_test(&self, host: HostId, reply: anyhow::Result<Reply>) {
-        if let Some(connection) = self.hosts.connection(host) {
-            connection.answer_for_test(reply);
+        if let Some(agents) = self.agents_client.link(host) {
+            agents.answer_for_test(reply);
         }
     }
 
@@ -7117,7 +7118,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(connection) = self.connection_for(agent) else {
+        let Some(connection) = self
+            .host_of(agent)
+            .and_then(|host| self.hosts.connection(host))
+        else {
             return;
         };
         let target = self.models.get(&agent).cloned();

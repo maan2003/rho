@@ -14,6 +14,7 @@ pub mod find;
 pub mod fold;
 pub mod map;
 pub mod model;
+pub mod remote;
 pub mod session;
 pub mod state;
 pub mod store;
