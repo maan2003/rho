@@ -27,7 +27,10 @@ pub enum EvalOp {
 }
 
 /// What a read of a mounted local input observed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum ObservedKind {
     /// The path's type: `regular`, `executable`, `directory`, `symlink`,
     /// `other` or `missing`.

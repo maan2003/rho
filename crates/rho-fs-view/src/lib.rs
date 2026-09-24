@@ -292,6 +292,13 @@ impl Worksets {
         self.root.join("cache")
     }
 
+    /// Where dev shells are cached, shared by the owner's worksets: GC
+    /// roots and activation scripts. Views bind it at this host path
+    /// because the Nix daemon resolves the roots on the host.
+    pub fn devshell_cache_dir(&self) -> Utf8PathBuf {
+        ns::devshell_cache(&self.cache_dir())
+    }
+
     /// The user's git identity as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, when
     /// known.
     pub fn identity_environment(&self) -> &[(OsString, OsString)] {

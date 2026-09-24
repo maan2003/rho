@@ -6,9 +6,7 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
-rusqlite.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

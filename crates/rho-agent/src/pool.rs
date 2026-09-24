@@ -49,6 +49,8 @@ pub struct AgentPool {
     responses: tokio::sync::mpsc::Sender<ResponseNotification>,
     db: RhoDb,
     inference: Inference,
+    /// Cached flake dev shells, shared by every workset process.
+    devshell: Arc<rho_devshell_daemon::Store>,
     /// The worksets agents work in, named by the daemon rather than
     /// resolved here: a library does not reach for the user's state
     /// directory.
@@ -113,8 +115,15 @@ impl AgentPool {
         let pool = Arc::new(Self {
             processes: Mutex::new(HashMap::new()),
             responses,
-            db,
+            db: db.clone(),
             inference: inference.clone(),
+            devshell: Arc::new(
+                rho_devshell_daemon::Store::open(
+                    db.clone(),
+                    worksets.devshell_cache_dir().into_std_path_buf(),
+                )
+                .await,
+            ),
             worksets,
             claude,
             agents: Mutex::new(HashMap::new()),
@@ -354,6 +363,10 @@ impl AgentPool {
 
     pub fn inference(&self) -> &Inference {
         &self.inference
+    }
+
+    pub fn devshell(&self) -> &Arc<rho_devshell_daemon::Store> {
+        &self.devshell
     }
 
     pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {

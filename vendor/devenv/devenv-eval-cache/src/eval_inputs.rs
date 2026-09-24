@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// How a local source tree was fetched, which decides file visibility.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum FlakeScheme {
     /// `git+file`: only files in the git index are visible.
     Git,
@@ -45,7 +48,7 @@ impl FlakeScheme {
 }
 
 /// An input dependency tracked during evaluation.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub enum Input {
     Path(PathInput),
     /// Source-info metadata of the flake itself (`rev`, `dirtyRev`,
@@ -107,7 +110,7 @@ pub enum InputIdentity {
 }
 
 /// One observation of a path in the flake's source tree.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct PathInput {
     pub kind: ObservedKind,
     /// Visibility rule of the input the path was read through.
@@ -123,7 +126,7 @@ pub struct PathInput {
 pub const UNREADABLE: &str = "\0unreadable";
 
 /// The flake's revision state: `HEAD` and whether the tree is dirty.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct RevInputDesc {
     /// `None` if the flake is not a git repository.
     pub content_hash: Option<String>,

@@ -4,9 +4,6 @@ use thiserror::Error;
 /// Common error type for cache operations
 #[derive(Error, Debug)]
 pub enum CacheError {
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
-
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

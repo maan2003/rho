@@ -333,8 +333,9 @@ impl Session {
         let slave = pty.user;
         set_nonblocking(&master)?;
 
-        let mut command = tokio::process::Command::new(rho_fs_view::devshell_builder());
-        command.args(["exec", "--", &spawn.shell]);
+        // In the dev shell of the agent's working directory.
+        let cwd = spawn.view.command_cwd(None)?;
+        let mut command = rho_devshell::command(cwd.as_std_path(), &spawn.shell).await;
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         spawn.view.prepare_command(&mut command, None).await?;

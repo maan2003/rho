@@ -15,7 +15,7 @@ use crate::db::{
     AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding, TurnEdge,
 };
 
-pub(super) const VERSION: u32 = 7;
+pub(super) const VERSION: u32 = 8;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {

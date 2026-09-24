@@ -3524,9 +3524,7 @@ name = "devenv-cache-core"
 version = "2.3.2"
 dependencies = [
  "blake3",
- "rusqlite",
  "thiserror 2.0.19",
- "tracing",
 ]
 
 [[package]]
@@ -3534,6 +3532,8 @@ name = "devenv-core"
 version = "2.3.2"
 dependencies = [
  "arc-swap",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -3544,9 +3544,8 @@ dependencies = [
  "blake3",
  "devenv-cache-core",
  "devenv-core",
- "rusqlite",
+ "serde",
  "thiserror 2.0.19",
- "tracing",
 ]
 
 [[package]]
@@ -4357,12 +4356,6 @@ name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
-
-[[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fancy-regex"
@@ -5848,15 +5841,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8094feaf31ff591f651a2664fb9cfd92bba7a60ce3197265e9482ebe753c8f7"
 dependencies = [
  "hashbrown 0.14.5",
-]
-
-[[package]]
-name = "hashlink"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
-dependencies = [
- "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -12514,6 +12498,8 @@ dependencies = [
  "rho-claude",
  "rho-context-config",
  "rho-db",
+ "rho-devshell",
+ "rho-devshell-daemon",
  "rho-fs-view",
  "rho-image",
  "rho-inference",
@@ -12659,6 +12645,7 @@ dependencies = [
  "camino",
  "libc",
  "rho-agent-host-proto",
+ "rho-devshell",
  "rho-fs-view",
  "rho-inference",
  "rustix 1.1.4",
@@ -12860,16 +12847,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-devshell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "devenv-core",
+ "devenv-eval-cache",
+ "futures",
+ "rho-fs-view",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-devshell-builder"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "devenv-core",
  "devenv-eval-cache",
  "devenv-nix-backend",
- "libc",
+ "rho-devshell",
  "serde_json",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rho-devshell-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "redb",
+ "rho-db",
+ "rho-devshell",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -13362,8 +13380,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "camino",
+ "futures",
  "rho-agent-host-proto",
  "rho-db",
+ "rho-devshell",
  "rho-fs-view",
  "rho-inference",
  "rustix 1.1.4",
@@ -13627,16 +13647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsqlite-vfs"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
-dependencies = [
- "hashbrown 0.16.1",
- "thiserror 2.0.19",
-]
-
-[[package]]
 name = "rtoolbox"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13651,21 +13661,6 @@ name = "rtrb"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
-
-[[package]]
-name = "rusqlite"
-version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
-dependencies = [
- "bitflags 2.13.1",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "hashlink 0.12.2",
- "libsqlite3-sys",
- "smallvec",
- "sqlite-wasm-rs",
-]
 
 [[package]]
 name = "rust-embed"
@@ -14946,18 +14941,6 @@ checksum = "7bba3a93db0cc4f7bdece8bb09e77e2e785c20bfebf79eb8340ed80708048790"
 dependencies = [
  "nom 7.1.3",
  "unicode_categories",
-]
-
-[[package]]
-name = "sqlite-wasm-rs"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
-dependencies = [
- "cc",
- "js-sys",
- "rsqlite-vfs",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -19148,7 +19131,7 @@ checksum = "8902160c4e6f2fb145dbe9d6760a75e3c9522d8bf796ed7047c85919ac7115f8"
 dependencies = [
  "arraydeque",
  "encoding_rs",
- "hashlink 0.8.4",
+ "hashlink",
 ]
 
 [[package]]

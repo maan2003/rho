@@ -1,4 +1,4 @@
-//! Cache keys and the mapping from evaluation effects to inputs.
+//! The mapping from evaluation effects to inputs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
@@ -6,39 +6,6 @@ use std::path::{Component, Path, PathBuf};
 use devenv_core::eval_op::{EvalOp, ObservedKind};
 
 use crate::eval_inputs::{FlakeScheme, Input, PathInput};
-
-/// Cache key for an evaluation operation.
-///
-/// The key covers everything an evaluation depends on that is not an observed
-/// input: the attribute, how the flake is fetched, and caller-supplied context
-/// such as the system, `flake.lock` and the evaluator version. It deliberately
-/// excludes the flake's location, so every checkout shares entries.
-#[derive(Clone, Debug)]
-pub struct EvalCacheKey {
-    /// Hash of the attribute name, scheme and context
-    pub key_hash: String,
-    /// Human-readable attribute name for debugging
-    pub attr_name: String,
-    pub scheme: FlakeScheme,
-}
-
-impl EvalCacheKey {
-    pub fn new(attr_name: &str, scheme: FlakeScheme, context: &[&[u8]]) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        for part in [b"rho-eval-v1".as_slice(), attr_name.as_bytes(), scheme.as_str().as_bytes()]
-            .into_iter()
-            .chain(context.iter().copied())
-        {
-            hasher.update(&(part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
-        Self {
-            key_hash: hasher.finalize().to_hex().to_string(),
-            attr_name: attr_name.to_owned(),
-            scheme,
-        }
-    }
-}
 
 /// The inputs of one evaluation, as Nix observed them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -262,15 +229,5 @@ mod tests {
     fn flake_must_be_mounted() {
         let err = record_inputs(&[], Path::new("/work/checkout")).unwrap_err();
         assert!(matches!(err, RecordError::FlakeNotMounted(_)));
-    }
-
-    #[test]
-    fn keys_depend_on_every_part() {
-        let key = |attr, scheme, lock: &[u8]| EvalCacheKey::new(attr, scheme, &[b"x86_64-linux", lock]).key_hash;
-        let base = key("devShells.x.default", FlakeScheme::Git, b"{}");
-        assert_eq!(base, key("devShells.x.default", FlakeScheme::Git, b"{}"));
-        assert_ne!(base, key("devShells.x.other", FlakeScheme::Git, b"{}"));
-        assert_ne!(base, key("devShells.x.default", FlakeScheme::Path, b"{}"));
-        assert_ne!(base, key("devShells.x.default", FlakeScheme::Git, b"{ }"));
     }
 }

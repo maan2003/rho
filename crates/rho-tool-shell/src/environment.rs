@@ -1,9 +1,9 @@
 //! Per-agent environment generations. A command's environment is the dev
-//! shell of the nearest flake, built by `rho-devshell-builder`, or the base
-//! environment outside flakes. Only cold/invalidated generations run the
-//! builder; command admission drains kernel watches over what the shell was
-//! built from before reusing a snapshot. Paths are absolute; resolver tasks
-//! inherit the workset process namespace.
+//! shell of the nearest flake, from the process's `rho_devshell` resolver,
+//! or the base environment outside flakes. Only cold/invalidated generations
+//! ask for the shell; command admission drains kernel watches over what the
+//! shell was built from before reusing a snapshot. Paths are absolute;
+//! resolver tasks inherit the workset process namespace.
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::mem::MaybeUninit;
@@ -16,6 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rustix::fs::inotify::{self, ReadFlags, WatchFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
 pub(super) type Environment = BTreeMap<OsString, OsString>;
@@ -25,18 +26,25 @@ const CACHE_SIZE: usize = 32;
 // A cold shell may build a toolchain.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-#[derive(Debug)]
+/// Where a flake's shell comes from: the process's dev shell resolver, or a
+/// stand-in in tests.
+type Shells = Arc<dyn Fn(PathBuf) -> BoxFuture<'static, Result<(Built, Vec<u8>)>> + Send + Sync>;
+
 pub(super) struct Worker {
     sender: tokio::sync::OnceCell<mpsc::Sender<Request>>,
     permits: Arc<tokio::sync::Semaphore>,
+    shells: Shells,
+}
+
+impl std::fmt::Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Worker").finish_non_exhaustive()
+    }
 }
 
 impl Default for Worker {
     fn default() -> Self {
-        Self {
-            sender: tokio::sync::OnceCell::new(),
-            permits: Arc::new(tokio::sync::Semaphore::new(64)),
-        }
+        Self::with_shells(Arc::new(|flake| Box::pin(resolved_shell(flake))))
     }
 }
 
@@ -68,19 +76,27 @@ struct Snapshot {
 /// A cached shell an environment was activated from.
 struct Source {
     flake: PathBuf,
-    eval_id: i64,
+    eval_id: u64,
     contents: HashSet<PathBuf>,
     names: HashSet<PathBuf>,
 }
 
 impl Worker {
+    fn with_shells(shells: Shells) -> Self {
+        Self {
+            sender: tokio::sync::OnceCell::new(),
+            permits: Arc::new(tokio::sync::Semaphore::new(64)),
+            shells,
+        }
+    }
+
     pub async fn resolve(&self, cwd: PathBuf, base: Environment) -> Result<Resolved> {
         let permit = Arc::clone(&self.permits).acquire_owned().await?;
         let sender = self
             .sender
             .get_or_try_init(|| async {
                 let (sender, receiver) = mpsc::channel(64);
-                tokio::spawn(serve(receiver));
+                tokio::spawn(serve(receiver, self.shells.clone()));
                 Ok::<_, anyhow::Error>(sender)
             })
             .await?;
@@ -100,7 +116,7 @@ impl Worker {
     }
 }
 
-async fn serve(mut requests: mpsc::Receiver<Request>) {
+async fn serve(mut requests: mpsc::Receiver<Request>, shells: Shells) {
     let mut snapshots: VecDeque<(Key, Snapshot)> = VecDeque::new();
     let mut loading = HashMap::<Key, (tokio::task::AbortHandle, Vec<Request>)>::new();
     let mut tasks = tokio::task::JoinSet::new();
@@ -127,8 +143,9 @@ async fn serve(mut requests: mpsc::Receiver<Request>) {
                     waiters.push(request);
                 } else {
                     let key = request.key.clone();
+                    let shells = shells.clone();
                     let task = tasks.spawn(async move {
-                        let result = tokio::time::timeout(RESOLVE_TIMEOUT, resolve(&key, previous)).await
+                        let result = tokio::time::timeout(RESOLVE_TIMEOUT, resolve(&key, previous, &shells)).await
                             .map_err(|_| anyhow!("environment resolution timed out"))
                             .and_then(|result| result);
                         (key, result)
@@ -282,11 +299,10 @@ fn discover(cwd: &Path) -> Result<Discovery> {
     Ok(Discovery { flake, names })
 }
 
-/// What `rho-devshell-builder` reports for a shell.
-#[derive(serde::Deserialize)]
+/// A flake's shell, for one generation.
 struct Built {
-    /// The cache candidate, if the shell could be cached.
-    eval_id: Option<i64>,
+    /// The cache entry, if the shell could be cached.
+    eval_id: Option<u64>,
     /// Bash applying the shell to the caller's environment, `shellHook`
     /// included.
     activation: String,
@@ -296,23 +312,26 @@ struct Built {
     watch_names: Vec<PathBuf>,
 }
 
-fn builder_program(base: &Environment) -> PathBuf {
-    if let Some(program) = base.get(OsStr::new("RHO_DEVSHELL_BUILDER")) {
-        return program.into();
-    }
-    rho_fs_view::devshell_builder()
+async fn resolved_shell(flake: PathBuf) -> Result<(Built, Vec<u8>)> {
+    let (resolved, diagnostics) = rho_devshell::resolver()
+        .resolve(&rho_devshell::Flake::new(flake, "default"))
+        .await?;
+    let activation = tokio::fs::read_to_string(&resolved.activation)
+        .await
+        .with_context(|| format!("read {}", resolved.activation.display()))?;
+    Ok((
+        Built {
+            eval_id: resolved.id,
+            activation,
+            watch: resolved.watch.contents.into_iter().collect(),
+            watch_names: resolved.watch.names.into_iter().collect(),
+        },
+        diagnostics,
+    ))
 }
 
-async fn build(key: &Key, flake: &Path) -> Result<(Built, Vec<u8>)> {
-    let mut command = tokio::process::Command::new(builder_program(&key.base));
-    command
-        .arg("shell")
-        .arg(flake)
-        .current_dir(&key.cwd)
-        .env_clear()
-        .envs(key.base.iter());
-    let (bytes, diagnostics) = output(command, &[], "rho-devshell-builder").await?;
-    let built: Built = serde_json::from_slice(&bytes).context("parse rho-devshell-builder output")?;
+async fn build(shells: &Shells, flake: &Path) -> Result<(Built, Vec<u8>)> {
+    let (built, diagnostics) = shells(flake.to_owned()).await?;
     ensure!(
         built.watch.iter().chain(&built.watch_names).all(|path| path.is_absolute()),
         "relative shell watch path"
@@ -351,9 +370,9 @@ async fn activate(key: &Key, activation: &str) -> Result<(Environment, Vec<u8>)>
     Ok((environment, diagnostics))
 }
 
-async fn resolve(key: &Key, previous: Option<Snapshot>) -> Result<(Snapshot, Vec<u8>)> {
+async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Result<(Snapshot, Vec<u8>)> {
     if let Some(previous) = previous
-        && let Some(reused) = reuse(key, previous).await?
+        && let Some(reused) = reuse(key, previous, shells).await?
     {
         return Ok(reused);
     }
@@ -364,7 +383,7 @@ async fn resolve(key: &Key, previous: Option<Snapshot>) -> Result<(Snapshot, Vec
         let (environment, diagnostics, source) = match &discovery.flake {
             None => ((*key.base).clone(), Vec::new(), None),
             Some(flake) => {
-                let (built, mut diagnostics) = build(key, flake).await?;
+                let (built, mut diagnostics) = build(shells, flake).await?;
                 let (environment, hook_output) = activate(key, &built.activation).await?;
                 diagnostics.extend(hook_output);
                 contents.extend(built.watch.iter().cloned());
@@ -384,7 +403,7 @@ async fn resolve(key: &Key, previous: Option<Snapshot>) -> Result<(Snapshot, Vec
         // An uncacheable shell cannot be confirmed and is kept as built.
         let still_valid = discover(&key.cwd)? == discovery
             && match &source {
-                Some(source) => build(key, &source.flake).await?.0.eval_id == Some(source.eval_id),
+                Some(source) => build(shells, &source.flake).await?.0.eval_id == Some(source.eval_id),
                 None => true,
             };
         if still_valid && !watches.changed()? {
@@ -405,7 +424,7 @@ async fn resolve(key: &Key, previous: Option<Snapshot>) -> Result<(Snapshot, Vec
 /// shell as it was, e.g. git rewriting its index or an editor saving
 /// unchanged contents. Watching the same inputs before asking the builder
 /// makes its answer hold until the next command drains the watches.
-async fn reuse(key: &Key, previous: Snapshot) -> Result<Option<(Snapshot, Vec<u8>)>> {
+async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<(Snapshot, Vec<u8>)>> {
     let Some(source) = previous.source else {
         return Ok(None);
     };
@@ -415,7 +434,7 @@ async fn reuse(key: &Key, previous: Snapshot) -> Result<Option<(Snapshot, Vec<u8
     }
     let names = source.names.union(&discovery.names).cloned().collect();
     let mut watches = Watches::new(&source.contents, &names)?;
-    let (built, diagnostics) = build(key, &source.flake).await?;
+    let (built, diagnostics) = build(shells, &source.flake).await?;
     if built.eval_id != Some(source.eval_id) || discover(&key.cwd)? != discovery || watches.changed()? {
         return Ok(None);
     }
@@ -566,41 +585,43 @@ mod tests {
 
     struct Fixture {
         root: TempDir,
-        _builder: TempDir,
         tools: ShellTools,
     }
 
+    /// A stand-in for the dev shell resolver: the shell sources the flake's
+    /// `env.sh` and depends on `env.sh` and an optional `extra`, and is
+    /// cached by their contents.
+    fn shells() -> Shells {
+        Arc::new(|flake: PathBuf| {
+            Box::pin(async move {
+                let mut hasher = std::hash::DefaultHasher::new();
+                for name in ["env.sh", "extra"] {
+                    std::hash::Hash::hash(&std::fs::read(flake.join(name)).ok(), &mut hasher);
+                }
+                let built = Built {
+                    eval_id: Some(std::hash::Hasher::finish(&hasher)),
+                    activation: format!(". {}/env.sh", flake.display()),
+                    watch: vec![flake.join("env.sh"), flake.join("extra")],
+                    watch_names: Vec::new(),
+                };
+                Ok((built, Vec::new()))
+            })
+        })
+    }
+
     impl Fixture {
-        /// A flake at the root, built by a stand-in for `rho-devshell-builder`
-        /// whose shell sources the flake's `env.sh` and depends on `env.sh`
-        /// and an optional `extra`, and is cached by their contents.
+        /// A flake at the root, with [`shells`].
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
-            let builder = tempfile::tempdir().unwrap();
-            let program = builder.path().join("rho-devshell-builder");
-            std::fs::write(
-                &program,
-                r#"#!/usr/bin/env bash
-id=$(cat "$2/env.sh" "$2/extra" 2>/dev/null | cksum | cut -d' ' -f1)
-printf '{"eval_id":%s,"activation":". %s/env.sh","watch":["%s/env.sh","%s/extra"],"watch_names":[]}' "$id" "$2" "$2" "$2"
-"#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&program, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
             std::fs::write(root.path().join("flake.nix"), "").unwrap();
-            let tools = ShellTools::in_directory(
+            let mut tools = ShellTools::in_directory(
                 Duration::from_secs(5),
                 camino::Utf8PathBuf::from_path_buf(root.path().to_owned()).unwrap(),
                 PathOverrides::default(),
             )
-            .with_env("RHO_DEVSHELL_BUILDER", program.to_str().unwrap())
             .with_env("RHO_CACHE_TEST_BASE", "base");
-            Self {
-                root,
-                _builder: builder,
-                tools,
-            }
+            tools.environments = Arc::new(Worker::with_shells(shells()));
+            Self { root, tools }
         }
 
         fn write(&self, name: &str, text: &str) {
@@ -1006,7 +1027,7 @@ mod latency {
     }
 
     #[tokio::test]
-    #[ignore = "manual: needs RHO_DEVSHELL_BUILDER and a flake checkout in RHO_TEST_FLAKE"]
+    #[ignore = "manual: needs rho-devshell-builder and a flake checkout in RHO_TEST_FLAKE"]
     async fn real_flake_admission() {
         let flake = std::env::var("RHO_TEST_FLAKE").unwrap();
         let tools = ShellTools::in_directory(

@@ -107,9 +107,8 @@ impl ClaudeCodeOptions {
     }
 
     pub async fn command(&self) -> Result<Command> {
-        // In the dev shell of the flake the caller's working directory is in.
-        let mut command = Command::new(rho_fs_view::devshell_builder());
-        command.arg("exec").arg("--");
+        // In the dev shell of the flake the working directory is in.
+        let mut command = rho_devshell::command(self.cwd.as_std_path(), self.command.as_std_path()).await;
         command.env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts");
         command.env("CLAUDE_AGENT_SDK_VERSION", CLAUDE_AGENT_SDK_VERSION);
         command.env(
@@ -125,7 +124,7 @@ impl ClaudeCodeOptions {
         for (name, value) in &self.env {
             command.env(name, value);
         }
-        command.arg(self.command.as_std_path()).args(self.args());
+        command.args(self.args());
         // The working directory and PATH are the agent namespace's: the
         // caller enters it with `Namespace::prepare_command`, and `cwd` is a
         // path as the agent sees it, which need not exist on the host.

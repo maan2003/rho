@@ -536,7 +536,10 @@ AI APIs.
   directory, built by `rho-devshell-builder`. A project's flake and its
   `shellHook` are trusted local code with the same authority as the agent shell
   tools they configure. Evaluation is pure, but building the shell can realise
-  derivations through the Nix daemon like any `nix develop`.
+  derivations through the Nix daemon like any `nix develop`. Built shells are
+  cached by the daemon for all of the owner's worksets, which store entries
+  and check them against their own checkouts; an entry is as trustworthy as
+  those worksets, which already share the agents' `~/.cache`.
 - The GUI's editor-native shell is also a daemon-owned command surface with the
   agent workspace's authority. The daemon starts `rho-shell` through the agent
   View and gives it one private framed Unix socket as stdin. The sidecar makes a

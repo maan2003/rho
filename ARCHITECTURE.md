@@ -371,7 +371,7 @@ security, resource-isolation, or rollback boundary.
   subprocesses use that environment directly. Agent commands use watched
   environment generations built from the nearest flake's dev shell; the
   terminal, Claude processes and the `rho-shell` sidecar start once in that
-  dev shell through `rho-devshell-builder exec`.
+  dev shell, from the same resolver.
   The GUI's Comint-style surface starts `rho-shell` through the agent
   View and lets Brush load normal Bash-compatible interactive configuration
   (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`). Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
@@ -422,17 +422,25 @@ security, resource-isolation, or rollback boundary.
   `exec_command` yields a process session id when a command remains live and
   `write_stdin` writes to or polls that session. Command continuation state is
   per agent because each agent owns its `ShellTools` instance. Cold or invalidated
-  environment generations run `rho-devshell-builder`, which evaluates the
-  nearest flake's dev shell in pure mode and caches the built environment
-  against exactly what evaluation read (reported by the Nix fork); commands
-  outside a flake get the base environment. Kernel watches over those inputs
-  and over flake discovery validate reuse; when they fire, one builder check
-  decides whether the shell actually changed before its activation reruns.
-  The builder links the Nix C API of cachix's Nix carrying
-  `nix/patches/nix-*.patch` (flake input `nix`), is installed next to the
-  daemon, and also serves `rho-devshell-builder exec`. The agent base's
-  `nix` is the same patched Nix, whose `nix develop` takes a local flake's
-  dev shell from the builder instead of evaluating it. A generation uses a native,
+  environment generations ask the workset process's one `rho-devshell`
+  resolver for the nearest flake's dev shell; commands outside a flake get
+  the base environment. Kernel watches over the shell's inputs and over
+  flake discovery validate reuse; when they fire, one resolver check decides
+  whether the shell actually changed before its activation reruns.
+- Dev shells are cached by the daemon (`rho-devshell-daemon`, reached over
+  the workset connection) under a key every valid entry of a flake shares:
+  evaluator, flake location and attribute, `flake.nix` and `flake.lock`.
+  Entries record what evaluation read, as the Nix fork reports it, and the
+  workset checks them in its own namespace, where those paths mean what they
+  meant to the evaluator. The daemon owns the entries and which environments
+  stay pinned: the 50 most recently used keep a GC root in the shared cache
+  directory, older ones stay usable until Nix collects them, and using one
+  pins it again. A miss runs `rho-devshell-builder`, which links the Nix C
+  API of cachix's Nix carrying `nix/patches/nix-*.patch` (flake input
+  `nix`), evaluates in pure mode and pins what it built; it is installed
+  next to the daemon. The agent base's `nix` is the same patched Nix, whose
+  `nix develop` takes a local flake's dev shell from the builder instead of
+  evaluating it. A generation uses a native,
   single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
   namespace. It keeps up to five pristine children of the initialized variable/builtin image
   ready for one-shot cwd/stdio specialization, replenishing when idle and falling

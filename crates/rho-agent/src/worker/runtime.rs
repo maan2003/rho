@@ -161,6 +161,13 @@ pub(super) async fn run(
     });
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let policy = super::policy::Host::new(sender.clone(), next.clone());
+    let devshell = super::devshell::Host::new(sender.clone(), next.clone());
+    rho_devshell::install(rho_devshell::Resolver::new(
+        Some(Arc::new(super::devshell::Cache(devshell.clone()))),
+        base.devshell_cache().as_std_path().to_owned(),
+        rho_fs_view::devshell_builder(),
+        base.command_environment(),
+    ));
     let inference = rho_inference::Inference::from_host(
         policy.clone(),
         rho_inference::InferenceConfig::with_responses_base_url(
@@ -203,6 +210,11 @@ pub(super) async fn run(
                 match message {
                     W::Policy(message) => {
                         if let Err(error) = policy.receive(message) {
+                            break Err(error);
+                        }
+                    }
+                    W::Devshell(message) => {
+                        if let Err(error) = devshell.receive(message) {
                             break Err(error);
                         }
                     }
@@ -332,6 +344,7 @@ pub(super) async fn run(
         });
     };
     policy.disconnect();
+    devshell.disconnect();
     agents.lock().expect("poison").clear();
     execution.clients.lock().expect("poison").clear();
     while tasks.join_next().await.is_some() {}

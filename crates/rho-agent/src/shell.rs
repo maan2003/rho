@@ -1063,8 +1063,9 @@ impl Session {
             UnixStream::from_std(parent_control).context("register rho-shell control socket")?;
 
         // In the dev shell of the agent's working directory.
-        let mut command = tokio::process::Command::new(rho_fs_view::devshell_builder());
-        command.args(["exec", "--"]).arg(&spawn.program).args(&spawn.args);
+        let cwd = spawn.view.command_cwd(None)?;
+        let mut command = rho_devshell::command(cwd.as_std_path(), &spawn.program).await;
+        command.args(&spawn.args);
         command
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")

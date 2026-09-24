@@ -11,7 +11,9 @@ rho-inference.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 rho-agent-host-proto.workspace = true
+rho-devshell.workspace = true
 rho-fs-view.workspace = true
+futures.workspace = true
 rustix = { version = "1", features = ["process", "thread", "fs", "net"] }
 serde.workspace = true
 serde_json.workspace = true

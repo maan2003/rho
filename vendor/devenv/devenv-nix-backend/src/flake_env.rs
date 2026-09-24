@@ -208,6 +208,37 @@ impl NixRuntime {
     pub fn add_gc_root(&mut self, gc_root: &Path, store_path: &str) -> Result<GcRootOutcome> {
         ensure_gc_root(&mut self.store, gc_root, store_path)
     }
+
+    /// Root `store_path` at `gc_root` if it is still valid, and report
+    /// whether it was. Nix registers a temporary root before the permanent
+    /// one, so a garbage collection cannot invalidate the path after this
+    /// checks it; a path already collected leaves no root behind.
+    pub fn pin(&mut self, gc_root: &Path, store_path: &str) -> Result<bool> {
+        use nix_bindings_bindgen_raw as raw;
+        use nix_bindings_util::check_call;
+        use nix_bindings_util::context::Context;
+
+        ensure_gc_root(&mut self.store, gc_root, store_path)?;
+        let path = self
+            .store
+            .parse_store_path(store_path)
+            .to_miette()
+            .wrap_err("Failed to parse store path")?;
+        let mut context = Context::new();
+        let valid = unsafe {
+            check_call!(raw::store_is_valid_path(
+                &mut context,
+                self.store.raw_ptr(),
+                path.as_ptr()
+            ))
+        }
+        .to_miette()?;
+        if !valid {
+            std::fs::remove_file(gc_root)
+                .map_err(|e| miette::miette!("Failed to remove GC root: {}", e))?;
+        }
+        Ok(valid)
+    }
 }
 
 /// Collects distinct effects. Nix repeats many of them (`pathExists`,

@@ -32,7 +32,7 @@ pub mod logger;
 pub mod anyhow_ext;
 
 // Pure Rust BuildEnvironment parsing (for cached -env JSON)
-pub mod build_environment;
+pub use devenv_core::build_environment;
 
 // Scoped umask guard for Nix C API calls
 pub mod umask_guard;

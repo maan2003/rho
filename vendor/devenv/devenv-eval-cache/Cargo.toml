@@ -8,9 +8,8 @@ license.workspace = true
 blake3.workspace = true
 devenv-cache-core.workspace = true
 devenv-core.workspace = true
-rusqlite.workspace = true
+serde.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

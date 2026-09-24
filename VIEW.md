@@ -55,17 +55,18 @@ security boundary (see `WORKSET.md`); it is a distribution.
    `flake.nix` above its working directory, looking no further than the
    enclosing git checkout, as `nix develop` would set it up; outside a
    flake it gets the base environment. Tool execution, the terminal, the
-   shell sidecar and Claude Code all get it from `rho-devshell-builder`
-   (ARCHITECTURE.md). There is no `.envrc`, no direnv and no trust step.
+   shell sidecar and Claude Code all get it from the workset process's
+   dev shell resolver (`rho-devshell`, ARCHITECTURE.md). There is no `.envrc`, no direnv and no trust step.
    *Why:* an agent already runs the repository's build scripts, so a
    trust gate protects nothing and only adds a failure mode. A flake
    evaluates purely, so a built shell can be cached against exactly what
    evaluation read and reused across checkouts and worksets.
-   - The builder's cache (`RHO_DEVSHELL_CACHE`) is shared by the
-     owner's worksets and bound into the view at its host path.
-     *Why:* the garbage-collection roots of cached shells live beside
-     it, and the nix daemon resolves them on the host. At a view-only
-     path the roots would dangle and every GC would delete the shells.
+   - The dev shell cache directory (`cache/rho-devshell`) is shared by
+     the owner's worksets and bound into the view at its host path. It
+     holds the GC roots of pinned shells and their activation scripts.
+     *Why:* the nix daemon resolves the roots on the host. At a
+     view-only path the roots would dangle and every GC would delete
+     the shells.
    - After a dev shell is applied, `RHO_DEVSHELL_CARGO` (Rho's
      shared-cache cargo fork, `cargoSharedCache` in the flake) goes first
      on its `PATH`, or right after the shell's own `cargo` when that is
@@ -184,7 +185,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under `~/.cache`;
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
 from the user's environment or git config, read once when the daemon
-starts; `RHO_DEVSHELL_CACHE`, `RHO_DEVSHELL_PATH_PREFIX`,
+starts; `RHO_DEVSHELL_PATH_PREFIX`,
 `RHO_DEVSHELL_CARGO` and `RHO_DEVSHELL_BUILDER` (above);
 `FIND_DENY_ROOTS` for Rho's find;
 `NIX_REMOTE=daemon` when the host has a nix daemon;

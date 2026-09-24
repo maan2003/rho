@@ -191,10 +191,8 @@ pub struct Namespace {
     devshell_cache: Utf8PathBuf,
 }
 
-/// Where rho-devshell-builder caches shells, shared by the owner's worksets.
-/// The view binds it at this host path because the GC roots of cached shells
-/// live in it and the Nix daemon resolves them on the host.
-fn devshell_cache(cache: &Utf8Path) -> Utf8PathBuf {
+/// See [`crate::Worksets::devshell_cache_dir`].
+pub(crate) fn devshell_cache(cache: &Utf8Path) -> Utf8PathBuf {
     cache.join("rho-devshell")
 }
 
@@ -350,6 +348,28 @@ impl Namespace {
     /// default. View mode replaces the environment with an allowlist;
     /// exposed mode passes the user's through. Inherited descriptors above
     /// stdio are closed on exec either way.
+    /// The shared dev shell cache, at its host path (see
+    /// [`crate::Worksets::devshell_cache_dir`]).
+    pub fn devshell_cache(&self) -> &Utf8Path {
+        &self.devshell_cache
+    }
+
+    /// The working directory [`Self::prepare_command`] gives a command.
+    pub fn command_cwd(&self, cwd: Option<&Utf8Path>) -> anyhow::Result<Utf8PathBuf> {
+        namespace_cwd(self.visible_root(), &self.cwd, cwd).map(Utf8PathBuf::from)
+    }
+
+    /// The environment [`Self::prepare_command`] starts commands with.
+    pub fn command_environment(&self) -> Vec<(OsString, OsString)> {
+        let mut command = tokio::process::Command::new("true");
+        self.configure_environment(&mut command);
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+            .collect()
+    }
+
     pub async fn prepare_command(
         &self,
         command: &mut tokio::process::Command,
@@ -391,7 +411,6 @@ impl Namespace {
                         None => cargo_bin,
                     },
                 );
-                command.env("RHO_DEVSHELL_CACHE", self.devshell_cache.join("cache.sqlite"));
                 // For the base's `nix develop` (VIEW.md 3).
                 command.env("RHO_DEVSHELL_BUILDER", crate::devshell_builder());
                 command

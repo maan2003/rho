@@ -179,13 +179,12 @@ test -f /etc/nix/registry.json
 test "$XDG_STATE_HOME" = /home/agent/.local/state
 test "$GIT_CONFIG_SYSTEM" = /etc/gitconfig
 test "$(git config --get core.pager)" = cat
-test "$RHO_DEVSHELL_CACHE" = {cache}/rho-devshell/cache.sqlite
 test -n "$RHO_DEVSHELL_BUILDER"
 case "$RHO_DEVSHELL_PATH_PREFIX" in *:/home/agent/.cache/cargo/bin|/home/agent/.cache/cargo/bin) ;; *) exit 1 ;; esac
 test "$INSIDE_AGENT" = 1
 test "$CARGO_HOME" = /home/agent/.cache/cargo
 touch /home/agent/.cache/from-view
-touch {state}/from-view "$RHO_DEVSHELL_CACHE"
+touch {state}/from-view {cache}/rho-devshell/from-view
 git clone -q -- {remote} second
 test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
 git -C /src/second fetch -q
@@ -267,7 +266,7 @@ test ! -e /src/.stores
             .join("from-view")
             .exists()
     );
-    assert!(root.cache_dir().join("rho-devshell/cache.sqlite").exists());
+    assert!(root.devshell_cache_dir().join("from-view").exists());
     assert_eq!(workset.repos().unwrap(), vec!["project", "second"]);
     assert_eq!(only_store(temp.path()), store);
 
