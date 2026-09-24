@@ -20,11 +20,11 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, Reply, ServerFrame as AgentsServerFrame,
+    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
 };
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::TranscriptEvent;
-use rho_agent_host_proto::{AgentCommand, AgentRole, ContentPart, JoinTarget, StartMode};
+use rho_agent_host_proto::{AgentRole, ContentPart, JoinTarget, NewAgent, StartMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1152,7 +1152,7 @@ async fn probe_async(name: &str) -> Result<()> {
     client
         .send_agents(&AgentsClientFrame::Follow { since: head })
         .await?;
-    client.send(AgentCommand::New {
+    client.create(NewAgent {
         role: AgentRole::default(),
         start: StartMode::Join(JoinTarget::User {
             repo: workspace.try_into().context("rig workspace is not UTF-8")?,
@@ -1212,7 +1212,7 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                 }
             }
-            Incoming::Reply(Reply::Failed { reason }) => {
+            Incoming::Refused(reason) => {
                 bail!("rig probe failed: {reason}")
             }
             _ => {}

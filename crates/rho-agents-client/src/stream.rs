@@ -12,7 +12,7 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_host_proto::agents::{self, ClientFrame, ServerFrame};
 use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
-use rho_agent_host_proto::{AgentId, Open, QuotaSummary, read_frame, write_frame};
+use rho_agent_host_proto::{AgentId, AuthState, Open, QuotaSummary, read_frame, write_frame};
 use rho_hosts::{Dialer, HostStream};
 
 use crate::HostId;
@@ -26,15 +26,22 @@ pub enum AgentFrame {
     JournalHead {
         machine_seed: u64,
         journal_head: Seq,
+        agent_counter: u64,
     },
+    /// Which provider accounts the host's agents may run on.
+    Auth { auth: AuthState },
     /// A run of the host's journal, contiguous by seq: the answer to
     /// `Follow` and everything appended since.
     Log { entries: Vec<LogEntry> },
     /// What changed in the runtime's tail past the log, for an agent some
     /// client is looking at.
     Live { agent_id: AgentId, live: Live },
-    /// An agent was created on the host, by any client or agent.
-    AgentCreated { agent_id: AgentId },
+    /// An agent was created on the host, by any client or agent, and the
+    /// agent-id counter moved to `agent_counter`.
+    AgentCreated {
+        agent_id: AgentId,
+        agent_counter: u64,
+    },
     /// The host's quota: every account's latest usage.
     QuotaUsage { summaries: Vec<QuotaSummary> },
 }
@@ -124,15 +131,22 @@ impl HostStream for AgentStream {
                         ServerFrame::JournalHead {
                             machine_seed,
                             journal_head,
+                            agent_counter,
                         } => AgentFrame::JournalHead {
                             machine_seed,
                             journal_head,
+                            agent_counter,
                         },
+                        ServerFrame::Auth { auth } => AgentFrame::Auth { auth },
                         ServerFrame::Log { entries } => AgentFrame::Log { entries },
                         ServerFrame::Live { agent_id, live } => AgentFrame::Live { agent_id, live },
-                        ServerFrame::AgentCreated { agent_id } => {
-                            AgentFrame::AgentCreated { agent_id }
-                        }
+                        ServerFrame::AgentCreated {
+                            agent_id,
+                            agent_counter,
+                        } => AgentFrame::AgentCreated {
+                            agent_id,
+                            agent_counter,
+                        },
                         ServerFrame::QuotaUsage { summaries } => {
                             AgentFrame::QuotaUsage { summaries }
                         }

@@ -210,7 +210,9 @@ impl AgentMap {
         self.mark_known(agent_id);
     }
 
-    /// What `Ready` says of a host. The agents come by the log, not here.
+    /// What a host's agents stream says of it when it opens, and again of
+    /// the counter with each agent created. The agents come by the log,
+    /// not here.
     pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;

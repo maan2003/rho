@@ -17,7 +17,7 @@ use rho_agent_host_proto::{
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
 pub mod debug;
@@ -864,10 +864,6 @@ struct Services {
     pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
-    /// Daemon-wide fanout for messages every client must hear regardless of
-    /// which connection caused them (attention changes); each connection
-    /// forwards this onto its own outgoing channel.
-    events: broadcast::Sender<ControlFrame>,
     /// Marked whenever a quota observation lands; every agents session
     /// tells its client the quota again.
     quota: tokio::sync::watch::Sender<()>,
@@ -906,7 +902,6 @@ impl Services {
             machine_seed,
             pr_monitor,
             platform_secrets,
-            events: broadcast::channel(1024).0,
             quota: tokio::sync::watch::channel(()).0,
             user_environment,
             git_transport: GitTransportBroker::default(),
@@ -926,15 +921,6 @@ impl Services {
 
     async fn set_auth_account_enabled(&self, name: &str, enabled: bool) {
         self.inference.set_account_enabled(name, enabled).await;
-    }
-
-    async fn ready_message(&self) -> ControlFrame {
-        let read = self.db.read();
-        ControlFrame::Ready {
-            auth: self.auth_state(),
-            machine_seed: self.machine_seed,
-            agent_counter: read.last_agent_counter(),
-        }
     }
 
     /// `mode` is the agent's own: how it sees the filesystem around the
@@ -1081,9 +1067,7 @@ where
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Durable presentation changes refresh the normal snapshot for every
-/// connection. Broadcast loss is harmless because `Ready` is reconstructed
-/// from the agent cache, including after daemon restart.
+/// An inference state change moves the quota every session shows.
 fn spawn_inference_projection(services: Arc<Services>) {
     let mut state = services.inference.subscribe();
     let services = Arc::downgrade(&services);
@@ -1093,9 +1077,6 @@ fn spawn_inference_projection(services: Arc<Services>) {
                 break;
             };
             let _ = state.borrow_and_update();
-            let _ = services.events.send(ControlFrame::AuthState {
-                auth: services.auth_state(),
-            });
             services.quota.send_replace(());
         }
     });

@@ -1,4 +1,4 @@
-//! One host's agents, as the client reaches them: requests, terminals,
+//! One host's agents, as the client reaches them: calls, terminals,
 //! shells, workspace channels and visualizations, each on a stream of its
 //! own opened by [`Open::Agents`]. The session beside them is
 //! [`crate::stream`].
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::agents::{self, Reply, Request};
+use rho_agent_host_proto::agents::{self, Call, VisualizationContent};
 use rho_agent_host_proto::{Open, Opened, WorkspaceInfo, read_frame, write_frame};
 use rho_hosts::{ChannelTask, Dialer, Link};
 
@@ -18,26 +18,11 @@ use rho_hosts::{ChannelTask, Dialer, Link};
 #[derive(Clone)]
 pub struct AgentsLink {
     link: Link,
-    #[cfg(feature = "test-support")]
-    requests: Arc<Mutex<TestRequests>>,
-}
-
-/// Requests a test link was asked to make: what they were, and the ones the
-/// test has yet to answer, oldest first.
-#[cfg(feature = "test-support")]
-#[derive(Default)]
-struct TestRequests {
-    sent: Vec<Request>,
-    unanswered: std::collections::VecDeque<tokio::sync::oneshot::Sender<anyhow::Result<Reply>>>,
 }
 
 impl AgentsLink {
     pub fn new(link: Link) -> Self {
-        Self {
-            link,
-            #[cfg(feature = "test-support")]
-            requests: Arc::default(),
-        }
+        Self { link }
     }
 
     /// Agents with no host behind them, for an agent whose host has been
@@ -47,43 +32,13 @@ impl AgentsLink {
         Self::new(Link::detached())
     }
 
-    /// Makes one request on a stream of its own. The answer needs no
+    /// Makes one call on a stream of its own. The answer needs no
     /// particular executor; a refusal is an error.
-    pub fn request(
+    pub fn call<C: Call>(
         &self,
-        request: Request,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<Reply>> {
-        #[cfg(feature = "test-support")]
-        {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let mut requests = self.requests.lock().unwrap();
-            requests.sent.push(request);
-            requests.unanswered.push_back(reply_tx);
-            Box::pin(async move {
-                reply_rx
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("request was dropped")))
-            })
-        }
-        #[cfg(not(feature = "test-support"))]
-        Box::pin(self.link.run(|dialer| dial_request(dialer, request)))
-    }
-
-    /// Every request made on this link since it was last asked, for a test
-    /// that checks what the client said rather than what it drew.
-    #[cfg(feature = "test-support")]
-    pub fn take_sent_for_test(&self) -> Vec<Request> {
-        std::mem::take(&mut self.requests.lock().unwrap().sent)
-    }
-
-    /// Answers the oldest request not yet answered, as the daemon would.
-    #[cfg(feature = "test-support")]
-    pub fn answer_for_test(&self, reply: anyhow::Result<Reply>) {
-        let answer = self.requests.lock().unwrap().unanswered.pop_front();
-        answer
-            .expect("no request is waiting for an answer")
-            .send(reply)
-            .ok();
+        call: C,
+    ) -> impl Future<Output = anyhow::Result<C::Reply>> + Send + 'static {
+        self.link.run(|dialer| dial_call(dialer, call))
     }
 
     /// Dials a dedicated terminal stream for an agent and runs the
@@ -113,8 +68,7 @@ impl AgentsLink {
         &self,
         agent: String,
     ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
-        let reply = self.request(Request::ShellClose { agent });
-        async move { reply.await.map(drop) }
+        self.call(agents::ShellClose { agent })
     }
 
     /// Dials a dedicated workspace file stream and runs the handshake.
@@ -129,46 +83,20 @@ impl AgentsLink {
     pub fn visualization(
         &self,
         id: String,
-    ) -> impl Future<Output = anyhow::Result<VisualizationArtifact>> + Send + 'static {
-        self.link.run(|dialer| dial_visualization(dialer, id))
+    ) -> impl Future<Output = anyhow::Result<VisualizationContent>> + Send + 'static {
+        self.call(agents::Visualization { id })
     }
 }
 
-pub struct VisualizationArtifact {
-    pub mime_type: String,
-    pub content: Vec<u8>,
-}
-
-/// One request on a stream of its own. A refusal is an error.
-async fn dial_request(dialer: Dialer, request: Request) -> anyhow::Result<Reply> {
-    // Bulk answers wait behind interactive traffic; everything else is
-    // someone waiting on a keypress, as urgent as the control stream.
-    let priority = match &request {
-        Request::Visualization { .. } => None,
-        _ => Some(1),
-    };
-    let mut stream = dialer.open(priority).await?;
-    write_frame(&mut stream, &Open::Agents(agents::Open::Request(request))).await?;
-    match read_frame(&mut stream).await? {
-        Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
+/// One call on a stream of its own. A refusal is an error.
+async fn dial_call<C: Call>(dialer: Dialer, call: C) -> anyhow::Result<C::Reply> {
+    let mut stream = dialer.open(C::PRIORITY).await?;
+    agents::call(&mut stream, call).await
 }
 
 async fn dial_stream(dialer: Dialer) -> anyhow::Result<rho_rpc::Stream> {
     // Interactive streams outrank the control session (priority 1).
     dialer.open(Some(50)).await
-}
-
-async fn dial_visualization(dialer: Dialer, id: String) -> anyhow::Result<VisualizationArtifact> {
-    match dial_request(dialer, Request::Visualization { id: id.clone() }).await? {
-        Reply::Visualization {
-            id: response_id,
-            mime_type,
-            content,
-        } if response_id == id => Ok(VisualizationArtifact { mime_type, content }),
-        _ => anyhow::bail!("unexpected reply to a visualization request"),
-    }
 }
 
 /// One workspace file channel. Dropping the owner cancels the transport and
@@ -236,10 +164,7 @@ async fn dial_terminal_list(
     dialer: Dialer,
     agent: String,
 ) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
-    match dial_request(dialer, Request::TerminalList { agent: Some(agent) }).await? {
-        Reply::TerminalList { terminals } => Ok(terminals),
-        _ => anyhow::bail!("unexpected reply to a terminal list request"),
-    }
+    dial_call(dialer, agents::TerminalList { agent: Some(agent) }).await
 }
 
 /// Dials a dedicated terminal stream: attach the agent's first running
@@ -299,17 +224,14 @@ async fn dial_terminal(
 
 /// Starts the agent's shell when none runs, then attaches.
 async fn start_and_dial_shell(dialer: Dialer, agent: String) -> anyhow::Result<ShellChannel> {
-    let list = Request::ShellList {
+    let list = agents::ShellList {
         agent: Some(agent.clone()),
     };
-    let Reply::ShellList { shells } = dial_request(dialer.clone(), list).await? else {
-        anyhow::bail!("unexpected shell list reply");
-    };
-    if shells.is_empty() {
-        let start = Request::ShellStart {
+    if dial_call(dialer.clone(), list).await?.is_empty() {
+        let start = agents::ShellStart {
             agent: agent.clone(),
         };
-        dial_request(dialer.clone(), start).await?;
+        dial_call(dialer.clone(), start).await?;
     }
     dial_shell(dialer, agent).await
 }

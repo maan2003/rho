@@ -12,7 +12,7 @@ use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::control::{
     ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
 };
-use rho_agent_host_proto::host::{Open as HostOpen, Reply, Request};
+use rho_agent_host_proto::host::{self, Open as HostOpen};
 use rho_agent_host_proto::{
     GitProvided, GitService, GitTransportRequest, Open, Opened, read_frame, write_frame,
 };
@@ -89,12 +89,8 @@ impl EventSink {
 
 pub enum ConnEvent {
     DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
-    Ready {
-        auth: rho_agent_host_proto::AuthState,
-        machine_seed: u64,
-        agent_counter: u64,
-    },
-    AuthState(rho_agent_host_proto::AuthState),
+    /// The host is up.
+    Ready,
     /// Several events in order, delivered as one. A daemon sends them
     /// separately; a test that stands for one stands for the batch.
     Many(Vec<ConnEvent>),
@@ -149,21 +145,10 @@ pub(crate) async fn dial_realtime(
     })
 }
 
-/// One request of the machine on a stream of its own. A refusal is an
-/// error.
-async fn dial_request(dialer: ChannelDialer, request: Request) -> anyhow::Result<Reply> {
-    // Bulk answers wait behind interactive traffic; everything else is
-    // someone waiting on a keypress, as urgent as the control stream.
-    let priority = match &request {
-        Request::GuiTelemetryUpload { .. } => None,
-        _ => Some(1),
-    };
-    let mut stream = dialer.open(priority).await?;
-    write_frame(&mut stream, &Open::Host(HostOpen::Request(request))).await?;
-    match read_frame(&mut stream).await? {
-        Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
+/// One call of the machine on a stream of its own. A refusal is an error.
+async fn dial_call<C: host::Call>(dialer: ChannelDialer, call: C) -> anyhow::Result<C::Reply> {
+    let mut stream = dialer.open(C::PRIORITY).await?;
+    host::call(&mut stream, call).await
 }
 
 async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
@@ -176,10 +161,7 @@ async fn dial_gui_telemetry(dialer: ChannelDialer, snapshot: Vec<u8>) -> anyhow:
         snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot is too large"
     );
-    match dial_request(dialer, Request::GuiTelemetryUpload { snapshot }).await? {
-        Reply::GuiTelemetryStored { path } => Ok(path),
-        _ => anyhow::bail!("unexpected reply to a GUI telemetry upload"),
-    }
+    dial_call(dialer, host::GuiTelemetryUpload { snapshot }).await
 }
 
 pub struct Connection {
@@ -209,8 +191,20 @@ impl Link {
         }
     }
 
+    /// Puts the host in this process: every stream opened from now on is
+    /// handed over here, far end first, for a test to answer as the host
+    /// would. A supervisor's next connection takes the host back.
+    pub fn connect_in_process(&self) -> tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream> {
+        let (streams, opened) = tokio::sync::mpsc::unbounded_channel();
+        *self.dialer.lock().unwrap() = Some(ChannelDialer::InProcess(streams));
+        opened
+    }
+
     /// Runs `work` against the host on the connection's runtime. The answer
-    /// needs no particular executor; dropping it cancels the work.
+    /// needs no particular executor; dropping it cancels the work. An
+    /// in-process host's work runs in the answer itself, on whatever
+    /// executor polls it: nothing in it needs a runtime, and a test steps
+    /// it with everything else.
     pub fn run<T, F>(
         &self,
         work: impl FnOnce(Dialer) -> F,
@@ -220,18 +214,21 @@ impl Link {
         T: Send + 'static,
     {
         let dialer = self.dialer.lock().unwrap().clone();
+        if let Some(dialer @ ChannelDialer::InProcess(_)) = dialer {
+            return futures::future::Either::Left(work(dialer));
+        }
         let task = match (&self.runtime, dialer) {
             (Some(runtime), Some(dialer)) => Some(AbortOnDrop(runtime.spawn(work(dialer)))),
             _ => None,
         };
-        async move {
+        futures::future::Either::Right(async move {
             let Some(mut task) = task else {
                 anyhow::bail!("not connected to rho-daemon");
             };
             (&mut task.0)
                 .await
                 .map_err(|error| anyhow::anyhow!("connection task failed: {error}"))?
-        }
+        })
     }
 }
 
@@ -284,13 +281,13 @@ impl Connection {
         self.link.clone()
     }
 
-    /// Makes one request of the machine on a stream of its own. The answer
+    /// Makes one call of the machine on a stream of its own. The answer
     /// needs no particular executor; a refusal is an error.
-    pub fn request(
+    pub fn call<C: host::Call>(
         &self,
-        request: Request,
-    ) -> impl Future<Output = anyhow::Result<Reply>> + Send + 'static {
-        self.link.run(|dialer| dial_request(dialer, request))
+        call: C,
+    ) -> impl Future<Output = anyhow::Result<C::Reply>> + Send + 'static {
+        self.link.run(|dialer| dial_call(dialer, call))
     }
 }
 
@@ -427,22 +424,10 @@ async fn run(
     };
     write_frame(&mut stream, &Open::Host(HostOpen::Control)).await?;
     let frame: ControlFrame = read_frame(&mut stream).await?;
-    let ControlFrame::Ready {
-        auth,
-        machine_seed,
-        agent_counter,
-    } = frame
-    else {
+    let ControlFrame::Ready = frame else {
         anyhow::bail!("rho daemon did not send ready message");
     };
-    if events
-        .unbounded_send(ConnEvent::Ready {
-            auth,
-            machine_seed,
-            agent_counter,
-        })
-        .is_err()
-    {
+    if events.unbounded_send(ConnEvent::Ready).is_err() {
         return Ok(());
     }
     *connected = true;
@@ -526,16 +511,7 @@ async fn run(
             ControlFrame::DesktopSessions { sessions } => {
                 Some(ConnEvent::DesktopSessions(sessions))
             }
-            ControlFrame::Ready {
-                auth,
-                machine_seed,
-                agent_counter,
-            } => Some(ConnEvent::Ready {
-                auth,
-                machine_seed,
-                agent_counter,
-            }),
-            ControlFrame::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
+            ControlFrame::Ready => Some(ConnEvent::Ready),
             ControlFrame::GitTransportRequested {
                 request_id,
                 provider_id,

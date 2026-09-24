@@ -5,19 +5,23 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_host_proto::agents::{ClientFrame, Reply, Request, ServerFrame};
+use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 use rho_agent_host_proto::transcript::Seq;
-use rho_agent_host_proto::{AgentCommand, Open, agents, host, read_frame, write_frame};
+use rho_agent_host_proto::{
+    AgentCommand, AgentId, Answer, NewAgent, Open, agents, host, read_frame, write_frame,
+};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
-/// A frame from the agents stream or a reply, in the order it was read.
+/// A frame from the agents stream or an answer, in the order it was read.
 pub enum Incoming {
     Agents(ServerFrame),
-    /// The answer to a command sent with [`Streams::send`].
-    Reply(Reply),
+    /// The agent [`Streams::create`] asked for.
+    Created(AgentId),
+    /// A call the daemon would not make, and why.
+    Refused(String),
 }
 
 pub struct Streams {
@@ -81,26 +85,43 @@ impl Streams {
         })
     }
 
-    /// Sends `command` on a request stream of its own; its reply arrives
-    /// as [`Incoming::Reply`].
+    /// Starts an agent on a call stream of its own; the agent arrives as
+    /// [`Incoming::Created`].
+    pub fn create(&self, new: NewAgent) {
+        self.call(new, |agent_id| Some(Incoming::Created(agent_id)));
+    }
+
+    /// Sends `command` on a call stream of its own. Only a refusal says
+    /// anything.
     pub fn send(&self, command: AgentCommand) {
+        self.call(command, |()| None);
+    }
+
+    fn call<C: agents::Call>(&self, call: C, answered: fn(C::Reply) -> Option<Incoming>) {
         let socket = self.socket.clone();
         let tx = self.incoming_tx.clone();
         tokio::spawn(async move {
-            // A refusal is a reply like any other here: the harness
-            // decides what it means.
-            let reply = async {
+            let answer = async {
                 let mut client = Client::connect(&socket).await?;
                 client
-                    .send(&Open::Agents(agents::Open::Request(Request::Command(
-                        command,
-                    ))))
+                    .send(&Open::Agents(agents::Open::Request(call.into())))
                     .await?;
-                client.recv().await
+                client.recv::<Answer<C::Reply>>().await
             }
-            .await
-            .map(Incoming::Reply);
-            let _ = tx.send(reply);
+            .await;
+            // A refusal is an answer like any other here: the harness
+            // decides what it means.
+            let incoming = match answer {
+                Ok(Answer::Done(reply)) => answered(reply),
+                Ok(Answer::Failed { reason }) => Some(Incoming::Refused(reason)),
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                    return;
+                }
+            };
+            if let Some(incoming) = incoming {
+                let _ = tx.send(Ok(incoming));
+            }
         });
     }
 

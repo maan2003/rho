@@ -505,7 +505,7 @@ impl AsyncWrite for Stream {
     }
 }
 
-/// A reusable way to open an application stream over either supported
+/// A reusable way to open an application stream over any supported
 /// transport. Authentication and endpoint ownership remain with the caller.
 #[derive(Clone)]
 pub enum Dialer {
@@ -515,6 +515,10 @@ pub enum Dialer {
         connection: iroh::endpoint::Connection,
         media: moq_tokio::shared_iroh::Mux,
     },
+    /// A host in this process: each stream is an in-memory pipe whose far
+    /// end goes to the host. Nothing on it needs a reactor, so what runs
+    /// over it can run on any executor.
+    InProcess(tokio::sync::mpsc::UnboundedSender<Stream>),
 }
 
 impl Dialer {
@@ -530,9 +534,21 @@ impl Dialer {
                 }
                 Ok(Stream::new(recv, send))
             }
+            Self::InProcess(host) => {
+                let (near, far) = tokio::io::duplex(IN_PROCESS_BUFFER);
+                let (far_reader, far_writer) = tokio::io::split(far);
+                host.send(Stream::new(far_reader, far_writer))
+                    .map_err(|_| anyhow::anyhow!("the in-process host has gone"))?;
+                let (reader, writer) = tokio::io::split(near);
+                Ok(Stream::new(reader, writer))
+            }
         }
     }
 }
+
+/// How much one direction of an in-process stream holds before its writer
+/// waits for the reader.
+const IN_PROCESS_BUFFER: usize = 1 << 20;
 
 /// Connects and version-negotiates a compressed Unix application stream.
 #[cfg(unix)]

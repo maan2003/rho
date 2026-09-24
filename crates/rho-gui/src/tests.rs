@@ -9256,7 +9256,11 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
                 Some((HostId::default(), context.clone())),
                 "Enter alone is create-from-here: the thing in view, not a place picked for it"
             );
-            workspace.clear_sent_for_test(HostId::default());
+        })
+        .unwrap();
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
         })
         .unwrap();
 
@@ -9271,18 +9275,15 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
 
+    let calls = story::calls(&mut host);
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| matches!(call, rho_agent_host_proto::agents::Request::New(_))),
+        "the draft started an agent"
+    );
     workspace
         .update(cx, |workspace, _, _| {
-            let sent = workspace.take_host_messages_for_test(HostId::default());
-            assert!(
-                sent.iter().any(|message| matches!(
-                    message,
-                    rho_agent_host_proto::agents::Request::Command(
-                        rho_agent_host_proto::AgentCommand::New { .. }
-                    )
-                )),
-                "the draft started an agent"
-            );
             // The daemon is never told where to file it: the client writes
             // that fact itself once the agent exists.
             assert_eq!(
@@ -10849,17 +10850,27 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
                 .update(cx, |draft, cx| draft.set_workdir_text("/tmp/repo", cx));
         })
         .expect("write the draft");
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
 
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            workspace.answer_host_request_for_test(
-                HostId::default(),
-                Err(anyhow::anyhow!("create workspace: no such repository")),
-            );
-        })
-        .expect("the daemon refuses");
+    let mut calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1, "the draft makes one call");
+    let (call, mut stream) = calls.pop().unwrap();
+    assert!(
+        matches!(call, rho_agent_host_proto::agents::Request::New(_)),
+        "the draft asked for a new agent: {call:?}"
+    );
+    story::answer(
+        &mut stream,
+        rho_agent_host_proto::Answer::<AgentId>::Failed {
+            reason: "create workspace: no such repository".to_owned(),
+        },
+    );
     cx.run_until_parked();
 
     let refusal = workspace

@@ -7,10 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[features]
-# Requests a caller's tests record and answer.
-test-support = []
-
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

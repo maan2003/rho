@@ -3,9 +3,9 @@ use std::io::{Read as _, Write as _};
 
 use anyhow::{Context as _, bail};
 use rho_agent_host_proto::PrCommand;
-use rho_agent_host_proto::host::{Reply, Request};
+use rho_agent_host_proto::host::{PlatformSecretsSet, PlatformStatus, Pr, PrOutput};
 
-use crate::{PrArgs, PrCliCommand, host_request};
+use crate::{PrArgs, PrCliCommand, host_call};
 
 pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
@@ -32,18 +32,15 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
         .to_owned();
     let runtime_paths = rho_agent_host_proto::RuntimePaths::new(Some(socket_path.clone()))?;
     loop {
-        let request = Request::Pr {
+        let call = Pr {
             agent_id: None,
             command: command.clone(),
         };
-        let Reply::Pr {
+        let PrOutput {
             output,
             data,
             is_error,
-        } = host_request(&socket_path, request).await?
-        else {
-            bail!("unexpected reply from the daemon");
-        };
+        } = host_call(&socket_path, call).await?;
         if is_error {
             bail!(output);
         }
@@ -135,19 +132,18 @@ async fn init(args: PrArgs) -> anyhow::Result<()> {
     let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let request = Request::PlatformSecretsSet {
+    let call = PlatformSecretsSet {
         secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
     };
-    match host_request(&socket_path, request).await? {
-        Reply::PlatformStatus {
+    match host_call(&socket_path, call).await? {
+        PlatformStatus {
             running: true,
             detail,
         } => {
             eprintln!("GitHub configured: {detail}");
             Ok(())
         }
-        Reply::PlatformStatus { detail, .. } => bail!(detail),
-        _ => bail!("unexpected reply from the daemon"),
+        PlatformStatus { detail, .. } => bail!(detail),
     }
 }
 

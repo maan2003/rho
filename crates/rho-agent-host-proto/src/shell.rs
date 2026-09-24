@@ -47,7 +47,7 @@ pub struct ShellStyleSpan {
     pub style: ShellTextStyle,
 }
 
-/// One workset-owned shell returned by [`crate::agents::Reply::ShellList`].
+/// One workset-owned shell returned by [`crate::agents::ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
     /// Encoded agent id ("eng-ht08").

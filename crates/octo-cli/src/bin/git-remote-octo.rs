@@ -5,7 +5,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result};
 use reqwest::Url;
-use rho_agent_host_proto::host::{Reply, Request};
+use rho_agent_host_proto::host::GitTransportPolicy;
 use rho_agent_host_proto::{GitService, GitTransportRequest, Open, Opened, host};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -64,18 +64,14 @@ async fn query_pat_available(host: &str) -> Result<bool> {
     let socket = rho_agent_host_proto::RuntimePaths::from_env()?
         .socket()
         .to_owned();
-    let reply = rho_agent_host_proto::client::host(
+    rho_agent_host_proto::client::host(
         &socket,
-        Request::GitTransportPolicy {
+        GitTransportPolicy {
             host: host.to_owned(),
         },
     )
     .await
-    .with_context(|| format!("ask the rho daemon at {}", socket.display()))?;
-    match reply {
-        Reply::GitTransportPolicy { pat_available } => Ok(pat_available),
-        reply => anyhow::bail!("unexpected Git transport policy reply: {reply:?}"),
-    }
+    .with_context(|| format!("ask the rho daemon at {}", socket.display()))
 }
 
 fn run_raw_remote_helper(remote_name: &str, mut remote: Remote) -> Result<()> {

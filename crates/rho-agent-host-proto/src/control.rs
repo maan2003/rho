@@ -7,7 +7,7 @@
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::{AuthState, DesktopSession, GitTransportRequest};
+use crate::{DesktopSession, GitTransportRequest};
 
 /// What a GUI says on its control stream.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -21,22 +21,8 @@ pub enum ClientFrame {
 /// What a host pushes on a control stream.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerFrame {
-    /// The host as it stands: the first frame, and again whenever the
-    /// agents it holds change.
-    Ready {
-        auth: AuthState,
-        /// The daemon database's machine seed; clients need it to encode
-        /// agent IDs (see [`crate::AgentIdDomain`]).
-        machine_seed: u64,
-        /// Last allocated agent-id counter; clients use it for uniform
-        /// short-prefix rendering.
-        agent_counter: u64,
-    },
-    /// The host's active/default auth changed, or its available namespaces
-    /// were refreshed.
-    AuthState {
-        auth: AuthState,
-    },
+    /// The first frame: the host is up.
+    Ready,
     DesktopSessions {
         sessions: Vec<DesktopSession>,
     },

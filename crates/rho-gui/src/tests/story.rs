@@ -7,10 +7,14 @@ use std::collections::HashMap;
 use rho_agent_host_proto::transcript::{
     AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
 };
-use rho_agent_host_proto::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
+use rho_agent_host_proto::{
+    AgentId, AgentRole, Answer, MessageDelivery, Open, Place, UnixMs, agents, read_frame,
+    write_frame,
+};
 use rho_agents_client::stream::AgentFrame;
 use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::ConnEvent;
+use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
 pub type UiSpawnedBy = rho_agent_host_proto::transcript::SpawnedBy;
@@ -211,23 +215,45 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
     // row so far is caught up.
     let journal_head = NEXT_SEQ.with(|next| Seq(next.get() - 1));
     Frame::Many(vec![
-        ConnEvent::Ready {
+        ConnEvent::Ready.into(),
+        AgentFrame::JournalHead {
+            machine_seed: 0,
+            journal_head,
+            agent_counter,
+        }
+        .into(),
+        AgentFrame::Auth {
             auth: rho_agent_host_proto::AuthState {
                 namespaces: Vec::new(),
                 disabled_namespaces: Vec::new(),
                 active_namespace: None,
             },
-            machine_seed: 0,
-            agent_counter,
-        }
-        .into(),
-        AgentFrame::JournalHead {
-            machine_seed: 0,
-            journal_head,
         }
         .into(),
         AgentFrame::Log { entries }.into(),
     ])
+}
+
+/// The calls a host in this process has been asked so far
+/// ([`crate::workspace::Workspace::host_in_process_for_test`]), each with
+/// the stream to answer it on.
+pub fn calls(
+    streams: &mut tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream>,
+) -> Vec<(agents::Request, rho_rpc::Stream)> {
+    let mut calls = Vec::new();
+    while let Ok(mut stream) = streams.try_recv() {
+        let open = futures::executor::block_on(read_frame::<_, Open>(&mut stream))
+            .expect("a stream opens by saying what it is for");
+        if let Open::Agents(agents::Open::Request(request)) = open {
+            calls.push((request, stream));
+        }
+    }
+    calls
+}
+
+/// Answers a call as the daemon would.
+pub fn answer<T: Packer + Unpacker>(stream: &mut rho_rpc::Stream, answer: Answer<T>) {
+    futures::executor::block_on(write_frame(stream, &answer)).expect("answer the call");
 }
 
 /// A run of one agent's story, each row past the last one told.

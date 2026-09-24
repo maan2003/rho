@@ -5,15 +5,14 @@
 //! pages never queues ahead of anything else, and its reader is the agents
 //! client alone. Every frame after the opening one is a [`ClientFrame`] or
 //! a [`ServerFrame`]. Whatever else is asked of the agents is a stream of
-//! its own: one [`Request`] answered with one [`Reply`], or a terminal,
-//! shell or workspace channel.
+//! its own: one [`Call`], or a terminal, shell or workspace channel.
 
-use senax_encoder::{Decode, Encode, Pack, Unpack};
+use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 use crate::transcript::{AgentPos, DetailBody, Live, LogEntry, Seq};
 use crate::{
-    AgentCommand, AgentCostSeries, AgentId, AgentUsageSeries, QuotaSeries, QuotaSummary,
-    WorkspaceInfo, shell, term,
+    AgentCommand, AgentCostSeries, AgentId, AgentUsageSeries, AuthState, NewAgent, QuotaSeries,
+    QuotaSummary, WorkspaceInfo, shell, term,
 };
 
 /// What an agents stream is for.
@@ -21,7 +20,8 @@ use crate::{
 pub enum Open {
     /// The journal and the live tails, for as long as the client stays.
     Session,
-    /// One request, answered with one [`Reply`]; then the stream closes.
+    /// One [`Call`], answered with one [`crate::Answer`]; then the stream
+    /// closes.
     Request(Request),
     /// A daemon-owned terminal for an agent. Answered with
     /// [`crate::Opened`]; an attached stream then carries
@@ -32,14 +32,14 @@ pub enum Open {
         /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
         agent: String,
         /// Client-chosen id, unique among the agent's running terminals
-        /// ([`Request::TerminalList`] enumerates them).
+        /// ([`TerminalList`] enumerates them).
         terminal_id: u64,
         open: term::TerminalOpen,
         /// The client's viewport, applied to the PTY (last writer wins).
         cols: u16,
         rows: u16,
     },
-    /// Attaches to an agent's running shell ([`Request::ShellStart`]).
+    /// Attaches to an agent's running shell ([`ShellStart`]).
     /// Answered with [`crate::Opened`], then [`shell`] frames. Closing the
     /// stream only detaches; the shell keeps running.
     Shell { agent: String },
@@ -51,90 +51,140 @@ pub enum Open {
     Workspace { workspace: WorkspaceInfo },
 }
 
-/// What a client can ask of a host's agents in one round trip.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum Request {
-    /// Answered with [`Reply::AgentCreated`] for [`AgentCommand::New`] and
-    /// [`Reply::Done`] for the rest.
-    Command(AgentCommand),
-    /// Every running terminal, of one agent if it names one (display
-    /// handle or id prefix). Answered with [`Reply::TerminalList`].
-    TerminalList { agent: Option<String> },
-    /// Starts the daemon-owned Comint-style shell for an agent. Attaching
-    /// is [`Open::Shell`].
-    ShellStart { agent: String },
-    /// Running shells, of one agent if it names one. Answered with
-    /// [`Reply::ShellList`].
-    ShellList { agent: Option<String> },
-    /// Stops an agent's running shell gracefully.
-    ShellClose { agent: String },
-    /// A recorded visualization. Answered with [`Reply::Visualization`].
-    Visualization { id: String },
-    /// Stores an immutable visualization snapshot. Answered with
-    /// [`Reply::VisualizationRecorded`].
-    RecordVisualization { mime_type: String, content: Vec<u8> },
-    /// Answered with [`Reply::QuotaUsage`].
-    QuotaUsage,
-    /// Answered with [`Reply::QuotaHistory`].
-    QuotaHistory,
-    /// Answered with [`Reply::GlobalUsage`].
-    GlobalUsage { since_ms: u64 },
-    /// Raw per-agent usage needed to form cost distributions beginning at
-    /// `since_ms`, with the fixed trailing-window lookback. Answered with
-    /// [`Reply::AgentCostDistribution`].
-    AgentCostDistribution { since_ms: u64 },
-    /// Which Claude accounts exist and which one agents run on. Answered
-    /// with [`Reply::ClaudeAccounts`].
-    ClaudeAccounts,
-    /// Puts every agent on `name` from its next turn. Answered with
-    /// [`Reply::ClaudeAccounts`] as it stands after the switch.
-    SetClaudeAccount { name: String },
-    /// Enables or disables one provider account namespace on this host.
-    SetAuthAccountEnabled { name: String, enabled: bool },
+/// A one-shot call on the agents: a stream of its own that opens with
+/// [`Open::Request`] and is answered with one [`crate::Answer`] of its
+/// reply.
+pub trait Call: Into<Request> + Send + 'static {
+    type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
+    /// The stream's priority: as urgent as the control stream unless the
+    /// answer is bulk.
+    const PRIORITY: Option<i32> = Some(1);
 }
 
-/// The answer to a [`Request`].
+calls! {
+    /// Every call the agents answer, as it goes on the wire.
+    pub enum Request {
+        /// Answered with the new agent's id.
+        New(NewAgent) -> AgentId;
+        Command(AgentCommand) -> ();
+        TerminalList(TerminalList) -> Vec<term::TerminalInfo>;
+        ShellStart(ShellStart) -> ();
+        ShellList(ShellList) -> Vec<shell::ShellInfo>;
+        ShellClose(ShellClose) -> ();
+        // Bulk: an answer that waits behind interactive traffic.
+        Visualization(Visualization) -> VisualizationContent, priority None;
+        /// Answered with the recorded visualization's id.
+        RecordVisualization(RecordVisualization) -> String;
+        QuotaUsage(QuotaUsage) -> Vec<QuotaSummary>;
+        QuotaHistory(QuotaHistory) -> Vec<QuotaSeries>;
+        GlobalUsage(GlobalUsage) -> Vec<AgentUsageSeries>;
+        AgentCostDistribution(AgentCostDistribution) -> Vec<AgentCostSeries>;
+        ClaudeAccounts(ClaudeAccounts) -> ClaudeAccountList;
+        /// Answered with the accounts as they stand after the switch.
+        SetClaudeAccount(SetClaudeAccount) -> ClaudeAccountList;
+        SetAuthAccountEnabled(SetAuthAccountEnabled) -> ();
+    }
+}
+
+/// Makes one call on `stream`, a stream opened for it. A refusal is an
+/// error.
+pub async fn call<S, C>(stream: &mut S, call: C) -> anyhow::Result<C::Reply>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    C: Call,
+{
+    let open = crate::Open::Agents(Open::Request(call.into()));
+    crate::write_frame(stream, &open).await?;
+    crate::read_frame::<_, crate::Answer<C::Reply>>(stream)
+        .await?
+        .into_result()
+}
+
+/// Every running terminal, of one agent if it names one (display handle or
+/// id prefix).
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum Reply {
-    /// Done, with nothing to say.
-    Done,
-    /// Not done, and why: the whole chain of causes.
-    Failed {
-        reason: String,
-    },
-    AgentCreated {
-        agent_id: AgentId,
-    },
-    TerminalList {
-        terminals: Vec<term::TerminalInfo>,
-    },
-    ShellList {
-        shells: Vec<shell::ShellInfo>,
-    },
-    Visualization {
-        id: String,
-        mime_type: String,
-        content: Vec<u8>,
-    },
-    VisualizationRecorded {
-        id: String,
-    },
-    QuotaUsage {
-        summaries: Vec<QuotaSummary>,
-    },
-    QuotaHistory {
-        series: Vec<QuotaSeries>,
-    },
-    GlobalUsage {
-        series: Vec<AgentUsageSeries>,
-    },
-    AgentCostDistribution {
-        series: Vec<AgentCostSeries>,
-    },
-    ClaudeAccounts {
-        accounts: Vec<String>,
-        current: String,
-    },
+pub struct TerminalList {
+    pub agent: Option<String>,
+}
+
+/// Starts the daemon-owned Comint-style shell for an agent. Attaching is
+/// [`Open::Shell`].
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellStart {
+    pub agent: String,
+}
+
+/// Running shells, of one agent if it names one.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellList {
+    pub agent: Option<String>,
+}
+
+/// Stops an agent's running shell gracefully.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellClose {
+    pub agent: String,
+}
+
+/// A recorded visualization.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Visualization {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct VisualizationContent {
+    pub mime_type: String,
+    pub content: Vec<u8>,
+}
+
+/// Stores an immutable visualization snapshot.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct RecordVisualization {
+    pub mime_type: String,
+    pub content: Vec<u8>,
+}
+
+/// Every provider's quota as it stands.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaUsage;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaHistory;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GlobalUsage {
+    pub since_ms: u64,
+}
+
+/// Raw per-agent usage needed to form cost distributions beginning at
+/// `since_ms`, with the fixed trailing-window lookback.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct AgentCostDistribution {
+    pub since_ms: u64,
+}
+
+/// Which Claude accounts exist and which one agents run on.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ClaudeAccounts;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ClaudeAccountList {
+    pub accounts: Vec<String>,
+    pub current: String,
+}
+
+/// Puts every agent on `name` from its next turn.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct SetClaudeAccount {
+    pub name: String,
+}
+
+/// Enables or disables one provider account namespace on this host.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct SetAuthAccountEnabled {
+    pub name: String,
+    pub enabled: bool,
 }
 
 /// What a client says on its agents session.
@@ -176,7 +226,13 @@ pub enum ServerFrame {
     JournalHead {
         machine_seed: u64,
         journal_head: Seq,
+        /// The last agent-id counter handed out, for short-prefix
+        /// rendering.
+        agent_counter: u64,
     },
+    /// Which provider accounts agents may run on: after the opening
+    /// [`ServerFrame::JournalHead`], and again whenever it changes.
+    Auth { auth: AuthState },
     /// A run of the host's journal in order: the answer to
     /// [`ClientFrame::Follow`], paged, and afterwards every append as it
     /// lands. Entries never repeat and never skip within one stream.
@@ -190,8 +246,12 @@ pub enum ServerFrame {
         pos: AgentPos,
         body: DetailBody,
     },
-    /// An agent was created on the host, by any client or agent.
-    AgentCreated { agent_id: AgentId },
+    /// An agent was created on the host, by any client or agent, and the
+    /// agent-id counter moved to `agent_counter`.
+    AgentCreated {
+        agent_id: AgentId,
+        agent_counter: u64,
+    },
     /// Every provider's quota as it stands: after the opening
     /// [`ServerFrame::JournalHead`], whenever an observation changes it,
     /// and every ten minutes besides, because burn and resets move with

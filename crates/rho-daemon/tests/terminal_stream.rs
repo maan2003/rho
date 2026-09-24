@@ -6,12 +6,12 @@
 
 use std::time::Duration;
 
-use rho_agent_host_proto::agents::{Reply, Request};
+use rho_agent_host_proto::agents::TerminalList;
 use rho_agent_host_proto::term::{
     ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalOpen, WireScreen,
 };
 use rho_agent_host_proto::{
-    AgentCommand, AgentId, Open, Opened, StartMode, agents, read_frame, write_frame,
+    AgentId, NewAgent, Open, Opened, StartMode, agents, read_frame, write_frame,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -88,11 +88,11 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     }
 
     // Create an agent on a clone of the temp repository.
-    let created = tokio::time::timeout(
+    let agent_id = tokio::time::timeout(
         Duration::from_secs(30),
         rho_agent_host_proto::client::agents(
             &socket_path,
-            Request::Command(AgentCommand::New {
+            NewAgent {
                 role: Default::default(),
                 start: StartMode::NewOn {
                     repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
@@ -100,14 +100,10 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
                 },
                 mode: rho_agent_host_proto::WorksetMode::View,
                 content: None,
-            }),
+            },
         ),
     )
     .await??;
-    let agent_id = match created {
-        Reply::AgentCreated { agent_id } => agent_id,
-        other => panic!("agent creation failed: {other:?}"),
-    };
 
     // Attaching before anything was created must be refused.
     let refused = open_terminal(&socket_path, agent_id, false).await;
@@ -126,18 +122,14 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     // The listing sees the running terminal.
     let list = rho_agent_host_proto::client::agents(
         &socket_path,
-        Request::TerminalList {
+        TerminalList {
             agent: Some(agent_id.encoded()),
         },
     );
-    match tokio::time::timeout(Duration::from_secs(30), list).await?? {
-        Reply::TerminalList { terminals } => {
-            assert_eq!(terminals.len(), 1, "one terminal should be running");
-            assert_eq!(terminals[0].terminal_id, 7);
-            assert_eq!(terminals[0].clients, 1);
-        }
-        other => panic!("unexpected terminal list reply: {other:?}"),
-    }
+    let terminals = tokio::time::timeout(Duration::from_secs(30), list).await??;
+    assert_eq!(terminals.len(), 1, "one terminal should be running");
+    assert_eq!(terminals[0].terminal_id, 7);
+    assert_eq!(terminals[0].clients, 1);
     drop(stream);
 
     // Second attach after detach: the shell kept running, and the snapshot

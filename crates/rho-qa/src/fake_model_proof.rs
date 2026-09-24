@@ -13,12 +13,12 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, Reply, ServerFrame as AgentsServerFrame,
+    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
 };
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
 use rho_agent_host_proto::{
-    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, StartMode,
+    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, NewAgent, StartMode,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;
@@ -205,7 +205,7 @@ async fn run_async(args: Args) -> Result<()> {
     };
     let submitted = Instant::now();
     for index in 0..agent_count {
-        client.send(AgentCommand::New {
+        client.create(NewAgent {
             role: AgentRole::default(),
             start: StartMode::NewOn {
                 repo: repo.clone(),
@@ -284,7 +284,7 @@ async fn run_async(args: Args) -> Result<()> {
                 )
             })??;
         match message {
-            Incoming::Reply(Reply::AgentCreated { agent_id }) => {
+            Incoming::Created(agent_id) => {
                 agents.insert(agent_id);
                 ensure!(
                     agents.len() <= agent_count,
@@ -441,7 +441,7 @@ async fn run_async(args: Args) -> Result<()> {
                     _ => bail!("daemon Detail body did not match its journal event"),
                 }
             }
-            Incoming::Reply(Reply::Failed { reason }) => {
+            Incoming::Refused(reason) => {
                 bail!("daemon refused proof action: {reason}")
             }
             _ => {}

@@ -10,6 +10,53 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
+/// Declares a part's one-shot calls. Each is a type of its own that names
+/// its answer ([`Call::Reply`]); `Request` is what goes on the wire, one
+/// variant per call. A call is answered with one [`Answer`] of its reply
+/// type, on a stream of its own.
+///
+/// [`Call::Reply`]: agents::Call::Reply
+macro_rules! calls {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum Request {
+            $(
+                $(#[$meta:meta])*
+                $variant:ident($call:ty) -> $reply:ty $(, priority $priority:expr)?;
+            )*
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+        pub enum Request {
+            $($(#[$meta])* $variant($call),)*
+        }
+
+        impl Request {
+            /// Its answer, read from `frame`, as a protocol log prints it.
+            #[cfg(not(target_family = "wasm"))]
+            pub(crate) fn debug_answer(&self, frame: &[u8]) -> String {
+                match self {
+                    $(Self::$variant(_) => crate::debug_frame::<crate::Answer<$reply>>(frame),)*
+                }
+            }
+        }
+
+        $(
+            impl From<$call> for Request {
+                fn from(call: $call) -> Self {
+                    Self::$variant(call)
+                }
+            }
+
+            impl Call for $call {
+                type Reply = $reply;
+                $(const PRIORITY: Option<i32> = $priority;)?
+            }
+        )*
+    };
+}
+
 pub mod agents;
 pub mod client;
 pub mod control;
@@ -37,9 +84,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/18";
+pub const IROH_ALPN: &[u8] = b"rho/ui/19";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP18";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP19";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,19 +204,22 @@ pub enum GitProvided {
     Done,
 }
 
-/// What a client tells a host to do to its agents.
+/// A new agent for a host to start.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct NewAgent {
+    pub role: AgentRole,
+    /// Where the agent's working copy starts (including which repo, for
+    /// the modes that need one).
+    pub start: StartMode,
+    /// How the agent sees the filesystem around its workset: a minimal
+    /// generated root, or the host.
+    pub mode: WorksetMode,
+    pub content: Option<Vec<ContentPart>>,
+}
+
+/// What a client tells a host to do to one of its agents.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum AgentCommand {
-    New {
-        role: AgentRole,
-        /// Where the agent's working copy starts (including which repo, for
-        /// the modes that need one).
-        start: StartMode,
-        /// How the agent sees the filesystem around its workset: a minimal
-        /// generated root, or the host.
-        mode: WorksetMode,
-        content: Option<Vec<ContentPart>>,
-    },
     Send {
         agent_id: AgentId,
         content: Vec<ContentPart>,
@@ -207,10 +257,9 @@ pub enum AgentCommand {
 }
 
 impl AgentCommand {
-    /// The agent the command is for; `None` for a new one.
-    pub fn agent_id(&self) -> Option<AgentId> {
+    /// The agent the command is for.
+    pub fn agent_id(&self) -> AgentId {
         match self {
-            Self::New { .. } => None,
             Self::Send { agent_id, .. }
             | Self::Compact { agent_id, .. }
             | Self::ChangeRole { agent_id, .. }
@@ -218,7 +267,7 @@ impl AgentCommand {
             | Self::Cancel { agent_id }
             | Self::Rewind { agent_id, .. }
             | Self::Continue { agent_id }
-            | Self::ChangePromptCacheKey { agent_id } => Some(*agent_id),
+            | Self::ChangePromptCacheKey { agent_id } => *agent_id,
         }
     }
 }
@@ -378,6 +427,48 @@ pub struct AuthState {
     pub namespaces: Vec<String>,
     pub disabled_namespaces: Vec<String>,
     pub active_namespace: Option<String>,
+}
+
+/// The answer to a one-shot call: what it asked for, or why the host
+/// would not.
+#[derive(Clone, Debug, PartialEq, Pack, Unpack)]
+pub enum Answer<T: Packer + Unpacker> {
+    Done(T),
+    /// Not done, and why: the whole chain of causes.
+    Failed {
+        reason: String,
+    },
+}
+
+impl<T: Packer + Unpacker> Answer<T> {
+    pub fn into_result(self) -> anyhow::Result<T> {
+        match self {
+            Self::Done(reply) => Ok(reply),
+            Self::Failed { reason } => Err(anyhow::anyhow!(reason)),
+        }
+    }
+}
+
+impl<T: Packer + Unpacker> From<anyhow::Result<T>> for Answer<T> {
+    fn from(result: anyhow::Result<T>) -> Self {
+        match result {
+            Ok(reply) => Self::Done(reply),
+            // The whole chain, not just the outermost context: a new agent
+            // that failed said "create managed workspace" and kept the
+            // reason to itself, which is not something a reader can act on.
+            Err(error) => Self::Failed {
+                reason: format!("{error:#}"),
+            },
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn debug_frame<T: Unpacker + std::fmt::Debug>(mut frame: &[u8]) -> String {
+    match senax_encoder::unpack::<T>(&mut frame) {
+        Ok(value) => format!("{value:#?}"),
+        Err(error) => format!("(undecodable: {error})"),
+    }
 }
 
 /// Encode and write one length-prefixed senax frame.
@@ -588,16 +679,10 @@ pub fn print_protocol_log(
             // request's reply is read here.
             ProtocolLogDirection::ServerToClient => {
                 let message = match &opened {
-                    Some(Open::Agents(agents::Open::Request(_))) => {
-                        let reply: agents::Reply =
-                            senax_encoder::unpack(&mut payload).context("unpack agents reply")?;
-                        format!("{reply:#?}")
+                    Some(Open::Agents(agents::Open::Request(request))) => {
+                        request.debug_answer(payload)
                     }
-                    Some(Open::Host(host::Open::Request(_))) => {
-                        let reply: host::Reply =
-                            senax_encoder::unpack(&mut payload).context("unpack host reply")?;
-                        format!("{reply:#?}")
-                    }
+                    Some(Open::Host(host::Open::Request(request))) => request.debug_answer(payload),
                     _ => "(stream frame)".to_owned(),
                 };
                 writeln!(
@@ -680,7 +765,7 @@ mod tests {
 
     #[test]
     fn protocol_log_records_full_length_prefixed_frame() {
-        let open = Open::Host(host::Open::Request(host::Request::Snapshot));
+        let open = Open::Host(host::Open::Request(host::Snapshot.into()));
         let frame = protocol_frame_bytes(&open).unwrap();
         let mut log = Vec::new();
         append_protocol_log_record(&mut log, 123, ProtocolLogDirection::ClientToServer, &frame)
@@ -701,7 +786,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP17\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP18\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -709,7 +794,7 @@ mod tests {
     fn requests_and_replies_round_trip() {
         let agent_id = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
         for request in [
-            host::Request::Pr {
+            host::Pr {
                 agent_id: Some("eng-abcd".into()),
                 command: PrCommand::Edit {
                     url: "https://github.com/acme/widgets/pull/1".into(),
@@ -717,30 +802,38 @@ mod tests {
                     title: Some("Better title".into()),
                     body: Some("Better summary".into()),
                 },
-            },
-            host::Request::GitTransportPolicy {
+            }
+            .into(),
+            host::GitTransportPolicy {
                 host: "github.com".to_owned(),
-            },
-            host::Request::GuiTelemetryUpload {
+            }
+            .into(),
+            host::GuiTelemetryUpload {
                 snapshot: br#"{"version":1}"#.to_vec(),
-            },
+            }
+            .into(),
+            host::Snapshot.into(),
         ] {
             round_trips(Open::Host(host::Open::Request(request)));
         }
         for request in [
-            agents::Request::SetAuthAccountEnabled {
+            agents::SetAuthAccountEnabled {
                 name: "work".to_owned(),
                 enabled: false,
-            },
-            agents::Request::AgentCostDistribution { since_ms: 42 },
-            agents::Request::RecordVisualization {
+            }
+            .into(),
+            agents::AgentCostDistribution { since_ms: 42 }.into(),
+            agents::RecordVisualization {
                 mime_type: "image/svg+xml".to_owned(),
                 content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-            },
-            agents::Request::ShellStart {
+            }
+            .into(),
+            agents::ShellStart {
                 agent: "eng-test".to_owned(),
-            },
-            agents::Request::Command(AgentCommand::Send {
+            }
+            .into(),
+            agents::QuotaUsage.into(),
+            AgentCommand::Send {
                 agent_id,
                 content: vec![
                     ContentPart::Text {
@@ -752,69 +845,52 @@ mod tests {
                     },
                 ],
                 delivery: MessageDelivery::NextRequest,
-            }),
+            }
+            .into(),
         ] {
-            round_trips(Open::Agents(agents::Open::Request(request)));
+            round_trips::<Open>(Open::Agents(agents::Open::Request(request)));
         }
-        for reply in [
-            agents::Reply::GlobalUsage {
-                series: vec![AgentUsageSeries {
-                    model: "fable".to_owned(),
-                    buckets: vec![AgentUsageBucket {
-                        bucket_start_ms: 300_000,
-                        input_tokens: 10,
-                        ..AgentUsageBucket::default()
-                    }],
-                }],
-            },
-            agents::Reply::AgentCostDistribution {
-                series: vec![AgentCostSeries {
-                    agent_id,
-                    model: "gpt".to_owned(),
-                    buckets: vec![AgentUsageBucket {
-                        bucket_start_ms: 3_600_000,
-                        output_tokens: 10,
-                        requests: 1,
-                        ..AgentUsageBucket::default()
-                    }],
-                }],
-            },
-            agents::Reply::Visualization {
-                id: "0123456789abcdef0123456789abcdef".to_owned(),
-                mime_type: "image/svg+xml".to_owned(),
-                content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-            },
-            agents::Reply::AgentCreated { agent_id },
-            agents::Reply::Failed {
-                reason: "no such repository".to_owned(),
-            },
-        ] {
-            round_trips(reply);
-        }
-        for reply in [
-            host::Reply::GitTransportPolicy {
-                pat_available: true,
-            },
-            host::Reply::GuiTelemetryStored {
-                path: "/state/rho/gui-telemetry/snapshot.json".to_owned(),
-            },
-            host::Reply::Failed {
-                reason: "no such pull request".to_owned(),
-            },
-        ] {
-            round_trips(reply);
-        }
+        round_trips(Answer::Done(vec![AgentUsageSeries {
+            model: "fable".to_owned(),
+            buckets: vec![AgentUsageBucket {
+                bucket_start_ms: 300_000,
+                input_tokens: 10,
+                ..AgentUsageBucket::default()
+            }],
+        }]));
+        round_trips(Answer::Done(vec![AgentCostSeries {
+            agent_id,
+            model: "gpt".to_owned(),
+            buckets: vec![AgentUsageBucket {
+                bucket_start_ms: 3_600_000,
+                output_tokens: 10,
+                requests: 1,
+                ..AgentUsageBucket::default()
+            }],
+        }]));
+        round_trips(Answer::Done(agents::VisualizationContent {
+            mime_type: "image/svg+xml".to_owned(),
+            content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
+        }));
+        round_trips(Answer::Done(agent_id));
+        round_trips(Answer::Done(()));
+        round_trips(Answer::Done(true));
+        round_trips(Answer::<String>::Failed {
+            reason: "no such repository".to_owned(),
+        });
+    }
+
+    /// A reply reads as its call's own type in a protocol log.
+    #[test]
+    fn protocol_log_prints_answers_by_their_call() {
+        let request: agents::Request = agents::ShellList { agent: None }.into();
+        let answer = senax_encoder::pack(&Answer::Done(Vec::<shell::ShellInfo>::new())).unwrap();
+        assert!(request.debug_answer(&answer).starts_with("Done("));
     }
 
     #[test]
     fn control_frames_round_trip() {
-        round_trips(control::ServerFrame::AuthState {
-            auth: AuthState {
-                namespaces: vec!["default".to_owned(), "work".to_owned()],
-                disabled_namespaces: vec!["work".to_owned()],
-                active_namespace: Some("default".to_owned()),
-            },
-        });
+        round_trips(control::ServerFrame::Ready);
         round_trips(control::ServerFrame::GitTransportDone { request_id: 9 });
         round_trips(control::ClientFrame::ProvideGitTransport);
     }

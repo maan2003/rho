@@ -10,8 +10,13 @@ use std::sync::atomic::Ordering;
 use anyhow::Context as _;
 use rho_agent::MessageDelivery;
 use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent_host_proto::agents::{ClientFrame, Open, Reply, Request, ServerFrame};
-use rho_agent_host_proto::{AgentCommand, Opened, WorkspaceInfo, write_frame};
+use rho_agent_host_proto::agents::{
+    AgentCostDistribution, Call, ClaudeAccountList, ClaudeAccounts, ClientFrame, GlobalUsage, Open,
+    QuotaHistory, QuotaUsage, RecordVisualization, Request, ServerFrame, SetAuthAccountEnabled,
+    SetClaudeAccount, ShellClose, ShellList, ShellStart, TerminalList, Visualization,
+    VisualizationContent,
+};
+use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Opened, WorkspaceInfo, write_frame};
 use rho_db::RhoDb;
 use tokio::sync::{broadcast, mpsc};
 
@@ -32,27 +37,7 @@ where
 {
     match open {
         Open::Session => serve_session(services, reader, writer).await,
-        Open::Request(request) => {
-            let reply = match handle_request(&services, request).await {
-                Ok((reply, refresh)) => {
-                    if let Refresh::Ready = refresh {
-                        // Registry changes show on every client (GUI rails
-                        // and a waiting CLI), so the refreshed snapshot goes
-                        // through the daemon-wide event fanout.
-                        let _ = services.events.send(services.ready_message().await);
-                    }
-                    reply
-                }
-                // The whole chain, not just the outermost context: a new
-                // agent that failed said "create managed workspace" and
-                // kept the reason to itself, which is not something a
-                // reader can act on.
-                Err(error) => Reply::Failed {
-                    reason: format!("{error:#}"),
-                },
-            };
-            write_frame(&mut writer, &reply).await
-        }
+        Open::Request(request) => serve_call(&services, request, &mut writer).await,
         Open::Terminal {
             agent,
             terminal_id,
@@ -111,15 +96,42 @@ where
             }
         }
     });
-    let journal_head = services.db.read().journal_head();
+    // Subscribed before the head is read, so a creation in between is in
+    // the head's counter or on the receiver (occasionally both, harmlessly).
+    let mut created = services.pool.subscribe_created();
+    let (journal_head, agent_counter) = {
+        let read = services.db.read();
+        (read.journal_head(), read.last_agent_counter())
+    };
     let _ = outgoing_tx.send(ServerFrame::JournalHead {
         machine_seed: services.machine_seed,
         journal_head,
+        agent_counter,
     });
+    // Which accounts agents run on: now, and whenever the inference state
+    // moves.
+    let auth_task = {
+        let services = Arc::clone(&services);
+        let outgoing_tx = outgoing_tx.clone();
+        let mut state = services.inference.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let _ = state.borrow_and_update();
+                let auth = services.auth_state();
+                if outgoing_tx.send(ServerFrame::Auth { auth }).is_err() {
+                    break;
+                }
+                if state.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
     // Agents made anywhere, by clients or by agents spawning children. The
-    // journal carries them whole; this only says which are new.
+    // journal carries them whole; this only says which are new. A lagged
+    // receiver misses a counter that the next creation brings up to date.
     let created_task = {
-        let mut created = services.pool.subscribe_created();
+        let services = Arc::clone(&services);
         let outgoing_tx = outgoing_tx.clone();
         tokio::spawn(async move {
             loop {
@@ -127,6 +139,7 @@ where
                     Ok(created) => {
                         let frame = ServerFrame::AgentCreated {
                             agent_id: created.agent_id,
+                            agent_counter: services.db.read().last_agent_counter(),
                         };
                         if outgoing_tx.send(frame).is_err() {
                             break;
@@ -220,6 +233,7 @@ where
     if let Some(follow) = follow {
         follow.abort();
     }
+    auth_task.abort();
     created_task.abort();
     quota_task.abort();
     services
@@ -349,112 +363,174 @@ async fn send_journal_from(
     }
 }
 
-/// Whether a handled request changed registry state that clients see through
-/// `Ready` (agents and workdirs); `Ready` refreshes every control stream,
-/// so all clients converge on the change at once.
-enum Refresh {
-    Ready,
-    None,
+/// Answers one call with its handler's reply: the call names the reply's
+/// type, so no arm can answer with another call's. `Err` becomes
+/// [`Answer::Failed`].
+async fn respond<C, W, F>(
+    writer: &mut W,
+    call: C,
+    handle: impl FnOnce(C) -> F,
+) -> anyhow::Result<()>
+where
+    C: Call,
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Future<Output = anyhow::Result<C::Reply>>,
+{
+    let reply = handle(call).await;
+    write_frame(writer, &Answer::from(reply)).await
 }
 
-/// One request stream's request. `Err` becomes a [`Reply::Failed`].
-async fn handle_request(
+/// One call stream's call.
+async fn serve_call<W>(
     services: &Arc<Services>,
     request: Request,
-) -> anyhow::Result<(Reply, Refresh)> {
-    let reply = match request {
-        Request::Command(command) => return handle_agent_command(services, command).await,
-        Request::ClaudeAccounts => claude_accounts_message(&services.db, &services.claude)?,
-        Request::SetClaudeAccount { name } => {
-            // The account has to be there before an agent tries to mount it;
-            // a switch to a name with no directory would fail at the next
-            // turn of every agent at once.
-            services.claude.bootstrap(&name)?;
-            let mut write = services.db.write().await;
-            write.set_claude_account(&name);
-            write.commit();
-            claude_accounts_message(&services.db, &services.claude)?
+    writer: &mut W,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match request {
+        Request::New(call) => respond(writer, call, |call| new_agent(services, call)).await,
+        Request::Command(call) => {
+            respond(writer, call, |call| handle_agent_command(services, call)).await
         }
-        Request::SetAuthAccountEnabled { name, enabled } => {
-            services.set_auth_account_enabled(&name, enabled).await;
-            Reply::Done
+        Request::ClaudeAccounts(call) => {
+            respond(writer, call, |ClaudeAccounts| async {
+                claude_accounts(&services.db, &services.claude)
+            })
+            .await
         }
-        Request::Visualization { id } => {
-            let visualization = services
-                .visualizations
-                .get(&id)
-                .with_context(|| format!("visualization {id} does not exist"))?;
-            Reply::Visualization {
-                id,
-                mime_type: visualization.mime_type,
-                content: visualization.content,
-            }
+        Request::SetClaudeAccount(call) => {
+            respond(writer, call, |SetClaudeAccount { name }| async move {
+                // The account has to be there before an agent tries to
+                // mount it; a switch to a name with no directory would fail
+                // at the next turn of every agent at once.
+                services.claude.bootstrap(&name)?;
+                let mut write = services.db.write().await;
+                write.set_claude_account(&name);
+                write.commit();
+                claude_accounts(&services.db, &services.claude)
+            })
+            .await
         }
-        Request::RecordVisualization { mime_type, content } => {
-            let id = services.visualizations.record(mime_type, content).await?;
-            Reply::VisualizationRecorded { id }
+        Request::SetAuthAccountEnabled(call) => {
+            respond(
+                writer,
+                call,
+                |SetAuthAccountEnabled { name, enabled }| async move {
+                    services.set_auth_account_enabled(&name, enabled).await;
+                    Ok(())
+                },
+            )
+            .await
         }
-        Request::QuotaUsage => Reply::QuotaUsage {
-            summaries: usage::quota_summaries(&services.db, &services.inference),
-        },
-        Request::QuotaHistory => Reply::QuotaHistory {
-            series: usage::quota_history(&services.db, &services.inference),
-        },
-        Request::GlobalUsage { since_ms } => {
-            services.pool.flush_agent_usage(None).await;
-            Reply::GlobalUsage {
-                series: usage::global_usage(&services.db, since_ms),
-            }
+        Request::Visualization(call) => {
+            respond(writer, call, |Visualization { id }| async move {
+                let visualization = services
+                    .visualizations
+                    .get(&id)
+                    .with_context(|| format!("visualization {id} does not exist"))?;
+                Ok(VisualizationContent {
+                    mime_type: visualization.mime_type,
+                    content: visualization.content,
+                })
+            })
+            .await
         }
-        Request::AgentCostDistribution { since_ms } => {
-            services.pool.flush_agent_usage(None).await;
-            Reply::AgentCostDistribution {
-                series: usage::agent_costs(&services.db, since_ms)?,
-            }
+        Request::RecordVisualization(call) => {
+            respond(
+                writer,
+                call,
+                |RecordVisualization { mime_type, content }| {
+                    services.visualizations.record(mime_type, content)
+                },
+            )
+            .await
         }
-        Request::TerminalList { agent } => Reply::TerminalList {
-            terminals: terminal_list(services, agent.as_deref()).await?,
-        },
-        Request::ShellStart { agent } => {
-            shell_start(services, &agent).await?;
-            Reply::Done
+        Request::QuotaUsage(call) => {
+            respond(writer, call, |QuotaUsage| async {
+                Ok(usage::quota_summaries(&services.db, &services.inference))
+            })
+            .await
         }
-        Request::ShellList { agent } => Reply::ShellList {
-            shells: shell_list(services, agent.as_deref()).await?,
-        },
-        Request::ShellClose { agent } => {
-            shell_close(services, &agent).await?;
-            Reply::Done
+        Request::QuotaHistory(call) => {
+            respond(writer, call, |QuotaHistory| async {
+                Ok(usage::quota_history(&services.db, &services.inference))
+            })
+            .await
         }
-    };
-    Ok((reply, Refresh::None))
+        Request::GlobalUsage(call) => {
+            respond(writer, call, |GlobalUsage { since_ms }| async move {
+                services.pool.flush_agent_usage(None).await;
+                Ok(usage::global_usage(&services.db, since_ms))
+            })
+            .await
+        }
+        Request::AgentCostDistribution(call) => {
+            respond(
+                writer,
+                call,
+                |AgentCostDistribution { since_ms }| async move {
+                    services.pool.flush_agent_usage(None).await;
+                    usage::agent_costs(&services.db, since_ms)
+                },
+            )
+            .await
+        }
+        Request::TerminalList(call) => {
+            respond(writer, call, |TerminalList { agent }| async move {
+                terminal_list(services, agent.as_deref()).await
+            })
+            .await
+        }
+        Request::ShellStart(call) => {
+            respond(writer, call, |ShellStart { agent }| async move {
+                shell_start(services, &agent).await
+            })
+            .await
+        }
+        Request::ShellList(call) => {
+            respond(writer, call, |ShellList { agent }| async move {
+                shell_list(services, agent.as_deref()).await
+            })
+            .await
+        }
+        Request::ShellClose(call) => {
+            respond(writer, call, |ShellClose { agent }| async move {
+                shell_close(services, &agent).await
+            })
+            .await
+        }
+    }
+}
+
+/// Starts a new agent. Sessions hear of it from the pool's creation
+/// broadcast; the answer tells this client which one is its own.
+async fn new_agent(services: &Arc<Services>, new: NewAgent) -> anyhow::Result<AgentId> {
+    let NewAgent {
+        role,
+        start,
+        mode,
+        mut content,
+    } = new;
+    if let Some(content) = content.as_mut() {
+        prepare_image_content(content).await?;
+    }
+    let (agent_id, agent) = services.create(role, start, mode).await?;
+    if let Some(content) = content {
+        // The agent is fresh, so the lanes are equivalent here.
+        agent
+            .send_user_content_accepted(content, MessageDelivery::NextRequest)
+            .await?;
+    }
+    Ok(agent_id)
 }
 
 async fn handle_agent_command(
     services: &Arc<Services>,
     command: AgentCommand,
-) -> anyhow::Result<(Reply, Refresh)> {
+) -> anyhow::Result<()> {
     match command {
-        AgentCommand::New {
-            role,
-            start,
-            mode,
-            mut content,
-        } => {
-            if let Some(content) = content.as_mut() {
-                prepare_image_content(content).await?;
-            }
-            // Control streams hear of the agent from the pool's creation
-            // broadcast; the reply tells this client which one is its own.
-            let (agent_id, agent) = services.create(role, start, mode).await?;
-            if let Some(content) = content {
-                // The agent is fresh, so the lanes are equivalent here.
-                agent
-                    .send_user_content_accepted(content, MessageDelivery::NextRequest)
-                    .await?;
-            }
-            Ok((Reply::AgentCreated { agent_id }, Refresh::Ready))
-        }
         AgentCommand::Send {
             agent_id,
             mut content,
@@ -473,7 +549,6 @@ async fn handle_agent_command(
             if notice.is_some() {
                 agent.notice_carried();
             }
-            Ok((Reply::Done, Refresh::None))
         }
         // A compaction rides the next request whichever lane the client
         // named; the lane is not a thing the runtime reads for it.
@@ -483,12 +558,10 @@ async fn handle_agent_command(
         } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.compact();
-            Ok((Reply::Done, Refresh::None))
         }
         AgentCommand::ChangeRole { agent_id, role } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_role(role).await?;
-            Ok((Reply::Done, Refresh::Ready))
         }
         AgentCommand::ChangeMode { agent_id, mode } => {
             let changed = services.pool.change_mode(agent_id, mode).await?;
@@ -499,36 +572,32 @@ async fn handle_agent_command(
             }
             // Back at once, in the new view, for whoever is looking.
             services.load(agent_id).await?;
-            Ok((Reply::Done, Refresh::Ready))
         }
         AgentCommand::ChangePromptCacheKey { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_prompt_cache_key()?;
-            Ok((Reply::Done, Refresh::None))
         }
         AgentCommand::Cancel { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.cancel();
-            Ok((Reply::Done, Refresh::None))
         }
         AgentCommand::Rewind { agent_id, turns } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.rewind(turns).await?;
-            Ok((Reply::Done, Refresh::Ready))
         }
         AgentCommand::Continue { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.retry();
-            Ok((Reply::Done, Refresh::None))
         }
     }
+    Ok(())
 }
 
-fn claude_accounts_message(
+fn claude_accounts(
     db: &RhoDb,
     claude: &rho_claude::accounts::ClaudePaths,
-) -> anyhow::Result<Reply> {
-    Ok(Reply::ClaudeAccounts {
+) -> anyhow::Result<ClaudeAccountList> {
+    Ok(ClaudeAccountList {
         accounts: claude.list()?,
         current: db.read().claude_account(),
     })

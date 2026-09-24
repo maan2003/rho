@@ -180,7 +180,7 @@ impl TermColor {
     pub const DEFAULT_BG: Self = Self::Background;
 }
 
-/// One running terminal in a [`crate::agents::Reply::TerminalList`] reply.
+/// One running terminal in a [`crate::agents::TerminalList`] answer.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct TerminalInfo {
     /// Encoded agent id ("eng-ht08").

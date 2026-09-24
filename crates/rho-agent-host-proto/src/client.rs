@@ -6,37 +6,31 @@ use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::{
-    Open, ProtocolLogDirection, agents, append_protocol_log_record, host, protocol_frame_bytes,
-    read_frame, write_frame,
+    Answer, Open, ProtocolLogDirection, agents, append_protocol_log_record, host,
+    protocol_frame_bytes, read_frame, write_frame,
 };
 
-/// One request of the agents, on a stream of its own over the daemon's
-/// Unix socket. A refusal is an error.
-pub async fn agents(
+/// One call of the agents, on a stream of its own over the daemon's Unix
+/// socket. A refusal is an error.
+pub async fn agents<C: agents::Call>(
     socket: impl AsRef<Path>,
-    request: agents::Request,
-) -> anyhow::Result<agents::Reply> {
+    call: C,
+) -> anyhow::Result<C::Reply> {
     let mut client = Client::connect(socket).await?;
     client
-        .send(&Open::Agents(agents::Open::Request(request)))
+        .send(&Open::Agents(agents::Open::Request(call.into())))
         .await?;
-    match client.recv().await? {
-        agents::Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
+    client.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
-/// One request of the machine, on a stream of its own over the daemon's
-/// Unix socket. A refusal is an error.
-pub async fn host(socket: impl AsRef<Path>, request: host::Request) -> anyhow::Result<host::Reply> {
+/// One call of the machine, on a stream of its own over the daemon's Unix
+/// socket. A refusal is an error.
+pub async fn host<C: host::Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<C::Reply> {
     let mut client = Client::connect(socket).await?;
     client
-        .send(&Open::Host(host::Open::Request(request)))
+        .send(&Open::Host(host::Open::Request(call.into())))
         .await?;
-    match client.recv().await? {
-        host::Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
+    client.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
 /// Raw async client for one stream over the daemon's Unix socket. The first
