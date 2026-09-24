@@ -292,9 +292,20 @@ where
     }
 }
 
-// TEMPORARY MIGRATION: remove once every database has been opened by a
-// build with it. Tables recorded `Sen<T>` under `T`'s full path; they now
-// record its short name, see `Sen::type_name`.
+// TEMPORARY MIGRATION: remove once the GUI has opened its database with
+// it; agent hosts have. Tables recorded `Sen<T>` under `T`'s full path;
+// they now record its short name, see `Sen::type_name`.
+impl RhoDb {
+    fn shorten_recorded_names(&self) {
+        let write = self.database.begin_write().expect("begin rho-db write txn");
+        if shorten_recorded_names(&write) {
+            write.commit().expect("commit rho-db type names");
+        } else {
+            write.abort().expect("abort rho-db write txn");
+        }
+    }
+}
+
 fn shorten_recorded_names(write: &redb::WriteTransaction) -> bool {
     const SEN: &str = "rho-db::Sen<";
     let tables = write
@@ -333,13 +344,6 @@ impl RhoDb {
             .set_cache_size(CACHE_SIZE)
             .create(path)
             .expect("open rho-db");
-
-        let write = database.begin_write().expect("begin rho-db write txn");
-        if shorten_recorded_names(&write) {
-            write.commit().expect("commit rho-db type names");
-        } else {
-            write.abort().expect("abort rho-db write txn");
-        }
 
         Self {
             database: Arc::new(database),
@@ -537,8 +541,6 @@ impl WriteTxn {
         self.inner
             .restore_savepoint(&savepoint)
             .expect("restore rho-db persistent savepoint");
-        // TEMPORARY MIGRATION: a savepoint taken before it keeps the old names.
-        shorten_recorded_names(&self.inner);
         true
     }
 
@@ -781,11 +783,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_shortens_the_names_tables_recorded() {
+    async fn the_client_database_shortens_the_names_its_tables_recorded() {
         const FULL: TableDefinition<u64, FullPath> = TableDefinition::new("items");
         const SHORT: TableDefinition<u64, Sen<TestRecord>> = TableDefinition::new("items");
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("rho.redb");
+        let path = client::path(temp.path());
         {
             let database = Database::create(&path).unwrap();
             let write = database.begin_write().unwrap();
@@ -805,7 +807,7 @@ mod tests {
 
         // Twice: the second open finds nothing left to rename.
         for _ in 0..2 {
-            let db = RhoDb::open(&path);
+            let db = client::open(temp.path()).unwrap();
             let read = db.read();
             let record = read.open_table(SHORT).get(7).unwrap().value().into_owned();
             assert_eq!(record.name, "moved");

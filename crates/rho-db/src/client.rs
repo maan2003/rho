@@ -40,6 +40,7 @@ pub fn open(state_dir: &Path) -> std::io::Result<RhoDb> {
     // has to be the one that answers.
     let lock = acquire_lock(state_dir)?;
     let db = RhoDb::open(path(state_dir)).holding(lock);
+    db.shorten_recorded_names();
     own_the_file(state_dir)?;
     Ok(db)
 }
