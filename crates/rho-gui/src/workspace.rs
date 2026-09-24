@@ -438,7 +438,7 @@ pub struct Workspace {
     /// every surface: see [`search`].
     search: search::Search,
     /// The label paths the filing prompt offers, and what each says.
-    pending_filing_destinations: Vec<(String, String)>,
+    pub(crate) pending_filing_destinations: Vec<(String, String)>,
     /// What the finder's highlighted row opens, carried from the prompt to
     /// its submit handler: the submitted text cannot tell two rows with the
     /// same path apart.
@@ -717,11 +717,21 @@ pub struct Subject {
     /// it: acking only the root leaves the row lit by a child's lamp, and
     /// the row never reaches settled.
     pub agents: Vec<AgentId>,
+    /// The note or label open in view.
+    pub made: Option<rho_dealer::NodeId>,
 }
 
 impl Subject {
     pub fn has_agent(&self) -> bool {
         self.agent.is_some()
+    }
+
+    pub fn has_made(&self) -> bool {
+        self.made.is_some()
+    }
+
+    pub fn has_label(&self) -> bool {
+        matches!(self.made, Some(rho_dealer::NodeId::Label(_)))
     }
 }
 
@@ -1305,7 +1315,7 @@ impl Workspace {
         surface
     }
 
-    fn close_current_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_current_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The overview and Home are both floors: there is nothing under
         // them to reveal, so `q` on either stays put.
         if self.active_surface().key == SurfaceKey::Home {
@@ -3622,13 +3632,23 @@ impl Workspace {
     /// The map used to answer this from the row under its cursor, and rows
     /// that named nobody fell through to the open agent. With the map gone
     /// there is no row, so the fall-through is the whole answer.
-    pub(crate) fn subject(&self, _window: &Window, _cx: &mut Context<Self>) -> Subject {
-        self.selection
-            .selected_agent()
-            .map_or_else(Subject::default, |agent_id| Subject {
-                agent: Some(agent_id),
-                agents: self.registry.agent_subtree(agent_id),
-            })
+    pub(crate) fn subject(&self, _window: &Window, cx: &mut Context<Self>) -> Subject {
+        let made = self.surface_node(cx).filter(|node| {
+            matches!(
+                node,
+                rho_dealer::NodeId::Note(_) | rho_dealer::NodeId::Label(_)
+            )
+        });
+        let mut subject =
+            self.selection
+                .selected_agent()
+                .map_or_else(Subject::default, |agent_id| Subject {
+                    agent: Some(agent_id),
+                    agents: self.registry.agent_subtree(agent_id),
+                    made: None,
+                });
+        subject.made = made;
+        subject
     }
 
     /// The subject's agent, or a `{verb}: no agent in focus` notice.
@@ -5579,6 +5599,8 @@ impl Workspace {
             Command::Terminal => self.cmd_term(false, window, cx),
             Command::NewTerminal => self.cmd_term(true, window, cx),
             Command::UndoVerdict => window.dispatch_action(Box::new(crate::UndoVerdict), cx),
+            Command::DeleteMade => self.delete_made(window, cx),
+            Command::MoveLabel => self.prompt_move_label(window, cx),
             Command::Quit => cx.quit(),
             Command::Home => self.toggle_overview(window, cx),
             Command::SlackReact(name) => self.slack_react(&name, window, cx),
@@ -6114,7 +6136,7 @@ impl Workspace {
                 sequence: 0,
                 verb: said.clone(),
                 writes,
-                card: Some((card.clone(), rho_journal::DealerVerdict::File)),
+                card: Some((card.node.clone(), rho_journal::DealerVerdict::File)),
                 slack_cursors: Vec::new(),
                 slack_muted: None,
             });
@@ -6298,7 +6320,7 @@ impl Workspace {
             false => subject,
         };
         undo.verb = verb.clone();
-        undo.card = Some((card.clone(), journal.clone()));
+        undo.card = Some((card.node.clone(), journal.clone()));
         let sequence = self.attention.push_undo(undo);
         let phone_verdict = self.phone.enabled.then_some(phone);
         self.complete_verdict(

@@ -5756,6 +5756,91 @@ fn toggling_a_label_twice_restores_the_note_and_find_uses_its_path(cx: &mut Test
 }
 
 #[gpui::test]
+fn deleting_a_label_takes_its_sublabels_and_undo_brings_them_back(cx: &mut TestAppContext) {
+    use rho_dealer::NodeId;
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let ops = workspace.mint_label("ops/weather", cx).unwrap();
+            let ops = workspace
+                .attention
+                .marks
+                .get(&NodeId::Label(ops))
+                .parent
+                .unwrap();
+            workspace.open_node(&NodeId::Label(ops), window, cx);
+            workspace.delete_made(window, cx);
+            assert!(workspace.attention.marks.label_at("ops").is_none());
+            assert!(workspace.attention.marks.label_at("ops/weather").is_none());
+            assert_ne!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Note(NodeId::Label(ops))
+            );
+            workspace.undo_verdict(window, cx);
+            assert_eq!(workspace.attention.marks.label_at("ops"), Some(ops));
+            assert!(workspace.attention.marks.label_at("ops/weather").is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn deleting_a_note_leaves_it_out_of_the_notes(cx: &mut TestAppContext) {
+    use rho_dealer::marks;
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(vec![marks::body(&note, "Frost report")], cx);
+            workspace.open_node(&note, window, cx);
+            workspace.delete_made(window, cx);
+            assert!(workspace.attention.marks.get(&note).deleted);
+            assert!(
+                workspace
+                    .attention
+                    .marks
+                    .notes()
+                    .all(|(held, _)| *held != note)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_moved_label_takes_its_sublabels_along(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _window, cx| {
+            let weather = workspace.mint_label("ops/weather/frost", cx).unwrap();
+            let weather = workspace
+                .attention
+                .marks
+                .get(&rho_dealer::NodeId::Label(weather))
+                .parent
+                .unwrap();
+            workspace.move_label(weather, "areas/climate", cx);
+            assert_eq!(
+                workspace.attention.marks.label_path(weather),
+                "areas/climate"
+            );
+            assert!(
+                workspace
+                    .attention
+                    .marks
+                    .label_at("areas/climate/frost")
+                    .is_some()
+            );
+            assert!(workspace.attention.marks.label_at("ops").is_some());
+            // Not under itself.
+            workspace.move_label(weather, "areas/climate/frost/weather", cx);
+            assert_eq!(
+                workspace.attention.marks.label_path(weather),
+                "areas/climate"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn creating_a_note_from_a_label_files_it_and_home_reads_the_dated_card(cx: &mut TestAppContext) {
     use rho_dealer::{DateMark, NodeId, marks};
     let workspace = test_workspace(cx);

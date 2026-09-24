@@ -31,10 +31,10 @@ pub(crate) struct Undo {
     pub(crate) verb: String,
     /// The writes that put the marks back.
     pub(crate) writes: Vec<Write>,
-    /// The card the verdict was on, dealt again by the undo, and what the
+    /// The node the verdict was on, dealt again by the undo, and what the
     /// journal called the verdict. `None` for a batch like `mark read
     /// before`, which has no card of its own.
-    pub(crate) card: Option<(Card, rho_journal::DealerVerdict)>,
+    pub(crate) card: Option<(NodeId, rho_journal::DealerVerdict)>,
     /// rho's own Slack cursors the verdict moved, and where each stood.
     pub(crate) slack_cursors: Vec<(rho_slack::model::Unit, rho_slack::session::HandledBefore)>,
     /// A unit the verdict muted in Slack, unmuted again.
@@ -59,7 +59,7 @@ pub(crate) struct Attention {
     streams: Arc<LedgerStreams>,
     pub(crate) marks: Marks,
     pub(crate) dealer: Dealer,
-    pub(crate) undo: Vec<Undo>,
+    undo: Vec<Undo>,
     next_undo: u64,
     pub(crate) slack: SlackSource,
 }
@@ -107,6 +107,15 @@ impl Attention {
 
     pub(crate) fn last_undo(&self) -> Option<u64> {
         self.undo.last().map(|undo| undo.sequence)
+    }
+
+    pub(crate) fn pop_undo(&mut self) -> Option<Undo> {
+        self.undo.pop()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn undo_len(&self) -> usize {
+        self.undo.len()
     }
 
     /// The ledger's stream, for a host to carry.
@@ -668,7 +677,7 @@ impl Workspace {
         if self.phone_snap_in_progress() {
             return;
         }
-        let Some(undo) = self.attention.undo.pop() else {
+        let Some(undo) = self.attention.pop_undo() else {
             self.echo("nothing to undo", StyleClass::SystemInfo, cx);
             return;
         };
@@ -678,7 +687,12 @@ impl Workspace {
         }
         self.write_marks(undo.writes, cx);
         self.refresh_slack_wants(cx);
-        let Some((card, verdict)) = undo.card else {
+        let Some((node, verdict)) = undo.card else {
+            if undo.slack_cursors.is_empty() {
+                self.echo(&format!("undid {}", undo.verb), StyleClass::SystemInfo, cx);
+                self.invalidate_dealer_signals(cx);
+                return;
+            }
             rho_journal::record(rho_journal::Event::SlackMarkReadBeforeUndone {
                 cards: undo.slack_cursors.len(),
             });
@@ -690,7 +704,8 @@ impl Workspace {
             self.invalidate_dealer_signals(cx);
             return;
         };
-        self.attention.dealer.clear_skip(&card.node);
+        self.attention.dealer.clear_skip(&node);
+        let card = self.card_for(&node);
         rho_journal::record(rho_journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.node),
             verdict,
@@ -740,6 +755,149 @@ impl Workspace {
         }
         self.write_marks(writes, cx);
         parent
+    }
+
+    /// `space d`: deletes the note or label in view, and every label under
+    /// a label. Deleting is a mark like any other, so it syncs, and
+    /// `shift-u` takes it back.
+    pub(crate) fn delete_made(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self
+            .surface_node(cx)
+            .filter(|node| matches!(node, NodeId::Note(_) | NodeId::Label(_)))
+        else {
+            self.echo(
+                "delete: no note or label in view",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let title = self.node_title(&node);
+        let mut doomed = vec![node.clone()];
+        if let NodeId::Label(label) = node {
+            let mut under = vec![label];
+            while let Some(label) = under.pop() {
+                for sublabel in self.attention.marks.sublabels(Some(label)) {
+                    doomed.push(NodeId::Label(sublabel));
+                    under.push(sublabel);
+                }
+            }
+        }
+        let said = match (&node, doomed.len() - 1) {
+            (NodeId::Note(_), _) => format!("deleted note: {title}"),
+            (_, 0) => format!("deleted label: {title}"),
+            (_, under) => format!("deleted label: {title}, and {under} under it"),
+        };
+        let writes = doomed
+            .iter()
+            .map(|node| marks::deleted(node, true))
+            .collect();
+        let writes = self.write_marks(writes, cx);
+        self.attention.push_undo(Undo {
+            sequence: 0,
+            verb: said.clone(),
+            writes,
+            card: None,
+            slack_cursors: Vec::new(),
+            slack_muted: None,
+        });
+        self.close_current_surface(window, cx);
+        self.echo(
+            &format!("{said} · shift-u undoes"),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    /// `space r`: the label in view, renamed or moved to a new path. Every
+    /// label on the way that nobody has made yet is made.
+    pub(crate) fn prompt_move_label(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(NodeId::Label(label)) = self.surface_node(cx) else {
+            self.echo("move: no label in view", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let from = self.attention.marks.label_path(label);
+        let under = format!("{from}/");
+        self.pending_filing_destinations = self
+            .attention
+            .marks
+            .labels()
+            .into_iter()
+            .filter(|(_, path)| *path != from && !path.starts_with(&under))
+            .map(|(_, path)| (path, "label".to_owned()))
+            .collect();
+        self.open_prompt(
+            format!("move {from} to:"),
+            std::rc::Rc::new(|workspace, needle, _cx| {
+                let needle = needle.to_lowercase();
+                workspace
+                    .pending_filing_destinations
+                    .iter()
+                    .filter(|(value, _)| value.to_lowercase().contains(&needle))
+                    .map(|(value, description)| crate::minibuffer::Candidate {
+                        value: value.clone(),
+                        description: description.clone(),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(move |workspace, path, _window, cx| {
+                workspace.move_label(label, &path, cx);
+            }),
+            window,
+            cx,
+        );
+        self.set_prompt_complete_whole_input();
+    }
+
+    pub(crate) fn move_label(&mut self, label: uuid::Uuid, path: &str, cx: &mut Context<Self>) {
+        let from = self.attention.marks.label_path(label);
+        let names = path_names(path);
+        let Some((name, parents)) = names.split_last() else {
+            self.echo("move: no path", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let to = names.join("/");
+        if to == from {
+            return;
+        }
+        if to.starts_with(&format!("{from}/")) {
+            self.echo(
+                &format!("move: {to} is under {from}"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        if self.attention.marks.label_at(&to).is_some() {
+            self.echo(
+                &format!("move: {to} already exists"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        let parent = match parents.is_empty() {
+            true => None,
+            false => self.mint_label(&parents.join("/"), cx),
+        };
+        let node = NodeId::Label(label);
+        let writes = self.write_marks(
+            vec![
+                marks::name(&node, Some((*name).to_owned())),
+                marks::parent(&node, parent),
+            ],
+            cx,
+        );
+        let said = format!("moved label: {from} to {to}");
+        self.attention.push_undo(Undo {
+            sequence: 0,
+            verb: said.clone(),
+            writes,
+            card: None,
+            slack_cursors: Vec::new(),
+            slack_muted: None,
+        });
+        self.echo(&said, StyleClass::SystemInfo, cx);
     }
 
     /// Puts the label at `path` on `node`, or takes it off when the node

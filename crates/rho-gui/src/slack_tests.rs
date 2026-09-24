@@ -3257,7 +3257,7 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
     );
     assert_eq!(
         workspace
-            .update(cx, |workspace, _, _| workspace.attention.undo.len())
+            .update(cx, |workspace, _, _| workspace.attention.undo_len())
             .unwrap(),
         1,
         "one keystroke leaves one thing to undo"
@@ -3275,7 +3275,7 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
     );
     assert_eq!(
         workspace
-            .update(cx, |workspace, _, _| workspace.attention.undo.len())
+            .update(cx, |workspace, _, _| workspace.attention.undo_len())
             .unwrap(),
         0
     );
@@ -3400,7 +3400,7 @@ async fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
     );
     assert_eq!(
         workspace
-            .update(cx, |workspace, _, _| workspace.attention.undo.len())
+            .update(cx, |workspace, _, _| workspace.attention.undo_len())
             .unwrap(),
         0,
         "a verdict made in another client is not this one's to undo"

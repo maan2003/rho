@@ -129,6 +129,9 @@ pub(crate) enum Command {
     Usage(crate::usage::Chart, u64),
     UploadTelemetry,
     Version,
+    // The note or label in view.
+    DeleteMade,
+    MoveLabel,
     SecretPhrase,
     // The agent under the point.
     AgentCancel,
@@ -287,6 +290,18 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
             MenuAction::Command(Command::FindNode),
         )
         .item("n", "new…", MenuAction::Open(MenuId::New))
+        .when(
+            subject.has_made(),
+            "d",
+            "delete this",
+            MenuAction::Command(Command::DeleteMade),
+        )
+        .when(
+            subject.has_label(),
+            "r",
+            "rename/move label…",
+            MenuAction::Command(Command::MoveLabel),
+        )
         .item(
             "shift-n",
             "notes for this",
