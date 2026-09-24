@@ -43,7 +43,7 @@ exhaustion is obvious and likely.
 
 - Docs say why; the code says what. Rules that must hold are Linked
   Specs next to the code they govern (`linked-specs` skill); records
-  exist for the `rho-agent` runtime loop in `crates/rho-agent/specs/`.
+  exist for the `rho-agent` runtime loop in `agent-host/rho-agent/specs/`.
 - `ARCHITECTURE.md` and `SECURITY.md` are being broken down into specs
   and crate docs. Treat them as history, not as rules.
 - Vendored subtrees (`vendor/*`, `crates/senax-encoder`) are first-class

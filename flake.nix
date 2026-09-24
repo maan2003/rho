@@ -241,6 +241,7 @@
           "Cargo.lock"
           "README.md"
           ".config/nextest.toml"
+          "agent-host"
           "crates"
           "vendor"
         ];

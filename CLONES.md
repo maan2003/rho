@@ -7,7 +7,7 @@ freedom to fetch, push, gc without asking anyone. Naively that is a
 round trip per clone. The mirror store is the primitive that removes
 both costs without changing what a clone *is*.
 
-It is three small crates under `crates/rho-git/` and one patch to git:
+It is three small crates under `agent-host/rho-git/` and one patch to git:
 
 - `rho-git-proto`: the one-line socket protocol, URL normalization and
   the store key.

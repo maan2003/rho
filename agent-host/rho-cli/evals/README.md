@@ -61,7 +61,7 @@ cases. A model's claim that its tests pass is not the grading result.
 ```sh
 python3 - <<'PY'
 import pathlib, shutil, subprocess, tempfile
-fixture = pathlib.Path('crates/rho-cli/evals')
+fixture = pathlib.Path('agent-host/rho-cli/evals')
 with tempfile.TemporaryDirectory() as work:
     shutil.copytree(fixture / 'retry-report', work, dirs_exist_ok=True)
     with open('coding-eval.jsonl', 'w') as log:

@@ -21,7 +21,7 @@ This skill applies to repo-local persisted formats such as `rho-agent`'s redb/se
 
 ## Current rho-agent pattern
 
-`crates/rho-agent/src/db.rs` stores one format string in the `FORMAT` table:
+`agent-host/rho-agent/src/db.rs` stores one format string in the `FORMAT` table:
 
 ```rust
 const FORMAT: TableDefinition<(), String> = TableDefinition::new("format");
