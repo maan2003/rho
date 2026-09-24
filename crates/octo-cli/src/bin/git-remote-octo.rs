@@ -5,8 +5,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result};
 use reqwest::Url;
-use rho_agent_host_proto::host::GitTransportPolicy;
-use rho_agent_host_proto::{GitService, GitTransportRequest, host};
+use rho_hosts::protocol as host;
+use rho_hosts::protocol::{GitService, GitTransportPolicy, GitTransportRequest};
 use rho_rpc::parts::Opened;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 

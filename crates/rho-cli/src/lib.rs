@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use rho_agent_host_proto::host;
 use rho_agents_client::protocol as agents;
 use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
+use rho_hosts::protocol as host;
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_rpc::parts::client::Client as UiClient;
 use rho_rpc::parts::{Answer, Call, client};
@@ -92,9 +92,11 @@ fn describe_frame(open: &rho_rpc::parts::Open, reply: Option<&[u8]>) -> String {
     match open.part {
         Part::Agents => describe_as::<agents::Open>(open, reply),
         Part::Desk => describe_as::<rho_desk_client::protocol::Open>(open, reply),
+        Part::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
         Part::Host => describe_as::<host::Open>(open, reply),
-        Part::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
         Part::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
+        Part::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
+        Part::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),
         Part::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
     }
 }

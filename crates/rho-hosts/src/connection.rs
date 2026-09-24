@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use futures::FutureExt as _;
-use rho_agent_host_proto::host::{self, GitProviderFrame, Open as HostOpen};
-use rho_agent_host_proto::{GitProvided, GitService, GitTransportRequest};
 use rho_rpc::parts::{read_frame, write_open};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+use crate::protocol::{
+    self, GitProvided, GitProviderFrame, GitService, GitTransportRequest, Open as HostOpen,
+};
 
 /// Set when the client is going away, before its tokio runtime is dropped.
 ///
@@ -128,10 +130,10 @@ async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
 
 async fn dial_gui_telemetry(dialer: ChannelDialer, snapshot: Vec<u8>) -> anyhow::Result<String> {
     anyhow::ensure!(
-        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= crate::protocol::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot is too large"
     );
-    dial_call(dialer, host::GuiTelemetryUpload { snapshot }).await
+    dial_call(dialer, protocol::GuiTelemetryUpload { snapshot }).await
 }
 
 pub struct Connection {
@@ -981,7 +983,6 @@ mod tests {
     use std::sync::Arc;
 
     use octo_types::{ReceivePackCommands, RefUpdate};
-    use rho_agent_host_proto::{GitService, GitTransportRequest};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
@@ -989,6 +990,7 @@ mod tests {
         display_field, git_push_prompt, next_reconnect_delay, receive_pack_refs_match,
         validate_git_transport_request,
     };
+    use crate::protocol::{GitService, GitTransportRequest};
 
     #[test]
     fn reconnect_backoff_caps_at_ten_seconds() {

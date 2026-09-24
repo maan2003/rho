@@ -232,7 +232,7 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
 /// Ask the running daemon for a snapshot: it alone can copy the file
 /// between commits, in a state that opens without repair.
 async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
-    let path = rho_rpc::parts::client::call(socket, rho_agent_host_proto::host::Snapshot)
+    let path = rho_rpc::parts::client::call(socket, rho_hosts::protocol::Snapshot)
         .await
         .context("the daemon holds the database, and its socket does not answer")?
         .into_std_path_buf();
@@ -245,7 +245,7 @@ async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapsh
 }
 
 /// The daemon's half of
-/// [`host::Snapshot`](rho_agent_host_proto::host::Snapshot):
+/// [`host::Snapshot`](rho_hosts::protocol::Snapshot):
 /// a snapshot of `db` in a directory of its own beside it.
 pub(crate) async fn daemon_snapshot(db: &RhoDb) -> anyhow::Result<camino::Utf8PathBuf> {
     let dir = new_snapshot_dir(db.path())?;

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use rho_agent_host_proto::host::Open as HostOpen;
 use rho_desktop_media::codec::{Decoder, RetainedFrame};
 use rho_desktop_proto::Input;
 use rho_rpc::parts::{Opened, read_frame, write_open};
@@ -90,7 +89,7 @@ async fn open_stream(
     let mut stream = rho_rpc::Stream::new(recv, send);
     write_open(
         &mut stream,
-        &HostOpen::Wayland {
+        &crate::protocol::Open::Wayland {
             media_id: id,
             agent,
             session,

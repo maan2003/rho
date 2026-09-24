@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 
 use anyhow::{Context as _, bail};
-use rho_agent_host_proto::PrCommand;
-use rho_agent_host_proto::host::{PlatformSecretsSet, PlatformStatus, Pr, PrOutput};
+use rho_hosts::protocol::{PlatformSecretsSet, PlatformStatus, Pr, PrCommand, PrOutput};
 
 use crate::{PrArgs, PrCliCommand, daemon_call};
 

@@ -50,7 +50,7 @@ pub enum Reply {
     Shells(Vec<rho_shell_view::protocol::ShellInfo>),
     Error(String),
     Desktop { socket: String },
-    DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
+    DesktopSessions(Vec<rho_desktop_client::protocol::DesktopSession>),
 }
 
 #[derive(Encode, Decode)]
@@ -434,7 +434,7 @@ async fn serve_shell(
 // Advertisements are ephemeral: starting a desktop atomically publishes one,
 // orderly stop removes it, and the lifetime lock excludes leftovers after a
 // crash.
-async fn desktop_sessions() -> anyhow::Result<Vec<rho_agent_host_proto::DesktopSession>> {
+async fn desktop_sessions() -> anyhow::Result<Vec<rho_desktop_client::protocol::DesktopSession>> {
     let mut sessions = Vec::new();
     #[cfg(target_os = "linux")]
     {
@@ -492,7 +492,7 @@ async fn desktop_sessions() -> anyhow::Result<Vec<rho_agent_host_proto::DesktopS
                 if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
                 {
-                    sessions.push(rho_agent_host_proto::DesktopSession {
+                    sessions.push(rho_desktop_client::protocol::DesktopSession {
                         agent: owner.to_owned(),
                         name: name.to_owned(),
                     });

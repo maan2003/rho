@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
-use rho_agent_host_proto::DesktopSession;
-use rho_agent_host_proto::host::Open as HostOpen;
 use rho_hosts::{Dialer, HostId, HostStream};
 use rho_rpc::parts::{read_frame, write_open};
+
+use crate::protocol::{DesktopSession, Open};
 
 /// A host's desktops, as it now has them.
 pub struct DesktopsEvent {
@@ -53,7 +53,7 @@ impl HostStream for DesktopsStream {
         let events = self.events.clone();
         Box::pin(async move {
             let mut stream = dialer.open(None).await?;
-            write_open(&mut stream, &HostOpen::Desktops).await?;
+            write_open(&mut stream, &Open::Sessions).await?;
             loop {
                 let sessions: Vec<DesktopSession> = read_frame(&mut stream).await?;
                 if events

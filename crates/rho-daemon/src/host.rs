@@ -1,19 +1,18 @@
-//! The machine part of the daemon, [`rho_rpc::parts::Part::Host`]:
-//! desktops, voice, Git transport, and administration.
+//! The machine part of the daemon, [`rho_rpc::parts::Part::Host`]: Git
+//! transport and administration.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent_host_proto::GitProvided;
-use rho_agent_host_proto::host::{
-    GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
+use rho_hosts::protocol::{
+    GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
     IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
 };
 use rho_rpc::parts::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
 
-use crate::{GitProviderClaim, Services, debug, realtime};
+use crate::{GitProviderClaim, Services, debug};
 
 /// Serves one host stream, whichever kind its opening frame asked for.
 pub(crate) async fn serve<R, W>(
@@ -28,22 +27,9 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match open {
-        Open::Desktops => serve_desktops(services, reader, writer).await,
         Open::GitProvider => serve_git_provider(services, reader, writer).await,
         Open::Request(request) => {
             serve_call(&services, iroh_auth.as_ref(), request, &mut writer).await
-        }
-        Open::Realtime { offer_sdp } => realtime::serve(services, reader, writer, offer_sdp).await,
-        // Served where the iroh connection's media are; see
-        // `run_iroh_listener`.
-        Open::Wayland { .. } => {
-            write_frame(
-                &mut writer,
-                &Opened::Refused {
-                    reason: "Wayland streams need an iroh connection".to_owned(),
-                },
-            )
-            .await
         }
         Open::GitTransport { request } => {
             serve_git_transport_request(services, reader, writer, request).await
@@ -55,44 +41,6 @@ where
         } => {
             serve_git_transport_provider(services, reader, writer, request_id, provider_id, claim)
                 .await
-        }
-    }
-}
-
-/// The desktops in every workset, told whole whenever they change. Only
-/// changes cross the stream; discovery never starts an encoder.
-async fn serve_desktops<R, W>(
-    services: Arc<Services>,
-    mut reader: R,
-    mut writer: W,
-) -> anyhow::Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let mut previous = Vec::new();
-    let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
-    loop {
-        tokio::select! {
-            // The client says nothing; its end of the stream is the end.
-            closed = rho_rpc::parts::read_frame_optional::<_, ()>(&mut reader) => {
-                return closed.map(|_| ());
-            }
-            _ = timer.tick() => {}
-        }
-        let mut sessions = Vec::new();
-        for process in services.pool.executions().await {
-            match process.action(rho_agent::WorksetAction::DesktopList).await {
-                Ok(rho_agent::WorksetReply::DesktopSessions(entries)) => sessions.extend(entries),
-                Ok(_) => tracing::warn!("unexpected desktop discovery reply"),
-                Err(error) => tracing::debug!(%error, "desktop discovery unavailable"),
-            }
-        }
-        sessions.sort();
-        sessions.dedup();
-        if sessions != previous {
-            write_frame(&mut writer, &sessions).await?;
-            previous = sessions;
         }
     }
 }
@@ -124,7 +72,7 @@ async fn serve_git_transport_request<R, W>(
     services: Arc<Services>,
     reader: R,
     mut writer: W,
-    request: rho_agent_host_proto::GitTransportRequest,
+    request: rho_hosts::protocol::GitTransportRequest,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -321,10 +269,10 @@ fn install_platform_secrets(
 
 /// A PR command's outcome. A failure is the command's own output, not a
 /// refused call.
-async fn pr(services: &Services, command: rho_agent_host_proto::PrCommand) -> PrOutput {
+async fn pr(services: &Services, command: rho_hosts::protocol::PrCommand) -> PrOutput {
     let result = async {
         match command {
-            rho_agent_host_proto::PrCommand::Create {
+            rho_hosts::protocol::PrCommand::Create {
                 owner,
                 repo,
                 head,
@@ -344,21 +292,21 @@ async fn pr(services: &Services, command: rho_agent_host_proto::PrCommand) -> Pr
                 })
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::Subscribe { .. } => Ok((
+            rho_hosts::protocol::PrCommand::Subscribe { .. } => Ok((
                 "persistent PR subscriptions were removed; poll `rho pr status` instead".to_owned(),
                 Vec::new(),
             )),
-            rho_agent_host_proto::PrCommand::Status { url } => services
+            rho_hosts::protocol::PrCommand::Status { url } => services
                 .pr_monitor
                 .status(&url)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
-            rho_agent_host_proto::PrCommand::Stop { .. } => Ok((
+            rho_hosts::protocol::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
+            rho_hosts::protocol::PrCommand::Stop { .. } => Ok((
                 "persistent PR subscriptions were removed".to_owned(),
                 Vec::new(),
             )),
-            rho_agent_host_proto::PrCommand::Comment {
+            rho_hosts::protocol::PrCommand::Comment {
                 url,
                 reply_comment,
                 body,
@@ -367,17 +315,17 @@ async fn pr(services: &Services, command: rho_agent_host_proto::PrCommand) -> Pr
                 .comment(&url, reply_comment, &body)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::Comments { url } => services
+            rho_hosts::protocol::PrCommand::Comments { url } => services
                 .pr_monitor
                 .comments(&url)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::Checks { url } => services
+            rho_hosts::protocol::PrCommand::Checks { url } => services
                 .pr_monitor
                 .checks(&url)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::Edit {
+            rho_hosts::protocol::PrCommand::Edit {
                 url,
                 base,
                 title,
@@ -387,12 +335,12 @@ async fn pr(services: &Services, command: rho_agent_host_proto::PrCommand) -> Pr
                 .edit(&url, base, title, body)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::Rerun { url, run_id } => services
+            rho_hosts::protocol::PrCommand::Rerun { url, run_id } => services
                 .pr_monitor
                 .rerun(&url, run_id)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_agent_host_proto::PrCommand::Logs { url, run_id } => services
+            rho_hosts::protocol::PrCommand::Logs { url, run_id } => services
                 .pr_monitor
                 .logs(&url, run_id)
                 .await
@@ -416,10 +364,10 @@ async fn pr(services: &Services, command: rho_agent_host_proto::PrCommand) -> Pr
 
 async fn store_gui_telemetry(snapshot: Vec<u8>) -> anyhow::Result<String> {
     anyhow::ensure!(
-        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
         snapshot.len(),
-        rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
+        rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES
     );
     let path = tokio::task::spawn_blocking(move || {
         let state = dirs::state_dir().context("state directory not available")?;
@@ -435,9 +383,9 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
     use std::io::Write as _;
 
     anyhow::ensure!(
-        snapshot.len() <= rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot exceeds the {} byte limit",
-        rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES
+        rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES
     );
     let directory = state_root.join("gui-telemetry");
     std::fs::create_dir_all(&directory)
@@ -493,7 +441,7 @@ mod tests {
         assert!(
             persist_gui_telemetry(
                 temp.path(),
-                &vec![0; rho_agent_host_proto::MAX_GUI_TELEMETRY_BYTES + 1]
+                &vec![0; rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES + 1]
             )
             .unwrap_err()
             .to_string()

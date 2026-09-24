@@ -1,3 +1,5 @@
+# Native realtime audio sessions. Without the `client` feature it is the
+# voice protocol alone, for the host.
 [package]
 name = "rho-rtc"
 version = "0.1.0"
@@ -6,14 +8,31 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[dependencies]
-anyhow.workspace = true
-futures.workspace = true
+[features]
+client = [
+  "dep:anyhow",
+  "dep:futures",
+  "dep:libwebrtc",
+  "dep:rodio",
+  "dep:tokio",
+  "dep:tracing",
+]
 
-libwebrtc.workspace = true
+[dependencies]
+bytes.workspace = true
+rho-rpc.workspace = true
+senax-encoder.workspace = true
+
+anyhow = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+libwebrtc = { workspace = true, optional = true }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
   "recording",
-] }
-tokio.workspace = true
-tracing.workspace = true
+], optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The tests exercise the client too.
+rho-rtc = { path = ".", features = ["client"] }

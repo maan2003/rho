@@ -12184,10 +12184,12 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
                 (agent(1), "browser"),
             ]
             .into_iter()
-            .map(|(agent, name)| rho_agent_host_proto::DesktopSession {
-                agent: agent.encoded(),
-                name: name.into(),
-            })
+            .map(
+                |(agent, name)| rho_desktop_client::protocol::DesktopSession {
+                    agent: agent.encoded(),
+                    name: name.into(),
+                },
+            )
             .collect();
             workspace.desktops_arrived(HostId::default(), sessions, cx);
             assert_eq!(
@@ -12197,7 +12199,7 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
             assert_eq!(workspace.available_desktops(agent(2)), ["other"]);
             workspace.desktops_arrived(
                 HostId::default(),
-                vec![rho_agent_host_proto::DesktopSession {
+                vec![rho_desktop_client::protocol::DesktopSession {
                     agent: agent(1).encoded(),
                     name: "preview".into(),
                 }],

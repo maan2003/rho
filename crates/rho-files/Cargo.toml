@@ -47,7 +47,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 path = { path = "../../vendor/zed/crates/path", optional = true }
-rho-hosts = { workspace = true, optional = true }
+rho-hosts = { workspace = true, features = ["client"], optional = true }
 rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }

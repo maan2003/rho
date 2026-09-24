@@ -560,7 +560,7 @@ pub struct Workspace {
     overlay_focus: crate::overlay::OverlayFocus,
     desktop: Option<Entity<crate::wayland_view::WaylandView>>,
     desktop_name: String,
-    desktop_sessions: HashMap<HostId, Vec<rho_agent_host_proto::DesktopSession>>,
+    desktop_sessions: HashMap<HostId, Vec<rho_desktop_client::protocol::DesktopSession>>,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -7104,7 +7104,7 @@ impl Workspace {
     pub(crate) fn desktops_arrived(
         &mut self,
         host: HostId,
-        sessions: Vec<rho_agent_host_proto::DesktopSession>,
+        sessions: Vec<rho_desktop_client::protocol::DesktopSession>,
         cx: &mut Context<Self>,
     ) {
         self.desktop_sessions.insert(host, sessions);

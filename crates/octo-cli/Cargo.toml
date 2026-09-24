@@ -7,9 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rho-hosts.workspace = true
 anyhow.workspace = true
 octo-types.workspace = true
 reqwest.workspace = true
-rho-agent-host-proto.workspace = true
 rho-rpc.workspace = true
 tokio.workspace = true

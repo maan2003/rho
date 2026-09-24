@@ -8,6 +8,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+rho-rtc.workspace = true
+rho-desktop-client.workspace = true
+rho-hosts.workspace = true
 rho-desktop-proto = { workspace = true, features = ["local"] }
 alacritty_terminal.workspace = true
 anyhow.workspace = true
@@ -29,7 +32,6 @@ rho-agent.workspace = true
 rho-claude.workspace = true
 rho-claude-usage.workspace = true
 rho-agent-types.workspace = true
-rho-agent-host-proto.workspace = true
 rho-agents-client.workspace = true
 rho-db.workspace = true
 rho-desk-server.workspace = true

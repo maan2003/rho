@@ -23,7 +23,7 @@ use rodio::source::UniformSourceIterator;
 use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source as _};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::*;
+use super::*;
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u32 = 1;

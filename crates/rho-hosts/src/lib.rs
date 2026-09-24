@@ -7,24 +7,37 @@
 //! client's, the desk's and the desktops' among them. The crate holds no agent
 //! state, no desk state and no window state: what it knows is which machines
 //! exist, whether they are answering, and how to reach one of them.
+//!
+//! [`protocol`] is what a client and a host say about the machine itself;
+//! the host uses it alone, without the `client` feature.
 
+pub mod protocol;
+
+#[cfg(feature = "client")]
 pub mod connection;
+#[cfg(feature = "client")]
 pub mod hosts;
+#[cfg(feature = "client")]
 pub mod saved;
 
+#[cfg(feature = "client")]
 pub use connection::{ConnEvent, Connection, HostEvent, Link, spawn};
 
 /// How a stream reaches its host: another Unix connection, or another
 /// bi-stream on the host's authenticated iroh connection.
+#[cfg(feature = "client")]
 pub type Dialer = rho_rpc::Dialer;
+#[cfg(feature = "client")]
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
 
 /// Which attached daemon. Assigned in attachment order; agent ids are
 /// already unique across machines, so this says which socket a command goes
 /// down rather than telling two things apart.
+#[cfg(feature = "client")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub u32);
 
+#[cfg(feature = "client")]
 impl std::fmt::Display for HostId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "host{}", self.0)
@@ -35,6 +48,7 @@ impl std::fmt::Display for HostId {
 /// socket may be forwarded from another machine, so this client's own cwd
 /// and home mean nothing to the daemon and must never leak into agent
 /// working directories.
+#[cfg(feature = "client")]
 #[derive(Clone)]
 pub enum AttachTarget {
     Unix(std::path::PathBuf),
@@ -45,6 +59,7 @@ pub enum AttachTarget {
     },
 }
 
+#[cfg(feature = "client")]
 impl AttachTarget {
     /// How the host reads in chrome and error text.
     pub fn describe(&self) -> String {
@@ -59,12 +74,14 @@ impl AttachTarget {
 
 /// One daemon to attach: the short name it is known by in this client, and
 /// how to reach it.
+#[cfg(feature = "client")]
 #[derive(Clone)]
 pub struct HostSpec {
     pub name: String,
     pub target: AttachTarget,
 }
 
+#[cfg(feature = "client")]
 impl HostSpec {
     /// Parses the one-line host form used both on the command line and in
     /// the attach prompt: `<name>=unix:<socket>` or
@@ -102,20 +119,24 @@ impl HostSpec {
 
 /// Nobody is listening any more: the reader this sink writes to is gone,
 /// and every event after this one would go the same way.
+#[cfg(feature = "client")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SinkClosed;
 
+#[cfg(feature = "client")]
 impl std::fmt::Display for SinkClosed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("nothing is listening for this host's events")
     }
 }
 
+#[cfg(feature = "client")]
 impl std::error::Error for SinkClosed {}
 
 /// Where a host's events go. The crate does not know what a reader makes of
 /// them, only that one is listening: this is what keeps the connection from
 /// depending on the crates that consume it.
+#[cfg(feature = "client")]
 pub trait HostSink: Send + Sync + 'static {
     fn send(&self, event: HostEvent) -> Result<(), SinkClosed>;
     /// Whether the reader has gone. A connection that finds nobody
@@ -124,6 +145,7 @@ pub trait HostSink: Send + Sync + 'static {
 }
 
 /// A channel is a sink: its receiver is the reader.
+#[cfg(feature = "client")]
 impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
     fn send(&self, event: HostEvent) -> Result<(), SinkClosed> {
         self.unbounded_send(event).map_err(|_| SinkClosed)
@@ -137,6 +159,7 @@ impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
 /// A stream a client keeps to one host. It opens once the host is ready and
 /// lasts the connection: when it ends, so does the connection, and on the next
 /// one every stream opens again.
+#[cfg(feature = "client")]
 pub trait HostStream: Send + Sync + 'static {
     /// What the stream is called when it is why a connection went.
     fn name(&self) -> &'static str;

@@ -5,9 +5,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rho_agent_host_proto::host;
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::NewAgent;
+use rho_hosts::protocol as host;
 use rho_rpc::parts::{Opened, read_frame, write_open};
 
 struct Child(std::process::Child);
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
             ensure!(tokio::time::Instant::now()<deadline,"daemon startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        write_open(&mut local,&host::Open::Desktops).await?;
+        write_open(&mut local,&rho_desktop_client::protocol::Open::Sessions).await?;
         let repo=temp.path().join("repo");
         std::fs::create_dir(&repo)?;
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
@@ -105,8 +105,8 @@ layout { background-color "#315b97"; }
         let descriptor:serde_json::Value=serde_json::from_slice(&std::fs::read(desktop_directory.join(format!("{desktop_name}.json")))?)?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                { let sessions = read_frame::<_, Vec<rho_agent_host_proto::DesktopSession>>(&mut local).await?;
-                    ensure!(sessions == vec![rho_agent_host_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
+                { let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
+                    ensure!(sessions == vec![rho_desktop_client::protocol::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
                     break;
                 }
             }
@@ -126,7 +126,7 @@ layout { background-color "#315b97"; }
         let transport=mux.session(1)?;
         let (send,recv)=connection.open_bi().await?;
         let mut input=rho_rpc::Stream::new(recv,send);
-        write_open(&mut input,&host::Open::Wayland {media_id:1,agent:agent.encoded(),session:desktop_name.clone()}).await?;
+        write_open(&mut input,&rho_desktop_client::protocol::Open::Wayland {media_id:1,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,Opened>(&mut input).await?,Opened::Ready),"open failed");
         let origin=rho_desktop_media::media::origin();
         let media=rho_desktop_media::media::subscribe(transport,origin.clone()).await.context("fixed video stream")?;
@@ -163,7 +163,7 @@ layout { background-color "#315b97"; }
         let transport2=mux.session(2)?;
         let (send2,recv2)=connection.open_bi().await?;
         let mut input2=rho_rpc::Stream::new(recv2,send2);
-        write_open(&mut input2,&host::Open::Wayland {media_id:2,agent:agent.encoded(),session:desktop_name.clone()}).await?;
+        write_open(&mut input2,&rho_desktop_client::protocol::Open::Wayland {media_id:2,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,Opened>(&mut input2).await?,Opened::Ready),"second viewer open failed");
         let origin2=rho_desktop_media::media::origin();
         let media2=rho_desktop_media::media::subscribe(transport2,origin2.clone()).await?;
@@ -206,7 +206,7 @@ layout { background-color "#315b97"; }
             .arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                { let sessions = read_frame::<_, Vec<rho_agent_host_proto::DesktopSession>>(&mut local).await?;
+                { let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
                     if sessions.len() == 2 {
                         ensure!(sessions.iter().all(|session| session.agent == agent.encoded()), "wrong owner");
                         ensure!(sessions.iter().map(|session| session.name.as_str()).collect::<Vec<_>>() == vec!["browser", "preview"], "wrong session names");
@@ -221,8 +221,8 @@ layout { background-color "#315b97"; }
         ensure!(desktop_directory.join("browser.json").exists(), "crash fixture did not leave an advertisement");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                { let sessions = read_frame::<_, Vec<rho_agent_host_proto::DesktopSession>>(&mut local).await?;
-                    if sessions == vec![rho_agent_host_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }] { break; }
+                { let sessions = read_frame::<_, Vec<rho_desktop_client::protocol::DesktopSession>>(&mut local).await?;
+                    if sessions == vec![rho_desktop_client::protocol::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }] { break; }
                 }
             }
             Ok::<_, anyhow::Error>(())

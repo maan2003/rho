@@ -39,7 +39,7 @@ futures = { workspace = true, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
 language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
-rho-hosts = { workspace = true, optional = true }
+rho-hosts = { workspace = true, features = ["client"], optional = true }
 rho-terminal = { workspace = true, features = ["client"], optional = true }
 rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }

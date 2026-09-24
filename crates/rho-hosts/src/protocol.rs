@@ -1,16 +1,11 @@
-//! The machine itself, [`rho_rpc::parts::Part::Host`]: desktops, voice,
-//! Git transport, and one-shot administration ([`rho_rpc::parts::Call`]).
+//! The machine itself, [`rho_rpc::parts::Part::Host`]: Git transport and
+//! one-shot administration ([`rho_rpc::parts::Call`]).
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
-
-use crate::{GitTransportRequest, PrCommand};
 
 /// What a host stream is for.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
-    /// The desktops running in this host's worksets: the whole list as
-    /// `Vec<`[`crate::DesktopSession`]`>`, pushed whenever it changes.
-    Desktops,
     /// This GUI holds SSH credentials and carries Git transport for the
     /// host's Git remote helpers. The host pushes [`GitProviderFrame`]s for
     /// as long as the stream is open.
@@ -18,22 +13,11 @@ pub enum Open {
     /// One [`rho_rpc::parts::Call`], answered with one
     /// [`rho_rpc::parts::Answer`]; then the stream closes.
     Request(Request),
-    /// A voice session. Answered with [`crate::realtime::Opened`]; after
-    /// the answer the stream carries [`crate::realtime::RealtimeClientFrame`]
-    /// and [`crate::realtime::RealtimeServerFrame`].
-    Realtime { offer_sdp: String },
-    /// One live application over MoQ streams on this connection. Answered
-    /// with [`rho_rpc::parts::Opened`].
-    Wayland {
-        media_id: u64,
-        agent: String,
-        session: String,
-    },
     /// A Git remote helper's transport, paired with a GUI that provides
     /// it. After [`rho_rpc::parts::Opened::Ready`] the stream is raw Git data.
     GitTransport { request: GitTransportRequest },
     /// A GUI's answer to [`GitProviderFrame::Requested`].
-    /// Answered with [`crate::GitProvided`]; after `Ready` the stream is raw
+    /// Answered with [`GitProvided`]; after `Ready` the stream is raw
     /// Git data.
     GitProvide {
         request_id: u64,
@@ -152,4 +136,165 @@ pub struct PrOutput {
     pub output: String,
     pub data: Vec<u8>,
     pub is_error: bool,
+}
+
+/// Maximum encoded GUI performance snapshot accepted by the daemon.
+pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
+
+/// The answer to [`Open::GitProvide`].
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitProvided {
+    /// This GUI carries the transport: raw Git data follows.
+    Ready,
+    /// The approval race completed or expired. Deliberately carries no
+    /// result or winner.
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum GitService {
+    UploadPack,
+    ReceivePack,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct GitTransportRequest {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub repository: String,
+    pub service: GitService,
+    /// Destination refs authorized by the first GUI approval for a push.
+    /// Fetches carry `None`.
+    pub planned_refs: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum PrCommand {
+    Create {
+        owner: String,
+        repo: String,
+        head: String,
+        base: String,
+        title: String,
+        body: String,
+        review_bots: Vec<String>,
+    },
+    Subscribe {
+        url: String,
+        replay_existing: bool,
+        review_bots: Vec<String>,
+    },
+    Status {
+        url: String,
+    },
+    List,
+    Stop {
+        url: String,
+    },
+    Comment {
+        url: String,
+        reply_comment: Option<u64>,
+        body: String,
+    },
+    Comments {
+        url: String,
+    },
+    Checks {
+        url: String,
+    },
+    Rerun {
+        url: String,
+        run_id: u64,
+    },
+    Logs {
+        url: String,
+        run_id: u64,
+    },
+    Edit {
+        url: String,
+        base: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_rpc::parts::{self, Part, PartOpen};
+
+    use super::*;
+
+    fn round_trips<T>(message: T)
+    where
+        T: senax_encoder::Packer + senax_encoder::Unpacker + PartialEq + std::fmt::Debug,
+    {
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: T = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn requests_round_trip() {
+        for request in [
+            Pr {
+                agent_id: Some("eng-abcd".into()),
+                command: PrCommand::Edit {
+                    url: "https://github.com/acme/widgets/pull/1".into(),
+                    base: Some("release".into()),
+                    title: Some("Better title".into()),
+                    body: Some("Better summary".into()),
+                },
+            }
+            .into(),
+            GitTransportPolicy {
+                host: "github.com".to_owned(),
+            }
+            .into(),
+            GuiTelemetryUpload {
+                snapshot: br#"{"version":1}"#.to_vec(),
+            }
+            .into(),
+            Snapshot.into(),
+        ] {
+            round_trips(Open::Request(request));
+        }
+    }
+
+    #[test]
+    fn git_provider_frames_round_trip() {
+        round_trips(GitProviderFrame::Done { request_id: 9 });
+        round_trips(GitProvided::Done);
+    }
+
+    /// A part's opening survives the envelope, and reads as no other part.
+    fn opens_as<T: PartOpen + PartialEq>(open: T) {
+        let envelope = parts::Open::of(&open).unwrap();
+        assert_eq!(envelope.unpack::<T>().unwrap(), open);
+        let other = parts::Open {
+            part: Part::Desk,
+            open: envelope.open.clone(),
+        };
+        assert!(other.unpack::<T>().is_err());
+    }
+
+    #[test]
+    fn stream_openings_round_trip() {
+        let request = GitTransportRequest {
+            host: "git.example".to_owned(),
+            port: 2222,
+            user: "deploy".to_owned(),
+            repository: "team/repo.git".to_owned(),
+            service: GitService::ReceivePack,
+            planned_refs: Some(vec!["refs/heads/main".to_owned()]),
+        };
+        opens_as(Open::GitProvider);
+        opens_as(Open::GitTransport { request });
+        opens_as(Open::GitProvide {
+            request_id: 9,
+            provider_id: 4,
+            claim: true,
+        });
+    }
 }

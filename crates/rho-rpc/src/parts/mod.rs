@@ -75,9 +75,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/21";
+pub const IROH_ALPN: &[u8] = b"rho/ui/22";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP21";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP22";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,15 +167,20 @@ pub enum Part {
     /// The agents: their journal and what is asked of them
     /// (`rho-agents-client`).
     Agents,
-    /// The desk (`rho-agent-host-proto`).
+    /// The desk (`rho-desk-client`).
     Desk,
-    /// The machine itself: desktops, voice, Git transport and
-    /// administration (`rho-agent-host-proto`).
+    /// The desktops in the host's worksets, and a live view of one
+    /// (`rho-desktop-client`).
+    Desktop,
+    /// The machine itself: Git transport and administration
+    /// (`rho-hosts`).
     Host,
-    /// An agent's terminals (`rho-terminal`).
-    Terminal,
     /// An agent's shell (`rho-shell-view`).
     Shell,
+    /// An agent's terminals (`rho-terminal`).
+    Terminal,
+    /// A voice session (`rho-rtc`).
+    Voice,
     /// An agent's workspace files (`rho-files`).
     Workspace,
 }
@@ -658,7 +663,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP21\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 

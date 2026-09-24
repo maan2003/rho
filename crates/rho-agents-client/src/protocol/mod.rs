@@ -462,10 +462,6 @@ mod tests {
     fn opening_survives_the_envelope() {
         let envelope = rho_rpc::parts::Open::of(&Open::Session).unwrap();
         assert_eq!(envelope.unpack::<Open>().unwrap(), Open::Session);
-        assert!(
-            envelope
-                .unpack::<rho_agent_host_proto::host::Open>()
-                .is_err()
-        );
+        assert!(envelope.unpack::<rho_hosts::protocol::Open>().is_err());
     }
 }

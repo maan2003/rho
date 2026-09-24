@@ -59,20 +59,19 @@ prefix-id = { workspace = true, features = ["redb"] }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-browser = { workspace = true }
 rho-agent-types.workspace = true
-rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
 rho-files = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-agents-view = { workspace = true }
-rho-hosts = { workspace = true }
+rho-hosts = { workspace = true, features = ["client"] }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
 rho-desk-client = { workspace = true, features = ["client"] }
-rho-desktop-client = { workspace = true }
+rho-desktop-client = { workspace = true, features = ["client"] }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
-rho-rtc.workspace = true
+rho-rtc = { workspace = true, features = ["client"] }
 rho-slack = { workspace = true, features = ["ui"] }
 rho-shell-view = { workspace = true, features = ["client"] }
 rho-terminal = { workspace = true, features = ["client"] }
