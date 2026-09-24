@@ -81,6 +81,7 @@ fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> Strin
         Protocol::Desk => describe_as::<rho_desk_client::protocol::Open>(open, reply),
         Protocol::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
         Protocol::Host => describe_as::<host::Open>(open, reply),
+        Protocol::Ledger => describe_as::<rho_ledger::protocol::Open>(open, reply),
         Protocol::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
         Protocol::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
         Protocol::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),

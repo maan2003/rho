@@ -21,6 +21,7 @@ rho-agent-types.workspace = true
 rho-rpc.workspace = true
 rho-agents-client.workspace = true
 rho-desktop-client.workspace = true
+rho-ledger.workspace = true
 rho-files.workspace = true
 rho-rtc.workspace = true
 rho-shell-view.workspace = true

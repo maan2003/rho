@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-ledger-server"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+redb.workspace = true
+rho-db.workspace = true
+rho-ledger.workspace = true
+rho-rpc.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+futures.workspace = true
+rho-agent-hosts = { workspace = true, features = ["client"] }
+rho-ledger = { workspace = true, features = ["client"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "rt", "macros", "time"] }

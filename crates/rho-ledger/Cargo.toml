@@ -1,0 +1,41 @@
+# The ledger: what the user put in, synced between their devices through
+# hosts that only ever hold it sealed. Without the `client` feature it is
+# the wire alone, for the host.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-ledger"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+client = [
+  "dep:anyhow",
+  "dep:chacha20poly1305",
+  "dep:futures",
+  "dep:rand",
+  "dep:redb",
+  "dep:rho-agent-hosts",
+  "dep:rho-db",
+  "dep:tokio",
+]
+
+[dependencies]
+bytes.workspace = true
+rho-rpc.workspace = true
+senax-encoder.workspace = true
+
+anyhow = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
+rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
+rho-db = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync"] }
+rho-ledger = { path = ".", features = ["client"] }
