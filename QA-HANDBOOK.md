@@ -18,13 +18,13 @@ rho-qa rig list                           # what rigs exist
 rho-qa snapshot --gui-state ~/state-from-the-laptop  # a second device's GUI half
 rho-qa rig new --from user-2026-09-06 --name desk   # once; it refuses to overwrite
 rho-qa build --binaries profiling         # the binaries a rig runs
-rho-qa rig up desk                        # daemon, fakes, headless GUI, profiler
+rho-qa rig up desk                        # agent host, fakes, headless GUI, profiler
 rho-qa rig down desk                      # stop; the state stays as the run left it
 ```
 
 `rig up` ends by printing the line that drives the session it just started. It
 refuses when the rig is already up, naming the session, whoever started it and
-the daemon pid holding it; `--take` stops what is running and takes it. Two
+the agent host pid holding it; `--take` stops what is running and takes it. Two
 agents drove the same desk twice in one evening, seconds apart in both
 directions, so the refusal is not politeness — an overlapped run's numbers are
 noise and neither party can tell from the screenshots.
@@ -88,12 +88,12 @@ Three rules for every run.
    an empty desk is not a case, it is a unit test.
 2. **Nothing touches the user's live state.** The live directory is read from
    by `rho-qa snapshot` and by nothing else, ever. Two allow lists say what a
-   snapshot may copy — the daemon's half and, when `--gui-state` names another
+   snapshot may copy — the agent host's half and, when `--gui-state` names another
    device's client directory, the GUI's half — and neither has ever named a
-   credential: no `auth.d`, no `iroh-secret.key`, no `sessions`. A rig daemon
-   is its own node. `rho-qa rig new` lays the GUI half over the daemon's state
+   credential: no `auth.d`, no `iroh-secret.key`, no `sessions`. A rig agent host
+   is its own node. `rho-qa rig new` lays the GUI half over the agent host's state
    when the snapshot has one, because a rig runs one state directory.
-3. **All mocking is server side.** The fake daemon is a real daemon on a copied
+3. **All mocking is server side.** The fake agent host is a real agent host on a copied
    store; Slack is `rho-qa fake-slack`; the browser is
    `rho-browser/examples/fake_browser`. Nothing is stubbed inside the GUI.
 
@@ -102,23 +102,23 @@ Three rules for every run.
 These are not product cases. They are the rig lying to you, and they have
 happened.
 
-### R1. The daemon is alive, not just its socket
+### R1. The agent host is alive, not just its socket
 
-A daemon that dies opening the store leaves a socket on disk and every later
+An agent host that dies opening the store leaves a socket on disk and every later
 step reports success while the GUI sits on "reconnecting". `rig up` waits for
-the previous daemon to exit, kills it if it will not, and checks the new one is
-alive. If `rig up` ever prints "daemon up" and the GUI still says
-"reconnecting", the check has regressed — read `logs/daemon.log` first, before
+the previous agent host to exit, kills it if it will not, and checks the new one is
+alive. If `rig up` ever prints "agent host up" and the GUI still says
+"reconnecting", the check has regressed — read `logs/agent-host.log` first, before
 believing any case that ran after it.
 
-The other half of R1 is the client. A daemon can be alive and its socket fine
+The other half of R1 is the client. An agent host can be alive and its socket fine
 while the GUI never gets past "connecting", and the reason is only in the
 Wayland session's `application.log` (under the rig's `run/rho-wayland/<name>/`).
 That is where a store-schema mismatch shows up: redb records the Rust path of a
 table's value type, so a crate rename makes the client panic with
-`TableTypeMismatch` on a table the daemon is perfectly happy with. Found on the
+`TableTypeMismatch` on a table the agent host is perfectly happy with. Found on the
 rig by eng-b8os during the map cut, which no unit test would have caught. If
-the GUI says "connecting" and the daemon is up, read that log before anything
+the GUI says "connecting" and the agent host is up, read that log before anything
 else.
 
 *Closed by:* 6 Sep 2026, the fix itself; `DatabaseAlreadyOpen` reproduced and
@@ -135,7 +135,7 @@ No rig ever had one. `rig up` wrote `credentials.json` for a workspace it
 named itself, `rig`, while the fake comes up as `acme`; the store is keyed by
 workspace name, so the lookup missed and the client ran with no session on
 every rig that has ever existed. Nothing said so: the fake was listening, the
-daemon was up, the GUI came up and dealt, and the Slack rows simply never
+agent host was up, the GUI came up and dealt, and the Slack rows simply never
 closed. Any Slack row count taken on a rig before 6 Sep was taken without a
 session.
 
@@ -156,14 +156,14 @@ took the verdict, left `next`, and was replaced by the next row of the flood.
 
 `slack.redb` in the snapshot taken 6 Sep holds only `acme`: 5 conversations,
 211 messages, which is the *fixture's* workspace written there by earlier QA
-runs. That is what a daemon-side copy is: the mirror is the client's file —
+runs. That is what a host-side copy is: the mirror is the client's file —
 `rho-slack`'s session writes every arriving message into it under the state
-directory of whichever device ran the GUI, and the daemon never touches it —
+directory of whichever device ran the GUI, and the agent host never touches it —
 so the user's real Slack state is on their device, not on this machine.
 
 The way to carry it is `rho-qa snapshot --gui-state <that device's state
 dir>`: the mirror comes over on the GUI half and `rig new` lays it over the
-daemon-side copy, so the rig reads the user's flood rather than the fixture.
+host-side copy, so the rig reads the user's flood rather than the fixture.
 Until a snapshot is taken that way, every Slack case below runs at fixture
 scale and proves rendering, not flood behaviour. Say which one the run had
 rather than reporting a green flood case.
@@ -222,15 +222,15 @@ snapshot is what frees the 43 GB, and only once no rig points into it.
 
 Three more things a run trips over, from the desk-parents deletion on 10 Sep.
 
-- **rho-daemon does not build outside the devshell.** `rho-agent`'s `python` module reads
-  `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-daemon`
-  fails to compile before it ever reaches the daemon. Run cargo in the dev
+- **rho-agent-host does not build outside the devshell.** `rho-agent`'s `python` module reads
+  `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-agent-host`
+  fails to compile before it ever reaches the agent host. Run cargo in the dev
   shell (agent commands already are; on the host, `nix develop -c cargo …`);
-  the same holds for every crate that pulls the daemon in.
+  the same holds for every crate that pulls the agent host in.
 - **A fresh rig carries no conversion markers.** `user-2026-09-06` predates the
   8 Sep parents conversion -- that is why it was the conversion's proof subject
   -- so a rig cloned from it has no `rho_desk_parent_labels_v1`. A case about a
-  marker needs a rig a daemon of that day has already run on; clone that rig's
+  marker needs a rig an agent host of that day has already run on; clone that rig's
   `rho.redb` into a throwaway of your own rather than running on someone else's.
 - **A store copy never goes in /tmp.** `/tmp` is the root pool, and three 45 GB
   copies left there on 7 Sep took the volume to 6 GB free. Copies live under
@@ -276,7 +276,7 @@ records `stale_binaries` in the session so `rig status` says so afterwards.
 
 This exists because on 2026-09-07 five consecutive sessions ran a GUI binary
 three hours older than the tree — a rebuild had picked up `rho-cli` and
-`rho-daemon` and not the GUI — and were reported as a commit that was never in
+`rho-agent-host` and not the GUI — and were reported as a commit that was never in
 them. It withdrew a crash result and a whole table of frame numbers, including
 one already sent onward. Nothing had ever checked, on a rig whose entire
 purpose is numbers over commits.
@@ -320,7 +320,7 @@ beside the name is what makes that visible.
 **It used to not tell you a rig was idle.** A session nobody ever drove and a
 session someone is using looked identical from the outside — same processes,
 same directory, same `rig status`. One was found on the desk host with sway,
-the profiling daemon and fake-slack up for 2h19m, and the only thing that
+the profiling agent host and fake-slack up for 2h19m, and the only thing that
 distinguished it from a live session was that the newest screenshot was from
 the day before. That thread was thin because nothing read it.
 
@@ -805,7 +805,7 @@ get it.* Two cases from the same day. eng-b8os believed the 144 rows laid out
 by the shipped fill only after forcing the fill back to tail-first and
 re-running the same assertion, which gave 961 — the contrast is the evidence,
 not the 144. And a workspace test of mine asserted that back never lands on a
-transcript whose daemon was detached; it passed, and it passed again with the
+transcript whose agent host was detached; it passed, and it passed again with the
 `forget` call it was meant to be testing commented out, because an agent's
 context dies with the agent and there was no stack left to walk. A test that
 passes with its mechanism removed and a profile written by a run that never

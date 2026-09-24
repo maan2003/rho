@@ -1,15 +1,15 @@
-//! A daemon's agents stream, with agent commands on call streams beside
+//! An agent host's agents stream, with agent commands on call streams beside
 //! it, for a harness that reads the journal and
 //! drives agents in one loop.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::{Answer, read_frame, write_frame, write_open};
 use rho_agent_types::{AgentId, Seq};
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::{AgentCommand, ClientFrame, NewAgent, ServerFrame};
+use rho_rpc::protocol::client::Client;
+use rho_rpc::protocol::{Answer, read_frame, write_frame, write_open};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
@@ -18,7 +18,7 @@ pub enum Incoming {
     Agents(ServerFrame),
     /// The agent [`Streams::create`] asked for.
     Created(AgentId),
-    /// A call the daemon would not make, and why.
+    /// A call the agent host would not make, and why.
     Refused(String),
 }
 
@@ -32,7 +32,7 @@ pub struct Streams {
 }
 
 impl Streams {
-    /// Opens an agents stream on `agents`, a connection to the daemon at
+    /// Opens an agents stream on `agents`, a connection to the agent host at
     /// `socket`, and reads its journal head. Nothing is followed yet.
     pub async fn open(agents: Client, socket: &Path) -> Result<Self> {
         let mut agents = agents.into_stream();
@@ -73,7 +73,7 @@ impl Streams {
         self.call(command, |()| None);
     }
 
-    fn call<C: rho_agent_host_proto::Call>(
+    fn call<C: rho_rpc::protocol::Call>(
         &self,
         call: C,
         answered: fn(C::Reply) -> Option<Incoming>,
@@ -111,6 +111,6 @@ impl Streams {
         self.incoming
             .recv()
             .await
-            .context("the daemon's streams closed")?
+            .context("the agent host's streams closed")?
     }
 }

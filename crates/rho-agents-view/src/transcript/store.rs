@@ -74,7 +74,7 @@ impl Transcripts {
 
     /// Opens an agent's transcript from the mirror the client already
     /// holds: the fold, for a reader who opened it before any live frame,
-    /// or with the daemon down. The live frame rides on its tail.
+    /// or with the agent host down. The live frame rides on its tail.
     ///
     /// Answers whether it opened one; an agent already open, or one with
     /// nothing on disk, is left as it was.

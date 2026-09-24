@@ -6,10 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use rho_agent_host_proto::host::Open as HostOpen;
-use rho_agent_host_proto::{Opened, read_frame, write_open};
 use rho_desktop_media::codec::{Decoder, RetainedFrame};
 use rho_desktop_proto::Input;
+use rho_rpc::protocol::{Opened, read_frame, write_open};
 use tokio::sync::{mpsc, watch};
 
 /// One decoded image: the YUV planes the decoder retained, which the
@@ -48,7 +47,7 @@ impl Drop for Viewer {
 /// Opens the desktop `session` of `agent` on the host `link` reaches.
 /// Only an iroh host carries media.
 pub fn open(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     agent: String,
     session: String,
 ) -> impl Future<Output = Result<Viewer>> + Send + 'static {
@@ -58,7 +57,7 @@ pub fn open(
             elapsed_ms = started.elapsed().as_millis(),
             "desktop IO task started"
         );
-        let rho_hosts::Dialer::Iroh { connection, media } = dialer else {
+        let rho_agent_hosts::Dialer::Iroh { connection, media } = dialer else {
             anyhow::bail!("the live Wayland viewer requires an Iroh host");
         };
         open_stream(connection, media, agent, session, started).await
@@ -90,7 +89,7 @@ async fn open_stream(
     let mut stream = rho_rpc::Stream::new(recv, send);
     write_open(
         &mut stream,
-        &HostOpen::Wayland {
+        &crate::protocol::Open::Wayland {
             media_id: id,
             agent,
             session,

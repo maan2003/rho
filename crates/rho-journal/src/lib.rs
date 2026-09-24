@@ -126,9 +126,9 @@ pub enum NodeIdentity {
     },
 }
 
-impl From<rho_agent_host_proto::desk::cells::Id> for NodeIdentity {
-    fn from(id: rho_agent_host_proto::desk::cells::Id) -> Self {
-        use rho_agent_host_proto::desk::cells::Id;
+impl From<rho_desk_client::protocol::cells::Id> for NodeIdentity {
+    fn from(id: rho_desk_client::protocol::cells::Id) -> Self {
+        use rho_desk_client::protocol::cells::Id;
         match id {
             Id::Note(uuid) => Self::Note { uuid: uuid.0 },
             Id::Label(uuid) => Self::Label { uuid: uuid.0 },

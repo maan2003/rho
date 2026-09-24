@@ -9,9 +9,9 @@ supervisor, protocol, and plugin runtime.
 - `rho-gui`, the native desktop application.
 - The `rho` terminal CLI.
 
-## Attaching the GUI to daemons
+## Attaching the GUI to agent hosts
 
-`rho-gui` attaches one or more daemons at once and shows them in a single
+`rho-gui` attaches one or more agent hosts at once and shows them in a single
 rail, each section headed by the host's name. With no arguments it attaches
 the hosts that were attached when it last ran, so a launcher needs none; a
 first run attaches nothing and says so. `--attach` is repeatable, names each
@@ -25,7 +25,7 @@ rho-gui --attach local=unix:/run/user/1000/rho/rho.sock \
 `space h` attaches, detaches, or lists hosts while running; the set attached
 at any moment is what the next start attaches. Agent labels stay
 bare while one host is attached and gain a `host/` prefix once several are
-(`fern/eng-h6u7`), as do project names; raw daemon paths are written
+(`fern/eng-h6u7`), as do project names; raw agent host paths are written
 `<host>:<path>`.
 
 ## Profiling
@@ -33,8 +33,8 @@ bare while one host is attached and gain a `host/` prefix once several are
 The native GUI always keeps a small rolling in-memory history of GPUI frame
 draw/dirty latency and numeric editor/display-pipeline timings. Press
 `Ctrl-Alt-Shift-P` (or `space s p`) to upload a versioned JSON snapshot to the
-daemon owning the selected agent; with no selected agent the normal primary
-attached host is used. The daemon stores it as a new mode-0600 file under
+agent host owning the selected agent; with no selected agent the normal primary
+attached host is used. The agent host stores it as a new mode-0600 file under
 `~/.local/state/rho/gui-telemetry/` (or the platform state-directory
 equivalent). Snapshots contain timing/count/row-range data, window and thread
 numeric IDs, application metadata, and typed numeric embedded-browser pipeline
@@ -57,14 +57,14 @@ editor events are embedded in Dial9 as `RhoEditorStageV1`. Each row start/count
 pair describes the bounding half-open area `[start, start + count)` affected by
 that stage.
 
-`just profile-daemon` profiles the optimized daemon until SIGINT or SIGTERM
-and writes `rho-daemon-profile.0.bin.gz`. Both recipes accept a trace base
+`just profile-agent-host` profiles the optimized agent host until SIGINT or SIGTERM
+and writes `rho-agent-host-profile.0.bin.gz`. Both recipes accept a trace base
 path followed by the normal executable arguments. Inspect traces with
 `dial9 serve --local-dir .` or Dial9's agent analysis toolkit. CPU stack
 sampling is Linux-only. A custom-event-only trace is still written when CPU
 sampling is unavailable, although the current Dial9 viewer requires CPU or
 runtime events to open it. The normal Linux perf backend samples the thread that starts profiling and
-threads subsequently created by it; Rho starts profiling before daemon and GUI
+threads subsequently created by it; Rho starts profiling before agent host and GUI
 worker creation. If Dial9 falls back to clock timers, coverage is limited to
 threads registered with the fallback sampler. Rho prefers a surviving raw
 `*.0.bin` artifact and validates the normal symbolized `*.0.bin.gz` artifact

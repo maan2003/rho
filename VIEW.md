@@ -24,7 +24,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 
 1. **Identical everywhere, generated, disposable.** Two agents on two
    machines get the same view, and an agent's view does not depend on
-   which user launched the daemon. Nothing is copied from the user's
+   which user launched the agent host. Nothing is copied from the user's
    home: no dotfiles, no home-manager tree, no skeleton, no link
    scripts. All configuration is a generated file under `/etc` or a
    variable in the environment, and `$HOME` starts empty on tmpfs.
@@ -35,7 +35,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 2. **The userland is a base plus a profile, both nix.** Rho names the
    tools every agent gets (coreutils, bash, Rho's patched git,
    nix, ripgrep, fd, just, python3, uv, node, …) as one `buildEnv` in
-   the flake, `agentBase`, whose path is baked into the daemon at build
+   the flake, `agentBase`, whose path is baked into the agent host at build
    time (`RHO_AGENT_BASE`). Anything else an agent wants it installs
    itself with `nix profile add nixpkgs#…` into a profile in its
    home, which is first on PATH:
@@ -64,7 +64,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
    - The dev shell cache directory (`cache/rho-devshell`) is shared by
      the owner's worksets and bound into the view at its host path. It
      holds the GC roots of pinned shells, their activation scripts, and
-     the daemon's cache socket (`daemon.sock`, `RHO_DEVSHELL_DIR`).
+     the agent host's cache socket (`daemon.sock`, `RHO_DEVSHELL_DIR`).
      *Why:* the nix daemon resolves the roots on the host. At a
      view-only path the roots would dangle and every GC would delete
      the shells.
@@ -79,16 +79,16 @@ security boundary (see `WORKSET.md`); it is a distribution.
    - The base's `nix` is Rho's patched Nix. `nix develop` and
      `nix print-dev-env` of a local flake's dev shell take the shell's
      environment from the builder (`RHO_DEVSHELL_BUILDER`), which asks
-     the daemon's cache as a workset process does, and do everything else
+     the agent host's cache as a workset process does, and do everything else
      as Nix does; other
      installables, `--impure` and lock-file overrides evaluate as usual.
 
-4. **Nix works, through the daemon.** The daemon socket is bound,
+4. **Nix works, through the agent host.** The agent host socket is bound,
    `NIX_REMOTE=daemon` is set, and `/etc/nix/nix.conf` is generated with
    flakes enabled (and whatever registry Rho wants pinned). The host's
    nix.conf is not copied.
    *Why:* flakes are how projects here declare toolchains, so their dev
-   shells must build. With a read-only store the daemon is the only
+   shells must build. With a read-only store the Nix daemon is the only
    writer; without `NIX_REMOTE` nix sees a writable `/nix/var` on the
    tmpfs, picks a local store and fails. On NixOS `/etc/nix/nix.conf`
    is a symlink into `/etc/static`, so binding it gives a dangling link;
@@ -106,7 +106,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
    cargo target directory out of the tree also keeps checkouts small,
    which matters to nix's `path:` fetcher (see 8).
 
-6. **Identity is environment; behaviour is `/etc`.** The daemon owns
+6. **Identity is environment; behaviour is `/etc`.** The agent host owns
    the user's name and email as a setting and exports `GIT_AUTHOR_*`
    and `GIT_COMMITTER_*`. Git's behavioural settings (no pager, no
    signing, `init.defaultBranch`) are a generated `/etc/gitconfig`
@@ -124,13 +124,13 @@ security boundary (see `WORKSET.md`); it is a distribution.
 8. **Every checkout is a plain git repository, and `git` is git.** The
    `git` on the agent's PATH is Rho's git: stock git with one patch
    (`CLONES.md`) under which `clone` and `fetch` of a remote URL read
-   the daemon's mirror store through git alternates and leave an
+   the agent host's mirror store through git alternates and leave an
    ordinary repository with `origin` at the real remote. Everything
    that fetches, from `pull` to `subtree` to submodules, goes through
    that one path; every other command is untouched. Further checkouts
    are `git worktree add`, which agents run for themselves when they
    want a child in its own checkout. There is no second VCS in the view
-   and no daemon-side notion of a change: the model works with git
+   and no host-side notion of a change: the model works with git
    alone.
    *Why:* one tool the model knows well beats two it confuses. Nix treats a directory without `.git`
    as a `path:` flake and copies the whole tree, ignored files included,
@@ -186,7 +186,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` under the home;
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under `~/.cache`;
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
-from the user's environment or git config, read once when the daemon
+from the user's environment or git config, read once when the agent host
 starts; `RHO_DEVSHELL_PATH_PREFIX`,
 `RHO_DEVSHELL_CARGO`, `RHO_DEVSHELL_BUILDER` and `RHO_DEVSHELL_DIR`
 (above);
@@ -201,8 +201,8 @@ All of it is `rho-fs-view`, in two places:
 
 - `flake.nix` declares the base: `agentBase`, a `buildEnv` of the
   program list plus the CA bundle and the pinned registry. The nix build
-  and the dev shell both hand its path to the daemon as
-  `RHO_AGENT_BASE`, read with `env!` so a daemon cannot be built without
+  and the dev shell both hand its path to the agent host as
+  `RHO_AGENT_BASE`, read with `env!` so an agent host cannot be built without
   one.
 - `layout.rs` builds the view per agent: the root tmpfs, the two shebang
   links, the generated `/etc` (passwd with the real uid, resolv.conf and
@@ -211,7 +211,7 @@ All of it is `rho-fs-view`, in two places:
   the shared cache at `~/.cache`, the workset's state directory, the dev
   shell cache, the store, the sockets). `ns.rs` sets the environment above.
 
-Nothing is assembled at daemon start and nothing is persisted: the
+Nothing is assembled at agent host start and nothing is persisted: the
 base is a store path, and the rest is a few files per agent.
 
 ## Later, enabled by this layout

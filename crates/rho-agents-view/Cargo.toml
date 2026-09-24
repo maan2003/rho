@@ -20,7 +20,6 @@ json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 rho-agent-types.workspace = true
-rho-agent-host-proto.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"

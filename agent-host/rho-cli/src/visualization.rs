@@ -1,0 +1,28 @@
+use std::io::Read as _;
+
+use anyhow::bail;
+use rho_agents_client::protocol::RecordVisualization;
+use rho_visualizations::{MAX_VISUALIZATION_BYTES, SVG_MIME_TYPE};
+
+use crate::{RecordVisualizationArgs, host_call};
+
+pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
+    let mut content = Vec::new();
+    std::io::stdin()
+        .take((MAX_VISUALIZATION_BYTES + 1) as u64)
+        .read_to_end(&mut content)?;
+    if content.len() > MAX_VISUALIZATION_BYTES {
+        bail!("visualization is too large (maximum {MAX_VISUALIZATION_BYTES} bytes)");
+    }
+
+    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let call = RecordVisualization {
+        mime_type: SVG_MIME_TYPE.to_owned(),
+        content,
+    };
+    let id = host_call(&socket_path, call).await?;
+    println!("{id}");
+    Ok(())
+}

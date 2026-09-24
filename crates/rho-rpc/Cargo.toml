@@ -23,6 +23,7 @@ server = [
 moq-tokio = { workspace = true, features = ["shared-iroh"] }
 anyhow.workspace = true
 async-compression.workspace = true
+bytes.workspace = true
 iroh.workspace = true
 futures.workspace = true
 noq-proto = { workspace = true, optional = true }
@@ -32,6 +33,9 @@ rho-iroh-auth.workspace = true
 rustls = { workspace = true, optional = true }
 senax-encoder.workspace = true
 tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+dirs.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["net"] }

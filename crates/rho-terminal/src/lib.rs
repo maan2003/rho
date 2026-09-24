@@ -1,4 +1,4 @@
-//! A daemon-owned terminal shown as a surface.
+//! A host-owned terminal shown as a surface.
 //!
 //! [`TerminalModel`] is the buffer role: it owns the wire display state
 //! ([`protocol::WireScreen`]), the input stream, and the read task — shared by
@@ -6,9 +6,9 @@
 //! with its own focus, scrollback offset, and mode.
 //!
 //! Input is deliberately mode-free on the wire — keystrokes go to the
-//! daemon as structured [`protocol::TermKeystroke`]s and are encoded against
-//! the terminal's live modes there, so this side never tracks application
-//! cursor keys, bracketed paste, or anything else stateful.
+//! agent host as structured [`protocol::TermKeystroke`]s and are encoded
+//! against the terminal's live modes there, so this side never tracks
+//! application cursor keys, bracketed paste, or anything else stateful.
 //!
 //! Views have two modes, vim-style: **raw** (the default) forwards every
 //! keystroke to the pty; **normal** (`ctrl-\ ctrl-n`, or `ctrl-shift-n`)

@@ -1,0 +1,185 @@
+//! The machines this client can reach.
+//!
+//! One connection per attached agent host, the handshake that brings it up, and
+//! the streams it carries. The host's own stream, Git transport, reports
+//! to one reader ([`HostSink`]); every other long-lived stream belongs to
+//! a client that hands the host a [`HostStream`] to run, the agents
+//! client's, the desk's and the desktops' among them. The crate holds no agent
+//! state, no desk state and no window state: what it knows is which machines
+//! exist, whether they are answering, and how to reach one of them.
+//!
+//! [`protocol`] is what a client and a host say about the machine itself;
+//! the host uses it alone, without the `client` feature.
+
+pub mod protocol;
+
+#[cfg(feature = "client")]
+pub mod connection;
+#[cfg(feature = "client")]
+pub mod hosts;
+#[cfg(feature = "client")]
+pub mod saved;
+
+#[cfg(feature = "client")]
+pub use connection::{ConnEvent, Connection, HostEvent, Link, spawn};
+
+/// How a stream reaches its host: another Unix connection, or another
+/// bi-stream on the host's authenticated iroh connection.
+#[cfg(feature = "client")]
+pub type Dialer = rho_rpc::Dialer;
+#[cfg(feature = "client")]
+pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
+
+/// Which attached agent host. Assigned in attachment order; agent ids are
+/// already unique across machines, so this says which socket a command goes
+/// down rather than telling two things apart.
+#[cfg(feature = "client")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostId(pub u32);
+
+#[cfg(feature = "client")]
+impl std::fmt::Display for HostId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "host{}", self.0)
+    }
+}
+
+/// How to reach the agent host. Deliberately holds no client-local paths: the
+/// socket may be forwarded from another machine, so this client's own cwd
+/// and home mean nothing to the agent host and must never leak into agent
+/// working directories.
+#[cfg(feature = "client")]
+#[derive(Clone)]
+pub enum AttachTarget {
+    Unix(std::path::PathBuf),
+    Iroh {
+        endpoint_id: iroh::EndpointId,
+        ssh_destination: String,
+        remote_rho: String,
+    },
+}
+
+#[cfg(feature = "client")]
+impl AttachTarget {
+    /// How the host reads in chrome and error text.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unix(path) => path.display().to_string(),
+            Self::Iroh {
+                ssh_destination, ..
+            } => format!("iroh via {ssh_destination}"),
+        }
+    }
+}
+
+/// One agent host to attach: the short name it is known by in this client, and
+/// how to reach it.
+#[cfg(feature = "client")]
+#[derive(Clone)]
+pub struct HostSpec {
+    pub name: String,
+    pub target: AttachTarget,
+}
+
+#[cfg(feature = "client")]
+impl HostSpec {
+    /// Parses the one-line host form used both on the command line and in
+    /// the attach prompt: `<name>=unix:<socket>` or
+    /// `<name>=iroh:<endpoint-id>@<ssh-destination>`.
+    pub fn parse(text: &str, remote_rho: &str) -> Result<Self, String> {
+        let (name, target) = text
+            .trim()
+            .split_once('=')
+            .ok_or("expected <name>=unix:<socket> or <name>=iroh:<endpoint-id>@<ssh-dest>")?;
+        if name.is_empty() {
+            return Err("host name is empty".to_owned());
+        }
+        let target = match target.split_once(':') {
+            Some(("unix", path)) => AttachTarget::Unix(std::path::PathBuf::from(path)),
+            Some(("iroh", rest)) => {
+                let (endpoint_id, ssh_destination) = rest
+                    .split_once('@')
+                    .ok_or("iroh targets are <endpoint-id>@<ssh-dest>")?;
+                AttachTarget::Iroh {
+                    endpoint_id: endpoint_id
+                        .parse()
+                        .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
+                    ssh_destination: ssh_destination.to_owned(),
+                    remote_rho: remote_rho.to_owned(),
+                }
+            }
+            _ => return Err(format!("unknown host target scheme in `{target}`")),
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            target,
+        })
+    }
+}
+
+/// Nobody is listening any more: the reader this sink writes to is gone,
+/// and every event after this one would go the same way.
+#[cfg(feature = "client")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SinkClosed;
+
+#[cfg(feature = "client")]
+impl std::fmt::Display for SinkClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing is listening for this host's events")
+    }
+}
+
+#[cfg(feature = "client")]
+impl std::error::Error for SinkClosed {}
+
+/// Where a host's events go. The crate does not know what a reader makes of
+/// them, only that one is listening: this is what keeps the connection from
+/// depending on the crates that consume it.
+#[cfg(feature = "client")]
+pub trait HostSink: Send + Sync + 'static {
+    fn send(&self, event: HostEvent) -> Result<(), SinkClosed>;
+    /// Whether the reader has gone. A connection that finds nobody
+    /// listening stops rather than dialling again for nothing.
+    fn is_closed(&self) -> bool;
+}
+
+/// A channel is a sink: its receiver is the reader.
+#[cfg(feature = "client")]
+impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
+    fn send(&self, event: HostEvent) -> Result<(), SinkClosed> {
+        self.unbounded_send(event).map_err(|_| SinkClosed)
+    }
+
+    fn is_closed(&self) -> bool {
+        futures::channel::mpsc::UnboundedSender::is_closed(self)
+    }
+}
+
+/// A stream a client keeps to one host. It opens once the host is ready and
+/// lasts the connection: when it ends, so does the connection, and on the next
+/// one every stream opens again.
+#[cfg(feature = "client")]
+pub trait HostStream: Send + Sync + 'static {
+    /// What the stream is called when it is why a connection went.
+    fn name(&self) -> &'static str;
+
+    /// The stream for one connection, from its dial to its end.
+    fn run(&self, dialer: Dialer) -> futures::future::BoxFuture<'static, anyhow::Result<()>>;
+}
+
+/// A sink with no reader: for a `Hosts` that stands in a test for the
+/// shape of an attachment, where nothing dials and nothing listens.
+#[cfg(feature = "test-support")]
+pub struct DroppedSink;
+
+#[cfg(feature = "test-support")]
+impl HostSink for DroppedSink {
+    fn send(&self, _event: HostEvent) -> Result<(), SinkClosed> {
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}

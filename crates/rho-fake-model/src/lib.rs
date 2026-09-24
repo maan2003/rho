@@ -1,7 +1,7 @@
 //! Deterministic provider-protocol server for full-stack Rho QA.
 //!
 //! Only the model is fake: callers use the same HTTP and WebSocket protocols
-//! as production and can run the real daemon, agent loop, tools, and GUI.
+//! as production and can run the real agent host, agent loop, tools, and GUI.
 
 pub const REAL_TOOL_ROUNDS: usize = 100;
 
@@ -831,7 +831,7 @@ fn persona_text(seed: u64, request_number: u64, request: &OpenAiRequest) -> Stri
         request.model,
         request.input.len()
     );
-    let line = "Observed state is consistent; continuing through the real daemon, tools, journal, story, and GUI wire.\n";
+    let line = "Observed state is consistent; continuing through the real agent host, tools, journal, story, and GUI wire.\n";
     let mut text = prefix;
     while text.len() < length {
         text.push_str(line);

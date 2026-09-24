@@ -27,7 +27,7 @@ its most urgent member.
 
 ## CLI
 
-`rho workstream` (alias `rho ws`) talks to the running daemon:
+`rho workstream` (alias `rho ws`) talks to the running agent host:
 
 ```sh
 rho ws list                       # every workstream: labels, members, attention

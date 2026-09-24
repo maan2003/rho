@@ -1,0 +1,87 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-agent-host"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rho-rtc.workspace = true
+rho-desktop-client.workspace = true
+rho-agent-hosts.workspace = true
+rho-desktop-proto = { workspace = true, features = ["local"] }
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clock.workspace = true
+camino.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap.workspace = true
+dirs.workspace = true
+futures.workspace = true
+iroh.workspace = true
+json-stream.workspace = true
+libc.workspace = true
+notify.workspace = true
+octo-server.workspace = true
+octo-types.workspace = true
+prefix-id.workspace = true
+rho-agent.workspace = true
+rho-claude.workspace = true
+rho-claude-usage.workspace = true
+rho-agent-types.workspace = true
+rho-agents-client.workspace = true
+rho-db.workspace = true
+rho-desk-server.workspace = true
+rho-inference.workspace = true
+rho-image.workspace = true
+rho-openai-realtime.workspace = true
+rho-iroh-auth.workspace = true
+rho-pr-monitor.workspace = true
+rho-profiling.workspace = true
+rho-rpc = { workspace = true, features = ["server"] }
+rho-visualizations.workspace = true
+rho-fs-view.workspace = true
+rho-files.workspace = true
+rho-shell-view.workspace = true
+rho-terminal.workspace = true
+rustix-openpty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+redb.workspace = true
+tempfile.workspace = true
+senax-encoder.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "fmt",
+] }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+moq-net.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+rho-shell.workspace = true
+senax-encoder.workspace = true
+
+[[test]]
+name = "terminal_stream"
+harness = false
+
+[[test]]
+name = "wayland_stream"
+harness = false
+
+[dependencies.rho-desktop-media]
+workspace = true
+features = ["iroh"]
+
+[dev-dependencies.rho-desktop-media]
+workspace = true
+features = ["decoder"]

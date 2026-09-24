@@ -1,9 +1,9 @@
 //! What the desk store holds, read off a copy.
 //!
-//! The rig proves what a client draws; this says what the daemon holds,
+//! The rig proves what a client draws; this says what the agent host holds,
 //! which is the other half of any "the GUI shows the wrong thing"
 //! question, and the only way to see whether a write ever reached the
-//! daemon at all. It opens a copy and refuses the live file:
+//! agent host at all. It opens a copy and refuses the live file:
 //!
 //!     cargo run -p rho-qa --example desk_cells -- \
 //!         /home/maan2003/src/rho-rigs/snz/state/rho/rho.redb
@@ -13,15 +13,13 @@
 //! prints their cells whether they are put away or not.
 
 use redb::TableDefinition;
-use rho_agent_host_proto::desk::cells::{
-    Cell, DeviceId, Id, Property, PropertyKey, Stamp, Version,
-};
 use rho_db::{RecordedTypeName, RhoDb, SenAs};
+use rho_desk_client::protocol::cells::{Cell, DeviceId, Id, Property, PropertyKey, Stamp, Version};
 use senax_encoder::{Decode, Encode};
 
-/// The daemon's own key and metadata shapes, redeclared: they are private
-/// to `rho-daemon`, and senax encodes by field, so the same fields in the
-/// same order read the same bytes. If the daemon's shapes change this
+/// The agent host's own key and metadata shapes, redeclared: they are private
+/// to `rho-agent-host`, and senax encodes by field, so the same fields in the
+/// same order read the same bytes. If the agent host's shapes change this
 /// stops decoding, loudly, which is the right way for it to fail.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 struct CellAddress {
@@ -31,37 +29,39 @@ struct CellAddress {
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct CellMeta {
-    daemon_device: DeviceId,
+    #[senax(rename = "daemon_device")]
+    host_device: DeviceId,
     frontier: Version,
     device_node_namespaces: Vec<(DeviceId, u16)>,
     next_node_namespace: u16,
 }
 
-/// The names the daemon's tables were written under. redb records the
+/// The names the agent host's tables were written under. redb records the
 /// Rust path of a value type and refuses a table that says another one,
-/// so a reader outside `rho-daemon` has to answer to the daemon's names.
+/// so a reader outside `rho-agent-host` has to answer to the agent host's
+/// names.
 #[derive(Debug)]
-struct AddressAsDaemonWroteIt;
+struct AddressAsHostWroteIt;
 #[derive(Debug)]
-struct MetaAsDaemonWroteIt;
+struct MetaAsHostWroteIt;
 #[derive(Debug)]
-struct CellAsDaemonWroteIt;
+struct CellAsHostWroteIt;
 
-impl RecordedTypeName for AddressAsDaemonWroteIt {
+impl RecordedTypeName for AddressAsHostWroteIt {
     const NAME: &'static str = "rho-db::Sen<rho_daemon::desk_cells::CellAddress>";
 }
-impl RecordedTypeName for MetaAsDaemonWroteIt {
+impl RecordedTypeName for MetaAsHostWroteIt {
     const NAME: &'static str = "rho-db::Sen<rho_daemon::desk_cells::CellMeta>";
 }
-impl RecordedTypeName for CellAsDaemonWroteIt {
+impl RecordedTypeName for CellAsHostWroteIt {
     const NAME: &'static str = "rho-db::Sen<rho_desk::cells::Cell>";
 }
 
 const CELLS: TableDefinition<
-    SenAs<CellAddress, AddressAsDaemonWroteIt>,
-    SenAs<Cell, CellAsDaemonWroteIt>,
+    SenAs<CellAddress, AddressAsHostWroteIt>,
+    SenAs<Cell, CellAsHostWroteIt>,
 > = TableDefinition::new("rho_desk_facts_v1");
-const META: TableDefinition<(), SenAs<CellMeta, MetaAsDaemonWroteIt>> =
+const META: TableDefinition<(), SenAs<CellMeta, MetaAsHostWroteIt>> =
     TableDefinition::new("rho_desk_cell_meta_v2");
 
 fn main() -> anyhow::Result<()> {
@@ -80,11 +80,11 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(meta) = read.open_table(META).get(&()) {
         let meta = meta.value().into_owned();
-        println!("store {:?}", meta.daemon_device);
+        println!("store {:?}", meta.host_device);
         println!("frontier:");
         for (device, counter) in &meta.frontier {
-            let mine = if *device == meta.daemon_device {
-                " (the daemon's own)"
+            let mine = if *device == meta.host_device {
+                " (the agent host's own)"
             } else {
                 ""
             };

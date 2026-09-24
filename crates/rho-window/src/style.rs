@@ -195,7 +195,7 @@ pub fn attachment_block(anchor: Anchor, labels: Vec<String>) -> BlockProperties<
     }
 }
 
-/// Why the daemon refused a draft, shown where the draft is: the echo area
+/// Why the agent host refused a draft, shown where the draft is: the echo area
 /// is two seconds long, and a creation that failed has to stay readable
 /// while the reader fixes the field that caused it.
 pub fn refusal_block(anchor: Anchor, message: String) -> BlockProperties<Anchor> {
@@ -273,7 +273,7 @@ mod tests {
             "the attachment chips are measured"
         );
         assert!(
-            refusal_block(Anchor::Min, "the daemon refused it".into())
+            refusal_block(Anchor::Min, "the agent host refused it".into())
                 .height
                 .is_some(),
             "the refusal is measured"

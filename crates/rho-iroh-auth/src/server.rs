@@ -399,7 +399,7 @@ impl IrohAuth {
         Ok(pending.client_endpoint_id)
     }
 
-    /// Trust an endpoint directly in daemon memory. Intended for a local
+    /// Trust an endpoint directly in agent host memory. Intended for a local
     /// control client reached through an already-authenticated SSH login.
     pub async fn trust_in_memory(&self, client_endpoint_id: EndpointId) {
         self.inner

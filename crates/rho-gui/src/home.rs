@@ -473,8 +473,8 @@ mod tests {
             label: format!("needs reply · {priority}"),
             priority,
             host: HostId::default(),
-            topic_node_id: rho_agent_host_proto::desk::cells::Id::Note(
-                rho_agent_host_proto::desk::cells::Uuid([0; 16]),
+            topic_node_id: rho_desk_client::protocol::cells::Id::Note(
+                rho_desk_client::protocol::cells::Uuid([0; 16]),
             ),
             agent_id: None,
             agent_tag: None,
@@ -483,8 +483,8 @@ mod tests {
             kind: DealCardKind::Desk,
             identity: DealCardId {
                 host: HostId::default(),
-                node_id: rho_agent_host_proto::desk::cells::Id::Note(
-                    rho_agent_host_proto::desk::cells::Uuid([0; 16]),
+                node_id: rho_desk_client::protocol::cells::Id::Note(
+                    rho_desk_client::protocol::cells::Uuid([0; 16]),
                 ),
             },
         }

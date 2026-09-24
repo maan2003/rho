@@ -53,7 +53,7 @@ pub use fold::{
 #[cfg(feature = "client")]
 pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap};
 #[cfg(feature = "client")]
-pub use rho_hosts::HostId;
+pub use rho_agent_hosts::HostId;
 
 /// Now, in Unix milliseconds, saturating rather than panicking on a clock
 /// that says something impossible.

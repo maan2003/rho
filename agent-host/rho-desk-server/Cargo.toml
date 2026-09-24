@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-desk-server"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rho-desk-client.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+redb.workspace = true
+rho-agent-types.workspace = true
+rho-rpc.workspace = true
+rho-db.workspace = true
+senax-encoder.workspace = true
+text.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

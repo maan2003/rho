@@ -1,7 +1,7 @@
 //! Native web-page resources for rho.
 //!
 //! The bundled extension owns client-local page identity and persistence; this
-//! crate owns browser runtime integration and GPUI page views. The daemon and
+//! crate owns browser runtime integration and GPUI page views. The agent host and
 //! Desk remain unaware of client-local browser processes.
 
 #![cfg(target_os = "linux")]

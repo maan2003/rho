@@ -1,4 +1,4 @@
-//! The agents part of a host, [`rho_agent_host_proto::Part::Agents`].
+//! The agents protocol of a host, [`rho_rpc::protocol::Protocol::Agents`].
 //!
 //! Its session ([`Open::Session`]) carries the host's journal and its
 //! agents' live tails: a stream of its own, so a catch-up of thousands of
@@ -22,13 +22,13 @@ pub mod transcript;
 pub enum Open {
     /// The journal and the live tails, for as long as the client stays.
     Session,
-    /// One [`rho_agent_host_proto::Call`], answered with one
-    /// [`rho_agent_host_proto::Answer`]; then the
+    /// One [`rho_rpc::protocol::Call`], answered with one
+    /// [`rho_rpc::protocol::Answer`]; then the
     /// stream closes.
     Request(Request),
 }
 
-rho_agent_host_proto::calls! {
+rho_rpc::calls! {
     /// Every call the agents answer, as it goes on the wire.
     pub enum Request {
         /// Answered with the new agent's id.
@@ -49,8 +49,8 @@ rho_agent_host_proto::calls! {
     }
 }
 
-impl rho_agent_host_proto::PartOpen for Open {
-    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Agents;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Agents;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
@@ -267,7 +267,7 @@ impl AgentCommand {
 /// Where a new agent works. Each mode carries exactly the data it needs.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum StartMode {
-    /// A fresh workset holding a clone of `repo` (a URL or a daemon-side
+    /// A fresh workset holding a clone of `repo` (a URL or a host-side
     /// path), with a new change on top of the revset.
     NewOn { repo: Utf8PathBuf, revset: String },
     /// The SAME place as the target: the new agent works in the target
@@ -287,7 +287,7 @@ pub enum JoinTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct QuotaSummary {
     pub model: String,
-    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
+    /// Host-local ChatGPT OAuth namespace; absent for Claude.
     pub auth_namespace: Option<String>,
     pub remaining_percent: u8,
     pub burn_10m: u16,
@@ -300,7 +300,7 @@ pub struct QuotaSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct QuotaSeries {
     pub model: String,
-    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
+    /// Host-local ChatGPT OAuth namespace; absent for Claude.
     pub auth_namespace: Option<String>,
     pub points: Vec<QuotaPoint>,
 }
@@ -339,7 +339,7 @@ pub struct AgentCostSeries {
     pub buckets: Vec<AgentUsageBucket>,
 }
 
-/// Daemon-wide authentication settings presented by a GUI host.
+/// Host-wide authentication settings presented by a GUI host.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct AuthState {
     pub namespaces: Vec<String>,
@@ -433,7 +433,7 @@ mod tests {
         ] {
             round_trips(Open::Request(request));
         }
-        round_trips(rho_agent_host_proto::Answer::Done(vec![AgentUsageSeries {
+        round_trips(rho_rpc::protocol::Answer::Done(vec![AgentUsageSeries {
             model: "fable".to_owned(),
             buckets: vec![AgentUsageBucket {
                 bucket_start_ms: 300_000,
@@ -441,7 +441,7 @@ mod tests {
                 ..AgentUsageBucket::default()
             }],
         }]));
-        round_trips(rho_agent_host_proto::Answer::Done(vec![AgentCostSeries {
+        round_trips(rho_rpc::protocol::Answer::Done(vec![AgentCostSeries {
             agent_id,
             model: "gpt".to_owned(),
             buckets: vec![AgentUsageBucket {
@@ -451,20 +451,20 @@ mod tests {
                 ..AgentUsageBucket::default()
             }],
         }]));
-        round_trips(rho_agent_host_proto::Answer::Done(VisualizationContent {
+        round_trips(rho_rpc::protocol::Answer::Done(VisualizationContent {
             mime_type: "image/svg+xml".to_owned(),
             content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
         }));
-        round_trips(rho_agent_host_proto::Answer::Done(agent_id));
+        round_trips(rho_rpc::protocol::Answer::Done(agent_id));
     }
 
     #[test]
     fn opening_survives_the_envelope() {
-        let envelope = rho_agent_host_proto::Open::of(&Open::Session).unwrap();
+        let envelope = rho_rpc::protocol::Open::of(&Open::Session).unwrap();
         assert_eq!(envelope.unpack::<Open>().unwrap(), Open::Session);
         assert!(
             envelope
-                .unpack::<rho_agent_host_proto::host::Open>()
+                .unpack::<rho_agent_hosts::protocol::Open>()
                 .is_err()
         );
     }

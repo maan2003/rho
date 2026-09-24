@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
+use rho_agent_hosts::HostStream;
 use rho_agent_types::{AgentId, AgentPos, Seq};
-use rho_hosts::HostStream;
 
 use crate::protocol::ClientFrame;
 use crate::protocol::transcript::{Live, LogEntry, TranscriptEvent};
@@ -73,13 +73,13 @@ pub struct ModelEvent {
 
 /// What the main thread asks of the model.
 pub enum ModelCommand {
-    /// A daemon the workspace attached, named before it is dialled: the
+    /// An agent host the workspace attached, named before it is dialled: the
     /// name is how the disk copy knows it across restarts.
     AttachHost {
         host: HostId,
         name: String,
     },
-    /// The way to send that daemon a command, once it has been dialled.
+    /// The way to send that agent host a command, once it has been dialled.
     HostCommands {
         host: HostId,
         commands: AgentCommands,
@@ -176,8 +176,8 @@ impl Model {
                 Vec::new()
             }
             ModelCommand::DetachHost(host) => {
-                // The disk copy keeps the host's rows: a daemon detached
-                // is not a daemon disowned, and the rows are what a later
+                // The disk copy keeps the host's rows: an agent host detached
+                // is not an agent host disowned, and the rows are what a later
                 // attach starts from.
                 self.hosts.remove(&host);
                 self.agents.retain(|_, agent| agent.host != host);
@@ -292,7 +292,7 @@ impl Model {
             .entry(host)
             .or_insert_with(|| HostModel::new(String::new()));
         slot.head = journal_head;
-        // A daemon whose database is not the one this client mirrored, or
+        // An agent host whose database is not the one this client mirrored, or
         // whose journal is shorter than the copy: the copy starts over.
         let started_over = slot.machine_seed != machine_seed || slot.seq > journal_head;
         let mut out = Vec::new();

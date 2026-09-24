@@ -55,10 +55,10 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_hosts::HostId;
     use rho_agent_types::{
         AgentIdDomain, AgentPos, MessageDelivery, TurnEdge, TurnOutcome, UnixMs,
     };
-    use rho_hosts::HostId;
 
     use super::*;
     use crate::MirroredAgent;

@@ -8,10 +8,10 @@ use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
-use rho_agent_host_proto::desk::cells::{BodySnapshot, Id};
 use rho_agents_client::HostId;
 use rho_desk_client::Desk;
 use rho_desk_client::desk::{DeskCapture, DeskCaptureNode, DeskDelta, DeskNode};
+use rho_desk_client::protocol::cells::{BodySnapshot, Id};
 use text::{BufferId, ReplicaId};
 
 use crate::workspace::Workspace;
@@ -97,7 +97,7 @@ impl DeskBuffers {
     }
 
     /// A note's body, as an editor buffer whose local edits go back to the
-    /// daemon as text operations.
+    /// agent host as text operations.
     fn new_note_buffer(
         &mut self,
         host: HostId,
@@ -126,7 +126,7 @@ impl DeskBuffers {
 
     /// Everything that is not a note has its title derived from its source,
     /// so its buffer is local and read-only: nothing it holds is ever sent
-    /// to the daemon.
+    /// to the agent host.
     fn new_derived_buffer(&mut self, cx: &mut Context<Workspace>) -> Entity<Buffer> {
         let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
         self.next_buffer_id += 1;
@@ -177,7 +177,7 @@ impl DeskBuffers {
     }
 
     /// Gives every shown thing a buffer and drops the buffers of things
-    /// that are gone. Notes get theirs from the daemon's body history;
+    /// that are gone. Notes get theirs from the agent host's body history;
     /// everything else gets an empty local one the dashboard fills with a
     /// derived title.
     pub fn reconcile_buffers(&mut self, host: HostId, desk: &Desk, cx: &mut Context<Workspace>) {
@@ -200,13 +200,13 @@ impl DeskBuffers {
         }
     }
 
-    /// A body operation from the daemon (another device, or this one echoed
+    /// A body operation from the agent host (another device, or this one echoed
     /// back). Applying an operation the buffer already has is a no-op.
     pub fn text_applied(
         &mut self,
         host: HostId,
         id: &Id,
-        operation: rho_agent_host_proto::desk::TextOperation,
+        operation: rho_desk_client::protocol::TextOperation,
         cx: &mut Context<Workspace>,
     ) {
         let Ok(operation) = operation.to_text() else {
@@ -347,7 +347,7 @@ pub(crate) fn write_derived_title(
     });
 }
 
-/// Watches a note body and sends every local edit to the daemon.
+/// Watches a note body and sends every local edit to the agent host.
 fn watch_note_buffer(
     buffer: &Entity<Buffer>,
     host: HostId,
@@ -360,9 +360,9 @@ fn watch_note_buffer(
             is_local: true,
         } = event
         {
-            let operation = rho_agent_host_proto::desk::TextOperation::from_text(operation);
+            let operation = rho_desk_client::protocol::TextOperation::from_text(operation);
             let timestamp = operation.timestamp();
-            let transaction = rho_agent_host_proto::desk::TextTransaction {
+            let transaction = rho_desk_client::protocol::TextTransaction {
                 id: timestamp,
                 edit_ids: vec![timestamp],
             };

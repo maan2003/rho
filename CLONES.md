@@ -7,20 +7,20 @@ freedom to fetch, push, gc without asking anyone. Naively that is a
 round trip per clone. The mirror store is the primitive that removes
 both costs without changing what a clone *is*.
 
-It is three small crates under `crates/rho-git/` and one patch to git:
+It is three small crates under `agent-host/rho-git/` and one patch to git:
 
 - `rho-git-proto`: the one-line socket protocol, URL normalization and
   the store key.
-- `rho-git-server`: the **keeper**, `MirrorStore`. The daemon runs it
+- `rho-git-server`: the **keeper**, `MirrorStore`. The agent host runs it
   in-process; it is the only writer of the store root.
-- `rho-git-client`: how the daemon births its own clones from a mirror
+- `rho-git-client`: how the agent host births its own clones from a mirror
   (`clone_from_mirror`, `ensure_alternate`; the keeper is called
   in-process) and the end-to-end tests of the patched git against a live
   keeper.
 - `nix/patches/git-rho-store.patch`: Rho's git. Its `clone` and `fetch`
   ask the keeper for the mirror themselves, so every path into a fetch
   is covered by construction. The flake builds it as `rhoGit`; the
-  daemon reaches it through the agent base (`RHO_AGENT_BASE`, VIEW.md).
+  agent host reaches it through the agent base (`RHO_AGENT_BASE`, VIEW.md).
 
 ## It is a cache, not a workflow
 
@@ -60,10 +60,10 @@ If the keeper cannot be reached git says so on stderr (`rho git store:
 ...; using the network`) and fetches from the real remote. Without the
 socket variable it is plain git.
 
-The daemon's own clones (`Workset::clone_repo`, for a new agent's
+The agent host's own clones (`Workset::clone_repo`, for a new agent's
 starting repository) use `rho-git-client` to ask the keeper and birth
 the clone from the mirror the same way, so an agent's `git clone` and
-the daemon's are the same thing.
+the agent host's are the same thing.
 
 ## Constraints, then design
 
@@ -135,9 +135,9 @@ otherwise every request fetches what it needs itself, and that fetch is
 delta-sized (well under a second against GitHub for a warm mirror).
 There is no background refresh: a mirror nobody asks for costs nothing,
 and a new agent's clone is born on whatever the mirror's last request
-fetched, at most the debounce old. The daemon hides that fetch behind
+fetched, at most the debounce old. The agent host hides that fetch behind
 the agent's start (`Lazy` in `rho-agent`), so the client sees the agent
-at once. There is no file locking: the daemon is one process, and git
+at once. There is no file locking: the agent host is one process, and git
 takes its own locks inside a mirror.
 
 The protocol is one line each way on a unix socket, so a client needs

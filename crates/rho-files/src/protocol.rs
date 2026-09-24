@@ -1,5 +1,5 @@
 //! What a client and a host say over a workspace file channel,
-//! [`rho_agent_host_proto::Part::Workspace`]: one agent's workspace files,
+//! [`rho_rpc::protocol::Protocol::Workspace`]: one agent's workspace files,
 //! on a channel of their own.
 
 use camino::Utf8PathBuf;
@@ -7,7 +7,7 @@ use rho_agent_types::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// File access for one agent's workspace. Answered with
-/// [`rho_agent_host_proto::Opened`]; after `Ready` the stream carries
+/// [`rho_rpc::protocol::Opened`]; after `Ready` the stream carries
 /// [`WorkspaceClientFrame`] and [`WorkspaceServerFrame`], and closing it
 /// closes the channel and its filesystem watcher.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
@@ -15,8 +15,8 @@ pub struct Open {
     pub workspace: WorkspaceInfo,
 }
 
-impl rho_agent_host_proto::PartOpen for Open {
-    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Workspace;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Workspace;
 }
 
 /// Largest file accepted by the workspace editor protocol.
@@ -24,7 +24,7 @@ pub const MAX_FILE_LEN: usize = 8 * 1024 * 1024;
 /// File payload plus bounded request metadata and senax framing overhead.
 pub const MAX_WORKSPACE_FRAME_LEN: usize = MAX_FILE_LEN + 16 * 1024;
 
-/// Client-to-daemon frames after the channel handshake.
+/// Client-to-agent host frames after the channel handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceClientFrame {
     Open {
@@ -79,7 +79,7 @@ pub enum FileSaveResult {
     Error(String),
 }
 
-/// Daemon-to-client frames after the channel handshake.
+/// Host-to-client frames after the channel handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceServerFrame {
     Opened {
@@ -133,7 +133,7 @@ mod tests {
         let (mut writer, mut reader) = tokio::io::duplex(16);
         writer.write_u32_le(1024).await.unwrap();
         let error =
-            rho_agent_host_proto::read_frame_limited::<_, WorkspaceClientFrame>(&mut reader, 32)
+            rho_rpc::protocol::read_frame_limited::<_, WorkspaceClientFrame>(&mut reader, 32)
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("exceeds 32"));
@@ -146,11 +146,11 @@ mod tests {
             rescan: true,
         };
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        rho_agent_host_proto::write_frame_limited(&mut writer, &frame, MAX_WORKSPACE_FRAME_LEN)
+        rho_rpc::protocol::write_frame_limited(&mut writer, &frame, MAX_WORKSPACE_FRAME_LEN)
             .await
             .unwrap();
         let decoded: WorkspaceServerFrame =
-            rho_agent_host_proto::read_frame_limited(&mut reader, MAX_WORKSPACE_FRAME_LEN)
+            rho_rpc::protocol::read_frame_limited(&mut reader, MAX_WORKSPACE_FRAME_LEN)
                 .await
                 .unwrap();
         assert_eq!(decoded, frame);

@@ -1,5 +1,5 @@
-# The comint-style shell surface for a daemon-owned shell: the model that
-# projects the daemon's structured executions into a multibuffer, its
+# The comint-style shell surface for a host-owned shell: the model that
+# projects the agent host's structured executions into a multibuffer, its
 # styles, its pager, and the actions that belong to it. rho-shell is the
 # kernel; this is the screen. Without the `client` feature it is the shell
 # protocol alone, for the host and the workset runtime.
@@ -20,7 +20,7 @@ client = [
   "dep:gpui",
   "dep:language",
   "dep:multi_buffer",
-  "dep:rho-hosts",
+  "dep:rho-agent-hosts",
   "dep:rho-terminal",
   "dep:rho-window",
   "dep:text",
@@ -30,7 +30,7 @@ client = [
 
 [dependencies]
 bytes.workspace = true
-rho-agent-host-proto.workspace = true
+rho-rpc.workspace = true
 senax-encoder.workspace = true
 
 anyhow = { workspace = true, optional = true }
@@ -39,7 +39,7 @@ futures = { workspace = true, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
 language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
-rho-hosts = { workspace = true, optional = true }
+rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 rho-terminal = { workspace = true, features = ["client"], optional = true }
 rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }

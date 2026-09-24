@@ -613,7 +613,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       messages per conversation, since a unit is one card whatever else is
       in it. Test:
       `a_mention_the_feed_has_passed_is_still_a_card_after_a_restart`. In
-      the rig all four cards survive a daemon and GUI restart against a
+      the rig all four cards survive an agent host and GUI restart against a
       fake whose feed cursor is past both mentions. Original text: gone after a restart
       when the activity-feed cursor has already passed that message: the
       store keeps the cursor, the mirror never re-reports the mention.
@@ -682,7 +682,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       summary still reads `@someone` before the roster loads, which 2.18
       fixes by rendering the card text at display time (pin it with a
       test). Original text: reported
-      by the user on 4 Sep from real use, on the latest GUI and daemon: a
+      by the user on 4 Sep from real use, on the latest GUI and agent host: a
       thread marked done is dealt again on an older message of the same
       thread, and `mark read before` (2.13) leaves cards standing for the
       same reason. First QA it on the real client against the fake, and
@@ -978,7 +978,7 @@ done right after the transcript primitive (2.4) and before 2.10:
 - [x] 4.1 Status bar. The surface segment reads the conversation label, and
       `· thread` inside a thread. Nothing about the connection while it is
       healthy; degraded shows the lamp and the notice (already). Found in
-      Phase 0: the `disconnected` seen in the bar is rho's own daemon
+      Phase 0: the `disconnected` seen in the bar is rho's own agent host
       status, not Slack. Keep it that way, and make sure a Slack outage
       never borrows that word: Slack's state is the lamp plus a notice
       that names Slack.

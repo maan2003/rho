@@ -69,7 +69,7 @@ pub(crate) enum FindTarget {
     /// `enter` on the dashboard row does.
     Topic {
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
     },
     Slack(rho_slack::session::Source),
 }
@@ -463,7 +463,7 @@ impl Workspace {
                 let unit = crate::slack::unit_of_source(name, source);
                 let Some(facts) = self
                     .desk
-                    .facts(host, &rho_agent_host_proto::desk::cells::Id::Slack(unit))
+                    .facts(host, &rho_desk_client::protocol::cells::Id::Slack(unit))
                 else {
                     continue;
                 };
@@ -891,8 +891,8 @@ mod tests {
                 labels: vec![LabelName::new("rho/agent", "the topic")],
                 target: FindTarget::Topic {
                     host: HostId::default(),
-                    node_id: rho_agent_host_proto::desk::cells::Id::Note(
-                        rho_agent_host_proto::desk::cells::Uuid([7; 16]),
+                    node_id: rho_desk_client::protocol::cells::Id::Note(
+                        rho_desk_client::protocol::cells::Uuid([7; 16]),
                     ),
                 },
                 recency: 40,

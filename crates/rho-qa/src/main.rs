@@ -2,18 +2,19 @@
 //!
 //! Everything a QA run needs to be about the user's world rather than a seeded
 //! one goes through this binary. `snapshot` takes a named, dated copy of the
-//! live state while the daemon keeps running. `rig new` clones a snapshot into
-//! a working rig — a reflink clone, so a rig costs almost nothing on bcachefs.
-//! `rig up` stands the rig up: its own daemon on the copied store, the fakes,
-//! and the GUI headless in an isolated Wayland session with the profiler on.
+//! live state while the agent host keeps running. `rig new` clones a snapshot
+//! into a working rig — a reflink clone, so a rig costs almost nothing on
+//! bcachefs. `rig up` stands the rig up: its own agent host on the copied
+//! store, the fakes, and the GUI headless in an isolated Wayland session with
+//! the profiler on.
 //!
 //! Two rules hold in every code path here:
 //!
 //! - The live state directory is read from and never written to, never opened
 //!   by a database, never locked. Verification happens on the copy.
 //! - Nothing that makes a rig the user's identity is copied: no `auth.d`, no
-//!   iroh secret, no credentials. A rig daemon is its own node and runs without
-//!   `--iroh`.
+//!   iroh secret, no credentials. A rig agent host is its own node and runs
+//!   without `--iroh`.
 
 mod build;
 mod fake_model_proof;

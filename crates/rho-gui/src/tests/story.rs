@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use rho_agent_host_proto::{Answer, Open, read_frame, write_frame};
+use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{
     AgentId, AgentPos, AgentRole, MessageDelivery, Place, PresentationField, Seq, TurnEdge, UnixMs,
 };
@@ -12,7 +12,7 @@ use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
 use rho_agents_client::stream::AgentFrame;
 use rho_desk_client::stream::DeskFrame;
-use rho_hosts::connection::ConnEvent;
+use rho_rpc::protocol::{Answer, Open, read_frame, write_frame};
 use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agents_client::protocol::transcript::RuntimeKind;
@@ -250,7 +250,7 @@ pub fn calls(
     calls
 }
 
-/// Answers a call as the daemon would.
+/// Answers a call as the agent host would.
 pub fn answer<T: Packer + Unpacker>(stream: &mut rho_rpc::Stream, answer: Answer<T>) {
     futures::executor::block_on(write_frame(stream, &answer)).expect("answer the call");
 }

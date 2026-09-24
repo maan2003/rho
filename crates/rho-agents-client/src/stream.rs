@@ -1,18 +1,18 @@
-//! One host's agents stream: the daemon's journal and live tails to the
-//! model, the model's follow and the window's focus back to the daemon.
+//! One host's agents stream: the agent host's journal and live tails to the
+//! model, the model's follow and the window's focus back to the agent host.
 //!
 //! The host opens it on every connection
-//! ([`rho_hosts::HostStream`]); what is said on it and where its frames go
-//! are this crate's.
+//! ([`rho_agent_hosts::HostStream`]); what is said on it and where its frames
+//! go are this crate's.
 
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
-use rho_agent_host_proto::{read_frame, write_frame, write_open};
+use rho_agent_hosts::{Dialer, HostStream};
 use rho_agent_types::{AgentId, Seq};
-use rho_hosts::{Dialer, HostStream};
+use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::HostId;
 use crate::model::ToModel;
@@ -107,8 +107,8 @@ impl HostStream for AgentStream {
         "agents"
     }
 
-    /// The daemon's frames to the model, this client's frames to the
-    /// daemon, for as long as the connection lasts. Ends with an error
+    /// The agent host's frames to the model, this client's frames to the
+    /// agent host, for as long as the connection lasts. Ends with an error
     /// when either direction does.
     fn run(&self, dialer: Dialer) -> BoxFuture<'static, anyhow::Result<()>> {
         let host = self.host;

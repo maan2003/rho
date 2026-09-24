@@ -11,14 +11,14 @@ and why. Proofs on a `cp` of the store only; never touch the live DB.
 - Nothing on the wire is named `Ui*`. `rho-ui-proto` carries facts;
   render types live in `rho-agents::state` (they were `rho-registry`'s
   `render` until the map cut absorbed that crate).
-- The daemon does not diff, snapshot, or project. The loop says what
+- The agent host does not diff, snapshot, or project. The loop says what
   changed as it changes it.
 - Focus never loads. Commands load.
 
 ## The wire
 
 One ordered feed per connection: journal rows and live deltas
-interleaved in the order the daemon produced them. No per-agent
+interleaved in the order the agent host produced them. No per-agent
 streams, no `AgentStreamOpened`, no generations, no decode budget.
 
 `ServerMessage::Log { entries }` as now. `ServerMessage::Live {
@@ -47,7 +47,7 @@ Ordering rule: the loop writes the row (`Replied`, `Sent`, `Turn`)
 and then sends the next `Live` from the same task. The client applies
 the row, then the tail. No position tag, no overlap window.
 
-Live is server-wide per agent: the daemon unions `AgentStreamFocus`
+Live is server-wide per agent: the agent host unions `AgentStreamFocus`
 across connections into one `live` set. Every connection forwards
 every delta; clients ignore agents they are not holding. A dropped
 connection drops its wants. Focus on an unloaded agent does nothing
@@ -63,7 +63,7 @@ changes.
 
 `Detail` answers with `Item`s, not `UiBlock`s. `remote.rs` is deleted.
 
-## Daemon
+## Agent host
 
 - The loop emits `Live` at its one publish site (`agent/mod.rs`
   `publish`) from what it just handled. `AgentState`, `AgentStateKind`,
@@ -82,7 +82,7 @@ changes.
   currently error "agent is not loaded"; they must load).
 - Presentation moves into the loop: after a turn ends the loop runs
   the title/activity pass itself and writes `Presented` rows. The
-  sidecar, `watch_presentation`, and the daemon's other
+  sidecar, `watch_presentation`, and the agent host's other
   `agent.subscribe()` readers go.
 - `agent_exists` is one key lookup (done). Cost series walks ids (done).
 
@@ -123,7 +123,7 @@ Landed as planned, with these deviations and leftovers:
   `rho_core::MessagePhase` has no `Pack`/`Unpack`.
 - `AgentState`/`AgentStateKind` stay inside `rho-agent` for now: the
   teller reads the kind, and `presentation.rs`, the pool's working
-  child count and the daemon's turn watcher still read the state.
+  child count and the agent host's turn watcher still read the state.
   Step 3 removes them with the sidecar.
 - `AgentPool::agent_handle` (the `role-id` label) still folds the log
   through `get_agent`; it is sync and called from seven places. Make it
@@ -167,7 +167,7 @@ Landed with these deviations:
 - "Presentation into the loop" landed as gating, not a rewrite: the
   sidecar stays, the loop drives it, and the pool sets a watched flag
   on a loaded loop when it enters or leaves the live set. The counted
-  `Watch` handles, `watch_presentation`, the daemon turn watcher and
+  `Watch` handles, `watch_presentation`, the agent host turn watcher and
   the pool's activation observer are gone.
 - `agent_handle` reads the loaded head when it can take the agents
   lock without waiting, and folds the log otherwise (cold agent, or a
@@ -210,7 +210,7 @@ the tree reads or names the old world now.
 takes a redb persistent savepoint first, in its own transaction before
 any table is touched, records the id under the hop in
 `recovery_savepoints`, then runs the migration. `rho debug rollback`
-(daemon stopped) restores that savepoint and drops it; the store is
+(agent host stopped) restores that savepoint and drops it; the store is
 then at the old layout for an older build. `rho debug savepoints`
 lists what the store holds. While a savepoint exists redb frees no
 page it covers, so the file grows by what the migration rewrote;
@@ -221,13 +221,13 @@ Found on the way: the live store holds ten persistent savepoints
 (ids 11 to 29) left by migrations of older builds whose code was
 removed without dropping them. Each pins every page freed since it
 was taken, which is why a store with a few GB of rows is a 47 GB
-file. `rho debug drop-stale-savepoints` (daemon stopped) drops the
+file. `rho debug drop-stale-savepoints` (agent host stopped) drops the
 ones no migration recorded; redb then reuses the pages, and
 `Database::compact` would shrink the file if that is ever wanted.
 
 ## Landing order
 
-1. Wire and daemon: `Live`/`Item` types, `remote.rs` gone, loop emits
+1. Wire and agent host: `Live`/`Item` types, `remote.rs` gone, loop emits
    deltas, union live set, single feed, commands that load, LRU 100,
    head in memory. Client updated only enough to compile and pass.
 2. Client: incremental transcript fold, derived attention, batched
@@ -269,14 +269,14 @@ compacted (a mid-migration kill, then `rho debug rollback` in under a second
 and the layout proof replaying all 2824 agents unchanged). Quick-repair mode
 was considered and rejected: commits would pay for it every time.
 
-Order for the live store, daemon stopped: `drop-stale-savepoints`, start the
-daemon (it migrates, ~20 s, behind savepoint), verify, `forget-savepoints`,
+Order for the live store, agent host stopped: `drop-stale-savepoints`, start the
+agent host (it migrates, ~20 s, behind savepoint), verify, `forget-savepoints`,
 `compact`. `rho debug savepoints` lists what is pinned at any point.
 
 ## After the first restart (6 Sep, evening)
 
 Seen on the live store after the migration, both in the GUI, neither in
-the daemon or the wire (the qlog showed both connections got the whole
+the agent host or the wire (the qlog showed both connections got the whole
 catch-up in 20 s, then idled):
 
 - A resync rebuilt the whole desk once per `Log` page (`sync_tree_dashboard`
@@ -344,7 +344,7 @@ where Claude is handed a session to fork:
   (its uuid) is when a message leaves the queue, and the echo's row is
   the message in the conversation. Older Claude logs were the copier's:
   the file's lines with `Accepted` and `QueueCleared` rows between
-  them, some never confirmed by an echo. A one-off at daemon start
+  them, some never confirmed by an echo. A one-off at agent host start
   (`rho_agent::rebuild`, 7 Sep), before any loop can append, rewinds
   each such log to its first conversation row and appends the file's
   active branch again in the file's order through the stream's
@@ -356,7 +356,7 @@ where Claude is handed a session to fork:
   `Presented`, `Rewound`.
 - **What the file is for.** A rewind hands Claude the uuid to fork at
   and reads the fork once to confirm it materialised. Sessions Rho did
-  not run are not imported, and lines written while the daemon was not
+  not run are not imported, and lines written while the agent host was not
   listening are not recovered: the log is what Rho witnessed. Rows from
   the one night of copying keep the file's `offset` in the store; the
   decoder skips it.

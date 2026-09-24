@@ -537,7 +537,7 @@ AI APIs.
   `shellHook` are trusted local code with the same authority as the agent shell
   tools they configure. Evaluation is pure, but building the shell can realise
   derivations through the Nix daemon like any `nix develop`. Built shells are
-  cached by the daemon for all of the owner's worksets, which store entries
+  cached by the agent host for all of the owner's worksets, which store entries
   and check them against their own checkouts. The cache's socket is in the
   shared cache directory that views bind, so any command in a view can store
   entries too; an entry is as trustworthy as those worksets, which already

@@ -6,7 +6,7 @@
 //! output, reasoning, the argument blob) are left behind; a client asks
 //! for them by position when it wants them.
 //!
-//! The runtimes write their own events; the daemon's `strip` is the one
+//! The runtimes write their own events; the agent host's `strip` is the one
 //! place they become these. The log's positions and the facts every reader
 //! takes as the runtime wrote them (turn edges, wants) are in
 //! `rho-agent-types`.
@@ -41,7 +41,7 @@ pub enum Speaker {
 }
 
 /// What one model response cost, as the provider reported it. The model
-/// is named so a client can price it; the tables the daemon keeps hold
+/// is named so a client can price it; the tables the agent host keeps hold
 /// the same numbers keyed by time.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Usage {

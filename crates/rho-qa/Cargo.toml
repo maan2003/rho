@@ -23,7 +23,6 @@ flate2 = "1"
 redb.workspace = true
 reqwest.workspace = true
 rho-agent-types.workspace = true
-rho-agent-host-proto.workspace = true
 rho-agents-client.workspace = true
 rho-fake-model.workspace = true
 rustls.workspace = true
@@ -39,6 +38,6 @@ tempfile.workspace = true
 bytes.workspace = true
 rho-db.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
-rho-desk-client.workspace = true
+rho-desk-client = { workspace = true, features = ["client"] }
 senax-encoder.workspace = true
 text.workspace = true

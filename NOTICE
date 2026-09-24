@@ -3,7 +3,7 @@ version 2.0 (MPL-2.0). A copy of that license is in LICENSE.
 
 Exceptions:
 
-- crates/rho-ci contains vendored selfci source code and is licensed under
+- agent-host/rho-ci contains vendored selfci source code and is licensed under
   MPL-2.0.
 - crates/rho-gui is licensed under GPL-3.0-or-later because it links
   GPL-licensed Zed-derived dependencies. Its license text is in

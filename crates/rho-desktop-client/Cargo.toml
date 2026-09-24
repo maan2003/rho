@@ -1,3 +1,5 @@
+# The host's desktops as a client sees them. Without the `client` feature it
+# is the desktops protocol alone, for the host and the workset runtime.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
@@ -7,19 +9,34 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-[dependencies]
-anyhow.workspace = true
-bytes.workspace = true
-futures.workspace = true
-iroh = { workspace = true }
-moq-net.workspace = true
-rho-agent-host-proto.workspace = true
-rho-desktop-proto.workspace = true
-rho-hosts = { workspace = true }
-rho-rpc = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+[features]
+client = [
+  "dep:anyhow",
+  "dep:futures",
+  "dep:iroh",
+  "dep:moq-net",
+  "dep:rho-desktop-media",
+  "dep:rho-desktop-proto",
+  "dep:rho-agent-hosts",
+  "dep:tokio",
+  "dep:tracing",
+]
 
-[dependencies.rho-desktop-media]
-workspace = true
-features = ["decoder", "iroh"]
+[dependencies]
+bytes.workspace = true
+rho-rpc.workspace = true
+senax-encoder.workspace = true
+
+anyhow = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+iroh = { workspace = true, optional = true }
+moq-net = { workspace = true, optional = true }
+rho-desktop-media = { workspace = true, features = ["decoder", "iroh"], optional = true }
+rho-desktop-proto = { workspace = true, optional = true }
+rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The tests exercise the client too.
+rho-desktop-client = { path = ".", features = ["client"] }

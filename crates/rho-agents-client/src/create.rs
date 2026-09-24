@@ -7,8 +7,8 @@
 //! `NewAgent`, and on which host.
 
 use camino::Utf8PathBuf;
+use rho_agent_hosts::{HostId, HostPath, Hosts};
 use rho_agent_types::{AgentRole, EngineerIntelligence, WorksetMode, WorkspaceInfo};
-use rho_hosts::{HostId, HostPath, Hosts};
 
 use crate::protocol::{JoinTarget, StartMode};
 
@@ -47,19 +47,19 @@ pub fn is_repository_url(argument: &str) -> bool {
     argument.contains("://") || argument.starts_with("git@")
 }
 
-/// Resolves a workdir argument to a directory on a specific daemon. A
+/// Resolves a workdir argument to a directory on a specific agent host. A
 /// registered project name resolves to its registration; anything else is
-/// a raw daemon-side path, which may name its host as `fern:/src/rho`.
-/// Paths name directories on the daemon's machine, so the GUI never joins
-/// its own cwd or expands its own home — the daemon expands `~` and
+/// a raw host-side path, which may name its host as `fern:/src/rho`.
+/// Paths name directories on the agent host's machine, so the GUI never joins
+/// its own cwd or expands its own home — the agent host expands `~` and
 /// validates.
 pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String> {
     if let Some(registered) = hosts.registered_workdir(argument) {
         return Ok(registered);
     }
-    // A Windows-style drive letter is not a thing on a daemon host, so a
+    // A Windows-style drive letter is not a thing on an agent host, so a
     // colon before any separator is unambiguously a host prefix. A URL
-    // (`https://…`, `git@host:path`) is what the daemon clones, not a host.
+    // (`https://…`, `git@host:path`) is what the agent host clones, not a host.
     let is_url = is_repository_url(argument);
     if !is_url
         && let Some((name, path)) = argument.split_once(':')
@@ -74,7 +74,7 @@ pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String
         });
     }
     let host = match hosts.len() {
-        0 => return Err("not connected to rho-daemon".to_owned()),
+        0 => return Err("not connected to an agent host".to_owned()),
         1 => hosts.iter().next().expect("one host").id,
         _ => {
             return Err(format!(
@@ -92,7 +92,7 @@ pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String
 /// The host a new agent starts on and how it starts there, or the reason
 /// it cannot. An agent target settles the host by itself: the new agent
 /// shares that agent's repository, which only exists on that agent's
-/// daemon. Where the workdir also names a host, the two must agree —
+/// agent host. Where the workdir also names a host, the two must agree —
 /// nothing downstream could reconcile a checkout on one machine with a
 /// base revision on another.
 pub fn parse_start(
@@ -140,7 +140,7 @@ pub fn parse_start(
         (None, Some(workdir)) => workdir.host,
         (None, None) => selected_host
             .or_else(|| hosts.primary())
-            .ok_or_else(|| "not connected to rho-daemon".to_owned())?,
+            .ok_or_else(|| "not connected to an agent host".to_owned())?,
     };
     let workspace = base.workspace;
     let start = match (mode, target, workspace) {
@@ -305,7 +305,7 @@ mod tests {
     /// refused in words, not resolved to whichever came last.
     #[test]
     fn a_base_and_a_workdir_on_two_hosts_is_refused() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
         let refusal = parse_start(
             &hosts,
             StartFieldMode::NewOn,
@@ -328,7 +328,7 @@ mod tests {
     /// the revision it stands for.
     #[test]
     fn the_default_base_goes_out_as_its_revision() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
         let (host, start) = parse_start(
             &hosts,
             StartFieldMode::NewOn,
@@ -355,7 +355,7 @@ mod tests {
     /// something went wrong.
     #[test]
     fn a_draft_with_no_workdir_says_what_to_type() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
         let refusal = parse_start(
             &hosts,
             StartFieldMode::NewOn,

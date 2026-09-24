@@ -429,19 +429,19 @@ security, resource-isolation, or rollback boundary.
   reuse; when they fire, one resolver check decides whether the shell
   actually changed before its activation reruns. The resolver likewise keeps
   each shell it resolved until its watches see an input change.
-- Dev shells are cached by the daemon (`rho-devshell-daemon`, reached over
+- Dev shells are cached by the agent host (`rho-devshell-daemon`, reached over
   `daemon.sock` in the shared cache directory, from workset processes and
   from `nix develop` in views) under a key every valid entry of a flake shares:
   evaluator, flake location and attribute, `flake.nix` and `flake.lock`.
   Entries record what evaluation read, as the Nix fork reports it, and the
   client checks them in its own namespace, where those paths mean what they
-  meant to the evaluator. The daemon owns the entries and which environments
+  meant to the evaluator. The agent host owns the entries and which environments
   stay pinned: the 50 most recently used keep a GC root in the shared cache
   directory, older ones stay usable until Nix collects them, and using one
   pins it again. A miss runs `rho-devshell-builder eval`, which links the Nix C
   API of cachix's Nix carrying `nix/patches/nix-*.patch` (flake input
   `nix`), evaluates in pure mode and pins what it built; it is installed
-  next to the daemon. The agent base's `nix` is the same patched Nix, whose
+  next to the agent host. The agent base's `nix` is the same patched Nix, whose
   `nix develop` takes a local flake's dev shell from `rho-devshell-builder
   shell`, which resolves it as a workset process does, instead of
   evaluating it. A generation uses a native,

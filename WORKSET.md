@@ -1,7 +1,7 @@
 # Worksets and the agent filesystem view
 
 A workset is the unit Rho gives an agent: one plain directory, presented
-at `/src` inside the agent's private mount namespace. The daemon does not
+at `/src` inside the agent's private mount namespace. The agent host does not
 interpret what is in it. The agent clones repositories into it with
 ordinary `git clone`, adds checkouts with `git worktree add`, and keeps
 whatever else it wants there; the directory is the truth and there is
@@ -24,10 +24,10 @@ no separate record of its contents.
 writer of `stores/`: it initializes a mirror on first request, refetches
 it on later requests (debounced, never in the background), and serves
 the same mirror to concurrent requests under one lock. Everything else —
-the daemon's own `Workset::clone_repo`, an agent's `git clone` and `git
+the agent host's own `Workset::clone_repo`, an agent's `git clone` and `git
 fetch` through Rho's patched git — is a client that reads a mirror.
 That git is part of the agent base (`VIEW.md`), the `buildEnv` whose
-path the daemon bakes in at build time (`RHO_AGENT_BASE`, set by the
+path the agent host bakes in at build time (`RHO_AGENT_BASE`, set by the
 flake for nix and dev-shell builds). `Worksets::discard_workset`
 deletes the workset directory; mirrors are shared and never removed.
 
@@ -35,10 +35,10 @@ Several agents can work in one workset: a child agent joins its parent's
 workset in the parent's directory. A parent that wants a child in a
 checkout of its own makes one itself first — a git worktree, another
 clone, whatever it likes — and tells the child where to work; the
-daemon only ever does the initial clone. Every agent's record is a workset id, a working directory as the
+agent host only ever does the initial clone. Every agent's record is a workset id, a working directory as the
 agent sees it, and a mode; loading
 `AGENTS.md`-style context is a function of that directory (the git
-checkout containing it), not of a "primary" repository. The daemon runs
+checkout containing it), not of a "primary" repository. The agent host runs
 one `Worksets` for its state root and hands the pool a `Workset` per
 agent; a directory outside the root can be adopted for one process
 (`Worksets::adopt`), which is how tests and `rho eval` work in place.
@@ -61,7 +61,7 @@ the life of the value. `prepare_command` enters it for a child process;
 `enter_interpreter_thread` moves a dedicated thread into it for the
 in-process Python notebook. There are two modes, view and exposed, and
 in both the workset is at `/src`; `rho-fs-view-dev` enters one from the
-command line the way the daemon does.
+command line the way the agent host does.
 `VIEW.md` records the requirements and principles the view is being
 built towards, and why.
 
@@ -95,9 +95,9 @@ a plain directory or file except a handful of real mounts:
 - The mirror store root, read-only, and the keeper's socket, at the
   same absolute paths they have on the host.
   Clones record the store by absolute path (git alternates), so the
-  path must not change between the daemon's frame and the agent's.
-- The directory holding the daemon's own executable, read-only at its
-  host path, when that is outside `/nix/store`: a cargo-built daemon can
+  path must not change between the agent host's frame and the agent's.
+- The directory holding the agent host's own executable, read-only at its
+  host path, when that is outside `/nix/store`: a cargo-built agent host can
   then launch its sibling sidecars (`rho-shell`, `rho-pager`). A nix
   build adds nothing.
 
@@ -143,7 +143,7 @@ real estate — deliberately opaque, so nothing can use or pollute it
 unmounted. Entering exposed mode on a host without it fails with that
 message.
 
-There is no mode without a namespace. `rho eval`, `rho-daemon debug
+There is no mode without a namespace. `rho eval`, `rho-agent-host debug
 render-prompt` and the tests adopt a host directory as a workset
 (`Worksets::adopt`) and enter it in view mode; whatever only reads files
 or renders prompts never builds the namespace, and whatever runs

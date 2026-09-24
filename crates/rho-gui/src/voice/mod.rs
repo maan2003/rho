@@ -1,8 +1,8 @@
-//! The voice session: whether the desk is listening, on whose daemon, and
+//! The voice session: whether the desk is listening, on whose agent host, and
 //! whether the microphone is open.
 //!
 //! Voice is one session for the whole client and it belongs to a host —
-//! the daemon does the listening, so the session dies when that daemon
+//! the agent host does the listening, so the session dies when that agent host
 //! goes. It also survives its own failures: a session the user asked for
 //! is started again when its task ends unexpectedly, which is why wanting
 //! a session and having one are two different facts here.
@@ -13,7 +13,7 @@
 
 pub(crate) mod rtc;
 
-use rho_hosts::HostId;
+use rho_agent_hosts::HostId;
 
 /// A session that is actually running.
 struct Running {
@@ -36,7 +36,7 @@ pub(crate) struct Voice {
     /// A session that ends on its own is started again; one the user ended
     /// is not.
     wanted: bool,
-    /// The daemon running it. The session is torn down with that host.
+    /// The agent host running it. The session is torn down with that host.
     host: Option<HostId>,
 }
 
@@ -51,7 +51,7 @@ impl Voice {
         self.wanted
     }
 
-    /// The daemon the session is on, if there is one.
+    /// The agent host the session is on, if there is one.
     pub(crate) fn host(&self) -> Option<HostId> {
         self.host
     }
@@ -84,7 +84,7 @@ impl Voice {
     }
 
     /// The user has asked for a session on `host`. Recorded before the
-    /// session exists, and kept if it fails to start: which daemon voice
+    /// session exists, and kept if it fails to start: which agent host voice
     /// belongs to is the ask, not the outcome.
     pub(crate) fn wants_host(&mut self, host: HostId) {
         self.host = Some(host);

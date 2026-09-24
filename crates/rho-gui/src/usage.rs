@@ -265,7 +265,7 @@ impl UsageView {
 
     /// Show `chart` over `days`. The data follows in one of the `arrived`
     /// calls, either from what the workspace already holds or from the
-    /// daemon's answer to the request that goes out with it.
+    /// agent host's answer to the request that goes out with it.
     pub(crate) fn show(&mut self, chart: Chart, days: u64, cx: &mut Context<Self>) {
         if self.chart != chart {
             self.series = Series::None;
@@ -379,7 +379,7 @@ impl UsageView {
                 ));
             }
             Some(Summary::Quota(_) | Summary::AgentCost(_)) => {}
-            None => text.push_str("waiting for the daemon's answer\n"),
+            None => text.push_str("waiting for the agent host's answer\n"),
         }
         self.buffer.update(cx, |buffer, cx| {
             let old = buffer.len();

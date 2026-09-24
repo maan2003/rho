@@ -21,7 +21,7 @@ This skill applies to repo-local persisted formats such as `rho-agent`'s redb/se
 
 ## Current rho-agent pattern
 
-`crates/rho-agent/src/db.rs` stores one format string in the `FORMAT` table:
+`agent-host/rho-agent/src/db.rs` stores one format string in the `FORMAT` table:
 
 ```rust
 const FORMAT: TableDefinition<(), String> = TableDefinition::new("format");
@@ -53,7 +53,7 @@ Still verify against a real or copied DB when possible:
 ```sh
 cargo run -q -p rho-cli -- debug migrate
 cargo run -q -p rho-cli -- debug agents
-cargo check -p rho-agent -p rho-daemon -p rho-cli
+cargo check -p rho-agent -p rho-agent-host -p rho-cli
 ```
 
 If old rows fail with `MissingRequiredField`, you need either a migration or a temporary compatible decode shape.
@@ -74,7 +74,7 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
 ];
 ```
 
-Ask the user/developer to run the daemon/CLI once with this commit. After it successfully opens the DB and writes the new format id, remove the migration in the next commit:
+Ask the user/developer to run the agent host/CLI once with this commit. After it successfully opens the DB and writes the new format id, remove the migration in the next commit:
 
 ```rust
 const CURRENT_AGENT_DB_FORMAT: &str = "9a4c1e20";
@@ -156,7 +156,7 @@ Keep the custom decode private/temporary and delete it with the migration. Only 
 ## Removal workflow
 
 1. Add the new format id and migration.
-2. Tell the user/developer to run the daemon/CLI once so their local DB opens and commits the new format id.
+2. Tell the user/developer to run the agent host/CLI once so their local DB opens and commits the new format id.
 3. Wait for confirmation that the migrated build ran successfully.
 4. Remove the migration function and any temporary legacy types in the next commit.
 5. Keep `CURRENT_*_DB_FORMAT` at the new id.
@@ -165,15 +165,15 @@ Keep the custom decode private/temporary and delete it with the migration. Only 
 Useful checks:
 
 ```sh
-cargo check -p rho-agent -p rho-daemon -p rho-cli
+cargo check -p rho-agent -p rho-agent-host -p rho-cli
 cargo run -q -p rho-cli -- debug migrate
 cargo run -q -p rho-cli -- debug agents
 ```
 
 `rho debug migrate` is the safe dry-run path: it copies the user's DB beside
 itself, runs pending migrations on the copy, and then decodes the migrated
-agent records. Use it before asking the user to run the real daemon/CLI.
-While the daemon runs, the copy is a snapshot the daemon takes between
+agent records. Use it before asking the user to run the real agent host/CLI.
+While the agent host runs, the copy is a snapshot the agent host takes between
 commits, which opens at once; a hand-made copy of the open file (`cp
 --reflink`) instead needs redb's full repair on open. Pass the copy with
 `--db-path` only when you mean that.

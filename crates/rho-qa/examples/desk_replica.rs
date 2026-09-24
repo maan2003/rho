@@ -1,6 +1,6 @@
 //! What the client's replica holds, read off a copy.
 //!
-//! The daemon probe says what the store holds; this says what the client
+//! The agent host probe says what the store holds; this says what the client
 //! resumes from, which is the other half of "why did that sync carry the
 //! whole desk again". It opens the client's database through the same
 //! reader the GUI uses, so what it prints is what the GUI would resume

@@ -197,31 +197,31 @@ where
 /// it is opened with, so a type keeps answering to its old name.
 const MOVED: &[(&str, &str)] = &[
     (
-        "rho_agent_host_proto::desk::cells::Cell",
+        "rho_desk_client::protocol::cells::Cell",
         "rho_desk::cells::Cell",
     ),
     (
-        "rho_agent_host_proto::desk::cells::VerdictEvent",
+        "rho_desk_client::protocol::cells::VerdictEvent",
         "rho_desk::cells::VerdictEvent",
     ),
     (
-        "rho_agent_host_proto::desk::cells::Id",
+        "rho_desk_client::protocol::cells::Id",
         "rho_desk::cells::Id",
     ),
     (
-        "rho_agent_host_proto::desk::cells::BodySnapshot",
+        "rho_desk_client::protocol::cells::BodySnapshot",
         "rho_desk::cells::BodySnapshot",
     ),
     (
-        "rho_agent_host_proto::desk::cells::Stamp",
+        "rho_desk_client::protocol::cells::Stamp",
         "rho_desk::cells::Stamp",
     ),
     (
-        "rho_agent_host_proto::desk::cells::CellMutation",
+        "rho_desk_client::protocol::cells::CellMutation",
         "rho_desk::cells::CellMutation",
     ),
     (
-        "rho_agent_host_proto::desk::cells::DeviceId",
+        "rho_desk_client::protocol::cells::DeviceId",
         "rho_desk::cells::DeviceId",
     ),
     (
@@ -251,6 +251,10 @@ const MOVED: &[(&str, &str)] = &[
     (
         "rho_agents_client::cache::AgentSnapshot",
         "rho_mirror::mirror::AgentSnapshot",
+    ),
+    (
+        "rho_agent_hosts::saved::SavedHosts",
+        "rho_hosts::saved::SavedHosts",
     ),
 ];
 

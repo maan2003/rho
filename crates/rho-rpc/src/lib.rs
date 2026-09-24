@@ -4,6 +4,9 @@
 //! retain their bounded length prefix inside that compressed byte stream, so
 //! callers can switch to raw bytes after a typed handshake without changing
 //! compression layers.
+//!
+//! [`protocol`] is what goes on those streams between a client and an agent
+//! host.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -17,6 +20,8 @@ use async_compression::tokio::write::ZstdEncoder;
 use futures::{SinkExt as _, StreamExt as _};
 use senax_encoder::{Packer, Unpacker};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader};
+
+pub mod protocol;
 
 /// Zstd's maximum history window in each direction (128 KiB).
 ///
@@ -33,7 +38,11 @@ const PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(feature = "server")]
 const IROH_SERVER_SECRET: redb::TableDefinition<(), &[u8; 32]> =
-    redb::TableDefinition::new("rho_daemon_iroh_secret_v1");
+    redb::TableDefinition::new("rho_agent_host_iroh_secret_v1");
+/// Where the secret was kept before the host was renamed. Temporary: it is
+/// carried over on the next start, and goes once every host has started.
+#[cfg(feature = "server")]
+const RENAMED_IROH_SERVER_SECRET: &str = "rho_daemon_iroh_secret_v1";
 
 /// Binds the native GUI's process-ephemeral iroh identity with Rho's standard
 /// incoming agent-stream credit and qlog policy.
@@ -106,7 +115,7 @@ impl AuthenticatedIrohListener {
         let auth = rho_iroh_auth::IrohAuth::new(db, secret.public());
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(16u8.into())
-            .qlog_from_env("rho-daemon");
+            .qlog_from_env("rho-agent-host");
         if env_flag("RHO_IROH_BBR3") {
             transport = transport.congestion_controller_factory(std::sync::Arc::new(
                 noq_proto::congestion::Bbr3Config::default(),
@@ -219,12 +228,21 @@ fn env_flag(name: &str) -> bool {
 #[cfg(feature = "server")]
 async fn load_or_create_server_secret(db: &rho_db::RhoDb) -> anyhow::Result<iroh::SecretKey> {
     let mut write = db.write().await;
+    // A host started before the rename keeps its identity, so the GUIs that
+    // trust it need not trust it again.
+    let renamed = write
+        .open_table(redb::TableDefinition::<(), &[u8; 32]>::new(
+            RENAMED_IROH_SERVER_SECRET,
+        ))
+        .get(&())
+        .map(|secret| *secret.value());
+    write.delete_table(RENAMED_IROH_SERVER_SECRET);
     let mut table = write.open_table(IROH_SERVER_SECRET);
     if let Some(secret) = table.get(&()) {
         return Ok(iroh::SecretKey::from_bytes(secret.value()));
     }
 
-    let secret = iroh::SecretKey::generate().to_bytes();
+    let secret = renamed.unwrap_or_else(|| iroh::SecretKey::generate().to_bytes());
     table.insert(&(), &secret);
     drop(table);
     write.commit();
@@ -812,6 +830,26 @@ mod tests {
         let second = load_or_create_server_secret(&db).await.unwrap();
 
         assert_eq!(first.public(), second.public());
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn server_secret_survives_the_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(temp.path().join("rho.redb"));
+        let old = iroh::SecretKey::generate();
+        let mut write = db.write().await;
+        write
+            .open_table(redb::TableDefinition::<(), &[u8; 32]>::new(
+                RENAMED_IROH_SERVER_SECRET,
+            ))
+            .insert(&(), &old.to_bytes());
+        write.commit();
+
+        let loaded = load_or_create_server_secret(&db).await.unwrap();
+
+        assert_eq!(loaded.public(), old.public());
+        assert!(!db.read().has_table(RENAMED_IROH_SERVER_SECRET));
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::{Opened, read_frame, write_open};
+use rho_rpc::protocol::{Opened, read_frame, write_open};
 
 use crate::protocol::{
     Open, TermClientFrame, TermServerFrame, TerminalInfo, TerminalList, TerminalOpen,
@@ -14,7 +14,7 @@ use crate::protocol::{
 /// (spawning the default one when none run), or spawn a fresh one with
 /// `new`.
 pub fn open(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     agent: String,
     new: bool,
     cols: u16,
@@ -25,7 +25,7 @@ pub fn open(
 
 /// One attached terminal: a dedicated stream carrying
 /// [`crate::protocol`] frames after the handshake. Dropping the
-/// owner cancels the attachment; the terminal keeps running in the daemon.
+/// owner cancels the attachment; the terminal keeps running in the agent host.
 pub struct TerminalChannel {
     pub terminal_id: u64,
     pub frames: futures_mpsc::Receiver<anyhow::Result<TermServerFrame>>,
@@ -35,19 +35,19 @@ pub struct TerminalChannel {
 
 /// One agent's running terminals.
 async fn dial_terminal_list(
-    dialer: rho_hosts::Dialer,
+    dialer: rho_agent_hosts::Dialer,
     agent: String,
 ) -> anyhow::Result<Vec<TerminalInfo>> {
     let mut stream = dialer
-        .open(<TerminalList as rho_agent_host_proto::Call>::PRIORITY)
+        .open(<TerminalList as rho_rpc::protocol::Call>::PRIORITY)
         .await?;
-    rho_agent_host_proto::call(&mut stream, TerminalList { agent: Some(agent) }).await
+    rho_rpc::protocol::call(&mut stream, TerminalList { agent: Some(agent) }).await
 }
 
 /// Dials a dedicated terminal stream: attach the agent's first running
 /// terminal (creating id 0 when none run), or spawn a fresh one with `new`.
 async fn dial_terminal(
-    dialer: rho_hosts::Dialer,
+    dialer: rho_agent_hosts::Dialer,
     agent: String,
     new: bool,
     cols: u16,
@@ -86,8 +86,8 @@ async fn dial_terminal(
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
-        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
+        tx_limit: rho_rpc::protocol::MAX_FRAME_LEN,
+        rx_limit: rho_rpc::protocol::MAX_FRAME_LEN,
         tx_capacity: 64,
         rx_capacity: 256,
     });

@@ -4,9 +4,8 @@
 use std::future::Future;
 
 use futures::StreamExt as _;
-use rho_agent_host_proto::host::Open as HostOpen;
-use rho_agent_host_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
-use rho_agent_host_proto::{read_frame, write_open};
+use rho_rpc::protocol::{read_frame, write_open};
+use rho_rtc::protocol::{RealtimeClientFrame, RealtimeServerFrame};
 use rho_rtc::{RtcEvent, RtcSession, SdpAnswer};
 
 struct RealtimeChannel {
@@ -18,24 +17,27 @@ struct RealtimeChannel {
 
 /// Runs voice against the host until `stop` fires or the session fails.
 pub(crate) fn start(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     stop: tokio::sync::oneshot::Receiver<()>,
     input_muted: tokio::sync::watch::Receiver<bool>,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
     link.run(|dialer| run(move |offer_sdp| dial(dialer, offer_sdp), stop, input_muted))
 }
 
-async fn dial(dialer: rho_hosts::Dialer, offer_sdp: String) -> anyhow::Result<RealtimeChannel> {
+async fn dial(
+    dialer: rho_agent_hosts::Dialer,
+    offer_sdp: String,
+) -> anyhow::Result<RealtimeChannel> {
     // Interactive streams outrank the sessions (priority 1 and below).
     let mut stream = dialer.open(Some(50)).await?;
-    write_open(&mut stream, &HostOpen::Realtime { offer_sdp }).await?;
+    write_open(&mut stream, &rho_rtc::protocol::Open { offer_sdp }).await?;
     let answer_sdp = match read_frame(&mut stream).await? {
-        rho_agent_host_proto::realtime::Opened::Answer { answer_sdp } => answer_sdp,
-        rho_agent_host_proto::realtime::Opened::Refused { reason } => anyhow::bail!("{reason}"),
+        rho_rtc::protocol::Opened::Answer { answer_sdp } => answer_sdp,
+        rho_rtc::protocol::Opened::Refused { reason } => anyhow::bail!("{reason}"),
     };
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
-        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
+        tx_limit: rho_rpc::protocol::MAX_FRAME_LEN,
+        rx_limit: rho_rpc::protocol::MAX_FRAME_LEN,
         tx_capacity: 32,
         rx_capacity: 32,
     });

@@ -1,6 +1,6 @@
-//! Comint-style editor surface for a daemon-owned shell.
+//! Comint-style editor surface for a host-owned shell.
 //!
-//! The multibuffer keeps a read-only projection of daemon-owned structured
+//! The multibuffer keeps a read-only projection of host-owned structured
 //! shell state beside the writable pending command. State deltas update the
 //! projection without disturbing a draft while commands run.
 //!

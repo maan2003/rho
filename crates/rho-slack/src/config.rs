@@ -28,7 +28,7 @@ impl std::fmt::Display for WorkspaceName {
 ///
 /// Handed in by the binary that opens a session. This crate never asks
 /// the OS where the user's state lives, and that is the point: a default
-/// would be the user's live mirror — the file the running daemon holds
+/// would be the user's live mirror — the file the running agent host holds
 /// open — and anything that is not the user's own rho would fall into it
 /// by writing nothing at all. A test did exactly that, silently, for a
 /// whole change. With no default there is nothing to fall into.

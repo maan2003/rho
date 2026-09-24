@@ -36,7 +36,7 @@ gpui::actions!(
     ]
 );
 
-/// Client-side scrollback retention; the daemon replays up to its own cap.
+/// Client-side scrollback retention; the agent host replays up to its own cap.
 const SCROLLBACK_LIMIT: usize = 8192;
 
 /// The shared terminal state: wire screen, input stream, and read task.
@@ -47,10 +47,10 @@ pub struct TerminalModel {
     /// Monotonic count of lines appended to scrollback, so views can keep
     /// their place while history arrives (the ring length saturates).
     history_appended: u64,
-    /// (cols, rows) last sent to the daemon; shared with the focused
+    /// (cols, rows) last sent to the agent host; shared with the focused
     /// view's paint-time measurement so resizes go straight to the stream.
     sent_size: Rc<Cell<(u16, u16)>>,
-    /// The stream ended without an `Exited` status (daemon or dial gone).
+    /// The stream ended without an `Exited` status (agent host or dial gone).
     disconnected: bool,
     _read_task: gpui::Task<()>,
     _transport: rho_rpc::ChannelTask,
@@ -343,7 +343,7 @@ impl Render for TerminalView {
         let focused = self.focus_handle.is_focused(window);
 
         // Size measurement happens at paint time: compare the viewport bounds
-        // to the cell metrics and tell the daemon when the grid changed.
+        // to the cell metrics and tell the agent host when the grid changed.
         // Only the focused view drives the pty size (tmux `window-size
         // latest`) so hidden terminal surfaces do not resize the pty.
         let model = self.model.read(cx);
@@ -723,7 +723,7 @@ fn row_element(
         .into_any_element()
 }
 
-/// Whether the daemon will write PTY bytes for this keystroke — the
+/// Whether the agent host will write PTY bytes for this keystroke — the
 /// client-side mirror of the encoder's coverage, deciding whether to stop
 /// propagation (a swallowed key must really be consumed).
 fn probably_produces_bytes(ks: &TermKeystroke) -> bool {

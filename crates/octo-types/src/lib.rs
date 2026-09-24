@@ -19,7 +19,7 @@ pub struct ReceivePackCommands {
 /// Parse the bounded command prefix at the start of a receive-pack request.
 ///
 /// `Ok(None)` means that more bytes are needed. The parser is shared by the
-/// daemon-side remote helper and the GUI credential holder so neither side
+/// host-side remote helper and the GUI credential holder so neither side
 /// relies on the other's validation.
 pub fn parse_receive_pack_commands(input: &[u8]) -> Result<Option<ReceivePackCommands>, String> {
     let mut offset = 0;

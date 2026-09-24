@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::{Call, Opened, read_frame, write_frame, write_open};
+use rho_rpc::protocol::{Call, Opened, read_frame, write_frame, write_open};
 
 use crate::protocol::{
     Open, ShellClientFrame, ShellClose, ShellList, ShellServerFrame, ShellStart,
@@ -15,7 +15,7 @@ use crate::protocol::{
 /// Starts the agent's shell on the host `link` reaches when none runs,
 /// then attaches.
 pub fn open(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     agent: String,
 ) -> impl Future<Output = anyhow::Result<ShellChannel>> + Send + 'static {
     link.run(|dialer| start_and_dial_shell(dialer, agent))
@@ -23,19 +23,19 @@ pub fn open(
 
 /// Gracefully closes the agent's persistent shell.
 pub fn close(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     agent: String,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
     link.run(|dialer| async move { call(&dialer, ShellClose { agent }).await })
 }
 
 /// One call on a stream of its own. A refusal is an error.
-async fn call<C: Call>(dialer: &rho_hosts::Dialer, call: C) -> anyhow::Result<C::Reply> {
+async fn call<C: Call>(dialer: &rho_agent_hosts::Dialer, call: C) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    rho_agent_host_proto::call(&mut stream, call).await
+    rho_rpc::protocol::call(&mut stream, call).await
 }
 
-/// One attachment to an agent's daemon-owned Comint-style shell. Dropping
+/// One attachment to an agent's host-owned Comint-style shell. Dropping
 /// `input` detaches this GUI but does not stop the shell process.
 pub struct ShellChannel {
     pub frames: futures_mpsc::Receiver<ShellServerFrame>,
@@ -50,7 +50,7 @@ pub struct ShellSubmission {
 
 /// Starts the agent's shell when none runs, then attaches.
 async fn start_and_dial_shell(
-    dialer: rho_hosts::Dialer,
+    dialer: rho_agent_hosts::Dialer,
     agent: String,
 ) -> anyhow::Result<ShellChannel> {
     let list = ShellList {
@@ -65,7 +65,10 @@ async fn start_and_dial_shell(
     dial_shell(dialer, agent).await
 }
 
-async fn dial_shell(dialer: rho_hosts::Dialer, agent: String) -> anyhow::Result<ShellChannel> {
+async fn dial_shell(
+    dialer: rho_agent_hosts::Dialer,
+    agent: String,
+) -> anyhow::Result<ShellChannel> {
     // Interactive streams outrank calls and sessions (priority 1 and below).
     let mut stream = dialer.open(Some(50)).await?;
     write_open(&mut stream, &Open::Attach { agent }).await?;

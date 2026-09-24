@@ -39,11 +39,11 @@ fn home() -> Result<PathBuf> {
 ///
 /// This is an allow list on purpose. What is deliberately *not* here:
 ///
-/// - `auth.d`, `iroh-secret.key`: identity. A rig daemon is its own node.
+/// - `auth.d`, `iroh-secret.key`: identity. A rig agent host is its own node.
 /// - `qlog`, `debug`: logs, tens of gigabytes, and no part of any state.
 /// - `chromium-qa-profile`, `chromium-extension`: the rig drives the fake
 ///   browser, not a real one.
-/// - `*.sock`, `*.lock`: the live daemon's, and meaningless in a copy.
+/// - `*.sock`, `*.lock`: the live agent host's, and meaningless in a copy.
 /// - `gui-telemetry`: output of a run, not input to one. A rig writes its own.
 /// - `sandboxes`: bubblewrap scaffolding — bind-mount masks and empty
 ///   `run`/`tmp` dirs, all of it left over from July and unused since. The
@@ -55,7 +55,7 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
     "rho.redb",
     // The client's one database: the agent mirror, the desk replica, the
     // Slack mirror and its cursors, the action journal and the inbox, each
-    // under its own tables. Beside a daemon it is a fallback only — it is
+    // under its own tables. Beside an agent host it is a fallback only — it is
     // whatever the box that ran a GUI happens to hold, here QA's own `acme`
     // fixture — and a snapshot taken with `--gui-state` overwrites it with
     // the real one; see [`GUI_SNAPSHOT_CONTENTS`].
@@ -67,8 +67,8 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
 /// [`SNAPSHOT_CONTENTS`] and the same rule: an allow list, never a deny list.
 ///
 /// A device that runs the GUI keeps the screens' own state beside the
-/// daemon's, and the two are not always the same machine: the desk's daemon
-/// holds the store, while the mirror, the journal and the inbox that a
+/// agent host's, and the two are not always the same machine: the desk's agent
+/// host holds the store, while the mirror, the journal and the inbox that a
 /// screen reads belong to whichever client the user was actually looking at.
 /// This is that client's half.
 ///
@@ -76,7 +76,7 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
 ///
 /// - `auth.d`, `iroh-secret.key`, `sessions`: credentials and identity. A rig
 ///   is never the user, on any device.
-/// - `rho.redb`: the daemon's store, copied from the daemon's own state
+/// - `rho.redb`: the agent host's store, copied from the agent host's own state
 ///   directory. A client never has it.
 /// - `gui-telemetry`, `qlog`, `debug`: what a run wrote, not what it needs.
 pub const GUI_SNAPSHOT_CONTENTS: &[&str] = &[
@@ -88,8 +88,8 @@ pub const GUI_SNAPSHOT_CONTENTS: &[&str] = &[
     // already holds, what a verdict wrote so undo means something after a
     // restart, and the Slack flood as the user's own device has it.
     // `rho-slack`'s session writes every arriving message into it and the
-    // daemon never touches it, so this copy is the real one and the
-    // daemon-side copy is the fixture. The overlay in `rig new` is what
+    // agent host never touches it, so this copy is the real one and the
+    // host-side copy is the fixture. The overlay in `rig new` is what
     // makes this one win.
     "rho-client.redb",
 ];
@@ -122,17 +122,17 @@ mod tests {
         }
     }
 
-    /// The store is the daemon's and a client never has it; copying one from
-    /// a client would make a rig disagree with itself about which device it
-    /// is. The client's own database is the other way round — it is the
-    /// client's, and it is on both lists on purpose, the daemon-side copy
-    /// being the fallback for a snapshot taken without `--gui-state`.
+    /// The store is the agent host's and a client never has it; copying one
+    /// from a client would make a rig disagree with itself about which
+    /// device it is. The client's own database is the other way round — it
+    /// is the client's, and it is on both lists on purpose, the host-side
+    /// copy being the fallback for a snapshot taken without `--gui-state`.
     #[test]
-    fn the_gui_half_holds_no_daemon_store() {
+    fn the_gui_half_holds_no_host_store() {
         for entry in GUI_SNAPSHOT_CONTENTS {
             assert_ne!(
                 *entry, "rho.redb",
-                "the store belongs to the daemon's state directory"
+                "the store belongs to the agent host's state directory"
             );
         }
         assert!(

@@ -286,7 +286,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("ctrl-alt-shift-p", UploadGuiTelemetry, Some("RhoGui")),
         // Capture is global and modal: one chord, type, enter, and focus is
         // restored to the exact surface that owned it.
-        // A Comint-style shell submits complete input lines to the daemon;
+        // A Comint-style shell submits complete input lines to the agent host;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(
             "enter",

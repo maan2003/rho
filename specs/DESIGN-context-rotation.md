@@ -47,4 +47,4 @@ Old context-rotation boundaries remain readable and authoritative; changing
 policy must not resurrect context already discarded by an old version.
 Legacy preparation events remain readable but are never resumed automatically.
 The durable event vocabulary is extended, not rewritten; see
-[DECISION-history-only-branches](../crates/rho-agent/specs/DECISION-history-only-branches.md).
+[DECISION-history-only-branches](../agent-host/rho-agent/specs/DECISION-history-only-branches.md).

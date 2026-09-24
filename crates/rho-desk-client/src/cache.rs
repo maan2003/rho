@@ -10,14 +10,14 @@
 //! dealt again, and listed as running, for as long as the first sync took.
 //!
 //! This is the replica that removes the state instead of guarding it at
-//! each reader. The client opens from the file and asks the daemon only
+//! each reader. The client opens from the file and asks the agent host only
 //! for what came after: `Sync` already carries the client's `Version`
-//! and the daemon already answers `Store::since`, so persisting the
+//! and the agent host already answers `Store::since`, so persisting the
 //! confirmed cells and their version is the whole of the client's half.
 //!
 //! It holds `confirmed` and never `view`. A client that dies with
 //! mutations in flight must open without them: an unacknowledged write is
-//! the daemon's to accept or refuse, and a replica that remembered one
+//! the agent host's to accept or refuse, and a replica that remembered one
 //! would show the user a verdict that was never taken.
 //!
 //! Like the transcript cache it is a copy, never a source. Anything doubted is
@@ -27,10 +27,11 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use redb::TableDefinition;
-use rho_agent_host_proto::desk::cells::{
+use rho_db::{RhoDb, Sen, SenValue};
+
+use crate::protocol::cells::{
     BodySnapshot, Cell, DeviceId, Id, PropertyKey, Snapshot, Stamp, VerdictEvent, Version,
 };
-use rho_db::{RhoDb, Sen, SenValue};
 
 /// How far this client has read a host's store, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -40,8 +41,8 @@ const DESK_HOSTS: TableDefinition<&str, Sen<StoredDeskHost>> =
     TableDefinition::new("gui_desk_host_v1");
 /// This device's id in the desk store, one row. It belongs in the
 /// database and not beside it because it means nothing without the
-/// replica: the daemon counts this device's stamps, so a fresh replica
-/// reusing the old id writes stamps the daemon has already counted, and
+/// replica: the agent host counts this device's stamps, so a fresh replica
+/// reusing the old id writes stamps the agent host has already counted, and
 /// last-writer-wins drops them without a word. Delete the file and the
 /// id goes with it, and this is a new device.
 const DESK_DEVICE: TableDefinition<(), Sen<DeviceId>> = TableDefinition::new("gui_desk_device_v1");
@@ -64,20 +65,20 @@ const DESK_BODIES: TableDefinition<Sen<BodyKey>, Sen<BodySnapshot>> =
 /// What the client holds of one host, and how far it read to hold it.
 /// The store's own identity belongs here too, so that a replica counting
 /// in one store is dropped rather than believed when it meets another;
-/// the wire does not carry it yet and the daemon's half adds both.
+/// the wire does not carry it yet and the agent host's half adds both.
 #[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
 struct StoredDeskHost {
     version: Version,
-    /// The store the version was counted in, said by the daemon. A version
+    /// The store the version was counted in, said by the agent host. A version
     /// is a count of writes per device inside one store, so the same
     /// numbers read against another store name writes that never happened.
     /// Held so the next handshake can say whose numbers these are, and so
-    /// a daemon that does not know the name can say to throw them away.
+    /// an agent host that does not know the name can say to throw them away.
     store: DeviceId,
-    /// The text replica id the daemon gave this device. It is the
+    /// The text replica id the agent host gave this device. It is the
     /// device's, not the connection's, so it is the same number after a
     /// restart — and it has to be held, because the client edits a note
-    /// from the replica before the daemon has answered and an edit made
+    /// from the replica before the agent host has answered and an edit made
     /// under a borrowed replica id is an edit attributed to someone else.
     namespace: u16,
 }
@@ -221,7 +222,7 @@ impl DeskMirror {
         }
     }
 
-    /// What the daemon just told this client, written as it was merged.
+    /// What the agent host just told this client, written as it was merged.
     /// The version is the store's own after the merge, not the delta's, so
     /// what is on disk and what the next `Sync` asks for are the same
     /// number.
@@ -242,7 +243,7 @@ impl DeskMirror {
         });
     }
 
-    /// Text typed on this client, kept next to what arrived. The daemon
+    /// Text typed on this client, kept next to what arrived. The agent host
     /// never sends a client its own operations back, so this is the only
     /// way a note written here survives a restart.
     pub fn write_bodies(&self, host: &str, bodies: Vec<BodySnapshot>) {
@@ -314,7 +315,7 @@ fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
     }
 }
 
-/// Body history added to what is held, never replacing it: the daemon
+/// Body history added to what is held, never replacing it: the agent host
 /// sends only the operations this client lacks, and the client's own
 /// typing arrives here the same way, one operation at a time.
 fn keep_bodies(transaction: &mut rho_db::WriteTxn, host: &str, bodies: &[BodySnapshot]) {
@@ -437,7 +438,7 @@ fn global() -> std::sync::RwLockReadGuard<'static, Option<DeskMirror>> {
 
 /// Takes the replica's tables in the client's database, which `main` opens
 /// at startup before any window exists. Without it every call below is a
-/// no-op and the GUI starts with no desk until the daemon answers, which
+/// no-op and the GUI starts with no desk until the agent host answers, which
 /// is exactly what it did before this existed — and what a test wants,
 /// since a test opens no database.
 pub fn init(db: RhoDb) -> std::io::Result<()> {
@@ -478,7 +479,7 @@ pub fn close() {
 /// This client's device id, minted on the first launch that had a
 /// database and kept in it ever after.
 ///
-/// The daemon binds one writer connection per device and a device's
+/// The agent host binds one writer connection per device and a device's
 /// stamps must keep ascending across restarts, so a fresh id every
 /// launch would both lock the GUI out of a second window and lose that
 /// ordering.
@@ -562,8 +563,9 @@ pub fn reset_host(host: &str) {
 
 #[cfg(test)]
 mod recorded_names {
-    use rho_agent_host_proto::desk::cells;
     use rho_db::Sen;
+
+    use crate::protocol::cells;
 
     /// redb refuses a table whose recorded value type differs from the
     /// one it is opened with, and `Sen` records the Rust path. These are
@@ -620,19 +622,18 @@ mod recorded_names {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::desk::cells::{Property, Store, Uuid};
-
     use super::*;
+    use crate::protocol::cells::{Property, Store, Uuid};
 
-    /// The store the daemon in these tests answers as.
-    const DAEMON: DeviceId = DeviceId([5; 16]);
+    /// The store the agent host in these tests answers as.
+    const AGENT_HOST: DeviceId = DeviceId([5; 16]);
 
     fn note(seed: u8) -> Id {
         Id::Note(Uuid([seed; 16]))
     }
 
     /// The replica builds a note's history up out of the pieces it is
-    /// sent. The daemon answers a sync with only the operations the
+    /// sent. The agent host answers a sync with only the operations the
     /// client lacks, so a body that arrived as a delta must not replace
     /// the one on disk, or the words the client already had are lost the
     /// moment somebody types the next one.
@@ -653,8 +654,8 @@ mod tests {
             transactions: Vec::new(),
         };
 
-        mirror.write_delta("desk", DAEMON, 1, store.snapshot(), vec![first]);
-        mirror.write_delta("desk", DAEMON, 1, store.snapshot(), vec![second]);
+        mirror.write_delta("desk", AGENT_HOST, 1, store.snapshot(), vec![first]);
+        mirror.write_delta("desk", AGENT_HOST, 1, store.snapshot(), vec![second]);
         mirror.flush();
 
         let held = mirror.load("desk");
@@ -665,14 +666,14 @@ mod tests {
             .expect("the note's history is held");
         assert_eq!(
             body.version(),
-            rho_agent_host_proto::desk::cells::BodyVersion::from([(1, 2)]),
+            crate::protocol::cells::BodyVersion::from([(1, 2)]),
             "both operations are there, the first one not thrown away by the second delta"
         );
     }
 
     /// Text typed on this client is kept, and keeping it says nothing
     /// about the cells: the version vector the next sync asks with is the
-    /// one the daemon's deltas set, not an empty one left by local typing.
+    /// one the agent host's deltas set, not an empty one left by local typing.
     #[test]
     fn text_typed_here_is_kept_and_leaves_the_cell_version_where_it_was() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,7 +684,7 @@ mod tests {
             .unwrap();
         let id = note(1);
 
-        mirror.write_delta("desk", DAEMON, 1, store.snapshot(), Vec::new());
+        mirror.write_delta("desk", AGENT_HOST, 1, store.snapshot(), Vec::new());
         mirror.write_bodies(
             "desk",
             vec![BodySnapshot {
@@ -702,13 +703,13 @@ mod tests {
         assert_eq!(
             held.snapshot.version,
             store.snapshot().version,
-            "and the version vector is still what the daemon's delta left"
+            "and the version vector is still what the agent host's delta left"
         );
     }
 
-    fn edit(replica_id: u16, value: u32) -> rho_agent_host_proto::desk::TextOperation {
-        rho_agent_host_proto::desk::TextOperation::Edit {
-            timestamp: rho_agent_host_proto::desk::TreeClock { value, replica_id },
+    fn edit(replica_id: u16, value: u32) -> crate::protocol::TextOperation {
+        crate::protocol::TextOperation::Edit {
+            timestamp: crate::protocol::TreeClock { value, replica_id },
             version: Vec::new(),
             ranges: vec![(0, 0)],
             new_text: vec!["x".into()],
@@ -719,7 +720,7 @@ mod tests {
     /// writes go on ascending across a restart. A second database is a
     /// second device: the id lives with the replica whose writes it
     /// counts, and a fresh replica reusing an old id would write stamps
-    /// the daemon has already counted and lose them silently.
+    /// the agent host has already counted and lose them silently.
     #[test]
     fn the_device_id_is_minted_once_per_database_and_read_back_from_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -739,7 +740,7 @@ mod tests {
 
     /// What the replica is for: a client that has written a host's cells
     /// down opens holding them, and the version it opens with is the one
-    /// the daemon is asked to resume from.
+    /// the agent host is asked to resume from.
     #[test]
     fn a_written_desk_is_read_back_whole_with_the_version_it_was_read_through() {
         let dir = tempfile::tempdir().unwrap();
@@ -752,21 +753,21 @@ mod tests {
         store.write(id.clone(), Property::PaceDays(3)).unwrap();
         let snapshot = store.snapshot();
 
-        mirror.write_delta("desk", DAEMON, 42, snapshot.clone(), Vec::new());
+        mirror.write_delta("desk", AGENT_HOST, 42, snapshot.clone(), Vec::new());
         mirror.flush();
 
         let held = mirror.load("desk");
         assert!(held.known, "the host was written, so it is known");
         assert_eq!(
             held.namespace, 42,
-            "the device's replica id is held, so an edit before the daemon answers is this device's"
+            "the device's replica id is held, so an edit before the agent host answers is this device's"
         );
         assert_eq!(
             held.snapshot.version, snapshot.version,
             "the version is what the next Sync asks from"
         );
         assert_eq!(
-            held.store, DAEMON,
+            held.store, AGENT_HOST,
             "the store the version was counted in is held with it, since the number means nothing without it"
         );
         let read = Store::from_snapshot(DeviceId([7; 16]), held.snapshot).unwrap();
@@ -786,7 +787,7 @@ mod tests {
 
         mirror.write_delta(
             "desk",
-            DAEMON,
+            AGENT_HOST,
             42,
             Store::new(DeviceId([7; 16])).snapshot(),
             Vec::new(),
@@ -811,13 +812,19 @@ mod tests {
             .write(first.clone(), Property::Name("rho".into()))
             .unwrap();
         let held_through = store.version().clone();
-        mirror.write_delta("desk", DAEMON, 42, store.snapshot(), Vec::new());
+        mirror.write_delta("desk", AGENT_HOST, 42, store.snapshot(), Vec::new());
 
         let second = note(2);
         store
             .write(second.clone(), Property::Name("slack".into()))
             .unwrap();
-        mirror.write_delta("desk", DAEMON, 42, store.since(&held_through), Vec::new());
+        mirror.write_delta(
+            "desk",
+            AGENT_HOST,
+            42,
+            store.since(&held_through),
+            Vec::new(),
+        );
         mirror.flush();
 
         let held = mirror.load("desk");
@@ -835,7 +842,7 @@ mod tests {
         let mirror = DeskMirror::open(dir.path()).unwrap();
         let mut store = Store::new(DeviceId([7; 16]));
         store.write(note(1), Property::Name("rho".into())).unwrap();
-        mirror.write_delta("desk", DAEMON, 42, store.snapshot(), Vec::new());
+        mirror.write_delta("desk", AGENT_HOST, 42, store.snapshot(), Vec::new());
         mirror.flush();
         assert!(mirror.load("desk").known);
 
