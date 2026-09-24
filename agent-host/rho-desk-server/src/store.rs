@@ -768,6 +768,22 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn private_table_types_keep_the_names_the_desk_database_recorded() {
+        assert_eq!(
+            <Sen<CellAddress> as redb::Value>::type_name().name(),
+            "rho-db::Sen<rho_daemon::desk_cells::CellAddress>"
+        );
+        assert_eq!(
+            <Sen<VerdictKey> as redb::Value>::type_name().name(),
+            "rho-db::Sen<rho_daemon::desk_cells::VerdictKey>"
+        );
+        assert_eq!(
+            <Sen<CellMeta> as redb::Value>::type_name().name(),
+            "rho-db::Sen<rho_daemon::desk_cells::CellMeta>"
+        );
+    }
+
     async fn fixture_store() -> DeskCellStore {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rho.redb");

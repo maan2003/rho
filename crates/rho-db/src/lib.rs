@@ -197,6 +197,18 @@ where
 /// it is opened with, so a type keeps answering to its old name.
 const MOVED: &[(&str, &str)] = &[
     (
+        "rho_desk_server::store::CellAddress",
+        "rho_daemon::desk_cells::CellAddress",
+    ),
+    (
+        "rho_desk_server::store::VerdictKey",
+        "rho_daemon::desk_cells::VerdictKey",
+    ),
+    (
+        "rho_desk_server::store::CellMeta",
+        "rho_daemon::desk_cells::CellMeta",
+    ),
+    (
         "rho_desk_client::protocol::cells::Cell",
         "rho_desk::cells::Cell",
     ),
