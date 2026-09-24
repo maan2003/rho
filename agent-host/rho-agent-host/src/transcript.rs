@@ -1,7 +1,7 @@
 //! Transcripts: what a client is told of an agent's raw log. `strip`
 //! takes one raw event to what a client keeps of it, per event, in that
-//! event's position (`AGENT-LOG-DESIGN.md`, "the transcript is a pure
-//! function of the raw log"). The runtime writes its own events; this is
+//! event's position: the transcript is a pure function of the raw log.
+//! The runtime writes its own events; this is
 //! the one place they become the client's words.
 
 use rho_agent::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};

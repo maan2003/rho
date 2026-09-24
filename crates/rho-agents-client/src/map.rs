@@ -1,7 +1,7 @@
 //! The map: every agent this client knows, and the indexes the screens
 //! read it through.
 //!
-//! The cost rule (`GUI-MODEL-DESIGN.md`) holds here from the first line:
+//! The cost rule holds here from the first line:
 //! **an event costs what it touched plus a lookup, and a read costs what
 //! it draws.** That is what the indexes are for, and it is what the map
 //! is shaped around rather than something checked afterwards.

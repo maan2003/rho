@@ -1,4 +1,4 @@
-//! Clones born from a shared mirror store (`CLONES.md`): the keeper that
+//! Clones born from a shared mirror store: the keeper that
 //! holds one bare mirror per remote URL ([`server`]), how the agent host
 //! births its own clones from a mirror ([`client`]), and the one-line
 //! socket protocol between them ([`protocol`]). The patched `git` agents

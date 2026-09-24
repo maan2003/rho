@@ -2,7 +2,7 @@
 //! fetched on request, served over a unix socket. The agent host runs it
 //! in-process and is the root's only writer; everything else — the agent host's
 //! own clones and the `git` wrapper agents run — is a client that reads a
-//! mirror and never touches the network (`CLONES.md`).
+//! mirror and never touches the network.
 //!
 //! Layout under the root, one directory per remote URL (`store_key`):
 //!

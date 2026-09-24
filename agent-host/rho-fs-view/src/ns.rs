@@ -361,8 +361,8 @@ impl Namespace {
         command.env_clear();
         match &self.mode {
             Mode::View { .. } => {
-                // The agent's own nix profile first, then the base userland
-                // (VIEW.md). Nothing of the host's PATH.
+                // The agent's own nix profile first, then the base userland.
+                // Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
                 // Passed through from the user: the terminal, the timezone,
                 // and the agent host's own find-fork directory for direnvrc.

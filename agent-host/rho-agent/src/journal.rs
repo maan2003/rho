@@ -1,8 +1,7 @@
 //! The journal observer: it tells the agent host about every append after it
-//! commits, and carries each loop's status in the same feed
-//! (`AGENT-LOG-DESIGN.md`). What a client is told of either is the
-//! agent host's business; this only says what happened, in the runtime's own
-//! words.
+//! commits, and carries each loop's status in the same feed. What a client is
+//! told of either is the agent host's business; this only says what happened,
+//! in the runtime's own words.
 
 use std::sync::Arc;
 

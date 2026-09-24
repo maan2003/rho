@@ -184,7 +184,7 @@ diff -Nur a/rho-store.h b/rho-store.h
 +#define RHO_STORE_H
 +
 +/*
-+ * Rho's mirror store (rho's CLONES.md). When RHO_GIT_STORE_SOCKET names the
++ * Rho's mirror store. When RHO_GIT_STORE_SOCKET names the
 + * keeper's unix socket, a fetch or clone of a remote URL asks the keeper
 + * for a fetched local mirror of that URL, borrows the mirror's objects
 + * through the repository's alternates, and reads the refs and objects from

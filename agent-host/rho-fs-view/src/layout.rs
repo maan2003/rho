@@ -355,12 +355,12 @@ fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     if registry.exists() {
         symlink(registry, etc.join("nix/registry.json"))?;
     }
-    // Git's behaviour (VIEW.md 6); identity is environment.
+    // Git's behaviour; identity is environment.
     fs::write(
         etc.join("gitconfig"),
         "[core]\n\tpager = cat\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n",
     )?;
-    // direnv under Rho's configuration (VIEW.md 3): everything under /src
+    // direnv under Rho's configuration: everything under /src
     // is trusted, the layout lives in the workset's state directory, and
     // `use flake` puts the agent host's find fork and cargo's bin first.
     fs::create_dir_all(etc.join("rho/direnv"))?;

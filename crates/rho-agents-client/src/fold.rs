@@ -1,9 +1,9 @@
 //! The fold: what a client makes of the mirror.
 //!
-//! The agent host sends the mirror, one stripped event per raw row
-//! (`AGENT-LOG-DESIGN.md`, "the mirror is a pure function of the raw
-//! log"). Everything a rail or a transcript shows is folded from it here,
-//! on the client, so the wire carries facts and never conclusions.
+//! The agent host sends the mirror, one stripped event per raw row: the
+//! mirror is a pure function of the raw log. Everything a rail or a transcript
+//! shows is folded from it here, on the client, so the wire carries facts and
+//! never conclusions.
 
 use std::sync::Arc;
 

@@ -444,7 +444,7 @@ pub struct Workspace {
     /// Each context retains one viewport over its surfaces, and the stack
     /// of where the reader was in it. One machine, per context, because a
     /// back that changes context moves two things at once (eng-en1p's
-    /// ruling under the Emacs rule; `RHO-WINDOW-DESIGN.md`).
+    /// ruling under the Emacs rule).
     /// The one history: every surface the reader has been on, in the order
     /// they were opened, with a cursor on where they are. `None` only
     /// before the first surface is shown.

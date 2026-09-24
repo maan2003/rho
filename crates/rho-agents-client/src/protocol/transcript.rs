@@ -1,8 +1,8 @@
 //! Transcripts: what a client keeps of an agent's raw log.
 //!
 //! Every [`TranscriptEvent`] is `strip` of exactly one raw event, in that
-//! event's position (`AGENT-LOG-DESIGN.md`, "the transcript is a pure function
-//! of the raw log"). Bodies a person does not read at a glance (tool
+//! event's position: the transcript is a pure function of the raw log.
+//! Bodies a person does not read at a glance (tool
 //! output, reasoning, the argument blob) are left behind; a client asks
 //! for them by position when it wants them.
 //!

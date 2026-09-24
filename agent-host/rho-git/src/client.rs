@@ -10,7 +10,7 @@
 //! real remote URL, so `git remote -v`, `git push` and any tooling see
 //! exactly what a plain clone would. What differs is only where the bytes
 //! come from: objects are borrowed from the mirror through
-//! `objects/info/alternates` (`CLONES.md`).
+//! `objects/info/alternates`.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;

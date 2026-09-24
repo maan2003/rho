@@ -4,7 +4,7 @@
 //! presented at `/src` inside the agent's namespace. The agent host does not
 //! interpret its contents: the agent clones what it needs with ordinary
 //! `git clone`, which is instant because every clone is born from the
-//! agent host's mirror store (`CLONES.md`). The store root is owned by the
+//! agent host's mirror store (`rho_git`). The store root is owned by the
 //! keeper (`rho_git::server`) running inside the agent host; the `git` agents
 //! see is Rho's patched git, which asks the keeper itself on every fetch
 //! and clone, and the agent host's own clones go through the same keeper
@@ -28,7 +28,7 @@ pub use layout::*;
 pub use ns::{MAX_BOUNDED_READ, Mode, Namespace, WorksetLayout};
 pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
-/// The agent's base userland (`VIEW.md`): a nix `buildEnv` fixed at build
+/// The agent's base userland: a nix `buildEnv` fixed at build
 /// time whose `bin/` is the agent's PATH, after the agent's own nix
 /// profile. It holds Rho's patched git, the CA bundle and the pinned
 /// flake registry.
@@ -257,7 +257,7 @@ impl Worksets {
         self.root.join("stores")
     }
 
-    /// The cache every agent shares as `~/.cache` (VIEW.md): nix
+    /// The cache every agent shares as `~/.cache`: nix
     /// evaluation and fetcher caches, cargo, uv, npm. Persistent.
     pub fn cache_dir(&self) -> Utf8PathBuf {
         self.root.join("cache")

@@ -53,7 +53,7 @@
         # wrapped mold and keeps the -rpath flags nix adds.
         moldLinker = nixpkgs.legacyPackages.${system}.mold;
         # Rho's git: the Octo unix-socket transport for git-remote-octo, and
-        # the mirror store hook (CLONES.md) that makes every fetch and clone
+        # the mirror store hook that makes every fetch and clone
         # of a remote URL read a local mirror when RHO_GIT_STORE_SOCKET is
         # set. Agents get this git in the view.
         rhoGit = pkgs.git.overrideAttrs (old: {
@@ -67,7 +67,7 @@
         });
 
         # The agent's base userland: one store path whose bin/ is the
-        # agent's PATH (VIEW.md). Agents add to it with `nix profile`.
+        # agent's PATH. Agents add to it with `nix profile`.
         agentRegistry = pkgs.writeTextDir "etc/nix/registry.json" (builtins.toJSON {
           version = 2;
           flakes = [{
@@ -126,7 +126,7 @@
           # NixOS's core and default system packages (nixos/modules/config/
           # system-path.nix), minus what has no meaning in a view (acl,
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
-          # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
+          # Rho's fork (find with deny roots); then Rho's own list.
           paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
             ++ (with pkgs; [
@@ -494,8 +494,8 @@
             # then fails to link ("Insufficient space allocated to section
             # .debug_gdb_scripts"), and wild 0.10.0 lays a large binary out
             # so that the PT_DYNAMIC program header's offset is sixteen bytes
-            # short of the .dynamic section and the binary does not start
-            # (GUI-CRATES-DESIGN.md, "The linker, not the size"). The tokio_unstable and frame-pointer flags are what
+            # short of the .dynamic section and the binary does not start.
+            # The tokio_unstable and frame-pointer flags are what
             # dial9-tokio-telemetry and CPU stack capture need.
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--ld-path=${moldLinker}/bin/mold -C link-arg=-Wl,--compress-debug-sections=zstd --cfg tokio_unstable -Cforce-frame-pointers=yes"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -Cforce-frame-pointers=yes"

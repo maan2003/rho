@@ -266,7 +266,7 @@ impl DeskCellStore {
     /// from the path, so a second run recognises what the first wrote.
     ///
     /// Once, like every conversion: a project that already has its label is
-    /// skipped. Deleted with the table it reads (`AGENT-LOG-DESIGN.md`).
+    /// skipped. Deleted with the table it reads.
     /// The workdirs the user has filed as projects: the labels that carry
     /// a `Project`, name and path. Iris routes by these; the agent host's old
     /// `projects` table is gone.
