@@ -436,6 +436,7 @@ pub struct Workspace {
     /// Everything the usage screen is drawn from, and the screen itself:
     /// see [`crate::usage::Usage`].
     usage: crate::usage::Usage,
+    quotas: rho_agents_client::quota::Quotas,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -1032,6 +1033,7 @@ impl Workspace {
             ready_hosts: HashSet::new(),
             replay_hosts: HashSet::new(),
             usage: crate::usage::Usage::default(),
+            quotas: Default::default(),
             duration_timer: None,
             chime: Chime,
             history: None,
@@ -1207,6 +1209,7 @@ impl Workspace {
             self.voice.stop();
         }
         self.hosts.detach(host);
+        self.quotas.forget(host);
         self.desk.slack_owned_by(self.hosts.owner());
         self.save_hosts();
         self.agents_client.detach_host(host);
@@ -2062,12 +2065,10 @@ impl Workspace {
                 cx.notify();
             }
             rho_agents_client::model::ModelMsg::Auth { auth } => {
-                if let Some(entry) = self.hosts.get_mut(host) {
-                    entry.auth = Some(auth);
-                }
+                self.quotas.set_auth(host, auth);
                 if let Some(view) = self.usage.opened_view() {
-                    let history = self.hosts.merged_quota_history();
-                    let active = self.hosts.active_quota_namespaces();
+                    let history = self.quotas.merged_history(&self.hosts);
+                    let active = self.quotas.active_namespaces(&self.hosts);
                     view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
                 }
                 cx.notify();
@@ -2083,7 +2084,7 @@ impl Workspace {
                 cx.notify();
             }
             rho_agents_client::model::ModelMsg::QuotaUsage { summaries } => {
-                self.hosts.set_quota_summaries(host, summaries);
+                self.quotas.set_summaries(host, summaries);
                 cx.notify();
             }
         }
@@ -3866,17 +3867,15 @@ impl Workspace {
             std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
                 let needle = input.trim().to_lowercase();
                 workspace
-                    .hosts
-                    .get(host)
-                    .and_then(|host| host.auth.as_ref())
+                    .quotas
+                    .auth(host)
                     .into_iter()
                     .flat_map(|auth| &auth.namespaces)
                     .filter(|name| name.to_lowercase().contains(&needle))
                     .map(|name| {
                         let disabled = workspace
-                            .hosts
-                            .get(host)
-                            .and_then(|host| host.auth.as_ref())
+                            .quotas
+                            .auth(host)
                             .is_some_and(|auth| auth.disabled_namespaces.contains(name));
                         crate::commands::Candidate {
                             value: name.clone(),
@@ -3901,9 +3900,8 @@ impl Workspace {
                     return;
                 }
                 let enabled = workspace
-                    .hosts
-                    .get(host)
-                    .and_then(|host| host.auth.as_ref())
+                    .quotas
+                    .auth(host)
                     .is_some_and(|auth| auth.disabled_namespaces.iter().any(|item| item == name));
                 workspace.call(
                     host,
@@ -5137,7 +5135,7 @@ impl Workspace {
     pub(crate) fn merged_quota_summaries_for_test(
         &self,
     ) -> Vec<rho_agent_host_proto::QuotaSummary> {
-        self.hosts.merged_quota_summaries()
+        self.quotas.merged_summaries(&self.hosts)
     }
 
     #[cfg(test)]
@@ -8052,10 +8050,10 @@ impl Workspace {
         series: Vec<rho_agent_host_proto::QuotaSeries>,
         cx: &mut Context<Self>,
     ) {
-        self.hosts.set_quota_history(host, series);
+        self.quotas.set_history(host, series);
         if let Some(view) = self.usage.opened_view() {
-            let history = self.hosts.merged_quota_history();
-            let active = self.hosts.active_quota_namespaces();
+            let history = self.quotas.merged_history(&self.hosts);
+            let active = self.quotas.active_namespaces(&self.hosts);
             view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
         }
     }
@@ -8101,8 +8099,8 @@ impl Workspace {
         match crate::usage::Usage::request_for(chart, days, now_ms()) {
             crate::usage::Request::QuotaHistory => {
                 self.ask_every_host(agents::QuotaHistory, cx, Self::quota_history_arrived);
-                let history = self.hosts.merged_quota_history();
-                let active = self.hosts.active_quota_namespaces();
+                let history = self.quotas.merged_history(&self.hosts);
+                let active = self.quotas.active_namespaces(&self.hosts);
                 view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
             }
             crate::usage::Request::GlobalUsage { since_ms } => {
@@ -8662,7 +8660,7 @@ impl Workspace {
         } else {
             colors.terminal_ansi_bright_cyan
         };
-        let quota = self.hosts.merged_quota_summaries();
+        let quota = self.quotas.merged_summaries(&self.hosts);
         div()
             .flex()
             .flex_row()

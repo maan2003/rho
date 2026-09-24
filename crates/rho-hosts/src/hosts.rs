@@ -51,7 +51,6 @@ pub struct Host {
     pub name: String,
     pub target: AttachTarget,
     pub status: HostStatus,
-    pub auth: Option<rho_agent_host_proto::AuthState>,
     connection: Connection,
 }
 
@@ -90,8 +89,6 @@ pub struct Hosts {
     /// the store; named and qualified here, because what a workdir is
     /// called depends on how many machines are attached.
     workdirs: Vec<HostWorkdir>,
-    quota_summaries: std::collections::HashMap<HostId, Vec<rho_agent_host_proto::QuotaSummary>>,
-    quota_history: std::collections::HashMap<HostId, Vec<rho_agent_host_proto::QuotaSeries>>,
 }
 
 impl Hosts {
@@ -103,8 +100,6 @@ impl Hosts {
             next_id: 0,
             events,
             workdirs: Vec::new(),
-            quota_summaries: std::collections::HashMap::new(),
-            quota_history: std::collections::HashMap::new(),
         }
     }
 
@@ -135,7 +130,6 @@ impl Hosts {
             name,
             target,
             status: HostStatus::Connecting,
-            auth: None,
             connection,
         });
         id
@@ -146,8 +140,6 @@ impl Hosts {
     pub fn detach(&mut self, host: HostId) -> Option<Host> {
         let index = self.hosts.iter().position(|entry| entry.id == host)?;
         self.workdirs.retain(|workdir| workdir.host != host);
-        self.quota_summaries.remove(&host);
-        self.quota_history.remove(&host);
         Some(self.hosts.remove(index))
     }
 
@@ -319,127 +311,5 @@ impl Hosts {
             .filter(|candidate| candidate.name == argument);
         let first = bare.next()?;
         bare.next().is_none().then(|| workdir(first))
-    }
-
-    pub fn set_quota_summaries(
-        &mut self,
-        host: HostId,
-        summaries: Vec<rho_agent_host_proto::QuotaSummary>,
-    ) {
-        self.quota_summaries.insert(host, summaries);
-    }
-
-    pub fn set_quota_history(
-        &mut self,
-        host: HostId,
-        series: Vec<rho_agent_host_proto::QuotaSeries>,
-    ) {
-        self.quota_history.insert(host, series);
-    }
-
-    pub fn quota_summaries_of(
-        &self,
-        host: HostId,
-    ) -> Option<&[rho_agent_host_proto::QuotaSummary]> {
-        self.quota_summaries.get(&host).map(Vec::as_slice)
-    }
-
-    pub fn merged_quota_summaries(&self) -> Vec<rho_agent_host_proto::QuotaSummary> {
-        let mut merged: Vec<rho_agent_host_proto::QuotaSummary> = Vec::new();
-        for (host, summaries) in &self.quota_summaries {
-            for summary in summaries {
-                let Some(namespace) = &summary.auth_namespace else {
-                    match merged.iter_mut().find(|existing| {
-                        existing.model == summary.model && existing.auth_namespace.is_none()
-                    }) {
-                        Some(existing)
-                            if summary.remaining_percent < existing.remaining_percent =>
-                        {
-                            *existing = summary.clone();
-                        }
-                        Some(_) => {}
-                        None => merged.push(summary.clone()),
-                    }
-                    continue;
-                };
-                let mut summary = summary.clone();
-                if self.len() > 1 {
-                    summary.auth_namespace =
-                        Some(format!("{}/{}", self.host_label(*host), namespace));
-                }
-                merged.push(summary);
-            }
-        }
-        merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
-        // An unnamed legacy entry and a named namespace can describe the
-        // same account; showing identical numbers twice says nothing.
-        merged.dedup_by(|a, b| {
-            a.model == b.model
-                && a.remaining_percent == b.remaining_percent
-                && a.reset_at_unix == b.reset_at_unix
-        });
-        merged
-    }
-
-    /// ChatGPT history is one line per host/namespace. Claude history keeps
-    /// the previous tightest-host merge because it has no named auth scope.
-    pub fn merged_quota_history(&self) -> Vec<rho_agent_host_proto::QuotaSeries> {
-        let mut merged: Vec<rho_agent_host_proto::QuotaSeries> = Vec::new();
-        for (host, series_set) in &self.quota_history {
-            for series in series_set {
-                if series.model == "gpt" {
-                    let Some(namespace) = &series.auth_namespace else {
-                        continue;
-                    };
-                    let mut series = series.clone();
-                    if self.len() > 1 {
-                        series.auth_namespace =
-                            Some(format!("{}/{}", self.host_label(*host), namespace));
-                    }
-                    merged.push(series);
-                    continue;
-                }
-                let Some(existing) = merged
-                    .iter_mut()
-                    .find(|existing| existing.model == series.model)
-                else {
-                    merged.push(series.clone());
-                    continue;
-                };
-                for point in &series.points {
-                    match existing
-                        .points
-                        .iter_mut()
-                        .find(|candidate| candidate.observed_at_ms == point.observed_at_ms)
-                    {
-                        Some(candidate)
-                            if point.remaining_percent < candidate.remaining_percent =>
-                        {
-                            *candidate = *point;
-                        }
-                        Some(_) => {}
-                        None => existing.points.push(*point),
-                    }
-                }
-                existing.points.sort_by_key(|point| point.observed_at_ms);
-            }
-        }
-        merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
-        merged
-    }
-
-    pub fn active_quota_namespaces(&self) -> Vec<String> {
-        let qualify = self.len() > 1;
-        self.hosts
-            .iter()
-            .filter_map(|host| {
-                let namespace = host.auth.as_ref()?.active_namespace.as_ref()?;
-                Some(if qualify {
-                    format!("{}/{}", host.name, namespace)
-                } else {
-                    namespace.clone()
-                })
-            })
-            .collect()
     }
 }
