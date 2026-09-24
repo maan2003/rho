@@ -1015,6 +1015,14 @@ impl Workspace {
                 cx,
             );
         }
+        // A device's first start asks for the secret phrase its other
+        // devices share, or makes one; a test's ledger is in memory and
+        // never asks.
+        if rho_db::client::shared().is_some() && this.attention.secret().is_none() {
+            cx.defer_in(window, |this, window, cx| {
+                this.prompt_secret_phrase(window, cx)
+            });
+        }
         this
     }
 
@@ -5605,7 +5613,7 @@ impl Workspace {
             Command::HostAttach => self.prompt_host_attach(window, cx),
             Command::HostDetach => self.prompt_host_detach(window, cx),
             Command::HostAuth => self.open_host_auth_transient(window, cx),
-            Command::LedgerKey => self.prompt_ledger_key(window, cx),
+            Command::SecretPhrase => self.prompt_secret_phrase(window, cx),
             Command::ProjectAdd => self.prompt_project_add(window, cx),
             Command::ProjectRemove => self.prompt_project_remove(window, cx),
             Command::EndVoice => self.cmd_end_voice(cx),

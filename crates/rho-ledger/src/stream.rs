@@ -14,8 +14,9 @@ use rho_agent_hosts::{Dialer, HostStream};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 use tokio::sync::broadcast;
 
-use crate::ledger::{Change, Ledger, LedgerKey};
+use crate::ledger::{Change, Ledger};
 use crate::protocol::{ClientFrame, DeviceId, Open, Segment, ServerFrame};
+use crate::secret::Secret;
 
 /// What the ledger's streams hear.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,11 +63,11 @@ impl LedgerStreams {
         moved
     }
 
-    /// Takes the key the user's devices share, puts everything this device
-    /// wrote before it to every host, and reads what other devices wrote
-    /// while it had none.
-    pub async fn set_key(&self, key: LedgerKey) -> anyhow::Result<()> {
-        let (base, received) = self.ledger.set_key(key).await?;
+    /// Takes the secret the user's devices share, puts everything this
+    /// device wrote before it to every host, and reads what other devices
+    /// wrote while it had none.
+    pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<()> {
+        let (base, received) = self.ledger.set_secret(secret).await?;
         if let Some(base) = base {
             let _ = self.puts.send(base);
         }

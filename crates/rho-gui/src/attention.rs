@@ -21,7 +21,7 @@ use rho_dealer::curve::{
 use rho_dealer::marks::{self, Cursor, Todo, Write};
 use rho_dealer::{Card, CardKind, Curve, DateMark, Dealer, Marks, NodeId, SlackUnit, Want};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
-use rho_ledger::{Ledger, LedgerKey};
+use rho_ledger::{Ledger, Secret};
 use rho_window::style::StyleClass;
 
 use crate::workspace::Workspace;
@@ -138,8 +138,8 @@ impl Attention {
         self.streams.stream()
     }
 
-    pub(crate) fn key(&self) -> Option<LedgerKey> {
-        self.streams.ledger().key()
+    pub(crate) fn secret(&self) -> Option<Secret> {
+        self.streams.ledger().secret()
     }
 
     /// Reads `keys` back from the ledger into the marks: the merged value
@@ -433,7 +433,7 @@ impl Workspace {
                 cx,
             ),
             LedgerEvent::NeedsKey => self.append_message(
-                "ledger: other devices have written marks; `space h k` enters the key they share"
+                "ledger: other devices have written marks; `space s s` enters the secret phrase they share"
                     .to_owned(),
                 StyleClass::SystemInfo,
                 cx,
@@ -934,42 +934,81 @@ impl Workspace {
         }
     }
 
-    /// `space h k`: the ledger key, shown so another device can take it,
-    /// or taken from the user when this device has none yet.
-    pub(crate) fn prompt_ledger_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(key) = self.attention.key() {
+    /// `space s s`: the secret phrase, shown so another device can take
+    /// it, or taken from the user when this device has none yet.
+    pub(crate) fn prompt_secret_phrase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(secret) = self.attention.secret() {
             self.append_message(
                 format!(
-                    "ledger key (enter it on your other devices): {}",
-                    key.to_text()
+                    "secret phrase (enter it on your other devices): {}",
+                    secret.to_words()
                 ),
                 StyleClass::SystemInfo,
                 cx,
             );
-            self.echo("ledger key: in the message log", StyleClass::SystemInfo, cx);
+            self.echo(
+                "secret phrase: in the message log",
+                StyleClass::SystemInfo,
+                cx,
+            );
             return;
         }
         self.open_prompt(
-            "ledger key (empty makes a new one):",
-            std::rc::Rc::new(|_, _, _| Vec::new()),
+            "secret phrase from another device (empty makes a new one):",
+            std::rc::Rc::new(|_, input, _| {
+                let word = &input[crate::minibuffer::token_start(input)..];
+                if word.is_empty() {
+                    return Vec::new();
+                }
+                Secret::words_starting(&word.to_lowercase())
+                    .iter()
+                    .map(|word| crate::minibuffer::Candidate {
+                        value: (*word).to_owned(),
+                        description: String::new(),
+                    })
+                    .collect()
+            }),
             std::rc::Rc::new(|workspace, input, _window, cx| {
                 let input = input.trim();
-                let key = match input.is_empty() {
-                    true => LedgerKey::generate(),
-                    false => match LedgerKey::from_text(input) {
-                        Some(key) => key,
-                        None => {
-                            workspace.echo("ledger key: 64 hex digits", StyleClass::SystemInfo, cx);
+                let (secret, made) = match input.is_empty() {
+                    true => (Secret::generate(), true),
+                    false => match Secret::from_words(input) {
+                        Ok(secret) => (secret, false),
+                        Err(error) => {
+                            workspace.echo(
+                                &format!("secret phrase: {error}"),
+                                StyleClass::SystemInfo,
+                                cx,
+                            );
                             return;
                         }
                     },
                 };
                 let streams = workspace.attention.streams.clone();
-                match futures::executor::block_on(streams.set_key(key)) {
-                    Ok(()) => workspace.echo("ledger key set", StyleClass::SystemInfo, cx),
-                    Err(error) => {
-                        workspace.echo(&format!("ledger key: {error}"), StyleClass::SystemInfo, cx)
-                    }
+                if let Err(error) = futures::executor::block_on(streams.set_secret(secret)) {
+                    workspace.echo(
+                        &format!("secret phrase: {error}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                }
+                if made {
+                    workspace.append_message(
+                        format!(
+                            "secret phrase (save it, and enter it on your other devices): {}",
+                            secret.to_words()
+                        ),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    workspace.echo(
+                        "secret phrase made: in the message log",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                } else {
+                    workspace.echo("secret phrase set", StyleClass::SystemInfo, cx);
                 }
             }),
             window,

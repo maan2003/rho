@@ -12,6 +12,8 @@ version.workspace = true
 [features]
 client = [
   "dep:anyhow",
+  "dep:bip39",
+  "dep:blake3",
   "dep:chacha20poly1305",
   "dep:futures",
   "dep:rand",
@@ -27,6 +29,8 @@ rho-rpc.workspace = true
 senax-encoder.workspace = true
 
 anyhow = { workspace = true, optional = true }
+bip39 = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }

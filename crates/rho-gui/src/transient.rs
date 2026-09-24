@@ -113,7 +113,6 @@ pub(crate) enum Command {
     HostAttach,
     HostDetach,
     HostAuth,
-    LedgerKey,
     // Projects.
     ProjectAdd,
     ProjectRemove,
@@ -130,6 +129,7 @@ pub(crate) enum Command {
     Usage(crate::usage::Chart, u64),
     UploadTelemetry,
     Version,
+    SecretPhrase,
     // The agent under the point.
     AgentCancel,
     AgentRole,
@@ -493,7 +493,6 @@ pub(crate) fn hosts_menu() -> Menu {
         .item("a", "attach…", MenuAction::Command(Command::HostAttach))
         .item("d", "detach…", MenuAction::Command(Command::HostDetach))
         .item("u", "auth…", MenuAction::Command(Command::HostAuth))
-        .item("k", "ledger key…", MenuAction::Command(Command::LedgerKey))
 }
 
 /// Creation, the one verb: everything new starts here and is filed where
@@ -538,6 +537,11 @@ pub(crate) fn status_menu() -> Menu {
         )
         .item("u", "usage…", MenuAction::Open(MenuId::UsageRoot))
         .item("v", "version", MenuAction::Command(Command::Version))
+        .item(
+            "s",
+            "secret phrase…",
+            MenuAction::Command(Command::SecretPhrase),
+        )
 }
 
 /// `space a`: driving the current conversation.

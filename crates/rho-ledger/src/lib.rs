@@ -4,10 +4,10 @@
 //!
 //! It is a map from keys to values, merged last-writer-wins. Each device
 //! writes its own entries into segments of its own, seals them with a key
-//! only the user's devices hold, and publishes them to every host it
-//! reaches. A host keeps each device's segments and passes them on: it can
-//! neither read nor forge them, and it merges nothing. Every device reads
-//! every other device's segments and merges them itself.
+//! derived from the [`Secret`] only the user's devices hold, and publishes them
+//! to every host it reaches. A host keeps each device's segments and passes
+//! them on: it can neither read nor forge them, and it merges nothing. Every
+//! device reads every other device's segments and merges them itself.
 //!
 //! [`protocol`] is what a device and a host say; the host uses it alone,
 //! without the `client` feature. [`Ledger`] is a device's side: its own
@@ -23,9 +23,13 @@ mod ledger;
 #[cfg(feature = "client")]
 mod seal;
 #[cfg(feature = "client")]
+mod secret;
+#[cfg(feature = "client")]
 pub mod stream;
 
 #[cfg(feature = "client")]
 pub use entry::{Entry, Stamp};
 #[cfg(feature = "client")]
-pub use ledger::{Change, Ledger, LedgerKey, Received};
+pub use ledger::{Change, Ledger, Received};
+#[cfg(feature = "client")]
+pub use secret::Secret;

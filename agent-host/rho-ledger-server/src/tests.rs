@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
-use rho_ledger::{Ledger, LedgerKey};
+use rho_ledger::{Ledger, Secret};
 
 use super::*;
 
@@ -13,12 +13,12 @@ struct Device {
     _dir: tempfile::TempDir,
 }
 
-async fn device(key: Option<LedgerKey>) -> Device {
+async fn device(secret: Option<Secret>) -> Device {
     let dir = tempfile::tempdir().unwrap();
     let ledger = Ledger::open(RhoDb::open(dir.path().join("client.redb"))).await;
     let (streams, events) = LedgerStreams::new(ledger);
-    if let Some(key) = key {
-        streams.set_key(key).await.unwrap();
+    if let Some(secret) = secret {
+        streams.set_secret(secret).await.unwrap();
     }
     Device {
         streams,
@@ -61,10 +61,10 @@ fn put(key: &str, value: &str) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 
 #[tokio::test]
 async fn a_write_reaches_a_device_connected_to_the_same_host() {
-    let key = LedgerKey::generate();
+    let secret = Secret::generate();
     let (server, _dir) = host().await;
-    let laptop = device(Some(key)).await;
-    let mut phone = device(Some(key)).await;
+    let laptop = device(Some(secret)).await;
+    let mut phone = device(Some(secret)).await;
     let _laptop = connect(&server, &laptop);
     let _phone = connect(&server, &phone);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -77,10 +77,10 @@ async fn a_write_reaches_a_device_connected_to_the_same_host() {
 
 #[tokio::test]
 async fn a_device_that_was_away_hears_what_it_missed() {
-    let key = LedgerKey::generate();
+    let secret = Secret::generate();
     let (server, _dir) = host().await;
-    let laptop = device(Some(key)).await;
-    let mut phone = device(Some(key)).await;
+    let laptop = device(Some(secret)).await;
+    let mut phone = device(Some(secret)).await;
     // Written with no host at all: the first connection hands it over.
     laptop.streams.write(put("a", "1")).await;
     let laptop_link = connect(&server, &laptop);
@@ -95,9 +95,9 @@ async fn a_device_that_was_away_hears_what_it_missed() {
 
 #[tokio::test]
 async fn the_host_holds_nothing_it_can_read() {
-    let key = LedgerKey::generate();
+    let secret = Secret::generate();
     let (server, _dir) = host().await;
-    let laptop = device(Some(key)).await;
+    let laptop = device(Some(secret)).await;
     laptop.streams.write(put("secret", "plans")).await;
     let _laptop = connect(&server, &laptop);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -130,9 +130,9 @@ async fn a_base_replaces_what_the_host_held_before_it() {
 }
 
 #[tokio::test]
-async fn a_device_without_the_key_is_told_it_needs_one() {
+async fn a_device_without_the_secret_is_told_it_needs_one() {
     let (server, _dir) = host().await;
-    let laptop = device(Some(LedgerKey::generate())).await;
+    let laptop = device(Some(Secret::generate())).await;
     let mut phone = device(None).await;
     laptop.streams.write(put("a", "1")).await;
     let _laptop = connect(&server, &laptop);

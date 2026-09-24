@@ -11,12 +11,13 @@ use senax_encoder::{Decode, Encode};
 use crate::entry::{Entry, Stamp};
 use crate::protocol::{DeviceId, Segment};
 use crate::seal;
+use crate::secret::Secret;
 
 /// How many segments a device writes before it publishes a base again, so
 /// a host holds a bounded run of each device's segments.
 const SEGMENTS_PER_BASE: u32 = 64;
 
-/// This device: its id, the key if it has one, its clock and how many
+/// This device: its id, the secret if it has one, its clock and how many
 /// segments it has written. One row.
 const SELF: TableDefinition<(), Sen<SelfRecord>> = TableDefinition::new("ledger_self_v1");
 /// What this device wrote, newest per key: what a base is made of.
@@ -34,10 +35,16 @@ const PENDING: TableDefinition<([u8; 16], u64), Sen<Segment>> =
 #[derive(Clone, Debug, Encode, Decode)]
 struct SelfRecord {
     device: DeviceId,
-    key: Option<[u8; 32]>,
+    secret: Option<[u8; 16]>,
     clock: (u64, u32),
     seq: u64,
     since_base: u32,
+}
+
+impl SelfRecord {
+    fn key(&self) -> Option<[u8; 32]> {
+        self.secret.map(|secret| Secret(secret).derive(KEY_CONTEXT))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -46,46 +53,8 @@ struct Stored {
     value: Option<Vec<u8>>,
 }
 
-/// The key the user's devices share. Shown to the user to carry to a new
-/// device, so it reads as text.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct LedgerKey(pub [u8; 32]);
-
-impl LedgerKey {
-    pub fn generate() -> Self {
-        use rand::RngCore as _;
-        let mut key = [0; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
-        Self(key)
-    }
-
-    pub fn to_text(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    /// Reads a key as [`to_text`](Self::to_text) wrote it, ignoring
-    /// whitespace and dashes a person may have added to copy it.
-    pub fn from_text(text: &str) -> Option<Self> {
-        let hex: Vec<u8> = text
-            .bytes()
-            .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'-')
-            .collect();
-        if hex.len() != 64 {
-            return None;
-        }
-        let mut key = [0; 32];
-        for (index, pair) in hex.chunks(2).enumerate() {
-            key[index] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-        }
-        Some(Self(key))
-    }
-}
-
-impl std::fmt::Debug for LedgerKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("LedgerKey(..)")
-    }
-}
+/// What the ledger's seal key is derived under from the [`Secret`].
+const KEY_CONTEXT: &str = "rho 2026-09-24 ledger";
 
 /// A key whose merged value moved, and what it is now.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,7 +134,7 @@ impl Ledger {
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut device);
             let me = SelfRecord {
                 device: DeviceId(device),
-                key: None,
+                secret: None,
                 clock: (0, 0),
                 seq: 0,
                 since_base: 0,
@@ -191,8 +160,8 @@ impl Ledger {
         self.me().device
     }
 
-    pub fn key(&self) -> Option<LedgerKey> {
-        self.me().key.map(LedgerKey)
+    pub fn secret(&self) -> Option<Secret> {
+        self.me().secret.map(Secret)
     }
 
     /// The newest segment this device has written.
@@ -211,11 +180,11 @@ impl Ledger {
             .collect()
     }
 
-    /// Takes the key the user's devices share. Returns the base every host
-    /// should now hold of this device, and what reading the segments that
-    /// came before the key made of them. Reading with one key and then
-    /// another would mix two ledgers, so a key is set once.
-    pub async fn set_key(&self, key: LedgerKey) -> anyhow::Result<(Option<Segment>, Received)> {
+    /// Takes the secret the user's devices share. Returns the base every
+    /// host should now hold of this device, and what reading the segments
+    /// that came before the secret made of them. Reading with one secret and
+    /// then another would mix two ledgers, so a secret is set once.
+    pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<(Option<Segment>, Received)> {
         let mut write = self.db.write().await;
         let mut table = write.open_table(SELF);
         let mut me = table
@@ -223,14 +192,15 @@ impl Ledger {
             .expect("the ledger's own row")
             .value()
             .into_owned();
-        if let Some(held) = me.key {
+        if let Some(held) = me.secret {
             anyhow::ensure!(
-                held == key.0,
-                "this device already holds another ledger key"
+                held == secret.0,
+                "this device already holds another secret phrase"
             );
             return Ok((None, Received::default()));
         }
-        me.key = Some(key.0);
+        me.secret = Some(secret.0);
+        let key = secret.derive(KEY_CONTEXT);
         table.insert((), SenValue::borrowed(&me));
         drop(table);
         let mut pending: BTreeMap<DeviceId, Vec<Segment>> = BTreeMap::new();
@@ -247,7 +217,7 @@ impl Ledger {
         }
         let mut received = Received::default();
         for (device, segments) in pending {
-            read_segments(&mut write, &key.0, device, segments, &mut received);
+            read_segments(&mut write, &key, device, segments, &mut received);
         }
         write.commit();
         Ok((self.base_for(0), received))
@@ -326,7 +296,7 @@ impl Ledger {
         }
         write.open_table(SELF).insert((), SenValue::borrowed(&me));
         write.commit();
-        let segment = me.key.map(|key| {
+        let segment = me.key().map(|key| {
             let entries = if base { self.own_entries() } else { entries };
             Segment {
                 seq: me.seq,
@@ -358,7 +328,7 @@ impl Ledger {
     /// `None` when the host is not behind, or there is no key to seal with.
     pub fn base_for(&self, host_head: u64) -> Option<Segment> {
         let me = self.me();
-        let key = me.key?;
+        let key = me.key()?;
         if me.seq == 0 || host_head >= me.seq {
             return None;
         }
@@ -379,7 +349,7 @@ impl Ledger {
             return received;
         }
         let mut write = self.db.write().await;
-        match me.key {
+        match me.key() {
             Some(key) => read_segments(&mut write, &key, device, segments, &mut received),
             None => {
                 received.needs_key = true;
@@ -467,7 +437,7 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    async fn device(key: Option<LedgerKey>) -> Device {
+    async fn device(secret: Option<Secret>) -> Device {
         let dir = tempfile::tempdir().unwrap();
         let now = Arc::new(AtomicU64::new(1_000));
         let clock = Arc::clone(&now);
@@ -476,8 +446,8 @@ mod tests {
             Arc::new(move || clock.load(Ordering::Relaxed)),
         )
         .await;
-        if let Some(key) = key {
-            ledger.set_key(key).await.unwrap();
+        if let Some(secret) = secret {
+            ledger.set_secret(secret).await.unwrap();
         }
         Device {
             ledger,
@@ -499,8 +469,8 @@ mod tests {
 
     #[tokio::test]
     async fn another_device_reads_what_one_wrote() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         let (changes, segment) = laptop.ledger.write(vec![put("a", "1")]).await;
         assert_eq!(changes.len(), 1);
         let received = phone
@@ -520,8 +490,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_newest_write_wins_whichever_device_is_read_first() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         let (_, older) = laptop.ledger.write(vec![put("a", "old")]).await;
         phone.now.store(2_000, Ordering::Relaxed);
         let (_, newer) = phone.ledger.write(vec![put("a", "new")]).await;
@@ -539,8 +509,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_made_after_reading_wins_though_its_clock_is_behind() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         laptop.now.store(9_000, Ordering::Relaxed);
         let (_, ahead) = laptop.ledger.write(vec![put("a", "laptop")]).await;
         phone
@@ -558,8 +528,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_old_segment_handed_back_changes_nothing() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         let laptop_device = laptop.ledger.device();
         let (_, first) = laptop.ledger.write(vec![put("a", "1")]).await;
         let (_, second) = laptop.ledger.write(vec![put("a", "2")]).await;
@@ -577,8 +547,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_device_with_another_key_reads_nothing_and_says_so() {
-        let laptop = device(Some(LedgerKey::generate())).await;
-        let stranger = device(Some(LedgerKey::generate())).await;
+        let laptop = device(Some(Secret::generate())).await;
+        let stranger = device(Some(Secret::generate())).await;
         let (_, segment) = laptop.ledger.write(vec![put("a", "1")]).await;
         let received = stranger
             .ledger
@@ -591,24 +561,24 @@ mod tests {
 
     #[tokio::test]
     async fn writes_made_before_the_key_reach_others_in_the_first_base() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(None).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(None).await, device(Some(secret)).await);
         let (_, segment) = laptop.ledger.write(vec![put("a", "1")]).await;
         assert!(segment.is_none(), "nothing to seal with yet");
-        let base = laptop.ledger.set_key(key).await.unwrap().0.unwrap();
+        let base = laptop.ledger.set_secret(secret).await.unwrap().0.unwrap();
         assert!(base.base);
         phone
             .ledger
             .receive(laptop.ledger.device(), vec![base])
             .await;
         assert_eq!(value(&phone, "a").as_deref(), Some("1"));
-        assert!(laptop.ledger.set_key(LedgerKey::generate()).await.is_err());
+        assert!(laptop.ledger.set_secret(Secret::generate()).await.is_err());
     }
 
     #[tokio::test]
     async fn segments_that_came_before_the_key_are_read_once_it_is_set() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(None).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(None).await);
         let (_, first) = laptop.ledger.write(vec![put("a", "1")]).await;
         let (_, second) = laptop.ledger.write(vec![put("b", "2")]).await;
         let received = phone
@@ -620,7 +590,7 @@ mod tests {
             .await;
         assert!(received.needs_key);
         assert_eq!(value(&phone, "a"), None);
-        let (_, received) = phone.ledger.set_key(key).await.unwrap();
+        let (_, received) = phone.ledger.set_secret(secret).await.unwrap();
         assert_eq!(received.changes.len(), 2);
         assert_eq!(value(&phone, "a").as_deref(), Some("1"));
         assert_eq!(value(&phone, "b").as_deref(), Some("2"));
@@ -629,8 +599,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_behind_gets_a_base_of_everything() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         laptop.ledger.write(vec![put("a", "1")]).await;
         laptop.ledger.write(vec![put("b", "2")]).await;
         assert!(laptop.ledger.base_for(2).is_none());
@@ -646,8 +616,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_so_often_a_write_publishes_a_base() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         laptop.ledger.write(vec![put("first", "1")]).await;
         let mut last = None;
         for index in 1..SEGMENTS_PER_BASE {
@@ -670,8 +640,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_taken_away_key_reads_as_absent_everywhere() {
-        let key = LedgerKey::generate();
-        let (laptop, phone) = (device(Some(key)).await, device(Some(key)).await);
+        let secret = Secret::generate();
+        let (laptop, phone) = (device(Some(secret)).await, device(Some(secret)).await);
         let (_, first) = laptop.ledger.write(vec![put("label/x", "1")]).await;
         let (_, gone) = laptop.ledger.write(vec![(b"label/x".to_vec(), None)]).await;
         phone
@@ -701,19 +671,5 @@ mod tests {
             .map(|(key, _)| String::from_utf8(key).unwrap())
             .collect();
         assert_eq!(keys, ["b/1", "b/2"]);
-    }
-
-    #[test]
-    fn a_key_reads_back_from_its_text_with_spaces_a_person_added() {
-        let key = LedgerKey::generate();
-        let text = key.to_text();
-        let spaced = text
-            .as_bytes()
-            .chunks(8)
-            .map(|chunk| std::str::from_utf8(chunk).unwrap())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(LedgerKey::from_text(&spaced), Some(key));
-        assert_eq!(LedgerKey::from_text("nope"), None);
     }
 }

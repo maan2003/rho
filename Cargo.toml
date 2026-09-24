@@ -83,6 +83,7 @@ async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
+bip39 = { version = "=2.2.2", default-features = false, features = ["alloc"] }
 brush-builtins = { path = "vendor/brush/brush-builtins" }
 brush-core = { path = "vendor/brush/brush-core" }
 devenv-nix-backend = { path = "vendor/devenv/devenv-nix-backend" }
