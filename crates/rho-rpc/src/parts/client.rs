@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
-use crate::{
+use super::{
     Answer, Call, Open, PartOpen, ProtocolLogDirection, append_protocol_log_record,
     protocol_frame_bytes, read_frame, write_frame,
 };
@@ -21,17 +21,17 @@ pub async fn call<C: Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<
 /// Raw async client for one stream over the daemon's Unix socket. The first
 /// frame sent is an [`Open`] ([`Client::open`]).
 pub struct Client {
-    stream: rho_rpc::Stream,
+    stream: crate::Stream,
     logger: Option<ProtocolLogger>,
 }
 
 impl Client {
     pub async fn connect(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let stream = rho_rpc::connect_unix(path).await?;
+        let stream = crate::connect_unix(path).await?;
         Ok(Self::from_stream(stream))
     }
 
-    pub fn from_stream(stream: rho_rpc::Stream) -> Self {
+    pub fn from_stream(stream: crate::Stream) -> Self {
         Self {
             stream,
             logger: ProtocolLogger::from_env(),
@@ -65,7 +65,7 @@ impl Client {
         self.stream.shutdown().await.map_err(Into::into)
     }
 
-    pub fn into_stream(self) -> rho_rpc::Stream {
+    pub fn into_stream(self) -> crate::Stream {
         self.stream
     }
 }

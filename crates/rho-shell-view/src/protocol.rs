@@ -1,6 +1,6 @@
 //! Wire vocabulary for workset-owned Comint-style shell sessions.
 //!
-//! The shells part of a host, [`rho_agent_host_proto::Part::Shell`]. A shell
+//! The shells part of a host, [`rho_rpc::parts::Part::Shell`]. A shell
 //! is started by [`ShellStart`] and a stream attached to it by
 //! [`Open::Attach`]. The workset owns the process and its canonical
 //! structured state; clients project that state into a read-only buffer,
@@ -36,15 +36,15 @@ pub enum PagerAction {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
     /// Attaches to an agent's running shell ([`ShellStart`]). Answered with
-    /// [`rho_agent_host_proto::Opened`], then [`ShellServerFrame`]s. Closing
+    /// [`rho_rpc::parts::Opened`], then [`ShellServerFrame`]s. Closing
     /// the stream only detaches; the shell keeps running.
     Attach { agent: String },
-    /// One call, answered with one [`rho_agent_host_proto::Answer`]; then the
+    /// One call, answered with one [`rho_rpc::parts::Answer`]; then the
     /// stream closes.
     Request(Request),
 }
 
-rho_agent_host_proto::calls! {
+rho_rpc::calls! {
     /// Every call the shells answer, as it goes on the wire.
     pub enum Request {
         ShellStart(ShellStart) -> ();
@@ -53,8 +53,8 @@ rho_agent_host_proto::calls! {
     }
 }
 
-impl rho_agent_host_proto::PartOpen for Open {
-    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Shell;
+impl rho_rpc::parts::PartOpen for Open {
+    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Shell;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
@@ -309,7 +309,7 @@ mod tests {
             }
             .into(),
         );
-        let envelope = rho_agent_host_proto::Open::of(&open).unwrap();
+        let envelope = rho_rpc::parts::Open::of(&open).unwrap();
         assert_eq!(envelope.unpack::<Open>().unwrap(), open);
     }
 

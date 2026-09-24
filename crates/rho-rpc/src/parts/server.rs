@@ -35,14 +35,14 @@ impl Server {
 
 /// One accepted UI client connection.
 pub struct ServerConnection {
-    stream: rho_rpc::Stream,
+    stream: crate::Stream,
     peer_cred: Option<tokio::net::unix::UCred>,
 }
 
 impl ServerConnection {
     pub async fn from_stream(stream: UnixStream) -> anyhow::Result<Self> {
         let peer_cred = stream.peer_cred().ok();
-        let stream = rho_rpc::accept_unix(stream).await?;
+        let stream = crate::accept_unix(stream).await?;
         Ok(Self { stream, peer_cred })
     }
 
@@ -51,7 +51,7 @@ impl ServerConnection {
             .ok_or_else(|| std::io::Error::other("Unix peer credentials unavailable"))
     }
 
-    pub fn into_stream(self) -> rho_rpc::Stream {
+    pub fn into_stream(self) -> crate::Stream {
         self.stream
     }
 }
@@ -79,7 +79,7 @@ mod tests {
         stale.write_all(b"old protocol").await.unwrap();
         drop(stale);
 
-        let client = rho_rpc::connect_unix(&path).await.unwrap();
+        let client = crate::connect_unix(&path).await.unwrap();
         let _connection = accept.await.unwrap();
         drop(client);
         let _ = std::fs::remove_file(path);

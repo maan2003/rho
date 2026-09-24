@@ -9,12 +9,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use rho_agent_host_proto::client::Client as UiClient;
-use rho_agent_host_proto::{Answer, Call, client, host};
+use rho_agent_host_proto::host;
 use rho_agents_client::protocol as agents;
 use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
 use rho_inference::{AuthArgs, run_auth_cli};
+use rho_rpc::parts::client::Client as UiClient;
+use rho_rpc::parts::{Answer, Call, client};
 
 mod eval;
 mod pr;
@@ -79,15 +80,16 @@ async fn run(command: Command) -> Result<()> {
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
-            rho_agent_host_proto::print_protocol_log(&args.path, &mut stdout, describe_frame)?;
+            rho_rpc::parts::print_protocol_log(&args.path, &mut stdout, describe_frame)?;
             Ok(())
         }
     }
 }
 
 /// A protocol log frame, read as the part it belongs to.
-fn describe_frame(open: &rho_agent_host_proto::Open, reply: Option<&[u8]>) -> String {
-    use rho_agent_host_proto::{Part, describe_as, desk};
+fn describe_frame(open: &rho_rpc::parts::Open, reply: Option<&[u8]>) -> String {
+    use rho_agent_host_proto::desk;
+    use rho_rpc::parts::{Part, describe_as};
     match open.part {
         Part::Agents => describe_as::<agents::Open>(open, reply),
         Part::Desk => describe_as::<desk::Open>(open, reply),
@@ -101,7 +103,7 @@ fn describe_frame(open: &rho_agent_host_proto::Open, reply: Option<&[u8]>) -> St
 /// Approves a pending iroh enrollment over the daemon's Unix socket, so
 /// trust decisions always come from a local user on the daemon host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
-    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let socket = &socket_path;
@@ -236,7 +238,7 @@ pub(crate) enum ClaudeAccountCommand {
 /// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
 /// view namespace outside an agent; agents get the same directory by mount.
 async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
-    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let list = match &args.command {

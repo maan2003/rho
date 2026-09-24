@@ -12,8 +12,8 @@ use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_host_proto::desk::stream::{ClientFrame, ServerFrame};
-use rho_agent_host_proto::{read_frame, write_frame, write_open};
 use rho_hosts::{Dialer, HostId, HostStream};
+use rho_rpc::parts::{read_frame, write_frame, write_open};
 
 /// What a host says on its desk stream.
 pub enum DeskFrame {

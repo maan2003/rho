@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
-use rho_agent_host_proto::client::Client;
 use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, MessageDelivery, Seq, TurnEdge};
 use rho_agents_client::protocol::transcript::{DetailBody, TranscriptEvent};
 use rho_agents_client::protocol::{
@@ -20,6 +19,7 @@ use rho_agents_client::protocol::{
     StartMode,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
+use rho_rpc::parts::client::Client;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};

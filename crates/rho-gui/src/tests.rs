@@ -10867,7 +10867,7 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     );
     story::answer(
         &mut stream,
-        rho_agent_host_proto::Answer::<AgentId>::Failed {
+        rho_rpc::parts::Answer::<AgentId>::Failed {
             reason: "create workspace: no such repository".to_owned(),
         },
     );

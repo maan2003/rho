@@ -6,7 +6,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use anyhow::{Context, Result};
 use reqwest::Url;
 use rho_agent_host_proto::host::GitTransportPolicy;
-use rho_agent_host_proto::{GitService, GitTransportRequest, Opened, host};
+use rho_agent_host_proto::{GitService, GitTransportRequest, host};
+use rho_rpc::parts::Opened;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn main() -> Result<()> {
@@ -61,10 +62,10 @@ impl Remote {
 }
 
 async fn query_pat_available(host: &str) -> Result<bool> {
-    let socket = rho_agent_host_proto::RuntimePaths::from_env()?
+    let socket = rho_rpc::parts::RuntimePaths::from_env()?
         .socket()
         .to_owned();
-    rho_agent_host_proto::client::call(
+    rho_rpc::parts::client::call(
         &socket,
         GitTransportPolicy {
             host: host.to_owned(),
@@ -194,10 +195,10 @@ fn parse_planned_refs(value: &str) -> Result<Vec<String>> {
 }
 
 async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> Result<()> {
-    let socket = rho_agent_host_proto::RuntimePaths::from_env()?
+    let socket = rho_rpc::parts::RuntimePaths::from_env()?
         .socket()
         .to_owned();
-    let mut client = rho_agent_host_proto::client::Client::connect(&socket)
+    let mut client = rho_rpc::parts::client::Client::connect(&socket)
         .await
         .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
     client
@@ -272,7 +273,7 @@ struct HttpHelper {
 
 impl HttpHelper {
     fn spawn(remote_name: &str, remote: &Remote) -> Result<Self> {
-        let socket = rho_agent_host_proto::RuntimePaths::from_env()?.octo_socket();
+        let socket = rho_rpc::parts::RuntimePaths::from_env()?.octo_socket();
         let socket_type = socket
             .metadata()
             .with_context(|| format!("Octo socket is unavailable at {}", socket.display()))?

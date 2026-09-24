@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rho_agent_host_proto::desk::cells::DeviceId;
 use rho_agent_host_proto::desk::stream::{ClientFrame, ServerFrame};
-use rho_agent_host_proto::{read_frame_optional, write_frame};
 use rho_db::RhoDb;
+use rho_rpc::parts::{read_frame_optional, write_frame};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 use crate::store::DeskCellStore;
@@ -433,7 +433,7 @@ mod tests {
         use rho_agent_host_proto::desk::cells::{
             CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
         };
-        use rho_agent_host_proto::{read_frame, write_frame};
+        use rho_rpc::parts::{read_frame, write_frame};
 
         let temp = tempfile::tempdir().unwrap();
         let server = test_server(temp.path()).await;

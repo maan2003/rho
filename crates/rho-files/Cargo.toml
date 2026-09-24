@@ -24,7 +24,7 @@ client = [
   "dep:multi_buffer",
   "dep:path",
   "dep:rho-hosts",
-  "dep:rho-rpc",
+  "rho-rpc/native-client",
   "dep:rho-window",
   "dep:text",
   "dep:theme",
@@ -34,7 +34,7 @@ client = [
 [dependencies]
 bytes.workspace = true
 camino.workspace = true
-rho-agent-host-proto.workspace = true
+rho-rpc.workspace = true
 rho-agent-types.workspace = true
 senax-encoder.workspace = true
 
@@ -48,7 +48,6 @@ language = { path = "../../vendor/zed/crates/language", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
 path = { path = "../../vendor/zed/crates/path", optional = true }
 rho-hosts = { workspace = true, optional = true }
-rho-rpc = { workspace = true, features = ["native-client"], optional = true }
 rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }

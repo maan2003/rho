@@ -6,9 +6,9 @@
 
 use std::time::Duration;
 
-use rho_agent_host_proto::{Opened, read_frame, write_frame, write_open};
 use rho_agent_types::AgentId;
 use rho_agents_client::protocol::{NewAgent, StartMode};
+use rho_rpc::parts::{Opened, read_frame, write_frame, write_open};
 use rho_terminal::protocol as term;
 use rho_terminal::protocol::{
     ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalList, TerminalOpen,
@@ -91,7 +91,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     // Create an agent on a clone of the temp repository.
     let agent_id = tokio::time::timeout(
         Duration::from_secs(30),
-        rho_agent_host_proto::client::call(
+        rho_rpc::parts::client::call(
             &socket_path,
             NewAgent {
                 role: Default::default(),
@@ -121,7 +121,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     wait_for_line(&mut stream, "e2e-done").await?;
 
     // The listing sees the running terminal.
-    let list = rho_agent_host_proto::client::call(
+    let list = rho_rpc::parts::client::call(
         &socket_path,
         TerminalList {
             agent: Some(agent_id.encoded()),

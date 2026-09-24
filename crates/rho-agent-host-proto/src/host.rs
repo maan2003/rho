@@ -1,5 +1,5 @@
-//! The machine itself, [`crate::Part::Host`]: desktops, voice,
-//! Git transport, and one-shot administration ([`crate::Call`]).
+//! The machine itself, [`rho_rpc::parts::Part::Host`]: desktops, voice,
+//! Git transport, and one-shot administration ([`rho_rpc::parts::Call`]).
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -15,22 +15,22 @@ pub enum Open {
     /// host's Git remote helpers. The host pushes [`GitProviderFrame`]s for
     /// as long as the stream is open.
     GitProvider,
-    /// One [`crate::Call`], answered with one [`crate::Answer`]; then the
-    /// stream closes.
+    /// One [`rho_rpc::parts::Call`], answered with one
+    /// [`rho_rpc::parts::Answer`]; then the stream closes.
     Request(Request),
     /// A voice session. Answered with [`crate::realtime::Opened`]; after
     /// the answer the stream carries [`crate::realtime::RealtimeClientFrame`]
     /// and [`crate::realtime::RealtimeServerFrame`].
     Realtime { offer_sdp: String },
     /// One live application over MoQ streams on this connection. Answered
-    /// with [`crate::Opened`].
+    /// with [`rho_rpc::parts::Opened`].
     Wayland {
         media_id: u64,
         agent: String,
         session: String,
     },
     /// A Git remote helper's transport, paired with a GUI that provides
-    /// it. After [`crate::Opened::Ready`] the stream is raw Git data.
+    /// it. After [`rho_rpc::parts::Opened::Ready`] the stream is raw Git data.
     GitTransport { request: GitTransportRequest },
     /// A GUI's answer to [`GitProviderFrame::Requested`].
     /// Answered with [`crate::GitProvided`]; after `Ready` the stream is raw
@@ -59,7 +59,7 @@ pub enum GitProviderFrame {
     Done { request_id: u64 },
 }
 
-calls! {
+rho_rpc::calls! {
     /// Every call the machine answers, as it goes on the wire.
     pub enum Request {
         /// Answered with whether a GitHub PAT is available.
@@ -79,8 +79,8 @@ calls! {
     }
 }
 
-impl crate::PartOpen for Open {
-    const PART: crate::Part = crate::Part::Host;
+impl rho_rpc::parts::PartOpen for Open {
+    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Host;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {

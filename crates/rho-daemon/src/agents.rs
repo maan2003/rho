@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent_host_proto::{Answer, Call, Opened, write_frame};
 use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
 use rho_agents_client::protocol::{
     AgentCommand, AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame,
@@ -17,6 +16,7 @@ use rho_agents_client::protocol::{
     ServerFrame, SetAuthAccountEnabled, SetClaudeAccount, Visualization, VisualizationContent,
 };
 use rho_db::RhoDb;
+use rho_rpc::parts::{Answer, Call, Opened, write_frame};
 use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
@@ -245,12 +245,11 @@ where
     let stream_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let mut follow: Option<tokio::task::JoinHandle<()>> = None;
     let result = loop {
-        let frame =
-            match rho_agent_host_proto::read_frame_optional::<_, ClientFrame>(&mut reader).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break Ok(()),
-                Err(error) => break Err(error),
-            };
+        let frame = match rho_rpc::parts::read_frame_optional::<_, ClientFrame>(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        };
         match frame {
             ClientFrame::Follow { since } => {
                 if let Some(previous) = follow.take() {
@@ -952,7 +951,7 @@ where
                 // registration completed. Treat that window like overflow; the
                 // GUI already reconciles it by reloading open buffers and
                 // scheduling a fresh semantic barrier.
-                rho_agent_host_proto::write_frame_limited(
+                rho_rpc::parts::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed {
                         paths: Vec::new(),
@@ -962,7 +961,7 @@ where
                 )
                 .await?;
             }
-            frame = rho_agent_host_proto::read_frame_limited::<_, WorkspaceClientFrame>(
+            frame = rho_rpc::parts::read_frame_limited::<_, WorkspaceClientFrame>(
                 &mut reader,
                 rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
             ) => {
@@ -992,7 +991,7 @@ where
                         WorkspaceServerFrame::Saved { request_id, path, result }
                     }
                 };
-                rho_agent_host_proto::write_frame_limited(
+                rho_rpc::parts::write_frame_limited(
                     &mut writer,
                     &response,
                     rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
@@ -1012,7 +1011,7 @@ where
                 }
                 let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
                 let rescan = explicit_rescan || overflowed;
-                rho_agent_host_proto::write_frame_limited(
+                rho_rpc::parts::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed { paths, rescan },
                     rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,

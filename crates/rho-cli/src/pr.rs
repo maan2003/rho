@@ -27,10 +27,10 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
         _ => None,
     };
     let command = command(args.command)?;
-    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    let runtime_paths = rho_agent_host_proto::RuntimePaths::new(Some(socket_path.clone()))?;
+    let runtime_paths = rho_rpc::parts::RuntimePaths::new(Some(socket_path.clone()))?;
     loop {
         let call = Pr {
             agent_id: None,
@@ -129,7 +129,7 @@ fn checks_pending(output: &str) -> anyhow::Result<bool> {
 
 async fn init(args: PrArgs) -> anyhow::Result<()> {
     let token = prompt_token("GitHub token (ghp_/github_pat_/...): ")?;
-    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let call = PlatformSecretsSet {
@@ -226,7 +226,7 @@ fn resolve_default_base_branch() -> anyhow::Result<String> {
 fn extract_logs(
     bytes: &[u8],
     run_id: u64,
-    runtime_paths: &rho_agent_host_proto::RuntimePaths,
+    runtime_paths: &rho_rpc::parts::RuntimePaths,
 ) -> anyhow::Result<()> {
     const MAX_FILES: usize = 1_000;
     const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;

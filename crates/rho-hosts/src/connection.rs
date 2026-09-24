@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context as _;
 use futures::FutureExt as _;
 use rho_agent_host_proto::host::{self, GitProviderFrame, Open as HostOpen};
-use rho_agent_host_proto::{GitProvided, GitService, GitTransportRequest, read_frame, write_open};
+use rho_agent_host_proto::{GitProvided, GitService, GitTransportRequest};
+use rho_rpc::parts::{read_frame, write_open};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Set when the client is going away, before its tokio runtime is dropped.
@@ -112,12 +113,12 @@ pub enum GitApprovalDecision {
 pub(crate) type ChannelDialer = rho_rpc::Dialer;
 
 /// One call of the machine on a stream of its own. A refusal is an error.
-async fn dial_call<C: rho_agent_host_proto::Call>(
+async fn dial_call<C: rho_rpc::parts::Call>(
     dialer: ChannelDialer,
     call: C,
 ) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    rho_agent_host_proto::call(&mut stream, call).await
+    rho_rpc::parts::call(&mut stream, call).await
 }
 
 async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
@@ -225,7 +226,7 @@ impl Connection {
 
     /// Makes one call of the machine on a stream of its own. The answer
     /// needs no particular executor; a refusal is an error.
-    pub fn call<C: rho_agent_host_proto::Call>(
+    pub fn call<C: rho_rpc::parts::Call>(
         &self,
         call: C,
     ) -> impl Future<Output = anyhow::Result<C::Reply>> + Send + 'static {
@@ -862,7 +863,7 @@ async fn connect_iroh(
         "ephemeral iroh client trusted over SSH"
     );
     let connection = endpoint
-        .connect(daemon_id, rho_agent_host_proto::IROH_ALPN)
+        .connect(daemon_id, rho_rpc::parts::IROH_ALPN)
         .await
         .context("connect to daemon over iroh")?;
     anyhow::ensure!(

@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
+use rho_agent_host_proto::DesktopSession;
 use rho_agent_host_proto::host::Open as HostOpen;
-use rho_agent_host_proto::{DesktopSession, read_frame, write_open};
 use rho_hosts::{Dialer, HostId, HostStream};
+use rho_rpc::parts::{read_frame, write_open};
 
 /// A host's desktops, as it now has them.
 pub struct DesktopsEvent {

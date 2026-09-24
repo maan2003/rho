@@ -10,12 +10,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent_host_proto::host::GitProviderFrame;
-use rho_agent_host_proto::server::{Server, ServerConnection};
-use rho_agent_host_proto::{Open, Opened, Part, read_frame, write_frame};
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
 use rho_inference::Inference;
+use rho_rpc::parts::server::{Server, ServerConnection};
+use rho_rpc::parts::{Open, Opened, Part, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
@@ -31,7 +31,7 @@ pub mod workspace_channel;
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    rho_agent_host_proto::socket_path()
+    rho_rpc::parts::socket_path()
 }
 
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
@@ -233,9 +233,7 @@ fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
     }
 }
 
-fn lock_runtime_directory(
-    paths: &rho_agent_host_proto::RuntimePaths,
-) -> anyhow::Result<std::fs::File> {
+fn lock_runtime_directory(paths: &rho_rpc::parts::RuntimePaths) -> anyhow::Result<std::fs::File> {
     let path = paths.daemon_lock();
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -255,7 +253,7 @@ fn lock_runtime_directory(
 }
 
 struct RuntimeSockets {
-    paths: rho_agent_host_proto::RuntimePaths,
+    paths: rho_rpc::parts::RuntimePaths,
     server: Server,
     _lock: std::fs::File,
 }
@@ -280,7 +278,7 @@ fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
 ) -> anyhow::Result<RuntimeSockets> {
-    let paths = rho_agent_host_proto::RuntimePaths::new(socket_path)?;
+    let paths = rho_rpc::parts::RuntimePaths::new(socket_path)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
@@ -414,7 +412,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
-        rho_agent_host_proto::RuntimePaths::SOCKET_ENV.into(),
+        rho_rpc::parts::RuntimePaths::SOCKET_ENV.into(),
         runtime.paths.socket().as_os_str().to_owned(),
     ));
     configure_octo_git_transport(&mut user_environment)?;
@@ -482,8 +480,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
     let iroh = if args.iroh {
         let (listener, auth) =
-            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_agent_host_proto::IROH_ALPN)
-                .await?;
+            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::parts::IROH_ALPN).await?;
         eprintln!("rho daemon iroh endpoint: {}", listener.endpoint_id());
         Some((listener, auth))
     } else {
@@ -1103,7 +1100,7 @@ fn validate_image_content(content: &[ContentPart]) -> anyhow::Result<()> {
         }
         encoded_total = encoded_total.saturating_add(encoded);
     }
-    if encoded_total > rho_agent_host_proto::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
+    if encoded_total > rho_rpc::parts::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
         anyhow::bail!("image attachments exceed the protocol aggregate size limit");
     }
     Ok(())
@@ -1258,7 +1255,7 @@ mod tests {
     async fn second_daemon_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
-            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+            rho_rpc::parts::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let first =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();
@@ -1287,7 +1284,7 @@ mod tests {
     async fn stale_socket_files_are_removed_and_rebound() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
-            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+            rho_rpc::parts::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         drop(std::os::unix::net::UnixListener::bind(paths.socket()).unwrap());
         drop(std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap());
 
@@ -1304,7 +1301,7 @@ mod tests {
     async fn runtime_lock_remains_held_after_socket_setup_returns() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
-            rho_agent_host_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+            rho_rpc::parts::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let sockets =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();

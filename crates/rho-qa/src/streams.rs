@@ -5,11 +5,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::{Answer, read_frame, write_frame, write_open};
 use rho_agent_types::{AgentId, Seq};
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::{AgentCommand, ClientFrame, NewAgent, ServerFrame};
+use rho_rpc::parts::client::Client;
+use rho_rpc::parts::{Answer, read_frame, write_frame, write_open};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
@@ -73,11 +73,7 @@ impl Streams {
         self.call(command, |()| None);
     }
 
-    fn call<C: rho_agent_host_proto::Call>(
-        &self,
-        call: C,
-        answered: fn(C::Reply) -> Option<Incoming>,
-    ) {
+    fn call<C: rho_rpc::parts::Call>(&self, call: C, answered: fn(C::Reply) -> Option<Incoming>) {
         let socket = self.socket.clone();
         let tx = self.incoming_tx.clone();
         tokio::spawn(async move {

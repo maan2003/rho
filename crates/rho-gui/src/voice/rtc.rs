@@ -6,7 +6,7 @@ use std::future::Future;
 use futures::StreamExt as _;
 use rho_agent_host_proto::host::Open as HostOpen;
 use rho_agent_host_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
-use rho_agent_host_proto::{read_frame, write_open};
+use rho_rpc::parts::{read_frame, write_open};
 use rho_rtc::{RtcEvent, RtcSession, SdpAnswer};
 
 struct RealtimeChannel {
@@ -34,8 +34,8 @@ async fn dial(dialer: rho_hosts::Dialer, offer_sdp: String) -> anyhow::Result<Re
         rho_agent_host_proto::realtime::Opened::Refused { reason } => anyhow::bail!("{reason}"),
     };
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
-        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
+        tx_limit: rho_rpc::parts::MAX_FRAME_LEN,
+        rx_limit: rho_rpc::parts::MAX_FRAME_LEN,
         tx_capacity: 32,
         rx_capacity: 32,
     });

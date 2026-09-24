@@ -94,11 +94,9 @@ impl Client {
         O: senax_encoder::Decoder + senax_encoder::Packer,
     {
         let input = async {
-            while let Some((frame, _)) = rho_rpc::read_frame_optional::<_, I>(
-                &mut reader,
-                rho_agent_host_proto::MAX_FRAME_LEN,
-            )
-            .await?
+            while let Some((frame, _)) =
+                rho_rpc::read_frame_optional::<_, I>(&mut reader, rho_rpc::parts::MAX_FRAME_LEN)
+                    .await?
             {
                 self.sender.send(self.port, encode(&frame)?).await?;
             }
@@ -107,8 +105,7 @@ impl Client {
         let output = async {
             while let Some(bytes) = self.incoming.recv().await {
                 let frame: O = decode(&bytes)?;
-                rho_rpc::write_frame(&mut writer, &frame, rho_agent_host_proto::MAX_FRAME_LEN)
-                    .await?;
+                rho_rpc::write_frame(&mut writer, &frame, rho_rpc::parts::MAX_FRAME_LEN).await?;
             }
             tokio::io::AsyncWriteExt::shutdown(&mut writer).await?;
             Ok::<(), anyhow::Error>(())

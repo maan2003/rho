@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rho_agent_host_proto::host::Open as HostOpen;
-use rho_agent_host_proto::{Opened, read_frame, write_open};
 use rho_desktop_media::codec::{Decoder, RetainedFrame};
 use rho_desktop_proto::Input;
+use rho_rpc::parts::{Opened, read_frame, write_open};
 use tokio::sync::{mpsc, watch};
 
 /// One decoded image: the YUV planes the decoder retained, which the

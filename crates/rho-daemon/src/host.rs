@@ -1,15 +1,16 @@
-//! The machine part of the daemon, [`rho_agent_host_proto::Part::Host`]:
+//! The machine part of the daemon, [`rho_rpc::parts::Part::Host`]:
 //! desktops, voice, Git transport, and administration.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use rho_agent_host_proto::GitProvided;
 use rho_agent_host_proto::host::{
     GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
     IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
 };
-use rho_agent_host_proto::{Answer, Call, GitProvided, Opened, write_frame};
+use rho_rpc::parts::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
 
 use crate::{GitProviderClaim, Services, debug, realtime};
@@ -74,7 +75,7 @@ where
     loop {
         tokio::select! {
             // The client says nothing; its end of the stream is the end.
-            closed = rho_agent_host_proto::read_frame_optional::<_, ()>(&mut reader) => {
+            closed = rho_rpc::parts::read_frame_optional::<_, ()>(&mut reader) => {
                 return closed.map(|_| ());
             }
             _ = timer.tick() => {}
@@ -111,7 +112,7 @@ where
     services.git_transport.register(frames_tx).await;
     loop {
         tokio::select! {
-            closed = rho_agent_host_proto::read_frame_optional::<_, ()>(&mut reader) => {
+            closed = rho_rpc::parts::read_frame_optional::<_, ()>(&mut reader) => {
                 return closed.map(|_| ());
             }
             Some(frame) = frames_rx.recv() => write_frame(&mut writer, &frame).await?,

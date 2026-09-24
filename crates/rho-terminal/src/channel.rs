@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::{Opened, read_frame, write_open};
+use rho_rpc::parts::{Opened, read_frame, write_open};
 
 use crate::protocol::{
     Open, TermClientFrame, TermServerFrame, TerminalInfo, TerminalList, TerminalOpen,
@@ -39,9 +39,9 @@ async fn dial_terminal_list(
     agent: String,
 ) -> anyhow::Result<Vec<TerminalInfo>> {
     let mut stream = dialer
-        .open(<TerminalList as rho_agent_host_proto::Call>::PRIORITY)
+        .open(<TerminalList as rho_rpc::parts::Call>::PRIORITY)
         .await?;
-    rho_agent_host_proto::call(&mut stream, TerminalList { agent: Some(agent) }).await
+    rho_rpc::parts::call(&mut stream, TerminalList { agent: Some(agent) }).await
 }
 
 /// Dials a dedicated terminal stream: attach the agent's first running
@@ -86,8 +86,8 @@ async fn dial_terminal(
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
-        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
+        tx_limit: rho_rpc::parts::MAX_FRAME_LEN,
+        rx_limit: rho_rpc::parts::MAX_FRAME_LEN,
         tx_capacity: 64,
         rx_capacity: 256,
     });

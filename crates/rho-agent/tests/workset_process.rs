@@ -47,7 +47,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
         tokio::spawn(client.relay::<_, _, TermClientFrame, TermServerFrame>(reader, writer));
     rho_rpc::write_frame(&mut ui, &TermClientFrame::Input(
         b"printf '%s' $$ > terminal-pid; stat -Lc '%i' /proc/self/ns/mnt > terminal-ns; touch terminal-ready\n".to_vec()
-    ), rho_agent_host_proto::MAX_FRAME_LEN).await.unwrap();
+    ), rho_rpc::parts::MAX_FRAME_LEN).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while !workset.root().join("terminal-ready").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -74,7 +74,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     rho_rpc::write_frame(
         &mut ui,
         &TermClientFrame::Input(b"exit\n".to_vec()),
-        rho_agent_host_proto::MAX_FRAME_LEN,
+        rho_rpc::parts::MAX_FRAME_LEN,
     )
     .await
     .unwrap();
@@ -139,14 +139,14 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
             submission: 7,
             command: "printf multiplexed; printf written > shell-effect".into(),
         },
-        rho_agent_host_proto::MAX_FRAME_LEN,
+        rho_rpc::parts::MAX_FRAME_LEN,
     )
     .await
     .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let (frame, _): (ShellServerFrame, _) =
-                rho_rpc::read_frame(&mut shell_ui, rho_agent_host_proto::MAX_FRAME_LEN)
+                rho_rpc::read_frame(&mut shell_ui, rho_rpc::parts::MAX_FRAME_LEN)
                     .await
                     .unwrap();
             if matches!(frame, ShellServerFrame::Accepted { submission: 7, .. }) {

@@ -15,8 +15,8 @@ pub mod stream;
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Open;
 
-impl crate::PartOpen for Open {
-    const PART: crate::Part = crate::Part::Desk;
+impl rho_rpc::parts::PartOpen for Open {
+    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Desk;
 }
 
 /// Lamport timestamp used by structural operations.

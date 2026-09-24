@@ -13,6 +13,7 @@ bytes.workspace = true
 redb.workspace = true
 rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
+rho-rpc.workspace = true
 rho-db.workspace = true
 senax-encoder.workspace = true
 text.workspace = true

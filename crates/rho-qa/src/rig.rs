@@ -19,13 +19,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_agent_host_proto::client::Client;
 use rho_agent_types::{AgentRole, ContentPart};
 use rho_agents_client::protocol::transcript::TranscriptEvent;
 use rho_agents_client::protocol::{
     ClientFrame as AgentsClientFrame, JoinTarget, NewAgent, ServerFrame as AgentsServerFrame,
     StartMode,
 };
+use rho_rpc::parts::client::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 

@@ -5021,6 +5021,7 @@ dependencies = [
  "octo-types",
  "reqwest 0.12.28",
  "rho-agent-host-proto",
+ "rho-rpc",
  "tokio",
 ]
 
@@ -12255,17 +12256,14 @@ dependencies = [
 name = "rho-agent-host-proto"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "camino",
  "clock",
- "dirs",
  "rand 0.8.7",
  "rho-agent-types",
  "rho-rpc",
  "senax-encoder",
  "text",
- "tokio",
 ]
 
 [[package]]
@@ -12314,7 +12312,6 @@ dependencies = [
  "json-stream",
  "language",
  "multi_buffer",
- "rho-agent-host-proto",
  "rho-agent-types",
  "rho-agents-client",
  "rho-window",
@@ -12434,6 +12431,7 @@ dependencies = [
  "rho-files",
  "rho-fs-view",
  "rho-inference",
+ "rho-rpc",
  "rho-shell-view",
  "rho-terminal",
  "rho-visualizations",
@@ -12547,6 +12545,7 @@ dependencies = [
  "rho-agents-client",
  "rho-db",
  "rho-hosts",
+ "rho-rpc",
  "rho-slack",
  "senax-encoder",
  "tempfile",
@@ -12565,6 +12564,7 @@ dependencies = [
  "rho-agent-host-proto",
  "rho-agent-types",
  "rho-db",
+ "rho-rpc",
  "senax-encoder",
  "tempfile",
  "text",
@@ -12669,7 +12669,6 @@ dependencies = [
  "language",
  "multi_buffer",
  "path",
- "rho-agent-host-proto",
  "rho-agent-types",
  "rho-files",
  "rho-hosts",
@@ -13000,6 +12999,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "bytes",
+ "dirs",
  "futures",
  "iroh",
  "moq-tokio",
@@ -13052,8 +13053,8 @@ dependencies = [
  "gpui",
  "language",
  "multi_buffer",
- "rho-agent-host-proto",
  "rho-hosts",
+ "rho-rpc",
  "rho-shell-view",
  "rho-terminal",
  "rho-window",
@@ -13107,7 +13108,6 @@ dependencies = [
  "bytes",
  "futures",
  "gpui",
- "rho-agent-host-proto",
  "rho-hosts",
  "rho-rpc",
  "rho-terminal",

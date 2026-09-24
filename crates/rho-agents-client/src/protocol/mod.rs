@@ -1,4 +1,4 @@
-//! The agents part of a host, [`rho_agent_host_proto::Part::Agents`].
+//! The agents part of a host, [`rho_rpc::parts::Part::Agents`].
 //!
 //! Its session ([`Open::Session`]) carries the host's journal and its
 //! agents' live tails: a stream of its own, so a catch-up of thousands of
@@ -22,13 +22,13 @@ pub mod transcript;
 pub enum Open {
     /// The journal and the live tails, for as long as the client stays.
     Session,
-    /// One [`rho_agent_host_proto::Call`], answered with one
-    /// [`rho_agent_host_proto::Answer`]; then the
+    /// One [`rho_rpc::parts::Call`], answered with one
+    /// [`rho_rpc::parts::Answer`]; then the
     /// stream closes.
     Request(Request),
 }
 
-rho_agent_host_proto::calls! {
+rho_rpc::calls! {
     /// Every call the agents answer, as it goes on the wire.
     pub enum Request {
         /// Answered with the new agent's id.
@@ -49,8 +49,8 @@ rho_agent_host_proto::calls! {
     }
 }
 
-impl rho_agent_host_proto::PartOpen for Open {
-    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Agents;
+impl rho_rpc::parts::PartOpen for Open {
+    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Agents;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
@@ -433,7 +433,7 @@ mod tests {
         ] {
             round_trips(Open::Request(request));
         }
-        round_trips(rho_agent_host_proto::Answer::Done(vec![AgentUsageSeries {
+        round_trips(rho_rpc::parts::Answer::Done(vec![AgentUsageSeries {
             model: "fable".to_owned(),
             buckets: vec![AgentUsageBucket {
                 bucket_start_ms: 300_000,
@@ -441,7 +441,7 @@ mod tests {
                 ..AgentUsageBucket::default()
             }],
         }]));
-        round_trips(rho_agent_host_proto::Answer::Done(vec![AgentCostSeries {
+        round_trips(rho_rpc::parts::Answer::Done(vec![AgentCostSeries {
             agent_id,
             model: "gpt".to_owned(),
             buckets: vec![AgentUsageBucket {
@@ -451,16 +451,16 @@ mod tests {
                 ..AgentUsageBucket::default()
             }],
         }]));
-        round_trips(rho_agent_host_proto::Answer::Done(VisualizationContent {
+        round_trips(rho_rpc::parts::Answer::Done(VisualizationContent {
             mime_type: "image/svg+xml".to_owned(),
             content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
         }));
-        round_trips(rho_agent_host_proto::Answer::Done(agent_id));
+        round_trips(rho_rpc::parts::Answer::Done(agent_id));
     }
 
     #[test]
     fn opening_survives_the_envelope() {
-        let envelope = rho_agent_host_proto::Open::of(&Open::Session).unwrap();
+        let envelope = rho_rpc::parts::Open::of(&Open::Session).unwrap();
         assert_eq!(envelope.unpack::<Open>().unwrap(), Open::Session);
         assert!(
             envelope

@@ -221,7 +221,7 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
         Some(source) => return copy_snapshot_unlocked(&source),
         None => default_db_path().context("resolve rho db path")?,
     };
-    let paths = rho_agent_host_proto::RuntimePaths::from_env()?;
+    let paths = rho_rpc::parts::RuntimePaths::from_env()?;
     std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
     match copy_snapshot_from(&source, &paths.daemon_lock())? {
         Some(snapshot) => Ok(snapshot),
@@ -232,7 +232,7 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
 /// Ask the running daemon for a snapshot: it alone can copy the file
 /// between commits, in a state that opens without repair.
 async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
-    let path = rho_agent_host_proto::client::call(socket, rho_agent_host_proto::host::Snapshot)
+    let path = rho_rpc::parts::client::call(socket, rho_agent_host_proto::host::Snapshot)
         .await
         .context("the daemon holds the database, and its socket does not answer")?
         .into_std_path_buf();
