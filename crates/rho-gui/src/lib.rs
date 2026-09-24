@@ -19,6 +19,7 @@ pub(crate) mod search;
 mod selection;
 pub mod slack;
 mod slack_navigation;
+pub(crate) mod sources;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod transient;

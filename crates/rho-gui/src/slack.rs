@@ -27,9 +27,9 @@ const NOT_WHILE_EDITING: &str =
 /// in the composer to send as a new message if the reader still wants them.
 const REWRITE_LOST: &str = "slack: that message was deleted; your rewrite is in the composer";
 
-use crate::attention::SlackFacts;
 use crate::minibuffer::Candidate;
 use crate::pane::{SlackInventoryKind, SurfaceKey};
+use crate::sources::SlackFacts;
 use crate::workspace::{ContextId, SurfaceView, Workspace};
 
 pub(crate) fn slack_filter_candidates(typed: &str) -> Vec<crate::minibuffer::Candidate> {

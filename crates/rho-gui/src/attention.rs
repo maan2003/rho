@@ -14,37 +14,14 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{Context, Window};
 use rho_agent_types::AgentId;
-use rho_dealer::curve::{
-    BLOCKED_REPLY_HEAD_START, CHANNEL_ANSWERED_DROP, CHANNEL_TRAFFIC_HEAD_START,
-    THREAD_REPLY_HEAD_START,
-};
 use rho_dealer::marks::{self, Cursor, Todo, Write};
 use rho_dealer::{Card, CardKind, Curve, DateMark, Dealer, Marks, NodeId, SlackUnit, Want};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Ledger, Secret};
 use rho_window::style::StyleClass;
 
+use crate::sources::{AgentsSource, NotesSource, SlackSource};
 use crate::workspace::Workspace;
-
-/// What Slack says about one unit right now, read live from the mirror.
-/// Nothing of it is kept: the words, the wait and the newest message stay
-/// in Slack, and a card's title is rendered fresh every time.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SlackFacts {
-    pub title: String,
-    pub conversation: String,
-    /// Why Slack is asking for the reader here, or `None` when it is not
-    /// asking at all: a unit whose messages have all been read is still a
-    /// unit — Find reaches it — but it is no longer a card.
-    pub reason: Option<rho_slack::model::Attention>,
-    /// How long the ball has been where it is, counted from the newest
-    /// message.
-    pub wait_days: f64,
-    /// The newest message in the unit: a new one voids a skip.
-    pub latest: String,
-    /// Whether somebody else has already answered in this run.
-    pub others_replied: bool,
-}
 
 /// What `shift-u` takes back: the marks a verdict wrote, as they were,
 /// and what it did outside the ledger.
@@ -84,8 +61,7 @@ pub(crate) struct Attention {
     pub(crate) dealer: Dealer,
     pub(crate) undo: Vec<Undo>,
     next_undo: u64,
-    /// Every Slack unit the mirror tracks, as last read.
-    pub(crate) slack: HashMap<SlackUnit, SlackFacts>,
+    pub(crate) slack: SlackSource,
 }
 
 impl Attention {
@@ -114,7 +90,7 @@ impl Attention {
                 dealer: Dealer::default(),
                 undo: Vec::new(),
                 next_undo: 0,
-                slack: HashMap::new(),
+                slack: SlackSource::default(),
             },
             events,
         )
@@ -287,56 +263,6 @@ pub(crate) fn desk_marks(
 }
 
 /// What an agent's last turn says, in the words a card uses.
-fn agent_reason(facts: &rho_agents_client::AgentFacts) -> &'static str {
-    if facts.errored {
-        "errored · {age} ago"
-    } else if facts.needs_you_hint {
-        "waiting on reply · {age}"
-    } else {
-        "finished · {age} ago"
-    }
-}
-
-/// A Slack unit's want, or `None` when Slack is not asking. A room is not a
-/// person waiting: it fades from the moment it is seen, and lower again
-/// when somebody else is already answering in it. Everything else is
-/// someone waiting, and rises.
-fn slack_want(facts: &SlackFacts, now_ms: i64) -> Option<Want> {
-    let reason = facts.reason?;
-    let since_ms = now_ms - (facts.wait_days * 86_400_000.0) as i64;
-    let (state, curve) = match reason {
-        rho_slack::model::Attention::ChannelTraffic => (
-            "unread",
-            Curve::Fading {
-                head_start: CHANNEL_TRAFFIC_HEAD_START
-                    - if facts.others_replied {
-                        CHANNEL_ANSWERED_DROP
-                    } else {
-                        0.0
-                    },
-                since_ms,
-            },
-        ),
-        _ => (
-            "needs reply",
-            Curve::Waiting {
-                head_start: THREAD_REPLY_HEAD_START,
-                since_ms,
-            },
-        ),
-    };
-    let why = rho_slack::model::reason_text(reason, &facts.conversation);
-    Some(Want {
-        kind: CardKind::Slack,
-        title: facts.title.clone(),
-        context: facts.conversation.clone(),
-        reason: format!("{why} · {state} · {{age}}"),
-        curve,
-        touched_ms: None,
-        cursor: facts.latest.clone(),
-    })
-}
-
 /// The wants a node's own dates make: a todo coming due or a deadline, and
 /// a snooze that has come back.
 fn dated_wants(marks: &rho_dealer::marks::NodeMarks, title: &str, context: &str) -> Vec<Want> {
@@ -491,13 +417,7 @@ impl Workspace {
         for agent_id in agents {
             let node = NodeId::Agent(*agent_id);
             let marks = self.attention.marks.get(&node);
-            let verdict = rho_agents_client::Verdict {
-                handled_through: rho_agent_types::AgentPos(match marks.handled {
-                    Some(Cursor::Story(pos)) => pos,
-                    _ => 0,
-                }),
-                muted: marks.muted,
-            };
+            let verdict = AgentsSource::map_verdict(marks);
             filings.push((
                 *agent_id,
                 rho_agents_client::AgentFiling {
@@ -520,28 +440,25 @@ impl Workspace {
 
     /// What a node is called on a card, in Find, and on its own surface.
     pub(crate) fn node_title(&self, node: &NodeId) -> String {
-        let marks = self.attention.marks.get(node);
         match node {
-            NodeId::Note(_) => match marks.title() {
-                "" => "untitled note".to_owned(),
-                title => title.to_owned(),
-            },
-            NodeId::Label(id) => self.attention.marks.label_path(*id),
-            NodeId::Agent(agent_id) => self
-                .registry
-                .agent_human_name(*agent_id)
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
-            NodeId::Slack(unit) => self
-                .attention
-                .slack
-                .get(unit)
-                .map(|facts| facts.title.clone())
-                .unwrap_or_else(|| unit.channel.clone()),
+            NodeId::Note(_) => self.notes_source().note_title(node),
+            NodeId::Label(id) => self.notes_source().label_title(*id),
+            NodeId::Agent(agent_id) => self.agents_source().title(*agent_id),
+            NodeId::Slack(unit) => self.attention.slack.title(unit),
             NodeId::PullRequest { repo, number } => format!("{repo}#{number}"),
+        }
+    }
+
+    pub(crate) fn agents_source(&self) -> AgentsSource<'_> {
+        AgentsSource {
+            map: &self.registry,
+            touched: &self.agent_last_interaction,
+        }
+    }
+
+    pub(crate) fn notes_source(&self) -> NotesSource<'_> {
+        NotesSource {
+            marks: &self.attention.marks,
         }
     }
 
@@ -549,9 +466,9 @@ impl Workspace {
     /// carries for anything else.
     pub(crate) fn node_context(&self, node: &NodeId) -> String {
         if let NodeId::Slack(unit) = node
-            && let Some(facts) = self.attention.slack.get(unit)
+            && let Some(conversation) = self.attention.slack.context(unit)
         {
-            return facts.conversation.clone();
+            return conversation;
         }
         let marks = self.attention.marks.get(node);
         marks
@@ -576,62 +493,15 @@ impl Workspace {
         let context = self.node_context(node);
         let mut wants = dated_wants(marks, &title, &context);
         match node {
-            NodeId::Agent(agent_id) => wants.extend(self.agent_want(*agent_id, marks)),
-            NodeId::Slack(unit) => wants.extend(
-                self.attention
-                    .slack
-                    .get(unit)
-                    .and_then(|facts| slack_want(facts, now.timestamp_millis())),
-            ),
+            NodeId::Agent(agent_id) => {
+                wants.extend(self.agents_source().want(*agent_id, marks, &context))
+            }
+            NodeId::Slack(unit) => {
+                wants.extend(self.attention.slack.want(unit, now.timestamp_millis()))
+            }
             _ => {}
         }
         wants
-    }
-
-    /// An agent's want: its last turn ended with something the user has
-    /// not dealt with. An agent created by an agent belongs to its creator
-    /// and wants nothing of its own.
-    fn agent_want(&self, agent_id: AgentId, marks: &rho_dealer::marks::NodeMarks) -> Option<Want> {
-        if !self.registry.created_by_user(agent_id)
-            || self.registry.host_of_agent(agent_id).is_none()
-        {
-            return None;
-        }
-        let digest = self.registry.agent_digest(agent_id)?;
-        let handled = match marks.handled {
-            Some(Cursor::Story(pos)) => pos,
-            _ => 0,
-        };
-        if digest.newest.0 <= handled {
-            return None;
-        }
-        let facts = self.registry.agent_facts(agent_id);
-        let ended = facts.last_turn_ended?;
-        if facts.turn_running || ended <= facts.last_user_message_at {
-            return None;
-        }
-        let since_ms = ended.0 as i64;
-        // A dead turn is not an FYI: only the user can start it again.
-        let curve = if facts.errored || facts.needs_you_hint {
-            Curve::Waiting {
-                head_start: BLOCKED_REPLY_HEAD_START,
-                since_ms,
-            }
-        } else {
-            Curve::Fading {
-                head_start: 0.0,
-                since_ms,
-            }
-        };
-        Some(Want {
-            kind: CardKind::Agent,
-            title: self.node_title(&NodeId::Agent(agent_id)),
-            context: self.node_context(&NodeId::Agent(agent_id)),
-            reason: agent_reason(&facts).to_owned(),
-            curve,
-            touched_ms: self.agent_last_interaction.get(&agent_id).copied(),
-            cursor: format!("{}", digest.newest.0),
-        })
     }
 
     fn refresh_node_wants(&mut self, node: &NodeId, now: chrono::DateTime<chrono::FixedOffset>) {
@@ -649,17 +519,9 @@ impl Workspace {
 
     /// Reads Slack's units again and makes their wants.
     pub(crate) fn refresh_slack_wants(&mut self, cx: &gpui::App) {
-        let slack = self.slack_thread_facts(cx);
+        let facts = self.slack_thread_facts(cx);
         let now = chrono::Local::now().fixed_offset();
-        let gone: Vec<SlackUnit> = self
-            .attention
-            .slack
-            .keys()
-            .filter(|unit| !slack.contains_key(*unit))
-            .cloned()
-            .collect();
-        self.attention.slack = slack;
-        let units: Vec<SlackUnit> = self.attention.slack.keys().cloned().chain(gone).collect();
+        let units = self.attention.slack.read(facts);
         for unit in units {
             self.refresh_node_wants(&NodeId::Slack(unit), now);
         }
@@ -672,9 +534,10 @@ impl Workspace {
         let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
         self.push_agent_marks(&agents);
         self.attention.dealer.retain(|_| false);
-        self.attention.slack = self.slack_thread_facts(cx);
+        let facts = self.slack_thread_facts(cx);
+        self.attention.slack.read(facts);
         let mut nodes: BTreeSet<NodeId> = agents.into_iter().map(NodeId::Agent).collect();
-        nodes.extend(self.attention.slack.keys().cloned().map(NodeId::Slack));
+        nodes.extend(self.attention.slack.units().cloned().map(NodeId::Slack));
         nodes.extend(
             self.attention
                 .marks
@@ -747,25 +610,24 @@ impl Workspace {
                 writes.push(marks::snooze(node, None));
             }
         };
-        match (verdict, node) {
-            (Verdict::Done | Verdict::Todo { .. }, NodeId::Agent(agent_id)) => {
-                let newest = self
-                    .registry
-                    .agent_digest(*agent_id)
-                    .map_or(0, |digest| digest.newest.0);
-                writes.push(marks::handled(node, Some(Cursor::Story(newest))));
+        match node {
+            NodeId::Agent(agent_id) => {
+                writes.extend(self.agents_source().verdict(*agent_id, verdict))
             }
-            (Verdict::Done | Verdict::Todo { .. } | Verdict::Mute, NodeId::Slack(unit)) => {
-                slack_cursors.extend(self.advance_slack_cursor(unit, None, cx));
-                if verdict == Verdict::Mute {
-                    self.slack_set_unit_muted(unit, true, cx);
-                    slack_muted = Some(unit.clone());
+            // Slack's verdicts are Slack's own, through its session.
+            NodeId::Slack(unit) => match verdict {
+                Verdict::Done | Verdict::Todo { .. } | Verdict::Mute => {
+                    slack_cursors.extend(self.advance_slack_cursor(unit, None, cx));
+                    if verdict == Verdict::Mute {
+                        self.slack_set_unit_muted(unit, true, cx);
+                        slack_muted = Some(unit.clone());
+                    }
                 }
-            }
-            (Verdict::Done | Verdict::Todo { .. }, _) => {}
-            (Verdict::Mute, _) => writes.push(marks::muted(node, true)),
-            (Verdict::Snooze(_), _) => {}
+                Verdict::Snooze(_) => {}
+            },
+            _ => writes.extend(self.notes_source().verdict(node, verdict)),
         }
+
         match verdict {
             Verdict::Done | Verdict::Mute => clear_dates(&mut writes),
             Verdict::Snooze(until) => writes.push(marks::snooze(node, Some(until))),
