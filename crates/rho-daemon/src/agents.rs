@@ -922,7 +922,7 @@ where
     };
     write_frame(&mut writer, &Opened::Ready).await?;
 
-    use rho_agent_host_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
+    use rho_files::protocol::{WorkspaceClientFrame, WorkspaceServerFrame};
     let mut changes = watcher_setup.changes;
     let changes_overflowed = watcher_setup.overflowed;
     let mut watcher_ready = Some(watcher_setup.ready);
@@ -964,13 +964,13 @@ where
                         paths: Vec::new(),
                         rescan: true,
                     },
-                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
             frame = rho_agent_host_proto::read_frame_limited::<_, WorkspaceClientFrame>(
                 &mut reader,
-                rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
             ) => {
                 let frame = match frame {
                     Ok(frame) => frame,
@@ -1001,7 +1001,7 @@ where
                 rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &response,
-                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }
@@ -1021,7 +1021,7 @@ where
                 rho_agent_host_proto::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed { paths, rescan },
-                    rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                    rho_files::protocol::MAX_WORKSPACE_FRAME_LEN,
                 )
                 .await?;
             }

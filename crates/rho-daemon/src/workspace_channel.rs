@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context as _, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
 use notify::{Config, EventKindMask, RecursiveMode, Watcher as _};
-use rho_agent_host_proto::workspace::{FileReadResult, FileSaveResult, MAX_FILE_LEN};
+use rho_files::protocol::{FileReadResult, FileSaveResult, MAX_FILE_LEN};
 use sha2::{Digest as _, Sha256};
 
 const MAX_PATH_LEN: usize = 4096;

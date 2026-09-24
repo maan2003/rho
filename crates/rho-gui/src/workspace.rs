@@ -4821,12 +4821,8 @@ impl Workspace {
         };
         let cached = self.cached_remote_project(host, &workspace);
         let project_task = cached.is_none().then(|| {
-            let agents = self.agents_for(agent_id)?;
-            Some(rho_files::open_remote_project(
-                &agents,
-                workspace.clone(),
-                cx,
-            ))
+            let link = self.hosts.connection(host)?.link();
+            Some(rho_files::open_remote_project(&link, workspace.clone(), cx))
         });
         if matches!(project_task, Some(None)) {
             return;

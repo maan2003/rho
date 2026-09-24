@@ -1,5 +1,5 @@
 //! One host's agents, as the client reaches them: calls, terminals,
-//! shells, workspace channels and visualizations, each on a stream of its
+//! shells and visualizations, each on a stream of its
 //! own. The session beside them is [`crate::stream`].
 
 use std::collections::HashMap;
@@ -10,7 +10,6 @@ use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_host_proto::agents::{self, VisualizationContent};
 use rho_agent_host_proto::{Call, Opened, read_frame, shell, term, write_frame, write_open};
-use rho_agent_types::WorkspaceInfo;
 use rho_hosts::{Dialer, Link};
 
 /// One host's agents, as a client reaches them. Cheap to clone; valid
@@ -71,14 +70,6 @@ impl AgentsLink {
         self.call(shell::ShellClose { agent })
     }
 
-    /// Dials a dedicated workspace file stream and runs the handshake.
-    pub fn open_workspace(
-        &self,
-        workspace: WorkspaceInfo,
-    ) -> impl Future<Output = anyhow::Result<WorkspaceChannel>> + Send + 'static {
-        self.link.run(|dialer| dial_channel(dialer, workspace))
-    }
-
     /// A recorded visualization.
     pub fn visualization(
         &self,
@@ -97,43 +88,6 @@ async fn dial_call<C: Call>(dialer: Dialer, call: C) -> anyhow::Result<C::Reply>
 async fn dial_stream(dialer: Dialer) -> anyhow::Result<rho_rpc::Stream> {
     // Interactive streams outrank calls and sessions (priority 1 and below).
     dialer.open(Some(50)).await
-}
-
-/// One workspace file channel. Dropping the owner cancels the transport and
-/// tears down its daemon-side watcher.
-pub struct WorkspaceChannel {
-    pub outgoing: futures_mpsc::Sender<rho_agent_host_proto::WorkspaceClientFrame>,
-    pub incoming:
-        futures_mpsc::Receiver<anyhow::Result<rho_agent_host_proto::WorkspaceServerFrame>>,
-    pub transport: rho_rpc::ChannelTask,
-}
-
-async fn dial_channel(
-    dialer: Dialer,
-    workspace: WorkspaceInfo,
-) -> anyhow::Result<WorkspaceChannel> {
-    let mut stream = dialer.open(None).await?;
-    write_open(
-        &mut stream,
-        &rho_agent_host_proto::workspace::Open { workspace },
-    )
-    .await?;
-    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
-        anyhow::bail!("daemon refused workspace file channel: {reason}")
-    }
-
-    let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
-        rx_limit: rho_agent_host_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
-        tx_capacity: 16,
-        rx_capacity: 32,
-    });
-    let (outgoing, incoming, transport) = channel.into_parts();
-    Ok(WorkspaceChannel {
-        outgoing,
-        incoming,
-        transport,
-    })
 }
 
 /// One attached terminal: a dedicated stream carrying

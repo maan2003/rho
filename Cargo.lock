@@ -12427,6 +12427,7 @@ dependencies = [
  "rho-claude",
  "rho-daemon",
  "rho-db",
+ "rho-files",
  "rho-fs-view",
  "rho-inference",
  "rho-visualizations",
@@ -12484,6 +12485,7 @@ dependencies = [
  "rho-desk-server",
  "rho-desktop-media",
  "rho-desktop-proto",
+ "rho-files",
  "rho-fs-view",
  "rho-image",
  "rho-inference",
@@ -12649,6 +12651,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "buffer_diff",
+ "bytes",
  "camino",
  "clock",
  "editor",
@@ -12659,11 +12662,13 @@ dependencies = [
  "path",
  "rho-agent-host-proto",
  "rho-agent-types",
- "rho-agents-client",
+ "rho-hosts",
  "rho-rpc",
  "rho-window",
+ "senax-encoder",
  "text",
  "theme",
+ "tokio",
  "tracing",
 ]
 

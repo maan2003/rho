@@ -131,7 +131,7 @@ rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-fake-model = { path = "crates/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
-rho-files = { path = "crates/rho-files" }
+rho-files = { path = "crates/rho-files", default-features = false }
 rho-git-client = { path = "crates/rho-git/client" }
 rho-git-proto = { path = "crates/rho-git/proto" }
 rho-git-server = { path = "crates/rho-git/server" }

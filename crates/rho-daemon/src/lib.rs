@@ -1044,7 +1044,7 @@ where
         Part::Terminal => agents::serve_terminals(services, open.unpack()?, reader, writer).await,
         Part::Shell => agents::serve_shells(services, open.unpack()?, reader, writer).await,
         Part::Workspace => {
-            let rho_agent_host_proto::workspace::Open { workspace } = open.unpack()?;
+            let rho_files::protocol::Open { workspace } = open.unpack()?;
             agents::serve_workspace_channel(services, reader, writer, workspace).await
         }
     }

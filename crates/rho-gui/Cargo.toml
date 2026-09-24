@@ -61,7 +61,7 @@ rho-browser = { workspace = true }
 rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
-rho-files = { workspace = true }
+rho-files = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true }
 rho-agents-view = { workspace = true }
 rho-hosts = { workspace = true }

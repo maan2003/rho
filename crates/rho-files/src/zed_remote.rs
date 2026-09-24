@@ -17,12 +17,11 @@ use gpui::{
     div,
 };
 use language::{Buffer, BufferEvent, Capability};
-use rho_agent_host_proto::{
-    FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame,
-};
 use rho_agent_types::WorkspaceInfo;
-use rho_agents_client::remote::{AgentsLink, WorkspaceChannel};
 use theme::ActiveTheme as _;
+
+use crate::channel::WorkspaceChannel;
+use crate::protocol::{FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame};
 
 #[derive(Clone, Copy, Debug)]
 pub enum RemoteProjectEvent {
@@ -261,11 +260,11 @@ pub struct RemoteProject {
 }
 
 pub fn open_remote_project(
-    agents: &AgentsLink,
+    link: &rho_hosts::Link,
     workspace: WorkspaceInfo,
     cx: &mut App,
 ) -> Task<Result<RemoteProject>> {
-    let channel_task = agents.open_workspace(workspace);
+    let channel_task = crate::channel::open(link, workspace);
     cx.spawn(async move |cx| {
         let WorkspaceChannel {
             outgoing,

@@ -82,9 +82,7 @@ pub mod shell;
 pub mod shell_kernel;
 pub mod term;
 pub mod transcript;
-pub mod workspace;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
