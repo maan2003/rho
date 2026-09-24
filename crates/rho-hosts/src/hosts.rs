@@ -112,8 +112,8 @@ impl Hosts {
     /// Attaching is fire-and-forget: the host appears immediately as
     /// `Connecting` and reports its own progress through the stream.
     /// `streams` is handed the new id and the host's [`crate::Link`], and
-    /// returns the streams the host carries beside its control stream,
-    /// opened again on every reconnect.
+    /// returns the streams the host carries, opened again on every
+    /// reconnect.
     pub fn attach(
         &mut self,
         name: String,

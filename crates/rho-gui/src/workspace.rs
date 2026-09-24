@@ -427,9 +427,8 @@ pub struct Workspace {
     /// daemon never writes it: the agent exists because the registry says
     /// so, and where it is shown is the user's own fact.
     pending_agent_filing: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
-    /// Hosts whose control stream has said `Ready` at least once. A host
-    /// attaches blind; until it answers, its agents do not exist for this
-    /// client.
+    /// Hosts that have been reached at least once. A host attaches blind;
+    /// until it is reached, its agents do not exist for this client.
     ready_hosts: HashSet<HostId>,
     /// Hosts to replay to once they are back: armed only by an actual
     /// disconnect.

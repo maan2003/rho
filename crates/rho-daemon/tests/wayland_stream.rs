@@ -5,7 +5,6 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rho_agent_host_proto::control::ServerFrame as S;
 use rho_agent_host_proto::{NewAgent, Open, Opened, agents, host, read_frame, write_frame};
 
 struct Child(std::process::Child);
@@ -69,8 +68,7 @@ fn main() -> Result<()> {
             ensure!(tokio::time::Instant::now()<deadline,"daemon startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        write_frame(&mut local,&Open::Host(host::Open::Control)).await?;
-        ensure!(matches!(read_frame::<_,S>(&mut local).await?,S::Ready {..}),"missing Ready");
+        write_frame(&mut local,&Open::Host(host::Open::Desktops)).await?;
         let repo=temp.path().join("repo");
         std::fs::create_dir(&repo)?;
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
@@ -104,7 +102,7 @@ layout { background-color "#315b97"; }
         let descriptor:serde_json::Value=serde_json::from_slice(&std::fs::read(desktop_directory.join(format!("{desktop_name}.json")))?)?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let S::DesktopSessions { sessions } = read_frame::<_,S>(&mut local).await? {
+                { let sessions = read_frame::<_, Vec<rho_agent_host_proto::DesktopSession>>(&mut local).await?;
                     ensure!(sessions == vec![rho_agent_host_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }], "incorrect desktop advertisement: {sessions:?}");
                     break;
                 }
@@ -205,7 +203,7 @@ layout { background-color "#315b97"; }
             .arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let S::DesktopSessions { sessions } = read_frame::<_, S>(&mut local).await? {
+                { let sessions = read_frame::<_, Vec<rho_agent_host_proto::DesktopSession>>(&mut local).await?;
                     if sessions.len() == 2 {
                         ensure!(sessions.iter().all(|session| session.agent == agent.encoded()), "wrong owner");
                         ensure!(sessions.iter().map(|session| session.name.as_str()).collect::<Vec<_>>() == vec!["browser", "preview"], "wrong session names");
@@ -220,7 +218,7 @@ layout { background-color "#315b97"; }
         ensure!(desktop_directory.join("browser.json").exists(), "crash fixture did not leave an advertisement");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let S::DesktopSessions { sessions } = read_frame::<_, S>(&mut local).await? {
+                { let sessions = read_frame::<_, Vec<rho_agent_host_proto::DesktopSession>>(&mut local).await?;
                     if sessions == vec![rho_agent_host_proto::DesktopSession { agent: agent.encoded(), name: desktop_name.clone() }] { break; }
                 }
             }

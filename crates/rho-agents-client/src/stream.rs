@@ -1,7 +1,7 @@
 //! One host's agents stream: the daemon's journal and live tails to the
 //! model, the model's follow and the window's focus back to the daemon.
 //!
-//! The host opens it beside its control stream on every connection
+//! The host opens it on every connection
 //! ([`rho_hosts::HostStream`]); what is said on it and where its frames go
 //! are this crate's.
 
@@ -116,7 +116,7 @@ impl HostStream for AgentStream {
         let commands = self.commands.clone();
         let focus = self.focus.clone();
         Box::pin(async move {
-            // Bulk priority: a catch-up must not hold up the control stream.
+            // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
             write_frame(&mut socket, &Open::Agents(agents::Open::Session)).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);

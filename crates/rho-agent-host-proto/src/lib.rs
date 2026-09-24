@@ -61,7 +61,6 @@ macro_rules! calls {
 
 pub mod agents;
 pub mod client;
-pub mod control;
 pub mod desk;
 pub mod host;
 pub mod realtime;
@@ -82,9 +81,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/19";
+pub const IROH_ALPN: &[u8] = b"rho/ui/20";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP19";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP20";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,8 +176,8 @@ pub enum Open {
     Agents(agents::Open),
     /// The desk ([`desk::stream`]).
     Desk,
-    /// The machine itself: its session with a GUI, voice, desktops, Git
-    /// transport and administration ([`host`]).
+    /// The machine itself: desktops, voice, Git transport and
+    /// administration ([`host`]).
     Host(host::Open),
 }
 
@@ -786,7 +785,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP18\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP19\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -889,10 +888,8 @@ mod tests {
     }
 
     #[test]
-    fn control_frames_round_trip() {
-        round_trips(control::ServerFrame::Ready);
-        round_trips(control::ServerFrame::GitTransportDone { request_id: 9 });
-        round_trips(control::ClientFrame::ProvideGitTransport);
+    fn git_provider_frames_round_trip() {
+        round_trips(host::GitProviderFrame::Done { request_id: 9 });
     }
 
     #[test]
@@ -930,7 +927,8 @@ mod tests {
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         for open in [
-            Open::Host(host::Open::Control),
+            Open::Host(host::Open::Desktops),
+            Open::Host(host::Open::GitProvider),
             Open::Agents(agents::Open::Session),
             Open::Desk,
             Open::Host(host::Open::GitTransport { request }),

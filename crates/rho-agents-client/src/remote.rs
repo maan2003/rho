@@ -96,7 +96,7 @@ async fn dial_call<C: Call>(dialer: Dialer, call: C) -> anyhow::Result<C::Reply>
 }
 
 async fn dial_stream(dialer: Dialer) -> anyhow::Result<rho_rpc::Stream> {
-    // Interactive streams outrank the control session (priority 1).
+    // Interactive streams outrank calls and sessions (priority 1 and below).
     dialer.open(Some(50)).await
 }
 

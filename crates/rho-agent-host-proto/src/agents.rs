@@ -57,8 +57,7 @@ pub enum Open {
 /// reply.
 pub trait Call: Into<Request> + Send + 'static {
     type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
-    /// The stream's priority: as urgent as the control stream unless the
-    /// answer is bulk.
+    /// The stream's priority: above the sessions unless the answer is bulk.
     const PRIORITY: Option<i32> = Some(1);
 }
 

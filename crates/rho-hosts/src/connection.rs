@@ -1,18 +1,16 @@
 //! Daemon connection: an IO task on the tokio runtime the caller hands in,
-//! bridged to the reader through sinks. What the control stream pushes
-//! becomes [`ConnEvent`]s on a futures channel the workspace awaits (no
-//! polling); every request is a stream of its own, answered once.
+//! bridged to the reader through sinks. Each thing the host pushes has a
+//! stream of its own, and what they carry becomes [`ConnEvent`]s on a
+//! futures channel the workspace awaits (no polling); every request is a
+//! stream of its own, answered once.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
-use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::control::{
-    ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
-};
-use rho_agent_host_proto::host::{self, Open as HostOpen};
+use futures::FutureExt as _;
+use rho_agent_host_proto::host::{self, GitProviderFrame, Open as HostOpen};
 use rho_agent_host_proto::{
     GitProvided, GitService, GitTransportRequest, Open, Opened, read_frame, write_frame,
 };
@@ -152,7 +150,7 @@ async fn dial_call<C: host::Call>(dialer: ChannelDialer, call: C) -> anyhow::Res
 }
 
 async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
-    // Interactive streams outrank the control session (priority 1).
+    // Interactive streams outrank the sessions (priority 1 and below).
     dialer.open(Some(50)).await
 }
 
@@ -309,7 +307,8 @@ pub fn supervises() -> bool {
 /// Attaches one daemon. Its events join `events`, tagged with `host`, so
 /// several daemons feed the workspace through a single ordered stream.
 /// `streams` is handed the host's [`Link`] and returns the streams that
-/// open beside the control stream on every connection. The connection's
+/// open on every connection, beside the host's own (desktops, Git
+/// transport). The connection's
 /// work runs on `runtime`.
 pub fn spawn(
     host: HostId,
@@ -395,20 +394,25 @@ async fn run(
     dialer: &Mutex<Option<ChannelDialer>>,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
-    let (mut stream, agent_connection, _endpoint) = match target {
+    // Held for the whole connection: the endpoint is what the iroh
+    // connection runs on.
+    let (health_connection, _endpoint, reached) = match target {
         AttachTarget::Unix(socket_path) => {
-            let client = Client::connect(&socket_path)
+            // Reaching the socket is what being connected means here. Each
+            // stream dials it afresh; the one that reached it carries the
+            // desktops.
+            let reached = rho_rpc::connect_unix(&socket_path)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
             *dialer.lock().unwrap() = Some(ChannelDialer::Unix(socket_path));
-            (client.into_stream(), None, None)
+            (None, None, Some(reached))
         }
         AttachTarget::Iroh {
             endpoint_id,
             ssh_destination,
             remote_rho,
         } => {
-            let (stream, connection, endpoint) =
+            let (connection, endpoint) =
                 connect_iroh(endpoint_id, &ssh_destination, &remote_rho).await?;
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
@@ -419,13 +423,8 @@ async fn run(
                 connection: connection.clone(),
                 media,
             });
-            (stream, Some(connection), Some(endpoint))
+            (Some(connection), Some(endpoint), None)
         }
-    };
-    write_frame(&mut stream, &Open::Host(HostOpen::Control)).await?;
-    let frame: ControlFrame = read_frame(&mut stream).await?;
-    let ControlFrame::Ready = frame else {
-        anyhow::bail!("rho daemon did not send ready message");
     };
     if events.unbounded_send(ConnEvent::Ready).is_err() {
         return Ok(());
@@ -448,16 +447,15 @@ async fn run(
         let run = host_stream.run(streams_dialer.clone());
         stream_tasks.spawn(async move { (name, run.await) });
     }
-    write_frame(&mut stream, &ControlClientFrame::ProvideGitTransport).await?;
+    stream_tasks.spawn(
+        follow_desktops(streams_dialer.clone(), reached, events.clone())
+            .map(|result| ("desktops", result)),
+    );
+    stream_tasks.spawn(
+        provide_git_transport(streams_dialer, events.clone())
+            .map(|result| ("Git provider", result)),
+    );
 
-    let health_connection = agent_connection;
-    let git_transport_limit = Arc::new(tokio::sync::Semaphore::new(1));
-    let git_requests = Arc::new(Mutex::new(
-        HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
-    ));
-
-    // The write half is held, unused, so the stream stays open.
-    let (mut reader, _writer) = tokio::io::split(stream);
     let health_task = health_connection.map(|connection| {
         let events = events.clone();
         tokio::spawn(async move {
@@ -491,50 +489,79 @@ async fn run(
             }
         })
     });
-    let mut git_provider_tasks = tokio::task::JoinSet::new();
 
-    let read_error = loop {
-        let frame: ControlFrame = tokio::select! {
-            Some(result) = stream_tasks.join_next() => {
-                break Some(match result {
-                    Ok((name, Ok(()))) => anyhow::anyhow!("daemon {name} stream closed"),
-                    Ok((name, Err(error))) => error.context(format!("daemon {name} stream")),
-                    Err(error) => anyhow::anyhow!("daemon stream task failed: {error}"),
-                });
-            }
-            result = read_frame(&mut reader) => match result {
-                Ok(frame) => frame,
-                Err(error) => break Some(error),
-            },
-        };
-        let event = match frame {
-            ControlFrame::DesktopSessions { sessions } => {
-                Some(ConnEvent::DesktopSessions(sessions))
-            }
-            ControlFrame::Ready => Some(ConnEvent::Ready),
-            ControlFrame::GitTransportRequested {
+    let ended = stream_tasks.join_next().await;
+    abort_tasks(&mut stream_tasks).await;
+    if let Some(task) = health_task {
+        task.abort();
+        let _ = task.await;
+    }
+    Err(match ended {
+        Some(Ok((name, Ok(())))) => anyhow::anyhow!("daemon {name} stream closed"),
+        Some(Ok((name, Err(error)))) => error.context(format!("daemon {name} stream")),
+        Some(Err(error)) => anyhow::anyhow!("daemon stream task failed: {error}"),
+        None => anyhow::anyhow!("daemon connection has no streams"),
+    })
+}
+
+/// The host's desktops, whole, each time they change: on `reached` if
+/// the connection already has a stream to spare, else on one of its own.
+async fn follow_desktops(
+    dialer: ChannelDialer,
+    reached: Option<rho_rpc::Stream>,
+    events: EventSink,
+) -> anyhow::Result<()> {
+    let mut stream = match reached {
+        Some(stream) => stream,
+        None => dialer.open(None).await?,
+    };
+    write_frame(&mut stream, &Open::Host(HostOpen::Desktops)).await?;
+    loop {
+        let sessions: Vec<rho_agent_host_proto::DesktopSession> = read_frame(&mut stream).await?;
+        if events
+            .unbounded_send(ConnEvent::DesktopSessions(sessions))
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// Carries SSH Git transport for the host's Git remote helpers, for as
+/// long as the connection lasts: this GUI holds the credentials. One
+/// transport runs at a time; each waits for its approval first.
+async fn provide_git_transport(dialer: ChannelDialer, events: EventSink) -> anyhow::Result<()> {
+    let mut stream = dialer.open(Some(1)).await?;
+    write_frame(&mut stream, &Open::Host(HostOpen::GitProvider)).await?;
+    let limit = Arc::new(tokio::sync::Semaphore::new(1));
+    let requests = Arc::new(Mutex::new(
+        HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
+    ));
+    // Dropped with this future, which ends every transport in flight.
+    let mut transports = tokio::task::JoinSet::new();
+    loop {
+        match read_frame(&mut stream).await? {
+            GitProviderFrame::Requested {
                 request_id,
                 provider_id,
                 request,
             } => {
                 let events = events.clone();
-                let provider_dialer = dialer.lock().unwrap().clone();
-                let git_transport_limit = git_transport_limit.clone();
+                let dialer = dialer.clone();
+                let limit = limit.clone();
                 let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
-                git_requests.lock().unwrap().insert(request_id, done_tx);
-                let git_requests = git_requests.clone();
-                git_provider_tasks.spawn(async move {
+                requests.lock().unwrap().insert(request_id, done_tx);
+                let requests = requests.clone();
+                transports.spawn(async move {
                     let result = async {
                         let _permit = tokio::select! {
-                            permit = git_transport_limit.acquire_owned() => {
+                            permit = limit.acquire_owned() => {
                                 permit.context("Git transport provider closed")?
                             }
                             _ = done_rx.changed() => return Ok(()),
                         };
-                        let provider_dialer =
-                            provider_dialer.context("not connected to rho daemon")?;
                         run_git_transport_provider(
-                            provider_dialer,
+                            dialer,
                             request_id,
                             provider_id,
                             request,
@@ -549,33 +576,21 @@ async fn run(
                         )));
                     }
                     let _ = events.unbounded_send(ConnEvent::GitTransportDone { request_id });
-                    git_requests.lock().unwrap().remove(&request_id);
+                    requests.lock().unwrap().remove(&request_id);
                 });
-                None
             }
-            ControlFrame::GitTransportDone { request_id } => {
-                if let Some(done) = git_requests.lock().unwrap().remove(&request_id) {
+            GitProviderFrame::Done { request_id } => {
+                if let Some(done) = requests.lock().unwrap().remove(&request_id) {
                     done.send_replace(true);
                 }
-                Some(ConnEvent::GitTransportDone { request_id })
+                if events
+                    .unbounded_send(ConnEvent::GitTransportDone { request_id })
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
-        };
-        if let Some(event) = event
-            && events.unbounded_send(event).is_err()
-        {
-            break None;
         }
-    };
-    abort_tasks(&mut stream_tasks).await;
-    if let Some(task) = health_task {
-        task.abort();
-        let _ = task.await;
-    }
-    abort_tasks(&mut git_provider_tasks).await;
-    git_requests.lock().unwrap().clear();
-    match read_error {
-        Some(error) => Err(error),
-        None => Ok(()),
     }
 }
 
@@ -909,7 +924,7 @@ async fn connect_iroh(
     daemon_id: iroh::EndpointId,
     ssh_destination: &str,
     remote_rho: &str,
-) -> anyhow::Result<(rho_rpc::Stream, iroh::endpoint::Connection, iroh::Endpoint)> {
+) -> anyhow::Result<(iroh::endpoint::Connection, iroh::Endpoint)> {
     // The native client's identity intentionally lives only as long as this
     // process. Each daemon can trust it in memory via an existing SSH login.
     let endpoint = client_endpoint().await?;
@@ -931,14 +946,7 @@ async fn connect_iroh(
             == rho_iroh_auth::ClientAuthResult::Approved,
         "daemon did not approve SSH-trusted iroh client"
     );
-    let (send, recv) = connection
-        .open_bi()
-        .await
-        .context("open iroh control stream")?;
-    send.set_priority(1)
-        .context("set iroh control stream priority")?;
-    let stream = rho_rpc::Stream::new(recv, send);
-    Ok((stream, connection, endpoint))
+    Ok((connection, endpoint))
 }
 
 async fn trust_in_memory_over_ssh(

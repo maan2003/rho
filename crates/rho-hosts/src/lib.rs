@@ -1,8 +1,9 @@
 //! The machines this client can reach.
 //!
 //! One connection per attached daemon, the handshake that brings it up, and
-//! the streams it carries. The control stream's events go to one reader
-//! ([`HostSink`]); every other long-lived stream belongs to a client that
+//! the streams it carries. The host's own streams (desktops, Git
+//! transport) report to one reader ([`HostSink`]); every other long-lived
+//! stream belongs to a client that
 //! hands the host a [`HostStream`] to run, the agents client's and the
 //! desk's among them. The crate holds no agent state, no desk state and no
 //! window state: what it knows is which machines exist, whether they are
@@ -135,9 +136,9 @@ impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
     }
 }
 
-/// A stream a client keeps to one host beside the control stream. It opens
-/// once the host is ready and lasts the connection: when it ends, so does
-/// the connection, and on the next one every stream opens again.
+/// A stream a client keeps to one host. It opens once the host is ready and
+/// lasts the connection: when it ends, so does the connection, and on the next
+/// one every stream opens again.
 pub trait HostStream: Send + Sync + 'static {
     /// What the stream is called when it is why a connection went.
     fn name(&self) -> &'static str;

@@ -7,7 +7,7 @@
 //! reconnect's catch-up is thousands of pages, and the main thread hears
 //! one message for the whole of it. What comes here is each host's agents
 //! stream and nothing else; the desk and the host's other news go to the
-//! window on the control stream.
+//! window on streams of their own.
 //!
 //! The connection itself stays where it is, on the shared tokio runtime:
 //! the socket was never the cost, and the workspace-file, terminal, shell

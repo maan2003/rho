@@ -3,13 +3,13 @@ use std::ffi::OsString;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_agent_host_proto::control::ServerFrame as ControlFrame;
+use rho_agent_host_proto::host::GitProviderFrame;
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
     AuthState, JoinTarget, Open, Opened, StartMode, read_frame, write_frame,
@@ -604,12 +604,8 @@ async fn run_iroh_listener(
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
             let uni_task = tokio::spawn(async move { uni.receive_uni().await });
-            // One control stream per iroh connection; every other stream
-            // is opened for one thing of its own.
-            let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let services = services.clone();
-                let control_claimed = control_claimed.clone();
                 let media = media.clone();
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
@@ -640,23 +636,6 @@ async fn run_iroh_listener(
                             )
                             .await;
                         }
-                        let control =
-                            matches!(open, Open::Host(rho_agent_host_proto::host::Open::Control));
-                        if control {
-                            anyhow::ensure!(
-                                control_claimed
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::AcqRel,
-                                        Ordering::Relaxed
-                                    )
-                                    .is_ok(),
-                                "iroh connection already has a control stream"
-                            );
-                            send.set_priority(1)
-                                .context("set iroh control stream priority")?;
-                        }
                         if matches!(
                             open,
                             Open::Agents(
@@ -668,11 +647,7 @@ async fn run_iroh_listener(
                                 .context("set iroh interactive stream priority")?;
                         }
                         let writer = rho_rpc::Writer::new(send);
-                        let result = serve_stream(services, iroh_auth, open, recv, writer).await;
-                        if control {
-                            control_claimed.store(false, Ordering::Release);
-                        }
-                        result
+                        serve_stream(services, iroh_auth, open, recv, writer).await
                     }
                     .await;
                     if let Err(error) = result {
@@ -692,13 +667,13 @@ type BoxGitStream = Box<dyn GitStream>;
 
 #[derive(Default)]
 struct GitTransportState {
-    providers: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
+    providers: HashMap<u64, mpsc::UnboundedSender<GitProviderFrame>>,
     pending: HashMap<u64, PendingGitTransport>,
 }
 
 struct PendingGitTransport {
     response: oneshot::Sender<Result<BoxGitStream, String>>,
-    recipients: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
+    recipients: HashMap<u64, mpsc::UnboundedSender<GitProviderFrame>>,
     remaining: HashSet<u64>,
 }
 
@@ -715,7 +690,7 @@ enum GitProviderClaim {
 }
 
 impl GitTransportBroker {
-    async fn register(&self, provider: mpsc::UnboundedSender<ControlFrame>) {
+    async fn register(&self, provider: mpsc::UnboundedSender<GitProviderFrame>) {
         let provider_id = self.next_provider_id.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.providers.retain(|_, provider| !provider.is_closed());
@@ -761,7 +736,7 @@ impl GitTransportBroker {
             let mut disconnected = Vec::new();
             for (&provider_id, provider) in &recipients {
                 if provider
-                    .send(ControlFrame::GitTransportRequested {
+                    .send(GitProviderFrame::Requested {
                         request_id,
                         provider_id,
                         request: request.clone(),
@@ -837,12 +812,12 @@ impl GitTransportBroker {
 
     fn notify_done(
         request_id: u64,
-        recipients: &HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
+        recipients: &HashMap<u64, mpsc::UnboundedSender<GitProviderFrame>>,
         except: Option<u64>,
     ) {
         for (&provider_id, provider) in recipients {
             if Some(provider_id) != except {
-                let _ = provider.send(ControlFrame::GitTransportDone { request_id });
+                let _ = provider.send(GitProviderFrame::Done { request_id });
             }
         }
     }
@@ -1238,7 +1213,7 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
-    use rho_agent_host_proto::control::ServerFrame as ControlFrame;
+    use rho_agent_host_proto::host::GitProviderFrame;
     use rho_agent_types::ContentPart;
 
     use super::{
@@ -1417,7 +1392,7 @@ mod tests {
             tokio::spawn(async move { broker.request(request).await })
         };
         let (request_id, first_provider) = match first_rx.recv().await.unwrap() {
-            ControlFrame::GitTransportRequested {
+            GitProviderFrame::Requested {
                 request_id,
                 provider_id,
                 ..
@@ -1425,7 +1400,7 @@ mod tests {
             message => panic!("unexpected provider message: {message:?}"),
         };
         let second_provider = match second_rx.recv().await.unwrap() {
-            ControlFrame::GitTransportRequested {
+            GitProviderFrame::Requested {
                 request_id: second_request,
                 provider_id,
                 ..
@@ -1455,7 +1430,7 @@ mod tests {
         waiting.await.unwrap().unwrap();
         assert!(matches!(
             first_rx.recv().await,
-            Some(ControlFrame::GitTransportDone {
+            Some(GitProviderFrame::Done {
                 request_id: done_request
             }) if done_request == request_id
         ));
@@ -1504,7 +1479,7 @@ mod tests {
             })
         };
         let request_id = match provider_rx.recv().await.unwrap() {
-            ControlFrame::GitTransportRequested { request_id, .. } => request_id,
+            GitProviderFrame::Requested { request_id, .. } => request_id,
             message => panic!("unexpected provider message: {message:?}"),
         };
         let error = match waiting.await.unwrap() {
@@ -1514,7 +1489,7 @@ mod tests {
         assert!(error.to_string().contains("within 60 seconds"));
         assert!(matches!(
             provider_rx.recv().await,
-            Some(ControlFrame::GitTransportDone {
+            Some(GitProviderFrame::Done {
                 request_id: done_request
             }) if done_request == request_id
         ));

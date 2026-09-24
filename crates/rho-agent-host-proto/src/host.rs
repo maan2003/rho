@@ -1,6 +1,5 @@
-//! The machine itself, opened by [`crate::Open::Host`]: its session with a
-//! GUI ([`crate::control`]), voice, desktops, Git transport, and one-shot
-//! administration ([`Call`]).
+//! The machine itself, opened by [`crate::Open::Host`]: desktops, voice,
+//! Git transport, and one-shot administration ([`Call`]).
 
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -9,9 +8,13 @@ use crate::{GitTransportRequest, PrCommand};
 /// What a host stream is for.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
-    /// A GUI's session: what the host pushes to it ([`crate::control`]).
-    /// One per iroh connection.
-    Control,
+    /// The desktops running in this host's worksets: the whole list as
+    /// `Vec<`[`crate::DesktopSession`]`>`, pushed whenever it changes.
+    Desktops,
+    /// This GUI holds SSH credentials and carries Git transport for the
+    /// host's Git remote helpers. The host pushes [`GitProviderFrame`]s for
+    /// as long as the stream is open.
+    GitProvider,
     /// One [`Call`], answered with one [`crate::Answer`]; then the stream
     /// closes.
     Request(Request),
@@ -29,8 +32,7 @@ pub enum Open {
     /// A Git remote helper's transport, paired with a GUI that provides
     /// it. After [`crate::Opened::Ready`] the stream is raw Git data.
     GitTransport { request: GitTransportRequest },
-    /// A GUI's answer to
-    /// [`crate::control::ServerFrame::GitTransportRequested`].
+    /// A GUI's answer to [`GitProviderFrame::Requested`].
     /// Answered with [`crate::GitProvided`]; after `Ready` the stream is raw
     /// Git data.
     GitProvide {
@@ -40,6 +42,21 @@ pub enum Open {
         /// operation. The first claim selects the credential provider.
         claim: bool,
     },
+}
+
+/// What a host pushes to a Git transport provider ([`Open::GitProvider`]).
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum GitProviderFrame {
+    /// A Git remote helper wants a transport. Sent to every provider; each
+    /// answers with [`Open::GitProvide`].
+    Requested {
+        request_id: u64,
+        provider_id: u64,
+        request: GitTransportRequest,
+    },
+    /// An approval race completed or expired. Deliberately carries no
+    /// result or winner information.
+    Done { request_id: u64 },
 }
 
 /// A one-shot call on the machine: a stream of its own that opens with

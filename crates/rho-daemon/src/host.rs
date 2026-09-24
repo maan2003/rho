@@ -1,17 +1,14 @@
 //! The machine part of the daemon: every stream opened by
-//! [`rho_agent_host_proto::Open::Host`]. A GUI's control session, voice,
-//! desktops, Git transport, and administration.
+//! [`rho_agent_host_proto::Open::Host`]: desktops, voice, Git transport,
+//! and administration.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent_host_proto::control::{
-    ClientFrame as ControlClientFrame, ServerFrame as ControlFrame,
-};
 use rho_agent_host_proto::host::{
-    Call, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke, IrohTrustInMemory, Open,
-    PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
+    Call, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
+    IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
 };
 use rho_agent_host_proto::{Answer, GitProvided, Opened, write_frame};
 use tokio::sync::mpsc;
@@ -31,7 +28,8 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match open {
-        Open::Control => serve_control(services, reader, writer).await,
+        Open::Desktops => serve_desktops(services, reader, writer).await,
+        Open::GitProvider => serve_git_provider(services, reader, writer).await,
         Open::Request(request) => {
             serve_call(&services, iroh_auth.as_ref(), request, &mut writer).await
         }
@@ -61,79 +59,65 @@ where
     }
 }
 
-/// The control stream: host-wide state pushed to one client, and its
-/// offer to carry SSH Git transport.
-async fn serve_control<R, W>(
+/// The desktops in every workset, told whole whenever they change. Only
+/// changes cross the stream; discovery never starts an encoder.
+async fn serve_desktops<R, W>(
     services: Arc<Services>,
     mut reader: R,
-    writer: W,
+    mut writer: W,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<ControlFrame>();
-    tokio::spawn(async move {
-        let mut writer = writer;
-        while let Some(frame) = outgoing_rx.recv().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
-                break;
+    let mut previous = Vec::new();
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            // The client says nothing; its end of the stream is the end.
+            closed = rho_agent_host_proto::read_frame_optional::<_, ()>(&mut reader) => {
+                return closed.map(|_| ());
+            }
+            _ = timer.tick() => {}
+        }
+        let mut sessions = Vec::new();
+        for process in services.pool.executions().await {
+            match process.action(rho_agent::WorksetAction::DesktopList).await {
+                Ok(rho_agent::WorksetReply::DesktopSessions(entries)) => sessions.extend(entries),
+                Ok(_) => tracing::warn!("unexpected desktop discovery reply"),
+                Err(error) => tracing::debug!(%error, "desktop discovery unavailable"),
             }
         }
-    });
-
-    let _ = outgoing_tx.send(ControlFrame::Ready);
-
-    // Reconcile ephemeral advertisements in workset namespaces. Only changes
-    // cross the authenticated GUI stream; discovery never starts an encoder.
-    let desktop_task = {
-        let services = services.clone();
-        let outgoing = outgoing_tx.clone();
-        tokio::spawn(async move {
-            let mut previous = Vec::new();
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                tokio::select! {
-                    _ = outgoing.closed() => break,
-                    _ = timer.tick() => {}
-                }
-                let mut sessions = Vec::new();
-                for process in services.pool.executions().await {
-                    match process.action(rho_agent::WorksetAction::DesktopList).await {
-                        Ok(rho_agent::WorksetReply::DesktopSessions(entries)) => {
-                            sessions.extend(entries)
-                        }
-                        Ok(_) => tracing::warn!("unexpected desktop discovery reply"),
-                        Err(error) => tracing::debug!(%error, "desktop discovery unavailable"),
-                    }
-                }
-                sessions.sort();
-                sessions.dedup();
-                if sessions != previous {
-                    previous = sessions.clone();
-                    if outgoing
-                        .send(ControlFrame::DesktopSessions { sessions })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        })
-    };
-
-    let result = loop {
-        match rho_agent_host_proto::read_frame_optional::<_, ControlClientFrame>(&mut reader).await
-        {
-            Ok(Some(ControlClientFrame::ProvideGitTransport)) => {
-                services.git_transport.register(outgoing_tx.clone()).await;
-            }
-            Ok(None) => break Ok(()),
-            Err(error) => break Err(error),
+        sessions.sort();
+        sessions.dedup();
+        if sessions != previous {
+            write_frame(&mut writer, &sessions).await?;
+            previous = sessions;
         }
-    };
-    desktop_task.abort();
-    result
+    }
+}
+
+/// A GUI carrying SSH Git transport: registered with the broker for as
+/// long as its stream is open, and told each request and its end.
+async fn serve_git_provider<R, W>(
+    services: Arc<Services>,
+    mut reader: R,
+    mut writer: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (frames_tx, mut frames_rx) = mpsc::unbounded_channel::<GitProviderFrame>();
+    services.git_transport.register(frames_tx).await;
+    loop {
+        tokio::select! {
+            closed = rho_agent_host_proto::read_frame_optional::<_, ()>(&mut reader) => {
+                return closed.map(|_| ());
+            }
+            Some(frame) = frames_rx.recv() => write_frame(&mut writer, &frame).await?,
+        }
+    }
 }
 
 async fn serve_git_transport_request<R, W>(
