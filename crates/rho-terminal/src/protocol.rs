@@ -1,8 +1,9 @@
 //! Wire vocabulary for workset-owned terminals.
 //!
-//! A terminal stream is opened by [`crate::agents::Open::Terminal`]; after
-//! [`crate::Opened::Ready`] an attached stream carries senax frames of
-//! [`TermClientFrame`] and [`TermServerFrame`].
+//! The terminals part of a host, [`rho_agent_host_proto::Part::Terminal`]. A
+//! terminal stream is opened by [`Open::Terminal`]; after
+//! [`rho_agent_host_proto::Opened::Ready`] an attached stream carries senax
+//! frames of [`TermClientFrame`] and [`TermServerFrame`].
 //!
 //! The protocol is deliberately dumb on the client side: the workset owns the
 //! only terminal emulator, and the wire carries *display state* — cell rows,
@@ -13,7 +14,56 @@ use std::collections::VecDeque;
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-/// How [`crate::agents::Open::Terminal`] reaches its terminal.
+/// What a terminals stream is for.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Open {
+    /// A daemon-owned terminal for an agent. Answered with
+    /// [`rho_agent_host_proto::Opened`]; an attached stream then carries
+    /// [`TermClientFrame`] and [`TermServerFrame`], the first of them a
+    /// snapshot of the screen preceded by history. Otherwise the terminal
+    /// runs headless and the stream closes.
+    Terminal {
+        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
+        agent: String,
+        /// Client-chosen id, unique among the agent's running terminals
+        /// ([`TerminalList`] enumerates them).
+        terminal_id: u64,
+        open: TerminalOpen,
+        /// The client's viewport, applied to the PTY (last writer wins).
+        cols: u16,
+        rows: u16,
+    },
+    /// One call, answered with one [`rho_agent_host_proto::Answer`]; then the
+    /// stream closes.
+    Request(Request),
+}
+
+rho_agent_host_proto::calls! {
+    /// Every call the terminals answer, as it goes on the wire.
+    pub enum Request {
+        TerminalList(TerminalList) -> Vec<TerminalInfo>;
+    }
+}
+
+impl rho_agent_host_proto::PartOpen for Open {
+    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Terminal;
+
+    fn debug_reply(&self, frame: &[u8]) -> Option<String> {
+        match self {
+            Self::Request(request) => Some(request.debug_answer(frame)),
+            Self::Terminal { .. } => None,
+        }
+    }
+}
+
+/// Every running terminal, of one agent if it names one (display handle or
+/// id prefix).
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct TerminalList {
+    pub agent: Option<String>,
+}
+
+/// How [`Open::Terminal`] reaches its terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum TerminalOpen {
     /// Spawns it, refused if `terminal_id` is already running. With
@@ -180,7 +230,7 @@ impl TermColor {
     pub const DEFAULT_BG: Self = Self::Background;
 }
 
-/// One running terminal in a [`crate::agents::Reply::TerminalList`] reply.
+/// One running terminal in a [`TerminalList`] answer.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct TerminalInfo {
     /// Encoded agent id ("eng-ht08").

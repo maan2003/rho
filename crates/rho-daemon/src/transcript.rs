@@ -1,87 +1,18 @@
-//! The raw log's transcript side: `strip`, which takes one raw event to what
-//! a client keeps of it, and the journal observer that tells the daemon
-//! about every append after it commits (`AGENT-LOG-DESIGN.md`).
+//! Transcripts: what a client is told of an agent's raw log. `strip`
+//! takes one raw event to what a client keeps of it, per event, in that
+//! event's position (`AGENT-LOG-DESIGN.md`, "the transcript is a pure
+//! function of the raw log"). The runtime writes its own events; this is
+//! the one place they become the client's words.
 
-use rho_agent_host_proto::transcript::{
-    AgentPos, Item, Live, LogEntry, RuntimeKind, Seq, SpawnedBy, ToolOutcome, ToolStatus,
-    TranscriptEvent, Usage,
+use rho_agent::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
+use rho_agent::{AgentEvent, InputKind, QueuedInput};
+use rho_agent_types::{PresentationField, UnixMs};
+use rho_agents_client::protocol::transcript::{
+    ArgumentsFormat, Item, RuntimeKind, SpawnedBy, ToolOutcome, ToolStatus, TranscriptEvent, Usage,
 };
-use rho_agent_host_proto::{AgentId, UnixMs};
-use rho_db::RhoDb;
 #[cfg(test)]
 use rho_inference::types::ContextBlock;
-use rho_inference::types::{InferenceResponseItem, MessageSender};
-
-use crate::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
-use crate::{AgentEvent, InputKind, PresentationField, QueuedInput};
-
-/// One row, the moment it became durable. `event` is `None` for the rows
-/// a client is not told about (the previous loop's bookkeeping).
-#[derive(Clone, Debug)]
-pub struct LogAppended {
-    pub seq: Seq,
-    pub agent_id: AgentId,
-    pub pos: AgentPos,
-    pub event: Option<TranscriptEvent>,
-}
-
-impl LogAppended {
-    /// The wire's view of this append, if it has one.
-    pub fn entry(&self) -> Option<LogEntry> {
-        Some(LogEntry {
-            seq: self.seq,
-            agent_id: self.agent_id,
-            pos: self.pos,
-            event: self.event.clone()?,
-        })
-    }
-}
-
-/// One thing a connection forwards, in the order it happened: a row
-/// became durable, or a loop said what its tail is now. One feed for
-/// both is what makes the ordering rule hold: a loop writes its row,
-/// the commit hook sends `Appended`, and only then does the same task
-/// send its `Live`.
-#[derive(Clone, Debug)]
-pub enum Feed {
-    Appended(LogAppended),
-    Live { agent_id: AgentId, live: Live },
-}
-
-/// The database's journal observer. Held in the database's own observer
-/// slot rather than passed down, because rows are appended from a dozen
-/// places and none of them should have to carry a channel.
-pub struct Journal {
-    feed: tokio::sync::broadcast::Sender<Feed>,
-}
-
-/// Every row appended to this database from now on, and every live
-/// delta any loop tells. A slow reader lags rather than blocking the
-/// writer; a lagged reader catches up from the journal table, which is
-/// the truth, and asks the loops to tell their tails again.
-pub fn feed(db: &RhoDb) -> tokio::sync::broadcast::Receiver<Feed> {
-    db.observer(Journal::new).feed.subscribe()
-}
-
-/// A loop saying what its tail is now.
-pub fn tell_live(db: &RhoDb, agent_id: AgentId, live: Live) {
-    let _ = db
-        .observer(Journal::new)
-        .feed
-        .send(Feed::Live { agent_id, live });
-}
-
-impl Journal {
-    fn new() -> Self {
-        Self {
-            feed: tokio::sync::broadcast::Sender::new(4096),
-        }
-    }
-
-    pub(crate) fn sender(&self) -> tokio::sync::broadcast::Sender<Feed> {
-        self.feed.clone()
-    }
-}
+use rho_inference::types::{InferenceResponseItem, MessageSender, ToolType};
 
 pub fn runtime_kind(runtime: &AgentRuntime) -> RuntimeKind {
     match runtime {
@@ -116,7 +47,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
     // Claude's post-compaction summary as a user line. The log is never
     // rewritten, so the reader is the one that leaves them out.
     if let AgentEvent::Transcript {
-        line: crate::TranscriptLine::User { text },
+        line: rho_agent::TranscriptLine::User { text },
         ..
     } = event
         && is_compaction_summary(text)
@@ -124,7 +55,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
         return None;
     }
     if let Some(native) = event.native_event() {
-        use crate::native::NativeEvent;
+        use rho_agent::native::NativeEvent;
         return match native {
             NativeEvent::RequestStarted {
                 input, context, at, ..
@@ -139,7 +70,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
                     })
                     .collect();
                 Some(
-                    if matches!(context, Some(crate::ContextChange::Preparing { .. })) {
+                    if matches!(context, Some(rho_agent::ContextChange::Preparing { .. })) {
                         TranscriptEvent::Results { results, at: *at }
                     } else {
                         TranscriptEvent::Sent {
@@ -191,7 +122,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
         };
     }
     let message =
-        |sender: &MessageSender, content: &[rho_agent_host_proto::ContentPart], delivery, at| {
+        |sender: &MessageSender, content: &[rho_agent_types::ContentPart], delivery, at| {
             TranscriptEvent::Message {
                 from: match sender {
                     MessageSender::User => None,
@@ -246,12 +177,12 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
         // already knows: a person's line is a message, the model's a
         // reply, the results a request that carried them.
         AgentEvent::Transcript { line, at, .. } => match line {
-            crate::TranscriptLine::User { text } => TranscriptEvent::ClaudeMessage {
-                speaker: rho_agent_host_proto::transcript::Speaker::User,
+            rho_agent::TranscriptLine::User { text } => TranscriptEvent::ClaudeMessage {
+                speaker: rho_agents_client::protocol::transcript::Speaker::User,
                 text: text.clone(),
                 at: *at,
             },
-            crate::TranscriptLine::Assistant {
+            rho_agent::TranscriptLine::Assistant {
                 text,
                 calls,
                 usage: cost,
@@ -269,7 +200,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
                         arguments: call.arguments.clone(),
                         // A transcript call is Claude's, and Claude's tools
                         // are all schema'd: its arguments are always JSON.
-                        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
+                        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
                     }))
                     .collect(),
                 compacted: false,
@@ -277,11 +208,11 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
                 context_used: *context_used,
                 at: *at,
             },
-            crate::TranscriptLine::ToolResults { results } => TranscriptEvent::Results {
+            rho_agent::TranscriptLine::ToolResults { results } => TranscriptEvent::Results {
                 results: results.iter().map(tool_outcome).collect(),
                 at: *at,
             },
-            crate::TranscriptLine::Compacted { context_used } => TranscriptEvent::Replied {
+            rho_agent::TranscriptLine::Compacted { context_used } => TranscriptEvent::Replied {
                 items: Vec::new(),
                 compacted: true,
                 usage: None,
@@ -353,9 +284,9 @@ fn tool_outcome(result: &rho_inference::types::ToolResult) -> ToolOutcome {
     ToolOutcome {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_agent_host_proto::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_agent_host_proto::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_types::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_types::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         started_at: result.started_at,
         finished_at: result.finished_at,
@@ -436,12 +367,20 @@ pub fn item(value: &InferenceResponseItem) -> Option<Item> {
             id: id.as_str().to_owned(),
             name: name.as_str().to_owned(),
             arguments: arguments.clone(),
-            format: (*tool_type).into(),
+            format: arguments_format(*tool_type),
         },
         InferenceResponseItem::Compaction { .. } | InferenceResponseItem::Unknown { .. } => {
             return None;
         }
     })
+}
+
+/// A function tool is given JSON; a custom tool the text the model wrote.
+pub(crate) fn arguments_format(tool_type: ToolType) -> ArgumentsFormat {
+    match tool_type {
+        ToolType::Function => ArgumentsFormat::Json,
+        ToolType::Custom => ArgumentsFormat::Text,
+    }
 }
 
 fn is_compaction_summary(text: &str) -> bool {
@@ -452,7 +391,7 @@ fn is_compaction_summary(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use rho_agent_host_proto::{ContentPart, MessageDelivery, ToolOutputStatus};
+    use rho_agent_types::{ContentPart, MessageDelivery, ToolOutputStatus};
     use rho_inference::types::{ToolOutput, ToolResult, ToolUpdate};
 
     use super::*;
@@ -464,13 +403,13 @@ mod tests {
                 item_id: "visible".try_into().unwrap(),
             })
         };
-        let items = vec![
+        let items = [
             InferenceResponseItem::AssistantMessage {
                 provider_specific: data(),
                 content: vec![ContentPart::Text {
                     text: "before".into(),
                 }],
-                phase: Some(rho_agent_host_proto::MessagePhase::Commentary),
+                phase: Some(rho_agent_types::MessagePhase::Commentary),
             },
             InferenceResponseItem::ToolCall {
                 provider_specific: data(),
@@ -484,7 +423,7 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: "after".into(),
                 }],
-                phase: Some(rho_agent_host_proto::MessagePhase::FinalAnswer),
+                phase: Some(rho_agent_types::MessagePhase::FinalAnswer),
             },
             InferenceResponseItem::Unknown {
                 provider_specific: data(),
@@ -502,17 +441,19 @@ mod tests {
                 items: vec![
                     Item::Text {
                         text: "before".into(),
-                        phase: Some(rho_agent_host_proto::transcript::TextPhase::Commentary)
+                        phase: Some(rho_agents_client::protocol::transcript::TextPhase::Commentary)
                     },
                     Item::ToolCall {
                         id: "middle".into(),
                         name: "exec".into(),
                         arguments: "print(42)".into(),
-                        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                     },
                     Item::Text {
                         text: "after".into(),
-                        phase: Some(rho_agent_host_proto::transcript::TextPhase::FinalAnswer)
+                        phase: Some(
+                            rho_agents_client::protocol::transcript::TextPhase::FinalAnswer
+                        )
                     },
                 ],
                 compacted: false,
@@ -544,8 +485,8 @@ mod tests {
 
     #[test]
     fn a_sent_keeps_statuses_and_leaves_output_behind() {
-        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
-            input: Vec::from(vec![ContextBlock::ToolResults {
+        let event = AgentEvent::Native(rho_agent::native::NativeEvent::RequestStarted {
+            input: vec![ContextBlock::ToolResults {
                 results: vec![ToolResult {
                     call_id: "call-1".try_into().unwrap(),
                     tool_type: rho_inference::types::ToolType::Function,
@@ -559,7 +500,7 @@ mod tests {
                     finished_at: UnixMs(2),
                     metadata: None,
                 }],
-            }]),
+            }],
             at: UnixMs(3),
             wake: None,
             context: None,
@@ -583,8 +524,8 @@ mod tests {
 
     #[test]
     fn a_later_report_does_not_rewrite_the_first_results_status_or_duration() {
-        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
-            input: Vec::from(vec![ContextBlock::ToolUpdate(ToolUpdate {
+        let event = AgentEvent::Native(rho_agent::native::NativeEvent::RequestStarted {
+            input: vec![ContextBlock::ToolUpdate(ToolUpdate {
                 status: None,
                 images: Default::default(),
                 call_id: "call-1".try_into().unwrap(),
@@ -592,7 +533,7 @@ mod tests {
                 output: std::sync::Arc::new("bounded".to_owned()),
                 full_output: Some(std::sync::Arc::new("complete".to_owned())),
                 at: UnixMs(2),
-            })]),
+            })],
             at: UnixMs(3),
             wake: None,
             context: None,
@@ -633,7 +574,7 @@ mod tests {
     fn bookkeeping_rows_say_nothing() {
         assert_eq!(
             strip(&AgentEvent::RuntimeRebound {
-                change: crate::RuntimeChange::ClaudeRewindPending(None),
+                change: rho_agent::RuntimeChange::ClaudeRewindPending(None),
                 at: UnixMs(0),
             }),
             None
@@ -644,7 +585,7 @@ mod tests {
     fn an_older_rows_compaction_summary_is_not_told() {
         let summary = AgentEvent::Transcript {
             uuid: uuid::Uuid::nil(),
-            line: crate::TranscriptLine::User {
+            line: rho_agent::TranscriptLine::User {
                 text: "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.".to_owned(),
             },
             at: UnixMs(1),
@@ -653,7 +594,7 @@ mod tests {
         assert_eq!(strip(&summary), None);
         let spoken = AgentEvent::Transcript {
             uuid: uuid::Uuid::nil(),
-            line: crate::TranscriptLine::User {
+            line: rho_agent::TranscriptLine::User {
                 text: "This session is fine".to_owned(),
             },
             at: UnixMs(1),

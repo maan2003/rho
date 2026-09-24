@@ -1,7 +1,8 @@
 # The files a daemon-owned workspace shows: buffers opened over rho's bounded
 # file protocol (the daemon owns disk IO, the GUI owns unsaved edits) and the
 # diff of a workspace against its base. Owned by no workspace; the window
-# shows both.
+# shows both. Without the `client` feature it is the protocol alone, for the
+# host that serves it.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
@@ -11,26 +12,52 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+client = [
+  "dep:anyhow",
+  "dep:buffer_diff",
+  "dep:clock",
+  "dep:editor",
+  "dep:futures",
+  "dep:gpui",
+  "dep:language",
+  "dep:multi_buffer",
+  "dep:path",
+  "dep:rho-hosts",
+  "dep:rho-rpc",
+  "dep:rho-window",
+  "dep:text",
+  "dep:theme",
+  "dep:tracing",
+]
+
 [dependencies]
-anyhow.workspace = true
-buffer_diff.workspace = true
+bytes.workspace = true
 camino.workspace = true
-clock = { path = "../../vendor/zed/crates/clock" }
-editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
-futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
-language = { path = "../../vendor/zed/crates/language" }
-multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
-path = { path = "../../vendor/zed/crates/path" }
-rho-agents-client = { workspace = true }
-rho-rpc = { workspace = true, features = ["native-client"] }
 rho-agent-host-proto.workspace = true
-rho-window = { workspace = true }
-text = { path = "../../vendor/zed/crates/text" }
-theme = { path = "../../vendor/zed/crates/theme" }
-tracing.workspace = true
+rho-agent-types.workspace = true
+senax-encoder.workspace = true
+
+anyhow = { workspace = true, optional = true }
+buffer_diff = { workspace = true, optional = true }
+clock = { path = "../../vendor/zed/crates/clock", optional = true }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"], optional = true }
+futures = { workspace = true, optional = true }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
+language = { path = "../../vendor/zed/crates/language", optional = true }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
+path = { path = "../../vendor/zed/crates/path", optional = true }
+rho-hosts = { workspace = true, optional = true }
+rho-rpc = { workspace = true, features = ["native-client"], optional = true }
+rho-window = { workspace = true, optional = true }
+text = { path = "../../vendor/zed/crates/text", optional = true }
+theme = { path = "../../vendor/zed/crates/theme", optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The tests exercise the client too.
+rho-files = { path = ".", features = ["client"] }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",
 ] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }

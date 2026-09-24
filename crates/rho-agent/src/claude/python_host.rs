@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 #[cfg(test)]
-use rho_agent_host_proto::ToolOutputStatus;
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::ToolOutputStatus;
+use rho_agent_types::UnixMs;
 use rho_claude::mcp::{reply, text_item, tool_result};
 use rho_inference::types::{ExecCall, ExecId, ToolOutput};
 use serde_json::Value;

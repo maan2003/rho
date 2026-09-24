@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-agent-types"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+camino.workspace = true
+prefix-id = { workspace = true, default-features = false }
+senax-encoder.workspace = true
+serde.workspace = true

@@ -32,6 +32,7 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-desk-client",
+  "crates/rho-desktop-client",
   "crates/rho-desk-server",
   "crates/rho-devshell-builder",
   "crates/rho-openai-realtime",
@@ -50,6 +51,7 @@ members = [
   "crates/rho-transcript",
   "crates/rho-touch-keyboard",
   "crates/rho-agent-host-proto",
+  "crates/rho-agent-types",
   "crates/rho-window",
   "crates/rho-visualizations",
   "crates/rho-web-search",
@@ -146,6 +148,7 @@ rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-desk-client = { path = "crates/rho-desk-client" }
+rho-desktop-client = { path = "crates/rho-desktop-client" }
 rho-desk-server = { path = "crates/rho-desk-server" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
@@ -169,6 +172,7 @@ rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-devshell = { path = "crates/rho-devshell" }
 rho-devshell-daemon = { path = "crates/rho-devshell-daemon" }
 rho-agent-host-proto = { path = "crates/rho-agent-host-proto" }
+rho-agent-types = { path = "crates/rho-agent-types" }
 rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-fs-view = { path = "crates/rho-fs-view" }
@@ -247,9 +251,11 @@ noq-proto = { path = "vendor/noq/noq-proto" }
 # Local redb fork: compaction keeps relocating pages past one it cannot
 # move lower, instead of stopping at the first such page.
 redb = { path = "vendor/redb" }
-# Upstream fix for integer comparison ambiguity in the derive's expansion,
-# exposed by alacritty_terminal's `impl PartialOrd<Column> for usize`.
-redb-derive = { git = "https://github.com/cberner/redb", rev = "32f8a1368f766fee33042a7f88abe3173d529ffe" }
+# Upstream fixes for ambiguities in the derive's expansion: integer comparison,
+# exposed by alacritty_terminal's `impl PartialOrd<Column> for usize`, and
+# `as_ref` on a single field's bytes, exposed by the GUI crates' `AsRef` impls.
+# Later revisions change the TypeName of structs with user-defined fields.
+redb-derive = { git = "https://github.com/cberner/redb", rev = "f551b96f43d36314db076ad38a49c8eb6e8ee311" }
 tree-sitter-language = { path = "vendor/tree-sitter-language" }
 
 # Share MoQ model primitives with its Iroh transport.

@@ -18,6 +18,7 @@ pub mod rho_assets;
 #[cfg(test)]
 mod sampler;
 pub(crate) mod search;
+mod selection;
 pub mod slack;
 mod slack_navigation;
 pub mod telemetry;

@@ -12,16 +12,16 @@ pub enum Action {
     TerminalList,
     ShellList,
     ShellStart {
-        agent: rho_agent_host_proto::AgentId,
+        agent: rho_agent_types::AgentId,
         cwd: camino::Utf8PathBuf,
         program: std::path::PathBuf,
         pager: std::path::PathBuf,
     },
     ShellClose {
-        agent: rho_agent_host_proto::AgentId,
+        agent: rho_agent_types::AgentId,
     },
     Desktop {
-        agent: rho_agent_host_proto::AgentId,
+        agent: rho_agent_types::AgentId,
         session: String,
     },
     DesktopList,
@@ -30,7 +30,7 @@ pub enum Action {
 #[derive(Encode, Decode)]
 pub enum Attach {
     Terminal {
-        agent: rho_agent_host_proto::AgentId,
+        agent: rho_agent_types::AgentId,
         terminal: u64,
         create: bool,
         cols: u16,
@@ -39,15 +39,15 @@ pub enum Attach {
         shell: String,
     },
     Shell {
-        agent: rho_agent_host_proto::AgentId,
+        agent: rho_agent_types::AgentId,
     },
 }
 
 #[derive(Encode, Decode)]
 pub enum Reply {
     Done,
-    Terminals(Vec<rho_agent_host_proto::term::TerminalInfo>),
-    Shells(Vec<rho_agent_host_proto::shell::ShellInfo>),
+    Terminals(Vec<rho_terminal::protocol::TerminalInfo>),
+    Shells(Vec<rho_shell_view::protocol::ShellInfo>),
     Error(String),
     Desktop { socket: String },
     DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
@@ -179,7 +179,7 @@ impl Execution {
                     .list()
                     .await
                     .into_iter()
-                    .map(|entry| rho_agent_host_proto::term::TerminalInfo {
+                    .map(|entry| rho_terminal::protocol::TerminalInfo {
                         agent: entry.agent_id.encoded(),
                         terminal_id: entry.terminal_id,
                         title: entry.title.unwrap_or_default(),
@@ -194,7 +194,7 @@ impl Execution {
                     .list()
                     .await
                     .into_iter()
-                    .map(|entry| rho_agent_host_proto::shell::ShellInfo {
+                    .map(|entry| rho_shell_view::protocol::ShellInfo {
                         agent: entry.agent_id.encoded(),
                         clients: entry.clients as u32,
                     })
@@ -279,7 +279,7 @@ impl Execution {
                 };
                 let input = async {
                     while let Some(bytes) = incoming.recv().await {
-                        use rho_agent_host_proto::term::TermClientFrame as F;
+                        use rho_terminal::protocol::TermClientFrame as F;
 
                         use crate::terminal::ClientInput as I;
                         let input = match decode::<F>(&bytes)? {
@@ -337,7 +337,7 @@ async fn serve_shell(
     sender: Sender,
     port: Port,
 ) -> anyhow::Result<()> {
-    use rho_agent_host_proto::shell::{ShellClientFrame as C, ShellServerFrame as S};
+    use rho_shell_view::protocol::{ShellClientFrame as C, ShellServerFrame as S};
 
     use crate::shell::{ShellControl, ShellSubmitError};
     let crate::shell::ShellClient {

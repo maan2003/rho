@@ -1,45 +1,90 @@
-//! What a client and an agent host say to each other, and the words both
-//! sides share. The GUI depends on this crate and nothing else from the
-//! agent host.
+//! How a client and an agent host talk: the opening every stream starts
+//! with ([`Open`]), one-shot calls ([`Call`]), the host and desk parts, and
+//! protocol logs. Every other part's words live with the crate that speaks
+//! them ([`Part`]); the words about agents that all of them share live in
+//! `rho-agent-types`.
 //!
 //! Transport, authentication, compression, and generic Senax framing live in
-//! `rho-rpc`; this crate owns message types, their limits, logical traffic
-//! accounting, and protocol logs.
+//! `rho-rpc`.
 
 use anyhow::{Context as _, bail};
-use camino::Utf8PathBuf;
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
-pub mod agents;
+/// Declares a part's one-shot calls. Each is a type of its own that names
+/// its answer ([`Call::Reply`]); `Request` is what goes on the wire, one
+/// variant per call, and the part's own `Open` in scope carries it as
+/// `Open::Request`. A call is answered with one [`Answer`] of its reply
+/// type, on a stream of its own.
+#[macro_export]
+macro_rules! calls {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum Request {
+            $(
+                $(#[$meta:meta])*
+                $variant:ident($call:ty) -> $reply:ty $(, priority $priority:expr)?;
+            )*
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(
+            Clone,
+            Debug,
+            PartialEq,
+            senax_encoder::Encode,
+            senax_encoder::Decode,
+            senax_encoder::Pack,
+            senax_encoder::Unpack,
+        )]
+        pub enum Request {
+            $($(#[$meta])* $variant($call),)*
+        }
+
+        impl Request {
+            /// Its answer, read from `frame`, as a protocol log prints it.
+            pub fn debug_answer(&self, frame: &[u8]) -> String {
+                match self {
+                    $(Self::$variant(_) => $crate::debug_frame::<$crate::Answer<$reply>>(frame),)*
+                }
+            }
+        }
+
+        $(
+            impl From<$call> for Request {
+                fn from(call: $call) -> Self {
+                    Self::$variant(call)
+                }
+            }
+
+            impl $crate::Call for $call {
+                type Open = Open;
+                type Reply = $reply;
+                $(const PRIORITY: Option<i32> = $priority;)?
+
+                fn open(self) -> Open {
+                    Open::Request(self.into())
+                }
+            }
+        )*
+    };
+}
+
 pub mod client;
-pub mod control;
 pub mod desk;
 pub mod host;
-mod place;
 pub mod realtime;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
-pub mod shell;
-pub mod shell_kernel;
-pub mod term;
-pub mod transcript;
-mod vocab;
-pub mod workspace;
-pub use place::*;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-pub use vocab::*;
-pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
-/// Window represented by each point in the agent-cost distribution graph.
-pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/18";
+pub const IROH_ALPN: &[u8] = b"rho/ui/21";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP18";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP21";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,19 +167,115 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
         .to_owned())
 }
 
-/// The first frame on every stream: which part of the host it is for.
-/// Everything after it is that part's own, starting with its own opening
-/// frame, so neither side ever reads a frame meant for another part.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum Open {
-    /// The agents: their journal, what is asked of them, their terminals
-    /// and shells ([`agents`]).
-    Agents(agents::Open),
+/// Which part of the host a stream is for. Each part's messages belong to
+/// the crate that speaks it, so this names the parts and nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Part {
+    /// The agents: their journal and what is asked of them
+    /// (`rho-agents-client`).
+    Agents,
     /// The desk ([`desk::stream`]).
     Desk,
-    /// The machine itself: its session with a GUI, voice, desktops, Git
-    /// transport and administration ([`host`]).
-    Host(host::Open),
+    /// The machine itself: desktops, voice, Git transport and
+    /// administration ([`host`]).
+    Host,
+    /// An agent's terminals (`rho-terminal`).
+    Terminal,
+    /// An agent's shell (`rho-shell-view`).
+    Shell,
+    /// An agent's workspace files (`rho-files`).
+    Workspace,
+}
+
+/// The first frame on every stream: which part it is for, and that part's
+/// own opening, packed. Everything after it is the part's own, so neither
+/// side ever reads a frame meant for another part.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Open {
+    pub part: Part,
+    pub open: Vec<u8>,
+}
+
+/// A part's own opening frame.
+pub trait PartOpen: Packer + Unpacker + std::fmt::Debug + Send + Sync {
+    const PART: Part;
+
+    /// A reply on a stream this opened, as a protocol log prints it; `None`
+    /// for a stream frame, which the log does not read.
+    fn debug_reply(&self, _frame: &[u8]) -> Option<String> {
+        None
+    }
+}
+
+impl Open {
+    pub fn of<T: PartOpen>(open: &T) -> anyhow::Result<Self> {
+        Ok(Self {
+            part: T::PART,
+            open: senax_encoder::pack(open)
+                .context("pack part opening")?
+                .to_vec(),
+        })
+    }
+
+    /// The part's own opening. Fails if the stream is for another part.
+    pub fn unpack<T: PartOpen>(&self) -> anyhow::Result<T> {
+        anyhow::ensure!(
+            self.part == T::PART,
+            "{:?} stream opened as {:?}",
+            T::PART,
+            self.part
+        );
+        senax_encoder::unpack(&mut self.open.as_slice()).context("unpack part opening")
+    }
+}
+
+/// Opens a stream for a part: the first frame on it.
+pub async fn write_open<W, T>(writer: &mut W, open: &T) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: PartOpen,
+{
+    write_frame(writer, &Open::of(open)?).await
+}
+
+/// A one-shot call: a stream of its own, opened with the part's
+/// `Open::Request` ([`calls!`]) and answered with one [`Answer`] of its
+/// reply.
+pub trait Call: Send + 'static {
+    type Open: PartOpen;
+    type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
+    /// The stream's priority: above the sessions unless the answer is bulk.
+    const PRIORITY: Option<i32> = Some(1);
+
+    fn open(self) -> Self::Open;
+}
+
+/// Makes one call on `stream`, a stream opened for it. A refusal is an
+/// error.
+pub async fn call<S, C>(stream: &mut S, call: C) -> anyhow::Result<C::Reply>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: Call,
+{
+    write_open(stream, &call.open()).await?;
+    read_frame::<_, Answer<C::Reply>>(stream)
+        .await?
+        .into_result()
+}
+
+/// A stream's opening as a protocol log prints it, read as part `T`, or
+/// with `reply` a reply on it.
+pub fn describe_as<T: PartOpen>(open: &Open, reply: Option<&[u8]>) -> String {
+    let opened = match open.unpack::<T>() {
+        Ok(opened) => opened,
+        Err(error) => return format!("(undecodable: {error:#})"),
+    };
+    match reply {
+        None => format!("{:?} {opened:#?}", open.part),
+        Some(frame) => opened
+            .debug_reply(frame)
+            .unwrap_or_else(|| "(stream frame)".to_owned()),
+    }
 }
 
 /// The answer to opening a stream the host can refuse.
@@ -155,72 +296,6 @@ pub enum GitProvided {
     /// The approval race completed or expired. Deliberately carries no
     /// result or winner.
     Done,
-}
-
-/// What a client tells a host to do to its agents.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum AgentCommand {
-    New {
-        role: AgentRole,
-        /// Where the agent's working copy starts (including which repo, for
-        /// the modes that need one).
-        start: StartMode,
-        /// How the agent sees the filesystem around its workset: a minimal
-        /// generated root, or the host.
-        mode: WorksetMode,
-        content: Option<Vec<ContentPart>>,
-    },
-    Send {
-        agent_id: AgentId,
-        content: Vec<ContentPart>,
-        delivery: MessageDelivery,
-    },
-    Compact {
-        agent_id: AgentId,
-        delivery: MessageDelivery,
-    },
-    ChangeRole {
-        agent_id: AgentId,
-        role: AgentRole,
-    },
-    /// How the agent sees the filesystem from now on. Its loop restarts
-    /// in the new view, so the Python notebook's state is lost.
-    ChangeMode {
-        agent_id: AgentId,
-        mode: WorksetMode,
-    },
-    Cancel {
-        agent_id: AgentId,
-    },
-    Rewind {
-        agent_id: AgentId,
-        turns: u32,
-    },
-    Continue {
-        agent_id: AgentId,
-    },
-    /// Gives a Rho-runtime agent a fresh key for subsequent provider
-    /// requests.
-    ChangePromptCacheKey {
-        agent_id: AgentId,
-    },
-}
-
-impl AgentCommand {
-    /// The agent the command is for; `None` for a new one.
-    pub fn agent_id(&self) -> Option<AgentId> {
-        match self {
-            Self::New { .. } => None,
-            Self::Send { agent_id, .. }
-            | Self::Compact { agent_id, .. }
-            | Self::ChangeRole { agent_id, .. }
-            | Self::ChangeMode { agent_id, .. }
-            | Self::Cancel { agent_id }
-            | Self::Rewind { agent_id, .. }
-            | Self::Continue { agent_id }
-            | Self::ChangePromptCacheKey { agent_id } => Some(*agent_id),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -291,93 +366,52 @@ pub enum PrCommand {
     },
 }
 
-/// Where a new agent works. Each mode carries exactly the data it needs.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum StartMode {
-    /// A fresh workset holding a clone of `repo` (a URL or a daemon-side
-    /// path), with a new change on top of the revset.
-    NewOn { repo: Utf8PathBuf, revset: String },
-    /// The SAME place as the target: the new agent works in the target
-    /// agent's directory, seeing its edits instantly.
-    Join(JoinTarget),
-}
-
-/// Whose workspace [`StartMode::Join`] joins.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum JoinTarget {
-    /// A known workspace, sent back verbatim from the mirror's `Created`.
-    Workspace(WorkspaceInfo),
-    /// The user's own checkout of `repo`.
-    User { repo: Utf8PathBuf },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack)]
 pub struct DesktopSession {
     pub agent: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct QuotaSummary {
-    pub model: String,
-    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
-    pub auth_namespace: Option<String>,
-    pub remaining_percent: u8,
-    pub burn_10m: u16,
-    pub burn_2h: u16,
-    pub burn_1d: u16,
-    pub burn_3d: u16,
-    pub reset_at_unix: Option<i64>,
+/// The answer to a one-shot call: what it asked for, or why the host
+/// would not.
+#[derive(Clone, Debug, PartialEq, Pack, Unpack)]
+pub enum Answer<T: Packer + Unpacker> {
+    Done(T),
+    /// Not done, and why: the whole chain of causes.
+    Failed {
+        reason: String,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct QuotaSeries {
-    pub model: String,
-    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
-    pub auth_namespace: Option<String>,
-    pub points: Vec<QuotaPoint>,
+impl<T: Packer + Unpacker> Answer<T> {
+    pub fn into_result(self) -> anyhow::Result<T> {
+        match self {
+            Self::Done(reply) => Ok(reply),
+            Self::Failed { reason } => Err(anyhow::anyhow!(reason)),
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct QuotaPoint {
-    pub observed_at_ms: u64,
-    pub remaining_percent: u8,
-    pub reset_at_unix: Option<i64>,
+impl<T: Packer + Unpacker> From<anyhow::Result<T>> for Answer<T> {
+    fn from(result: anyhow::Result<T>) -> Self {
+        match result {
+            Ok(reply) => Self::Done(reply),
+            // The whole chain, not just the outermost context: a new agent
+            // that failed said "create managed workspace" and kept the
+            // reason to itself, which is not something a reader can act on.
+            Err(error) => Self::Failed {
+                reason: format!("{error:#}"),
+            },
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct AgentUsageBucket {
-    pub bucket_start_ms: u64,
-    pub input_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cache_write_1h_tokens: u64,
-    pub output_tokens: u64,
-    pub requests: u64,
-    pub approximate: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct AgentUsageSeries {
-    pub model: String,
-    pub buckets: Vec<AgentUsageBucket>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct AgentCostSeries {
-    /// Host-local identity. Clients combining hosts must keep the host in the
-    /// distribution key rather than merging equal counters.
-    pub agent_id: AgentId,
-    pub model: String,
-    pub buckets: Vec<AgentUsageBucket>,
-}
-
-/// Daemon-wide authentication settings presented by a GUI host.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct AuthState {
-    pub namespaces: Vec<String>,
-    pub disabled_namespaces: Vec<String>,
-    pub active_namespace: Option<String>,
+#[doc(hidden)]
+pub fn debug_frame<T: Unpacker + std::fmt::Debug>(mut frame: &[u8]) -> String {
+    match senax_encoder::unpack::<T>(&mut frame) {
+        Ok(value) => format!("{value:#?}"),
+        Err(error) => format!("(undecodable: {error})"),
+    }
 }
 
 /// Encode and write one length-prefixed senax frame.
@@ -553,10 +587,14 @@ pub fn append_protocol_log_record(
     Ok(())
 }
 
+/// Prints a protocol log. `describe` reads a part's frames, which this
+/// crate does not know: a stream's opening with `None`, a reply on it with
+/// the reply's frame ([`describe_as`]).
 #[cfg(not(target_family = "wasm"))]
 pub fn print_protocol_log(
     path: impl AsRef<std::path::Path>,
     output: &mut impl std::io::Write,
+    describe: impl Fn(&Open, Option<&[u8]>) -> String,
 ) -> anyhow::Result<()> {
     let mut input = std::fs::File::open(path).context("open protocol log")?;
     let mut opened = None;
@@ -572,42 +610,27 @@ pub fn print_protocol_log(
             .get(4..)
             .filter(|payload| payload.len() == payload_len)
             .context("protocol log frame length mismatch")?;
-        match direction {
+        let message = match direction {
             ProtocolLogDirection::ClientToServer => {
-                let message: Open =
+                let open: Open =
                     senax_encoder::unpack(&mut payload).context("unpack client frame")?;
-                writeln!(
-                    output,
-                    "{unix_ms} {} {}B {message:#?}",
-                    direction.label(),
-                    frame.len()
-                )?;
-                opened = Some(message);
+                let message = describe(&open, None);
+                opened = Some(open);
+                message
             }
             // What the host answers is the opened part's own; only a
-            // request's reply is read here.
-            ProtocolLogDirection::ServerToClient => {
-                let message = match &opened {
-                    Some(Open::Agents(agents::Open::Request(_))) => {
-                        let reply: agents::Reply =
-                            senax_encoder::unpack(&mut payload).context("unpack agents reply")?;
-                        format!("{reply:#?}")
-                    }
-                    Some(Open::Host(host::Open::Request(_))) => {
-                        let reply: host::Reply =
-                            senax_encoder::unpack(&mut payload).context("unpack host reply")?;
-                        format!("{reply:#?}")
-                    }
-                    _ => "(stream frame)".to_owned(),
-                };
-                writeln!(
-                    output,
-                    "{unix_ms} {} {}B {message}",
-                    direction.label(),
-                    frame.len()
-                )?;
-            }
-        }
+            // request's reply is read.
+            ProtocolLogDirection::ServerToClient => match &opened {
+                Some(open) => describe(open, Some(payload)),
+                None => "(stream frame)".to_owned(),
+            },
+        };
+        writeln!(
+            output,
+            "{unix_ms} {} {}B {message}",
+            direction.label(),
+            frame.len()
+        )?;
     }
 }
 
@@ -680,7 +703,7 @@ mod tests {
 
     #[test]
     fn protocol_log_records_full_length_prefixed_frame() {
-        let open = Open::Host(host::Open::Request(host::Request::Snapshot));
+        let open = Open::of(&host::Open::Request(host::Snapshot.into())).unwrap();
         let frame = protocol_frame_bytes(&open).unwrap();
         let mut log = Vec::new();
         append_protocol_log_record(&mut log, 123, ProtocolLogDirection::ClientToServer, &frame)
@@ -701,15 +724,14 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP17\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
     #[test]
     fn requests_and_replies_round_trip() {
-        let agent_id = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
         for request in [
-            host::Request::Pr {
+            host::Pr {
                 agent_id: Some("eng-abcd".into()),
                 command: PrCommand::Edit {
                     url: "https://github.com/acme/widgets/pull/1".into(),
@@ -717,130 +739,54 @@ mod tests {
                     title: Some("Better title".into()),
                     body: Some("Better summary".into()),
                 },
-            },
-            host::Request::GitTransportPolicy {
+            }
+            .into(),
+            host::GitTransportPolicy {
                 host: "github.com".to_owned(),
-            },
-            host::Request::GuiTelemetryUpload {
+            }
+            .into(),
+            host::GuiTelemetryUpload {
                 snapshot: br#"{"version":1}"#.to_vec(),
-            },
+            }
+            .into(),
+            host::Snapshot.into(),
         ] {
-            round_trips(Open::Host(host::Open::Request(request)));
+            round_trips(host::Open::Request(request));
         }
-        for request in [
-            agents::Request::SetAuthAccountEnabled {
-                name: "work".to_owned(),
-                enabled: false,
-            },
-            agents::Request::AgentCostDistribution { since_ms: 42 },
-            agents::Request::RecordVisualization {
-                mime_type: "image/svg+xml".to_owned(),
-                content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-            },
-            agents::Request::ShellStart {
-                agent: "eng-test".to_owned(),
-            },
-            agents::Request::Command(AgentCommand::Send {
-                agent_id,
-                content: vec![
-                    ContentPart::Text {
-                        text: "inspect".to_owned(),
-                    },
-                    ContentPart::Image {
-                        media_type: "image/gif".to_owned(),
-                        data: vec![1, 2, 3],
-                    },
-                ],
-                delivery: MessageDelivery::NextRequest,
-            }),
-        ] {
-            round_trips(Open::Agents(agents::Open::Request(request)));
+        round_trips(Answer::Done("stored".to_owned()));
+        round_trips(Answer::Done(()));
+        round_trips(Answer::Done(true));
+        round_trips(Answer::<String>::Failed {
+            reason: "no such repository".to_owned(),
+        });
+    }
+
+    /// A reply reads as its call's own type in a protocol log.
+    #[test]
+    fn protocol_log_prints_answers_by_their_call() {
+        let request: host::Request = host::GitTransportPolicy {
+            host: "github.com".to_owned(),
         }
-        for reply in [
-            agents::Reply::GlobalUsage {
-                series: vec![AgentUsageSeries {
-                    model: "fable".to_owned(),
-                    buckets: vec![AgentUsageBucket {
-                        bucket_start_ms: 300_000,
-                        input_tokens: 10,
-                        ..AgentUsageBucket::default()
-                    }],
-                }],
-            },
-            agents::Reply::AgentCostDistribution {
-                series: vec![AgentCostSeries {
-                    agent_id,
-                    model: "gpt".to_owned(),
-                    buckets: vec![AgentUsageBucket {
-                        bucket_start_ms: 3_600_000,
-                        output_tokens: 10,
-                        requests: 1,
-                        ..AgentUsageBucket::default()
-                    }],
-                }],
-            },
-            agents::Reply::Visualization {
-                id: "0123456789abcdef0123456789abcdef".to_owned(),
-                mime_type: "image/svg+xml".to_owned(),
-                content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-            },
-            agents::Reply::AgentCreated { agent_id },
-            agents::Reply::Failed {
-                reason: "no such repository".to_owned(),
-            },
-        ] {
-            round_trips(reply);
-        }
-        for reply in [
-            host::Reply::GitTransportPolicy {
-                pat_available: true,
-            },
-            host::Reply::GuiTelemetryStored {
-                path: "/state/rho/gui-telemetry/snapshot.json".to_owned(),
-            },
-            host::Reply::Failed {
-                reason: "no such pull request".to_owned(),
-            },
-        ] {
-            round_trips(reply);
-        }
+        .into();
+        let answer = senax_encoder::pack(&Answer::Done(true)).unwrap();
+        assert!(request.debug_answer(&answer).starts_with("Done("));
     }
 
     #[test]
-    fn control_frames_round_trip() {
-        round_trips(control::ServerFrame::AuthState {
-            auth: AuthState {
-                namespaces: vec!["default".to_owned(), "work".to_owned()],
-                disabled_namespaces: vec!["work".to_owned()],
-                active_namespace: Some("default".to_owned()),
-            },
-        });
-        round_trips(control::ServerFrame::GitTransportDone { request_id: 9 });
-        round_trips(control::ClientFrame::ProvideGitTransport);
+    fn git_provider_frames_round_trip() {
+        round_trips(host::GitProviderFrame::Done { request_id: 9 });
     }
 
-    #[test]
-    fn shell_frames_round_trip() {
-        round_trips(shell::ShellServerFrame::ExecutionOutput {
-            execution: 3,
-            start: 0,
-            end: 0,
-            text: "λ".to_owned(),
-            styles: vec![shell::ShellStyleSpan {
-                start: 0,
-                end: 2,
-                style: shell::ShellTextStyle {
-                    foreground: Some(shell::ShellColor::Indexed(1)),
-                    bold: true,
-                    ..Default::default()
-                },
-            }],
-        });
-
-        assert!(shell::command_fits(&"x".repeat(shell::MAX_COMMAND_BYTES)));
-        assert!(!shell::command_fits(
-            &"x".repeat(shell::MAX_COMMAND_BYTES + 1)
-        ));
+    /// A part's opening survives the envelope, and reads as no other part.
+    fn opens_as<T: PartOpen + PartialEq>(open: T) {
+        let envelope = Open::of(&open).unwrap();
+        round_trips(envelope.clone());
+        assert_eq!(envelope.unpack::<T>().unwrap(), open);
+        let other = match T::PART {
+            Part::Desk => envelope.unpack::<host::Open>().err(),
+            _ => envelope.unpack::<desk::Open>().err(),
+        };
+        assert!(other.is_some());
     }
 
     #[test]
@@ -853,26 +799,15 @@ mod tests {
             service: GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
-        for open in [
-            Open::Host(host::Open::Control),
-            Open::Agents(agents::Open::Session),
-            Open::Desk,
-            Open::Host(host::Open::GitTransport { request }),
-            Open::Host(host::Open::GitProvide {
-                request_id: 9,
-                provider_id: 4,
-                claim: true,
-            }),
-            Open::Agents(agents::Open::Terminal {
-                agent: "eng-test".to_owned(),
-                terminal_id: 3,
-                open: term::TerminalOpen::Create { attach: true },
-                cols: 80,
-                rows: 24,
-            }),
-        ] {
-            round_trips(open);
-        }
+        opens_as(host::Open::Desktops);
+        opens_as(host::Open::GitProvider);
+        opens_as(host::Open::GitTransport { request });
+        opens_as(host::Open::GitProvide {
+            request_id: 9,
+            provider_id: 4,
+            claim: true,
+        });
+        opens_as(desk::Open);
         round_trips(Opened::Refused {
             reason: "not running".to_owned(),
         });

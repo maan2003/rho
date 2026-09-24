@@ -18,7 +18,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, HighlightStyle, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
@@ -530,9 +530,7 @@ mod tests {
         assert_eq!(rows.next[0].label, "needs reply · 1.9h");
 
         let agent = DealCard {
-            agent_id: Some(
-                AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).unwrap(),
-            ),
+            agent_id: Some(AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap()),
             kind: DealCardKind::Agent,
             breadcrumb: "slack polish".to_owned(),
             ..card("", 1.0)

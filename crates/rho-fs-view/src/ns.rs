@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
+use rho_agent_types::WorksetMode;
 
 use crate::layout::MOUNT_ROOT;
-use crate::{PathOverrides, UserEnvironment, Workset, WorksetMode};
+use crate::{PathOverrides, UserEnvironment, Workset};
 
 /// How an agent sees its workset.
 #[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]

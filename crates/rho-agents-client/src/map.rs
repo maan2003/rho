@@ -38,14 +38,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
-use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::transcript::AgentWant;
-#[cfg(test)]
-use rho_agent_host_proto::transcript::LogEntry;
+use rho_agent_types::{AgentId, AgentWant};
 use rho_hosts::HostId;
 
 use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
 use crate::now_ms;
+#[cfg(test)]
+use crate::protocol::transcript::LogEntry;
 
 const LABEL_HEADROOM: u64 = 200;
 
@@ -82,9 +81,9 @@ pub struct AgentFiling {
 pub struct AgentFacts {
     pub turn_running: bool,
     /// When the running turn began, when the client saw it start.
-    pub turn_started_at: Option<rho_agent_host_proto::UnixMs>,
-    pub last_turn_ended: Option<rho_agent_host_proto::UnixMs>,
-    pub last_user_message_at: rho_agent_host_proto::UnixMs,
+    pub turn_started_at: Option<rho_agent_types::UnixMs>,
+    pub last_turn_ended: Option<rho_agent_types::UnixMs>,
+    pub last_user_message_at: rho_agent_types::UnixMs,
     /// The last turn said it wants something only the user can give.
     pub needs_you_hint: bool,
     /// The last turn died. Nobody but the user can restart it, so this
@@ -118,7 +117,7 @@ pub struct AgentMap {
     /// as what to add, and the fold holds only what the agent is now, so
     /// this holds what it was indexed as. Nothing else reads it.
     indexed_as: BTreeMap<AgentId, (Option<AgentId>, &'static str)>,
-    last_active: BTreeMap<AgentId, rho_agent_host_proto::UnixMs>,
+    last_active: BTreeMap<AgentId, rho_agent_types::UnixMs>,
     hosts: BTreeMap<HostId, HostSnapshot>,
 
     // The indexes. Every one of them is kept as the agents that changed
@@ -210,7 +209,9 @@ impl AgentMap {
         self.mark_known(agent_id);
     }
 
-    /// What `Ready` says of a host. The agents come by the log, not here.
+    /// What a host's agents stream says of it when it opens, and again of
+    /// the counter with each agent created. The agents come by the log,
+    /// not here.
     pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
@@ -420,7 +421,7 @@ impl AgentMap {
         let active = self
             .last_active
             .entry(agent_id)
-            .or_insert(rho_agent_host_proto::UnixMs(0));
+            .or_insert(rho_agent_types::UnixMs(0));
         *active = (*active).max(last_active);
 
         let was = self.indexed_as.get(&agent_id).copied();
@@ -555,7 +556,7 @@ impl AgentMap {
     }
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
-            .insert(agent_id, rho_agent_host_proto::UnixMs(now_ms()));
+            .insert(agent_id, rho_agent_types::UnixMs(now_ms()));
     }
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
         // Hidden agents are excluded from the result but still walked,
@@ -640,23 +641,20 @@ impl AgentMap {
             .and_then(|place| place.origin.clone())
     }
     /// Where the agent works.
-    pub fn agent_place(&self, agent_id: AgentId) -> Option<&rho_agent_host_proto::Place> {
+    pub fn agent_place(&self, agent_id: AgentId) -> Option<&rho_agent_types::Place> {
         self.agent_identity(agent_id)
             .map(|identity| &identity.place)
     }
     /// The agent's place as a request names it (opening its files, its
     /// diff, joining it).
-    pub fn agent_workspace(
-        &self,
-        agent_id: AgentId,
-    ) -> Option<rho_agent_host_proto::WorkspaceInfo> {
+    pub fn agent_workspace(&self, agent_id: AgentId) -> Option<rho_agent_types::WorkspaceInfo> {
         self.agent_place(agent_id).map(|place| place.clone().into())
     }
     pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
         self.agent_place(agent_id)
             .map(|place| format!("ws-{}", place.workset))
     }
-    pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_agent_host_proto::AgentRole> {
+    pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_agent_types::AgentRole> {
         self.agent_identity(agent_id).map(|identity| identity.role)
     }
     pub fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId> {
@@ -699,7 +697,7 @@ impl AgentMap {
             })
             .filter(|reason| !reason.trim().is_empty())
     }
-    pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_agent_host_proto::UnixMs> {
+    pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_agent_types::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }
     /// The chronology, folded from the story rather than sent.
@@ -844,12 +842,10 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{
-        AgentPos, RuntimeKind, Seq, SpawnedBy, TranscriptEvent, TurnEdge, TurnOutcome,
-    };
-    use rho_agent_host_proto::{AgentIdDomain, UnixMs};
+    use rho_agent_types::{AgentIdDomain, AgentPos, Seq, TurnEdge, TurnOutcome, UnixMs};
 
     use super::*;
+    use crate::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
 
     fn created(at: u64) -> TranscriptEvent {
         child_of(None, at)
@@ -857,9 +853,9 @@ mod tests {
 
     fn child_of(parent: Option<AgentId>, at: u64) -> TranscriptEvent {
         TranscriptEvent::Created {
-            role: rho_agent_host_proto::AgentRole::default(),
+            role: rho_agent_types::AgentRole::default(),
             runtime: RuntimeKind::Rho,
-            place: rho_agent_host_proto::Place {
+            place: rho_agent_types::Place {
                 workset: "0123456789ab".into(),
                 cwd: "/src/repo".into(),
                 mode: Default::default(),
@@ -1015,7 +1011,7 @@ mod tests {
                         TranscriptEvent::Message {
                             from: None,
                             text: "do the thing\nand then some".to_owned(),
-                            delivery: rho_agent_host_proto::MessageDelivery::Immediate,
+                            delivery: rho_agent_types::MessageDelivery::Immediate,
                             at: UnixMs(10),
                         },
                         TranscriptEvent::Turn {

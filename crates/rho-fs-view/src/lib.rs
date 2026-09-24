@@ -82,7 +82,6 @@ pub fn devshell_builder() -> PathBuf {
         .find(|path| path.is_file())
         .unwrap_or_else(|| NAME.into())
 }
-pub use rho_agent_host_proto::{Place, WorksetMode, WorkspaceInfo};
 pub use rho_git_server::Refresh as StoreRefresh;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]

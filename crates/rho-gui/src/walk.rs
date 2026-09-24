@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use editor::Editor;
 use gpui::{App, Entity, TestAppContext, TestDispatcher, WindowHandle, point, px, size};
-use rho_agent_host_proto::{AgentId, AgentIdDomain, UnixMs};
+use rho_agent_types::{AgentId, AgentIdDomain, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
@@ -967,7 +967,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         id: "generated-tool".to_owned(),
         name: "shell_command".to_owned(),
         arguments: "generated arguments ".repeat(32),
-        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
         preview: None,
         status: UiToolStatus::Success,
         output: Some("generated result ".repeat(64)),

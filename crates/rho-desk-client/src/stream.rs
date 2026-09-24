@@ -1,7 +1,7 @@
 //! Each host's desk stream: the host's copy of the desk to the window, the
 //! window's syncs and writes back.
 //!
-//! The host opens it beside its control stream on every connection
+//! The host opens it on every connection
 //! ([`rho_hosts::HostStream`]); what is said on it and where its frames go
 //! are this crate's.
 
@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_host_proto::desk::stream::{ClientFrame, ServerFrame};
-use rho_agent_host_proto::{Open, read_frame, write_frame};
+use rho_agent_host_proto::{read_frame, write_frame, write_open};
 use rho_hosts::{Dialer, HostId, HostStream};
 
 /// What a host says on its desk stream.
@@ -127,9 +127,9 @@ impl HostStream for DeskStream {
         let events = self.events.clone();
         let commands = self.commands.clone();
         Box::pin(async move {
-            // Interactive streams outrank the control stream (priority 1).
+            // Interactive streams outrank calls and sessions (priority 1 and below).
             let mut socket = dialer.open(Some(50)).await?;
-            write_frame(&mut socket, &Open::Desk).await?;
+            write_open(&mut socket, &rho_agent_host_proto::desk::Open).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);
             let mut commands = commands.lock().await;
             // Written for the last stream; the handshake after `Opened`

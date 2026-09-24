@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rho_agent_host_proto::{ToolOutputStatus, UnixMs};
+use rho_agent_types::{ToolOutputStatus, UnixMs};
 use rho_claude::protocol::{
     AssistantContent, AssistantMessage, OutputContent, SystemCompactMetadata, TokenUsage,
     UserOutputMessage,

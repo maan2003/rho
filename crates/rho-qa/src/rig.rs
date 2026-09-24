@@ -19,12 +19,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, Reply, ServerFrame as AgentsServerFrame,
-};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::transcript::TranscriptEvent;
-use rho_agent_host_proto::{AgentCommand, AgentRole, ContentPart, JoinTarget, StartMode};
+use rho_agent_types::{AgentRole, ContentPart};
+use rho_agents_client::protocol::transcript::TranscriptEvent;
+use rho_agents_client::protocol::{
+    ClientFrame as AgentsClientFrame, JoinTarget, NewAgent, ServerFrame as AgentsServerFrame,
+    StartMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1152,12 +1153,12 @@ async fn probe_async(name: &str) -> Result<()> {
     client
         .send_agents(&AgentsClientFrame::Follow { since: head })
         .await?;
-    client.send(AgentCommand::New {
+    client.create(NewAgent {
         role: AgentRole::default(),
         start: StartMode::Join(JoinTarget::User {
             repo: workspace.try_into().context("rig workspace is not UTF-8")?,
         }),
-        mode: rho_agent_host_proto::WorksetMode::View,
+        mode: rho_agent_types::WorksetMode::View,
         content: Some(vec![ContentPart::Text {
             text: "Complete one deterministic rig probe turn.".to_owned(),
         }]),
@@ -1184,7 +1185,7 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                     let completed_reply = matches!(
                         &entry.event,
-                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agent_host_proto::transcript::Item::ToolCall { .. }))
+                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agents_client::protocol::transcript::Item::ToolCall { .. }))
                     );
                     if matches!(&entry.event, TranscriptEvent::Replied { .. }) {
                         replies += 1;
@@ -1212,7 +1213,7 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                 }
             }
-            Incoming::Reply(Reply::Failed { reason }) => {
+            Incoming::Refused(reason) => {
                 bail!("rig probe failed: {reason}")
             }
             _ => {}

@@ -9,14 +9,13 @@ use pyo3::PyClassInitializer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::{AgentId, AgentRole};
 use rho_inference::Inference;
 use rho_inference::types::{ImageDetail, ToolExecutionContext};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::{WebRequest, WebSearchTools};
 
 use crate::View;
-use crate::db::AgentRole;
 use crate::image_tool::{ImageTools, ViewImageArgs};
 use crate::multi_agent_tools::{AdvisorArgs, AgentCall, InterruptArgs, SendArgs, SpawnArgs, Team};
 use crate::papercut::PapercutArgs;
@@ -248,7 +247,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use rho_agent_host_proto::{AdvisorIntelligence, ToolOutputStatus};
+    use rho_agent_types::{AdvisorIntelligence, ToolOutputStatus};
     use rho_inference::types::ExecCall;
 
     use super::*;

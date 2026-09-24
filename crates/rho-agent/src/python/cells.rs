@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_inference::types::{ExecCall, ExecId, ToolOutput};
 use tokio::sync::Notify;
 

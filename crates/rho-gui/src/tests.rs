@@ -12,7 +12,7 @@ use gpui::{
 };
 use language::InlayId;
 use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
-use rho_agent_host_proto::{AgentId, UnixMs};
+use rho_agent_types::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
@@ -1289,7 +1289,7 @@ fn modal_overlays_preserve_surface_mode(cx: &mut TestAppContext) {
 }
 
 fn agent(id: u64) -> AgentId {
-    AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).unwrap()
+    AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).unwrap()
 }
 
 /// The transcript the workspace holds for this agent, to edit and feed back.
@@ -2141,7 +2141,7 @@ fn tool(
         id: id.to_owned(),
         name: "shell_command".to_owned(),
         arguments: "echo ok".to_owned(),
-        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
         preview: None,
         status,
         output: None,
@@ -2550,7 +2550,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     id: format!("t1.{}", blocks_count - 1),
                     name: "shell_command".to_owned(),
                     arguments: format!("echo {tick}"),
-                    format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                    format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                     preview: None,
                     status: UiToolStatus::Running,
                     output: None,
@@ -3376,7 +3376,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 id: "tool-1".to_owned(),
                 name: "shell_command".to_owned(),
                 arguments: "echo".to_owned(),
-                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -3458,7 +3458,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),
-                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -4156,7 +4156,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
     feed_edit(&workspace, cx, agent(1), |state| {
         state.usage = rho_agents_client::state::UiAgentUsage {
             provider: "fable".to_owned(),
-            total: rho_agent_host_proto::AgentUsageBucket {
+            total: rho_agents_client::protocol::AgentUsageBucket {
                 input_tokens: 1_000_000,
                 cache_read_tokens: 1_000_000,
                 cache_write_tokens: 1_000_000,
@@ -4180,7 +4180,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::Place;
+    use rho_agent_types::Place;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
@@ -4218,7 +4218,7 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             context_used: Some(62_300),
             usage: rho_agents_client::state::UiAgentUsage {
                 provider: "fable".to_owned(),
-                total: rho_agent_host_proto::AgentUsageBucket {
+                total: rho_agents_client::protocol::AgentUsageBucket {
                     input_tokens: 1_000_000,
                     ..Default::default()
                 },
@@ -6077,13 +6077,13 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: r#"{"command":"echo **bold** and _under_"}"#.to_owned(),
-        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
+        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
         preview: None,
         status: UiToolStatus::Success,
         output: None,
         error: None,
-        started_at: Some(rho_agent_host_proto::UnixMs(10)),
-        finished_at: Some(rho_agent_host_proto::UnixMs(20)),
+        started_at: Some(rho_agent_types::UnixMs(10)),
+        finished_at: Some(rho_agent_types::UnixMs(20)),
         metadata: None,
     });
     feed_frame(
@@ -6622,7 +6622,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
 #[gpui::test]
 fn unnamed_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
-    let summary = rho_agent_host_proto::QuotaSummary {
+    let summary = rho_agents_client::protocol::QuotaSummary {
         model: "gpt".to_owned(),
         auth_namespace: None,
         remaining_percent: 40,
@@ -7768,9 +7768,9 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
     story::UiAgentHead {
         agent_id,
         story_pos: story::UiStoryPos(0),
-        role: rho_agent_host_proto::AgentRole::default(),
+        role: rho_agent_types::AgentRole::default(),
         runtime_kind: story::UiRuntimeKind::Rho,
-        place: rho_agent_host_proto::Place {
+        place: rho_agent_types::Place {
             workset: "0123456789ab".into(),
             cwd: "/src/tmp".into(),
             mode: Default::default(),
@@ -9256,7 +9256,11 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
                 Some((HostId::default(), context.clone())),
                 "Enter alone is create-from-here: the thing in view, not a place picked for it"
             );
-            workspace.clear_sent_for_test(HostId::default());
+        })
+        .unwrap();
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
         })
         .unwrap();
 
@@ -9271,18 +9275,15 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
 
+    let calls = story::calls(&mut host);
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| matches!(call, rho_agents_client::protocol::Request::New(_))),
+        "the draft started an agent"
+    );
     workspace
         .update(cx, |workspace, _, _| {
-            let sent = workspace.take_host_messages_for_test(HostId::default());
-            assert!(
-                sent.iter().any(|message| matches!(
-                    message,
-                    rho_agent_host_proto::agents::Request::Command(
-                        rho_agent_host_proto::AgentCommand::New { .. }
-                    )
-                )),
-                "the draft started an agent"
-            );
             // The daemon is never told where to file it: the client writes
             // that fact itself once the agent exists.
             assert_eq!(
@@ -10849,17 +10850,27 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
                 .update(cx, |draft, cx| draft.set_workdir_text("/tmp/repo", cx));
         })
         .expect("write the draft");
+    let mut host = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.host_in_process_for_test(HostId::default())
+        })
+        .unwrap();
 
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            workspace.answer_host_request_for_test(
-                HostId::default(),
-                Err(anyhow::anyhow!("create workspace: no such repository")),
-            );
-        })
-        .expect("the daemon refuses");
+    let mut calls = story::calls(&mut host);
+    assert_eq!(calls.len(), 1, "the draft makes one call");
+    let (call, mut stream) = calls.pop().unwrap();
+    assert!(
+        matches!(call, rho_agents_client::protocol::Request::New(_)),
+        "the draft asked for a new agent: {call:?}"
+    );
+    story::answer(
+        &mut stream,
+        rho_agent_host_proto::Answer::<AgentId>::Failed {
+            reason: "create workspace: no such repository".to_owned(),
+        },
+    );
     cx.run_until_parked();
 
     let refusal = workspace
@@ -12174,26 +12185,18 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
                 name: name.into(),
             })
             .collect();
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DesktopSessions(sessions),
-                window,
-                cx,
-            );
+            workspace.desktops_arrived(HostId::default(), sessions, cx);
             assert_eq!(
                 workspace.available_desktops(agent(1)),
                 ["browser", "preview"]
             );
             assert_eq!(workspace.available_desktops(agent(2)), ["other"]);
-            story::feed(
-                workspace,
+            workspace.desktops_arrived(
                 HostId::default(),
-                ConnEvent::DesktopSessions(vec![rho_agent_host_proto::DesktopSession {
+                vec![rho_agent_host_proto::DesktopSession {
                     agent: agent(1).encoded(),
                     name: "preview".into(),
-                }]),
-                window,
+                }],
                 cx,
             );
             assert_eq!(workspace.available_desktops(agent(1)), ["preview"]);

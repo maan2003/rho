@@ -9,18 +9,21 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
+use rho_agent_types::{
+    AgentId, AgentRole, EngineerIntelligence, MessageDelivery, Place, WorksetMode,
+};
 use rho_db::RhoDb;
 use rho_fs_view::{Mode, Workset, Worksets};
 use rho_inference::Inference;
 use tokio::sync::{Mutex, broadcast};
 
 use crate::db::{
-    AGENT_USAGE_BUCKET_MS, AgentId, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentRole,
+    AGENT_USAGE_BUCKET_MS, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _,
     AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
-    EngineerIntelligence, SessionBinding,
+    SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{MessageDelivery, Place, StartPlace, View, WorksetMode};
+use crate::{StartPlace, View};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -327,7 +330,7 @@ impl AgentPool {
     }
 
     pub async fn record_agent_usage(&self, agent_id: AgentId, mut usage: AgentUsageBucket) {
-        let now = rho_agent_host_proto::UnixMs::now().0;
+        let now = rho_agent_types::UnixMs::now().0;
         usage.bucket_start_ms = now / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
         let mut pending = self.usage.lock().await;
         pending
@@ -572,7 +575,7 @@ impl AgentPool {
                 .clone();
             let loading = lock.lock_owned().await;
             write.create_agent(
-                rho_agent_host_proto::UnixMs::now(),
+                rho_agent_types::UnixMs::now(),
                 agent_id,
                 display_name,
                 place,
@@ -710,10 +713,10 @@ impl AgentPool {
     pub fn resolve_agent_id(
         &self,
         text: &str,
-    ) -> anyhow::Result<prefix_id::PrefixResolution<crate::db::AgentIdDomain>> {
+    ) -> anyhow::Result<prefix_id::PrefixResolution<rho_agent_types::AgentIdDomain>> {
         let text = text.trim();
         let read = self.db.read();
-        let domain = crate::db::AgentIdDomain(read.machine_seed());
+        let domain = rho_agent_types::AgentIdDomain(read.machine_seed());
         Ok(AgentId::from_prefix(
             text,
             read.last_agent_counter() + 1,
@@ -922,8 +925,9 @@ pub use crate::worker::Remote as RunningAgent;
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::EngineerIntelligence;
+
     use super::*;
-    use crate::db::EngineerIntelligence;
 
     #[test]
     fn mini_engineers_spawn_mini_engineers() {
@@ -939,11 +943,11 @@ mod tests {
             child_role(
                 mini,
                 AgentRole::Advisor {
-                    intelligence: crate::db::AdvisorIntelligence::Medium,
+                    intelligence: rho_agent_types::AdvisorIntelligence::Medium,
                 }
             ),
             AgentRole::Advisor {
-                intelligence: crate::db::AdvisorIntelligence::Medium,
+                intelligence: rho_agent_types::AdvisorIntelligence::Medium,
             }
         );
     }
@@ -1123,7 +1127,7 @@ mod tests {
             for role in [
                 AgentRole::default(),
                 AgentRole::Advisor {
-                    intelligence: crate::db::AdvisorIntelligence::Medium,
+                    intelligence: rho_agent_types::AdvisorIntelligence::Medium,
                 },
             ] {
                 let native = crate::prompt::prompt(&child_view, Some(&team), role);
@@ -1422,7 +1426,7 @@ mod tests {
         rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(10),
-            pool.change_mode(first_id, rho_fs_view::WorksetMode::Exposed),
+            pool.change_mode(first_id, rho_agent_types::WorksetMode::Exposed),
         )
         .await
         .unwrap()

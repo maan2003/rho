@@ -12,13 +12,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
-use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, Reply, ServerFrame as AgentsServerFrame,
-};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
-use rho_agent_host_proto::{
-    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, StartMode,
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, MessageDelivery, Seq, TurnEdge};
+use rho_agents_client::protocol::transcript::{DetailBody, TranscriptEvent};
+use rho_agents_client::protocol::{
+    AgentCommand, ClientFrame as AgentsClientFrame, NewAgent, ServerFrame as AgentsServerFrame,
+    StartMode,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;
@@ -205,13 +204,13 @@ async fn run_async(args: Args) -> Result<()> {
     };
     let submitted = Instant::now();
     for index in 0..agent_count {
-        client.send(AgentCommand::New {
+        client.create(NewAgent {
             role: AgentRole::default(),
             start: StartMode::NewOn {
                 repo: repo.clone(),
                 revset: "HEAD".into(),
             },
-            mode: rho_agent_host_proto::WorksetMode::View,
+            mode: rho_agent_types::WorksetMode::View,
             content: Some(prompt(index, 0)),
         });
     }
@@ -284,7 +283,7 @@ async fn run_async(args: Args) -> Result<()> {
                 )
             })??;
         match message {
-            Incoming::Reply(Reply::AgentCreated { agent_id }) => {
+            Incoming::Created(agent_id) => {
                 agents.insert(agent_id);
                 ensure!(
                     agents.len() <= agent_count,
@@ -312,7 +311,8 @@ async fn run_async(args: Args) -> Result<()> {
                     match entry.event {
                         TranscriptEvent::Created { runtime, .. } => {
                             ensure!(
-                                runtime == rho_agent_host_proto::transcript::RuntimeKind::Rho,
+                                runtime
+                                    == rho_agents_client::protocol::transcript::RuntimeKind::Rho,
                                 "created a non-native agent"
                             );
                             agents.insert(entry.agent_id);
@@ -327,7 +327,7 @@ async fn run_async(args: Args) -> Result<()> {
                                 if args.scenario == Scenario::RealToolRounds {
                                     ensure!(
                                         result.status
-                                            == rho_agent_host_proto::transcript::ToolStatus::Success,
+                                            == rho_agents_client::protocol::transcript::ToolStatus::Success,
                                         "real-tool-rounds tool failed"
                                     );
                                 }
@@ -363,7 +363,7 @@ async fn run_async(args: Args) -> Result<()> {
                                 .filter(|item| {
                                     matches!(
                                         item,
-                                        rho_agent_host_proto::transcript::Item::ToolCall { .. }
+                                        rho_agents_client::protocol::transcript::Item::ToolCall { .. }
                                     )
                                 })
                                 .count();
@@ -373,7 +373,7 @@ async fn run_async(args: Args) -> Result<()> {
                                     .iter()
                                     .rev()
                                     .find_map(|item| match item {
-                                        rho_agent_host_proto::transcript::Item::Text {
+                                        rho_agents_client::protocol::transcript::Item::Text {
                                             text,
                                             ..
                                         } => Some(text),
@@ -441,7 +441,7 @@ async fn run_async(args: Args) -> Result<()> {
                     _ => bail!("daemon Detail body did not match its journal event"),
                 }
             }
-            Incoming::Reply(Reply::Failed { reason }) => {
+            Incoming::Refused(reason) => {
                 bail!("daemon refused proof action: {reason}")
             }
             _ => {}

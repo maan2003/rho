@@ -25,7 +25,10 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_host_proto::{AgentId, ContentPart, MessageDelivery, ToolOutputStatus, UnixMs};
+use rho_agent_types::{
+    AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, ToolOutputStatus,
+    TurnEdge, TurnOutcome, UnixMs,
+};
 #[cfg(test)]
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
@@ -40,8 +43,8 @@ use crate::boundary::{
     Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
 };
 use crate::db::{
-    AgentHead, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket,
-    AgentUsageModel, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMillis,
+    AgentHead, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentUsageModel,
+    UnixMillis,
 };
 #[cfg(test)]
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
@@ -731,7 +734,7 @@ impl Agent {
                         for id in handed_off {
                             self.persist(AgentEvent::ExecObserved {
                                 id,
-                                milestone: rho_agent_host_proto::ExecMilestone::HandedOff,
+                                milestone: rho_agent_types::ExecMilestone::HandedOff,
                                 at: now,
                             })
                             .await?;
@@ -741,7 +744,7 @@ impl Agent {
                     InferenceEvent::ExecArgumentsFinished { id } => {
                         self.persist(AgentEvent::ExecObserved {
                             id,
-                            milestone: rho_agent_host_proto::ExecMilestone::ArgumentsFinished,
+                            milestone: rho_agent_types::ExecMilestone::ArgumentsFinished,
                             at: now,
                         })
                         .await?;
@@ -812,7 +815,7 @@ impl Agent {
                         if let Some(id) = exec {
                             self.persist(AgentEvent::ExecObserved {
                                 id,
-                                milestone: rho_agent_host_proto::ExecMilestone::ResponseFinished,
+                                milestone: rho_agent_types::ExecMilestone::ResponseFinished,
                                 at: now,
                             })
                             .await?;
@@ -1396,7 +1399,7 @@ impl Agent {
         for id in &handoff {
             self.persist(AgentEvent::ExecObserved {
                 id: id.clone(),
-                milestone: rho_agent_host_proto::ExecMilestone::Boundary,
+                milestone: rho_agent_types::ExecMilestone::Boundary,
                 at: now,
             })
             .await?;

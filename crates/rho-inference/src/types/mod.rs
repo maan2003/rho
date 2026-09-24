@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rho_agent_host_proto::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
+use rho_agent_types::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -557,15 +557,6 @@ pub fn text_content(parts: &[ContentPart]) -> String {
         }
     }
     output
-}
-
-impl From<ToolType> for rho_agent_host_proto::transcript::ArgumentsFormat {
-    fn from(tool_type: ToolType) -> Self {
-        match tool_type {
-            ToolType::Function => Self::Json,
-            ToolType::Custom => Self::Text,
-        }
-    }
 }
 
 #[cfg(test)]

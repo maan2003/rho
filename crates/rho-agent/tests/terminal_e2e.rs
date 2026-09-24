@@ -7,8 +7,8 @@ use std::sync::Arc;
 mod common;
 
 use rho_agent::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
-use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::term::{ScrollbackItem, TermRow, TermServerFrame, WireScreen};
+use rho_agent_types::AgentId;
+use rho_terminal::protocol::{ScrollbackItem, TermRow, TermServerFrame, WireScreen};
 
 fn main() {
     let unshare = std::process::Command::new("unshare")
@@ -25,7 +25,7 @@ fn main() {
 async fn terminal_end_to_end_over_registry(view: Arc<rho_fs_view::Namespace>) {
     let registry = Arc::new(TerminalRegistry::default());
     let agent_id =
-        AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter 1 encodes");
+        AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(42)).expect("counter 1 encodes");
     let mut client = registry
         .create(
             agent_id,

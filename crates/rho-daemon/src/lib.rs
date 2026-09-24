@@ -3,27 +3,28 @@ use std::ffi::OsString;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentRole};
+use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_agent_host_proto::control::ServerFrame as ControlFrame;
+use rho_agent_host_proto::host::GitProviderFrame;
 use rho_agent_host_proto::server::{Server, ServerConnection};
-use rho_agent_host_proto::{
-    AuthState, ContentPart, JoinTarget, Open, Opened, Place, StartMode, WorksetMode, WorkspaceInfo,
-    read_frame, write_frame,
-};
+use rho_agent_host_proto::{Open, Opened, Part, read_frame, write_frame};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
+use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
 pub mod debug;
 mod host;
+mod live;
 mod realtime;
 mod secret_store;
+mod transcript;
 mod usage;
 pub mod workspace_channel;
 
@@ -593,12 +594,8 @@ async fn run_iroh_listener(
             let media = rho_rpc::media::Mux::new(connection.clone());
             let uni = media.clone();
             let uni_task = tokio::spawn(async move { uni.receive_uni().await });
-            // One control stream per iroh connection; every other stream
-            // is opened for one thing of its own.
-            let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let services = services.clone();
-                let control_claimed = control_claimed.clone();
                 let media = media.clone();
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
@@ -614,11 +611,14 @@ async fn run_iroh_listener(
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
-                        if let Open::Host(rho_agent_host_proto::host::Open::Wayland {
+                        let host_open = (open.part == Part::Host)
+                            .then(|| open.unpack::<rho_agent_host_proto::host::Open>())
+                            .transpose()?;
+                        if let Some(rho_agent_host_proto::host::Open::Wayland {
                             media_id,
                             agent,
                             session,
-                        }) = open
+                        }) = host_open
                         {
                             let transport = media.session(media_id)?;
                             send.set_priority(100)?;
@@ -629,39 +629,17 @@ async fn run_iroh_listener(
                             )
                             .await;
                         }
-                        let control =
-                            matches!(open, Open::Host(rho_agent_host_proto::host::Open::Control));
-                        if control {
-                            anyhow::ensure!(
-                                control_claimed
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::AcqRel,
-                                        Ordering::Relaxed
-                                    )
-                                    .is_ok(),
-                                "iroh connection already has a control stream"
-                            );
-                            send.set_priority(1)
-                                .context("set iroh control stream priority")?;
-                        }
-                        if matches!(
-                            open,
-                            Open::Agents(
-                                rho_agent_host_proto::agents::Open::Terminal { .. }
-                                    | rho_agent_host_proto::agents::Open::Shell { .. }
-                            ) | Open::Host(rho_agent_host_proto::host::Open::Realtime { .. })
-                        ) {
+                        if matches!(open.part, Part::Terminal | Part::Shell)
+                            || matches!(
+                                host_open,
+                                Some(rho_agent_host_proto::host::Open::Realtime { .. })
+                            )
+                        {
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
                         let writer = rho_rpc::Writer::new(send);
-                        let result = serve_stream(services, iroh_auth, open, recv, writer).await;
-                        if control {
-                            control_claimed.store(false, Ordering::Release);
-                        }
-                        result
+                        serve_stream(services, iroh_auth, open, recv, writer).await
                     }
                     .await;
                     if let Err(error) = result {
@@ -681,13 +659,13 @@ type BoxGitStream = Box<dyn GitStream>;
 
 #[derive(Default)]
 struct GitTransportState {
-    providers: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
+    providers: HashMap<u64, mpsc::UnboundedSender<GitProviderFrame>>,
     pending: HashMap<u64, PendingGitTransport>,
 }
 
 struct PendingGitTransport {
     response: oneshot::Sender<Result<BoxGitStream, String>>,
-    recipients: HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
+    recipients: HashMap<u64, mpsc::UnboundedSender<GitProviderFrame>>,
     remaining: HashSet<u64>,
 }
 
@@ -704,7 +682,7 @@ enum GitProviderClaim {
 }
 
 impl GitTransportBroker {
-    async fn register(&self, provider: mpsc::UnboundedSender<ControlFrame>) {
+    async fn register(&self, provider: mpsc::UnboundedSender<GitProviderFrame>) {
         let provider_id = self.next_provider_id.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().await;
         state.providers.retain(|_, provider| !provider.is_closed());
@@ -750,7 +728,7 @@ impl GitTransportBroker {
             let mut disconnected = Vec::new();
             for (&provider_id, provider) in &recipients {
                 if provider
-                    .send(ControlFrame::GitTransportRequested {
+                    .send(GitProviderFrame::Requested {
                         request_id,
                         provider_id,
                         request: request.clone(),
@@ -826,12 +804,12 @@ impl GitTransportBroker {
 
     fn notify_done(
         request_id: u64,
-        recipients: &HashMap<u64, mpsc::UnboundedSender<ControlFrame>>,
+        recipients: &HashMap<u64, mpsc::UnboundedSender<GitProviderFrame>>,
         except: Option<u64>,
     ) {
         for (&provider_id, provider) in recipients {
             if Some(provider_id) != except {
-                let _ = provider.send(ControlFrame::GitTransportDone { request_id });
+                let _ = provider.send(GitProviderFrame::Done { request_id });
             }
         }
     }
@@ -855,10 +833,6 @@ struct Services {
     pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
     /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
-    /// Daemon-wide fanout for messages every client must hear regardless of
-    /// which connection caused them (attention changes); each connection
-    /// forwards this onto its own outgoing channel.
-    events: broadcast::Sender<ControlFrame>,
     /// Marked whenever a quota observation lands; every agents session
     /// tells its client the quota again.
     quota: tokio::sync::watch::Sender<()>,
@@ -897,7 +871,6 @@ impl Services {
             machine_seed,
             pr_monitor,
             platform_secrets,
-            events: broadcast::channel(1024).0,
             quota: tokio::sync::watch::channel(()).0,
             user_environment,
             git_transport: GitTransportBroker::default(),
@@ -917,15 +890,6 @@ impl Services {
 
     async fn set_auth_account_enabled(&self, name: &str, enabled: bool) {
         self.inference.set_account_enabled(name, enabled).await;
-    }
-
-    async fn ready_message(&self) -> ControlFrame {
-        let read = self.db.read();
-        ControlFrame::Ready {
-            auth: self.auth_state(),
-            machine_seed: self.machine_seed,
-            agent_counter: read.last_agent_counter(),
-        }
     }
 
     /// `mode` is the agent's own: how it sees the filesystem around the
@@ -1063,18 +1027,22 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match open {
-        Open::Agents(open) => agents::serve(services, open, reader, writer).await,
-        Open::Desk => services.desk.serve(reader, writer).await,
-        Open::Host(open) => host::serve(services, iroh_auth, open, reader, writer).await,
+    match open.part {
+        Part::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
+        Part::Desk => services.desk.serve(reader, writer).await,
+        Part::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,
+        Part::Terminal => agents::serve_terminals(services, open.unpack()?, reader, writer).await,
+        Part::Shell => agents::serve_shells(services, open.unpack()?, reader, writer).await,
+        Part::Workspace => {
+            let rho_files::protocol::Open { workspace } = open.unpack()?;
+            agents::serve_workspace_channel(services, reader, writer, workspace).await
+        }
     }
 }
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Durable presentation changes refresh the normal snapshot for every
-/// connection. Broadcast loss is harmless because `Ready` is reconstructed
-/// from the agent cache, including after daemon restart.
+/// An inference state change moves the quota every session shows.
 fn spawn_inference_projection(services: Arc<Services>) {
     let mut state = services.inference.subscribe();
     let services = Arc::downgrade(&services);
@@ -1084,9 +1052,6 @@ fn spawn_inference_projection(services: Arc<Services>) {
                 break;
             };
             let _ = state.borrow_and_update();
-            let _ = services.events.send(ControlFrame::AuthState {
-                auth: services.auth_state(),
-            });
             services.quota.send_replace(());
         }
     });
@@ -1246,8 +1211,8 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
-    use rho_agent_host_proto::ContentPart;
-    use rho_agent_host_proto::control::ServerFrame as ControlFrame;
+    use rho_agent_host_proto::host::GitProviderFrame;
+    use rho_agent_types::ContentPart;
 
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
@@ -1425,7 +1390,7 @@ mod tests {
             tokio::spawn(async move { broker.request(request).await })
         };
         let (request_id, first_provider) = match first_rx.recv().await.unwrap() {
-            ControlFrame::GitTransportRequested {
+            GitProviderFrame::Requested {
                 request_id,
                 provider_id,
                 ..
@@ -1433,7 +1398,7 @@ mod tests {
             message => panic!("unexpected provider message: {message:?}"),
         };
         let second_provider = match second_rx.recv().await.unwrap() {
-            ControlFrame::GitTransportRequested {
+            GitProviderFrame::Requested {
                 request_id: second_request,
                 provider_id,
                 ..
@@ -1463,7 +1428,7 @@ mod tests {
         waiting.await.unwrap().unwrap();
         assert!(matches!(
             first_rx.recv().await,
-            Some(ControlFrame::GitTransportDone {
+            Some(GitProviderFrame::Done {
                 request_id: done_request
             }) if done_request == request_id
         ));
@@ -1512,7 +1477,7 @@ mod tests {
             })
         };
         let request_id = match provider_rx.recv().await.unwrap() {
-            ControlFrame::GitTransportRequested { request_id, .. } => request_id,
+            GitProviderFrame::Requested { request_id, .. } => request_id,
             message => panic!("unexpected provider message: {message:?}"),
         };
         let error = match waiting.await.unwrap() {
@@ -1522,7 +1487,7 @@ mod tests {
         assert!(error.to_string().contains("within 60 seconds"));
         assert!(matches!(
             provider_rx.recv().await,
-            Some(ControlFrame::GitTransportDone {
+            Some(GitProviderFrame::Done {
                 request_id: done_request
             }) if done_request == request_id
         ));

@@ -1,19 +1,18 @@
 //! The machines this client can reach.
 //!
 //! One connection per attached daemon, the handshake that brings it up, and
-//! the streams it carries. The control stream's events go to one reader
-//! ([`HostSink`]); every other long-lived stream belongs to a client that
-//! hands the host a [`HostStream`] to run, the agents client's and the
-//! desk's among them. The crate holds no agent state, no desk state and no
-//! window state: what it knows is which machines exist, whether they are
-//! answering, and how to reach one of them.
+//! the streams it carries. The host's own stream, Git transport, reports
+//! to one reader ([`HostSink`]); every other long-lived stream belongs to
+//! a client that hands the host a [`HostStream`] to run, the agents
+//! client's, the desk's and the desktops' among them. The crate holds no agent
+//! state, no desk state and no window state: what it knows is which machines
+//! exist, whether they are answering, and how to reach one of them.
 
 pub mod connection;
 pub mod hosts;
-pub mod realtime_client;
 pub mod saved;
 
-pub use connection::{ChannelTask, ConnEvent, Connection, HostEvent, Link, spawn};
+pub use connection::{ConnEvent, Connection, HostEvent, Link, spawn};
 
 /// How a stream reaches its host: another Unix connection, or another
 /// bi-stream on the host's authenticated iroh connection.
@@ -135,9 +134,9 @@ impl HostSink for futures::channel::mpsc::UnboundedSender<HostEvent> {
     }
 }
 
-/// A stream a client keeps to one host beside the control stream. It opens
-/// once the host is ready and lasts the connection: when it ends, so does
-/// the connection, and on the next one every stream opens again.
+/// A stream a client keeps to one host. It opens once the host is ready and
+/// lasts the connection: when it ends, so does the connection, and on the next
+/// one every stream opens again.
 pub trait HostStream: Send + Sync + 'static {
     /// What the stream is called when it is why a connection went.
     fn name(&self) -> &'static str;
@@ -161,5 +160,3 @@ impl HostSink for DroppedSink {
         false
     }
 }
-
-pub mod wayland;

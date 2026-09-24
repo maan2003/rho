@@ -1,7 +1,23 @@
-//! Typed frames for a dedicated workspace file channel.
+//! What a client and a host say over a workspace file channel,
+//! [`rho_agent_host_proto::Part::Workspace`]: one agent's workspace files,
+//! on a channel of their own.
 
 use camino::Utf8PathBuf;
+use rho_agent_types::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+
+/// File access for one agent's workspace. Answered with
+/// [`rho_agent_host_proto::Opened`]; after `Ready` the stream carries
+/// [`WorkspaceClientFrame`] and [`WorkspaceServerFrame`], and closing it
+/// closes the channel and its filesystem watcher.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Open {
+    pub workspace: WorkspaceInfo,
+}
+
+impl rho_agent_host_proto::PartOpen for Open {
+    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Workspace;
+}
 
 /// Largest file accepted by the workspace editor protocol.
 pub const MAX_FILE_LEN: usize = 8 * 1024 * 1024;
@@ -116,9 +132,10 @@ mod tests {
 
         let (mut writer, mut reader) = tokio::io::duplex(16);
         writer.write_u32_le(1024).await.unwrap();
-        let error = crate::read_frame_limited::<_, WorkspaceClientFrame>(&mut reader, 32)
-            .await
-            .unwrap_err();
+        let error =
+            rho_agent_host_proto::read_frame_limited::<_, WorkspaceClientFrame>(&mut reader, 32)
+                .await
+                .unwrap_err();
         assert!(error.to_string().contains("exceeds 32"));
     }
 
@@ -129,11 +146,11 @@ mod tests {
             rescan: true,
         };
         let (mut writer, mut reader) = tokio::io::duplex(1024);
-        crate::write_frame_limited(&mut writer, &frame, MAX_WORKSPACE_FRAME_LEN)
+        rho_agent_host_proto::write_frame_limited(&mut writer, &frame, MAX_WORKSPACE_FRAME_LEN)
             .await
             .unwrap();
         let decoded: WorkspaceServerFrame =
-            crate::read_frame_limited(&mut reader, MAX_WORKSPACE_FRAME_LEN)
+            rho_agent_host_proto::read_frame_limited(&mut reader, MAX_WORKSPACE_FRAME_LEN)
                 .await
                 .unwrap();
         assert_eq!(decoded, frame);

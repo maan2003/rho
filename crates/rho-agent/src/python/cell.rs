@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use rho_agent_host_proto::{ToolOutputStatus, UnixMs};
+use rho_agent_types::{ToolOutputStatus, UnixMs};
 use rho_inference::types::{ExecId, ToolOutput};
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
 

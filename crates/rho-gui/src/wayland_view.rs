@@ -11,34 +11,34 @@ use theme::ActiveTheme as _;
 /// A decoded image and the one frame the renderer draws it from: the
 /// renderer knows a frame by its identity, so an image gets exactly one.
 struct Shown {
-    image: Arc<rho_hosts::wayland::Image>,
+    image: Arc<rho_desktop_client::viewer::Image>,
     #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     render: VideoFrame,
 }
 
 impl Shown {
-    fn new(image: Arc<rho_hosts::wayland::Image>) -> anyhow::Result<Self> {
-        let render = VideoFrame::new(Arc::new(Planes(image.planes.clone())))?;
+    fn new(image: Arc<rho_desktop_client::viewer::Image>) -> anyhow::Result<Self> {
+        let render = VideoFrame::new(Arc::new(Planes(image.clone())))?;
         Ok(Self { image, render })
     }
 }
 
-struct Planes(Arc<rho_hosts::wayland::RetainedFrame>);
+struct Planes(Arc<rho_desktop_client::viewer::Image>);
 
 impl Yuv444Data for Planes {
     fn size(&self) -> (u32, u32) {
-        (self.0.width() as u32, self.0.height() as u32)
+        (self.0.planes.width() as u32, self.0.planes.height() as u32)
     }
     fn plane(&self, index: usize) -> &[u8] {
-        self.0.plane(index)
+        self.0.planes.plane(index)
     }
     fn stride(&self, index: usize) -> u32 {
-        self.0.stride(index) as u32
+        self.0.planes.stride(index) as u32
     }
 }
 
 pub struct WaylandView {
-    viewer: rho_hosts::wayland::Viewer,
+    viewer: rho_desktop_client::viewer::Viewer,
     image: Option<Rc<Shown>>,
     frozen: Option<Rc<Shown>>,
     strokes: Vec<Vec<(u32, u32)>>,
@@ -55,7 +55,7 @@ pub struct WaylandView {
 }
 impl WaylandView {
     pub fn new(
-        viewer: rho_hosts::wayland::Viewer,
+        viewer: rho_desktop_client::viewer::Viewer,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {

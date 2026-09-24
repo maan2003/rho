@@ -5,15 +5,13 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
 use rho_inference::types::ExecId;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::AgentEvent;
-use crate::db::{
-    AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding, TurnEdge,
-};
+use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
 pub(super) const VERSION: u32 = 8;
 
@@ -26,14 +24,14 @@ pub(super) struct Bootstrap {
 pub(super) enum Control {
     Retire,
     User {
-        content: Vec<rho_agent_host_proto::ContentPart>,
-        delivery: rho_agent_host_proto::MessageDelivery,
+        content: Vec<rho_agent_types::ContentPart>,
+        delivery: rho_agent_types::MessageDelivery,
     },
     Mail {
-        sender: rho_agent_host_proto::AgentId,
+        sender: rho_agent_types::AgentId,
         label: String,
         body: String,
-        delivery: rho_agent_host_proto::MessageDelivery,
+        delivery: rho_agent_types::MessageDelivery,
     },
     NoticeCarried,
     TellTail,
@@ -41,7 +39,7 @@ pub(super) enum Control {
     Cancel,
     Retry,
     Effort(rho_claude::Effort),
-    Role(crate::db::AgentRole),
+    Role(rho_agent_types::AgentRole),
     CacheKey,
     Rewind(u32),
 }
@@ -139,7 +137,7 @@ pub(super) enum Message<'a> {
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
-        queue: Option<Vec<rho_agent_host_proto::transcript::QueuedItem>>,
+        queue: Option<Vec<crate::QueuedInput>>,
         reset: bool,
     },
     HistoryBatch {
@@ -200,7 +198,7 @@ impl Drop for Pending {
 /// its existing status slot; the writer snapshots only when it can send.
 #[derive(Default)]
 struct Publication {
-    queue: Mutex<Option<Vec<rho_agent_host_proto::transcript::QueuedItem>>>,
+    queue: Mutex<Option<Vec<crate::QueuedInput>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
     full: std::sync::atomic::AtomicBool,
@@ -414,7 +412,7 @@ impl Host {
         self.tell_tail();
     }
 
-    pub(crate) fn publish_queue(&self, queue: Vec<rho_agent_host_proto::transcript::QueuedItem>) {
+    pub(crate) fn publish_queue(&self, queue: Vec<crate::QueuedInput>) {
         *self.publication.queue.lock().expect("poison") = Some(queue);
     }
 
@@ -756,14 +754,14 @@ mod tests {
                     body: Request::Append(AgentEvent::Native(
                         crate::native::NativeEvent::RequestStarted {
                             input: vec![rho_inference::types::ContextBlock::UserMessage {
-                                sender: crate::MessageSender::User,
-                                content: vec![rho_agent_host_proto::ContentPart::Text {
+                                sender: rho_inference::types::MessageSender::User,
+                                content: vec![rho_agent_types::ContentPart::Text {
                                     text: "a".repeat(count),
                                 }],
                             }],
                             context: None,
                             wake: None,
-                            at: rho_agent_host_proto::UnixMs(1),
+                            at: rho_agent_types::UnixMs(1),
                         },
                     )),
                 })
@@ -785,7 +783,7 @@ mod tests {
         let rho_inference::types::ContextBlock::UserMessage { content, .. } = &input[0] else {
             panic!()
         };
-        let rho_agent_host_proto::ContentPart::Text { text } = &content[0] else {
+        let rho_agent_types::ContentPart::Text { text } = &content[0] else {
             panic!()
         };
         assert_eq!(text.len(), count);

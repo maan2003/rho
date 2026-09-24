@@ -1,17 +1,87 @@
 //! Wire vocabulary for workset-owned Comint-style shell sessions.
 //!
-//! A shell is started by [`crate::agents::Request::ShellStart`] and a stream
-//! attached to it by [`crate::agents::Open::Shell`]. The workset owns the
-//! process and its canonical structured state; clients project that state into
-//! a read-only buffer, keep their pending input locally, and submit complete
-//! commands.
+//! The shells part of a host, [`rho_agent_host_proto::Part::Shell`]. A shell
+//! is started by [`ShellStart`] and a stream attached to it by
+//! [`Open::Attach`]. The workset owns the process and its canonical
+//! structured state; clients project that state into a read-only buffer,
+//! keep their pending input locally, and submit complete commands.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-pub use crate::shell_kernel::{
-    MAX_ACTIVE_PAGERS, MAX_COMMAND_BYTES, MAX_PAGER_BYTES, MAX_PAGER_LINES, PagerAction,
-    command_fits,
-};
+/// Most pagers one shell holds paused at once.
+pub const MAX_ACTIVE_PAGERS: usize = 64;
+/// Most lines one pager page shows.
+pub const MAX_PAGER_LINES: u32 = 1_000;
+/// Most bytes one pager page shows.
+pub const MAX_PAGER_BYTES: u64 = 64 * 1024;
+/// Longest command a client may submit.
+pub const MAX_COMMAND_BYTES: usize = 1024 * 1024;
+
+pub fn command_fits(command: &str) -> bool {
+    command.len() <= MAX_COMMAND_BYTES
+}
+
+/// What a client asks of a paused pager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum PagerAction {
+    /// Show the next page.
+    Continue,
+    /// Show the rest without pausing.
+    Drain,
+    /// Stop paging.
+    Quit,
+}
+
+/// What a shells stream is for.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Open {
+    /// Attaches to an agent's running shell ([`ShellStart`]). Answered with
+    /// [`rho_agent_host_proto::Opened`], then [`ShellServerFrame`]s. Closing
+    /// the stream only detaches; the shell keeps running.
+    Attach { agent: String },
+    /// One call, answered with one [`rho_agent_host_proto::Answer`]; then the
+    /// stream closes.
+    Request(Request),
+}
+
+rho_agent_host_proto::calls! {
+    /// Every call the shells answer, as it goes on the wire.
+    pub enum Request {
+        ShellStart(ShellStart) -> ();
+        ShellList(ShellList) -> Vec<ShellInfo>;
+        ShellClose(ShellClose) -> ();
+    }
+}
+
+impl rho_agent_host_proto::PartOpen for Open {
+    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Shell;
+
+    fn debug_reply(&self, frame: &[u8]) -> Option<String> {
+        match self {
+            Self::Request(request) => Some(request.debug_answer(frame)),
+            Self::Attach { .. } => None,
+        }
+    }
+}
+
+/// Starts the daemon-owned Comint-style shell for an agent. Attaching is
+/// [`Open::Attach`].
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellStart {
+    pub agent: String,
+}
+
+/// Running shells, of one agent if it names one.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellList {
+    pub agent: Option<String>,
+}
+
+/// Stops an agent's running shell gracefully.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellClose {
+    pub agent: String,
+}
 
 /// Maximum structured SGR runs retained for one output stream.
 pub const MAX_STYLE_SPANS: usize = 4096;
@@ -47,7 +117,7 @@ pub struct ShellStyleSpan {
     pub style: ShellTextStyle,
 }
 
-/// One workset-owned shell returned by [`crate::agents::Reply::ShellList`].
+/// One workset-owned shell returned by [`ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
     /// Encoded agent id ("eng-ht08").
@@ -189,4 +259,63 @@ pub enum ShellServerFrame {
     Exited {
         status: Option<i32>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trips<T>(value: T)
+    where
+        T: senax_encoder::Packer + senax_encoder::Unpacker + PartialEq + std::fmt::Debug,
+    {
+        let bytes = senax_encoder::pack(&value).unwrap();
+        assert_eq!(
+            senax_encoder::unpack::<T>(&mut bytes.clone()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn frames_round_trip() {
+        round_trips(ShellServerFrame::ExecutionOutput {
+            execution: 3,
+            start: 0,
+            end: 0,
+            text: "λ".to_owned(),
+            styles: vec![ShellStyleSpan {
+                start: 0,
+                end: 2,
+                style: ShellTextStyle {
+                    foreground: Some(ShellColor::Indexed(1)),
+                    bold: true,
+                    ..Default::default()
+                },
+            }],
+        });
+        round_trips(ShellClientFrame::PagerAction {
+            execution: 1,
+            pager: 2,
+            page: 3,
+            action: PagerAction::Drain,
+        });
+    }
+
+    #[test]
+    fn opening_survives_the_envelope() {
+        let open = Open::Request(
+            ShellStart {
+                agent: "eng-test".to_owned(),
+            }
+            .into(),
+        );
+        let envelope = rho_agent_host_proto::Open::of(&open).unwrap();
+        assert_eq!(envelope.unpack::<Open>().unwrap(), open);
+    }
+
+    #[test]
+    fn commands_fit_up_to_the_limit() {
+        assert!(command_fits(&"x".repeat(MAX_COMMAND_BYTES)));
+        assert!(!command_fits(&"x".repeat(MAX_COMMAND_BYTES + 1)));
+    }
 }

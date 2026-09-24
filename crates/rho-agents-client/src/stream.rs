@@ -1,7 +1,7 @@
 //! One host's agents stream: the daemon's journal and live tails to the
 //! model, the model's follow and the window's focus back to the daemon.
 //!
-//! The host opens it beside its control stream on every connection
+//! The host opens it on every connection
 //! ([`rho_hosts::HostStream`]); what is said on it and where its frames go
 //! are this crate's.
 
@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
-use rho_agent_host_proto::agents::{self, ClientFrame, ServerFrame};
-use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
-use rho_agent_host_proto::{AgentId, Open, QuotaSummary, read_frame, write_frame};
+use rho_agent_host_proto::{read_frame, write_frame, write_open};
+use rho_agent_types::{AgentId, Seq};
 use rho_hosts::{Dialer, HostStream};
 
 use crate::HostId;
 use crate::model::ToModel;
+use crate::protocol::transcript::{Live, LogEntry};
+use crate::protocol::{self, AuthState, ClientFrame, QuotaSummary, ServerFrame};
 
 /// What a host says on its agents stream.
 pub enum AgentFrame {
@@ -26,15 +27,22 @@ pub enum AgentFrame {
     JournalHead {
         machine_seed: u64,
         journal_head: Seq,
+        agent_counter: u64,
     },
+    /// Which provider accounts the host's agents may run on.
+    Auth { auth: AuthState },
     /// A run of the host's journal, contiguous by seq: the answer to
     /// `Follow` and everything appended since.
     Log { entries: Vec<LogEntry> },
     /// What changed in the runtime's tail past the log, for an agent some
     /// client is looking at.
     Live { agent_id: AgentId, live: Live },
-    /// An agent was created on the host, by any client or agent.
-    AgentCreated { agent_id: AgentId },
+    /// An agent was created on the host, by any client or agent, and the
+    /// agent-id counter moved to `agent_counter`.
+    AgentCreated {
+        agent_id: AgentId,
+        agent_counter: u64,
+    },
     /// The host's quota: every account's latest usage.
     QuotaUsage { summaries: Vec<QuotaSummary> },
 }
@@ -108,9 +116,9 @@ impl HostStream for AgentStream {
         let commands = self.commands.clone();
         let focus = self.focus.clone();
         Box::pin(async move {
-            // Bulk priority: a catch-up must not hold up the control stream.
+            // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
-            write_frame(&mut socket, &Open::Agents(agents::Open::Session)).await?;
+            write_open(&mut socket, &protocol::Open::Session).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);
             let mut commands = commands.lock().await;
             while commands.try_recv().is_ok() {}
@@ -124,15 +132,22 @@ impl HostStream for AgentStream {
                         ServerFrame::JournalHead {
                             machine_seed,
                             journal_head,
+                            agent_counter,
                         } => AgentFrame::JournalHead {
                             machine_seed,
                             journal_head,
+                            agent_counter,
                         },
+                        ServerFrame::Auth { auth } => AgentFrame::Auth { auth },
                         ServerFrame::Log { entries } => AgentFrame::Log { entries },
                         ServerFrame::Live { agent_id, live } => AgentFrame::Live { agent_id, live },
-                        ServerFrame::AgentCreated { agent_id } => {
-                            AgentFrame::AgentCreated { agent_id }
-                        }
+                        ServerFrame::AgentCreated {
+                            agent_id,
+                            agent_counter,
+                        } => AgentFrame::AgentCreated {
+                            agent_id,
+                            agent_counter,
+                        },
                         ServerFrame::QuotaUsage { summaries } => {
                             AgentFrame::QuotaUsage { summaries }
                         }

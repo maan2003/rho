@@ -1,4 +1,4 @@
-use rho_agent_host_proto::MessagePhase;
+use rho_agent_types::MessagePhase;
 
 use super::streaming::tests::agent as standard_agent;
 use super::*;

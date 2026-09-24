@@ -6,41 +6,20 @@ use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::{
-    Open, ProtocolLogDirection, agents, append_protocol_log_record, host, protocol_frame_bytes,
-    read_frame, write_frame,
+    Answer, Call, Open, PartOpen, ProtocolLogDirection, append_protocol_log_record,
+    protocol_frame_bytes, read_frame, write_frame,
 };
 
-/// One request of the agents, on a stream of its own over the daemon's
-/// Unix socket. A refusal is an error.
-pub async fn agents(
-    socket: impl AsRef<Path>,
-    request: agents::Request,
-) -> anyhow::Result<agents::Reply> {
+/// One call, on a stream of its own over the daemon's Unix socket. A
+/// refusal is an error.
+pub async fn call<C: Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<C::Reply> {
     let mut client = Client::connect(socket).await?;
-    client
-        .send(&Open::Agents(agents::Open::Request(request)))
-        .await?;
-    match client.recv().await? {
-        agents::Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
-}
-
-/// One request of the machine, on a stream of its own over the daemon's
-/// Unix socket. A refusal is an error.
-pub async fn host(socket: impl AsRef<Path>, request: host::Request) -> anyhow::Result<host::Reply> {
-    let mut client = Client::connect(socket).await?;
-    client
-        .send(&Open::Host(host::Open::Request(request)))
-        .await?;
-    match client.recv().await? {
-        host::Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
+    client.open(&call.open()).await?;
+    client.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
 /// Raw async client for one stream over the daemon's Unix socket. The first
-/// frame sent is an [`Open`].
+/// frame sent is an [`Open`] ([`Client::open`]).
 pub struct Client {
     stream: rho_rpc::Stream,
     logger: Option<ProtocolLogger>,
@@ -57,6 +36,11 @@ impl Client {
             stream,
             logger: ProtocolLogger::from_env(),
         }
+    }
+
+    /// Opens the stream for a part: the first frame sent.
+    pub async fn open<T: PartOpen>(&mut self, open: &T) -> anyhow::Result<()> {
+        self.send(&Open::of(open)?).await
     }
 
     pub async fn send<T: Packer>(&mut self, frame: &T) -> anyhow::Result<()> {

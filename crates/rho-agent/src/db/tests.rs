@@ -1,6 +1,5 @@
-use rho_agent_host_proto::{ContentPart, UnixMs};
+use rho_agent_types::{ContentPart, MessageDelivery, Place, TurnOutcome, UnixMs};
 use rho_db::RhoDb;
-use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
 
 use super::*;
@@ -373,7 +372,9 @@ fn agent_roles_resolve_the_current_model_matrix() {
     );
 }
 
-use crate::{InputKind, MessageDelivery, MessageSender, QueuedInput};
+use rho_inference::types::MessageSender;
+
+use crate::{InputKind, QueuedInput};
 
 pub(crate) fn user_event(text: &str) -> AgentEvent<'static> {
     AgentEvent::Accepted(QueuedInput {
@@ -814,7 +815,7 @@ async fn deleting_an_agent_removes_every_row_it_owns() {
 async fn the_journal_names_every_row_in_write_order() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut feed = crate::transcript::feed(&db);
+    let mut feed = crate::journal::feed(&db);
 
     let mut write = db.write().await;
     write.init_agent_tables();
@@ -850,7 +851,7 @@ async fn the_journal_names_every_row_in_write_order() {
 
     // Every row was announced after commit, in the same order.
     let mut announced = Vec::new();
-    while let Ok(crate::transcript::Feed::Appended(appended)) = feed.try_recv() {
+    while let Ok(crate::journal::Feed::Appended(appended)) = feed.try_recv() {
         announced.push((appended.seq.0, appended.agent_id, appended.pos.0));
     }
     assert_eq!(
@@ -908,7 +909,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
                 output: std::sync::Arc::new("already ran".into()),
                 full_output: None,
                 images: Default::default(),
-                status: rho_agent_host_proto::ToolOutputStatus::Success,
+                status: rho_agent_types::ToolOutputStatus::Success,
             },
         )],
         wake: crate::WakeFacts::interrupt(),
@@ -971,7 +972,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
 
 #[tokio::test]
 async fn native_later_image_survives_reopen_and_provider_projection() {
-    use rho_agent_host_proto::ToolOutputStatus;
+    use rho_agent_types::ToolOutputStatus;
     use rho_inference::types::{ContextBlock, ExecOutput, ToolOutput};
 
     use crate::native::NativeEvent;

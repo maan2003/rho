@@ -4,9 +4,8 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use rho_agent::db::{
-    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, EngineerIntelligence,
-};
+use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime};
+use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
 use rho_inference::Inference;
 
@@ -233,26 +232,20 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
 /// Ask the running daemon for a snapshot: it alone can copy the file
 /// between commits, in a state that opens without repair.
 async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
-    let reply =
-        rho_agent_host_proto::client::host(socket, rho_agent_host_proto::host::Request::Snapshot)
-            .await
-            .context("the daemon holds the database, and its socket does not answer")?;
-    match reply {
-        rho_agent_host_proto::host::Reply::Snapshotted { path } => {
-            let path = path.into_std_path_buf();
-            let dir = path.parent().context("snapshot has no directory")?;
-            Ok(Snapshot {
-                source: source.to_owned(),
-                _dir: SnapshotDir(dir.to_owned()),
-                path,
-            })
-        }
-        reply => anyhow::bail!("unexpected reply to a snapshot request: {reply:?}"),
-    }
+    let path = rho_agent_host_proto::client::call(socket, rho_agent_host_proto::host::Snapshot)
+        .await
+        .context("the daemon holds the database, and its socket does not answer")?
+        .into_std_path_buf();
+    let dir = path.parent().context("snapshot has no directory")?;
+    Ok(Snapshot {
+        source: source.to_owned(),
+        _dir: SnapshotDir(dir.to_owned()),
+        path,
+    })
 }
 
 /// The daemon's half of
-/// [`Request::Snapshot`](rho_agent_host_proto::Request::Snapshot):
+/// [`host::Snapshot`](rho_agent_host_proto::host::Snapshot):
 /// a snapshot of `db` in a directory of its own beside it.
 pub(crate) async fn daemon_snapshot(db: &RhoDb) -> anyhow::Result<camino::Utf8PathBuf> {
     let dir = new_snapshot_dir(db.path())?;
@@ -597,8 +590,7 @@ async fn delete_agents(db_path: Option<PathBuf>, agents: &[String]) -> anyhow::R
     let agents = agents
         .iter()
         .map(|id| {
-            rho_agent_host_proto::AgentId::from_encoded(id)
-                .with_context(|| format!("agent id {id}"))
+            rho_agent_types::AgentId::from_encoded(id).with_context(|| format!("agent id {id}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let path = db_path
@@ -648,8 +640,8 @@ async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn config_name(config: rho_agent::db::AgentRole) -> String {
-    use rho_agent::db::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
+fn config_name(config: rho_agent_types::AgentRole) -> String {
+    use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
     match config {
         AgentRole::Advisor { intelligence } => match intelligence {
             AdvisorIntelligence::Low => "low-adv",
@@ -667,7 +659,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
     .to_owned()
 }
 
-fn place_name(place: &rho_fs_view::Place) -> String {
+fn place_name(place: &rho_agent_types::Place) -> String {
     format!("{} in workset {}", place.cwd, place.workset)
 }
 

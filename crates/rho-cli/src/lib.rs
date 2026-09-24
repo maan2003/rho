@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use rho_agent_host_proto::client::Client as UiClient;
-use rho_agent_host_proto::{Open, agents, host};
+use rho_agent_host_proto::{Answer, Call, client, host};
+use rho_agents_client::protocol as agents;
 use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
 use rho_inference::{AuthArgs, run_auth_cli};
@@ -78,63 +79,61 @@ async fn run(command: Command) -> Result<()> {
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
-            rho_agent_host_proto::print_protocol_log(&args.path, &mut stdout)?;
+            rho_agent_host_proto::print_protocol_log(&args.path, &mut stdout, describe_frame)?;
             Ok(())
         }
+    }
+}
+
+/// A protocol log frame, read as the part it belongs to.
+fn describe_frame(open: &rho_agent_host_proto::Open, reply: Option<&[u8]>) -> String {
+    use rho_agent_host_proto::{Part, describe_as, desk};
+    match open.part {
+        Part::Agents => describe_as::<agents::Open>(open, reply),
+        Part::Desk => describe_as::<desk::Open>(open, reply),
+        Part::Host => describe_as::<host::Open>(open, reply),
+        Part::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
+        Part::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
+        Part::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
     }
 }
 
 /// Approves a pending iroh enrollment over the daemon's Unix socket, so
 /// trust decisions always come from a local user on the daemon host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
-    let request = match args.command {
-        IrohCommand::Approve { code } => host::Request::IrohApprove { code },
-        IrohCommand::TrustInMemory { endpoint_id } => {
-            host::Request::IrohTrustInMemory { endpoint_id }
-        }
-        IrohCommand::Revoke { endpoint_id } => host::Request::IrohRevoke { endpoint_id },
-    };
     let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
-    match rho_agent_host_proto::client::host(&socket_path, request).await? {
-        host::Reply::IrohApproved { endpoint_id } => println!("enrolled iroh client {endpoint_id}"),
-        host::Reply::IrohRevoked { endpoint_id } => println!("revoked iroh client {endpoint_id}"),
-        _ => anyhow::bail!("unexpected reply from the daemon"),
+    let socket = &socket_path;
+    match args.command {
+        IrohCommand::Approve { code } => {
+            let endpoint_id = client::call(socket, host::IrohApprove { code }).await?;
+            println!("enrolled iroh client {endpoint_id}");
+        }
+        IrohCommand::TrustInMemory { endpoint_id } => {
+            let call = host::IrohTrustInMemory {
+                endpoint_id: endpoint_id.clone(),
+            };
+            client::call(socket, call).await?;
+            println!("enrolled iroh client {endpoint_id}");
+        }
+        IrohCommand::Revoke { endpoint_id } => {
+            let endpoint_id = client::call(socket, host::IrohRevoke { endpoint_id }).await?;
+            println!("revoked iroh client {endpoint_id}");
+        }
     }
     Ok(())
 }
 
-/// One request of the daemon's agents, starting the daemon if it is not
-/// running. A refusal is an error.
-pub(crate) async fn agents_request(
+/// One call of the daemon, starting the daemon if it is not running. A
+/// refusal is an error.
+pub(crate) async fn daemon_call<C: Call>(
     socket_path: &std::path::Path,
-    request: agents::Request,
-) -> Result<agents::Reply> {
+    call: C,
+) -> Result<C::Reply> {
     let mut daemon = connect_or_start_daemon(socket_path).await?;
-    daemon
-        .send(&Open::Agents(agents::Open::Request(request)))
-        .await?;
-    match daemon.recv().await? {
-        agents::Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
-}
-
-/// One request of the daemon's machine, starting the daemon if it is not
-/// running. A refusal is an error.
-pub(crate) async fn host_request(
-    socket_path: &std::path::Path,
-    request: host::Request,
-) -> Result<host::Reply> {
-    let mut daemon = connect_or_start_daemon(socket_path).await?;
-    daemon
-        .send(&Open::Host(host::Open::Request(request)))
-        .await?;
-    match daemon.recv().await? {
-        host::Reply::Failed { reason } => anyhow::bail!(reason),
-        reply => Ok(reply),
-    }
+    daemon.open(&call.open()).await?;
+    daemon.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
 pub(crate) async fn connect_or_start_daemon(socket_path: &std::path::Path) -> Result<UiClient> {
@@ -237,10 +236,14 @@ pub(crate) enum ClaudeAccountCommand {
 /// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
 /// view namespace outside an agent; agents get the same directory by mount.
 async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
-    let request = match &args.command {
-        ClaudeAccountCommand::List => agents::Request::ClaudeAccounts,
+    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let list = match &args.command {
+        ClaudeAccountCommand::List => daemon_call(&socket_path, agents::ClaudeAccounts).await?,
         ClaudeAccountCommand::Use { name } => {
-            agents::Request::SetClaudeAccount { name: name.clone() }
+            let call = agents::SetClaudeAccount { name: name.clone() };
+            daemon_call(&socket_path, call).await?
         }
         ClaudeAccountCommand::Login { name } => {
             let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
@@ -253,16 +256,8 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
             return Ok(());
         }
     };
-    let socket_path = rho_agent_host_proto::RuntimePaths::resolve(args.socket_path)?
-        .socket()
-        .to_owned();
-    let agents::Reply::ClaudeAccounts { accounts, current } =
-        agents_request(&socket_path, request).await?
-    else {
-        anyhow::bail!("unexpected reply from the daemon");
-    };
-    for name in accounts {
-        let mark = if name == current { "*" } else { " " };
+    for name in list.accounts {
+        let mark = if name == list.current { "*" } else { " " };
         println!("{mark} {name}");
     }
     Ok(())

@@ -12,6 +12,7 @@ rho-rpc.workspace = true
 alacritty_terminal.workspace = true
 rustix-openpty.workspace = true
 libc.workspace = true
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
@@ -45,8 +46,11 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 uuid.workspace = true
 
-[dev-dependencies]
 rho-shell.workspace = true
+rho-shell-view.workspace = true
+rho-terminal.workspace = true
+
+[dev-dependencies]
 tokio-tungstenite.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 

@@ -279,14 +279,14 @@ impl DeskCellStore {
     pub async fn seed_desk_rows(
         &self,
         note_text: &str,
-        agents: &[rho_agent_host_proto::AgentId],
+        agents: &[rho_agent_types::AgentId],
     ) -> Result<Id, String> {
         let mut write = self.db.write().await;
         let mut meta = load_meta_from_write(&mut write)?;
         let snapshot = read_snapshot_from_write(&mut write)?;
         let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
         let created_at = rho_agent_host_proto::desk::cells::Timestamp {
-            unix_ms: rho_agent_host_proto::UnixMs::now().0 as i64,
+            unix_ms: rho_agent_types::UnixMs::now().0 as i64,
             precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
         };
         let note = Id::Note(rho_agent_host_proto::desk::cells::Uuid(

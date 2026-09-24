@@ -12,9 +12,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
+use rho_agent_types::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::AgentId;
 use crate::desk::PageId;
 
 #[derive(
@@ -1168,8 +1168,9 @@ fn wins(new: &Cell, old: &Cell) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::AgentIdDomain;
+
     use super::*;
-    use crate::AgentIdDomain;
 
     fn device(byte: u8) -> DeviceId {
         DeviceId([byte; 16])

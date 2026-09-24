@@ -9,7 +9,7 @@ rust-version.workspace = true
 [dependencies]
 futures.workspace = true
 reqwest.workspace = true
-rho-agent-host-proto.workspace = true
+rho-agent-types.workspace = true
 rho-inference.workspace = true
 serde.workspace = true
 serde_json.workspace = true

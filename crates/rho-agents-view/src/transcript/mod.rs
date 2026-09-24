@@ -44,19 +44,19 @@ use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, Weak
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 use rho_agents_client::elision::ElisionPlan;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
-use rho_window::visualization::Visualization;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
 use crate::render::{
     BlockKind, RenderedBlock, block_kind, block_visible, render_block_with_agent_labels,
 };
+use crate::visualization::Visualization;
 
 mod store;
 
@@ -436,7 +436,7 @@ impl TranscriptModel {
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
-        agent_label: &impl Fn(rho_agent_host_proto::AgentId) -> String,
+        agent_label: &impl Fn(rho_agent_types::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
         self.turn_open = rho_agents_client::store::turn_open(state.status);

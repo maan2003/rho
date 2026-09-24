@@ -73,10 +73,10 @@ impl HostDesk {
 /// this; it is read from the registry every time a view is built.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSource {
-    pub agent: rho_agent_host_proto::AgentId,
+    pub agent: rho_agent_types::AgentId,
     /// Who asked for this agent. The store's `Parent` is the user's
     /// filing and beats it; this is where the agent came from.
-    pub spawned_by: Option<rho_agent_host_proto::AgentId>,
+    pub spawned_by: Option<rho_agent_types::AgentId>,
     pub workdir: Option<camino::Utf8PathBuf>,
     /// One past the newest story event this client holds: the cursor a
     /// verdict on this agent writes.
@@ -87,7 +87,7 @@ pub struct AgentSource {
     pub errored: Option<StoryPos>,
     /// What the last finished turn says it asks of the user, and where it
     /// said so.
-    pub wants: Option<(rho_agent_host_proto::transcript::AgentWant, StoryPos)>,
+    pub wants: Option<(rho_agent_types::AgentWant, StoryPos)>,
 }
 
 impl AgentSource {
@@ -140,7 +140,7 @@ pub struct Sources {
     /// agent, one unit or one page per node it builds, and asking by
     /// scanning made a walk cost the nodes times the sources. The lists
     /// are private so these cannot drift from them.
-    by_agent: HashMap<rho_agent_host_proto::AgentId, usize>,
+    by_agent: HashMap<rho_agent_types::AgentId, usize>,
     by_unit: HashMap<rho_agent_host_proto::desk::cells::SlackUnit, usize>,
     by_page: HashMap<rho_agent_host_proto::desk::PageId, usize>,
 }
@@ -224,7 +224,7 @@ impl Sources {
         &self.pages
     }
 
-    fn agent(&self, agent: rho_agent_host_proto::AgentId) -> Option<&AgentSource> {
+    fn agent(&self, agent: rho_agent_types::AgentId) -> Option<&AgentSource> {
         charge_scan(1);
         self.by_agent.get(&agent).map(|at| &self.agents[*at])
     }
@@ -384,7 +384,7 @@ impl DeskNode {
         matches!(self.id, Id::Note(_))
     }
 
-    pub fn agent(&self) -> Option<rho_agent_host_proto::AgentId> {
+    pub fn agent(&self) -> Option<rho_agent_types::AgentId> {
         match &self.id {
             Id::Agent(agent) => Some(*agent),
             _ => None,
@@ -522,8 +522,8 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     })
 }
 
-fn agent_pos(pos: StoryPos) -> rho_agent_host_proto::transcript::AgentPos {
-    rho_agent_host_proto::transcript::AgentPos(pos.0)
+fn agent_pos(pos: StoryPos) -> rho_agent_types::AgentPos {
+    rho_agent_types::AgentPos(pos.0)
 }
 
 /// The user's verdict on an agent, as the store holds it.
@@ -1177,7 +1177,7 @@ impl Desk {
     pub fn agent_verdicts(
         &self,
         host: HostId,
-    ) -> Vec<(rho_agent_host_proto::AgentId, rho_agents_client::Verdict)> {
+    ) -> Vec<(rho_agent_types::AgentId, rho_agents_client::Verdict)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1197,10 +1197,7 @@ impl Desk {
     pub fn agent_filing(
         &self,
         host: HostId,
-    ) -> Vec<(
-        rho_agent_host_proto::AgentId,
-        rho_agents_client::AgentFiling,
-    )> {
+    ) -> Vec<(rho_agent_types::AgentId, rho_agents_client::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1235,10 +1232,7 @@ impl Desk {
         &self,
         host: HostId,
         touched: &std::collections::BTreeSet<Id>,
-    ) -> Vec<(
-        rho_agent_host_proto::AgentId,
-        rho_agents_client::AgentFiling,
-    )> {
+    ) -> Vec<(rho_agent_types::AgentId, rho_agents_client::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1987,7 +1981,7 @@ impl Desk {
 
     /// The agent that owns an area: the thing itself when it is an agent,
     /// else the nearest ancestor that is one.
-    pub fn nearest_agent(&self, host: HostId, id: &Id) -> Option<rho_agent_host_proto::AgentId> {
+    pub fn nearest_agent(&self, host: HostId, id: &Id) -> Option<rho_agent_types::AgentId> {
         let nodes = self.nodes(host);
         let mut cursor = Some(id.clone());
         for _ in 0..MAX_ANCESTRY {

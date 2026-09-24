@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::mpsc;
@@ -65,7 +65,9 @@ impl Services {
     }
 
     pub(super) async fn worker_failed(&self, error: String) {
-        use crate::db::{AgentWriteTxnExt as _, TurnEdge, TurnOutcome};
+        use rho_agent_types::{TurnEdge, TurnOutcome};
+
+        use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
             kind: crate::AgentStateKind::Error(crate::FailedInferenceResponse {
                 partial_response: Default::default(),
@@ -78,7 +80,7 @@ impl Services {
         // statements ran. Record only that coarse lifecycle fact.
         let mut write = self.db.write().await;
         write.tell_turn(
-            rho_agent_host_proto::UnixMs::now(),
+            rho_agent_types::UnixMs::now(),
             self.agent,
             TurnEdge::Ended(TurnOutcome::Errored { message: error }),
         );
@@ -86,9 +88,13 @@ impl Services {
         if let Some(pool) = self.pool.upgrade() {
             pool.settle_turn(self.agent).await;
             if pool.is_live(self.agent) {
-                for live in crate::live::Teller::default().tell(&status.kind) {
-                    crate::transcript::tell_live(&self.db, self.agent, live);
-                }
+                crate::journal::tell_status(
+                    &self.db,
+                    self.agent,
+                    Arc::new(status.clone()),
+                    None,
+                    true,
+                );
             }
         }
         self.status.send_replace(status);
@@ -133,7 +139,9 @@ impl Services {
                 .expect("one daemon connection");
             let (outgoing, mut messages) = mpsc::channel::<Message<'static>>(32);
             let mut calls = JoinSet::new();
-            let mut teller = crate::live::Teller::default();
+            // Whether this loop's tail has been told since it was last not
+            // live; the first status after that is told whole.
+            let mut told = false;
             let result = tokio::select! {
                 result = async {
                     loop {
@@ -173,18 +181,17 @@ impl Services {
                                 continue;
                             }
                             Message::Status { status, queue, reset } => {
-                                if reset { teller.reset(); }
                                 if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
-                                    if let Some(queue) = queue
-                                        && let Some(live) = teller.tell_queue(&queue)
-                                    {
-                                        crate::transcript::tell_live(&self.db, self.agent, live);
-                                    }
-                                    for live in teller.tell(&status.kind) {
-                                        crate::transcript::tell_live(&self.db, self.agent, live);
-                                    }
+                                    crate::journal::tell_status(
+                                        &self.db,
+                                        self.agent,
+                                        Arc::new(status.clone()),
+                                        queue.map(Arc::from),
+                                        reset || !told,
+                                    );
+                                    told = true;
                                 } else {
-                                    teller.reset();
+                                    told = false;
                                 }
                                 self.status.send_replace(status);
                                 continue;
@@ -436,11 +443,11 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::UnixMs;
+    use rho_agent_types::{AgentRole, UnixMs};
 
     use super::*;
     use crate::AgentEvent;
-    use crate::db::{AgentRole, AgentRoleSessionProfile as _, AgentRuntime};
+    use crate::db::{AgentRoleSessionProfile as _, AgentRuntime};
 
     #[tokio::test]
     async fn blocked_append_does_not_block_reads_and_history_crosses_multiple_frames() {

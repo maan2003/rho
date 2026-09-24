@@ -10,6 +10,7 @@ pub mod draft;
 pub mod messages;
 pub mod render;
 pub mod transcript;
+mod visualization;
 
 pub use agent_view::{AgentModel, AgentModelEvent};
 pub use transcript::{FrameChange, TranscriptFrame, Transcripts};
@@ -29,3 +30,22 @@ gpui::actions!(
         RoleCycleGroup,
     ]
 );
+
+/// The chip labels for a prompt's image attachments, e.g. `PNG · 12 KB`.
+fn attachment_labels(attachments: &[rho_agent_types::ContentPart]) -> Vec<String> {
+    use rho_agent_types::ContentPart;
+    attachments
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Image { media_type, data } => Some(format!(
+                "{} · {} KB",
+                media_type
+                    .strip_prefix("image/")
+                    .unwrap_or(media_type)
+                    .to_ascii_uppercase(),
+                data.len().div_ceil(1024)
+            )),
+            ContentPart::Text { .. } => None,
+        })
+        .collect()
+}

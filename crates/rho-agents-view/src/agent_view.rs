@@ -22,7 +22,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use rho_agent_host_proto::{AgentId, ContentPart};
+use rho_agent_types::{AgentId, ContentPart};
 use rho_agents_client::now_ms;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::FrameSummary;
@@ -620,7 +620,7 @@ impl AgentModel {
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
-        agent_label: &impl Fn(rho_agent_host_proto::AgentId) -> String,
+        agent_label: &impl Fn(rho_agent_types::AgentId) -> String,
         cx: &mut Context<Self>,
     ) {
         self.transcript
@@ -829,7 +829,7 @@ impl AgentModel {
         else {
             return;
         };
-        let block = style::attachment_block(anchor, &self.attachments);
+        let block = style::attachment_block(anchor, crate::attachment_labels(&self.attachments));
         for editor in self.live_editors() {
             let block = block.clone();
             let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));

@@ -11,10 +11,10 @@
 
 use std::sync::Arc;
 
+use rho_agent_types::{AgentId, AgentRole, MessageDelivery};
 use senax_encoder::{Decode, Encode};
 
-use crate::MessageDelivery;
-use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
+use crate::db::AgentReadTxnExt as _;
 use crate::pool::AgentPool;
 
 /// Startup presentation identities for a worker's prompts. Pool capabilities
@@ -129,15 +129,15 @@ async fn ask_advisor(tools: &MultiAgentTools, args: AdvisorArgs) -> anyhow::Resu
     ))
 }
 
-fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligence {
+fn default_advisor_intelligence(role: AgentRole) -> rho_agent_types::AdvisorIntelligence {
     match role {
         AgentRole::Engineer {
-            intelligence: crate::db::EngineerIntelligence::Mini,
-        } => crate::db::AdvisorIntelligence::Low,
+            intelligence: rho_agent_types::EngineerIntelligence::Mini,
+        } => rho_agent_types::AdvisorIntelligence::Low,
         AgentRole::Engineer {
-            intelligence: crate::db::EngineerIntelligence::High,
-        } => crate::db::AdvisorIntelligence::Medium1,
-        _ => crate::db::AdvisorIntelligence::Medium,
+            intelligence: rho_agent_types::EngineerIntelligence::High,
+        } => rho_agent_types::AdvisorIntelligence::Medium1,
+        _ => rho_agent_types::AdvisorIntelligence::Medium,
     }
 }
 
@@ -286,19 +286,19 @@ mod tests {
     fn engineer_modes_choose_the_requested_advisor_tiers() {
         assert_eq!(
             default_advisor_intelligence(AgentRole::Engineer {
-                intelligence: crate::db::EngineerIntelligence::High,
+                intelligence: rho_agent_types::EngineerIntelligence::High,
             }),
-            crate::db::AdvisorIntelligence::Medium1
+            rho_agent_types::AdvisorIntelligence::Medium1
         );
         assert_eq!(
             default_advisor_intelligence(AgentRole::Engineer {
-                intelligence: crate::db::EngineerIntelligence::Mini,
+                intelligence: rho_agent_types::EngineerIntelligence::Mini,
             }),
-            crate::db::AdvisorIntelligence::Low
+            rho_agent_types::AdvisorIntelligence::Low
         );
         assert_eq!(
             default_advisor_intelligence(AgentRole::default()),
-            crate::db::AdvisorIntelligence::Medium
+            rho_agent_types::AdvisorIntelligence::Medium
         );
     }
 }

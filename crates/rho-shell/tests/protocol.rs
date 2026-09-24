@@ -2,7 +2,7 @@ use std::os::unix::process::CommandExt as _;
 use std::process::Stdio;
 use std::time::Duration;
 
-use rho_agent_host_proto::shell_kernel::{PROTOCOL_VERSION, Request, Response};
+use rho_shell::kernel::{PROTOCOL_VERSION, Request, Response};
 
 #[test]
 fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
@@ -229,7 +229,7 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
             execution: 16,
             pager,
             page: 1,
-            action: rho_agent_host_proto::shell_kernel::PagerAction::Continue,
+            action: rho_shell::kernel::PagerAction::Continue,
         },
     );
     // A duplicate credit for page 1 must not apply to a later page.
@@ -239,7 +239,7 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
             execution: 16,
             pager,
             page: 1,
-            action: rho_agent_host_proto::shell_kernel::PagerAction::Continue,
+            action: rho_shell::kernel::PagerAction::Continue,
         },
     );
     let mut resumed = 0;
@@ -273,7 +273,7 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
         .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     loop {
-        match rho_agent_host_proto::shell_kernel::read_frame(&mut control) {
+        match rho_shell::kernel::read_frame(&mut control) {
             Ok(Response::Output {
                 execution: 16,
                 data,
@@ -299,7 +299,7 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
             execution: 16,
             pager,
             page: 2,
-            action: rho_agent_host_proto::shell_kernel::PagerAction::Continue,
+            action: rho_shell::kernel::PagerAction::Continue,
         },
     );
     let mut pager_finished = false;
@@ -450,9 +450,9 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
     stale
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    rho_agent_host_proto::shell_kernel::write_pager_frame(
+    rho_shell::kernel::write_pager_frame(
         &mut stale,
-        &rho_agent_host_proto::shell_kernel::PagerMessage::Hello {
+        &rho_shell::kernel::PagerMessage::Hello {
             protocol: 1,
             token: token.into(),
             execution_token: execution_token.into(),
@@ -476,11 +476,11 @@ fn output_events_keep_execution_boundaries_and_merge_standard_streams() {
 }
 
 fn write(control: &mut std::os::unix::net::UnixStream, request: &Request) {
-    rho_agent_host_proto::shell_kernel::write_frame(control, request).unwrap();
+    rho_shell::kernel::write_frame(control, request).unwrap();
 }
 
 fn read(control: &mut std::os::unix::net::UnixStream) -> Response {
-    match rho_agent_host_proto::shell_kernel::read_frame(control) {
+    match rho_shell::kernel::read_frame(control) {
         Ok(response) => response,
         // The read timeout is a backstop, so say what it means: the frame the
         // test is standing on never came, and the stream is desynchronised

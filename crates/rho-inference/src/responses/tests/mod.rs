@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Sink, Stream};
-use rho_agent_host_proto::{ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
+use rho_agent_types::{ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::Message as WsMessage;

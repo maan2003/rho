@@ -22,7 +22,9 @@ dirs.workspace = true
 flate2 = "1"
 redb.workspace = true
 reqwest.workspace = true
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
+rho-agents-client.workspace = true
 rho-fake-model.workspace = true
 rustls.workspace = true
 rho-slack = { workspace = true, features = ["fake", "ui"] }
@@ -36,7 +38,7 @@ tempfile.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 rho-db.workspace = true
-rho-agents-client.workspace = true
+rho-agents-client = { workspace = true, features = ["client"] }
 rho-desk-client.workspace = true
 senax-encoder.workspace = true
 text.workspace = true

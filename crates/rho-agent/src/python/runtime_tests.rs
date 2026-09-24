@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use rho_agent_host_proto::ToolOutputStatus;
+use rho_agent_types::ToolOutputStatus;
 use rho_inference::types::{ExecCall, ToolOutput};
 use tokio::sync::Notify;
 

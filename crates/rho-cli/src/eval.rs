@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use rho_agent::db::{AgentReadTxnExt as _, AgentRole, EngineerIntelligence, TurnEdge, TurnOutcome};
-use rho_agent::{AgentEvent, MessageDelivery, StartPlace};
+use rho_agent::db::AgentReadTxnExt as _;
+use rho_agent::{AgentEvent, StartPlace};
+use rho_agent_types::{AgentRole, EngineerIntelligence, MessageDelivery, TurnEdge, TurnOutcome};
 use rho_fs_view::{UserEnvironment, Worksets};
 use rho_inference::types::{ContextBlock, InferenceResponseItem};
 use serde_json::{Value, json};
@@ -126,7 +127,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             _ => unreachable!("clap validates evaluation roles"),
         },
     };
-    let mut feed = rho_agent::transcript::feed(&db);
+    let mut feed = rho_agent::journal::feed(&db);
     let (id, agent) = pool
         .create(
             role,
@@ -164,7 +165,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             event = feed.recv() => event,
         };
         let appended = match event {
-            Ok(rho_agent::transcript::Feed::Appended(event)) if event.agent_id == id => event,
+            Ok(rho_agent::journal::Feed::Appended(event)) if event.agent_id == id => event,
             Ok(_) => continue,
             Err(error) => break Err(format!("Evaluation feed lost: {error}")),
         };
@@ -209,9 +210,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                                     content, phase, ..
                                 } => {
                                     let text: String = rho_inference::types::text_content(content);
-                                    if *phase
-                                        != Some(rho_agent_host_proto::MessagePhase::Commentary)
-                                    {
+                                    if *phase != Some(rho_agent_types::MessagePhase::Commentary) {
                                         if !final_answer.is_empty() {
                                             final_answer.push('\n');
                                         }

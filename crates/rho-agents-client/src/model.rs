@@ -7,7 +7,7 @@
 //! reconnect's catch-up is thousands of pages, and the main thread hears
 //! one message for the whole of it. What comes here is each host's agents
 //! stream and nothing else; the desk and the host's other news go to the
-//! window on the control stream.
+//! window on streams of their own.
 //!
 //! The connection itself stays where it is, on the shared tokio runtime:
 //! the socket was never the cost, and the workspace-file, terminal, shell
@@ -17,12 +17,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::AgentId;
-use rho_agent_host_proto::agents::ClientFrame;
-use rho_agent_host_proto::transcript::{AgentPos, Live, LogEntry, Seq, TranscriptEvent};
-use rho_hosts::{HostStream, Link};
+use rho_agent_types::{AgentId, AgentPos, Seq};
+use rho_hosts::HostStream;
 
-use crate::remote::AgentsLink;
+use crate::protocol::ClientFrame;
+use crate::protocol::transcript::{Live, LogEntry, TranscriptEvent};
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
 use crate::{HostId, Verdict};
 
@@ -46,11 +45,24 @@ pub enum ModelMsg {
     },
     /// The live tail of an agent the main thread follows.
     Live { agent_id: AgentId, live: Live },
-    /// An agent was created on the host, by any client or agent.
-    AgentCreated { agent_id: AgentId },
+    /// Whose agents these are: the host's database seed, which agent ids
+    /// are encoded with, and the last agent-id counter it handed out. Once
+    /// each time the host's agents stream opens, after anything it resets.
+    Host {
+        machine_seed: u64,
+        agent_counter: u64,
+    },
+    /// Which provider accounts the host's agents may run on.
+    Auth { auth: crate::protocol::AuthState },
+    /// An agent was created on the host, by any client or agent, and the
+    /// agent-id counter moved to `agent_counter`.
+    AgentCreated {
+        agent_id: AgentId,
+        agent_counter: u64,
+    },
     /// The host's quota: every account's latest usage.
     QuotaUsage {
-        summaries: Vec<rho_agent_host_proto::QuotaSummary>,
+        summaries: Vec<crate::protocol::QuotaSummary>,
     },
 }
 
@@ -223,7 +235,22 @@ impl Model {
             AgentFrame::JournalHead {
                 machine_seed,
                 journal_head,
-            } => self.ready(host, machine_seed, journal_head),
+                agent_counter,
+            } => {
+                let mut out = self.ready(host, machine_seed, journal_head);
+                out.push(ModelEvent {
+                    host,
+                    msg: ModelMsg::Host {
+                        machine_seed,
+                        agent_counter,
+                    },
+                });
+                out
+            }
+            AgentFrame::Auth { auth } => vec![ModelEvent {
+                host,
+                msg: ModelMsg::Auth { auth },
+            }],
             AgentFrame::Log { entries } => self.told(host, entries),
             // A live tell for an agent no screen is reading says nothing
             // the digest does not: what a reader sees of it comes from the
@@ -239,9 +266,15 @@ impl Model {
                     msg: ModelMsg::Live { agent_id, live },
                 }]
             }
-            AgentFrame::AgentCreated { agent_id } => vec![ModelEvent {
+            AgentFrame::AgentCreated {
+                agent_id,
+                agent_counter,
+            } => vec![ModelEvent {
                 host,
-                msg: ModelMsg::AgentCreated { agent_id },
+                msg: ModelMsg::AgentCreated {
+                    agent_id,
+                    agent_counter,
+                },
             }],
             AgentFrame::QuotaUsage { summaries } => vec![ModelEvent {
                 host,
@@ -388,9 +421,8 @@ impl Model {
 /// and the disk copy behind it.
 pub struct AgentsClient {
     incoming: futures_mpsc::UnboundedSender<ToModel>,
-    /// Each attached host's agents: its session stream, for the focus the
-    /// window says, and the link the window asks on.
-    streams: std::sync::Mutex<HashMap<HostId, (AgentCommands, AgentsLink)>>,
+    /// Each attached host's agents stream, for the focus the window says.
+    streams: std::sync::Mutex<HashMap<HostId, AgentCommands>>,
 }
 
 impl AgentsClient {
@@ -439,13 +471,10 @@ impl AgentsClient {
 
     /// The agents stream for a host just attached, for the host to open on
     /// every connection. Its frames go to the model, and the model and
-    /// [`Self::focus`] speak on it. `link` is what [`Self::link`] asks on.
-    pub fn stream(&self, host: HostId, link: Link) -> std::sync::Arc<dyn HostStream> {
+    /// [`Self::focus`] speak on it.
+    pub fn stream(&self, host: HostId) -> std::sync::Arc<dyn HostStream> {
         let (stream, commands) = AgentStream::new(host, self.incoming.clone());
-        self.streams
-            .lock()
-            .unwrap()
-            .insert(host, (commands.clone(), AgentsLink::new(link)));
+        self.streams.lock().unwrap().insert(host, commands.clone());
         self.command(ModelCommand::HostCommands { host, commands });
         std::sync::Arc::new(stream)
     }
@@ -458,15 +487,9 @@ impl AgentsClient {
     /// The agents whose live frames a host should stream: every open pane
     /// on it, replaced wholesale.
     pub fn focus(&self, host: HostId, agent_ids: Vec<AgentId>) {
-        if let Some((commands, _)) = self.streams.lock().unwrap().get(&host) {
+        if let Some(commands) = self.streams.lock().unwrap().get(&host) {
             commands.focus(agent_ids);
         }
-    }
-
-    /// A host's agents, to ask things of, while the host is attached.
-    pub fn link(&self, host: HostId) -> Option<AgentsLink> {
-        let streams = self.streams.lock().unwrap();
-        streams.get(&host).map(|(_, link)| link.clone())
     }
 
     /// The agents whose rows the window wants, replaced wholesale.
@@ -514,15 +537,15 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::AgentRole;
-    use rho_agent_host_proto::transcript::{PresentationField, RuntimeKind, SpawnedBy};
+    use rho_agent_types::{AgentRole, PresentationField};
 
     use super::*;
+    use crate::protocol::transcript::{RuntimeKind, SpawnedBy};
 
     const HOST: HostId = HostId(0);
 
     fn agent(id: u64) -> AgentId {
-        AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent id")
+        AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
     fn created(seq: u64, agent_id: AgentId) -> LogEntry {
@@ -533,7 +556,7 @@ mod tests {
             event: TranscriptEvent::Created {
                 role: AgentRole::default(),
                 runtime: RuntimeKind::Claude,
-                place: rho_agent_host_proto::Place {
+                place: rho_agent_types::Place {
                     workset: "0123456789ab".into(),
                     cwd: "/src/repo".into(),
                     mode: Default::default(),
@@ -543,7 +566,7 @@ mod tests {
                 spawn_name: None,
                 parent: None,
                 model: "test-model".to_owned(),
-                at: rho_agent_host_proto::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
             },
         }
     }
@@ -556,7 +579,7 @@ mod tests {
             event: TranscriptEvent::Presented {
                 title: PresentationField::Set(title.to_owned()),
                 activity: PresentationField::Unchanged,
-                at: rho_agent_host_proto::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
             },
         }
     }
@@ -565,13 +588,14 @@ mod tests {
         AgentFrame::JournalHead {
             machine_seed: 7,
             journal_head: Seq(journal_head),
+            agent_counter: 0,
         }
     }
 
     fn live(agent_id: AgentId) -> AgentFrame {
         AgentFrame::Live {
             agent_id,
-            live: rho_agent_host_proto::transcript::Live::Idle,
+            live: crate::protocol::transcript::Live::Idle,
         }
     }
 

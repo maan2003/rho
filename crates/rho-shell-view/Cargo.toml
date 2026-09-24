@@ -1,7 +1,8 @@
 # The comint-style shell surface for a daemon-owned shell: the model that
 # projects the daemon's structured executions into a multibuffer, its
 # styles, its pager, and the actions that belong to it. rho-shell is the
-# kernel; this is the screen.
+# kernel; this is the screen. Without the `client` feature it is the shell
+# protocol alone, for the host and the workset runtime.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
@@ -11,16 +12,40 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+client = [
+  "dep:anyhow",
+  "dep:editor",
+  "dep:futures",
+  "dep:gpui",
+  "dep:language",
+  "dep:multi_buffer",
+  "dep:rho-hosts",
+  "dep:rho-terminal",
+  "dep:rho-window",
+  "dep:text",
+  "dep:theme",
+  "dep:tokio",
+]
+
 [dependencies]
-editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
-futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
-language = { path = "../../vendor/zed/crates/language" }
-multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
-rho-agents-client = { workspace = true }
-rho-terminal = { workspace = true }
+bytes.workspace = true
 rho-agent-host-proto.workspace = true
-rho-window = { workspace = true }
-text = { path = "../../vendor/zed/crates/text" }
-theme = { path = "../../vendor/zed/crates/theme" }
-tokio = { workspace = true, features = ["sync"] }
+senax-encoder.workspace = true
+
+anyhow = { workspace = true, optional = true }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"], optional = true }
+futures = { workspace = true, optional = true }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
+language = { path = "../../vendor/zed/crates/language", optional = true }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
+rho-hosts = { workspace = true, optional = true }
+rho-terminal = { workspace = true, features = ["client"], optional = true }
+rho-window = { workspace = true, optional = true }
+text = { path = "../../vendor/zed/crates/text", optional = true }
+theme = { path = "../../vendor/zed/crates/theme", optional = true }
+tokio = { workspace = true, features = ["sync", "io-util", "macros", "rt"], optional = true }
+
+[dev-dependencies]
+# The tests exercise the client too.
+rho-shell-view = { path = ".", features = ["client"] }

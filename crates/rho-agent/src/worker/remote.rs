@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use rho_agent_types::{AgentId, AgentRole, MessageDelivery};
 use tokio::sync::{oneshot, watch};
 
 use super::ipc::{self, Bootstrap, Control, Message};
 use super::services::Services;
-use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
+use crate::db::AgentReadTxnExt as _;
 use crate::lazy::Lazy;
-use crate::{AgentStatus, MessageDelivery, View};
+use crate::{AgentStatus, View};
 
 #[derive(Clone)]
 pub struct Remote(Arc<Inner>);
@@ -207,21 +208,18 @@ impl Remote {
         self.send(Control::Retry);
     }
     pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        self.send_user_content(
-            vec![rho_agent_host_proto::ContentPart::Text { text }],
-            delivery,
-        );
+        self.send_user_content(vec![rho_agent_types::ContentPart::Text { text }], delivery);
     }
     pub fn send_user_content(
         &self,
-        content: Vec<rho_agent_host_proto::ContentPart>,
+        content: Vec<rho_agent_types::ContentPart>,
         delivery: MessageDelivery,
     ) {
         self.send(Control::User { content, delivery });
     }
     pub async fn send_user_content_accepted(
         &self,
-        content: Vec<rho_agent_host_proto::ContentPart>,
+        content: Vec<rho_agent_types::ContentPart>,
         delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         self.request(Control::User { content, delivery }).await

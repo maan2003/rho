@@ -8,7 +8,7 @@
 //! query, and `n` in one continues what `/` typed in the other.
 
 use gpui::{App, Entity};
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 
 /// Which way a search runs. Not a `bool`: three call sites in a row read
 /// `backwards`, and the one that repeats a search in the other direction
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn a_waiting_search_belongs_to_the_agent_it_waits_for() {
         let agent = |counter| {
-            AgentId::from_counter(counter, &rho_agent_host_proto::AgentIdDomain(0))
+            AgentId::from_counter(counter, &rho_agent_types::AgentIdDomain(0))
                 .expect("a counter in the domain is an id")
         };
         let (mine, theirs) = (agent(1), agent(2));

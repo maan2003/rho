@@ -5,7 +5,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyModule, PyTuple};
-use rho_agent_host_proto::{ContentPart, ToolOutputStatus};
+use rho_agent_types::{ContentPart, ToolOutputStatus};
 use rho_inference::types::{
     ContextBlock, InferenceResponseItem, MessageSender, ProviderSpecificData, ToolType,
 };
@@ -235,8 +235,8 @@ fn history_item<'py>(
                     .set(
                         "phase",
                         phase.map(|phase| match phase {
-                            rho_agent_host_proto::MessagePhase::Commentary => "commentary",
-                            rho_agent_host_proto::MessagePhase::FinalAnswer => "final_answer",
+                            rho_agent_types::MessagePhase::Commentary => "commentary",
+                            rho_agent_types::MessagePhase::FinalAnswer => "final_answer",
                         }),
                     )?
                     .build(),

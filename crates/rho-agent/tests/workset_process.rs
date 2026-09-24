@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rho_agent::pool::AgentPool;
 use rho_agent::{StartPlace, WorksetAction, WorksetAttach, WorksetReply};
-use rho_agent_host_proto::term::{TermClientFrame, TermServerFrame};
+use rho_terminal::protocol::{TermClientFrame, TermServerFrame};
 
 #[tokio::test]
 async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
@@ -67,7 +67,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     assert!(std::path::Path::new(&format!("/proc/{terminal_pid}")).exists());
 
     let error = pool
-        .change_mode(first, rho_fs_view::WorksetMode::Exposed)
+        .change_mode(first, rho_agent_types::WorksetMode::Exposed)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("terminal"));
@@ -94,7 +94,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     .await
     .unwrap();
     let changed = pool
-        .change_mode(first, rho_fs_view::WorksetMode::Exposed)
+        .change_mode(first, rho_agent_types::WorksetMode::Exposed)
         .await
         .unwrap();
     assert!(changed.contains(&first) && changed.contains(&second));
@@ -105,11 +105,11 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     let (_, reloaded, _) = pool.load(first).await.unwrap();
     assert_eq!(
         reloaded.view().await.unwrap().workset_mode(),
-        rho_fs_view::WorksetMode::Exposed
+        rho_agent_types::WorksetMode::Exposed
     );
     // Development integration checks require both companions built first:
     // cargo build -p rho-agent -p rho-shell --bins
-    use rho_agent_host_proto::shell::{ShellClientFrame, ShellServerFrame};
+    use rho_shell_view::protocol::{ShellClientFrame, ShellServerFrame};
     let shell = std::path::Path::new(env!("CARGO_BIN_EXE_rho-agent-worker"))
         .ancestors()
         .map(|path| path.join("rho-shell"))
@@ -346,10 +346,7 @@ async fn streaming_crash() {
         )
         .await
         .unwrap();
-    agent.send_user_message(
-        "run".into(),
-        rho_agent_host_proto::MessageDelivery::Immediate,
-    );
+    agent.send_user_message("run".into(), rho_agent_types::MessageDelivery::Immediate);
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("side-effect").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -367,10 +364,10 @@ async fn streaming_crash() {
         async move {
             agent
                 .send_user_content_accepted(
-                    vec![rho_agent_host_proto::ContentPart::Text {
+                    vec![rho_agent_types::ContentPart::Text {
                         text: "blocked".into(),
                     }],
-                    rho_agent_host_proto::MessageDelivery::NextRequest,
+                    rho_agent_types::MessageDelivery::NextRequest,
                 )
                 .await
         }
@@ -415,7 +412,7 @@ async fn streaming_crash() {
     );
     replacement.send_user_message(
         "inspect fresh globals".into(),
-        rho_agent_host_proto::MessageDelivery::Immediate,
+        rho_agent_types::MessageDelivery::Immediate,
     );
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("recovered").exists() {

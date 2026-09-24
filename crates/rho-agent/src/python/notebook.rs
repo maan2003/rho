@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::{IntoPyObjectExt, PyClass, PyClassInitializer};
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_inference::types::{ContextBlock, ExecCall, ExecId};
 use rho_tool_shell::{BoundedOutput, ShellTools};
 use tokio::sync::Notify;

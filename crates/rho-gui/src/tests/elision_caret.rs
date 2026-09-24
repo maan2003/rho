@@ -27,13 +27,13 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
             id: format!("tool-{ix}"),
             name: "shell_command".to_owned(),
             arguments: format!("echo {ix}"),
-            format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+            format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
             preview: None,
             status: UiToolStatus::Success,
             output: Some(format!("ok {ix}")),
             error: None,
-            started_at: Some(rho_agent_host_proto::UnixMs(1_000)),
-            finished_at: Some(rho_agent_host_proto::UnixMs(3_500)),
+            started_at: Some(rho_agent_types::UnixMs(1_000)),
+            finished_at: Some(rho_agent_types::UnixMs(3_500)),
             metadata: None,
         })
     }));
