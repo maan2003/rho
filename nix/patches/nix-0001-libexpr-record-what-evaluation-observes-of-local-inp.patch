@@ -1,0 +1,1353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maan2003 <manmeetmann2003@gmail.com>
+Date: Thu, 24 Sep 2026 09:36:27 +0000
+Subject: [PATCH 1/3] libexpr: record what evaluation observes of local inputs;
+ C API
+
+With record-input-reads, mounted local inputs are wrapped in an accessor
+that records what each read observed (BLAKE3 of contents and listings,
+stat types, symlink targets), and forcing a source-info attribute such
+as rev records its value. Observations are kept by the EvalState, named
+by the input as evaluation named it and the path within it, and returned
+by nix_eval_state_input_observations.
+
+nix_local_input_open/observe observe a local input again through its
+accessor, with the same code, so a caller can tell whether a result
+still holds by comparing. The accessor hides its fingerprint and
+physical path so copies are always walked through it.
+
+nix_eval_state_builder_eval_settings_as_abstract_settings lets C API
+users set evaluator settings. HashSink takes experimental-feature
+settings like hashString, so observations can use BLAKE3 without
+enabling blake3-hashes for user code.
+---
+ src/libexpr-c/nix_api_expr.cc                 |  33 ++++
+ src/libexpr-c/nix_api_expr.h                  |  49 +++++
+ src/libexpr-tests/lazy-fetcher-attr.cc        |  23 +++
+ src/libexpr/eval.cc                           |   2 +
+ src/libexpr/include/nix/expr/eval-settings.hh |  16 ++
+ src/libexpr/include/nix/expr/eval.hh          |   6 +
+ src/libexpr/paths.cc                          | 123 +++++++++++-
+ src/libexpr/primops/fetchTree.cc              | 121 ++++++++++--
+ src/libfetchers-c/nix_api_fetchers.cc         |  59 ++++++
+ src/libfetchers-c/nix_api_fetchers.h          |  51 +++++
+ src/libfetchers/git-utils.cc                  |  18 ++
+ src/libfetchers/git.cc                        |  71 ++++++-
+ .../include/nix/fetchers/fetchers.hh          |  31 +++
+ .../include/nix/fetchers/git-utils.hh         |   7 +
+ .../nix/fetchers/input-observations.hh        | 104 ++++++++++
+ .../include/nix/fetchers/meson.build          |   1 +
+ src/libfetchers/input-observations.cc         | 183 ++++++++++++++++++
+ src/libfetchers/meson.build                   |   1 +
+ src/libfetchers/path.cc                       |  18 ++
+ src/libutil/hash.cc                           |   7 +-
+ src/libutil/include/nix/util/hash.hh          |   3 +-
+ 21 files changed, 909 insertions(+), 18 deletions(-)
+ create mode 100644 src/libfetchers/include/nix/fetchers/input-observations.hh
+ create mode 100644 src/libfetchers/input-observations.cc
+
+diff --git a/src/libexpr-c/nix_api_expr.cc b/src/libexpr-c/nix_api_expr.cc
+index 5fe7e746e..c990bfaf3 100644
+--- a/src/libexpr-c/nix_api_expr.cc
++++ b/src/libexpr-c/nix_api_expr.cc
+@@ -6,6 +6,7 @@
+ #include "nix/expr/eval-gc.hh"
+ #include "nix/store/globals.hh"
+ #include "nix/expr/eval-settings.hh"
++#include "nix/fetchers/input-observations.hh"
+ #include "nix/util/ref.hh"
+ 
+ #include "nix_api_expr.h"
+@@ -193,6 +194,19 @@ nix_eval_state_builder_fetch_settings_as_abstract_settings(nix_c_context * conte
+     NIXC_CATCH_ERRS_NULL
+ }
+ 
++nix_abstract_settings *
++nix_eval_state_builder_eval_settings_as_abstract_settings(nix_c_context * context, nix_eval_state_builder * builder)
++{
++    if (context)
++        context->last_err_code = NIX_OK;
++    try {
++        return new nix_abstract_settings{
++            .config = &builder->settings,
++        };
++    }
++    NIXC_CATCH_ERRS_NULL
++}
++
+ EvalState * nix_eval_state_build(nix_c_context * context, nix_eval_state_builder * builder)
+ {
+     if (context)
+@@ -233,6 +247,25 @@ void nix_state_free(EvalState * state)
+     operator delete(state, static_cast<std::align_val_t>(alignof(EvalState)));
+ }
+ 
++nix_err nix_eval_state_input_observations(
++    nix_c_context * context, EvalState * state, nix_input_observation_callback callback, void * user_data)
++{
++    if (context)
++        context->last_err_code = NIX_OK;
++    try {
++        if (!state->state.inputObservations)
++            return NIX_OK;
++        for (auto & o : state->state.inputObservations->get())
++            callback(
++                user_data,
++                std::string(nix::fetchers::observationKindName(o.kind)).c_str(),
++                o.input.c_str(),
++                o.path.c_str(),
++                o.value.c_str());
++    }
++    NIXC_CATCH_ERRS
++}
++
+ #if NIX_USE_BOEHMGC
+ boost::concurrent_flat_map<
+     const void *,
+diff --git a/src/libexpr-c/nix_api_expr.h b/src/libexpr-c/nix_api_expr.h
+index 7e7f0ad47..5f23fa3bf 100644
+--- a/src/libexpr-c/nix_api_expr.h
++++ b/src/libexpr-c/nix_api_expr.h
+@@ -278,6 +278,23 @@ nix_err nix_eval_state_builder_set_env_override(
+ nix_abstract_settings *
+ nix_eval_state_builder_fetch_settings_as_abstract_settings(nix_c_context * context, nix_eval_state_builder * builder);
+ 
++/**
++ * @brief Get a settings view for the builder's evaluator settings.
++ *
++ * The returned view targets the `EvalSettings` that the built EvalState will
++ * use. Use it with nix_abstract_settings_set() to override a setting such as
++ * "pure-eval" before calling nix_eval_state_build(). Call it after
++ * nix_eval_state_builder_load(), which would otherwise override the values set
++ * here. Free the view with nix_abstract_settings_free(); this does not free
++ * @p builder, which must outlive the view.
++ *
++ * @param[out] context Optional, stores error information
++ * @param[in] builder The builder whose evaluator settings to view
++ * @return A settings view, or NULL on error
++ */
++nix_abstract_settings *
++nix_eval_state_builder_eval_settings_as_abstract_settings(nix_c_context * context, nix_eval_state_builder * builder);
++
+ /**
+  * @brief Create a new Nix language evaluator state
+  * @ingroup libexpr_init
+@@ -326,6 +343,38 @@ EvalState * nix_state_create(nix_c_context * context, const char ** lookupPath,
+  */
+ void nix_state_free(EvalState * state);
+ 
++/**
++ * @brief Receives one observation from nix_eval_state_input_observations().
++ *
++ * @param[in] user_data The user data passed along
++ * @param[in] kind `stat`, `file`, `dir`, `link` or `attr`
++ * @param[in] input The input, as a URL, as evaluation named it before locking
++ * @param[in] path The path relative to the input's root, empty for the root;
++ * for `attr`, the source-info attribute's name
++ * @param[in] value What was observed, empty if the read failed
++ */
++typedef void (*nix_input_observation_callback)(
++    void * user_data, const char * kind, const char * input, const char * path, const char * value);
++
++/**
++ * @brief What evaluation observed of local inputs so far.
++ *
++ * Needs the `record-input-reads` evaluator setting (see
++ * nix_eval_state_builder_eval_settings_as_abstract_settings()); without it
++ * nothing is recorded. Each distinct observation is passed once, in the order
++ * first made; a path observed with different values during evaluation is
++ * passed once per value. nix_local_input_observe() observes the same things
++ * again.
++ *
++ * @param[out] context Optional, stores error information
++ * @param[in] state The evaluator
++ * @param[in] callback Called for each observation
++ * @param[in] user_data Passed to the callback
++ * @return NIX_OK on success, an error code otherwise
++ */
++nix_err nix_eval_state_input_observations(
++    nix_c_context * context, EvalState * state, nix_input_observation_callback callback, void * user_data);
++
+ /** @addtogroup GC
+  * @ingroup libexpr
+  * @brief Reference counting and garbage collector operations
+diff --git a/src/libexpr-tests/lazy-fetcher-attr.cc b/src/libexpr-tests/lazy-fetcher-attr.cc
+index 4c36424ec..f52fe6e63 100644
+--- a/src/libexpr-tests/lazy-fetcher-attr.cc
++++ b/src/libexpr-tests/lazy-fetcher-attr.cc
+@@ -97,4 +97,27 @@ TEST_F(LazyFetcherAttrTest, lazyFunctionOnlyCalledOnAccess)
+     EXPECT_EQ(calls, 1);
+ }
+ 
++TEST_F(LazyFetcherAttrTest, observedAttrsForceToTheirValues)
++{
++    fetchers::Input input;
++    input.attrs.insert_or_assign("type", std::string("git"));
++    input.attrs.insert_or_assign("rev", std::string("0123456789abcdef0123456789abcdef01234567"));
++    input.attrs.insert_or_assign("lastModified", uint64_t(0));
++
++    Value v;
++    emitTreeAttrs(state, dummyPath(), input, v, false, false);
++    state.forceValue(v, noPos);
++
++    auto * revAttr = v.attrs()->get(state.symbols.create("rev"));
++    ASSERT_NE(revAttr, nullptr);
++    EXPECT_EQ(revAttr->value->type(), nThunk);
++    state.forceValue(*revAttr->value, noPos);
++    EXPECT_EQ(revAttr->value->string_view(), "0123456789abcdef0123456789abcdef01234567");
++
++    auto * dateAttr = v.attrs()->get(state.symbols.create("lastModifiedDate"));
++    ASSERT_NE(dateAttr, nullptr);
++    state.forceValue(*dateAttr->value, noPos);
++    EXPECT_EQ(dateAttr->value->string_view(), "19700101000000");
++}
++
+ } // namespace nix
+diff --git a/src/libexpr/eval.cc b/src/libexpr/eval.cc
+index f967cb999..857f4bb27 100644
+--- a/src/libexpr/eval.cc
++++ b/src/libexpr/eval.cc
+@@ -1,4 +1,5 @@
+ #include "nix/expr/eval.hh"
++#include "nix/fetchers/input-observations.hh"
+ #include "nix/expr/eval-error.hh"
+ #include "nix/expr/eval-settings.hh"
+ #include "nix/expr/primops.hh"
+@@ -244,6 +245,7 @@ EvalState::EvalState(
+     std::shared_ptr<Store> buildStore)
+     : fetchSettings{fetchSettings}
+     , settings{settings}
++    , inputObservations(settings.recordInputReads ? std::make_shared<fetchers::InputObservations>() : nullptr)
+     , symbols(StaticEvalSymbols::staticSymbolTable())
+     , repair(NoRepair)
+     , storeFS(makeMountedSourceAccessor({
+diff --git a/src/libexpr/include/nix/expr/eval-settings.hh b/src/libexpr/include/nix/expr/eval-settings.hh
+index 4613017d7..b00cef20b 100644
+--- a/src/libexpr/include/nix/expr/eval-settings.hh
++++ b/src/libexpr/include/nix/expr/eval-settings.hh
+@@ -494,6 +494,22 @@ public:
+           The default value is chosen to balance performance and memory usage. On 32 bit systems
+           where memory is scarce, the default is a large value to reduce the amount of allocations.
+     )"};
++
++    Setting<bool> recordInputReads{
++        this,
++        false,
++        "record-input-reads",
++        R"(
++          Record what evaluation observed of mounted local inputs: the
++          BLAKE3 hash of file contents and directory listings read, the type
++          of paths stat'd, symlink targets, and the values of source-info
++          attributes such as `rev` that were forced.
++
++          This lets a caller decide whether an evaluation result is still valid
++          by observing the same things again (see `fetchers::observe`) and
++          comparing. Reads bypass the fetcher cache, so copies of local inputs
++          are always walked.
++        )"};
+ };
+ 
+ /**
+diff --git a/src/libexpr/include/nix/expr/eval.hh b/src/libexpr/include/nix/expr/eval.hh
+index f0a89343d..70f51b8bc 100644
+--- a/src/libexpr/include/nix/expr/eval.hh
++++ b/src/libexpr/include/nix/expr/eval.hh
+@@ -43,6 +43,7 @@ class Store;
+ namespace fetchers {
+ struct Settings;
+ struct InputCache;
++class InputObservations;
+ struct Input;
+ } // namespace fetchers
+ struct EvalSettings;
+@@ -363,6 +364,11 @@ public:
+     const fetchers::Settings & fetchSettings;
+     const EvalSettings & settings;
+ 
++    /**
++     * With `record-input-reads`, what evaluation observed of local inputs.
++     */
++    const std::shared_ptr<fetchers::InputObservations> inputObservations;
++
+     SymbolTable symbols;
+     PosTable positions;
+ 
+diff --git a/src/libexpr/paths.cc b/src/libexpr/paths.cc
+index 4ceab2b4d..674235a69 100644
+--- a/src/libexpr/paths.cc
++++ b/src/libexpr/paths.cc
+@@ -2,9 +2,120 @@
+ #include "nix/expr/eval.hh"
+ #include "nix/util/mounted-source-accessor.hh"
+ #include "nix/fetchers/fetch-to-store.hh"
++#include "nix/fetchers/input-observations.hh"
+ 
+ namespace nix {
+ 
++namespace {
++
++/**
++ * Records every read of a mounted local input, with what the read observed:
++ * the empty string if it failed. See `record-input-reads`.
++ */
++class RecordingSourceAccessor : public SourceAccessor
++{
++    ref<SourceAccessor> next;
++    ref<fetchers::InputObservations> observations;
++    std::string input;
++
++    void anchor() override {};
++
++    void record(fetchers::ObservationKind kind, const CanonPath & path, std::string value)
++    {
++        observations->record({kind, input, std::string(path.rel()), std::move(value)});
++    }
++
++public:
++    RecordingSourceAccessor(ref<SourceAccessor> next_, ref<fetchers::InputObservations> observations, std::string input)
++        : next(std::move(next_))
++        , observations(std::move(observations))
++        , input(std::move(input))
++    {
++        displayPrefix.clear();
++    }
++
++    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
++    {
++        fetchers::ContentsObserver contents;
++        TeeSink tee(sink, contents.sink);
++        try {
++            next->readFile(path, tee, sizeCallback);
++        } catch (Error &) {
++            record(fetchers::ObservationKind::File, path, "");
++            throw;
++        }
++        record(fetchers::ObservationKind::File, path, contents.finish());
++    }
++
++    std::optional<Stat> maybeLstat(const CanonPath & path) override
++    {
++        std::optional<Stat> st;
++        try {
++            st = next->maybeLstat(path);
++        } catch (Error &) {
++            record(fetchers::ObservationKind::Stat, path, "");
++            throw;
++        }
++        record(fetchers::ObservationKind::Stat, path, fetchers::observeStat(st));
++        return st;
++    }
++
++    DirEntries readDirectory(const CanonPath & path) override
++    {
++        DirEntries entries;
++        try {
++            entries = next->readDirectory(path);
++        } catch (Error &) {
++            record(fetchers::ObservationKind::Dir, path, "");
++            throw;
++        }
++        record(fetchers::ObservationKind::Dir, path, fetchers::observeListing(entries));
++        return entries;
++    }
++
++    std::string readLink(const CanonPath & path) override
++    {
++        std::string target;
++        try {
++            target = next->readLink(path);
++        } catch (Error &) {
++            record(fetchers::ObservationKind::Link, path, "");
++            throw;
++        }
++        record(fetchers::ObservationKind::Link, path, target);
++        return target;
++    }
++
++    std::string showPath(const CanonPath & path) override
++    {
++        return next->showPath(path);
++    }
++
++    void invalidateCache() override
++    {
++        next->invalidateCache();
++    }
++
++    /* Hide the physical path and fingerprint so that nothing reads the input
++       behind our back, whether from disk or from the fetcher cache. */
++    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
++    {
++        return std::nullopt;
++    }
++
++    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
++    {
++        return {path, std::nullopt};
++    }
++
++    std::optional<time_t> getLastModified() override
++    {
++        return next->getLastModified();
++    }
++};
++
++} // namespace
++
+ SourcePath EvalState::rootPath(CanonPath path)
+ {
+     return {rootFS, std::move(path)};
+@@ -74,7 +185,17 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
+ 
+     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
+ 
+-    storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
++    auto mountPoint = store->printStorePath(storePath);
++    if (inputObservations) {
++        /* Inputs in the store are immutable and identified by their lock. */
++        auto sourcePath = input.getSourcePath(fetchSettings);
++        if (sourcePath && !store->isInStore(sourcePath->string())) {
++            accessor = make_ref<RecordingSourceAccessor>(accessor, ref(inputObservations), originalInput.to_string());
++            inputObservations->mounted(mountPoint, originalInput.to_string());
++        }
++    }
++
++    storeFS->mount(CanonPath(mountPoint), accessor);
+ 
+     input.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
+ 
+diff --git a/src/libexpr/primops/fetchTree.cc b/src/libexpr/primops/fetchTree.cc
+index 0e092927b..cbea62fa2 100644
+--- a/src/libexpr/primops/fetchTree.cc
++++ b/src/libexpr/primops/fetchTree.cc
+@@ -14,6 +14,8 @@
+ #include "nix/fetchers/fetch-to-store.hh"
+ #include "nix/fetchers/input-cache.hh"
+ 
++#include "nix/fetchers/input-observations.hh"
++
+ #include <nlohmann/json.hpp>
+ 
+ #include <ctime>
+@@ -116,6 +118,102 @@ static void emitLazyAttrThunk(EvalState & state, const fetchers::LazyAttr & lazy
+     dest.mkApp(vPrimOp, vExt);
+ }
+ 
++/**
++ * Adapter carrying a source-info metadata attribute whose value is recorded
++ * as an observation of its input when forced (see `record-input-reads`).
++ */
++class ObservedInputAttr : public ExternalValueBase, public gc_cleanup
++{
++private:
++    /* VTable anchor, see LazyFetcherAttr. */
++    virtual void anchor();
++
++public:
++    std::string storePath;
++    std::string name;
++    Value * inner;
++
++    ObservedInputAttr(std::string storePath, std::string name, Value * inner)
++        : storePath(std::move(storePath))
++        , name(std::move(name))
++        , inner(inner)
++    {
++    }
++
++protected:
++    std::ostream & print(std::ostream & str) const override
++    {
++        unreachable();
++    }
++
++public:
++    std::string showType() const override
++    {
++        unreachable();
++    }
++
++    std::string typeOf() const override
++    {
++        unreachable();
++    }
++};
++
++void ObservedInputAttr::anchor() {}
++
++/**
++ * internal primop: Force and record an ObservedInputAttr external value.
++ */
++static void prim_forceObservedInputAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v)
++{
++    Value & arg = *args[0];
++
++    state.forceValue(arg, pos);
++    assert(arg.type() == nExternal);
++    auto * ext = dynamic_cast<ObservedInputAttr *>(args[0]->external());
++    assert(ext);
++
++    state.forceValue(*ext->inner, pos);
++    v = *ext->inner;
++    if (state.inputObservations)
++        if (auto input = state.inputObservations->inputAt(ext->storePath))
++            state.inputObservations->record({
++                .kind = fetchers::ObservationKind::Attr,
++                .input = *input,
++                .path = ext->name,
++                .value = v.type() == nInt ? std::to_string(v.integer().value) : std::string(v.string_view()),
++            });
++}
++
++/**
++ * Allocate `name` in `attrs` as a thunk that records its value as an
++ * observation when forced, and return the value the caller should initialize
++ * instead. This lets eval caches treat metadata such as `self.rev` as an
++ * input only when the evaluation actually depends on it. Keep in sync with
++ * `fetchers::observeSourceInfoAttr`.
++ */
++static Value & observedInputAttr(
++    EvalState & state, BindingsBuilder & attrs, const StorePath & storePath, std::string_view name)
++{
++    // not user-callable (unregistered, internal)
++    static PrimOp forcePrimOp{
++        .name = "__forceObservedInputAttr",
++        .arity = 1,
++        .impl = prim_forceObservedInputAttr,
++        .internal = true,
++    };
++
++    auto * inner = state.allocValue();
++
++    auto * vExt = state.allocValue();
++    vExt->mkExternal(new ObservedInputAttr(state.store->printStorePath(storePath), std::string(name), inner));
++
++    auto * vPrimOp = state.allocValue();
++    vPrimOp->mkPrimOp(&forcePrimOp);
++
++    attrs.alloc(name).mkApp(vPrimOp, vExt);
++    return *inner;
++}
++
+ void emitTreeAttrs(
+     EvalState & state,
+     const StorePath & storePath,
+@@ -125,6 +223,7 @@ void emitTreeAttrs(
+     bool forceDirty)
+ {
+     auto attrs = state.buildBindings(100);
++    auto observed = [&](std::string_view name) -> Value & { return observedInputAttr(state, attrs, storePath, name); };
+ 
+     state.mkStorePathString(storePath, attrs.alloc(state.s.outPath));
+ 
+@@ -139,31 +238,31 @@ void emitTreeAttrs(
+     if (!forceDirty) {
+ 
+         if (auto rev = input.getRev()) {
+-            attrs.alloc("rev").mkString(rev->gitRev(), state.mem);
+-            attrs.alloc("shortRev").mkString(rev->gitShortRev(), state.mem);
++            observed("rev").mkString(rev->gitRev(), state.mem);
++            observed("shortRev").mkString(rev->gitShortRev(), state.mem);
+         } else if (emptyRevFallback) {
+             // Backwards compat for `builtins.fetchGit`: dirty repos return an empty sha1 as rev
+             auto emptyHash = Hash(HashAlgorithm::SHA1);
+-            attrs.alloc("rev").mkString(emptyHash.gitRev(), state.mem);
+-            attrs.alloc("shortRev").mkString(emptyHash.gitShortRev(), state.mem);
++            observed("rev").mkString(emptyHash.gitRev(), state.mem);
++            observed("shortRev").mkString(emptyHash.gitShortRev(), state.mem);
+         }
+ 
+         if (auto revCount = maybeGetLazyAttr(input.attrs, "revCount"))
+-            emitLazyAttrThunk(state, *revCount, attrs.alloc("revCount"));
++            emitLazyAttrThunk(state, *revCount, observed("revCount"));
+         else if (auto revCount = input.getRevCount())
+-            attrs.alloc("revCount").mkInt(*revCount);
++            observed("revCount").mkInt(*revCount);
+         else if (emptyRevFallback)
+-            attrs.alloc("revCount").mkInt(0);
++            observed("revCount").mkInt(0);
+     }
+ 
+     if (auto dirtyRev = fetchers::maybeGetStrAttr(input.attrs, "dirtyRev")) {
+-        attrs.alloc("dirtyRev").mkString(*dirtyRev, state.mem);
+-        attrs.alloc("dirtyShortRev").mkString(*fetchers::maybeGetStrAttr(input.attrs, "dirtyShortRev"), state.mem);
++        observed("dirtyRev").mkString(*dirtyRev, state.mem);
++        observed("dirtyShortRev").mkString(*fetchers::maybeGetStrAttr(input.attrs, "dirtyShortRev"), state.mem);
+     }
+ 
+     if (auto lastModified = input.getLastModified()) {
+-        attrs.alloc("lastModified").mkInt(*lastModified);
+-        attrs.alloc("lastModifiedDate")
++        observed("lastModified").mkInt(*lastModified);
++        observed("lastModifiedDate")
+             .mkString(fmt("%s", std::put_time(std::gmtime(&*lastModified), "%Y%m%d%H%M%S")), state.mem);
+     }
+ 
+diff --git a/src/libfetchers-c/nix_api_fetchers.cc b/src/libfetchers-c/nix_api_fetchers.cc
+index aae719a63..0f0124abc 100644
+--- a/src/libfetchers-c/nix_api_fetchers.cc
++++ b/src/libfetchers-c/nix_api_fetchers.cc
+@@ -2,7 +2,20 @@
+ #include "nix_api_fetchers_internal.hh"
+ #include "nix_api_util_internal.h"
+ 
++#include "nix_api_store_internal.h"
++
+ #include "nix/store/globals.hh"
++#include "nix/fetchers/input-observations.hh"
++
++struct nix_local_input
++{
++    nix::ref<nix::fetchers::Settings> settings;
++    nix::ref<nix::Store> store;
++    nix::fetchers::Input input;
++    nix::ref<nix::SourceAccessor> accessor;
++    /* Computed when an attribute is observed: it can take much longer. */
++    std::optional<nix::fetchers::Input> sourceInfo;
++};
+ 
+ extern "C" {
+ 
+@@ -38,4 +51,50 @@ nix_fetchers_settings_as_abstract_settings(nix_c_context * context, nix_fetchers
+     NIXC_CATCH_ERRS_NULL
+ }
+ 
++nix_local_input *
++nix_local_input_open(nix_c_context * context, nix_fetchers_settings * settings, Store * store, const char * url)
++{
++    if (context)
++        context->last_err_code = NIX_OK;
++    try {
++        auto input = nix::fetchers::Input::fromURL(*settings->settings, url);
++        auto accessor = input.getLocalAccessor(*settings->settings, *store->ptr);
++        return new nix_local_input{
++            .settings = settings->settings,
++            .store = store->ptr,
++            .input = std::move(input),
++            .accessor = accessor,
++        };
++    }
++    NIXC_CATCH_ERRS_NULL
++}
++
++nix_err nix_local_input_observe(
++    nix_c_context * context,
++    nix_local_input * input,
++    const char * kind,
++    const char * path,
++    nix_get_string_callback callback,
++    void * user_data)
++{
++    if (context)
++        context->last_err_code = NIX_OK;
++    try {
++        auto parsed = nix::fetchers::parseObservationKind(kind);
++        if (!parsed)
++            throw nix::Error("unknown observation kind '%s'", kind);
++        if (*parsed == nix::fetchers::ObservationKind::Attr && !input->sourceInfo)
++            input->sourceInfo = input->input.getLocalSourceInfo(*input->settings, *input->store);
++        auto observed = nix::fetchers::observe(
++            *input->accessor, input->sourceInfo.value_or(input->input), *parsed, nix::CanonPath(path));
++        return call_nix_get_string_callback(observed, callback, user_data);
++    }
++    NIXC_CATCH_ERRS
++}
++
++void nix_local_input_free(nix_local_input * input)
++{
++    delete input;
++}
++
+ } // extern "C"
+diff --git a/src/libfetchers-c/nix_api_fetchers.h b/src/libfetchers-c/nix_api_fetchers.h
+index 16df204bc..cba8fe315 100644
+--- a/src/libfetchers-c/nix_api_fetchers.h
++++ b/src/libfetchers-c/nix_api_fetchers.h
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "nix_api_util.h"
++#include "nix_api_store.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -55,6 +56,56 @@ void nix_fetchers_settings_free(nix_fetchers_settings * settings);
+ nix_abstract_settings *
+ nix_fetchers_settings_as_abstract_settings(nix_c_context * context, nix_fetchers_settings * settings);
+ 
++/**
++ * @brief A local input as evaluation would read it now.
++ * @see nix_local_input_open
++ */
++typedef struct nix_local_input nix_local_input;
++
++/**
++ * @brief Open a local input to observe it as evaluation would now.
++ *
++ * With the evaluator setting `record-input-reads`, evaluation records what it
++ * observes of local inputs (see nix_eval_state_input_observations()).
++ * Observing the same things through this and comparing tells whether a
++ * result of that evaluation still holds.
++ *
++ * @param[out] context Optional, stores error information
++ * @param[in] settings The fetchers settings evaluation used
++ * @param[in] store The store evaluation used
++ * @param[in] url The input as observations name it
++ * @return The input, or NULL on error; free with nix_local_input_free()
++ */
++nix_local_input *
++nix_local_input_open(nix_c_context * context, nix_fetchers_settings * settings, Store * store, const char * url);
++
++/**
++ * @brief Observe part of a local input now.
++ *
++ * A read that fails, as of a path that is absent or not of the kind asked
++ * for, is observed as the empty string, as evaluation records it; a `stat`
++ * of an absent path observes `missing`.
++ *
++ * @param[out] context Optional, stores error information
++ * @param[in] input The input
++ * @param[in] kind `stat`, `file`, `dir`, `link` or `attr`
++ * @param[in] path Relative to the input's root, empty for the root; for
++ * `attr`, the source-info attribute's name
++ * @param[in] callback Called with the observation, in the format evaluation
++ * records it; an attribute the input does not have is observed as empty
++ * @param[in] user_data Passed to the callback
++ * @return NIX_OK on success, an error code otherwise
++ */
++nix_err nix_local_input_observe(
++    nix_c_context * context,
++    nix_local_input * input,
++    const char * kind,
++    const char * path,
++    nix_get_string_callback callback,
++    void * user_data);
++
++void nix_local_input_free(nix_local_input * input);
++
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif
+diff --git a/src/libfetchers/git-utils.cc b/src/libfetchers/git-utils.cc
+index 9bdc1f493..9c2775008 100644
+--- a/src/libfetchers/git-utils.cc
++++ b/src/libfetchers/git-utils.cc
+@@ -24,6 +24,7 @@
+ #include <git2/describe.h>
+ #include <git2/errors.h>
+ #include <git2/global.h>
++#include <git2/index.h>
+ #include <git2/indexer.h>
+ #include <git2/object.h>
+ #include <git2/odb.h>
+@@ -118,6 +119,7 @@ typedef std::unique_ptr<git_config_iterator, Deleter<git_config_iterator_free>>
+ typedef std::unique_ptr<git_odb, Deleter<git_odb_free>> ObjectDb;
+ typedef std::unique_ptr<git_packbuilder, Deleter<git_packbuilder_free>> PackBuilder;
+ typedef std::unique_ptr<git_indexer, Deleter<git_indexer_free>> Indexer;
++typedef std::unique_ptr<git_index, Deleter<git_index_free>> Index;
+ 
+ static Hash toHash(const git_oid & oid)
+ {
+@@ -540,6 +542,22 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
+         return (*((std::function<int(const char * path, unsigned int statusFlags)> *) payload))(path, statusFlags);
+     }
+ 
++    std::set<CanonPath> getIndexFiles() override
++    {
++        Index index;
++        if (git_repository_index(Setter(index), *this))
++            throw GitError("reading the index");
++        std::set<CanonPath> files;
++        auto count = git_index_entrycount(index.get());
++        for (size_t i = 0; i < count; ++i) {
++            auto entry = git_index_get_byindex(index.get(), i);
++            /* Like getWorkdirInfo(), which excludes submodules. */
++            if (entry->mode != GIT_FILEMODE_COMMIT)
++                files.insert(CanonPath(entry->path));
++        }
++        return files;
++    }
++
+     WorkdirInfo getWorkdirInfo() override
+     {
+         WorkdirInfo info;
+diff --git a/src/libfetchers/git.cc b/src/libfetchers/git.cc
+index cab3d14c7..ef2a0c47f 100644
+--- a/src/libfetchers/git.cc
++++ b/src/libfetchers/git.cc
+@@ -15,6 +15,7 @@
+ #include "nix/util/archive.hh"
+ #include "nix/util/memo.hh"
+ #include "nix/util/mounted-source-accessor.hh"
++#include "nix/fetchers/filtering-source-accessor.hh"
+ 
+ #include <sys/time.h>
+ 
+@@ -40,6 +41,60 @@ std::filesystem::path getCachePath(std::string_view key, bool shallow)
+     return getCacheDir() / "gitv3" / std::move(name);
+ }
+ 
++/**
++ * A working directory as getAccessorFromWorkdir() shows it, without the
++ * status: visible are the files in the index that the status would not
++ * report deleted, and the directories holding them. Only the entries that
++ * decide a path looked at are stat'd.
++ */
++struct WorkdirIndexAccessor : FilteringSourceAccessor
++{
++    std::filesystem::path repoPath;
++    std::set<CanonPath> index;
++    std::mutex mutex;
++    std::map<CanonPath, bool> present;
++
++    void anchor() override {};
++
++    WorkdirIndexAccessor(std::filesystem::path repoPath_, std::set<CanonPath> index, MakeNotAllowedError && error)
++        : FilteringSourceAccessor(
++              SourcePath(makeFSSourceAccessor(repoPath_, /*trackLastModified=*/false, FinalSymlink::Follow)),
++              std::move(error))
++        , repoPath(std::move(repoPath_))
++        , index(std::move(index))
++    {
++    }
++
++    /* Git reports a file replaced by a directory as deleted too. */
++    bool isPresent(const CanonPath & file)
++    {
++        std::lock_guard lock(mutex);
++        auto [i, inserted] = present.try_emplace(file, false);
++        if (inserted) {
++            auto st = nix::maybeLstat(repoPath / file.rel());
++            i->second = st && !S_ISDIR(st->st_mode);
++        }
++        return i->second;
++    }
++
++    /* As CanonPath::isAllowed() with the files of the status. */
++    bool isAllowed(const CanonPath & path) override
++    {
++        if (path.isRoot())
++            return true;
++        for (auto i = index.lower_bound(path); i != index.end() && i->isWithin(path); ++i)
++            if (isPresent(*i))
++                return true;
++        auto parent = path;
++        while (!parent.isRoot()) {
++            parent.pop();
++            if (index.count(parent) && isPresent(parent))
++                return true;
++        }
++        return false;
++    }
++};
++
+ // Returns the name of the HEAD branch.
+ //
+ // Returns the head branch name as reported by git ls-remote --symref, e.g., if
+@@ -615,7 +670,7 @@ struct GitInputScheme : InputScheme
+         return maybeGetBoolAttr(input.attrs, "allRefs").value_or(false);
+     }
+ 
+-    RepoInfo getRepoInfo(const Input & input, const Settings & settings) const
++    RepoInfo getRepoInfo(const Input & input, const Settings & settings, bool withWorkdirInfo = true) const
+     {
+         auto checkHashAlgorithm = [&](const std::optional<Hash> & hash) {
+             if (hash.has_value() && !(hash->algo == HashAlgorithm::SHA1 || hash->algo == HashAlgorithm::SHA256))
+@@ -717,7 +772,7 @@ struct GitInputScheme : InputScheme
+ 
+         // If this is a local directory and no ref or revision is
+         // given, then allow the use of an unclean working tree.
+-        if (auto repoPath = repoInfo.getPath(); !input.getRef() && !input.getRev() && repoPath)
++        if (auto repoPath = repoInfo.getPath(); withWorkdirInfo && !input.getRef() && !input.getRev() && repoPath)
+             repoInfo.workdirInfo = GitRepo::getCachedWorkdirInfo(*repoPath);
+ 
+         return repoInfo;
+@@ -1107,6 +1162,18 @@ struct GitInputScheme : InputScheme
+         return {accessor, std::move(final)};
+     }
+ 
++    /* A working directory without submodules or export-ignore is read
++       without computing its status. */
++    ref<SourceAccessor> getLocalAccessor(const Settings & settings, Store & store, const Input & input) const override
++    {
++        auto repoInfo = getRepoInfo(input, settings, /*withWorkdirInfo=*/false);
++        auto repoPath = repoInfo.getPath();
++        if (input.getRef() || input.getRev() || !repoPath || getSubmodulesAttr(input) || getExportIgnoreAttr(input))
++            return getAccessor(settings, store, input).first;
++        return make_ref<WorkdirIndexAccessor>(
++            *repoPath, GitRepo::openRepo(*repoPath, {})->getIndexFiles(), makeNotAllowedError(*repoPath));
++    }
++
+     std::optional<std::string> getFingerprint(const Settings & settings, Store & store, const Input & input) const override
+     {
+         auto makeFingerprint = [&](const Hash & rev) {
+diff --git a/src/libfetchers/include/nix/fetchers/fetchers.hh b/src/libfetchers/include/nix/fetchers/fetchers.hh
+index 519d310b9..445411e1c 100644
+--- a/src/libfetchers/include/nix/fetchers/fetchers.hh
++++ b/src/libfetchers/include/nix/fetchers/fetchers.hh
+@@ -141,6 +141,21 @@ public:
+      */
+     std::pair<ref<SourceAccessor>, Input> getAccessor(const Settings & settings, Store & store) const;
+ 
++    /**
++     * The accessor evaluation reads a local input through, as the input is
++     * now, cheaply: without copying it to the store or computing its
++     * fingerprint or source info (a `path` input is read in place, a Git
++     * working directory without its status). For observing an input again
++     * (see `nix/fetchers/input-observations.hh`).
++     */
++    ref<SourceAccessor> getLocalAccessor(const Settings & settings, Store & store) const;
++
++    /**
++     * This local input with the source-info attributes evaluation gets
++     * (`rev`, `lastModified`, ...), as it is now.
++     */
++    Input getLocalSourceInfo(const Settings & settings, Store & store) const;
++
+ private:
+ 
+     std::pair<ref<SourceAccessor>, Input> getAccessorUnchecked(const Settings & settings, Store & store) const;
+@@ -250,6 +265,22 @@ struct InputScheme
+     virtual std::pair<ref<SourceAccessor>, Input>
+     getAccessor(const Settings & settings, Store & store, const Input & input) const = 0;
+ 
++    /**
++     * See `Input::getLocalAccessor()`. By default, getAccessor()'s.
++     */
++    virtual ref<SourceAccessor> getLocalAccessor(const Settings & settings, Store & store, const Input & input) const
++    {
++        return getAccessor(settings, store, input).first;
++    }
++
++    /**
++     * See `Input::getLocalSourceInfo()`. By default, getAccessor()'s.
++     */
++    virtual Input getLocalSourceInfo(const Settings & settings, Store & store, const Input & input) const
++    {
++        return getAccessor(settings, store, input).second;
++    }
++
+     /**
+      * Is this `InputScheme` part of an experimental feature?
+      */
+diff --git a/src/libfetchers/include/nix/fetchers/git-utils.hh b/src/libfetchers/include/nix/fetchers/git-utils.hh
+index 37084497f..1e997a96c 100644
+--- a/src/libfetchers/include/nix/fetchers/git-utils.hh
++++ b/src/libfetchers/include/nix/fetchers/git-utils.hh
+@@ -91,6 +91,13 @@ struct GitRepo
+ 
+     virtual WorkdirInfo getWorkdirInfo() = 0;
+ 
++    /**
++     * The files in the index, submodules excepted: `WorkdirInfo::files`
++     * before excluding those deleted from the working directory, without
++     * computing the status.
++     */
++    virtual std::set<CanonPath> getIndexFiles() = 0;
++
+     static WorkdirInfo getCachedWorkdirInfo(const std::filesystem::path & path);
+ 
+     /* Drop all entries from the getCachedWorkdirInfo() cache. */
+diff --git a/src/libfetchers/include/nix/fetchers/input-observations.hh b/src/libfetchers/include/nix/fetchers/input-observations.hh
+new file mode 100644
+index 000000000..589214809
+--- /dev/null
++++ b/src/libfetchers/include/nix/fetchers/input-observations.hh
+@@ -0,0 +1,104 @@
++#pragma once
++///@file
++
++#include "nix/util/source-accessor.hh"
++#include "nix/fetchers/fetchers.hh"
++
++#include <mutex>
++#include <set>
++
++namespace nix::fetchers {
++
++/**
++ * What an evaluation can observe of a local input: a path's type, a file's
++ * contents, a directory's entries, a symlink's target, or one of the
++ * input's source-info attributes (`rev`, `lastModified`, ...). Recorded with
++ * `record-input-reads`, a result can be revalidated by observing the same
++ * things again and comparing.
++ */
++enum class ObservationKind { Stat, File, Dir, Link, Attr };
++
++std::string_view observationKindName(ObservationKind kind);
++
++std::optional<ObservationKind> parseObservationKind(std::string_view name);
++
++/**
++ * How a stat is observed: `missing`, `regular`, `executable`, `directory`,
++ * `symlink` or `other`.
++ */
++std::string observeStat(const std::optional<SourceAccessor::Stat> & st);
++
++/**
++ * How a directory listing is observed: the base16 BLAKE3 of the entry
++ * names, each followed by a NUL byte, in sorted order.
++ */
++std::string observeListing(const SourceAccessor::DirEntries & entries);
++
++/**
++ * A sink computing how file contents written to it are observed: their
++ * base16 BLAKE3.
++ */
++struct ContentsObserver
++{
++    HashSink sink;
++    ContentsObserver();
++    std::string finish();
++};
++
++/**
++ * What evaluation would observe of `path` (for `Attr`, the attribute name)
++ * in `input` through `accessor`, its accessor now: the empty string for a
++ * read that fails, and for an attribute the input does not have.
++ */
++std::string observe(SourceAccessor & accessor, const Input & input, ObservationKind kind, const CanonPath & path);
++
++/**
++ * The source-info attribute `name` as evaluation shows it for `input`, if
++ * it has one.
++ */
++std::optional<std::string> observeSourceInfoAttr(const Input & input, std::string_view name);
++
++struct InputObservation
++{
++    ObservationKind kind;
++    /**
++     * The input as the evaluation named it, before locking.
++     */
++    std::string input;
++    /**
++     * Relative to the input's root, empty for the root itself; for `Attr`,
++     * the attribute name.
++     */
++    std::string path;
++    /**
++     * Empty if the read failed.
++     */
++    std::string value;
++
++    auto operator<=>(const InputObservation &) const = default;
++};
++
++/**
++ * What an evaluation observed of its local inputs. An observation repeated
++ * with the same value is kept once; one with a different value is kept
++ * again, so that a change during evaluation shows.
++ */
++class InputObservations
++{
++    std::mutex mutex;
++    std::set<InputObservation> seen;
++    std::vector<InputObservation> observations;
++    /* Mount point of each local input, to attribute its source info. */
++    std::map<std::string, std::string> mounts;
++
++public:
++    void record(InputObservation observation);
++
++    std::vector<InputObservation> get();
++
++    void mounted(std::string mountPoint, std::string input);
++
++    std::optional<std::string> inputAt(const std::string & mountPoint);
++};
++
++} // namespace nix::fetchers
+diff --git a/src/libfetchers/include/nix/fetchers/meson.build b/src/libfetchers/include/nix/fetchers/meson.build
+index a313b1e0b..908adc069 100644
+--- a/src/libfetchers/include/nix/fetchers/meson.build
++++ b/src/libfetchers/include/nix/fetchers/meson.build
+@@ -10,6 +10,7 @@ headers = files(
+   'git-lfs-fetch.hh',
+   'git-utils.hh',
+   'input-cache.hh',
++  'input-observations.hh',
+   'registry.hh',
+   'tarball.hh',
+ )
+diff --git a/src/libfetchers/input-observations.cc b/src/libfetchers/input-observations.cc
+new file mode 100644
+index 000000000..8a6de758e
+--- /dev/null
++++ b/src/libfetchers/input-observations.cc
+@@ -0,0 +1,183 @@
++#include "nix/fetchers/input-observations.hh"
++#include "nix/fetchers/attrs.hh"
++#include "nix/util/hash.hh"
++
++#include <iomanip>
++
++namespace nix::fetchers {
++
++namespace {
++
++/* Observations are hashed with BLAKE3 whether or not users may. */
++const ExperimentalFeatureSettings & observationXpSettings()
++{
++    static const ExperimentalFeatureSettings & settings = *[] {
++        auto settings = new ExperimentalFeatureSettings;
++        settings->set("experimental-features", "blake3-hashes");
++        return settings;
++    }();
++    return settings;
++}
++
++} // namespace
++
++ref<SourceAccessor> Input::getLocalAccessor(const Settings & settings, Store & store) const
++{
++    if (!scheme)
++        throw Error("cannot fetch unsupported input '%s'", to_string());
++    return scheme->getLocalAccessor(settings, store, *this);
++}
++
++Input Input::getLocalSourceInfo(const Settings & settings, Store & store) const
++{
++    if (!scheme)
++        throw Error("cannot fetch unsupported input '%s'", to_string());
++    return scheme->getLocalSourceInfo(settings, store, *this);
++}
++
++std::string_view observationKindName(ObservationKind kind)
++{
++    switch (kind) {
++    case ObservationKind::Stat:
++        return "stat";
++    case ObservationKind::File:
++        return "file";
++    case ObservationKind::Dir:
++        return "dir";
++    case ObservationKind::Link:
++        return "link";
++    case ObservationKind::Attr:
++        return "attr";
++    }
++    unreachable();
++}
++
++std::optional<ObservationKind> parseObservationKind(std::string_view name)
++{
++    for (auto kind :
++         {ObservationKind::Stat, ObservationKind::File, ObservationKind::Dir, ObservationKind::Link, ObservationKind::Attr})
++        if (observationKindName(kind) == name)
++            return kind;
++    return std::nullopt;
++}
++
++std::string observeStat(const std::optional<SourceAccessor::Stat> & st)
++{
++    return !st                                  ? "missing"
++           : st->type == SourceAccessor::tRegular   ? (st->isExecutable ? "executable" : "regular")
++           : st->type == SourceAccessor::tDirectory ? "directory"
++           : st->type == SourceAccessor::tSymlink   ? "symlink"
++                                                    : "other";
++}
++
++std::string observeListing(const SourceAccessor::DirEntries & entries)
++{
++    std::string names;
++    for (auto & [name, _] : entries) {
++        names += name;
++        names += '\0';
++    }
++    return hashString(HashAlgorithm::BLAKE3, names, observationXpSettings()).to_string(HashFormat::Base16, false);
++}
++
++ContentsObserver::ContentsObserver()
++    : sink(HashAlgorithm::BLAKE3, observationXpSettings())
++{
++}
++
++std::string ContentsObserver::finish()
++{
++    return sink.finish().hash.to_string(HashFormat::Base16, false);
++}
++
++/* What evaluation reads of a path; throws if it could not read it. */
++static std::string observePath(SourceAccessor & accessor, ObservationKind kind, const CanonPath & path)
++{
++    switch (kind) {
++    case ObservationKind::Stat:
++        return observeStat(accessor.maybeLstat(path));
++    case ObservationKind::File: {
++        ContentsObserver contents;
++        accessor.readFile(path, contents.sink);
++        return contents.finish();
++    }
++    case ObservationKind::Dir:
++        return observeListing(accessor.readDirectory(path));
++    case ObservationKind::Link:
++        return accessor.readLink(path);
++    case ObservationKind::Attr:
++        break;
++    }
++    unreachable();
++}
++
++std::string observe(SourceAccessor & accessor, const Input & input, ObservationKind kind, const CanonPath & path)
++{
++    if (kind == ObservationKind::Attr)
++        return observeSourceInfoAttr(input, path.rel()).value_or("");
++    try {
++        return observePath(accessor, kind, path);
++    } catch (Error &) {
++        return "";
++    }
++}
++
++/* Keep in sync with emitTreeAttrs, for inputs of flakes (no empty-rev
++   fallback, not forced dirty). */
++std::optional<std::string> observeSourceInfoAttr(const Input & input, std::string_view name)
++{
++    if (name == "rev" || name == "shortRev") {
++        auto rev = input.getRev();
++        if (!rev)
++            return std::nullopt;
++        return name == "rev" ? rev->gitRev() : rev->gitShortRev();
++    }
++    if (name == "revCount") {
++        if (auto lazy = maybeGetLazyAttr(input.attrs, "revCount"))
++            return std::to_string(std::get<uint64_t>(forceAttr(*lazy)));
++        if (auto revCount = input.getRevCount())
++            return std::to_string(*revCount);
++        return std::nullopt;
++    }
++    if (name == "dirtyRev" || name == "dirtyShortRev")
++        return maybeGetStrAttr(input.attrs, std::string(name));
++    if (name == "lastModified" || name == "lastModifiedDate") {
++        auto lastModified = input.getLastModified();
++        if (!lastModified)
++            return std::nullopt;
++        if (name == "lastModified")
++            return std::to_string(*lastModified);
++        return fmt("%s", std::put_time(std::gmtime(&*lastModified), "%Y%m%d%H%M%S"));
++    }
++    return std::nullopt;
++}
++
++void InputObservations::record(InputObservation observation)
++{
++    std::lock_guard lock(mutex);
++    if (seen.insert(observation).second)
++        observations.push_back(std::move(observation));
++}
++
++std::vector<InputObservation> InputObservations::get()
++{
++    std::lock_guard lock(mutex);
++    return observations;
++}
++
++void InputObservations::mounted(std::string mountPoint, std::string input)
++{
++    std::lock_guard lock(mutex);
++    mounts.insert_or_assign(std::move(mountPoint), std::move(input));
++}
++
++std::optional<std::string> InputObservations::inputAt(const std::string & mountPoint)
++{
++    std::lock_guard lock(mutex);
++    auto i = mounts.find(mountPoint);
++    if (i == mounts.end())
++        return std::nullopt;
++    return i->second;
++}
++
++} // namespace nix::fetchers
+diff --git a/src/libfetchers/meson.build b/src/libfetchers/meson.build
+index ed52e5652..d1fe40e9c 100644
+--- a/src/libfetchers/meson.build
++++ b/src/libfetchers/meson.build
+@@ -46,6 +46,7 @@ sources = files(
+   'github.cc',
+   'indirect.cc',
+   'input-cache.cc',
++  'input-observations.cc',
+   'mercurial.cc',
+   'path.cc',
+   'registry.cc',
+diff --git a/src/libfetchers/path.cc b/src/libfetchers/path.cc
+index 13988903c..aed831995 100644
+--- a/src/libfetchers/path.cc
++++ b/src/libfetchers/path.cc
+@@ -201,6 +201,24 @@ struct PathInputScheme : InputScheme
+         return {accessor, std::move(input)};
+     }
+ 
++    /* Read in place, rather than copied to the store. */
++    ref<SourceAccessor> getLocalAccessor(const Settings & settings, Store & store, const Input & input) const override
++    {
++        return makeFSSourceAccessor(getAbsPath(settings, input));
++    }
++
++    /* The `lastModified` getAccessor() would give it, without the copy. */
++    Input getLocalSourceInfo(const Settings & settings, Store & store, const Input & _input) const override
++    {
++        Input input(_input);
++        if (!input.getLastModified()) {
++            LambdaSink sink([](std::string_view) {});
++            input.attrs.insert_or_assign(
++                "lastModified", uint64_t(dumpPathAndGetMtime(getAbsPath(settings, input), sink, defaultPathFilter)));
++        }
++        return input;
++    }
++
+     std::optional<ExperimentalFeature> experimentalFeature() const override
+     {
+         return Xp::Flakes;
+diff --git a/src/libutil/hash.cc b/src/libutil/hash.cc
+index ee5f28ffe..48b363a8e 100644
+--- a/src/libutil/hash.cc
++++ b/src/libutil/hash.cc
+@@ -380,8 +380,9 @@ Hash hashFile(HashAlgorithm ha, const std::filesystem::path & path)
+     return sink.finish().hash;
+ }
+ 
+-HashSink::HashSink(HashAlgorithm ha)
++HashSink::HashSink(HashAlgorithm ha, const ExperimentalFeatureSettings & xpSettings)
+     : ha(ha)
++    , xpSettings(&xpSettings)
+ {
+     ctx = new Hash::Ctx;
+     bytes = 0;
+@@ -403,7 +404,7 @@ void HashSink::writeUnbuffered(std::string_view data)
+ HashResult HashSink::finish()
+ {
+     flush();
+-    Hash hash(ha);
++    Hash hash(ha, *xpSettings);
+     nix::finish(ha, *ctx, hash.hash);
+     return HashResult(hash, bytes);
+ }
+@@ -412,7 +413,7 @@ HashResult HashSink::currentHash()
+ {
+     flush();
+     Hash::Ctx ctx2 = *ctx;
+-    Hash hash(ha);
++    Hash hash(ha, *xpSettings);
+     nix::finish(ha, ctx2, hash.hash);
+     return HashResult(hash, bytes);
+ }
+diff --git a/src/libutil/include/nix/util/hash.hh b/src/libutil/include/nix/util/hash.hh
+index 2dab25ea9..255020ccf 100644
+--- a/src/libutil/include/nix/util/hash.hh
++++ b/src/libutil/include/nix/util/hash.hh
+@@ -228,11 +228,12 @@ private:
+     HashAlgorithm ha;
+     Hash::Ctx * ctx;
+     uint64_t bytes;
++    const ExperimentalFeatureSettings * xpSettings;
+ 
+     void anchor() override;
+ 
+ public:
+-    HashSink(HashAlgorithm ha);
++    HashSink(HashAlgorithm ha, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
+     HashSink(const HashSink & h);
+     ~HashSink();
+     void writeUnbuffered(std::string_view data) override;

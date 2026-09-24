@@ -290,9 +290,9 @@
         # read; the agent base's `nix develop` takes local flakes' dev shells
         # from the builder's cache.
         nixFork = nix.packages.${system}.nix.appendPatches [
-          ./nix/patches/nix-0001-libexpr-report-input-mounts-and-forced-source-info-m.patch
-          ./nix/patches/nix-0002-libexpr-record-observed-reads-of-mounted-local-input.patch
-          ./nix/patches/nix-0003-nix-develop-take-a-local-flake-dev-shell-from-RHO_DEVSHELL_BUILDER.patch
+          ./nix/patches/nix-0001-libexpr-record-what-evaluation-observes-of-local-inp.patch
+          ./nix/patches/nix-0002-libstore-BuildEnvironment-toRcScript-C-API.patch
+          ./nix/patches/nix-0003-nix-develop-take-a-local-flake-dev-shell-from-RHO_DE.patch
         ];
 
         guiNativeBuildInputs = [

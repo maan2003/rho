@@ -1,7 +1,7 @@
-From 6d3b756437ca7da7f0a3764d99d022ac56dc16a5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maan2003 <manmeetmann2003@gmail.com>
 Date: Wed, 23 Sep 2026 20:15:56 +0000
-Subject: [PATCH] nix develop: take a local flake dev shell from
+Subject: [PATCH 3/3] nix develop: take a local flake dev shell from
  $RHO_DEVSHELL_BUILDER
 
 rho-devshell-builder builds the same -env output as getShellOutPath and
@@ -15,7 +15,7 @@ locking the flake to find its bashInteractive.
  1 file changed, 75 insertions(+)
 
 diff --git a/src/nix/develop.cc b/src/nix/develop.cc
-index 57558c483..8ce7f1268 100644
+index ab8b3f490..9b83572ef 100644
 --- a/src/nix/develop.cc
 +++ b/src/nix/develop.cc
 @@ -10,6 +10,9 @@
@@ -28,7 +28,7 @@ index 57558c483..8ce7f1268 100644
  
  #ifndef _WIN32 // TODO re-enable on Windows
  #  include "run.hh"
-@@ -214,8 +217,77 @@ struct Common : InstallableCommand, MixProfile
+@@ -114,8 +117,77 @@ struct Common : InstallableCommand, MixProfile
          return res;
      }
  
@@ -106,7 +106,7 @@ index 57558c483..8ce7f1268 100644
          auto path = installable->getStorePath();
          if (path && hasSuffix(path->to_string(), "-env"))
              return *path;
-@@ -383,6 +455,9 @@ struct CmdDevelop : Common, MixEnvironment
+@@ -283,6 +355,9 @@ struct CmdDevelop : Common, MixEnvironment
          std::filesystem::path shell = "bash";
          bool foundInteractive = false;
  
@@ -116,6 +116,3 @@ index 57558c483..8ce7f1268 100644
          try {
              auto state = getEvalState();
  
--- 
-2.55.0
-

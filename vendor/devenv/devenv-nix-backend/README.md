@@ -1,18 +1,14 @@
 # devenv-nix-backend
 
-devenv's default Nix backend.
-Talks to Nix through C++ bindings (the `nix-bindings-*` crates).
-
-A long-lived `EvalState` keeps an in-process evaluation cache across calls within a single devenv run.
+rho's Nix backend for `rho-devshell-builder`.
+Talks to Nix through C bindings (the `nix-bindings-*` crates), against rho's Nix fork (`nix/patches/nix-*.patch`).
 
 ## What's in here
 
-- `backend.rs` — `NixCBackend`, the `NixBackend` trait implementation.
-- `lib.rs`, `lock.rs` — input locking. Writes `devenv.lock`.
-- `cnix_store.rs` — wrapper around the C store API.
-- `build_environment.rs` — pure-Rust parser for cached `-env` JSON.
-- `cachix_daemon.rs`, `cachix_protocol.rs` — client and wire format for the cachix push daemon.
-- `logger.rs` — bridges Nix's activity logger into `tracing`.
+- `flake_env.rs` — `NixRuntime`: evaluates a flake's `devShells` into its `-env` output, recording what evaluation observed of local inputs; GC roots.
+- `observations.rs` — those observations, observing local inputs again, and the rc script `nix develop` sources.
+- `gc_root.rs` — GC root registration.
+- `logger.rs` — bridges Nix's log messages into `tracing`.
 - `umask_guard.rs` — scoped restrictive umask around C calls.
 
 ## Threads and the GC

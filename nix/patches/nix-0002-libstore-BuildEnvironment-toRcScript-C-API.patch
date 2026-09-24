@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maan2003 <manmeetmann2003@gmail.com>
+Date: Thu, 24 Sep 2026 09:37:25 +0000
+Subject: [PATCH 2/3] libstore: BuildEnvironment::toRcScript; C API
+
+The script nix develop and print-dev-env source, moved from develop.cc,
+so that C API users (nix_build_env_to_rc_script) apply an environment
+exactly as nix develop does: interactive variables kept, PATH and
+XDG_DATA_DIRS appended, fresh temporary directories, outputs redirected,
+shellHook last.
+---
+ src/libstore-c/nix_api_build_env.cc           |  17 +++
+ src/libstore-c/nix_api_build_env.h            |  26 ++++
+ src/libstore/build-environment.cc             | 105 ++++++++++++++++
+ .../include/nix/store/build-environment.hh    |  22 ++++
+ src/nix/develop.cc                            | 112 +-----------------
+ 5 files changed, 176 insertions(+), 106 deletions(-)
+
+diff --git a/src/libstore-c/nix_api_build_env.cc b/src/libstore-c/nix_api_build_env.cc
+index 213d9f50d..2316693e7 100644
+--- a/src/libstore-c/nix_api_build_env.cc
++++ b/src/libstore-c/nix_api_build_env.cc
+@@ -72,6 +72,23 @@ nix_err nix_build_env_to_bash(
+     NIXC_CATCH_ERRS
+ }
+ 
++nix_err nix_build_env_to_rc_script(
++    nix_c_context * context,
++    nix_build_env * env,
++    const char * tmp_dir,
++    const char * outputs_dir,
++    nix_get_string_callback callback,
++    void * user_data)
++{
++    if (context)
++        context->last_err_code = NIX_OK;
++    try {
++        auto script = env->env->toRcScript(tmp_dir, outputs_dir);
++        return call_nix_get_string_callback(script, callback, user_data);
++    }
++    NIXC_CATCH_ERRS
++}
++
+ bool nix_build_env_has_structured_attrs(nix_build_env * env)
+ {
+     return env->env->providesStructuredAttrs();
+diff --git a/src/libstore-c/nix_api_build_env.h b/src/libstore-c/nix_api_build_env.h
+index f513d8da5..a3cf3196f 100644
+--- a/src/libstore-c/nix_api_build_env.h
++++ b/src/libstore-c/nix_api_build_env.h
+@@ -115,6 +115,32 @@ nix_err nix_build_env_to_bash(
+     nix_get_string_callback callback,
+     void * user_data);
+ 
++/**
++ * @brief Bash applying a BuildEnvironment to an interactive shell, as
++ * `nix develop` does.
++ *
++ * Unlike nix_build_env_to_bash(), this leaves the variables an interactive
++ * shell keeps alone, keeps the shell's `PATH` and `XDG_DATA_DIRS` after the
++ * environment's, makes fresh temporary directories, and runs `shellHook`.
++ *
++ * @param[out] context Optional, stores error information
++ * @param[in] env The environment
++ * @param[in] tmp_dir Where structured attributes files are written; it must
++ * outlive uses of the script
++ * @param[in] outputs_dir The directory the environment's outputs are
++ * redirected to
++ * @param[in] callback Called with the script
++ * @param[in] user_data Optional, arbitrary data passed to the callback
++ * @return NIX_OK on success, an error code otherwise
++ */
++nix_err nix_build_env_to_rc_script(
++    nix_c_context * context,
++    nix_build_env * env,
++    const char * tmp_dir,
++    const char * outputs_dir,
++    nix_get_string_callback callback,
++    void * user_data);
++
+ /**
+  * @brief Check if the environment provides structured attributes.
+  *
+diff --git a/src/libstore/build-environment.cc b/src/libstore/build-environment.cc
+index 9c3c17f20..1616b5e44 100644
+--- a/src/libstore/build-environment.cc
++++ b/src/libstore/build-environment.cc
+@@ -282,4 +282,109 @@ std::pair<StorePath, BuildEnvironment> BuildEnvironment::getDevEnvironment(ref<S
+     throw Error("get-env.sh failed to produce an environment");
+ }
+ 
++const StringSet BuildEnvironment::interactiveIgnoreVars{
++    "BASHOPTS",
++    "HOME", // FIXME: don't ignore in pure mode?
++    "NIX_BUILD_TOP",
++    "NIX_ENFORCE_PURITY",
++    "NIX_LOG_FD",
++    "NIX_REMOTE",
++    "PPID",
++    "SHELLOPTS",
++    "SSL_CERT_FILE", // FIXME: only want to ignore /no-cert-file.crt
++    "TEMP",
++    "TEMPDIR",
++    "TERM",
++    "TMP",
++    "TMPDIR",
++    "TZ",
++    "UID",
++};
++
++/**
++ * Replace the value of NIX_ATTRS_*_FILE (`/build/.attrs.*`) with a tmp file
++ * that's accessible from the interactive shell session.
++ */
++static void fixupStructuredAttrs(
++    PathView::string_view ext,
++    const std::string & envVar,
++    const std::string & content,
++    StringMap & rewrites,
++    const BuildEnvironment & buildEnvironment,
++    const std::filesystem::path & tmpDir)
++{
++    auto targetFilePath = tmpDir / OS_STR(".attrs.");
++    targetFilePath += ext;
++
++    writeFile(targetFilePath, content);
++
++    auto fileInBuilderEnv = buildEnvironment.vars.find(envVar);
++    assert(fileInBuilderEnv != buildEnvironment.vars.end());
++    rewrites.insert({BuildEnvironment::getString(fileInBuilderEnv->second), targetFilePath.string()});
++}
++
++std::string BuildEnvironment::toRcScript(
++    const std::filesystem::path & tmpDir, const std::filesystem::path & outputsDir, StringMap extraRewrites) const
++{
++    // A list of colon-separated environment variables that should be
++    // prepended to, rather than overwritten, in order to keep the shell usable.
++    // Please keep this list minimal in order to avoid impurities.
++    static const char * const savedVars[] = {
++        "PATH",          // for commands
++        "XDG_DATA_DIRS", // for loadable completion
++    };
++
++    std::ostringstream out;
++
++    out << "unset shellHook\n";
++
++    for (auto & var : savedVars) {
++        out << fmt("%s=${%s:-}\n", var, var);
++        out << fmt("nix_saved_%s=\"$%s\"\n", var, var);
++    }
++
++    toBash(out, interactiveIgnoreVars);
++
++    for (auto & var : savedVars)
++        out << fmt("%s=\"$%s${nix_saved_%s:+:$nix_saved_%s}\"\n", var, var, var, var);
++
++    out << "export NIX_BUILD_TOP=\"$(mktemp -d -t nix-shell.XXXXXX)\"\n";
++    for (auto & i : {"TMP", "TMPDIR", "TEMP", "TEMPDIR"})
++        out << fmt("export %s=\"$NIX_BUILD_TOP\"\n", i);
++
++    out << "eval \"${shellHook:-}\"\n";
++
++    auto script = out.str();
++
++    /* Substitute occurrences of output paths. */
++    auto outputs = vars.find("outputs");
++    if (outputs == vars.end())
++        throw Error("derivation does not have an 'outputs' attribute");
++
++    StringMap rewrites;
++    if (providesStructuredAttrs()) {
++        for (auto & [outputName, from] : getAssociative(outputs->second)) {
++            rewrites.insert({from, (outputsDir / outputName).string()});
++        }
++    } else {
++        for (auto & outputName : getStrings(outputs->second)) {
++            auto from = vars.find(outputName);
++            assert(from != vars.end());
++            rewrites.insert({
++                getString(from->second),
++                (outputsDir / outputName).string(),
++            });
++        }
++    }
++
++    rewrites.insert(extraRewrites.begin(), extraRewrites.end());
++
++    if (providesStructuredAttrs()) {
++        fixupStructuredAttrs(OS_STR("sh"), "NIX_ATTRS_SH_FILE", getAttrsSH(), rewrites, *this, tmpDir);
++        fixupStructuredAttrs(OS_STR("json"), "NIX_ATTRS_JSON_FILE", getAttrsJSON(), rewrites, *this, tmpDir);
++    }
++
++    return rewriteStrings(script, rewrites);
++}
++
+ } // namespace nix
+diff --git a/src/libstore/include/nix/store/build-environment.hh b/src/libstore/include/nix/store/build-environment.hh
+index 43d5b1f57..4038b4d50 100644
+--- a/src/libstore/include/nix/store/build-environment.hh
++++ b/src/libstore/include/nix/store/build-environment.hh
+@@ -172,6 +172,28 @@ struct BuildEnvironment
+      */
+     void toBash(std::ostream & out, const StringSet & ignoreVars) const;
+ 
++    /**
++     * @brief Variables an interactive shell keeps rather than taking them
++     * from the build environment.
++     */
++    static const StringSet interactiveIgnoreVars;
++
++    /**
++     * @brief Bash applying the environment to an interactive shell, as
++     * `nix develop` does.
++     *
++     * `PATH` and `XDG_DATA_DIRS` keep the shell's own values after the
++     * environment's, temporary directories are fresh, and `shellHook` runs
++     * last. Output paths are replaced with directories below @p outputsDir.
++     *
++     * @param tmpDir Where structured attributes files are written; it must
++     * outlive the script's use
++     * @param outputsDir The directory outputs are redirected to
++     * @param rewrites Further replacements, after those of the outputs
++     */
++    std::string toRcScript(
++        const std::filesystem::path & tmpDir, const std::filesystem::path & outputsDir, StringMap rewrites = {}) const;
++
+     /**
+      * @brief Extract a string value from a Value variant.
+      *
+diff --git a/src/nix/develop.cc b/src/nix/develop.cc
+index 57558c483..ab8b3f490 100644
+--- a/src/nix/develop.cc
++++ b/src/nix/develop.cc
+@@ -52,25 +52,6 @@ static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore
+ 
+ struct Common : InstallableCommand, MixProfile
+ {
+-    StringSet ignoreVars{
+-        "BASHOPTS",
+-        "HOME", // FIXME: don't ignore in pure mode?
+-        "NIX_BUILD_TOP",
+-        "NIX_ENFORCE_PURITY",
+-        "NIX_LOG_FD",
+-        "NIX_REMOTE",
+-        "PPID",
+-        "SHELLOPTS",
+-        "SSL_CERT_FILE", // FIXME: only want to ignore /no-cert-file.crt
+-        "TEMP",
+-        "TEMPDIR",
+-        "TERM",
+-        "TMP",
+-        "TMPDIR",
+-        "TZ",
+-        "UID",
+-    };
+-
+     std::vector<std::pair<std::string, std::filesystem::path>> redirects;
+ 
+     Common()
+@@ -91,66 +72,19 @@ struct Common : InstallableCommand, MixProfile
+         const std::filesystem::path & tmpDir,
+         const std::filesystem::path & outputsDir = std::filesystem::path{std::filesystem::current_path()} / "outputs")
+     {
+-        // A list of colon-separated environment variables that should be
+-        // prepended to, rather than overwritten, in order to keep the shell usable.
+-        // Please keep this list minimal in order to avoid impurities.
+-        static const char * const savedVars[] = {
+-            "PATH",          // for commands
+-            "XDG_DATA_DIRS", // for loadable completion
+-        };
+-
+-        std::ostringstream out;
+-
+-        out << "unset shellHook\n";
+-
+-        for (auto & var : savedVars) {
+-            out << fmt("%s=${%s:-}\n", var, var);
+-            out << fmt("nix_saved_%s=\"$%s\"\n", var, var);
+-        }
+-
+-        buildEnvironment.toBash(out, ignoreVars);
+-
+-        for (auto & var : savedVars)
+-            out << fmt("%s=\"$%s${nix_saved_%s:+:$nix_saved_%s}\"\n", var, var, var, var);
+-
+-        out << "export NIX_BUILD_TOP=\"$(mktemp -d -t nix-shell.XXXXXX)\"\n";
+-        for (auto & i : {"TMP", "TMPDIR", "TEMP", "TEMPDIR"})
+-            out << fmt("export %s=\"$NIX_BUILD_TOP\"\n", i);
+-
+-        out << "eval \"${shellHook:-}\"\n";
+-
+-        auto script = out.str();
+-
+-        /* Substitute occurrences of output paths. */
+-        auto outputs = buildEnvironment.vars.find("outputs");
+-        if (outputs == buildEnvironment.vars.end())
+-            throw Error("derivation does not have an 'outputs' attribute");
+-
+-        StringMap rewrites;
+-        if (buildEnvironment.providesStructuredAttrs()) {
+-            for (auto & [outputName, from] : BuildEnvironment::getAssociative(outputs->second)) {
+-                rewrites.insert({from, (outputsDir / outputName).string()});
+-            }
+-        } else {
+-            for (auto & outputName : BuildEnvironment::getStrings(outputs->second)) {
+-                auto from = buildEnvironment.vars.find(outputName);
+-                assert(from != buildEnvironment.vars.end());
+-                rewrites.insert({
+-                    BuildEnvironment::getString(from->second),
+-                    (outputsDir / outputName).string(),
+-                });
+-            }
+-        }
+-
+         /* Substitute redirects. */
++        StringMap rewrites;
++        std::optional<std::string> script;
+         for (auto & [installable_, dir_] : redirects) {
++            if (!script)
++                script = buildEnvironment.toRcScript(tmpDir, outputsDir);
+             auto dir = absPath(dir_);
+             auto installable = parseInstallable(store, installable_);
+             auto builtPaths =
+                 Installable::toStorePathSet(getEvalStore(), store, Realise::Nothing, OperateOn::Output, {installable});
+             for (auto & path : builtPaths) {
+                 auto from = store->printStorePath(path);
+-                if (script.find(from) == std::string::npos)
++                if (script->find(from) == std::string::npos)
+                     warn("'%s' (path '%s') is not used by this build environment", installable->what(), from);
+                 else {
+                     printInfo("redirecting '%s' to '%s'", from, PathFmt(dir));
+@@ -159,41 +93,7 @@ struct Common : InstallableCommand, MixProfile
+             }
+         }
+ 
+-        if (buildEnvironment.providesStructuredAttrs()) {
+-            fixupStructuredAttrs(
+-                OS_STR("sh"), "NIX_ATTRS_SH_FILE", buildEnvironment.getAttrsSH(), rewrites, buildEnvironment, tmpDir);
+-            fixupStructuredAttrs(
+-                OS_STR("json"),
+-                "NIX_ATTRS_JSON_FILE",
+-                buildEnvironment.getAttrsJSON(),
+-                rewrites,
+-                buildEnvironment,
+-                tmpDir);
+-        }
+-
+-        return rewriteStrings(script, rewrites);
+-    }
+-
+-    /**
+-     * Replace the value of NIX_ATTRS_*_FILE (`/build/.attrs.*`) with a tmp file
+-     * that's accessible from the interactive shell session.
+-     */
+-    void fixupStructuredAttrs(
+-        PathView::string_view ext,
+-        const std::string & envVar,
+-        const std::string & content,
+-        StringMap & rewrites,
+-        const BuildEnvironment & buildEnvironment,
+-        const std::filesystem::path & tmpDir)
+-    {
+-        auto targetFilePath = tmpDir / OS_STR(".attrs.");
+-        targetFilePath += ext;
+-
+-        writeFile(targetFilePath, content);
+-
+-        auto fileInBuilderEnv = buildEnvironment.vars.find(envVar);
+-        assert(fileInBuilderEnv != buildEnvironment.vars.end());
+-        rewrites.insert({BuildEnvironment::getString(fileInBuilderEnv->second), targetFilePath.string()});
++        return buildEnvironment.toRcScript(tmpDir, outputsDir, std::move(rewrites));
+     }
+ 
+     Strings getDefaultFlakeAttrPaths() override

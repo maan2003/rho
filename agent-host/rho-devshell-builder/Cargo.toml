@@ -8,9 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-devenv-eval-cache.workspace = true
 devenv-nix-backend.workspace = true
 rho-devshell.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

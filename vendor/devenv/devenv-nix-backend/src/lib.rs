@@ -1,8 +1,12 @@
 //! Nix C API backend for rho: evaluates flake `devShells` into development
-//! environments while recording evaluation effects for caching.
+//! environments while recording what evaluation observed of local inputs,
+//! and observes those inputs again for caching.
 
 pub mod flake_env;
 pub use flake_env::{DevShell, DevShellEval, DevShellRequest, NixRuntime};
+
+pub mod observations;
+pub use observations::{LocalInput, Observation};
 
 pub mod gc_boehm;
 pub use gc_boehm::{
@@ -30,9 +34,6 @@ pub mod logger;
 
 // Extension trait for anyhow::Result conversion
 pub mod anyhow_ext;
-
-// Pure Rust BuildEnvironment parsing (for cached -env JSON)
-pub use devenv_core::build_environment;
 
 // Scoped umask guard for Nix C API calls
 pub mod umask_guard;

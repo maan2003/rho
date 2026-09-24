@@ -433,18 +433,22 @@ security, resource-isolation, or rollback boundary.
   `daemon.sock` in the shared cache directory, from workset processes and
   from `nix develop` in views) under a key every valid entry of a flake shares:
   evaluator, flake location and attribute, `flake.nix` and `flake.lock`.
-  Entries record what evaluation read, as the Nix fork reports it, and the
-  client checks them in its own namespace, where those paths mean what they
-  meant to the evaluator. The agent host owns the entries and which environments
-  stay pinned: the 50 most recently used keep a GC root in the shared cache
+  Entries record what evaluation observed of local inputs (file contents,
+  directory listings, stats, symlinks, source-info attributes), named by the
+  input's URL with the flake's own source tree relative, as the Nix fork
+  records it. The agent host owns the entries and which environments stay
+  pinned: the 50 most recently used keep a GC root in the shared cache
   directory, older ones stay usable until Nix collects them, and using one
-  pins it again. A miss runs `rho-devshell-builder eval`, which links the Nix C
-  API of cachix's Nix carrying `nix/patches/nix-*.patch` (flake input
-  `nix`), evaluates in pure mode and pins what it built; it is installed
-  next to the agent host. The agent base's `nix` is the same patched Nix, whose
-  `nix develop` takes a local flake's dev shell from `rho-devshell-builder
-  shell`, which resolves it as a workset process does, instead of
-  evaluating it. A generation uses a native,
+  pins it again. Everything Nix-shaped is one `rho-devshell-builder shell`
+  process, run by the resolver in the caller's namespace: it links the Nix C
+  API of cachix's Nix carrying `nix/patches/nix-*.patch` (flake input `nix`),
+  checks entries by observing their inputs again through Nix's own
+  accessors, pins a hit, evaluates in pure mode on a miss, and writes the
+  activation script, Nix's own `nix develop` rc script, to the shared cache
+  directory; it is installed next to the agent host. The agent base's `nix`
+  is the same patched Nix, whose `nix develop` takes a local flake's dev
+  shell from the same `rho-devshell-builder shell` instead of evaluating
+  it. A generation uses a native,
   single-threaded supervisor from a separately pinned Bash fork, inheriting the workset
   namespace. It keeps up to five pristine children of the initialized variable/builtin image
   ready for one-shot cwd/stdio specialization, replenishing when idle and falling

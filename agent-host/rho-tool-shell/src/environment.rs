@@ -327,7 +327,7 @@ struct Built {
     /// The cache entry, if the shell could be cached.
     eval_id: Option<u64>,
     /// Bash applying the shell to the caller's environment, `shellHook`
-    /// included.
+    /// included, then rho's `PATH` policy.
     activation: String,
     /// Paths whose contents the shell depends on.
     watch: Vec<PathBuf>,
@@ -341,9 +341,10 @@ async fn resolved_shell(flake: PathBuf) -> Result<(Built, Vec<u8>)> {
         .resolve(&rho_devshell::Flake::new(flake, "default"))
         .await?;
     let path = resolver.activation(&resolved.env_store_path).await?;
-    let activation = tokio::fs::read_to_string(&path)
+    let mut activation = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("read {}", path.display()))?;
+    activation.push_str(rho_devshell::AFTER_SHELL);
     Ok((
         Built {
             eval_id: resolved.id,

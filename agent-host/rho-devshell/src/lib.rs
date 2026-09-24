@@ -2,26 +2,24 @@
 //! how an evaluated shell is found again.
 //!
 //! One [`Resolver`] per workset process serves every agent's commands,
-//! terminals and sidecars; `rho-devshell-builder shell` runs one for a
-//! `nix develop` in a view. Shells are cached by the daemon ([`Client`])
-//! under a key that every valid entry for a flake shares (see
-//! [`Flake::key`]); entries record what evaluation read, and are checked
-//! here, in the caller's filesystem namespace, where those paths mean what
-//! they meant to the evaluator. A miss runs `rho-devshell-builder eval`,
-//! which evaluates with libnix in its own process. With a watcher, a
-//! resolved shell is kept until something it was built from changes.
+//! terminals and sidecars. It runs `rho-devshell-builder shell`, which does
+//! everything Nix-shaped in one process with libnix: finds a valid shell in
+//! the daemon's cache ([`Client`]) under a key every valid entry for a flake
+//! shares (see [`Flake::key`]), checks entries by observing what their
+//! evaluation observed of local inputs again ([`Observation`]), pins them,
+//! evaluates on a miss, and writes the activation script. It runs in the
+//! caller's filesystem namespace, where those inputs mean what they meant to
+//! the evaluator. With a watcher, a resolved shell is kept until something
+//! it was built from changes.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, bail, ensure};
-use devenv_core::ObservedKind;
-use devenv_core::build_environment::BuildEnvironment;
-use devenv_eval_cache::eval_inputs::Uncached;
-use devenv_eval_cache::{Checkout, FlakeScheme, Input};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 
@@ -30,11 +28,46 @@ pub use protocol::Client;
 
 /// Changes whenever evaluation semantics change (evaluator, Nix fork
 /// patches), so shells of an older evaluator are never found.
-pub const EVALUATOR: &str = concat!("rho-devshell/", env!("CARGO_PKG_VERSION"), " nix-2.35-rho3");
+pub const EVALUATOR: &str = concat!("rho-devshell/", env!("CARGO_PKG_VERSION"), " nix-2.35-rho4");
 
-/// Bash running a program after the activation script in `$1`. `shellHook`
-/// output goes to stderr so that stdout is the program's alone.
-pub const EXEC_SCRIPT: &str = r#"script=$1; shift; . "$script" >&2; unset script; exec "$@""#;
+macro_rules! after_shell {
+    () => {
+        r#"
+if [ -n "${RHO_DEVSHELL_CARGO-}" ]; then
+    __rho_cargo=$(command -v cargo || true)
+    case $__rho_cargo in
+        *-cargo-deluxe-*/bin/cargo)
+            __rho_cargo=${__rho_cargo%/cargo}
+            PATH=${PATH/"$__rho_cargo"/"$__rho_cargo:$RHO_DEVSHELL_CARGO"} ;;
+        *) PATH="$RHO_DEVSHELL_CARGO:$PATH" ;;
+    esac
+    unset __rho_cargo
+fi
+if [ -n "${RHO_DEVSHELL_PATH_PREFIX-}" ]; then
+    PATH="$RHO_DEVSHELL_PATH_PREFIX:$PATH"
+fi
+export PATH
+"#
+    };
+}
+
+/// Bash to run after an activation script: the caller's tools ahead of the
+/// shell's own. `RHO_DEVSHELL_CARGO`, a directory with the `cargo` to use,
+/// goes first, except that a shell whose `cargo` is cargo-deluxe keeps it:
+/// deluxe intercepts and runs the next `cargo` on `PATH`, so this one goes
+/// right after it. Then `RHO_DEVSHELL_PATH_PREFIX` goes before everything.
+/// Not part of the script, so that scripts written before a change to it
+/// still get it.
+pub const AFTER_SHELL: &str = after_shell!();
+
+/// Bash running a program after the activation script in `$1` and
+/// [`AFTER_SHELL`]. `shellHook` output goes to stderr so that stdout is the
+/// program's alone.
+pub const EXEC_SCRIPT: &str = concat!(
+    r#"script=$1; shift; . "$script" >&2; unset script"#,
+    after_shell!(),
+    r#"exec "$@""#
+);
 
 /// The nearest directory with a `flake.nix`, looking no further up than the
 /// enclosing git checkout, as Nix finds `.`.
@@ -51,12 +84,30 @@ pub fn find_flake(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+/// How Nix fetches a local flake's source tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    /// `git+file`: only files in the git index are visible.
+    Git,
+    /// `path`: every file is visible.
+    Path,
+}
+
+impl Scheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Git => "git",
+            Scheme::Path => "path",
+        }
+    }
+}
+
 /// Where a flake's source tree is fetched from, as Nix does for a local
 /// flake: the enclosing git repository (with the flake in a subdirectory of
 /// it), or the flake directory itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
-    pub scheme: FlakeScheme,
+    pub scheme: Scheme,
     pub root: PathBuf,
     /// The flake directory relative to `root`.
     pub subdir: PathBuf,
@@ -67,20 +118,19 @@ impl Source {
         for dir in flake_dir.ancestors() {
             if dir.join(".git").exists() {
                 return Self {
-                    scheme: FlakeScheme::Git,
+                    scheme: Scheme::Git,
                     root: dir.to_path_buf(),
                     subdir: flake_dir.strip_prefix(dir).unwrap_or(Path::new("")).to_path_buf(),
                 };
             }
         }
         Self {
-            scheme: FlakeScheme::Path,
+            scheme: Scheme::Path,
             root: flake_dir.to_path_buf(),
             subdir: PathBuf::new(),
         }
     }
 }
-
 /// One dev shell of a local flake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Flake {
@@ -137,14 +187,127 @@ impl Flake {
     }
 }
 
-/// What `rho-devshell-builder eval` reports: the shell, and what its
-/// evaluation read, if that could be recorded.
+/// One thing evaluation observed of a local input, as the Nix fork records
+/// it, with the input named so that every checkout of the flake can check
+/// the same record (see [`InputUrl`]). It still holds while observing it
+/// again gives the same value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Observation {
+    /// `stat`, `file`, `dir`, `link` or `attr`.
+    pub kind: String,
+    pub input: InputUrl,
+    /// Relative to the input's root, empty for the root; for `attr`, the
+    /// source-info attribute's name.
+    pub path: String,
+    /// What was observed; empty if the read failed.
+    pub value: String,
+}
+
+/// A local input's URL (`git+file:///repo?...`, `path:/dir`), with a
+/// directory inside the flake's source tree relative to it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InputUrl {
+    /// Up to the path: `git+file://`, `path:`.
+    pub prefix: String,
+    /// Relative to the flake's source root if inside it, else absolute.
+    pub dir: PathBuf,
+    /// The query and fragment, if any, from their `?` or `#` on.
+    pub rest: String,
+}
+
+impl InputUrl {
+    /// `url` with its directory relative to `root` if inside it; `None` for
+    /// a URL that is not of a local directory.
+    pub fn parse(url: &str, root: &Path) -> Option<Self> {
+        let colon = url.find(':')?;
+        let after = &url[colon + 1..];
+        let slashes = if after.starts_with("//") { 2 } else { 0 };
+        let path_start = colon + 1 + slashes;
+        let path_end = url[path_start..].find(['?', '#']).map_or(url.len(), |i| path_start + i);
+        let dir = PathBuf::from(OsString::from_vec(percent_decode(&url[path_start..path_end])?));
+        if !dir.is_absolute() {
+            return None;
+        }
+        let dir = match dir.strip_prefix(root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => dir,
+        };
+        Some(Self {
+            prefix: url[..path_start].to_owned(),
+            dir,
+            rest: url[path_end..].to_owned(),
+        })
+    }
+
+    /// The input's directory in the checkout at `root`.
+    pub fn dir(&self, root: &Path) -> PathBuf {
+        join(root, &self.dir)
+    }
+
+    /// The input's URL in the checkout at `root`.
+    pub fn url(&self, root: &Path) -> String {
+        format!("{}{}{}", self.prefix, percent_encode(self.dir(root).as_os_str().as_encoded_bytes()), self.rest)
+    }
+
+    fn is_git(&self) -> bool {
+        self.prefix.starts_with("git+")
+    }
+}
+
+/// `base` joined with `rel`, without a trailing slash for an empty `rel`;
+/// an absolute `rel` replaces `base`.
+fn join(base: &Path, rel: &Path) -> PathBuf {
+    if rel.as_os_str().is_empty() { base.to_path_buf() } else { base.join(rel) }
+}
+
+fn percent_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b"-._~/!$&'()*+,;=:@".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A cached shell as the builder stores it in the daemon, which does not
+/// interpret it: the shell, and what its evaluation observed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Evaluated {
     pub drv_path: String,
     pub env_store_path: String,
-    /// `None` if the shell cannot be cached.
-    pub inputs: Option<Vec<Input>>,
+    pub observations: Vec<Observation>,
+}
+
+/// What `rho-devshell-builder shell` prints.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Shell {
+    /// The cache entry, if the shell could be cached.
+    pub id: Option<u64>,
+    pub env_store_path: String,
+    /// The activation script, if the builder had a cache directory to
+    /// write it to.
+    pub activation: Option<PathBuf>,
+    pub watch: Watch,
 }
 
 /// A cached shell as the daemon holds it: `data` is an [`Evaluated`] the
@@ -167,10 +330,19 @@ pub fn roots_dir(dir: &Path) -> PathBuf {
     dir.join("roots")
 }
 
-/// Where the activation script of `env_store_path` is written below the
-/// shared cache directory.
+/// The directory of `env_store_path`'s activation scripts below the shared
+/// cache directory, removed with the environment.
+pub fn activations_dir(dir: &Path, env_store_path: &str) -> PathBuf {
+    dir.join("activations").join(store_basename(env_store_path))
+}
+
+/// Where the activation script of `env_store_path` is written: one per
+/// [`EVALUATOR`], since the script is Nix's. Next to it, with extension
+/// `d`, is the directory it keeps structured attributes and redirects the
+/// environment's outputs to.
 pub fn activation_path(dir: &Path, env_store_path: &str) -> PathBuf {
-    dir.join("activations").join(format!("{}.sh", store_basename(env_store_path)))
+    let evaluator = blake3::hash(EVALUATOR.as_bytes()).to_hex();
+    activations_dir(dir, env_store_path).join(format!("{}.sh", &evaluator[..16]))
 }
 
 fn store_basename(path: &str) -> &str {
@@ -187,7 +359,7 @@ pub struct Resolved {
 }
 
 /// What to watch to know a shell may be stale.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Watch {
     /// Paths whose contents matter: files read, directories listed,
     /// `flake.lock`, and the git state deciding which files are visible
@@ -199,35 +371,26 @@ pub struct Watch {
 }
 
 impl Watch {
-    fn subscribe(&self, watcher: &rho_watch::Watcher) -> io::Result<rho_watch::Subscription> {
-        watcher.watch(
-            self.contents.iter().map(PathBuf::as_path),
-            self.names.iter().map(PathBuf::as_path),
-        )
-    }
-}
-
-impl Watch {
-    fn new(flake: &Flake, inputs: &[Input]) -> Self {
-        let source = &flake.source;
+    /// What to watch for a shell of `flake` built from `observations`.
+    pub fn new(flake: &Flake, observations: &[Observation]) -> Self {
+        let root = &flake.source.root;
         let mut watch = Self::default();
         watch.contents.insert(flake.dir.join("flake.nix"));
         watch.contents.insert(flake.dir.join("flake.lock"));
         // Whether the flake is fetched from git.
-        watch.names.insert(source.root.join(".git"));
-        let absolute = |rel: &Path| {
-            if rel.as_os_str().is_empty() { source.root.clone() } else { source.root.join(rel) }
-        };
-        for input in inputs {
-            match input {
-                Input::Path(p) if p.kind == ObservedKind::Stat => {
-                    watch.names.insert(absolute(&p.path));
+        watch.names.insert(root.join(".git"));
+        let mut git_inputs = BTreeSet::new();
+        for observation in observations {
+            let dir = observation.input.dir(root);
+            if observation.input.is_git() {
+                git_inputs.insert(dir.clone());
+            }
+            match observation.kind.as_str() {
+                "stat" => {
+                    watch.names.insert(join(&dir, Path::new(&observation.path)));
                 }
-                Input::Path(p) => {
-                    watch.contents.insert(absolute(&p.path));
-                }
-                Input::FlakeRev(_) => {
-                    if let Some(git) = GitDirs::find(&source.root) {
+                "attr" => {
+                    if let Some(git) = GitDirs::find(&dir) {
                         watch.contents.insert(git.dir.join("HEAD"));
                         watch.contents.insert(git.common.join("packed-refs"));
                         if let Some(head) = std::fs::read_to_string(git.dir.join("HEAD"))
@@ -238,15 +401,32 @@ impl Watch {
                         }
                     }
                 }
+                _ => {
+                    watch.contents.insert(join(&dir, Path::new(&observation.path)));
+                }
             }
         }
-        if source.scheme == FlakeScheme::Git
-            && let Some(git) = GitDirs::find(&source.root)
-        {
-            watch.contents.insert(git.dir.join("index"));
+        // Which files git inputs show.
+        for dir in git_inputs {
+            if let Some(git) = GitDirs::find(&dir) {
+                watch.contents.insert(git.dir.join("index"));
+            }
         }
         watch.names.retain(|path| !watch.contents.contains(path));
         watch
+    }
+
+    fn subscribe(&self, watcher: &rho_watch::Watcher) -> io::Result<rho_watch::Subscription> {
+        watcher.watch(
+            self.contents.iter().map(PathBuf::as_path),
+            self.names.iter().map(PathBuf::as_path),
+        )
+    }
+
+    /// Whether a subscription to `other` sees every change this watch would.
+    fn within(&self, other: &Watch) -> bool {
+        self.contents.is_subset(&other.contents)
+            && self.names.iter().all(|name| other.names.contains(name) || other.contents.contains(name))
     }
 }
 
@@ -273,76 +453,6 @@ impl GitDirs {
     }
 }
 
-/// The candidates whose recorded inputs all hold in the checkout now, in
-/// the order given. Candidates mostly share inputs; each is observed once.
-fn valid(source: &Source, candidates: Vec<Candidate>) -> Result<Vec<(Candidate, Evaluated)>> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let checkout = Checkout::new(&source.root, source.scheme)?;
-    let mut now = HashMap::new();
-    let mut valid = Vec::new();
-    for candidate in candidates {
-        let Ok(evaluated) = serde_json::from_slice::<Evaluated>(&candidate.data) else {
-            continue;
-        };
-        let Some(inputs) = &evaluated.inputs else { continue };
-        if holds(&checkout, &mut now, inputs) {
-            valid.push((candidate, evaluated));
-        }
-    }
-    Ok(valid)
-}
-
-/// Whether every input observes now as it was recorded, remembering what
-/// was observed in `now`.
-fn holds(
-    checkout: &Checkout,
-    now: &mut HashMap<devenv_eval_cache::eval_inputs::InputIdentity, Option<Input>>,
-    inputs: &[Input],
-) -> bool {
-    inputs.iter().all(|input| {
-        now.entry(input.identity())
-            .or_insert_with(|| input.recapture(checkout, &mut Uncached).ok())
-            .as_ref()
-            == Some(input)
-    })
-}
-
-/// Bash applying the environment at `env_store_path` (the JSON Nix's
-/// `get-env.sh` writes), then [`AFTER_SHELL`].
-fn activation_script(env_store_path: &str) -> Result<String> {
-    let json = std::fs::read_to_string(env_store_path)
-        .with_context(|| format!("read {env_store_path}"))?;
-    let mut script = BuildEnvironment::from_json(&json)
-        .with_context(|| format!("parse {env_store_path}"))?
-        .to_activation_script();
-    script.push_str(AFTER_SHELL);
-    Ok(script)
-}
-
-/// The caller's tools ahead of the shell's own. `RHO_DEVSHELL_CARGO`, a
-/// directory with the `cargo` to use, goes first, except that a shell whose
-/// `cargo` is cargo-deluxe keeps it: deluxe intercepts and runs the next
-/// `cargo` on `PATH`, so this one goes right after it. Then
-/// `RHO_DEVSHELL_PATH_PREFIX` goes before everything.
-pub const AFTER_SHELL: &str = r#"
-if [ -n "${RHO_DEVSHELL_CARGO-}" ]; then
-    __rho_cargo=$(command -v cargo || true)
-    case $__rho_cargo in
-        *-cargo-deluxe-*/bin/cargo)
-            __rho_cargo=${__rho_cargo%/cargo}
-            PATH=${PATH/"$__rho_cargo"/"$__rho_cargo:$RHO_DEVSHELL_CARGO"} ;;
-        *) PATH="$RHO_DEVSHELL_CARGO:$PATH" ;;
-    esac
-    unset __rho_cargo
-fi
-if [ -n "${RHO_DEVSHELL_PATH_PREFIX-}" ]; then
-    PATH="$RHO_DEVSHELL_PATH_PREFIX:$PATH"
-fi
-export PATH
-"#;
-
 /// Finds, pins or evaluates dev shells for one process.
 pub struct Resolver {
     cache: Option<Client>,
@@ -357,10 +467,15 @@ pub struct Resolver {
     hot: Option<Hot>,
 }
 
+type Slot = (PathBuf, String);
+
 /// Shells resolved before, each until something it was built from changes.
 struct Hot {
     watcher: rho_watch::Watcher,
-    shells: Mutex<HashMap<(PathBuf, String), (Resolved, rho_watch::Subscription)>>,
+    shells: Mutex<HashMap<Slot, (Resolved, rho_watch::Subscription)>>,
+    /// What each flake's last shell watched, to watch before resolving it
+    /// again.
+    watches: Mutex<HashMap<Slot, Watch>>,
 }
 
 static RESOLVER: OnceLock<Arc<Resolver>> = OnceLock::new();
@@ -378,7 +493,7 @@ pub fn resolver() -> Arc<Resolver> {
             let dir = std::env::var_os("RHO_DEVSHELL_DIR").map(PathBuf::from);
             Arc::new(Resolver::new(
                 dir.as_deref().map(Client::new),
-                dir.unwrap_or_default(),
+                dir.unwrap_or_else(|| std::env::temp_dir().join("rho-devshell")),
                 rho_fs_view::devshell_builder(),
                 std::env::vars_os().collect(),
             ))
@@ -445,6 +560,7 @@ impl Resolver {
         self.hot = Some(Hot {
             watcher,
             shells: Mutex::default(),
+            watches: Mutex::default(),
         });
         self
     }
@@ -462,7 +578,10 @@ impl Resolver {
         let lock = self.keys.lock().unwrap().entry(key.clone()).or_default().clone();
         let result = {
             let _guard = lock.lock().await;
-            self.resolve_key(flake, &key).await
+            match self.hot(flake).await {
+                Some(resolved) => Ok((resolved, Vec::new())),
+                None => self.resolve_now(flake).await,
+            }
         };
         drop(lock);
         let mut keys = self.keys.lock().unwrap();
@@ -475,7 +594,7 @@ impl Resolver {
     /// A kept shell nothing has changed under, used as a cache hit is.
     async fn hot(&self, flake: &Flake) -> Option<Resolved> {
         let hot = self.hot.as_ref()?;
-        let slot = (flake.dir.clone(), flake.shell.clone());
+        let slot = slot(flake);
         let resolved = {
             let mut shells = hot.shells.lock().unwrap();
             let (resolved, subscription) = shells.get(&slot)?;
@@ -498,104 +617,88 @@ impl Resolver {
         Some(resolved)
     }
 
-    async fn resolve_key(&self, flake: &Flake, key: &str) -> Result<(Resolved, Vec<u8>)> {
-        let mut diagnostics = Vec::new();
-        if let Some(cache) = &self.cache {
-            match self.cached(cache, flake, key).await {
-                Ok(Some((resolved, evaluated))) => {
-                    self.keep(flake, &resolved, evaluated).await;
-                    return Ok((resolved, diagnostics));
+    async fn resolve_now(&self, flake: &Flake) -> Result<(Resolved, Vec<u8>)> {
+        // Watching what the flake's last shell watched before the builder
+        // checks means a change after the check cannot go unseen.
+        let before = match &self.hot {
+            Some(hot) => {
+                let watch = hot.watches.lock().unwrap().get(&slot(flake)).cloned();
+                match watch {
+                    Some(watch) => self.subscribe(hot, watch).await,
+                    None => None,
                 }
-                Ok(None) => {}
-                Err(e) => diagnostics.extend(format!("rho: dev shell cache unavailable: {e:#}\n").bytes()),
             }
-        }
-        let (evaluated, builder_output) = self.evaluate(flake).await?;
-        diagnostics.extend(builder_output);
-        let mut id = None;
-        if let (Some(cache), Some(_)) = (&self.cache, &evaluated.inputs) {
-            match cache
-                .store(key.to_owned(), evaluated.env_store_path.clone(), serde_json::to_vec(&evaluated)?)
-                .await
-            {
-                Ok(stored) => id = Some(stored),
-                Err(e) => diagnostics.extend(format!("rho: failed to cache dev shell: {e:#}\n").bytes()),
-            }
-        }
-        let resolved = Self::resolved(flake, id, &evaluated);
-        self.keep(flake, &resolved, evaluated).await;
+            None => None,
+        };
+        let (shell, diagnostics) = self.build(flake).await?;
+        let resolved = Resolved {
+            id: shell.id,
+            env_store_path: shell.env_store_path,
+            watch: shell.watch,
+        };
+        self.keep(flake, &resolved, before).await;
         Ok((resolved, diagnostics))
     }
 
-    /// Keep `resolved` for [`Self::hot`] if its inputs, now watched, still
-    /// hold: a change after they were checked or read but before the watch
-    /// existed would otherwise go unseen.
-    async fn keep(&self, flake: &Flake, resolved: &Resolved, evaluated: Evaluated) {
-        let (Some(hot), Some(inputs)) = (&self.hot, evaluated.inputs) else {
+    /// Keep `resolved` for [`Self::hot`] if nothing it was built from can
+    /// have changed since the builder checked it unseen: watched from
+    /// before, or watched now and confirmed by checking again.
+    async fn keep(&self, flake: &Flake, resolved: &Resolved, before: Option<(Watch, rho_watch::Subscription)>) {
+        let (Some(hot), Some(id)) = (&self.hot, resolved.id) else {
             return;
         };
-        let watcher = hot.watcher.clone();
-        let watch = resolved.watch.clone();
-        let source = flake.source.clone();
-        let subscription = tokio::task::spawn_blocking(move || {
-            let subscription = watch.subscribe(&watcher).ok()?;
-            let checkout = Checkout::new(&source.root, source.scheme).ok()?;
-            holds(&checkout, &mut HashMap::new(), &inputs).then_some(subscription)
-        })
-        .await;
-        if let Ok(Some(subscription)) = subscription {
-            hot.shells
-                .lock()
-                .unwrap()
-                .insert((flake.dir.clone(), flake.shell.clone()), (resolved.clone(), subscription));
-        }
-    }
-
-    /// The newest valid cached shell whose environment could be pinned.
-    async fn cached(&self, cache: &Client, flake: &Flake, key: &str) -> Result<Option<(Resolved, Evaluated)>> {
-        let candidates = cache.lookup(key.to_owned()).await?;
-        let valid = {
-            let source = flake.source.clone();
-            tokio::task::spawn_blocking(move || valid(&source, candidates)).await??
-        };
-        for (candidate, evaluated) in valid {
-            if !cache.used(candidate.id).await? && !self.pin(&candidate.env_store_path).await? {
-                cache.forget(candidate.id).await?;
-                continue;
+        hot.watches.lock().unwrap().insert(slot(flake), resolved.watch.clone());
+        let subscription = match before {
+            Some((watch, subscription))
+                if resolved.watch.within(&watch) && matches!(subscription.changed(), Ok(false)) =>
+            {
+                subscription
             }
-            return Ok(Some((Self::resolved(flake, Some(candidate.id), &evaluated), evaluated)));
-        }
-        Ok(None)
+            _ => {
+                let Some((_, subscription)) = self.subscribe(hot, resolved.watch.clone()).await else {
+                    return;
+                };
+                let Ok((again, _)) = self.build(flake).await else { return };
+                if again.id != Some(id) || !again.watch.within(&resolved.watch) {
+                    return;
+                }
+                subscription
+            }
+        };
+        hot.shells
+            .lock()
+            .unwrap()
+            .insert(slot(flake), (resolved.clone(), subscription));
     }
 
-    fn resolved(flake: &Flake, id: Option<u64>, evaluated: &Evaluated) -> Resolved {
-        Resolved {
-            id,
-            env_store_path: evaluated.env_store_path.clone(),
-            watch: Watch::new(flake, evaluated.inputs.as_deref().unwrap_or_default()),
-        }
+    async fn subscribe(&self, hot: &Hot, watch: Watch) -> Option<(Watch, rho_watch::Subscription)> {
+        let watcher = hot.watcher.clone();
+        tokio::task::spawn_blocking(move || {
+            let subscription = watch.subscribe(&watcher).ok()?;
+            Some((watch, subscription))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Bash applying the shell at `env_store_path` to the caller's
-    /// environment, `shellHook` included, then rho's `PATH` policy: a
-    /// script written once per environment and shared.
+    /// environment as `nix develop` does, `shellHook` included: a script
+    /// written once per environment and shared. Run [`AFTER_SHELL`] after
+    /// it.
     pub async fn activation(&self, env_store_path: &str) -> Result<PathBuf> {
         let path = activation_path(&self.dir, env_store_path);
-        let dir = path.parent().unwrap().to_owned();
-        let env_store_path = env_store_path.to_owned();
-        let target = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            if target.exists() {
-                return Ok(());
-            }
-            let script = activation_script(&env_store_path)?;
-            std::fs::create_dir_all(&dir)?;
-            let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
-            std::io::Write::write_all(&mut temporary, script.as_bytes())?;
-            temporary.persist(&target)?;
-            Ok(())
-        })
-        .await??;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(path);
+        }
+        let mut command = self.builder_command();
+        command.arg("activate").arg(env_store_path).arg("--dir").arg(&self.dir);
+        let output = run(command).await?;
+        ensure!(
+            output.status.success(),
+            "writing the activation script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(path)
     }
 
@@ -611,11 +714,18 @@ impl Resolver {
         }
     }
 
-    async fn evaluate(&self, flake: &Flake) -> Result<(Evaluated, Vec<u8>)> {
+    /// Run `rho-devshell-builder shell` for `flake`.
+    async fn build(&self, flake: &Flake) -> Result<(Shell, Vec<u8>)> {
         let mut command = self.builder_command();
-        command.arg("eval").arg(&flake.dir).arg("--shell").arg(&flake.shell);
-        if self.cache.is_some() {
-            command.arg("--roots").arg(roots_dir(&self.dir));
+        command
+            .arg("shell")
+            .arg(&flake.dir)
+            .arg("--shell")
+            .arg(&flake.shell)
+            .arg("--dir")
+            .arg(&self.dir);
+        if self.cache.is_none() {
+            command.arg("--no-cache");
         }
         command.current_dir(&flake.dir);
         let output = run(command).await?;
@@ -624,8 +734,8 @@ impl Resolver {
             "rho-devshell-builder failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let evaluated = serde_json::from_slice(&output.stdout).context("parse rho-devshell-builder output")?;
-        Ok((evaluated, output.stderr))
+        let shell = serde_json::from_slice(&output.stdout).context("parse rho-devshell-builder output")?;
+        Ok((shell, output.stderr))
     }
 
     fn builder_command(&self) -> tokio::process::Command {
@@ -633,6 +743,10 @@ impl Resolver {
         command.env_clear().envs(self.environment.iter().map(|(k, v)| (k, v)));
         command
     }
+}
+
+fn slot(flake: &Flake) -> Slot {
+    (flake.dir.clone(), flake.shell.clone())
 }
 
 /// `rho-devshell-builder pin`'s exit status for a path already collected.
@@ -683,8 +797,6 @@ impl Drop for Group {
 
 #[cfg(test)]
 mod tests {
-    use devenv_eval_cache::PathInput;
-
     use super::*;
 
     fn flake(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -726,39 +838,57 @@ mod tests {
     }
 
     #[test]
-    fn only_candidates_whose_inputs_hold_are_valid_in_order() {
-        let dir = flake(&[("flake.nix", "{}"), ("shell.nix", "one")]);
-        let source = Source::find(dir.path());
-        let checkout = Checkout::new(&source.root, source.scheme).unwrap();
-        let input = |rel: &str| {
-            Input::Path(PathInput {
-                kind: ObservedKind::File,
-                scheme: FlakeScheme::Path,
-                path: rel.into(),
-                value: String::new(),
-            })
-            .recapture(&checkout, &mut Uncached)
-            .unwrap()
+    fn input_urls_inside_the_source_are_relative_to_it() {
+        let root = Path::new("/work/a b");
+        let url = InputUrl::parse("git+file:///work/a%20b?dir=sub", root).unwrap();
+        assert_eq!(url.dir, Path::new(""));
+        assert_eq!(url.url(Path::new("/other/ch%eckout")), "git+file:///other/ch%25eckout?dir=sub");
+        let nested = InputUrl::parse("path:/work/a%20b/vendored", root).unwrap();
+        assert_eq!(nested.dir, Path::new("vendored"));
+        assert_eq!(nested.url(root), "path:/work/a%20b/vendored");
+        let outside = InputUrl::parse("path:/elsewhere#x", root).unwrap();
+        assert_eq!(outside.url(Path::new("/other")), "path:/elsewhere#x");
+        assert_eq!(InputUrl::parse("github:NixOS/nixpkgs", root), None);
+    }
+
+    #[test]
+    fn watches_what_was_observed_in_this_checkout() {
+        let repo = flake(&[("flake.nix", "{}"), ("sub/flake.nix", "{}")]);
+        std::fs::create_dir_all(repo.path().join(".git/refs/heads")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let flake = Flake::new(root.join("sub"), "default");
+        let observation = |kind: &str, url: &str, path: &str| Observation {
+            kind: kind.into(),
+            input: InputUrl::parse(url, Path::new("/elsewhere")).unwrap(),
+            path: path.into(),
+            value: String::new(),
         };
-        let candidate = |id, inputs: Option<Vec<Input>>| Candidate {
-            id,
-            env_store_path: format!("/nix/store/{id}-env"),
-            data: serde_json::to_vec(&Evaluated {
-                drv_path: String::new(),
-                env_store_path: String::new(),
-                inputs,
-            })
-            .unwrap(),
-        };
-        let old = candidate(1, Some(vec![input("flake.nix"), input("shell.nix")]));
-        std::fs::write(dir.path().join("shell.nix"), "two").unwrap();
-        let candidates = vec![
-            old,
-            candidate(2, None),
-            candidate(3, Some(vec![input("flake.nix"), input("shell.nix")])),
-            candidate(4, Some(vec![input("flake.nix")])),
-        ];
-        let ids: Vec<u64> = valid(&source, candidates).unwrap().into_iter().map(|(c, _)| c.id).collect();
-        assert_eq!(ids, [3, 4]);
+        let watch = Watch::new(
+            &flake,
+            &[
+                observation("file", "git+file:///elsewhere", "sub/flake.nix"),
+                observation("dir", "git+file:///elsewhere", ""),
+                observation("stat", "git+file:///elsewhere", "sub/missing"),
+                observation("attr", "git+file:///elsewhere", "rev"),
+                observation("file", "path:/outside", "x.nix"),
+            ],
+        );
+        let git = root.join(".git");
+        let contents: BTreeSet<PathBuf> = [
+            root.join("sub/flake.nix"),
+            root.join("sub/flake.lock"),
+            root.clone(),
+            git.join("HEAD"),
+            git.join("packed-refs"),
+            git.join("refs/heads/main"),
+            git.join("index"),
+            PathBuf::from("/outside/x.nix"),
+        ]
+        .into();
+        assert_eq!(watch.contents, contents);
+        assert_eq!(watch.names, [git, root.join("sub/missing")].into());
+        assert!(Watch::new(&flake, &[]).within(&watch));
+        assert!(!watch.within(&Watch::new(&flake, &[])));
     }
 }

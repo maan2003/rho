@@ -4,16 +4,12 @@
 //! settings, the store connection and the logger. Each
 //! [`NixRuntime::eval_dev_shell`] call builds a fresh `EvalState`, locks the
 //! flake in check mode (a stale or missing lock is an error, never a write),
-//! realises the shell derivation, and returns the environment together with
-//! every evaluation effect observed while producing it. Callers decide what
-//! those effects mean for caching.
+//! builds the shell's environment, and returns it together with everything
+//! evaluation observed of local inputs while producing it. Callers decide
+//! what those observations mean for caching.
 
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 
-use devenv_core::eval_op::{EvalOp, OpObserver};
-use devenv_core::nix_log_bridge::NixLogBridge;
 use miette::{Result, WrapErr, miette};
 use nix_bindings_expr::eval_state::{EvalStateBuilder, ThreadRegistrationGuard, gc_register_my_thread};
 use nix_bindings_fetchers::FetchersSettings;
@@ -26,9 +22,9 @@ use nix_bindings_store::store::Store;
 use nix_bindings_util::settings;
 
 use crate::anyhow_ext::AnyhowToMiette;
-use crate::build_environment::BuildEnvironment;
 use crate::gc_root::{GcRootOutcome, ensure_gc_root};
-use crate::logger::{NixLoggerSetup, setup_nix_logger};
+use crate::logger::setup_nix_logger;
+use crate::observations::{LocalInput, Observation, observations};
 use crate::umask_guard::UmaskGuard;
 
 /// Which development shell to evaluate.
@@ -47,23 +43,19 @@ impl DevShellRequest {
     }
 }
 
-/// A realised development shell.
+/// A development shell's environment.
 #[derive(Clone, Debug)]
 pub struct DevShell {
     pub drv_path: String,
     /// Store path of the `-env` JSON produced by `getDevEnvironment`. Rooting
     /// it keeps the shell's inputs alive.
     pub env_store_path: String,
-    /// The environment as Nix serialised it, before any shell hook runs.
-    pub env_json: String,
-    pub env: BuildEnvironment,
 }
 
-/// A development shell plus what its evaluation depended on.
+/// A development shell plus what its evaluation observed.
 pub struct DevShellEval {
     pub shell: DevShell,
-    /// Distinct effects, including input mounts, in no particular order.
-    pub ops: Vec<EvalOp>,
+    pub observations: Vec<Observation>,
 }
 
 /// Process-wide Nix state. Must be created and used on one thread with a
@@ -72,7 +64,7 @@ pub struct NixRuntime {
     store: Store,
     flake_settings: FlakeSettings,
     fetchers_settings: FetchersSettings,
-    logger: NixLoggerSetup,
+    _logger: nix_bindings_expr::logger::ActivityLogger,
     _gc: ThreadRegistrationGuard,
 }
 
@@ -94,37 +86,24 @@ impl NixRuntime {
         let fetchers_settings = FetchersSettings::new()
             .to_miette()
             .wrap_err("Failed to create fetchers settings")?;
+        // Evaluation is under the hood, and checks open checkouts often.
+        fetchers_settings
+            .set("warn-dirty", "false")
+            .to_miette()
+            .wrap_err("Failed to set warn-dirty")?;
         let logger = setup_nix_logger()?;
         Ok(Self {
             store,
             flake_settings,
             fetchers_settings,
-            logger,
+            _logger: logger,
             _gc: gc,
         })
     }
 
-    pub fn log_bridge(&self) -> &Arc<NixLogBridge> {
-        &self.logger.bridge
-    }
-
-    /// Evaluate and realise `request`'s shell, recording evaluation effects.
+    /// Evaluate `request`'s shell and build its environment, recording what
+    /// evaluation observed of local inputs.
     pub fn eval_dev_shell(&mut self, request: &DevShellRequest) -> Result<DevShellEval> {
-        let recorder = Arc::new(Recorder::default());
-        let observer: Arc<dyn OpObserver> = recorder.clone();
-        self.logger.bridge.add_observer(Arc::clone(&observer));
-        let shell = self.eval_dev_shell_inner(request);
-        self.logger.bridge.remove_observer(&observer);
-        let ops = std::mem::take(&mut *recorder.ops.lock().unwrap())
-            .into_iter()
-            .collect();
-        Ok(DevShellEval {
-            shell: shell?,
-            ops,
-        })
-    }
-
-    fn eval_dev_shell_inner(&mut self, request: &DevShellRequest) -> Result<DevShell> {
         let flake_dir = request
             .flake_dir
             .to_str()
@@ -176,32 +155,36 @@ impl NixRuntime {
         state.force(&drv).to_miette()?;
         let drv_path = state.require_attrs_select(&drv, "drvPath").to_miette()?;
         let drv_path = state.require_string(&drv_path).to_miette()?;
-        let out_path = state.require_attrs_select(&drv, "outPath").to_miette()?;
-        {
-            let _umask = UmaskGuard::restrictive();
-            state
-                .realise_string(&out_path, false)
-                .to_miette()
-                .wrap_err("Failed to realise shell derivation")?;
-        }
-
+        // Building the environment needs the derivation, not its output.
         let drv_store_path = self.store.parse_store_path(&drv_path).to_miette()?;
-        let (mut nix_env, env_store_path) = {
+        let (_, env_store_path) = {
             let _umask = UmaskGuard::restrictive();
             NixBuildEnvironment::get_dev_environment(&self.store, &drv_store_path)
                 .to_miette()
                 .wrap_err("Failed to get dev environment")?
         };
-        let env_json = nix_env.to_json().to_miette()?;
-        let env = BuildEnvironment::from_json(&env_json)
-            .map_err(|e| miette!("Failed to parse dev environment: {e}"))?;
         let env_store_path = self.store.real_path(&env_store_path).to_miette()?;
-        Ok(DevShell {
-            drv_path,
-            env_store_path,
-            env_json,
-            env,
+        Ok(DevShellEval {
+            shell: DevShell {
+                drv_path,
+                env_store_path,
+            },
+            observations: observations(&state)?,
         })
+    }
+
+    /// A local input, named as observations name it, to observe as
+    /// evaluation would now.
+    pub fn open_local_input(&self, url: &str) -> Result<LocalInput> {
+        LocalInput::open(&self.fetchers_settings, &self.store, url)
+    }
+
+    /// Bash applying the environment `env_json` (the `-env` output) to an
+    /// interactive shell exactly as `nix develop` does, `shellHook` last.
+    /// Structured attributes files are written to `tmp_dir`, which uses of
+    /// the script need; the environment's outputs go to `outputs_dir`.
+    pub fn rc_script(&self, env_json: &str, tmp_dir: &Path, outputs_dir: &Path) -> Result<String> {
+        crate::observations::rc_script(env_json, tmp_dir, outputs_dir)
     }
 
     /// Point `gc_root` at `store_path` and register it as a Nix GC root.
@@ -241,24 +224,10 @@ impl NixRuntime {
     }
 }
 
-/// Collects distinct effects. Nix repeats many of them (`pathExists`,
-/// `getEnv`, re-reads), so deduplicating on insert bounds memory by the
-/// distinct inputs rather than the raw event count, as devenv's tracker does.
-#[derive(Default)]
-struct Recorder {
-    ops: Mutex<HashSet<EvalOp>>,
-}
-
-impl OpObserver for Recorder {
-    fn record(&self, op: EvalOp) {
-        self.ops.lock().unwrap().insert(op);
-    }
-}
-
 /// Load nix.conf into `builder`, then force the settings evaluation caching
 /// depends on: pure evaluation, so the shell depends only on its flake as with
-/// `nix develop`, and read recording, so every read of the flake's sources is
-/// reported with what it observed.
+/// `nix develop`, and read recording, so every read of local inputs is
+/// recorded with what it observed.
 fn configure_eval_settings(builder: &EvalStateBuilder) -> Result<()> {
     use nix_bindings_bindgen_raw as raw;
     use nix_bindings_util::check_call;
@@ -284,6 +253,23 @@ fn configure_eval_settings(builder: &EvalStateBuilder) -> Result<()> {
                 break;
             }
         }
+        raw::abstract_settings_free(view);
+        result?;
+        // Evaluation is under the hood; a dirty checkout is the norm.
+        let view = check_call!(raw::eval_state_builder_fetch_settings_as_abstract_settings(
+            &mut context,
+            builder.raw_ptr()
+        ))
+        .to_miette()?;
+        let result = check_call!(raw::abstract_settings_set(
+            &mut context,
+            view,
+            c"warn-dirty".as_ptr(),
+            c"false".as_ptr()
+        ))
+        .map(drop)
+        .to_miette()
+        .wrap_err("Failed to set warn-dirty");
         raw::abstract_settings_free(view);
         result
     }

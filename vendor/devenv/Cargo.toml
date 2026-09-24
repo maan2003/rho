@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-  "devenv-cache-core",
-  "devenv-core",
-  "devenv-eval-cache",
   "devenv-nix-backend",
 ]
 
@@ -15,9 +12,6 @@ homepage = "https://devenv.sh/"
 repository = "https://github.com/cachix/devenv/"
 
 [workspace.dependencies]
-arc-swap = "1.9.2"
-devenv-cache-core = { path = "devenv-cache-core" }
-devenv-core = { path = "devenv-core" }
 nix-bindings-flake = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-expr = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-store = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
@@ -25,7 +19,6 @@ nix-bindings-util = { git = "https://github.com/cachix/nix-bindings-rust.git", b
 nix-bindings-fetchers = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 nix-bindings-bindgen-raw = { git = "https://github.com/cachix/nix-bindings-rust.git", branch = "2.35" }
 anyhow = "1.0.102"
-blake3 = "1.8.3"
 miette = { version = "7.6.0", features = ["fancy"] }
 nix = { version = "0.31", features = [
   "fs",
@@ -37,7 +30,5 @@ nix = { version = "0.31", features = [
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-tempfile = "3.27.0"
-thiserror = "2.0.18"
 tracing = "0.1.44"
 rusqlite = { version = "0.40", features = ["bundled"] }

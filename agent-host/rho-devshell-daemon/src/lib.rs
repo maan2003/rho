@@ -1,8 +1,9 @@
 //! The daemon's dev shell cache: which shells were evaluated, and which of
 //! their environments stay pinned.
 //!
-//! Workset processes check entries against their own checkouts, evaluate,
-//! and pin (see `rho-devshell`); the daemon only keeps the entries and
+//! `rho-devshell-builder`, run in workset processes' namespaces, checks
+//! entries against their own checkouts, evaluates, and pins (see
+//! `rho-devshell`); the daemon only keeps the entries and
 //! decides what stays rooted. An entry lives as long as its environment is
 //! in the Nix store. The [`PIN_BUDGET`] most recently used environments keep
 //! a GC root in the shared cache directory; older ones are unpinned and
@@ -19,7 +20,7 @@ use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 pub use rho_devshell::Candidate;
 use rho_devshell::protocol::{self, Reply, Request};
-use rho_devshell::{activation_path, gc_root, roots_dir};
+use rho_devshell::{activations_dir, gc_root, roots_dir};
 use senax_encoder::{Decode, Encode};
 
 /// How many environments stay pinned, most recently used first.
@@ -344,10 +345,10 @@ impl State {
         self.forget_activation(dir, env);
     }
 
-    /// Remove `env`'s activation script once no entry uses it.
+    /// Remove `env`'s activation scripts once no entry uses it.
     fn forget_activation(&self, dir: &Path, env: &str) {
         if !self.entries.values().any(|entry| entry.env_store_path == env) {
-            let _ = std::fs::remove_file(activation_path(dir, env));
+            let _ = std::fs::remove_dir_all(activations_dir(dir, env));
         }
     }
 }

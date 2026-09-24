@@ -11,7 +11,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
-devenv-core.workspace = true
 
 # Dependencies to nix-bindings-rust crates
 nix-bindings-flake.workspace = true

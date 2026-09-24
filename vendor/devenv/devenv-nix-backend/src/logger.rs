@@ -1,36 +1,20 @@
-//! The Nix logger: evaluation effects go to the [`NixLogBridge`], messages to
-//! `tracing`.
+//! The Nix logger: messages go to `tracing`.
 //!
 //! Upstream devenv also mirrored Nix activities (builds, downloads, progress)
 //! into its TUI; rho does not register those callbacks.
 
-use devenv_core::NixLogBridge;
 use miette::Result;
-use nix_bindings_expr::logger::ActivityLoggerBuilder;
+use nix_bindings_expr::logger::{ActivityLogger, ActivityLoggerBuilder};
 use nix_bindings_util::context::Context;
-use std::sync::Arc;
 
-/// Result of setting up the Nix logger.
-pub struct NixLoggerSetup {
-    /// Must be kept alive for the duration of Nix operations.
-    pub logger: nix_bindings_expr::logger::ActivityLogger,
-    /// Receives evaluation effects for input tracking.
-    pub bridge: Arc<NixLogBridge>,
-}
-
-/// Register the logger callbacks with Nix.
-pub fn setup_nix_logger() -> Result<NixLoggerSetup> {
-    let bridge = NixLogBridge::new();
-    let eval_effect_bridge = Arc::clone(&bridge);
+/// Register the logger callbacks with Nix. The logger must be kept alive for
+/// the duration of Nix operations.
+pub fn setup_nix_logger() -> Result<ActivityLogger> {
     let mut context = Context::new();
-    let logger = ActivityLoggerBuilder::new()
+    ActivityLoggerBuilder::new()
         .on_log(log_message)
-        .on_eval_effect(move |kind, subject, detail| {
-            eval_effect_bridge.process_eval_effect(kind, subject, detail);
-        })
         .register(&mut context)
-        .map_err(|e| miette::miette!("Failed to register Nix logger: {}", e))?;
-    Ok(NixLoggerSetup { logger, bridge })
+        .map_err(|e| miette::miette!("Failed to register Nix logger: {}", e))
 }
 
 /// Forward a Nix log message at the matching `tracing` level.
