@@ -14,7 +14,7 @@ use crate::protocol::{
 /// (spawning the default one when none run), or spawn a fresh one with
 /// `new`.
 pub fn open(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     agent: String,
     new: bool,
     cols: u16,
@@ -35,7 +35,7 @@ pub struct TerminalChannel {
 
 /// One agent's running terminals.
 async fn dial_terminal_list(
-    dialer: rho_hosts::Dialer,
+    dialer: rho_agent_hosts::Dialer,
     agent: String,
 ) -> anyhow::Result<Vec<TerminalInfo>> {
     let mut stream = dialer
@@ -47,7 +47,7 @@ async fn dial_terminal_list(
 /// Dials a dedicated terminal stream: attach the agent's first running
 /// terminal (creating id 0 when none run), or spawn a fresh one with `new`.
 async fn dial_terminal(
-    dialer: rho_hosts::Dialer,
+    dialer: rho_agent_hosts::Dialer,
     agent: String,
     new: bool,
     cols: u16,

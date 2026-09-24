@@ -11,6 +11,6 @@ profile-gui OUTPUT="rho-gui-profile.bin" *ARGS="":
   target/profiling/rho-gui --cpu-profile "{{OUTPUT}}" {{ARGS}}
 
 # Build an optimized daemon and save a Dial9 trace on shutdown.
-profile-daemon OUTPUT="rho-daemon-profile.bin" *ARGS="":
+profile-daemon OUTPUT="rho-agent-host-profile.bin" *ARGS="":
   RUSTFLAGS="${RUSTFLAGS:-} --cfg tokio_unstable -Cforce-frame-pointers=yes" cargo build --profile profiling --package rho-cli
   target/profiling/rho daemon --cpu-profile "{{OUTPUT}}" {{ARGS}}

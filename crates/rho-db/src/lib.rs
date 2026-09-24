@@ -252,6 +252,10 @@ const MOVED: &[(&str, &str)] = &[
         "rho_agents_client::cache::AgentSnapshot",
         "rho_mirror::mirror::AgentSnapshot",
     ),
+    (
+        "rho_agent_hosts::saved::SavedHosts",
+        "rho_hosts::saved::SavedHosts",
+    ),
 ];
 
 fn recorded_path<T>() -> &'static str {

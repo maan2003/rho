@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use rho_agent_host::DaemonArgs;
+use rho_agent_host::debug::DebugArgs;
+use rho_agent_hosts::protocol as host;
 use rho_agents_client::protocol as agents;
-use rho_daemon::DaemonArgs;
-use rho_daemon::debug::DebugArgs;
-use rho_hosts::protocol as host;
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_rpc::protocol::client::Client as UiClient;
 use rho_rpc::protocol::{Answer, Call, client};
@@ -42,12 +42,12 @@ pub fn main() -> Result<()> {
         );
     }
     if let Command::Daemon(mut daemon_args) = args.command {
-        let profiler = rho_daemon::DaemonProfiler::start(&mut daemon_args)?;
+        let profiler = rho_agent_host::DaemonProfiler::start(&mut daemon_args)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()?;
-        let result = runtime.block_on(rho_daemon::run(daemon_args));
+        let result = runtime.block_on(rho_agent_host::run(daemon_args));
         drop(runtime);
         return profiler.finish(result);
     }
@@ -70,7 +70,7 @@ async fn run(command: Command) -> Result<()> {
         Command::ClaudeAccount(args) => run_claude_account(args).await,
         Command::Daemon(_) => unreachable!("daemon runs before the shared async runtime"),
         Command::Debug(args) => {
-            rho_daemon::debug::run(args).await?;
+            rho_agent_host::debug::run(args).await?;
             Ok(())
         }
         Command::Eval(args) => eval::run(args).await,

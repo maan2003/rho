@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use rho_hosts::protocol::{
+use rho_agent_hosts::protocol::{
     GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
     IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
 };
@@ -72,7 +72,7 @@ async fn serve_git_transport_request<R, W>(
     services: Arc<Services>,
     reader: R,
     mut writer: W,
-    request: rho_hosts::protocol::GitTransportRequest,
+    request: rho_agent_hosts::protocol::GitTransportRequest,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -269,10 +269,10 @@ fn install_platform_secrets(
 
 /// A PR command's outcome. A failure is the command's own output, not a
 /// refused call.
-async fn pr(services: &Services, command: rho_hosts::protocol::PrCommand) -> PrOutput {
+async fn pr(services: &Services, command: rho_agent_hosts::protocol::PrCommand) -> PrOutput {
     let result = async {
         match command {
-            rho_hosts::protocol::PrCommand::Create {
+            rho_agent_hosts::protocol::PrCommand::Create {
                 owner,
                 repo,
                 head,
@@ -292,21 +292,21 @@ async fn pr(services: &Services, command: rho_hosts::protocol::PrCommand) -> PrO
                 })
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::Subscribe { .. } => Ok((
+            rho_agent_hosts::protocol::PrCommand::Subscribe { .. } => Ok((
                 "persistent PR subscriptions were removed; poll `rho pr status` instead".to_owned(),
                 Vec::new(),
             )),
-            rho_hosts::protocol::PrCommand::Status { url } => services
+            rho_agent_hosts::protocol::PrCommand::Status { url } => services
                 .pr_monitor
                 .status(&url)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
-            rho_hosts::protocol::PrCommand::Stop { .. } => Ok((
+            rho_agent_hosts::protocol::PrCommand::List => Ok(("[]".to_owned(), Vec::new())),
+            rho_agent_hosts::protocol::PrCommand::Stop { .. } => Ok((
                 "persistent PR subscriptions were removed".to_owned(),
                 Vec::new(),
             )),
-            rho_hosts::protocol::PrCommand::Comment {
+            rho_agent_hosts::protocol::PrCommand::Comment {
                 url,
                 reply_comment,
                 body,
@@ -315,17 +315,17 @@ async fn pr(services: &Services, command: rho_hosts::protocol::PrCommand) -> PrO
                 .comment(&url, reply_comment, &body)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::Comments { url } => services
+            rho_agent_hosts::protocol::PrCommand::Comments { url } => services
                 .pr_monitor
                 .comments(&url)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::Checks { url } => services
+            rho_agent_hosts::protocol::PrCommand::Checks { url } => services
                 .pr_monitor
                 .checks(&url)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::Edit {
+            rho_agent_hosts::protocol::PrCommand::Edit {
                 url,
                 base,
                 title,
@@ -335,12 +335,12 @@ async fn pr(services: &Services, command: rho_hosts::protocol::PrCommand) -> PrO
                 .edit(&url, base, title, body)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::Rerun { url, run_id } => services
+            rho_agent_hosts::protocol::PrCommand::Rerun { url, run_id } => services
                 .pr_monitor
                 .rerun(&url, run_id)
                 .await
                 .map(|output| (output, Vec::new())),
-            rho_hosts::protocol::PrCommand::Logs { url, run_id } => services
+            rho_agent_hosts::protocol::PrCommand::Logs { url, run_id } => services
                 .pr_monitor
                 .logs(&url, run_id)
                 .await
@@ -364,10 +364,10 @@ async fn pr(services: &Services, command: rho_hosts::protocol::PrCommand) -> PrO
 
 async fn store_gui_telemetry(snapshot: Vec<u8>) -> anyhow::Result<String> {
     anyhow::ensure!(
-        snapshot.len() <= rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_agent_hosts::protocol::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
         snapshot.len(),
-        rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES
+        rho_agent_hosts::protocol::MAX_GUI_TELEMETRY_BYTES
     );
     let path = tokio::task::spawn_blocking(move || {
         let state = dirs::state_dir().context("state directory not available")?;
@@ -383,9 +383,9 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
     use std::io::Write as _;
 
     anyhow::ensure!(
-        snapshot.len() <= rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES,
+        snapshot.len() <= rho_agent_hosts::protocol::MAX_GUI_TELEMETRY_BYTES,
         "GUI telemetry snapshot exceeds the {} byte limit",
-        rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES
+        rho_agent_hosts::protocol::MAX_GUI_TELEMETRY_BYTES
     );
     let directory = state_root.join("gui-telemetry");
     std::fs::create_dir_all(&directory)
@@ -441,7 +441,7 @@ mod tests {
         assert!(
             persist_gui_telemetry(
                 temp.path(),
-                &vec![0; rho_hosts::protocol::MAX_GUI_TELEMETRY_BYTES + 1]
+                &vec![0; rho_agent_hosts::protocol::MAX_GUI_TELEMETRY_BYTES + 1]
             )
             .unwrap_err()
             .to_string()

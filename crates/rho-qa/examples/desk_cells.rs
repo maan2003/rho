@@ -18,7 +18,7 @@ use rho_desk_client::protocol::cells::{Cell, DeviceId, Id, Property, PropertyKey
 use senax_encoder::{Decode, Encode};
 
 /// The daemon's own key and metadata shapes, redeclared: they are private
-/// to `rho-daemon`, and senax encodes by field, so the same fields in the
+/// to `rho-agent-host`, and senax encodes by field, so the same fields in the
 /// same order read the same bytes. If the daemon's shapes change this
 /// stops decoding, loudly, which is the right way for it to fail.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
@@ -37,7 +37,7 @@ struct CellMeta {
 
 /// The names the daemon's tables were written under. redb records the
 /// Rust path of a value type and refuses a table that says another one,
-/// so a reader outside `rho-daemon` has to answer to the daemon's names.
+/// so a reader outside `rho-agent-host` has to answer to the daemon's names.
 #[derive(Debug)]
 struct AddressAsDaemonWroteIt;
 #[derive(Debug)]

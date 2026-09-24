@@ -17,7 +17,7 @@ client = [
   "dep:anyhow",
   "dep:futures",
   "dep:gpui",
-  "dep:rho-hosts",
+  "dep:rho-agent-hosts",
   "dep:settings",
   "dep:theme",
   "dep:theme_settings",
@@ -31,7 +31,7 @@ senax-encoder.workspace = true
 anyhow = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"], optional = true }
-rho-hosts = { workspace = true, features = ["client"], optional = true }
+rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 settings = { path = "../../vendor/zed/crates/settings", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = true }

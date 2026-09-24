@@ -63,7 +63,7 @@ rho-db = { workspace = true }
 rho-files = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-agents-view = { workspace = true }
-rho-hosts = { workspace = true, features = ["client"] }
+rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
@@ -131,7 +131,7 @@ rho-slack = { workspace = true, features = ["ui", "fake"] }
 # The default Slack world's own numbers, for the one measurement that has to
 # be at the scale the user runs at rather than at a scale chosen here.
 rho-fake-slack.workspace = true
-rho-hosts = { workspace = true, features = ["test-support"] }
+rho-agent-hosts = { workspace = true, features = ["test-support"] }
 rho-desk-client = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
 editor = { path = "../../vendor/zed/crates/editor", features = [

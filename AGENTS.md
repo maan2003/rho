@@ -18,7 +18,7 @@ inbound world, like Slack. The GUI is the product.
 
 - `rho-gui` stands alone. It keeps its own database, runs Slack itself,
   and syncs the desk. It is usually remote, on a laptop or a phone.
-- Agent hosts (`rho-daemon`) are machines the GUI attaches to. They run
+- Agent hosts (`rho-agent-host`) are machines the GUI attaches to. They run
   agents, one worker process per workset.
 
 ## Security

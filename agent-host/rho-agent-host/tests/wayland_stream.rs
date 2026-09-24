@@ -5,9 +5,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+use rho_agent_hosts::protocol as host;
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::NewAgent;
-use rho_hosts::protocol as host;
 use rho_rpc::protocol::{Opened, read_frame, write_open};
 
 struct Child(std::process::Child);

@@ -1256,7 +1256,7 @@ impl Build {
     }
 
     fn daemon(&self) -> PathBuf {
-        self.dir.join("rho-daemon")
+        self.dir.join("rho-agent-host")
     }
 
     fn gui(&self) -> PathBuf {
@@ -1299,7 +1299,7 @@ fn binaries(which: Binaries, gui: bool) -> Result<Build> {
                 .join(".nix-profile")
                 .join("bin"),
             "nix",
-            // The nix profile ships `rho` and `rho-daemon` only; the GUI and
+            // The nix profile ships `rho` and `rho-agent-host` only; the GUI and
             // the fakes come from the tree either way.
             Some(target.join("profiling")),
         ),

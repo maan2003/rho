@@ -73,7 +73,11 @@ impl Streams {
         self.call(command, |()| None);
     }
 
-    fn call<C: rho_rpc::protocol::Call>(&self, call: C, answered: fn(C::Reply) -> Option<Incoming>) {
+    fn call<C: rho_rpc::protocol::Call>(
+        &self,
+        call: C,
+        answered: fn(C::Reply) -> Option<Incoming>,
+    ) {
         let socket = self.socket.clone();
         let tx = self.incoming_tx.clone();
         tokio::spawn(async move {

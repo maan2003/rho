@@ -11,13 +11,13 @@ use gpui::{
     point, px, size,
 };
 use language::InlayId;
+use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
 use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 use rho_desk_client::protocol::stream::ClientFrame as DeskClientFrame;
-use rho_hosts::connection::ConnEvent;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
@@ -1215,7 +1215,7 @@ fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
 
 /// No test dials anything. Every test workspace names a host, and
 /// `connection::spawn` read `cfg!(test)` to decide whether to start the
-/// supervisor behind it, true only inside rho-hosts' own tests, so this
+/// supervisor behind it, true only inside rho-agent-hosts' own tests, so this
 /// binary got a live supervisor dialing a socket that is not there and
 /// reconnecting on a timer. When a test ended, the App took its tokio
 /// runtime with it, and a supervisor still being polled panicked inside
@@ -1225,7 +1225,7 @@ fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
 #[test]
 fn a_test_host_connection_has_nothing_dialing_behind_it() {
     assert!(
-        !rho_hosts::connection::supervises(),
+        !rho_agent_hosts::connection::supervises(),
         "a test binary starts no host supervisor"
     );
 }
@@ -4073,7 +4073,9 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
             .update(cx, |workspace, _, cx| workspace
                 .message_log_texts(cx)
                 .iter()
-                .any(|message| message.contains("not connected to rho-daemon")))
+                .any(
+                    |message| message.contains("not connected to an agent host")
+                ))
             .expect("read messages"),
         "submit should reach the workspace and report the failed send"
     );
@@ -10783,7 +10785,9 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
             .update(cx, |workspace, _, cx| workspace
                 .message_log_texts(cx)
                 .iter()
-                .any(|message| message.contains("not connected to rho-daemon")))
+                .any(
+                    |message| message.contains("not connected to an agent host")
+                ))
             .expect("read messages"),
         "enter in a new-agent draft should submit the draft"
     );
@@ -10949,7 +10953,9 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
             .update(cx, |workspace, _, cx| workspace
                 .message_log_texts(cx)
                 .iter()
-                .any(|message| message.contains("not connected to rho-daemon")))
+                .any(
+                    |message| message.contains("not connected to an agent host")
+                ))
             .expect("read messages"),
         "enter in the workdir row should submit the draft"
     );

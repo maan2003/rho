@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rho-hosts.workspace = true
+rho-agent-hosts.workspace = true
 rho-desk-client.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
@@ -28,7 +28,7 @@ rho-terminal.workspace = true
 rho-db.workspace = true
 tempfile.workspace = true
 rho-claude.workspace = true
-rho-daemon.workspace = true
+rho-agent-host.workspace = true
 rho-inference.workspace = true
 rho-visualizations.workspace = true
 rho-fs-view.workspace = true

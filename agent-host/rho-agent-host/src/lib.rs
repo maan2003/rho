@@ -9,10 +9,10 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::{AgentPool, RunningAgent};
+use rho_agent_hosts::protocol::GitProviderFrame;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
-use rho_hosts::protocol::GitProviderFrame;
 use rho_inference::Inference;
 use rho_rpc::protocol::server::{Server, ServerConnection};
 use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
@@ -315,10 +315,10 @@ fn find_deny_roots() -> OsString {
 /// environment is not thread-safe.
 pub fn configure_embedded_environment() {
     if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
-        // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
+        // SAFETY: called by rho-agent-host's main before it creates the Tokio runtime.
         unsafe { std::env::set_var("RHO_DIRENV_PATH_BEFORE", path) };
     }
-    // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
+    // SAFETY: called by rho-agent-host's main before it creates the Tokio runtime.
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
@@ -699,7 +699,7 @@ impl GitTransportBroker {
 
     async fn request(
         &self,
-        request: rho_hosts::protocol::GitTransportRequest,
+        request: rho_agent_hosts::protocol::GitTransportRequest,
     ) -> anyhow::Result<BoxGitStream> {
         self.request_with_timeout(request, std::time::Duration::from_secs(60))
             .await
@@ -707,7 +707,7 @@ impl GitTransportBroker {
 
     async fn request_with_timeout(
         &self,
-        request: rho_hosts::protocol::GitTransportRequest,
+        request: rho_agent_hosts::protocol::GitTransportRequest,
         timeout: std::time::Duration,
     ) -> anyhow::Result<BoxGitStream> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -1226,8 +1226,8 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
+    use rho_agent_hosts::protocol::GitProviderFrame;
     use rho_agent_types::ContentPart;
-    use rho_hosts::protocol::GitProviderFrame;
 
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
@@ -1392,12 +1392,12 @@ mod tests {
         let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
         broker.register(first_tx).await;
         broker.register(second_tx).await;
-        let request = rho_hosts::protocol::GitTransportRequest {
+        let request = rho_agent_hosts::protocol::GitTransportRequest {
             host: "git.example".to_owned(),
             port: 22,
             user: "git".to_owned(),
             repository: "team/repo.git".to_owned(),
-            service: rho_hosts::protocol::GitService::ReceivePack,
+            service: rho_agent_hosts::protocol::GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
         let waiting = {
@@ -1452,12 +1452,12 @@ mod tests {
     #[tokio::test]
     async fn git_transport_broker_rejects_without_registered_clients() {
         let result = GitTransportBroker::default()
-            .request(rho_hosts::protocol::GitTransportRequest {
+            .request(rho_agent_hosts::protocol::GitTransportRequest {
                 host: "git.example".to_owned(),
                 port: 22,
                 user: "git".to_owned(),
                 repository: "team/repo.git".to_owned(),
-                service: rho_hosts::protocol::GitService::UploadPack,
+                service: rho_agent_hosts::protocol::GitService::UploadPack,
                 planned_refs: None,
             })
             .await;
@@ -1478,12 +1478,12 @@ mod tests {
             tokio::spawn(async move {
                 broker
                     .request_with_timeout(
-                        rho_hosts::protocol::GitTransportRequest {
+                        rho_agent_hosts::protocol::GitTransportRequest {
                             host: "git.example".to_owned(),
                             port: 22,
                             user: "git".to_owned(),
                             repository: "team/repo.git".to_owned(),
-                            service: rho_hosts::protocol::GitService::UploadPack,
+                            service: rho_agent_hosts::protocol::GitService::UploadPack,
                             planned_refs: None,
                         },
                         std::time::Duration::from_millis(10),

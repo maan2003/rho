@@ -2,8 +2,8 @@
 //! window's syncs and writes back.
 //!
 //! The host opens it on every connection
-//! ([`rho_hosts::HostStream`]); what is said on it and where its frames go
-//! are this crate's.
+//! ([`rho_agent_hosts::HostStream`]); what is said on it and where its frames
+//! go are this crate's.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
-use rho_hosts::{Dialer, HostId, HostStream};
+use rho_agent_hosts::{Dialer, HostId, HostStream};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::protocol::stream::{ClientFrame, ServerFrame};

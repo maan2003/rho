@@ -17,14 +17,17 @@ struct RealtimeChannel {
 
 /// Runs voice against the host until `stop` fires or the session fails.
 pub(crate) fn start(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     stop: tokio::sync::oneshot::Receiver<()>,
     input_muted: tokio::sync::watch::Receiver<bool>,
 ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
     link.run(|dialer| run(move |offer_sdp| dial(dialer, offer_sdp), stop, input_muted))
 }
 
-async fn dial(dialer: rho_hosts::Dialer, offer_sdp: String) -> anyhow::Result<RealtimeChannel> {
+async fn dial(
+    dialer: rho_agent_hosts::Dialer,
+    offer_sdp: String,
+) -> anyhow::Result<RealtimeChannel> {
     // Interactive streams outrank the sessions (priority 1 and below).
     let mut stream = dialer.open(Some(50)).await?;
     write_open(&mut stream, &rho_rtc::protocol::Open { offer_sdp }).await?;

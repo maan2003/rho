@@ -38,8 +38,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
+use rho_agent_hosts::HostId;
 use rho_agent_types::{AgentId, AgentWant};
-use rho_hosts::HostId;
 
 use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
 use crate::now_ms;

@@ -2,16 +2,16 @@
 //! model, the model's follow and the window's focus back to the daemon.
 //!
 //! The host opens it on every connection
-//! ([`rho_hosts::HostStream`]); what is said on it and where its frames go
-//! are this crate's.
+//! ([`rho_agent_hosts::HostStream`]); what is said on it and where its frames
+//! go are this crate's.
 
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
+use rho_agent_hosts::{Dialer, HostStream};
 use rho_agent_types::{AgentId, Seq};
-use rho_hosts::{Dialer, HostStream};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::HostId;

@@ -27,6 +27,8 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
+use rho_agent_hosts::connection::{ConnEvent, GitApprovalDecision};
+use rho_agent_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
@@ -48,8 +50,6 @@ use rho_agents_view::{
 use rho_desk_client::Desk;
 use rho_desk_client::protocol::stream::ClientFrame as DeskClientFrame;
 use rho_desk_client::stream::DeskFrame;
-use rho_hosts::connection::{ConnEvent, GitApprovalDecision};
-use rho_hosts::hosts::{HostStatus, Hosts};
 use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
@@ -198,7 +198,7 @@ pub(crate) enum ContextId {
     Slack,
 }
 
-pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
+pub use rho_agent_hosts::{AttachTarget, HostPath, HostSpec};
 
 #[derive(Clone)]
 struct PendingTreeVerdict {
@@ -853,7 +853,7 @@ impl Workspace {
         let (agents_client, changes) = rho_agents_client::model::AgentsClient::detached();
         // Each stream of a host has its own reader: the agents stream goes
         // to the agents client, the control and desk streams come here.
-        let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_hosts::HostEvent>();
+        let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_agent_hosts::HostEvent>();
         let (desk_streams, desk_events_rx) = rho_desk_client::stream::DeskStreams::new();
         let (desktop_streams, desktop_events_rx) =
             rho_desktop_client::stream::DesktopStreams::new();
@@ -904,7 +904,7 @@ impl Workspace {
                     batch.push(event);
                 }
                 let updated = this.update_in(cx, |this, window, cx| {
-                    for rho_hosts::HostEvent { host, event } in batch {
+                    for rho_agent_hosts::HostEvent { host, event } in batch {
                         this.handle_event(host, event, window, cx);
                     }
                 });
@@ -1202,7 +1202,7 @@ impl Workspace {
                 target: host.target.clone(),
             })
             .collect::<Vec<_>>();
-        rho_hosts::saved::save(&db, &specs);
+        rho_agent_hosts::saved::save(&db, &specs);
     }
 
     /// Forgets a daemon: its transcripts, surfaces, and cached projects go
@@ -1280,7 +1280,7 @@ impl Workspace {
     }
 
     /// How to reach the host an agent lives on, while it is attached.
-    fn link_for(&self, agent_id: AgentId) -> Option<rho_hosts::Link> {
+    fn link_for(&self, agent_id: AgentId) -> Option<rho_agent_hosts::Link> {
         Some(self.hosts.connection(self.host_of(agent_id)?)?.link())
     }
 
@@ -2571,7 +2571,7 @@ impl Workspace {
         if !self.connected() {
             self.notice_on(
                 Some(&agent_id),
-                "not connected to rho-daemon",
+                "not connected to an agent host",
                 StyleClass::SystemImportant,
                 cx,
             );
@@ -2631,7 +2631,7 @@ impl Workspace {
         self.draft_model
             .update(cx, |draft, cx| draft.set_refusal(None, cx));
         if !self.connected() {
-            self.refuse_draft("not connected to rho-daemon", cx);
+            self.refuse_draft("not connected to an agent host", cx);
             return;
         }
         let field = self.draft_model.read(cx).workdir_text(cx).trim().to_owned();
@@ -2895,7 +2895,7 @@ impl Workspace {
         if !self.connected() {
             self.notice_on(
                 None,
-                "not connected to rho-daemon",
+                "not connected to an agent host",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -5112,7 +5112,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn force_host_online(&mut self, host: HostId) {
         self.hosts
-            .set_status(host, rho_hosts::hosts::HostStatus::Online);
+            .set_status(host, rho_agent_hosts::hosts::HostStatus::Online);
     }
 
     /// Puts the host in this process: the streams its calls open arrive on
@@ -5655,7 +5655,7 @@ impl Workspace {
     }
 
     /// A transcript handed in whole, for a test that drives the view
-    /// without a mirror to fold. Not an event: `rho-hosts` carries what a
+    /// without a mirror to fold. Not an event: `rho-agent-hosts` carries what a
     /// daemon said, and no daemon says this.
     #[cfg(any(test, feature = "walk-support"))]
     pub(crate) fn seed_transcript_for_test(

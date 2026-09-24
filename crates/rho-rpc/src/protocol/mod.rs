@@ -173,7 +173,7 @@ pub enum Protocol {
     /// (`rho-desktop-client`).
     Desktop,
     /// The machine itself: Git transport and administration
-    /// (`rho-hosts`).
+    /// (`rho-agent-hosts`).
     Host,
     /// An agent's shell (`rho-shell-view`).
     Shell,

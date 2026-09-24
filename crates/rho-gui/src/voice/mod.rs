@@ -13,7 +13,7 @@
 
 pub(crate) mod rtc;
 
-use rho_hosts::HostId;
+use rho_agent_hosts::HostId;
 
 /// A session that is actually running.
 struct Running {

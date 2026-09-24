@@ -44,7 +44,7 @@ pub struct Args {
     /// Sequential exchanges for real-tool-rounds.
     #[arg(long, default_value_t = REAL_TOOL_ROUNDS)]
     rounds: usize,
-    /// Directory containing rho-daemon and rho-fake-model. Defaults to the
+    /// Directory containing rho-agent-host and rho-fake-model. Defaults to the
     /// directory containing this rho-qa executable.
     #[arg(long)]
     bin_dir: Option<PathBuf>,
@@ -125,7 +125,7 @@ async fn run_async(args: Args) -> Result<()> {
             .to_owned(),
     };
     let fake_bin = bin_dir.join("rho-fake-model");
-    let daemon_bin = bin_dir.join("rho-daemon");
+    let daemon_bin = bin_dir.join("rho-agent-host");
     ensure!(fake_bin.is_file(), "missing {}", fake_bin.display());
     ensure!(daemon_bin.is_file(), "missing {}", daemon_bin.display());
     let tree_commit = tree_commit()?;
@@ -760,7 +760,7 @@ async fn connect(socket: &Path) -> Result<Client> {
             Err(_) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(50)).await
             }
-            Err(error) => return Err(error).context("connect to rho-daemon"),
+            Err(error) => return Err(error).context("connect to rho-agent-host"),
         }
     }
 }

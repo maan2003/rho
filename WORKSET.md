@@ -141,7 +141,7 @@ real estate — deliberately opaque, so nothing can use or pollute it
 unmounted. Entering exposed mode on a host without it fails with that
 message.
 
-There is no mode without a namespace. `rho eval`, `rho-daemon debug
+There is no mode without a namespace. `rho eval`, `rho-agent-host debug
 render-prompt` and the tests adopt a host directory as a workset
 (`Worksets::adopt`) and enter it in view mode; whatever only reads files
 or renders prompts never builds the namespace, and whatever runs

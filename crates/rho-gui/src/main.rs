@@ -374,7 +374,7 @@ fn run() -> Result<()> {
                 // Before the tokio runtime goes with the app: a host
                 // supervisor still waiting out a reconnect delay would be
                 // polled into the runtime's shutdown and panic there.
-                rho_hosts::connection::close();
+                rho_agent_hosts::connection::close();
                 rho_journal::flush();
                 // Closing rather than flushing: a mirror left open is a
                 // file redb finds unclean, and the next start rebuilds its
@@ -824,7 +824,7 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
 /// set attached is what the next start finds.
 fn host_specs(args: &Args, db: &rho_db::RhoDb) -> Result<Vec<HostSpec>> {
     if args.attach.is_empty() {
-        return Ok(rho_hosts::saved::load(db));
+        return Ok(rho_agent_hosts::saved::load(db));
     }
     let mut specs = Vec::new();
     for host in &args.attach {

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use rho_hosts::{HostId, Hosts};
+use rho_agent_hosts::{HostId, Hosts};
 
 use crate::protocol::{AuthState, QuotaSeries, QuotaSummary};
 

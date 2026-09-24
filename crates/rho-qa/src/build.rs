@@ -56,8 +56,8 @@ pub struct RigBinary {
 
 pub const RIG_BINARIES: &[RigBinary] = &[
     RigBinary {
-        file: "rho-daemon",
-        package: "rho-daemon",
+        file: "rho-agent-host",
+        package: "rho-agent-host",
         example: None,
         gui_only: false,
     },

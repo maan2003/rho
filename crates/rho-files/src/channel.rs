@@ -11,7 +11,7 @@ use crate::protocol::{MAX_WORKSPACE_FRAME_LEN, Open, WorkspaceClientFrame, Works
 /// Dials a dedicated workspace file stream on the host `link` reaches and
 /// runs the handshake.
 pub fn open(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     workspace: WorkspaceInfo,
 ) -> impl Future<Output = anyhow::Result<WorkspaceChannel>> + Send + 'static {
     link.run(|dialer| dial(dialer, workspace))
@@ -26,7 +26,7 @@ pub struct WorkspaceChannel {
 }
 
 async fn dial(
-    dialer: rho_hosts::Dialer,
+    dialer: rho_agent_hosts::Dialer,
     workspace: WorkspaceInfo,
 ) -> anyhow::Result<WorkspaceChannel> {
     let mut stream = dialer.open(None).await?;

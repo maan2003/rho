@@ -5,7 +5,7 @@
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
-name = "rho-hosts"
+name = "rho-agent-hosts"
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -24,7 +24,7 @@ client = [
   "dep:tracing",
   "rho-rpc/native-client",
 ]
-# The event kinds only a test produces. rho-hosts never depends on the
+# The event kinds only a test produces. rho-agent-hosts never depends on the
 # crates that read its events, so anything a fixture needs of them is
 # built by the reader, not carried through here.
 test-support = ["client"]
@@ -48,4 +48,4 @@ tracing = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 # The tests exercise the client too.
-rho-hosts = { path = ".", features = ["client"] }
+rho-agent-hosts = { path = ".", features = ["client"] }

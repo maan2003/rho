@@ -1,26 +1,26 @@
 use clap::Parser as _;
 
 #[derive(clap::Parser)]
-#[command(name = "rho-daemon", about = "Run the rho GUI daemon")]
+#[command(name = "rho-agent-host", about = "Run the rho GUI daemon")]
 struct Args {
     #[command(flatten)]
-    daemon: rho_daemon::DaemonArgs,
+    daemon: rho_agent_host::DaemonArgs,
 }
 
 fn main() {
     let args = Args::parse();
     init_tracing();
-    rho_daemon::configure_embedded_environment();
+    rho_agent_host::configure_embedded_environment();
     let mut daemon_args = args.daemon;
     let result = (|| {
-        let profiler = rho_daemon::DaemonProfiler::start(&mut daemon_args)?;
+        let profiler = rho_agent_host::DaemonProfiler::start(&mut daemon_args)?;
         let runtime = tokio::runtime::Runtime::new()?;
-        let result = runtime.block_on(rho_daemon::run(daemon_args));
+        let result = runtime.block_on(rho_agent_host::run(daemon_args));
         drop(runtime);
         profiler.finish(result)
     })();
     if let Err(error) = result {
-        eprintln!("rho-daemon: {error:#}");
+        eprintln!("rho-agent-host: {error:#}");
         std::process::exit(1);
     }
 }
@@ -42,6 +42,6 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .try_init()
     {
-        eprintln!("rho-daemon: failed to initialize tracing: {error}");
+        eprintln!("rho-agent-host: failed to initialize tracing: {error}");
     }
 }

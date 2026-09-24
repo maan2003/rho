@@ -208,7 +208,7 @@ def classify_segment(seg, raw_cmd):
         return (w, "remote/copy")
     if w in ("tailscale", "ping", "nc", "curl", "wget", "dig", "ip", "ss", "networkctl", "iw", "nmcli"):
         return (w, "remote/net")
-    if w in ("rho", "rho-daemon", "rho-gui", "rho-cli"):
+    if w in ("rho", "rho-daemon", "rho-agent-host", "rho-gui", "rho-cli"):
         return (f"{w}:{sub}" if sub else w, "proc/rho")
     if w in ("ps", "kill", "pkill", "pgrep", "fuser", "lsof", "systemctl", "journalctl", "swaymsg", "hyprctl", "loginctl"):
         return (w, "proc/manage")

@@ -111,7 +111,7 @@ impl AuthenticatedIrohListener {
         let auth = rho_iroh_auth::IrohAuth::new(db, secret.public());
         let mut transport = iroh::endpoint::QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(16u8.into())
-            .qlog_from_env("rho-daemon");
+            .qlog_from_env("rho-agent-host");
         if env_flag("RHO_IROH_BBR3") {
             transport = transport.congestion_controller_factory(std::sync::Arc::new(
                 noq_proto::congestion::Bbr3Config::default(),

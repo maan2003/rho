@@ -4,7 +4,7 @@
 
 use std::future::Future;
 
-use rho_hosts::{Dialer, Link};
+use rho_agent_hosts::{Dialer, Link};
 use rho_rpc::protocol::Call;
 
 use crate::protocol::{self, VisualizationContent};

@@ -1,7 +1,7 @@
 [package]
 edition.workspace = true
 license.workspace = true
-name = "rho-daemon"
+name = "rho-agent-host"
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ version.workspace = true
 [dependencies]
 rho-rtc.workspace = true
 rho-desktop-client.workspace = true
-rho-hosts.workspace = true
+rho-agent-hosts.workspace = true
 rho-desktop-proto = { workspace = true, features = ["local"] }
 alacritty_terminal.workspace = true
 anyhow.workspace = true

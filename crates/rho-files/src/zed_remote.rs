@@ -260,7 +260,7 @@ pub struct RemoteProject {
 }
 
 pub fn open_remote_project(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     workspace: WorkspaceInfo,
     cx: &mut App,
 ) -> Task<Result<RemoteProject>> {

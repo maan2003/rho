@@ -7,8 +7,8 @@
 //! `NewAgent`, and on which host.
 
 use camino::Utf8PathBuf;
+use rho_agent_hosts::{HostId, HostPath, Hosts};
 use rho_agent_types::{AgentRole, EngineerIntelligence, WorksetMode, WorkspaceInfo};
-use rho_hosts::{HostId, HostPath, Hosts};
 
 use crate::protocol::{JoinTarget, StartMode};
 
@@ -74,7 +74,7 @@ pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String
         });
     }
     let host = match hosts.len() {
-        0 => return Err("not connected to rho-daemon".to_owned()),
+        0 => return Err("not connected to an agent host".to_owned()),
         1 => hosts.iter().next().expect("one host").id,
         _ => {
             return Err(format!(
@@ -140,7 +140,7 @@ pub fn parse_start(
         (None, Some(workdir)) => workdir.host,
         (None, None) => selected_host
             .or_else(|| hosts.primary())
-            .ok_or_else(|| "not connected to rho-daemon".to_owned())?,
+            .ok_or_else(|| "not connected to an agent host".to_owned())?,
     };
     let workspace = base.workspace;
     let start = match (mode, target, workspace) {
@@ -305,7 +305,7 @@ mod tests {
     /// refused in words, not resolved to whichever came last.
     #[test]
     fn a_base_and_a_workdir_on_two_hosts_is_refused() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
         let refusal = parse_start(
             &hosts,
             StartFieldMode::NewOn,
@@ -328,7 +328,7 @@ mod tests {
     /// the revision it stands for.
     #[test]
     fn the_default_base_goes_out_as_its_revision() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
         let (host, start) = parse_start(
             &hosts,
             StartFieldMode::NewOn,
@@ -355,7 +355,7 @@ mod tests {
     /// something went wrong.
     #[test]
     fn a_draft_with_no_workdir_says_what_to_type() {
-        let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
+        let hosts = Hosts::new(std::sync::Arc::new(rho_agent_hosts::DroppedSink));
         let refusal = parse_start(
             &hosts,
             StartFieldMode::NewOn,

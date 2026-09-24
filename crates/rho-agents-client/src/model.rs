@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
+use rho_agent_hosts::HostStream;
 use rho_agent_types::{AgentId, AgentPos, Seq};
-use rho_hosts::HostStream;
 
 use crate::protocol::ClientFrame;
 use crate::protocol::transcript::{Live, LogEntry, TranscriptEvent};

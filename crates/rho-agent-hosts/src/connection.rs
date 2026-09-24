@@ -195,7 +195,7 @@ impl Link {
         };
         futures::future::Either::Right(async move {
             let Some(mut task) = task else {
-                anyhow::bail!("not connected to rho-daemon");
+                anyhow::bail!("not connected to an agent host");
             };
             (&mut task.0)
                 .await

@@ -17,7 +17,7 @@ client = [
   "dep:moq-net",
   "dep:rho-desktop-media",
   "dep:rho-desktop-proto",
-  "dep:rho-hosts",
+  "dep:rho-agent-hosts",
   "dep:tokio",
   "dep:tracing",
 ]
@@ -33,7 +33,7 @@ iroh = { workspace = true, optional = true }
 moq-net = { workspace = true, optional = true }
 rho-desktop-media = { workspace = true, features = ["decoder", "iroh"], optional = true }
 rho-desktop-proto = { workspace = true, optional = true }
-rho-hosts = { workspace = true, features = ["client"], optional = true }
+rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 

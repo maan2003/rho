@@ -221,8 +221,8 @@ snapshot is what frees the 43 GB, and only once no rig points into it.
 
 Three more things a run trips over, from the desk-parents deletion on 10 Sep.
 
-- **rho-daemon does not build outside the devshell.** `rho-agent`'s `python` module reads
-  `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-daemon`
+- **rho-agent-host does not build outside the devshell.** `rho-agent`'s `python` module reads
+  `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-agent-host`
   fails to compile before it ever reaches the daemon. `direnv exec . cargo …`
   is the fix, and it is the fix for every crate that pulls the daemon in.
 - **A fresh rig carries no conversion markers.** `user-2026-09-06` predates the
@@ -274,7 +274,7 @@ records `stale_binaries` in the session so `rig status` says so afterwards.
 
 This exists because on 2026-09-07 five consecutive sessions ran a GUI binary
 three hours older than the tree — a rebuild had picked up `rho-cli` and
-`rho-daemon` and not the GUI — and were reported as a commit that was never in
+`rho-agent-host` and not the GUI — and were reported as a commit that was never in
 them. It withdrew a crash result and a whole table of frame numbers, including
 one already sent onward. Nothing had ever checked, on a rig whose entire
 purpose is numbers over commits.

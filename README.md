@@ -58,7 +58,7 @@ pair describes the bounding half-open area `[start, start + count)` affected by
 that stage.
 
 `just profile-daemon` profiles the optimized daemon until SIGINT or SIGTERM
-and writes `rho-daemon-profile.0.bin.gz`. Both recipes accept a trace base
+and writes `rho-agent-host-profile.0.bin.gz`. Both recipes accept a trace base
 path followed by the normal executable arguments. Inspect traces with
 `dial9 serve --local-dir .` or Dial9's agent analysis toolkit. CPU stack
 sampling is Linux-only. A custom-event-only trace is still written when CPU

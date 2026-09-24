@@ -68,7 +68,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
         assert!(status.success());
     }
 
-    tokio::spawn(rho_daemon::run(rho_daemon::DaemonArgs {
+    tokio::spawn(rho_agent_host::run(rho_agent_host::DaemonArgs {
         socket_path: Some(socket_path.clone()),
         // As with the state directory: the test's own, never the user's.
         claude_config_dir: Some(

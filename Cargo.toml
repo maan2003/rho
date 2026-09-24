@@ -15,7 +15,7 @@ members = [
   "agent-host/rho-claude-usage",
   "agent-host/rho-cli",
   "agent-host/rho-context-config",
-  "agent-host/rho-daemon",
+  "agent-host/rho-agent-host",
   "crates/rho-desktop-proto",
   "crates/rho-desktop-media",
   "crates/rho-db",
@@ -26,7 +26,7 @@ members = [
   "agent-host/rho-git/proto",
   "agent-host/rho-git/server",
   "crates/rho-gui",
-  "crates/rho-hosts",
+  "crates/rho-agent-hosts",
   "agent-host/rho-image",
   "agent-host/rho-inference",
   "crates/rho-iroh-auth",
@@ -126,7 +126,7 @@ rho-claude = { path = "agent-host/rho-claude" }
 rho-claude-usage = { path = "agent-host/rho-claude-usage" }
 rho-cli = { path = "agent-host/rho-cli" }
 rho-context-config = { path = "agent-host/rho-context-config" }
-rho-daemon = { path = "agent-host/rho-daemon" }
+rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-db = { path = "crates/rho-db" }
 rho-fake-model = { path = "crates/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
@@ -144,7 +144,7 @@ rho-desk-server = { path = "agent-host/rho-desk-server" }
 rho-openai-realtime = { path = "agent-host/rho-openai-realtime" }
 rho-pr-monitor = { path = "agent-host/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
-rho-hosts = { path = "crates/rho-hosts" }
+rho-agent-hosts = { path = "crates/rho-agent-hosts" }
 rho-desktop-proto = { path = "crates/rho-desktop-proto", features = ["senax"] }
 rho-desktop-media = { path = "crates/rho-desktop-media" }
 moq-net = { path = "vendor/moq/rs/moq-net" }

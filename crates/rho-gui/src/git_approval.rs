@@ -12,7 +12,7 @@
 
 use gpui::prelude::*;
 use gpui::{AnyElement, App, FocusHandle, TextStyle, Window, div};
-use rho_hosts::connection::GitApprovalDecision;
+use rho_agent_hosts::connection::GitApprovalDecision;
 use theme::ActiveTheme as _;
 
 /// A request waiting for the user's answer, and the channel the daemon is

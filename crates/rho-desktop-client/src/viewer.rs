@@ -47,7 +47,7 @@ impl Drop for Viewer {
 /// Opens the desktop `session` of `agent` on the host `link` reaches.
 /// Only an iroh host carries media.
 pub fn open(
-    link: &rho_hosts::Link,
+    link: &rho_agent_hosts::Link,
     agent: String,
     session: String,
 ) -> impl Future<Output = Result<Viewer>> + Send + 'static {
@@ -57,7 +57,7 @@ pub fn open(
             elapsed_ms = started.elapsed().as_millis(),
             "desktop IO task started"
         );
-        let rho_hosts::Dialer::Iroh { connection, media } = dialer else {
+        let rho_agent_hosts::Dialer::Iroh { connection, media } = dialer else {
             anyhow::bail!("the live Wayland viewer requires an Iroh host");
         };
         open_stream(connection, media, agent, session, started).await
