@@ -1,0 +1,25 @@
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-desktop-client"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+iroh = { workspace = true }
+moq-net.workspace = true
+rho-agent-host-proto.workspace = true
+rho-desktop-proto.workspace = true
+rho-hosts = { workspace = true }
+rho-rpc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dependencies.rho-desktop-media]
+workspace = true
+features = ["decoder", "iroh"]

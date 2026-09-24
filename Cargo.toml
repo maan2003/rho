@@ -32,6 +32,7 @@ members = [
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-desk-client",
+  "crates/rho-desktop-client",
   "crates/rho-desk-server",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
@@ -139,6 +140,7 @@ rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-desk-client = { path = "crates/rho-desk-client" }
+rho-desktop-client = { path = "crates/rho-desktop-client" }
 rho-desk-server = { path = "crates/rho-desk-server" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }

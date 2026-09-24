@@ -12185,26 +12185,18 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
                 name: name.into(),
             })
             .collect();
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DesktopSessions(sessions),
-                window,
-                cx,
-            );
+            workspace.desktops_arrived(HostId::default(), sessions, cx);
             assert_eq!(
                 workspace.available_desktops(agent(1)),
                 ["browser", "preview"]
             );
             assert_eq!(workspace.available_desktops(agent(2)), ["other"]);
-            story::feed(
-                workspace,
+            workspace.desktops_arrived(
                 HostId::default(),
-                ConnEvent::DesktopSessions(vec![rho_agent_host_proto::DesktopSession {
+                vec![rho_agent_host_proto::DesktopSession {
                     agent: agent(1).encoded(),
                     name: "preview".into(),
-                }]),
-                window,
+                }],
                 cx,
             );
             assert_eq!(workspace.available_desktops(agent(1)), ["preview"]);

@@ -71,7 +71,7 @@ pub struct TerminalModel {
     /// The stream ended without an `Exited` status (daemon or dial gone).
     disconnected: bool,
     _read_task: gpui::Task<()>,
-    _transport: rho_hosts::ChannelTask,
+    _transport: rho_rpc::ChannelTask,
 }
 
 impl TerminalModel {

@@ -16,6 +16,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 rho-hosts = { workspace = true }
 rho-agents-client = { workspace = true }
 rho-agent-host-proto.workspace = true
+rho-rpc = { workspace = true }
 settings = { path = "../../vendor/zed/crates/settings" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }

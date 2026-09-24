@@ -12,7 +12,7 @@ use anyhow::Context as _;
 use futures::FutureExt as _;
 use rho_agent_host_proto::host::{self, GitProviderFrame, Open as HostOpen};
 use rho_agent_host_proto::{
-    GitProvided, GitService, GitTransportRequest, Open, Opened, read_frame, write_frame,
+    GitProvided, GitService, GitTransportRequest, Open, read_frame, write_frame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -54,10 +54,6 @@ fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
 
 use crate::{AttachTarget, Dialer, HostId, HostStream};
 
-/// Owns the transport pumps for a dedicated stream. Dropping it cancels both
-/// directions on every target.
-pub type ChannelTask = rho_rpc::ChannelTask;
-
 /// A connection event tagged with the daemon it came from. Every attached
 /// host feeds the same channel, so the workspace handles one ordered stream
 /// rather than polling several.
@@ -86,7 +82,6 @@ impl EventSink {
 }
 
 pub enum ConnEvent {
-    DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
     /// The host is up.
     Ready,
     /// Several events in order, delivered as one. A daemon sends them
@@ -117,31 +112,6 @@ pub enum GitApprovalDecision {
 /// second Unix connection, remotely another bi-stream on the already
 /// authenticated iroh connection. Set by the IO task once connected.
 pub(crate) type ChannelDialer = rho_rpc::Dialer;
-
-pub(crate) async fn dial_realtime(
-    dialer: ChannelDialer,
-    offer_sdp: String,
-) -> anyhow::Result<crate::realtime_client::RealtimeChannel> {
-    let mut stream = dial_stream(dialer).await?;
-    write_frame(&mut stream, &Open::Host(HostOpen::Realtime { offer_sdp })).await?;
-    let answer_sdp = match read_frame(&mut stream).await? {
-        rho_agent_host_proto::realtime::Opened::Answer { answer_sdp } => answer_sdp,
-        rho_agent_host_proto::realtime::Opened::Refused { reason } => anyhow::bail!("{reason}"),
-    };
-    let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
-        rx_limit: rho_agent_host_proto::MAX_FRAME_LEN,
-        tx_capacity: 32,
-        rx_capacity: 32,
-    });
-    let (requests, replies, transport) = channel.into_parts();
-    Ok(crate::realtime_client::RealtimeChannel {
-        answer_sdp,
-        requests,
-        replies,
-        _transport: transport,
-    })
-}
 
 /// One call of the machine on a stream of its own. A refusal is an error.
 async fn dial_call<C: host::Call>(dialer: ChannelDialer, call: C) -> anyhow::Result<C::Reply> {
@@ -240,38 +210,11 @@ impl<T> Drop for AbortOnDrop<T> {
 }
 
 impl Connection {
-    pub fn open_wayland(
-        &self,
-        agent: String,
-        session: String,
-    ) -> impl Future<Output = anyhow::Result<crate::wayland::Viewer>> + Send + 'static {
-        let started = std::time::Instant::now();
-        self.link.run(move |dialer| async move {
-            tracing::info!(
-                elapsed_ms = started.elapsed().as_millis(),
-                "desktop IO task started"
-            );
-            let ChannelDialer::Iroh { connection, media } = dialer else {
-                anyhow::bail!("the live Wayland viewer requires an Iroh host");
-            };
-            open_wayland_stream(connection, media, agent, session, started).await
-        })
-    }
-
     pub fn upload_gui_telemetry(
         &self,
         snapshot: Vec<u8>,
     ) -> impl Future<Output = anyhow::Result<String>> + Send + 'static {
         self.link.run(|dialer| dial_gui_telemetry(dialer, snapshot))
-    }
-
-    pub fn start_native_realtime(
-        &self,
-        stop: tokio::sync::oneshot::Receiver<()>,
-        input_muted: tokio::sync::watch::Receiver<bool>,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
-        self.link
-            .run(|dialer| crate::realtime_client::run_native(dialer, stop, input_muted))
     }
 
     /// The way a client crate reaches this host.
@@ -307,9 +250,8 @@ pub fn supervises() -> bool {
 /// Attaches one daemon. Its events join `events`, tagged with `host`, so
 /// several daemons feed the workspace through a single ordered stream.
 /// `streams` is handed the host's [`Link`] and returns the streams that
-/// open on every connection, beside the host's own (desktops, Git
-/// transport). The connection's
-/// work runs on `runtime`.
+/// open on every connection, beside the host's own (Git transport). The
+/// connection's work runs on `runtime`.
 pub fn spawn(
     host: HostId,
     target: AttachTarget,
@@ -400,7 +342,7 @@ async fn run(
         AttachTarget::Unix(socket_path) => {
             // Reaching the socket is what being connected means here. Each
             // stream dials it afresh; the one that reached it carries the
-            // desktops.
+            // Git provider.
             let reached = rho_rpc::connect_unix(&socket_path)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
@@ -448,11 +390,7 @@ async fn run(
         stream_tasks.spawn(async move { (name, run.await) });
     }
     stream_tasks.spawn(
-        follow_desktops(streams_dialer.clone(), reached, events.clone())
-            .map(|result| ("desktops", result)),
-    );
-    stream_tasks.spawn(
-        provide_git_transport(streams_dialer, events.clone())
+        provide_git_transport(streams_dialer, reached, events.clone())
             .map(|result| ("Git provider", result)),
     );
 
@@ -504,34 +442,19 @@ async fn run(
     })
 }
 
-/// The host's desktops, whole, each time they change: on `reached` if
-/// the connection already has a stream to spare, else on one of its own.
-async fn follow_desktops(
+/// Carries SSH Git transport for the host's Git remote helpers, for as
+/// long as the connection lasts: this GUI holds the credentials. One
+/// transport runs at a time; each waits for its approval first. Runs on
+/// `reached` if the connection already has a stream to spare.
+async fn provide_git_transport(
     dialer: ChannelDialer,
     reached: Option<rho_rpc::Stream>,
     events: EventSink,
 ) -> anyhow::Result<()> {
     let mut stream = match reached {
         Some(stream) => stream,
-        None => dialer.open(None).await?,
+        None => dialer.open(Some(1)).await?,
     };
-    write_frame(&mut stream, &Open::Host(HostOpen::Desktops)).await?;
-    loop {
-        let sessions: Vec<rho_agent_host_proto::DesktopSession> = read_frame(&mut stream).await?;
-        if events
-            .unbounded_send(ConnEvent::DesktopSessions(sessions))
-            .is_err()
-        {
-            return Ok(());
-        }
-    }
-}
-
-/// Carries SSH Git transport for the host's Git remote helpers, for as
-/// long as the connection lasts: this GUI holds the credentials. One
-/// transport runs at a time; each waits for its approval first.
-async fn provide_git_transport(dialer: ChannelDialer, events: EventSink) -> anyhow::Result<()> {
-    let mut stream = dialer.open(Some(1)).await?;
     write_frame(&mut stream, &Open::Host(HostOpen::GitProvider)).await?;
     let limit = Arc::new(tokio::sync::Semaphore::new(1));
     let requests = Arc::new(Mutex::new(
@@ -1307,47 +1230,4 @@ mod tests {
                 assert!(received.is_empty());
             });
     }
-}
-
-async fn open_wayland_stream(
-    connection: iroh::endpoint::Connection,
-    media: rho_rpc::media::Mux,
-    agent: String,
-    session: String,
-    started: std::time::Instant,
-) -> anyhow::Result<crate::wayland::Viewer> {
-    static NEXT_MEDIA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let id = NEXT_MEDIA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(desktop_id = id, %agent, %session, "desktop open requested");
-    for path in connection.paths().iter().filter(|path| path.is_selected()) {
-        tracing::info!(
-            desktop_id = id,
-            direct = path.is_ip(),
-            rtt_ms = path.rtt().as_millis(),
-            lost_packets = connection.stats().lost_packets,
-            "desktop selected network path"
-        );
-    }
-    let transport = media.session(id)?;
-    let (send, recv) = connection.open_bi().await?;
-    send.set_priority(100)?;
-    let mut stream = rho_rpc::Stream::new(recv, send);
-    write_frame(
-        &mut stream,
-        &Open::Host(HostOpen::Wayland {
-            media_id: id,
-            agent,
-            session,
-        }),
-    )
-    .await?;
-    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
-        anyhow::bail!("Wayland open refused: {reason}");
-    }
-    tracing::info!(
-        desktop_id = id,
-        elapsed_ms = started.elapsed().as_millis(),
-        "desktop open acknowledged"
-    );
-    crate::wayland::open(transport, stream, started, id).await
 }

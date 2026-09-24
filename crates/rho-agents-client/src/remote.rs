@@ -12,7 +12,7 @@ use futures::channel::mpsc as futures_mpsc;
 use rho_agent_host_proto::agents::{self, Call, VisualizationContent};
 use rho_agent_host_proto::{Open, Opened, read_frame, write_frame};
 use rho_agent_types::WorkspaceInfo;
-use rho_hosts::{ChannelTask, Dialer, Link};
+use rho_hosts::{Dialer, Link};
 
 /// One host's agents, as a client reaches them. Cheap to clone; valid
 /// across reconnects, since each use dials whatever connection is up.
@@ -106,7 +106,7 @@ pub struct WorkspaceChannel {
     pub outgoing: futures_mpsc::Sender<rho_agent_host_proto::WorkspaceClientFrame>,
     pub incoming:
         futures_mpsc::Receiver<anyhow::Result<rho_agent_host_proto::WorkspaceServerFrame>>,
-    pub transport: ChannelTask,
+    pub transport: rho_rpc::ChannelTask,
 }
 
 async fn dial_channel(

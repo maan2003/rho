@@ -69,6 +69,7 @@ rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
 rho-desk-client = { workspace = true }
+rho-desktop-client = { workspace = true }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true

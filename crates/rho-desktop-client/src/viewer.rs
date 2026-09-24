@@ -1,10 +1,14 @@
-//! A native VP9 viewer connection. Only decoded images are coalesced.
+//! A live view of one of the host's desktops: VP9 over the host's media
+//! transport, input back on a stream of its own. Only decoded images are
+//! coalesced.
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use rho_desktop_media::codec::Decoder;
-pub use rho_desktop_media::codec::RetainedFrame;
+use rho_agent_host_proto::host::Open as HostOpen;
+use rho_agent_host_proto::{Open, Opened, read_frame, write_frame};
+use rho_desktop_media::codec::{Decoder, RetainedFrame};
 use rho_desktop_proto::Input;
 use tokio::sync::{mpsc, watch};
 
@@ -41,7 +45,70 @@ impl Drop for Viewer {
     }
 }
 
-pub(crate) async fn open(
+/// Opens the desktop `session` of `agent` on the host `link` reaches.
+/// Only an iroh host carries media.
+pub fn open(
+    link: &rho_hosts::Link,
+    agent: String,
+    session: String,
+) -> impl Future<Output = Result<Viewer>> + Send + 'static {
+    let started = Instant::now();
+    link.run(move |dialer| async move {
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "desktop IO task started"
+        );
+        let rho_hosts::Dialer::Iroh { connection, media } = dialer else {
+            anyhow::bail!("the live Wayland viewer requires an Iroh host");
+        };
+        open_stream(connection, media, agent, session, started).await
+    })
+}
+
+async fn open_stream(
+    connection: iroh::endpoint::Connection,
+    media: rho_rpc::media::Mux,
+    agent: String,
+    session: String,
+    started: Instant,
+) -> Result<Viewer> {
+    static NEXT_MEDIA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_MEDIA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(desktop_id = id, %agent, %session, "desktop open requested");
+    for path in connection.paths().iter().filter(|path| path.is_selected()) {
+        tracing::info!(
+            desktop_id = id,
+            direct = path.is_ip(),
+            rtt_ms = path.rtt().as_millis(),
+            lost_packets = connection.stats().lost_packets,
+            "desktop selected network path"
+        );
+    }
+    let transport = media.session(id)?;
+    let (send, recv) = connection.open_bi().await?;
+    send.set_priority(100)?;
+    let mut stream = rho_rpc::Stream::new(recv, send);
+    write_frame(
+        &mut stream,
+        &Open::Host(HostOpen::Wayland {
+            media_id: id,
+            agent,
+            session,
+        }),
+    )
+    .await?;
+    if let Opened::Refused { reason } = read_frame(&mut stream).await? {
+        anyhow::bail!("Wayland open refused: {reason}");
+    }
+    tracing::info!(
+        desktop_id = id,
+        elapsed_ms = started.elapsed().as_millis(),
+        "desktop open acknowledged"
+    );
+    subscribe(transport, stream, started, id).await
+}
+
+async fn subscribe(
     transport: rho_rpc::media::Session,
     stream: rho_rpc::Stream,
     started: Instant,

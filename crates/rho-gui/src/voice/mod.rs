@@ -11,6 +11,8 @@
 //! workspace when it ends. What is held here is everything that says what
 //! to do about that.
 
+pub(crate) mod rtc;
+
 use rho_hosts::HostId;
 
 /// A session that is actually running.

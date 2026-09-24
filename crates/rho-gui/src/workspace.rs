@@ -402,6 +402,7 @@ pub struct Workspace {
     /// and whose rows it wants. The journal cursor is the model's.
     agents_client: rho_agents_client::model::AgentsClient,
     desk_streams: rho_desk_client::stream::DeskStreams,
+    desktop_streams: rho_desktop_client::stream::DesktopStreams,
     draft_model: Entity<DraftModel>,
     /// What rho has said, and the surface it says it on. The log owns its
     /// own buffer, editor and highlights; the host records a line and shows
@@ -577,6 +578,7 @@ pub struct Workspace {
     _event_task: Task<()>,
     _host_event_task: Task<()>,
     _desk_event_task: Task<()>,
+    _desktop_event_task: Task<()>,
     _keystroke_subscription: gpui::Subscription,
     _transient_keystroke_interceptor: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
@@ -858,6 +860,8 @@ impl Workspace {
         // to the agents client, the control and desk streams come here.
         let (host_events, host_events_rx) = futures_mpsc::unbounded::<rho_hosts::HostEvent>();
         let (desk_streams, desk_events_rx) = rho_desk_client::stream::DeskStreams::new();
+        let (desktop_streams, desktop_events_rx) =
+            rho_desktop_client::stream::DesktopStreams::new();
         let hosts = Hosts::new(std::sync::Arc::new(host_events));
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
@@ -910,6 +914,19 @@ impl Workspace {
                     }
                 });
                 if updated.is_err() {
+                    break;
+                }
+            }
+        });
+        let desktop_event_task = cx.spawn(async move |this, cx| {
+            let mut events = desktop_events_rx;
+            while let Some(rho_desktop_client::stream::DesktopsEvent { host, sessions }) =
+                events.next().await
+            {
+                if this
+                    .update(cx, |this, cx| this.desktops_arrived(host, sessions, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1024,6 +1041,7 @@ impl Workspace {
             pending_syncs: HashMap::new(),
             agents_client,
             desk_streams,
+            desktop_streams,
             draft_model,
             messages,
             draft_area: None,
@@ -1091,6 +1109,7 @@ impl Workspace {
             _event_task: event_task,
             _host_event_task: host_event_task,
             _desk_event_task: desk_event_task,
+            _desktop_event_task: desktop_event_task,
             _keystroke_subscription: keystroke_subscription,
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
@@ -1151,6 +1170,7 @@ impl Workspace {
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
         let agents_client = &self.agents_client;
         let desk_streams = &self.desk_streams;
+        let desktop_streams = &self.desktop_streams;
         // The agents client is told the host exists, and gets its agents
         // stream, before any frame from it can arrive.
         let host = self.hosts.attach(
@@ -1158,7 +1178,11 @@ impl Workspace {
             spec.target,
             |host, _| {
                 agents_client.attach_host(host, spec.name.clone());
-                vec![agents_client.stream(host), desk_streams.stream(host)]
+                vec![
+                    agents_client.stream(host),
+                    desk_streams.stream(host),
+                    desktop_streams.stream(host),
+                ]
             },
             &gpui_tokio::Tokio::handle(cx),
         );
@@ -2228,10 +2252,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnEvent::DesktopSessions(sessions) => {
-                self.desktop_sessions.insert(host, sessions);
-                cx.notify();
-            }
             ConnEvent::Ready => {
                 self.replay_hosts.remove(&host);
                 let first_ready = self.ready_hosts.insert(host);
@@ -2497,7 +2517,7 @@ impl Workspace {
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice.muted());
-        let task = connection.start_native_realtime(stop_rx, input_muted_rx);
+        let task = crate::voice::rtc::start(&connection.link(), stop_rx, input_muted_rx);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
@@ -7092,6 +7112,16 @@ impl Workspace {
         self.set_prompt_complete_whole_input();
     }
 
+    pub(crate) fn desktops_arrived(
+        &mut self,
+        host: HostId,
+        sessions: Vec<rho_agent_host_proto::DesktopSession>,
+        cx: &mut Context<Self>,
+    ) {
+        self.desktop_sessions.insert(host, sessions);
+        cx.notify();
+    }
+
     pub(crate) fn available_desktops(&self, agent: AgentId) -> Vec<String> {
         let owner = agent.encoded();
         let mut sessions: Vec<_> = self
@@ -7120,7 +7150,8 @@ impl Workspace {
             return;
         };
         let target = self.models.get(&agent).cloned();
-        let task = connection.open_wayland(agent.encoded(), session.clone());
+        let task =
+            rho_desktop_client::viewer::open(&connection.link(), agent.encoded(), session.clone());
         cx.spawn_in(window, async move |this, cx| match task.await {
             Ok(viewer) => {
                 let _ = this.update_in(cx, |this, window, cx| {
