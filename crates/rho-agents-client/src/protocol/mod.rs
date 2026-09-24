@@ -267,7 +267,7 @@ impl AgentCommand {
 /// Where a new agent works. Each mode carries exactly the data it needs.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum StartMode {
-    /// A fresh workset holding a clone of `repo` (a URL or a daemon-side
+    /// A fresh workset holding a clone of `repo` (a URL or a host-side
     /// path), with a new change on top of the revset.
     NewOn { repo: Utf8PathBuf, revset: String },
     /// The SAME place as the target: the new agent works in the target
@@ -287,7 +287,7 @@ pub enum JoinTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct QuotaSummary {
     pub model: String,
-    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
+    /// Host-local ChatGPT OAuth namespace; absent for Claude.
     pub auth_namespace: Option<String>,
     pub remaining_percent: u8,
     pub burn_10m: u16,
@@ -300,7 +300,7 @@ pub struct QuotaSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct QuotaSeries {
     pub model: String,
-    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
+    /// Host-local ChatGPT OAuth namespace; absent for Claude.
     pub auth_namespace: Option<String>,
     pub points: Vec<QuotaPoint>,
 }
@@ -339,7 +339,7 @@ pub struct AgentCostSeries {
     pub buckets: Vec<AgentUsageBucket>,
 }
 
-/// Daemon-wide authentication settings presented by a GUI host.
+/// Host-wide authentication settings presented by a GUI host.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct AuthState {
     pub namespaces: Vec<String>,

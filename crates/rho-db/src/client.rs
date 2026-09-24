@@ -5,7 +5,7 @@
 //! inbox, the hosts it attaches. Each was its own redb file, which is one
 //! file lock, one page cache and one allocator rebuild per kind, and five
 //! chances for a session to be half open. They are one file now, the way
-//! the daemon's store is one file. Every crate keeps its own tables and
+//! the agent host's store is one file. Every crate keeps its own tables and
 //! its own types; only the file is shared.
 //!
 //! It is opened once, by `main` and before anything else happens, and

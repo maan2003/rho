@@ -529,8 +529,8 @@ pub(crate) struct Agent {
 }
 
 impl Agent {
-    /// Construct a worker-owned runtime from daemon services, without opening
-    /// a database or retaining the pool.
+    /// Construct a worker-owned runtime from agent host services, without
+    /// opening a database or retaining the pool.
     pub(crate) async fn load(
         agent_id: AgentId,
         host: Arc<crate::worker::Host>,
@@ -854,7 +854,7 @@ impl Agent {
                 } {
                     let _ = reply.send(Ok(()));
                     // Freeze scheduling and admission at this serialized boundary.
-                    // The outer driver cancels this future on daemon disconnect.
+                    // The outer driver cancels this future on agent host disconnect.
                     std::future::pending::<()>().await;
                 } else {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));

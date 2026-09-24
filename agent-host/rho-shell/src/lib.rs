@@ -440,7 +440,7 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 fn take_control_stdin() -> anyhow::Result<File> {
-    // The daemon passes the full-duplex protocol socket as stdin. Keep a
+    // The agent host passes the full-duplex protocol socket as stdin. Keep a
     // close-on-exec duplicate before replacing process stdio with /dev/null.
     let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
     if fd < 0 {

@@ -1,8 +1,8 @@
-//! Daemon-owned OpenAI realtime signaling and sideband.
+//! Host-owned OpenAI realtime signaling and sideband.
 //!
 //! The GUI owns only WebRTC media. Provider control events and commands stay
-//! on the daemon's authenticated sideband connection. No agent stands behind
-//! the voice session yet: a delegation is answered with that fact so the
+//! on the agent host's authenticated sideband connection. No agent stands
+//! behind the voice session yet: a delegation is answered with that fact so the
 //! model never promises work.
 
 use std::sync::Arc;

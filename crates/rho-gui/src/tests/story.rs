@@ -250,7 +250,7 @@ pub fn calls(
     calls
 }
 
-/// Answers a call as the daemon would.
+/// Answers a call as the agent host would.
 pub fn answer<T: Packer + Unpacker>(stream: &mut rho_rpc::Stream, answer: Answer<T>) {
     futures::executor::block_on(write_frame(stream, &answer)).expect("answer the call");
 }

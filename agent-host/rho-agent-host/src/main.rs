@@ -1,21 +1,21 @@
 use clap::Parser as _;
 
 #[derive(clap::Parser)]
-#[command(name = "rho-agent-host", about = "Run the rho GUI daemon")]
+#[command(name = "rho-agent-host", about = "Run a rho agent host")]
 struct Args {
     #[command(flatten)]
-    daemon: rho_agent_host::DaemonArgs,
+    agent_host: rho_agent_host::HostArgs,
 }
 
 fn main() {
     let args = Args::parse();
     init_tracing();
     rho_agent_host::configure_embedded_environment();
-    let mut daemon_args = args.daemon;
+    let mut host_args = args.agent_host;
     let result = (|| {
-        let profiler = rho_agent_host::DaemonProfiler::start(&mut daemon_args)?;
+        let profiler = rho_agent_host::HostProfiler::start(&mut host_args)?;
         let runtime = tokio::runtime::Runtime::new()?;
-        let result = runtime.block_on(rho_agent_host::run(daemon_args));
+        let result = runtime.block_on(rho_agent_host::run(host_args));
         drop(runtime);
         profiler.finish(result)
     })();
@@ -25,10 +25,10 @@ fn main() {
     }
 }
 
-/// The daemon's own output, so what it says about itself is kept.
+/// The agent host's own output, so what it says about itself is kept.
 ///
 /// It said nothing until now: nothing in this binary installed a
-/// subscriber, so every `tracing::info!` in the daemon — including the
+/// subscriber, so every `tracing::info!` in the agent host — including the
 /// one-shot conversions' reports of what they did to the user's store —
 /// was written to a subscriber that did not exist and was lost. Under
 /// systemd stderr is what journald keeps, so that is where this writes,

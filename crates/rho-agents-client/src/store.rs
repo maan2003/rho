@@ -312,7 +312,7 @@ impl AgentStore {
     }
 
     /// Drops a transcript: the agent left this client's active set, or
-    /// its daemon is gone.
+    /// its agent host is gone.
     pub fn forget(&mut self, agent_id: AgentId) {
         self.states.remove(&agent_id);
     }

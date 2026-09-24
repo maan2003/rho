@@ -27,7 +27,7 @@ pub const DEFAULT_ACCOUNT: &str = "default";
 /// Resolved once, in a binary's `main`, and passed down from there. Nothing
 /// else in this crate reads `$HOME` or `$CLAUDE_CONFIG_DIR`. A library that
 /// resolves the home directory itself puts every caller on the user's live
-/// configuration whether it meant to be there or not: that is how a daemon
+/// configuration whether it meant to be there or not: that is how an agent host
 /// pointed at a rig's state directory, but started by hand rather than by
 /// `rho-qa rig up`, read the user's own `~/.claude/projects` and rebuilt
 /// agent rows from the user's transcripts.
@@ -93,7 +93,7 @@ impl ClaudePaths {
         &self.config_home
     }
 
-    /// Where the daemon reads transcripts from, since `projects/` is shared
+    /// Where the agent host reads transcripts from, since `projects/` is shared
     /// across accounts.
     pub fn projects(&self) -> Utf8PathBuf {
         self.projects_root.clone()
@@ -177,7 +177,7 @@ impl ClaudePaths {
 
     /// Makes sure the account agents run on exists, so that "every Claude
     /// agent has an account" holds from the first spawn. Which account that
-    /// is lives in the daemon's store, not here.
+    /// is lives in the agent host's store, not here.
     ///
     /// Nothing is copied out of `~/.claude`: filling [`DEFAULT_ACCOUNT`]
     /// with a login is the person's own move, whether by copying their
@@ -273,8 +273,8 @@ mod paths_tests {
     use super::*;
 
     /// A rig's paths are the rig's. Nothing here consults `$HOME`, which is
-    /// what a daemon started by hand against a rig's state directory used to
-    /// fall back to.
+    /// what an agent host started by hand against a rig's state directory used
+    /// to fall back to.
     #[test]
     fn paths_rooted_at_a_rig_stay_under_it() {
         let paths = ClaudePaths::at("/rigs/mv/config/claude");

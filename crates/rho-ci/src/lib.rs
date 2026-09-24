@@ -6,7 +6,7 @@
 //!
 //! Runs a repo's `.config/selfci/` CI jobs against a caller-provided
 //! candidate checkout. None of selfci's VCS machinery — revision
-//! resolution, test merges, workdir cloning, or the merge-queue daemon —
+//! resolution, test merges, workdir cloning, or the merge-queue agent host —
 //! is vendored; the landing flow around it is being redesigned.
 //!
 //! What is preserved, byte-for-byte where it matters, is the repo-facing
@@ -14,7 +14,7 @@
 //! `SELFCI_*` job environment ([`envs`]), and the CBOR job-control
 //! socket ([`protocol`]) behind the in-script `selfci step`/`selfci job`
 //! calls. Jobs inherit the caller's PATH; put rho's `selfci` binary (or a
-//! compatible one) there if scripts use those commands. There is no daemon
+//! compatible one) there if scripts use those commands. There is no agent host
 //! anywhere — the only socket is per-run and ephemeral.
 //!
 //! Vendored from selfci v0.5.0 (`rad:z2tDzYbAXxTQEKTGFVwiJPajkbeDU`),

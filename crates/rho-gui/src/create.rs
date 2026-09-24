@@ -271,7 +271,7 @@ impl Workspace {
         else {
             self.notice_on(
                 None,
-                "new note: no daemon is connected",
+                "new note: no agent host is connected",
                 StyleClass::SystemInfo,
                 cx,
             );

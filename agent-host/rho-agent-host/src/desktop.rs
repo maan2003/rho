@@ -1,6 +1,7 @@
-//! The desktops part of the daemon, [`rho_rpc::protocol::Protocol::Desktop`]:
-//! which desktops the worksets run. A live view of one is served where the
-//! iroh connection's media are; see `run_iroh_listener`.
+//! The desktops part of the agent host,
+//! [`rho_rpc::protocol::Protocol::Desktop`]: which desktops the worksets run. A
+//! live view of one is served where the iroh connection's media are; see
+//! `run_iroh_listener`.
 
 use std::sync::Arc;
 

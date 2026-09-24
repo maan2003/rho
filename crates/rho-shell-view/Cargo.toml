@@ -1,5 +1,5 @@
-# The comint-style shell surface for a daemon-owned shell: the model that
-# projects the daemon's structured executions into a multibuffer, its
+# The comint-style shell surface for a host-owned shell: the model that
+# projects the agent host's structured executions into a multibuffer, its
 # styles, its pager, and the actions that belong to it. rho-shell is the
 # kernel; this is the screen. Without the `client` feature it is the shell
 # protocol alone, for the host and the workset runtime.

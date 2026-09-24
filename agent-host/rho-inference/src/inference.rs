@@ -1,4 +1,4 @@
-//! The daemon-wide inference runtime and the sessions created from it.
+//! The host-wide inference runtime and the sessions created from it.
 
 use std::sync::{Arc, OnceLock};
 
@@ -19,8 +19,9 @@ use crate::responses::{
 #[derive(Clone, Debug)]
 pub struct Inference(Arc<Inner>);
 
-/// The session-facing daemon services. A worker receives account decisions and
-/// route observations; it never opens the account database or starts pollers.
+/// The session-facing agent host services. A worker receives account decisions
+/// and route observations; it never opens the account database or starts
+/// pollers.
 pub trait InferenceHost: std::fmt::Debug + Send + Sync {
     fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>>;
     fn select_resolved(
@@ -48,7 +49,7 @@ pub trait InferenceHost: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug)]
 enum Backend {
-    Daemon {
+    AgentHost {
         accounts: Arc<AccountManager>,
         routes: RouteSelector,
     },
@@ -74,7 +75,7 @@ impl Inference {
         accounts::init(db).await
     }
 
-    /// Opens the daemon-owned inference runtime and starts its quota and route
+    /// Opens the host-owned inference runtime and starts its quota and route
     /// pollers.
     pub async fn new(db: RhoDb) -> anyhow::Result<Self> {
         Self::new_with_config(db, InferenceConfig::default()).await
@@ -94,7 +95,7 @@ impl Inference {
         let production_chatgpt =
             &*config.responses_base_url == crate::responses::DEFAULT_CHATGPT_BASE_URL;
         let inference = Self(Arc::new(Inner {
-            backend: Backend::Daemon {
+            backend: Backend::AgentHost {
                 accounts,
                 routes: RouteSelector::new(Some(db)),
             },
@@ -123,7 +124,7 @@ impl Inference {
         &self.0.responses_base_url
     }
 
-    /// Session transport without daemon-owned account state or background work.
+    /// Session transport without host-owned account state or background work.
     pub fn from_host(host: Arc<dyn InferenceHost>, config: InferenceConfig) -> Self {
         Self(Arc::new(Inner {
             backend: Backend::Host(host),
@@ -134,7 +135,7 @@ impl Inference {
 
     pub fn route_updates(&self) -> watch::Receiver<RouteSelection> {
         match &self.0.backend {
-            Backend::Daemon { routes, .. } => routes.subscribe(),
+            Backend::AgentHost { routes, .. } => routes.subscribe(),
             Backend::Host(host) => host.route_updates(),
             #[cfg(test)]
             Backend::Fixed { routes, .. } => routes.subscribe(),
@@ -151,7 +152,7 @@ impl Inference {
 
     pub async fn report_connect_failure(&self, route: DialRoute, selected: Option<&SelectedAuth>) {
         match &self.0.backend {
-            Backend::Daemon { routes, .. } => routes.report_connect_failure(route, selected),
+            Backend::AgentHost { routes, .. } => routes.report_connect_failure(route, selected),
             Backend::Host(host) => host.report_connect_failure(route, selected.cloned()).await,
             #[cfg(test)]
             Backend::Fixed { routes, .. } => routes.report_connect_failure(route, selected),
@@ -166,7 +167,7 @@ impl Inference {
                     return;
                 };
                 let inference = Inference(inner);
-                if let Backend::Daemon { routes, .. } = &inference.0.backend {
+                if let Backend::AgentHost { routes, .. } = &inference.0.backend {
                     routes.probe_once(&inference).await;
                 }
                 drop(inference);
@@ -233,7 +234,7 @@ impl Inference {
         Ok(self.select().await?.auth)
     }
 
-    /// Resolve/refresh credentials in the daemon's filesystem context, even
+    /// Resolve/refresh credentials in the agent host's filesystem context, even
     /// when the requesting provider transport lives in a pivoted workset.
     pub async fn resolve_auth(&self, auth: InferenceAuth) -> anyhow::Result<crate::ResolvedAuth> {
         if let Backend::Host(host) = &self.0.backend {
@@ -242,7 +243,7 @@ impl Inference {
         Ok(tokio::task::spawn_blocking(move || auth.resolve()).await??)
     }
 
-    /// Private daemon-to-worker credential stream; never a UI/public-state DTO.
+    /// Private host-to-worker credential stream; never a UI/public-state DTO.
     pub fn credential_updates(&self) -> watch::Receiver<crate::CredentialSnapshot> {
         self.0
             .credentials
@@ -276,7 +277,7 @@ impl Inference {
 
     pub async fn select(&self) -> anyhow::Result<SelectedAuth> {
         match &self.0.backend {
-            Backend::Daemon { accounts, .. } => accounts.select().await,
+            Backend::AgentHost { accounts, .. } => accounts.select().await,
             Backend::Host(host) => host.select().await,
             #[cfg(test)]
             Backend::Fixed { auth, .. } => Ok(SelectedAuth {
@@ -289,7 +290,7 @@ impl Inference {
 
     pub async fn mark_rate_limited(&self, selected: &SelectedAuth) -> bool {
         match &self.0.backend {
-            Backend::Daemon { accounts, .. } => accounts.mark_rate_limited(selected).await,
+            Backend::AgentHost { accounts, .. } => accounts.mark_rate_limited(selected).await,
             Backend::Host(host) => host.mark_rate_limited(selected.clone()).await,
             #[cfg(test)]
             Backend::Fixed { .. } => false,
@@ -298,7 +299,7 @@ impl Inference {
 
     pub async fn observe_quota(&self, selected: &SelectedAuth, quota: QuotaUpdate) {
         match &self.0.backend {
-            Backend::Daemon { accounts, .. } => accounts.observe_quota(selected, quota).await,
+            Backend::AgentHost { accounts, .. } => accounts.observe_quota(selected, quota).await,
             Backend::Host(host) => host.observe_quota(selected.clone(), quota).await,
             #[cfg(test)]
             Backend::Fixed { .. } => {}
@@ -323,14 +324,14 @@ impl Inference {
 
     pub fn route_probe_history(&self, since: UnixMs) -> Vec<crate::responses::InferenceRouteProbe> {
         match &self.0.backend {
-            Backend::Daemon { routes, .. } => routes.history(since),
+            Backend::AgentHost { routes, .. } => routes.history(since),
             _ => Vec::new(),
         }
     }
 
     fn accounts(&self) -> &AccountManager {
-        let Backend::Daemon { accounts, .. } = &self.0.backend else {
-            panic!("account administration belongs to the daemon")
+        let Backend::AgentHost { accounts, .. } = &self.0.backend else {
+            panic!("account administration belongs to the agent host")
         };
         accounts
     }

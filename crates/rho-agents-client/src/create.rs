@@ -47,19 +47,19 @@ pub fn is_repository_url(argument: &str) -> bool {
     argument.contains("://") || argument.starts_with("git@")
 }
 
-/// Resolves a workdir argument to a directory on a specific daemon. A
+/// Resolves a workdir argument to a directory on a specific agent host. A
 /// registered project name resolves to its registration; anything else is
-/// a raw daemon-side path, which may name its host as `fern:/src/rho`.
-/// Paths name directories on the daemon's machine, so the GUI never joins
-/// its own cwd or expands its own home — the daemon expands `~` and
+/// a raw host-side path, which may name its host as `fern:/src/rho`.
+/// Paths name directories on the agent host's machine, so the GUI never joins
+/// its own cwd or expands its own home — the agent host expands `~` and
 /// validates.
 pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String> {
     if let Some(registered) = hosts.registered_workdir(argument) {
         return Ok(registered);
     }
-    // A Windows-style drive letter is not a thing on a daemon host, so a
+    // A Windows-style drive letter is not a thing on an agent host, so a
     // colon before any separator is unambiguously a host prefix. A URL
-    // (`https://…`, `git@host:path`) is what the daemon clones, not a host.
+    // (`https://…`, `git@host:path`) is what the agent host clones, not a host.
     let is_url = is_repository_url(argument);
     if !is_url
         && let Some((name, path)) = argument.split_once(':')
@@ -92,7 +92,7 @@ pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String
 /// The host a new agent starts on and how it starts there, or the reason
 /// it cannot. An agent target settles the host by itself: the new agent
 /// shares that agent's repository, which only exists on that agent's
-/// daemon. Where the workdir also names a host, the two must agree —
+/// agent host. Where the workdir also names a host, the two must agree —
 /// nothing downstream could reconcile a checkout on one machine with a
 /// base revision on another.
 pub fn parse_start(

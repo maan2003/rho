@@ -2,8 +2,8 @@
 //!
 //! Ported from zed's `terminal/src/mappings/keys.rs` (itself derived from
 //! alacritty's default bindings), reshaped onto the wire's [`TermKeystroke`]
-//! and alacritty's [`TermMode`] directly. Alt is always meta (the daemon has
-//! no macOS "option sends option" convention to honor).
+//! and alacritty's [`TermMode`] directly. Alt is always meta (the agent host
+//! has no macOS "option sends option" convention to honor).
 
 use std::borrow::Cow;
 

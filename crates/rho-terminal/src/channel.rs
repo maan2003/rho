@@ -25,7 +25,7 @@ pub fn open(
 
 /// One attached terminal: a dedicated stream carrying
 /// [`crate::protocol`] frames after the handshake. Dropping the
-/// owner cancels the attachment; the terminal keeps running in the daemon.
+/// owner cancels the attachment; the terminal keeps running in the agent host.
 pub struct TerminalChannel {
     pub terminal_id: u64,
     pub frames: futures_mpsc::Receiver<anyhow::Result<TermServerFrame>>,

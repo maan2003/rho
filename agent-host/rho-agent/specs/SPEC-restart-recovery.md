@@ -11,7 +11,7 @@ interrupted executions are represented.
 A restart tears down and reloads an agent runtime, whether through idle eviction
 or workset-process death. Other agents and retained sessions can survive an
 individual runtime's eviction.
-Crashes and clean shutdowns have the same conversation-recovery rules. A daemon
+Crashes and clean shutdowns have the same conversation-recovery rules. An agent host
 may record a coarse worker-failure event, but that is not an execution journal
 or evidence of which unrecorded statements ran.
 

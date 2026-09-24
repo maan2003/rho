@@ -1341,7 +1341,8 @@ async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
 }
 
 /// Local code submission through real Bash completion and result rendering.
-/// Uses the workset's Tokio worker count; excludes daemon/provider transport.
+/// Uses the workset's Tokio worker count; excludes agent host/provider
+/// transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "manual release-mode awaited command latency benchmark"]
 async fn benchmark_awaited_command() {

@@ -148,7 +148,7 @@ async fn worksets_clone_through_the_mirror_store() {
     root.discard_workset(&first_id).await.unwrap();
     assert_eq!(root.list().unwrap(), vec![second_workset.id().to_owned()]);
 
-    // A restarted daemon replaces the keeper and reopens worksets.
+    // A restarted agent host replaces the keeper and reopens worksets.
     let second_id = second_workset.id().to_owned();
     drop(second_workset);
     drop(root);

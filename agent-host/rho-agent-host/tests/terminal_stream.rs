@@ -1,7 +1,7 @@
-//! End-to-end smoke test for terminal streams: a real daemon on a temp
+//! End-to-end smoke test for terminal streams: a real agent host on a temp
 //! socket, an agent started on a clone of a temp git repository, a shell
 //! echoing through the dedicated stream, and a second attach after detach
-//! proving the terminal survived. Harness-free: the daemon's identity user
+//! proving the terminal survived. Harness-free: the agent host's identity user
 //! namespace must precede every thread, including the test harness's.
 
 use std::time::Duration;
@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let state_dir = tempfile::tempdir()?;
-    // Keep the daemon's state (redb, sockets) away from the user's real one,
+    // Keep the agent host's state (redb, sockets) away from the user's real one,
     // and give its terminals a shell that exists in a view.
     // SAFETY: top of main; no other threads exist yet.
     unsafe {
@@ -68,7 +68,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
         assert!(status.success());
     }
 
-    tokio::spawn(rho_agent_host::run(rho_agent_host::DaemonArgs {
+    tokio::spawn(rho_agent_host::run(rho_agent_host::HostArgs {
         socket_path: Some(socket_path.clone()),
         // As with the state directory: the test's own, never the user's.
         claude_config_dir: Some(

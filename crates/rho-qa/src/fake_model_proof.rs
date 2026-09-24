@@ -125,9 +125,9 @@ async fn run_async(args: Args) -> Result<()> {
             .to_owned(),
     };
     let fake_bin = bin_dir.join("rho-fake-model");
-    let daemon_bin = bin_dir.join("rho-agent-host");
+    let host_bin = bin_dir.join("rho-agent-host");
     ensure!(fake_bin.is_file(), "missing {}", fake_bin.display());
-    ensure!(daemon_bin.is_file(), "missing {}", daemon_bin.display());
+    ensure!(host_bin.is_file(), "missing {}", host_bin.display());
     let tree_commit = tree_commit()?;
     let proof_hash = sha256_file(&std::env::current_exe()?)?;
     let fake_hash = sha256_file(&fake_bin)?;
@@ -161,28 +161,28 @@ async fn run_async(args: Args) -> Result<()> {
     );
 
     let socket = runtime.join("rho.sock");
-    let mut daemon = isolated_command(&daemon_bin, root.path());
-    daemon
+    let mut agent_host = isolated_command(&host_bin, root.path());
+    agent_host
         .args([
             "--socket-path",
             socket.to_str().context("socket path is not UTF-8")?,
         ])
         .args(["--openai-base-url", &ready.openai_base_url])
         .args(["--anthropic-base-url", &ready.anthropic_base_url])
-        .stdout(File::create(root.path().join("daemon.stdout.log"))?)
-        .stderr(File::create(root.path().join("daemon.stderr.log"))?);
-    let daemon = daemon
+        .stdout(File::create(root.path().join("agent host.stdout.log"))?)
+        .stderr(File::create(root.path().join("agent host.stderr.log"))?);
+    let agent_host = agent_host
         .spawn()
-        .with_context(|| format!("start {}", daemon_bin.display()))?;
-    let daemon_pid = daemon.id();
-    children.0.push(daemon);
+        .with_context(|| format!("start {}", host_bin.display()))?;
+    let host_pid = agent_host.id();
+    children.0.push(agent_host);
     let _children = children;
 
     let mut client = Streams::open(connect(&socket).await?, &socket).await?;
     let initial_head = client.journal_head;
     ensure!(
         initial_head == Seq(0),
-        "fresh isolated daemon journal was not empty"
+        "fresh isolated agent host journal was not empty"
     );
     println!(
         "PROOF_READY tree_commit={} proof_sha256={} fake_sha256={} scenario={} seed={}",
@@ -278,8 +278,9 @@ async fn run_async(args: Args) -> Result<()> {
             .await
             .with_context(|| {
                 format!(
-                    "daemon journal stalled: {}",
-                    fs::read_to_string(root.path().join("daemon.stderr.log")).unwrap_or_default()
+                    "agent host journal stalled: {}",
+                    fs::read_to_string(root.path().join("agent host.stderr.log"))
+                        .unwrap_or_default()
                 )
             })??;
         match message {
@@ -287,7 +288,7 @@ async fn run_async(args: Args) -> Result<()> {
                 agents.insert(agent_id);
                 ensure!(
                     agents.len() <= agent_count,
-                    "daemon created more than {agent_count} agents"
+                    "agent host created more than {agent_count} agents"
                 );
             }
             Incoming::Agents(AgentsServerFrame::Log { entries }) => {
@@ -438,11 +439,11 @@ async fn run_async(args: Args) -> Result<()> {
                     (ExpectedDetail::Results, DetailBody::Results(results)) => {
                         result_sizes.extend(results.into_iter().map(|result| result.output.len()));
                     }
-                    _ => bail!("daemon Detail body did not match its journal event"),
+                    _ => bail!("agent host Detail body did not match its journal event"),
                 }
             }
             Incoming::Refused(reason) => {
-                bail!("daemon refused proof action: {reason}")
+                bail!("agent host refused proof action: {reason}")
             }
             _ => {}
         }
@@ -534,7 +535,7 @@ async fn run_async(args: Args) -> Result<()> {
     sorted_result_sizes.sort_unstable();
     let elapsed = started.elapsed().as_secs_f64().min(args.seconds as f64);
     println!(
-        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} results={} result_bytes={} result_p50={} result_mean={} result_p90={} result_max={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} daemon_vmrss_kib={} journal_head={}",
+        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} results={} result_bytes={} result_p50={} result_mean={} result_p90={} result_max={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} host_vmrss_kib={} journal_head={}",
         args.scenario.as_str(),
         agent_count,
         args.seconds,
@@ -557,7 +558,7 @@ async fn run_async(args: Args) -> Result<()> {
         percentile(&latencies, 50),
         percentile(&latencies, 99),
         vmrss_kib(fake_pid)?,
-        vmrss_kib(daemon_pid)?,
+        vmrss_kib(host_pid)?,
         final_head.0
     );
     if let Some(error) = scenario_error {
@@ -614,21 +615,27 @@ fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<
         Scenario::RateLimit => {
             ensure!(
                 results.failed >= 2,
-                "daemon did not journal both provider failures"
+                "agent host did not journal both provider failures"
             );
             ensure!(
                 results.retrying >= 1,
-                "daemon did not mark a provider failure retrying"
+                "agent host did not mark a provider failure retrying"
             );
         }
         Scenario::StreamCut => {
-            ensure!(results.failed >= 1, "daemon did not journal the cut stream");
-            ensure!(results.retrying >= 1, "daemon did not retry the cut stream");
+            ensure!(
+                results.failed >= 1,
+                "agent host did not journal the cut stream"
+            );
+            ensure!(
+                results.retrying >= 1,
+                "agent host did not retry the cut stream"
+            );
         }
         Scenario::SlowTrickle => {
             ensure!(
                 percentile(results.latencies, 50) >= 59_000,
-                "daemon ended the one-minute trickle early"
+                "agent host ended the one-minute trickle early"
             );
         }
         Scenario::HugeToolOutput => {
@@ -654,12 +661,12 @@ fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<
             );
         }
         Scenario::FortyToolCalls => {
-            ensure!(results.calls == 40, "daemon did not retain forty calls")
+            ensure!(results.calls == 40, "agent host did not retain forty calls")
         }
         Scenario::ReasoningCompaction => {
             ensure!(
                 results.compacted >= 1,
-                "daemon did not retain the compaction item"
+                "agent host did not retain the compaction item"
             );
         }
         Scenario::ClarifyingQuestion => {

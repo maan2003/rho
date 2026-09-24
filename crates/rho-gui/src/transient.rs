@@ -484,7 +484,7 @@ pub(crate) fn slack_menu() -> Menu {
         )
 }
 
-/// `space h`: the attached daemons. Attaching and detaching are rare, so
+/// `space h`: the attached agent hosts. Attaching and detaching are rare, so
 /// they live one level down rather than on the root's crowded first row.
 pub(crate) fn hosts_menu() -> Menu {
     Menu::new("hosts")

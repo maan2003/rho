@@ -17,7 +17,7 @@ use super::{
     UiBlock, UiToolStatus, agent, display_text, feed_frame, state, test_workspace, tool, user,
 };
 
-/// A call that has finished. Its output is in the daemon's log; nothing in
+/// A call that has finished. Its output is in the agent host's log; nothing in
 /// the transcript records where, because nothing goes looking.
 fn finished_call(id: &str) -> UiBlock {
     UiBlock::Tool(tool(id, UiToolStatus::Success, Some(1_000), Some(1_200)))

@@ -24,7 +24,7 @@ pub const MAX_FILE_LEN: usize = 8 * 1024 * 1024;
 /// File payload plus bounded request metadata and senax framing overhead.
 pub const MAX_WORKSPACE_FRAME_LEN: usize = MAX_FILE_LEN + 16 * 1024;
 
-/// Client-to-daemon frames after the channel handshake.
+/// Client-to-agent host frames after the channel handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceClientFrame {
     Open {
@@ -79,7 +79,7 @@ pub enum FileSaveResult {
     Error(String),
 }
 
-/// Daemon-to-client frames after the channel handshake.
+/// Host-to-client frames after the channel handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceServerFrame {
     Opened {

@@ -1,4 +1,4 @@
-//! Daemon-owned proxy and process lifetime. No agent loop or notebook runs
+//! Host-owned proxy and process lifetime. No agent loop or notebook runs
 //! here.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

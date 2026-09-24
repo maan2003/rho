@@ -1,5 +1,5 @@
-# The files a daemon-owned workspace shows: buffers opened over rho's bounded
-# file protocol (the daemon owns disk IO, the GUI owns unsaved edits) and the
+# The files a host-owned workspace shows: buffers opened over rho's bounded
+# file protocol (the agent host owns disk IO, the GUI owns unsaved edits) and the
 # diff of a workspace against its base. Owned by no workspace; the window
 # shows both. Without the `client` feature it is the protocol alone, for the
 # host that serves it.

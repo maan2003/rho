@@ -19,7 +19,7 @@ The default output matches a 13-inch MacBook display: 2560×1664 physical
 pixels at 2× scale (1280×832 logical pixels). Override `--width`, `--height`,
 or `--scale` when a test needs different geometry.
 
-For `rho-gui`, pass the daemon socket explicitly when testing a local daemon:
+For `rho-gui`, pass the agent host socket explicitly when testing a local agent host:
 
 ```bash
 rho_socket="$XDG_RUNTIME_DIR/rho/rho.sock"
@@ -78,7 +78,7 @@ rho wayland --session gui stop
 
 The session sockets are private but applications are not sandboxed: launched
 programs retain the invoking user's authority. Do not point a test GUI at a
-production daemon unless the task specifically requires interacting with it.
+production agent host unless the task specifically requires interacting with it.
 
 ## Present results
 

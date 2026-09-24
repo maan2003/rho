@@ -4,7 +4,7 @@ use std::io::{Read as _, Write as _};
 use anyhow::{Context as _, bail};
 use rho_agent_hosts::protocol::{PlatformSecretsSet, PlatformStatus, Pr, PrCommand, PrOutput};
 
-use crate::{PrArgs, PrCliCommand, daemon_call};
+use crate::{PrArgs, PrCliCommand, host_call};
 
 pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
@@ -39,7 +39,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
             output,
             data,
             is_error,
-        } = daemon_call(&socket_path, call).await?;
+        } = host_call(&socket_path, call).await?;
         if is_error {
             bail!(output);
         }
@@ -134,7 +134,7 @@ async fn init(args: PrArgs) -> anyhow::Result<()> {
     let call = PlatformSecretsSet {
         secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
     };
-    match daemon_call(&socket_path, call).await? {
+    match host_call(&socket_path, call).await? {
         PlatformStatus {
             running: true,
             detail,

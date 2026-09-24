@@ -1,5 +1,5 @@
 //! The mirror store's client side: birthing a clone from a mirror, for
-//! the daemon's own clones (the keeper itself is called in-process). Agents
+//! the agent host's own clones (the keeper itself is called in-process). Agents
 //! need no client: the `git` in their view is Rho's patched git
 //! (`nix/patches/git-rho-store.patch`), which asks the keeper itself on every
 //! fetch and clone of a remote URL when `RHO_GIT_STORE_SOCKET` is set. The

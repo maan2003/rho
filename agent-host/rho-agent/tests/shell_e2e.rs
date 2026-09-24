@@ -341,7 +341,7 @@ async fn shell_end_to_end_over_registry(
     .expect("exited shell remained registered");
 
     // Starting, detaching, discovering, and explicitly closing are
-    // separate daemon lifecycle operations.
+    // separate agent host lifecycle operations.
     registry.start(agent_id, spawn()).await.unwrap();
     let detached = registry.attach(agent_id).await.unwrap();
     assert_eq!(registry.list().await[0].clients, 1);

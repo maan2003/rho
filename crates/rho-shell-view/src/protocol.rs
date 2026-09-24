@@ -64,7 +64,7 @@ impl rho_rpc::protocol::ProtocolOpen for Open {
     }
 }
 
-/// Starts the daemon-owned Comint-style shell for an agent. Attaching is
+/// Starts the host-owned Comint-style shell for an agent. Attaching is
 /// [`Open::Attach`].
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct ShellStart {
@@ -135,7 +135,7 @@ pub enum ShellExecutionState {
     Cancelled,
 }
 
-/// One daemon-authoritative command block retained by a shell session.
+/// One host-authoritative command block retained by a shell session.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellExecution {
     pub execution: u64,
@@ -173,11 +173,11 @@ pub struct ShellState {
     pub terminal_styles: Vec<ShellStyleSpan>,
 }
 
-/// Client to daemon frames after the shell handshake.
+/// Client to agent host frames after the shell handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ShellClientFrame {
     /// Submit one complete command. Embedded newlines are preserved; the
-    /// daemon supplies the final newline consumed by the shell.
+    /// agent host supplies the final newline consumed by the shell.
     Submit { submission: u64, command: String },
     /// Interrupt descendants attached to the active execution PTY.
     Interrupt,
@@ -192,12 +192,12 @@ pub enum ShellClientFrame {
     },
 }
 
-/// Daemon to client frames after the shell handshake.
+/// Agent host to client frames after the shell handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ShellServerFrame {
-    /// The daemon accepted a submitted command into the agent shell's bounded
-    /// queue. Clients use this to resolve an immediately displayed local
-    /// pending submission.
+    /// The agent host accepted a submitted command into the agent shell's
+    /// bounded queue. Clients use this to resolve an immediately displayed
+    /// local pending submission.
     Accepted {
         submission: u64,
         execution: u64,
@@ -250,7 +250,7 @@ pub enum ShellServerFrame {
         styles: Vec<ShellStyleSpan>,
     },
     /// Current prompt for the client-local writable draft. Prompt bytes are
-    /// sanitized by the daemon before crossing this protocol.
+    /// sanitized by the agent host before crossing this protocol.
     Prompt {
         prompt: String,
         cwd: String,

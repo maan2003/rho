@@ -148,7 +148,8 @@ impl ClaudeAgent {
     }
 
     /// Deliver agent mail and wait for acceptance into Rho's volatile Claude
-    /// queue. A process or daemon restart may lose it before Claude records it.
+    /// queue. A process or agent host restart may lose it before Claude records
+    /// it.
     pub async fn send_agent_message_accepted(&self, text: String) -> anyhow::Result<()> {
         self.send_content_accepted(vec![ContentPart::Text { text }])
             .await
@@ -254,7 +255,7 @@ enum ClaudeControl {
 
 pub(crate) struct ClaudeLoop {
     /// The Claude configuration this agent runs against, handed down from
-    /// the daemon rather than resolved here.
+    /// the agent host rather than resolved here.
     claude: rho_claude::accounts::ClaudePaths,
     inference: Inference,
     agent_id: AgentId,
@@ -496,7 +497,7 @@ impl ClaudeLoop {
                     tokio::select! {
                         biased;
                         changed = self.name_updates.changed() => {
-                            changed.context("daemon naming connection closed")?;
+                            changed.context("agent host naming connection closed")?;
                             let named = self.name_updates.borrow_and_update().clone();
                             if let Some(named) = named { self.apply_name(named); self.published(); }
                             continue;
@@ -549,7 +550,7 @@ impl ClaudeLoop {
                 let control = tokio::select! {
                     control = self.control_rx.recv() => control,
                     changed = self.name_updates.changed() => {
-                            changed.context("daemon naming connection closed")?;
+                            changed.context("agent host naming connection closed")?;
                         let named = self.name_updates.borrow_and_update().clone();
                         if let Some(named) = named { self.apply_name(named); self.published(); }
                         continue;
@@ -590,7 +591,7 @@ impl ClaudeLoop {
                 {
                     let _ = reply.send(Ok(()));
                     // Freeze scheduling and admission at this serialized boundary.
-                    // The outer driver cancels this future on daemon disconnect.
+                    // The outer driver cancels this future on agent host disconnect.
                     std::future::pending::<()>().await;
                 } else {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));

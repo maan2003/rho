@@ -1,7 +1,7 @@
 //! Process-local pool of running agents.
 //!
 //! The pool owns the id → running-agent map and the worksets agents work
-//! in. Higher layers (the daemon) own product policy around it: topics,
+//! in. Higher layers (the agent host) own product policy around it: topics,
 //! titles, land leases.
 
 use std::collections::{HashMap, HashSet};
@@ -52,11 +52,11 @@ pub struct AgentPool {
     responses: tokio::sync::mpsc::Sender<ResponseNotification>,
     db: RhoDb,
     inference: Inference,
-    /// The worksets agents work in, named by the daemon rather than
+    /// The worksets agents work in, named by the agent host rather than
     /// resolved here: a library does not reach for the user's state
     /// directory.
     worksets: Arc<Worksets>,
-    /// The Claude configuration agents run against, named by the daemon for
+    /// The Claude configuration agents run against, named by the agent host for
     /// the same reason as `worksets`: a library that resolves `$HOME` puts
     /// every caller on the user's live `~/.claude`.
     claude: rho_claude::accounts::ClaudePaths,
@@ -131,7 +131,7 @@ impl AgentPool {
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
             // Completion publication must not await another serialized actor.
-            // A single daemon-owned consumer preserves notification order, and
+            // A single host-owned consumer preserves notification order, and
             // never participates in a worker generation's retirement barrier.
             while let Some(notification) = notifications.recv().await {
                 let Some(pool) = weak.upgrade() else { break };

@@ -40,12 +40,12 @@ pub(crate) fn host_tools(
         Arc::clone(view),
     )
     .with_env("RHO_AGENT_ID", agent_id.encoded());
-    let daemon = host.map(|host| {
+    let agent_host = host.map(|host| {
         let host = Arc::clone(host);
         Arc::new(move |call| -> Pin<Box<dyn Future<Output = _> + Send>> {
             let host = Arc::clone(&host);
             Box::pin(async move { host.shared_tool(call).await })
-        }) as Daemon
+        }) as AgentHost
     });
     let mut exports = vec![Export::new(
         "view_image",
@@ -53,8 +53,8 @@ pub(crate) fn host_tools(
             images: ImageTools::new(Arc::clone(view)),
         },
     )];
-    if let Some(daemon) = daemon.as_ref().filter(|_| multi_agent.is_some()) {
-        exports.push(agents(role, Arc::clone(daemon)));
+    if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
+        exports.push(agents(role, Arc::clone(agent_host)));
     }
     if let Some(inference) = inference {
         exports.push(Export::new(
@@ -64,33 +64,38 @@ pub(crate) fn host_tools(
             },
         ));
     }
-    if let Some(daemon) = daemon {
-        exports.push(Export::new("papercut", Papercut { daemon }));
+    if let Some(agent_host) = agent_host {
+        exports.push(Export::new("papercut", Papercut { agent_host }));
     }
     (shell, exports)
 }
 
-/// Whoever answers the calls the daemon owns: the worker's host, over IPC.
-type Daemon = Arc<
+/// Whoever answers the calls the agent host owns: the worker's host, over IPC.
+type AgentHost = Arc<
     dyn Fn(SharedCall) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
 
-/// A call the daemon answers, as an operation of the running cell. Its reply
-/// is both reported and returned.
-fn ask(py: Python<'_>, daemon: &Daemon, name: &str, call: SharedCall) -> PyResult<Py<PyAny>> {
-    let daemon = Arc::clone(daemon);
+/// A call the agent host answers, as an operation of the running cell. Its
+/// reply is both reported and returned.
+fn ask(
+    py: Python<'_>,
+    agent_host: &AgentHost,
+    name: &str,
+    call: SharedCall,
+) -> PyResult<Py<PyAny>> {
+    let agent_host = Arc::clone(agent_host);
     operation(py, name, move |cx| async move {
-        let text = daemon(call).await?;
+        let text = agent_host(call).await?;
         cx.report(&text);
         Ok(text)
     })
 }
 
 /// `agents`: collaboration. Engineers may also start and stop others.
-fn agents(role: AgentRole, daemon: Daemon) -> Export {
-    let agents = Agents { daemon };
+fn agents(role: AgentRole, agent_host: AgentHost) -> Export {
+    let agents = Agents { agent_host };
     match role {
         AgentRole::Engineer { .. } => Export::build("agents", move |py| {
             let engineer = PyClassInitializer::from(agents).add_subclass(EngineerAgents);
@@ -102,7 +107,7 @@ fn agents(role: AgentRole, daemon: Daemon) -> Export {
 
 #[pyclass(subclass, frozen, module = "__main__")]
 struct Agents {
-    daemon: Daemon,
+    agent_host: AgentHost,
 }
 
 #[pymethods]
@@ -111,7 +116,12 @@ impl Agents {
     #[pyo3(signature = (*, agent_id, message))]
     fn message(&self, py: Python<'_>, agent_id: String, message: String) -> PyResult<Py<PyAny>> {
         let call = AgentCall::Message(SendArgs { agent_id, message });
-        ask(py, &self.daemon, "agents.message", SharedCall::Agent(call))
+        ask(
+            py,
+            &self.agent_host,
+            "agents.message",
+            SharedCall::Agent(call),
+        )
     }
 }
 
@@ -136,7 +146,7 @@ impl EngineerAgents {
         });
         ask(
             py,
-            &this.as_super().daemon,
+            &this.as_super().agent_host,
             "agents.spawn_new_engineer",
             SharedCall::Agent(call),
         )
@@ -148,7 +158,7 @@ impl EngineerAgents {
         let call = AgentCall::Cancel(InterruptArgs { agent_id });
         ask(
             py,
-            &this.as_super().daemon,
+            &this.as_super().agent_host,
             "agents.cancel",
             SharedCall::Agent(call),
         )
@@ -163,7 +173,7 @@ impl EngineerAgents {
         let call = AgentCall::SpawnAdvisor(AdvisorArgs { message: msg });
         ask(
             py,
-            &this.as_super().daemon,
+            &this.as_super().agent_host,
             "agents.spawn_new_advisor",
             SharedCall::Agent(call),
         )
@@ -230,7 +240,7 @@ fn web_request(request: &Bound<'_, PyDict>) -> PyResult<WebRequest> {
 /// `papercut(*, description)`: record Rho friction locally.
 #[pyclass(frozen, module = "__main__")]
 struct Papercut {
-    daemon: Daemon,
+    agent_host: AgentHost,
 }
 
 #[pymethods]
@@ -238,7 +248,7 @@ impl Papercut {
     #[pyo3(signature = (*, description))]
     fn __call__(&self, py: Python<'_>, description: String) -> PyResult<Py<PyAny>> {
         let call = SharedCall::Papercut(PapercutArgs { description });
-        ask(py, &self.daemon, "papercut", call)
+        ask(py, &self.agent_host, "papercut", call)
     }
 }
 
@@ -280,8 +290,8 @@ mod tests {
         });
     }
 
-    /// A daemon that answers every call with the call itself.
-    fn echo_daemon(calls: Arc<Mutex<Vec<String>>>) -> Daemon {
+    /// An agent host that answers every call with the call itself.
+    fn echo_host(calls: Arc<Mutex<Vec<String>>>) -> AgentHost {
         Arc::new(move |call| -> Pin<Box<dyn Future<Output = _> + Send>> {
             let text = format!("{call:?}");
             calls.lock().unwrap().push(text.clone());
@@ -321,10 +331,10 @@ mod tests {
     #[tokio::test]
     async fn agents_api_takes_python_arguments_and_runs_without_await() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let daemon = echo_daemon(calls.clone());
+        let agent_host = echo_host(calls.clone());
         let exports = vec![
-            agents(AgentRole::default(), Arc::clone(&daemon)),
-            Export::new("papercut", Papercut { daemon }),
+            agents(AgentRole::default(), Arc::clone(&agent_host)),
+            Export::new("papercut", Papercut { agent_host }),
         ];
         let output = run(
             exports,
@@ -370,7 +380,7 @@ papercut(description="friction")
             intelligence: AdvisorIntelligence::Medium,
         };
         let output = run(
-            vec![agents(role, echo_daemon(calls))],
+            vec![agents(role, echo_host(calls))],
             r#"
 assert not hasattr(agents, "spawn_new_engineer")
 assert not hasattr(agents, "spawn_new_advisor")

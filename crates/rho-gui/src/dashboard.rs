@@ -747,7 +747,7 @@ impl Dashboard {
     /// An agent nobody filed is a card all the same: what makes one is the
     /// agent asking for the user, and filing is only the user's own
     /// labelling and placement. This is also the whole of Home before a
-    /// daemon answers, when the client has its mirror of the agents and no
+    /// agent host answers, when the client has its mirror of the agents and no
     /// Desk yet: the card ranks at the root, with no breadcrumb.
     fn loose_agent_card(
         &self,
@@ -762,7 +762,7 @@ impl Dashboard {
         // as `is_some_and`, so no desk meant no verdict and the card went
         // out — which is how a snoozed agent was dealt again on every cold
         // open. Nothing is dealt until the client's replica is loaded,
-        // which is off this disk and does not wait on a daemon; when it
+        // which is off this disk and does not wait on an agent host; when it
         // is, the whole host is made again.
         let source = self
             .deal_hosts

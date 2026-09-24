@@ -72,7 +72,7 @@ async fn query_pat_available(host: &str) -> Result<bool> {
         },
     )
     .await
-    .with_context(|| format!("ask the rho daemon at {}", socket.display()))
+    .with_context(|| format!("ask the rho-agent-host at {}", socket.display()))
 }
 
 fn run_raw_remote_helper(remote_name: &str, mut remote: Remote) -> Result<()> {
@@ -200,7 +200,7 @@ async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> 
         .to_owned();
     let mut client = rho_rpc::protocol::client::Client::connect(&socket)
         .await
-        .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
+        .with_context(|| format!("connect to rho-agent-host at {}", socket.display()))?;
     client
         .open(&host::Open::GitTransport {
             request: request.clone(),
@@ -218,21 +218,21 @@ async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> 
     }
 
     let stream = client.into_stream();
-    let (mut daemon_read, mut daemon_write) = stream.into_split();
+    let (mut host_read, mut host_write) = stream.into_split();
     let service = request.service;
     let upload = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         if service == GitService::ReceivePack {
-            copy_validated_receive_pack(&mut stdin, &mut daemon_write).await?;
+            copy_validated_receive_pack(&mut stdin, &mut host_write).await?;
         } else {
-            tokio::io::copy(&mut stdin, &mut daemon_write).await?;
+            tokio::io::copy(&mut stdin, &mut host_write).await?;
         }
-        daemon_write.shutdown().await?;
+        host_write.shutdown().await?;
         Ok::<(), anyhow::Error>(())
     });
     let download = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
-        tokio::io::copy(&mut daemon_read, &mut stdout).await?;
+        tokio::io::copy(&mut host_read, &mut stdout).await?;
         stdout.shutdown().await?;
         Ok::<(), anyhow::Error>(())
     });

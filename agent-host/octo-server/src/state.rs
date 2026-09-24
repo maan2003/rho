@@ -229,7 +229,7 @@ impl AppState {
     }
 
     /// Fetch a bounded GitHub REST collection. The bound prevents a watched
-    /// PR with pathological history from monopolizing the daemon.
+    /// PR with pathological history from monopolizing the agent host.
     pub async fn github_get_json_pages(
         &self,
         segments: &[&str],

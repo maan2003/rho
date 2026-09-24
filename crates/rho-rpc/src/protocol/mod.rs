@@ -1,6 +1,6 @@
 //! How a client and an agent host talk over [`Stream`](crate::Stream)s:
 //! the opening every stream starts with ([`Open`]), one-shot calls
-//! ([`Call`]), bounded frames, the daemon's Unix socket ([`client`],
+//! ([`Call`]), bounded frames, the agent host's Unix socket ([`client`],
 //! [`server`]), and protocol logs. Each protocol's own words live with the
 //! crate that speaks them ([`Protocol`]).
 
@@ -74,7 +74,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
-/// ALPN identifying this protocol on iroh connections to the daemon.
+/// ALPN identifying this protocol on iroh connections to the agent host.
 pub const IROH_ALPN: &[u8] = b"rho/ui/22";
 #[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP22";
@@ -147,12 +147,12 @@ impl RuntimePaths {
         self.directory.join("pr-logs")
     }
 
-    pub fn daemon_lock(&self) -> std::path::PathBuf {
-        self.directory.join(".rho-daemon.lock")
+    pub fn host_lock(&self) -> std::path::PathBuf {
+        self.directory.join(".rho-agent-host.lock")
     }
 }
 
-/// Fixed per-user daemon socket used by normal clients.
+/// Fixed per-user agent host socket used by normal clients.
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(RuntimePaths::new(None::<std::path::PathBuf>)?
@@ -625,8 +625,8 @@ mod tests {
         );
         assert_eq!(paths.pr_logs(), paths.directory().join("pr-logs"));
         assert_eq!(
-            paths.daemon_lock(),
-            paths.directory().join(".rho-daemon.lock")
+            paths.host_lock(),
+            paths.directory().join(".rho-agent-host.lock")
         );
     }
 

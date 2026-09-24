@@ -1,4 +1,4 @@
-//! Daemon-owned credential publication. Selection, file changes and refresh
+//! Host-owned credential publication. Selection, file changes and refresh
 //! deadlines invalidate the snapshot before resolving again. Workers never
 //! refresh tokens, and a late resolution cannot replace a newer selection.
 use std::time::Duration;

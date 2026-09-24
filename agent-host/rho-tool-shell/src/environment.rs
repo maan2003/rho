@@ -753,7 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_does_not_inherit_daemon_descriptors() {
+    async fn resolver_does_not_inherit_host_descriptors() {
         use std::os::fd::AsRawFd;
         let root = tempfile::tempdir().unwrap();
         let sentinel = root.path().join("sentinel");

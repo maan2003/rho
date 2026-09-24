@@ -69,7 +69,7 @@ impl MultiAgentTools {
 }
 
 /// A collaboration call, typed from the notebook's Python arguments to the
-/// daemon that answers it.
+/// agent host that answers it.
 #[derive(Debug, Encode, Decode)]
 pub(crate) enum AgentCall {
     SpawnEngineer(SpawnArgs),
@@ -79,7 +79,7 @@ pub(crate) enum AgentCall {
 }
 
 impl AgentCall {
-    /// Whether an agent in `role` may make this call. The daemon checks it
+    /// Whether an agent in `role` may make this call. The agent host checks it
     /// again: a worker's notebook is not trusted to offer only these.
     pub(crate) fn allowed(&self, role: AgentRole) -> bool {
         match role {

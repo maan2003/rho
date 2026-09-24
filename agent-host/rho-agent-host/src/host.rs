@@ -1,5 +1,5 @@
-//! The machine part of the daemon, [`rho_rpc::protocol::Protocol::Host`]: Git
-//! transport and administration.
+//! The machine part of the agent host, [`rho_rpc::protocol::Protocol::Host`]:
+//! Git transport and administration.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -160,7 +160,7 @@ async fn serve_call<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let iroh = || iroh_auth.context("daemon is not listening over iroh (start it with --iroh)");
+    let iroh = || iroh_auth.context("agent host is not listening over iroh (start it with --iroh)");
     match request {
         Request::GitTransportPolicy(call) => {
             respond(writer, call, |GitTransportPolicy { host }| async move {
@@ -193,10 +193,7 @@ where
             .await
         }
         Request::Snapshot(call) => {
-            respond(writer, call, |Snapshot| {
-                debug::daemon_snapshot(&services.db)
-            })
-            .await
+            respond(writer, call, |Snapshot| debug::host_snapshot(&services.db)).await
         }
         Request::IrohApprove(call) => {
             respond(writer, call, |IrohApprove { code }| async move {
@@ -254,7 +251,7 @@ fn install_platform_secrets(
             let persistence = if stashed {
                 " and stashed in the systemd fd store"
             } else {
-                " (no systemd notify socket: they will not survive a daemon restart)"
+                " (no systemd notify socket: they will not survive an agent host restart)"
             };
             if wants_octo && store.read()?.contains_key("GITHUB_TOKEN") {
                 (true, format!("GitHub secrets installed{persistence}"))

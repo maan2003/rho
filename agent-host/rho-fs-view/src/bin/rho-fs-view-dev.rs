@@ -1,8 +1,8 @@
-//! Development runner: enters a workset namespace the way the daemon does
+//! Development runner: enters a workset namespace the way the agent host does
 //! and runs one command in it. `--src` is adopted as the workset; `--state`
 //! is a state root (its `stores/` is the mirror store). With `--store` the
 //! keeper runs and `git` inside is Rho's patched git, as under the
-//! daemon; without it no keeper runs and `git` inside is the plain one.
+//! agent host; without it no keeper runs and `git` inside is the plain one.
 
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt as _;

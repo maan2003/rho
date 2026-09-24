@@ -185,7 +185,7 @@ impl PythonNotebook {
     }
 
     /// Stop admission, cancel managed work, and await its child cleanup.
-    /// This uses no daemon service or persistence acknowledgement.
+    /// This uses no agent host service or persistence acknowledgement.
     pub async fn shutdown(&self) -> Result<(), String> {
         self.stop();
         let (mut tasks, mut failure) = {

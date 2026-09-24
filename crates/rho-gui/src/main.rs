@@ -1,4 +1,4 @@
-//! rho-gui: a native GUI attached to a running rho daemon.
+//! rho-gui: a native GUI attached to a running rho-agent-host.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,10 +23,10 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Parser)]
 #[command(
     name = "rho-gui",
-    about = "Attach a native GUI to one or more running Rho daemons"
+    about = "Attach a native GUI to one or more running Rho agent hosts"
 )]
 struct Args {
-    /// Attach a daemon as `<name>=unix:<socket>` or
+    /// Attach an agent host as `<name>=unix:<socket>` or
     /// `<name>=iroh:<endpoint-id>@<ssh-dest>`. Repeatable; the name labels
     /// the host's agents and projects once more than one is attached.
     /// Without it, the hosts attached when rho-gui last ran are attached
@@ -293,7 +293,7 @@ fn run() -> Result<()> {
     if let Some(profiler) = &profiler {
         install_profile_panic_hook(Arc::clone(&profiler.checkpoint));
     }
-    // The client keeps one database, the way the daemon does, and it is
+    // The client keeps one database, the way the agent host does, and it is
     // opened here, before anything else: the hosts to attach are in it, and
     // everything that keeps a cache is handed it now rather than told about
     // it later. A second rho stops at the door rather than running on with
@@ -305,10 +305,10 @@ fn run() -> Result<()> {
         tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
     }
     if let Err(error) = rho_agents_client::cache::init(db.clone()) {
-        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
+        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the agent host");
     }
     if let Err(error) = rho_desk_client::cache::init(db.clone()) {
-        tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the daemon");
+        tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the agent host");
     }
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
@@ -818,7 +818,7 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-/// The daemons to attach at startup, in the order they should be numbered.
+/// The agent hosts to attach at startup, in the order they should be numbered.
 /// With no `--attach`, the hosts saved by the last run are the whole list,
 /// and a first run attaches nothing: `space h` attaches a host, and the
 /// set attached is what the next start finds.

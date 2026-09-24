@@ -17,13 +17,14 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 /// What a terminals stream is for.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
-    /// A daemon-owned terminal for an agent. Answered with
+    /// A host-owned terminal for an agent. Answered with
     /// [`rho_rpc::protocol::Opened`]; an attached stream then carries
     /// [`TermClientFrame`] and [`TermServerFrame`], the first of them a
     /// snapshot of the screen preceded by history. Otherwise the terminal
     /// runs headless and the stream closes.
     Terminal {
-        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
+        /// Display handle or id prefix, resolved by the agent host
+        /// ("eng-ht08").
         agent: String,
         /// Client-chosen id, unique among the agent's running terminals
         /// ([`TerminalList`] enumerates them).
@@ -75,21 +76,21 @@ pub enum TerminalOpen {
     Attach,
 }
 
-/// Client → daemon frames after the terminal handshake.
+/// Client → agent host frames after the terminal handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum TermClientFrame {
     /// Raw bytes for the PTY (already-encoded keys from a passthrough client).
     Input(Vec<u8>),
-    /// Ask the daemon to resize the terminal (last writer wins). The daemon
-    /// answers every attached client with [`TermServerFrame::Screen`] carrying
-    /// the new authoritative size.
+    /// Ask the agent host to resize the terminal (last writer wins). The agent
+    /// host answers every attached client with [`TermServerFrame::Screen`]
+    /// carrying the new authoritative size.
     Resize { cols: u16, rows: u16 },
-    /// A key event, encoded to bytes daemon-side against the terminal's live
+    /// A key event, encoded to bytes host-side against the terminal's live
     /// modes (application cursor keys etc.), so clients never track modes.
     Keystroke(TermKeystroke),
-    /// Pasted text; the daemon applies bracketed-paste mode.
+    /// Pasted text; the agent host applies bracketed-paste mode.
     Paste(String),
-    /// A vertical wheel gesture in terminal-cell coordinates. The daemon
+    /// A vertical wheel gesture in terminal-cell coordinates. The agent host
     /// routes it against the live terminal modes (mouse reporting or
     /// alternate-screen scrolling).
     Scroll {
@@ -115,12 +116,12 @@ pub struct TermKeystroke {
     pub key_char: Option<String>,
 }
 
-/// Daemon → client frames after the terminal handshake.
+/// Agent host → client frames after the terminal handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum TermServerFrame {
     /// Full visible screen replacing whatever the client had, including the
     /// authoritative size. Sent at attach, after resizes, and whenever the
-    /// daemon prefers a full sync over a diff.
+    /// agent host prefers a full sync over a diff.
     Snapshot(TermScreen),
     /// Changed rows of the visible screen since the last frame this client
     /// received. Row indexes are 0-based from the screen top.
@@ -138,7 +139,7 @@ pub enum TermServerFrame {
         lost: u64,
     },
     Title(String),
-    /// The terminal's child process exited. The daemon drops the terminal;
+    /// The terminal's child process exited. The agent host drops the terminal;
     /// the stream closes after this frame.
     Exited {
         status: Option<i32>,
@@ -265,7 +266,7 @@ pub enum TermCursorShape {
 pub enum ScrollbackItem {
     Line(TermRow),
     /// This many lines scrolled by without being delivered (output outran
-    /// the daemon's retention); render as a discontinuity marker.
+    /// the agent host's retention); render as a discontinuity marker.
     Gap(u64),
 }
 

@@ -1,7 +1,7 @@
 //! Embedded Octo GitHub helper server.
 //!
-//! Rho runs this in-process on a daemon-owned Unix socket. GitHub tokens are
-//! supplied by the daemon from its sealed RAM-only platform secret store; Octo
+//! Rho runs this in-process on a host-owned Unix socket. GitHub tokens are
+//! supplied by the agent host from its sealed RAM-only platform secret store; Octo
 //! never receives them via argv/env or persists them to disk.
 
 use std::sync::Arc;

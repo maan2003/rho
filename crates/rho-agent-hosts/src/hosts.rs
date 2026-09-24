@@ -1,4 +1,4 @@
-//! The attached daemons. Each host is one [`Connection`] plus the liveness
+//! The attached agent hosts. Each host is one [`Connection`] plus the liveness
 //! the chrome reports; all of them feed a single tagged event stream, so the
 //! workspace handles one ordered sequence instead of polling per host.
 //!
@@ -60,9 +60,9 @@ impl Host {
     }
 }
 
-/// Every attached daemon, in attachment order, and the shared event stream
+/// Every attached agent host, in attachment order, and the shared event stream
 /// they write to.
-/// A working directory on a specific daemon. Two machines can both offer
+/// A working directory on a specific agent host. Two machines can both offer
 /// `/home/you/src/rho`, so a bare path never identifies a project once more
 /// than one host is attached.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub struct HostPath {
     pub path: Utf8PathBuf,
 }
 
-/// A workdir one daemon offers, under the name its store gave it. What
+/// A workdir one agent host offers, under the name its store gave it. What
 /// makes it a project is a fact in the store, which is not this crate's;
 /// what this crate knows is which machine it is on and what to call it.
 #[derive(Clone, Debug)]
@@ -85,7 +85,7 @@ pub struct Hosts {
     hosts: Vec<Host>,
     next_id: u32,
     events: Arc<dyn HostSink>,
-    /// Registered workdirs from every attached daemon. Fed by whoever reads
+    /// Registered workdirs from every attached agent host. Fed by whoever reads
     /// the store; named and qualified here, because what a workdir is
     /// called depends on how many machines are attached.
     workdirs: Vec<HostWorkdir>,
@@ -103,9 +103,9 @@ impl Hosts {
         }
     }
 
-    /// Dials a daemon and starts feeding its events into the shared stream.
-    /// Attaching is fire-and-forget: the host appears immediately as
-    /// `Connecting` and reports its own progress through the stream.
+    /// Dials an agent host and starts feeding its events into the shared
+    /// stream. Attaching is fire-and-forget: the host appears immediately
+    /// as `Connecting` and reports its own progress through the stream.
     /// `streams` is handed the new id and the host's [`crate::Link`], and
     /// returns the streams the host carries, opened again on every
     /// reconnect.
@@ -235,7 +235,7 @@ impl Hosts {
             .unwrap_or_default()
     }
 
-    /// Qualifies a daemon-side name with its host, but only when there is
+    /// Qualifies a host-side name with its host, but only when there is
     /// more than one host for it to be confused with.
     pub fn qualify(&self, host: HostId, name: &str) -> String {
         if self.len() > 1 {
@@ -245,7 +245,7 @@ impl Hosts {
         }
     }
 
-    /// The workdirs one daemon offers. Whoever reads the store hands them
+    /// The workdirs one agent host offers. Whoever reads the store hands them
     /// over; what they are called once more than one machine is attached is
     /// this crate's answer.
     pub fn set_workdirs(&mut self, host: HostId, workdirs: Vec<(String, Utf8PathBuf)>) {

@@ -1,4 +1,4 @@
-//! Process-local runtime connections. Shared services remain in the daemon.
+//! Process-local runtime connections. Shared services remain in the agent host.
 
 mod ipc;
 mod policy;
@@ -70,7 +70,7 @@ pub fn worker_main() -> anyhow::Result<()> {
         config_home,
     )?;
     let view = unsafe { startup.layout.enter()? };
-    // This process owns provider transports, but does not start the daemon's
+    // This process owns provider transports, but does not start the agent host's
     // RPC listener (which installs its own TLS provider).
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

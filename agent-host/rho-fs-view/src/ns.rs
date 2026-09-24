@@ -46,7 +46,7 @@ impl Mode {
 pub const MAX_BOUNDED_READ: usize = 64 * 1024 * 1024;
 
 /// Filesystem inputs for the one execution process of a workset.
-/// The daemon supplies paths; the single-threaded child builds the mounts.
+/// The agent host supplies paths; the single-threaded child builds the mounts.
 #[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct WorksetLayout {
     pub workset: String,
@@ -365,7 +365,7 @@ impl Namespace {
                 // (VIEW.md). Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
                 // Passed through from the user: the terminal, the timezone,
-                // and the daemon's own find-fork directory for direnvrc.
+                // and the agent host's own find-fork directory for direnvrc.
                 for name in ["TERM", "TZ", "RHO_DIRENV_PATH_BEFORE"] {
                     if let Some(value) = self.environment.get(name) {
                         command.env(name, value);

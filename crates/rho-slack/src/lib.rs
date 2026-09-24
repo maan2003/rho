@@ -3,7 +3,7 @@
 //! The client is entirely client-side. It talks to slack.com from the GUI
 //! process with the user's own web session — the `xoxc` token and the `d`
 //! cookie, exactly as emacs-slack has for years — and no part of it passes
-//! through a Rho daemon: a Slack session belongs to the person, and the
+//! through a Rho agent host: a Slack session belongs to the person, and the
 //! person sits at the client.
 //!
 //! Two sources feed the same model. `activity.feed` is the truth: a stable,

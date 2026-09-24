@@ -10,7 +10,7 @@ use super::{
     protocol_frame_bytes, read_frame, write_frame,
 };
 
-/// One call, on a stream of its own over the daemon's Unix socket. A
+/// One call, on a stream of its own over the agent host's Unix socket. A
 /// refusal is an error.
 pub async fn call<C: Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<C::Reply> {
     let mut client = Client::connect(socket).await?;
@@ -18,7 +18,7 @@ pub async fn call<C: Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<
     client.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
-/// Raw async client for one stream over the daemon's Unix socket. The first
+/// Raw async client for one stream over the agent host's Unix socket. The first
 /// frame sent is an [`Open`] ([`Client::open`]).
 pub struct Client {
     stream: crate::Stream,
@@ -60,7 +60,8 @@ impl Client {
     }
 
     /// Finishes the client's compressed send stream and half-closes the
-    /// connection so the daemon can distinguish a normal exit from truncation.
+    /// connection so the agent host can distinguish a normal exit from
+    /// truncation.
     pub async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.stream.shutdown().await.map_err(Into::into)
     }

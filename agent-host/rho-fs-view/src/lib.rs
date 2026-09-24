@@ -1,13 +1,13 @@
-//! Daemon-owned workset storage.
+//! Host-owned workset storage.
 //!
 //! A workset is one plain directory an agent uses as its working place,
-//! presented at `/src` inside the agent's namespace. The daemon does not
+//! presented at `/src` inside the agent's namespace. The agent host does not
 //! interpret its contents: the agent clones what it needs with ordinary
 //! `git clone`, which is instant because every clone is born from the
-//! daemon's mirror store (`CLONES.md`). The store root is owned by the
-//! keeper (`rho-git-server`) running inside the daemon; the `git` agents
+//! agent host's mirror store (`CLONES.md`). The store root is owned by the
+//! keeper (`rho-git-server`) running inside the agent host; the `git` agents
 //! see is Rho's patched git, which asks the keeper itself on every fetch
-//! and clone, and the daemon's own clones go through the same keeper
+//! and clone, and the agent host's own clones go through the same keeper
 //! in-process. Nothing but the keeper writes a mirror.
 
 use std::collections::BTreeMap;
@@ -38,7 +38,7 @@ pub const AGENT_BASE: &str = env!(
 );
 
 /// Rho's patched git (`nix/patches/git-rho-store.patch`): the keeper
-/// fetches with it, the daemon clones with it, and agents see it as `git`.
+/// fetches with it, the agent host clones with it, and agents see it as `git`.
 /// Without the store socket in its environment it is plain git.
 pub const GIT: &str = concat!(env!("RHO_AGENT_BASE"), "/bin/git");
 
@@ -80,7 +80,7 @@ impl PathOverrides {
     }
 }
 
-/// Environment explicitly supplied to subprocesses owned by the daemon.
+/// Environment explicitly supplied to subprocesses owned by the agent host.
 #[derive(Clone, Debug, Default)]
 pub struct UserEnvironment(Arc<[(OsString, OsString)]>);
 
@@ -121,13 +121,13 @@ impl UserEnvironment {
 /// nothing is shared.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreService {
-    /// Use the daemon's existing keeper without owning its service.
+    /// Use the agent host's existing keeper without owning its service.
     Client(Utf8PathBuf),
     Serve(StoreRefresh),
     None,
 }
 
-/// The daemon-wide owner of one state root: the mirror store, its keeper,
+/// The host-wide owner of one state root: the mirror store, its keeper,
 /// and every workset directory.
 #[derive(Debug)]
 pub struct Worksets {
@@ -228,8 +228,9 @@ impl Worksets {
         &self.path_overrides
     }
 
-    /// Reconstitutes a daemon-owned workset in a worker without allocating
-    /// another identity or directory. The daemon has already resolved its root.
+    /// Reconstitutes a host-owned workset in a worker without allocating
+    /// another identity or directory. The agent host has already resolved its
+    /// root.
     pub fn attach(self: &Arc<Self>, id: String, root: Utf8PathBuf) -> anyhow::Result<Workset> {
         anyhow::ensure!(
             root.is_absolute() && root.is_dir(),
@@ -393,7 +394,7 @@ impl Worksets {
         }
     }
 
-    /// A daemon-side command with the user's environment and the store
+    /// A host-side command with the user's environment and the store
     /// wired in.
     pub fn command(&self, program: &str) -> tokio::process::Command {
         let mut command = base_command(program, &self.environment, &self.path_overrides);

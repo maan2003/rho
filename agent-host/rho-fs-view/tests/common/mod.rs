@@ -52,7 +52,7 @@ pub async fn store_git(root: &Worksets, dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// The user environment the tests hand the daemon: the process's, without
+/// The user environment the tests hand the agent host: the process's, without
 /// the store variables a surrounding view may have set.
 pub fn environment() -> UserEnvironment {
     UserEnvironment::new(

@@ -6,6 +6,10 @@ that the user watches, terminals and shells in an agent's workset, the
 git an agent uses and the user approves, voice, and a copy of the desk
 for devices to sync through.
 
+The host is the `rho-agent-host` binary. The `rho` command (rho-cli) runs
+beside it and is mostly the agents' own: tools they call from their shell,
+plus the plumbing around the host.
+
 ## The boundary
 
 - The GUI reaches the host only through protocols: `rho_rpc::protocol`

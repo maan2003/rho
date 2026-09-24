@@ -71,7 +71,7 @@ struct Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         // Once published, even an abandoned request owns its credit until the
-        // daemon replies. Caller cancellation must not let bursts bypass admission.
+        // agent host replies. Caller cancellation must not let bursts bypass admission.
         if !self.published {
             self.replies.lock().expect("poison").calls.remove(&self.id);
         }

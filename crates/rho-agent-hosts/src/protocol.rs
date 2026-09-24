@@ -83,13 +83,13 @@ pub struct GitTransportPolicy {
 }
 
 /// A bounded, client-produced performance snapshot, kept under the
-/// daemon's state directory.
+/// agent host's state directory.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct GuiTelemetryUpload {
     pub snapshot: Vec<u8>,
 }
 
-/// Installs platform secrets into the daemon's RAM-only store.
+/// Installs platform secrets into the agent host's RAM-only store.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct PlatformSecretsSet {
     pub secrets: Vec<(String, String)>,
@@ -108,7 +108,7 @@ pub struct IrohApprove {
     pub code: String,
 }
 
-/// Trusts an iroh endpoint in daemon memory. A privileged local-control
+/// Trusts an iroh endpoint in agent host memory. A privileged local-control
 /// operation intended to be invoked through SSH.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct IrohTrustInMemory {
@@ -121,7 +121,7 @@ pub struct IrohRevoke {
     pub endpoint_id: String,
 }
 
-/// Copies the daemon's database for inspection, as of its latest commit
+/// Copies the agent host's database for inspection, as of its latest commit
 /// and ready to open without repair.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Snapshot;
@@ -139,7 +139,7 @@ pub struct PrOutput {
     pub is_error: bool,
 }
 
-/// Maximum encoded GUI performance snapshot accepted by the daemon.
+/// Maximum encoded GUI performance snapshot accepted by the agent host.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 
 /// The answer to [`Open::GitProvide`].

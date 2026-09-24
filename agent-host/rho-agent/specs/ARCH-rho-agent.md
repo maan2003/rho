@@ -5,12 +5,12 @@
 The native `Agent` and `ClaudeLoop` are separate concrete runtimes. There is no
 universal runtime trait and Claude Code is not a raw inference provider.
 One workset process contains its agents' runtimes, notebooks, local tools,
-jobs, provider transports, retained terminals, and interactive shells. The daemon alone owns the shared
+jobs, provider transports, retained terminals, and interactive shells. The agent host alone owns the shared
 database, account and route policy, naming tasks, workset allocation, pool,
 subscriptions, and UI projection. Each runtime serializes its own controls and
 scheduling. Native events replicate through an ordered, bounded background writer;
-Claude's durable operations retain acknowledged daemon services.
-There is no in-daemon runtime fallback.
+Claude's durable operations retain acknowledged agent host services.
+There is no in-agent host runtime fallback.
 
 The append-only `NativeEvent` log owns the recoverable conversation prefix. The
 native worker owns an ordered volatile tail; live provider input includes that
@@ -25,7 +25,7 @@ prose or one custom Python `exec`. `rho-claude` owns CLI transport and MCP proto
 adaptation. Neither adapter owns Rho's scheduling or persistence.
 
 One private Senax Unix connection multiplexes agent services and controls with
-workset control and terminal/shell traffic. Inference policy has one daemon
+workset control and terminal/shell traffic. Inference policy has one agent host
 subscription and one shared client per workset, not per agent. Its pushes and
 RPC replies share workset FIFO ordering; agent retirement does not close it.
 Policy admission is bounded across the workset; a published request retains
@@ -52,7 +52,7 @@ then drain and replace the whole workset execution.
 Agent retirement requires the runtime's serialized permission and fences new
 admission; coalesced observations are not authority. Activation and retirement
 serialize per agent even across caller cancellation. The ID is reused only after
-runtime and daemon-handler drain, without incarnation IDs or extra sockets.
+runtime and host-handler drain, without incarnation IDs or extra sockets.
 Unloading an agent or detaching a GUI leaves workset terminals and shells alive.
 Workset failure loses all local ephemeral execution. Normal shutdown drains
 owned work; crashes may leave descendants and external effects behind. Recovery

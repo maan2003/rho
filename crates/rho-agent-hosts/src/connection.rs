@@ -1,4 +1,4 @@
-//! Daemon connection: an IO task on the tokio runtime the caller hands in,
+//! Agent host connection: an IO task on the tokio runtime the caller hands in,
 //! bridged to the reader through sinks. Each thing the host pushes has a
 //! stream of its own, and what they carry becomes [`ConnEvent`]s on a
 //! futures channel the workspace awaits (no polling); every request is a
@@ -55,7 +55,7 @@ fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
 
 use crate::{AttachTarget, Dialer, HostId, HostStream};
 
-/// A connection event tagged with the daemon it came from. Every attached
+/// A connection event tagged with the agent host it came from. Every attached
 /// host feeds the same channel, so the workspace handles one ordered stream
 /// rather than polling several.
 pub struct HostEvent {
@@ -85,7 +85,7 @@ impl EventSink {
 pub enum ConnEvent {
     /// The host is up.
     Ready,
-    /// Several events in order, delivered as one. A daemon sends them
+    /// Several events in order, delivered as one. An agent host sends them
     /// separately; a test that stands for one stands for the batch.
     Many(Vec<ConnEvent>),
     ServerError(String),
@@ -109,7 +109,7 @@ pub enum GitApprovalDecision {
     Done,
 }
 
-/// How to dial an extra workspace-file stream to the daemon: locally a
+/// How to dial an extra workspace-file stream to the agent host: locally a
 /// second Unix connection, remotely another bi-stream on the already
 /// authenticated iroh connection. Set by the IO task once connected.
 pub(crate) type ChannelDialer = rho_rpc::Dialer;
@@ -251,8 +251,8 @@ pub fn supervises() -> bool {
     !cfg!(test) && !cfg!(feature = "test-support")
 }
 
-/// Attaches one daemon. Its events join `events`, tagged with `host`, so
-/// several daemons feed the workspace through a single ordered stream.
+/// Attaches one agent host. Its events join `events`, tagged with `host`, so
+/// several agent hosts feed the workspace through a single ordered stream.
 /// `streams` is handed the host's [`Link`] and returns the streams that
 /// open on every connection, beside the host's own (Git transport). The
 /// connection's work runs on `runtime`.
@@ -303,7 +303,7 @@ async fn supervise(
         let reason = result
             .err()
             .map(|error| format!("{error:#}"))
-            .unwrap_or_else(|| "daemon connection closed".to_owned());
+            .unwrap_or_else(|| "agent host connection closed".to_owned());
         if (!reconnecting
             && events
                 .unbounded_send(ConnEvent::Disconnected(reason))
@@ -439,10 +439,10 @@ async fn run(
         let _ = task.await;
     }
     Err(match ended {
-        Some(Ok((name, Ok(())))) => anyhow::anyhow!("daemon {name} stream closed"),
-        Some(Ok((name, Err(error)))) => error.context(format!("daemon {name} stream")),
-        Some(Err(error)) => anyhow::anyhow!("daemon stream task failed: {error}"),
-        None => anyhow::anyhow!("daemon connection has no streams"),
+        Some(Ok((name, Ok(())))) => anyhow::anyhow!("agent host {name} stream closed"),
+        Some(Ok((name, Err(error)))) => error.context(format!("agent host {name} stream")),
+        Some(Err(error)) => anyhow::anyhow!("agent host stream task failed: {error}"),
+        None => anyhow::anyhow!("agent host connection has no streams"),
     })
 }
 
@@ -836,7 +836,7 @@ fn display_field(value: &str) -> String {
 }
 
 /// The client's iroh identity, bound once and shared by every attached
-/// daemon. One identity means one key for the user to recognize across
+/// agent host. One identity means one key for the user to recognize across
 /// hosts, and each host still enrolls it separately over its own SSH login.
 static CLIENT_ENDPOINT: tokio::sync::OnceCell<iroh::Endpoint> = tokio::sync::OnceCell::const_new();
 
@@ -848,12 +848,12 @@ async fn client_endpoint() -> anyhow::Result<iroh::Endpoint> {
 }
 
 async fn connect_iroh(
-    daemon_id: iroh::EndpointId,
+    host_id: iroh::EndpointId,
     ssh_destination: &str,
     remote_rho: &str,
 ) -> anyhow::Result<(iroh::endpoint::Connection, iroh::Endpoint)> {
     // The native client's identity intentionally lives only as long as this
-    // process. Each daemon can trust it in memory via an existing SSH login.
+    // process. Each agent host can trust it in memory via an existing SSH login.
     let endpoint = client_endpoint().await?;
     tracing::info!(
         destination = ssh_destination,
@@ -865,13 +865,13 @@ async fn connect_iroh(
         "ephemeral iroh client trusted over SSH"
     );
     let connection = endpoint
-        .connect(daemon_id, rho_rpc::protocol::IROH_ALPN)
+        .connect(host_id, rho_rpc::protocol::IROH_ALPN)
         .await
-        .context("connect to daemon over iroh")?;
+        .context("connect to agent host over iroh")?;
     anyhow::ensure!(
         rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await?
             == rho_iroh_auth::ClientAuthResult::Approved,
-        "daemon did not approve SSH-trusted iroh client"
+        "agent host did not approve SSH-trusted iroh client"
     );
     Ok((connection, endpoint))
 }

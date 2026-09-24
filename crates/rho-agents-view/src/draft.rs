@@ -394,7 +394,7 @@ impl DraftModel {
     }
 
     /// The message body, without clearing it. Submissions read instead of
-    /// taking: the buffers survive until the daemon confirms creation.
+    /// taking: the buffers survive until the agent host confirms creation.
     pub fn body_text(&self, cx: &gpui::App) -> String {
         let buffer = self.body_buffer.read(cx);
         buffer.text_for_range(0..buffer.len()).collect()
@@ -733,7 +733,7 @@ impl DraftModel {
         cx.notify();
     }
 
-    /// What the daemon said when it refused this draft, or nothing once the
+    /// What the agent host said when it refused this draft, or nothing once the
     /// reader submits again.
     pub fn set_refusal(&mut self, message: Option<String>, cx: &mut Context<Self>) {
         if self.refusal == message {

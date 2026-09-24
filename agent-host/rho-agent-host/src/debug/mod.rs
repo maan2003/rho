@@ -13,9 +13,9 @@ use crate::default_db_path;
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DebugArgs {
-    /// Source database path. Defaults to rho's normal daemon database: a
-    /// running daemon hands out a snapshot of it, and commands that write
-    /// it need the daemon stopped. A named one is taken to be nobody's and
+    /// Source database path. Defaults to rho's normal agent host database: a
+    /// running agent host hands out a snapshot of it, and commands that write
+    /// it need the agent host stopped. A named one is taken to be nobody's and
     /// is read or written without that check.
     #[arg(long = "db-path")]
     db_path: Option<PathBuf>,
@@ -39,30 +39,30 @@ enum DebugCommand {
     /// Snapshot the database and run pending migrations on the copy.
     Migrate,
     /// Put the real database back as it was before its last migration,
-    /// from the savepoint taken then. Stop the daemon first.
+    /// from the savepoint taken then. Stop the agent host first.
     Rollback,
     /// List the recovery savepoints the real database holds, and the
-    /// migration each was taken for. Stop the daemon first.
+    /// migration each was taken for. Stop the agent host first.
     Savepoints,
     /// Drop the savepoints no migration recorded: leftovers of older
-    /// builds that keep freed pages from being reused. Stop the daemon
+    /// builds that keep freed pages from being reused. Stop the agent host
     /// first.
     DropStaleSavepoints,
     /// Drop the savepoints recorded for migrations once they are verified,
-    /// so nothing pins the pages they freed. Stop the daemon first.
+    /// so nothing pins the pages they freed. Stop the agent host first.
     ForgetSavepoints,
     /// Rewrite the real database file without the pages nothing refers to
     /// any more. Needs every savepoint gone (`drop-stale-savepoints` after
-    /// the last migration is done). Stop the daemon first.
+    /// the last migration is done). Stop the agent host first.
     Compact,
     /// Delete agents outright: their log, journal entries, subscriptions
-    /// and usage. Takes full agent ids. Stop the daemon first.
+    /// and usage. Takes full agent ids. Stop the agent host first.
     DeleteAgents {
         #[arg(required = true)]
         agents: Vec<String>,
     },
     /// Print bytes stored per table and pages allocated overall for the
-    /// real database. Stop the daemon first.
+    /// real database. Stop the agent host first.
     Stats,
     /// Snapshot the database and print the context usage each agent would
     /// restore on load (event log for Rho agents, session transcript for
@@ -97,22 +97,22 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     }
 }
 
-/// The daemon's lock, held for as long as the file lives, or `None` while
-/// the daemon has it.
-fn try_daemon_lock(daemon_lock: &Path) -> anyhow::Result<Option<std::fs::File>> {
+/// The agent host's lock, held for as long as the file lives, or `None` while
+/// the agent host has it.
+fn try_host_lock(host_lock: &Path) -> anyhow::Result<Option<std::fs::File>> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(daemon_lock)
-        .with_context(|| format!("open daemon lock {}", daemon_lock.display()))?;
+        .open(host_lock)
+        .with_context(|| format!("open agent host lock {}", host_lock.display()))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::WouldBlock {
             return Ok(None);
         }
-        return Err(error).with_context(|| format!("lock {}", daemon_lock.display()));
+        return Err(error).with_context(|| format!("lock {}", host_lock.display()));
     }
     Ok(Some(lock))
 }
@@ -223,18 +223,18 @@ async fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
     };
     let paths = rho_rpc::protocol::RuntimePaths::from_env()?;
     std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
-    match copy_snapshot_from(&source, &paths.daemon_lock())? {
+    match copy_snapshot_from(&source, &paths.host_lock())? {
         Some(snapshot) => Ok(snapshot),
         None => request_snapshot(paths.socket(), &source).await,
     }
 }
 
-/// Ask the running daemon for a snapshot: it alone can copy the file
+/// Ask the running agent host for a snapshot: it alone can copy the file
 /// between commits, in a state that opens without repair.
 async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapshot> {
     let path = rho_rpc::protocol::client::call(socket, rho_agent_hosts::protocol::Snapshot)
         .await
-        .context("the daemon holds the database, and its socket does not answer")?
+        .context("the agent host holds the database, and its socket does not answer")?
         .into_std_path_buf();
     let dir = path.parent().context("snapshot has no directory")?;
     Ok(Snapshot {
@@ -244,10 +244,10 @@ async fn request_snapshot(socket: &Path, source: &Path) -> anyhow::Result<Snapsh
     })
 }
 
-/// The daemon's half of
+/// The agent host's half of
 /// [`host::Snapshot`](rho_agent_hosts::protocol::Snapshot):
 /// a snapshot of `db` in a directory of its own beside it.
-pub(crate) async fn daemon_snapshot(db: &RhoDb) -> anyhow::Result<camino::Utf8PathBuf> {
+pub(crate) async fn host_snapshot(db: &RhoDb) -> anyhow::Result<camino::Utf8PathBuf> {
     let dir = new_snapshot_dir(db.path())?;
     let path = dir.0.join("rho.redb");
     db.snapshot(&path).await?;
@@ -336,9 +336,9 @@ fn describe_age(age: std::time::Duration) -> String {
     }
 }
 
-/// A copy of the closed database, or `None` while the daemon has it open.
-fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Option<Snapshot>> {
-    let Some(_lock) = try_daemon_lock(daemon_lock)? else {
+/// A copy of the closed database, or `None` while the agent host has it open.
+fn copy_snapshot_from(source: &Path, host_lock: &Path) -> anyhow::Result<Option<Snapshot>> {
+    let Some(_lock) = try_host_lock(host_lock)? else {
         return Ok(None);
     };
     copy_snapshot_unlocked(source).map(Some)
@@ -686,11 +686,11 @@ mod snapshot_tests {
     use super::*;
 
     #[test]
-    fn a_live_daemon_lock_leaves_the_copy_to_the_daemon() {
+    fn a_live_host_lock_leaves_the_copy_to_the_host() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("rho.redb");
         drop(RhoDb::open(&source));
-        let lock_path = directory.path().join("daemon.lock");
+        let lock_path = directory.path().join("agent-host.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -717,7 +717,7 @@ mod snapshot_tests {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("rho.redb");
         drop(RhoDb::open(&source));
-        let lock_path = directory.path().join("daemon.lock");
+        let lock_path = directory.path().join("agent-host.lock");
 
         let snapshot = copy_snapshot_from(&source, &lock_path).unwrap().unwrap();
         let held = snapshot.path.clone();

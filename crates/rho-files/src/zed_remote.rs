@@ -1,6 +1,6 @@
-//! Daemon-backed workspace files using rho's bounded file protocol.
+//! Host-backed workspace files using rho's bounded file protocol.
 //!
-//! Buffers and unsaved edits live only in the GUI. The daemon owns disk IO,
+//! Buffers and unsaved edits live only in the GUI. The agent host owns disk IO,
 //! checked-save revisions, and workspace-scoped filesystem notifications.
 
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ pub enum RemoteProjectEvent {
 pub struct RemoteProjectState {
     outgoing: Sender<WorkspaceClientFrame>,
     next_request_id: u64,
-    /// Monotonically advances for each daemon filesystem invalidation. Diff
+    /// Monotonically advances for each agent host filesystem invalidation. Diff
     /// preparation samples this so a watcher event that arrives before its
     /// model subscribes cannot be lost.
     change_epoch: u64,

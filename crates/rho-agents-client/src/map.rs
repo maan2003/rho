@@ -219,7 +219,7 @@ impl AgentMap {
     }
 
     /// Drops everything mirrored from a host that is still attached: for
-    /// a daemon whose database is not the one this client mirrored.
+    /// an agent host whose database is not the one this client mirrored.
     pub fn reset_host(&mut self, host: HostId) -> BTreeSet<AgentId> {
         let departed = self.by_host.get(&host).cloned().unwrap_or_default();
         self.forget_agents(&departed);
@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(registry.attention(agent_id), Attention::Quiet);
     }
 
-    /// The rails read the log, not the daemon: a turn that starts and
+    /// The rails read the log, not the agent host: a turn that starts and
     /// ends asking for something leaves the fold saying exactly that.
     #[test]
     fn the_log_is_what_the_rails_read() {

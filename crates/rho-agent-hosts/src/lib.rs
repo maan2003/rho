@@ -1,6 +1,6 @@
 //! The machines this client can reach.
 //!
-//! One connection per attached daemon, the handshake that brings it up, and
+//! One connection per attached agent host, the handshake that brings it up, and
 //! the streams it carries. The host's own stream, Git transport, reports
 //! to one reader ([`HostSink`]); every other long-lived stream belongs to
 //! a client that hands the host a [`HostStream`] to run, the agents
@@ -30,7 +30,7 @@ pub type Dialer = rho_rpc::Dialer;
 #[cfg(feature = "client")]
 pub use hosts::{Host, HostPath, HostStatus, HostWorkdir, Hosts};
 
-/// Which attached daemon. Assigned in attachment order; agent ids are
+/// Which attached agent host. Assigned in attachment order; agent ids are
 /// already unique across machines, so this says which socket a command goes
 /// down rather than telling two things apart.
 #[cfg(feature = "client")]
@@ -44,9 +44,9 @@ impl std::fmt::Display for HostId {
     }
 }
 
-/// How to reach the daemon. Deliberately holds no client-local paths: the
+/// How to reach the agent host. Deliberately holds no client-local paths: the
 /// socket may be forwarded from another machine, so this client's own cwd
-/// and home mean nothing to the daemon and must never leak into agent
+/// and home mean nothing to the agent host and must never leak into agent
 /// working directories.
 #[cfg(feature = "client")]
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl AttachTarget {
     }
 }
 
-/// One daemon to attach: the short name it is known by in this client, and
+/// One agent host to attach: the short name it is known by in this client, and
 /// how to reach it.
 #[cfg(feature = "client")]
 #[derive(Clone)]

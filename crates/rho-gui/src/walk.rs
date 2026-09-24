@@ -440,7 +440,7 @@ fn run_events_with_detached_host(
         .as_ref()
         .map(|isolated| HostSpec {
             name: "generated".to_owned(),
-            target: AttachTarget::Unix(isolated.path().join("daemon.sock")),
+            target: AttachTarget::Unix(isolated.path().join("agent-host.sock")),
         })
         .into_iter()
         .collect();

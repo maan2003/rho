@@ -79,7 +79,7 @@ pub enum UiAgentStatus {
     /// The turn failed permanently; the error text is the trailing unsealed
     /// [`UiBlock::Notice`].
     Error,
-    /// The daemon is not streaming to this client, and a turn was running
+    /// The agent host is not streaming to this client, and a turn was running
     /// when it last heard. Retained transcript content is still displayed
     /// and is no longer being updated.
     ///

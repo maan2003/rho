@@ -1,8 +1,8 @@
-//! Taking a snapshot of the user's state while the daemon runs.
+//! Taking a snapshot of the user's state while the agent host runs.
 //!
-//! The copy is hot: the live daemon keeps writing throughout, and a proof does
-//! not need a quiesced copy. What a hot copy of a redb file can be is torn —
-//! the header committed at one moment, pages read at another — so a copy is
+//! The copy is hot: the live agent host keeps writing throughout, and a proof
+//! does not need a quiesced copy. What a hot copy of a redb file can be is torn
+//! — the header committed at one moment, pages read at another — so a copy is
 //! not a snapshot until it has been opened and read. Verification runs on the
 //! copy, which is also where redb's own recovery runs, so a verified snapshot
 //! is a store that opens cleanly. A file that fails is copied once more before
@@ -33,8 +33,8 @@ pub struct SnapshotArgs {
     root: Option<PathBuf>,
 
     /// A client's state directory, when the device that runs the GUI is not
-    /// the device that runs the daemon. Its own allow list, its own place in
-    /// the snapshot, read only like the other one.
+    /// the device that runs the agent host. Its own allow list, its own place
+    /// in the snapshot, read only like the other one.
     #[arg(long)]
     gui_state: Option<PathBuf>,
 
@@ -166,7 +166,7 @@ pub fn take(args: SnapshotArgs) -> Result<()> {
     }
 
     // The GUI half. A second directory, copied after the first so a failure
-    // in it cannot leave the daemon's half half-written, and verified the
+    // in it cannot leave the agent host's half half-written, and verified the
     // same way: a copy is not a snapshot until it has been read back.
     let mut gui_files = Vec::new();
     let mut gui_databases = Vec::new();
@@ -295,7 +295,7 @@ pub fn list() -> Result<()> {
 
 /// Open a copied database and read what it holds. This is the verification:
 /// a file that opens, lists its tables and counts their rows is a file a rig
-/// daemon can run on. Only the copy is ever opened.
+/// agent host can run on. Only the copy is ever opened.
 fn read_tables(path: &Path) -> Result<Vec<TableRecord>> {
     use redb::{ReadableDatabase as _, ReadableTableMetadata as _, TableHandle as _};
 

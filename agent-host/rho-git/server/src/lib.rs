@@ -1,6 +1,6 @@
 //! The mirror keeper: one bare git mirror per remote URL under a root,
-//! fetched on request, served over a unix socket. The daemon runs it in-process
-//! and is the root's only writer; everything else — the daemon's own
+//! fetched on request, served over a unix socket. The agent host runs it in-process
+//! and is the root's only writer; everything else — the agent host's own
 //! clones and the `git` wrapper agents run — is a client that reads a
 //! mirror and never touches the network (`CLONES.md`).
 //!

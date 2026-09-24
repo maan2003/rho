@@ -1,6 +1,6 @@
 //! The fold: what a client makes of the mirror.
 //!
-//! The daemon sends the mirror, one stripped event per raw row
+//! The agent host sends the mirror, one stripped event per raw row
 //! (`AGENT-LOG-DESIGN.md`, "the mirror is a pure function of the raw
 //! log"). Everything a rail or a transcript shows is folded from it here,
 //! on the client, so the wire carries facts and never conclusions.
@@ -691,7 +691,7 @@ impl TranscriptFold {
             blocks,
             // Never `Streaming`: this is the mirror, not the live tail. A
             // turn that was running when the client last heard is the
-            // daemon's to report again.
+            // agent host's to report again.
             status: if self.errored {
                 UiAgentStatus::Error
             } else if self.turn_running {

@@ -23,7 +23,7 @@ const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
 
 /// The same two tables, read without trusting every row to decode. A newer
 /// build on another device can write a property or a verdict this one has
-/// never heard of; through `Sen` that row aborts the daemon on the way in,
+/// never heard of; through `Sen` that row aborts the agent host on the way in,
 /// so the rows the store is loaded from come through these instead and an
 /// unreadable one is skipped rather than fatal. Writes still go through the
 /// definitions above, and skipping never deletes: the row stays in the
@@ -34,7 +34,7 @@ const VERDICTS_READ: TableDefinition<Lenient<VerdictKey>, Lenient<VerdictEvent>>
     TableDefinition::new("rho_desk_fact_verdicts_v1");
 /// The replay-dedup log, read the same way: a retry of a mutation this
 /// build cannot read is not the mutation it is holding, and saying so is
-/// an error the client sees rather than a dead daemon.
+/// an error the client sees rather than a dead agent host.
 const MUTATIONS_READ: TableDefinition<Sen<Stamp>, Lenient<CellMutation>> =
     TableDefinition::new("rho_desk_fact_mutations_v1");
 /// Note bodies, read the same way. A text operation this build has never
@@ -56,7 +56,8 @@ struct VerdictKey {
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct CellMeta {
-    daemon_device: DeviceId,
+    #[senax(rename = "daemon_device")]
+    host_device: DeviceId,
     frontier: Version,
     device_node_namespaces: Vec<(DeviceId, u16)>,
     next_node_namespace: u16,
@@ -95,12 +96,12 @@ impl DeskCellStore {
             .ok_or("Desk cells V2 metadata is missing")?
             .value()
             .into_owned();
-        let store = Store::from_snapshot(meta.daemon_device, read_snapshot(&read)?)?;
+        let store = Store::from_snapshot(meta.host_device, read_snapshot(&read)?)?;
         let delta = match held {
-            Some(held) if held != meta.daemon_device => store.since(&Version::new()),
+            Some(held) if held != meta.host_device => store.since(&Version::new()),
             _ => store.since(known),
         };
-        Ok((meta.daemon_device, delta))
+        Ok((meta.host_device, delta))
     }
 
     pub fn sync_since(&self, known: &Version) -> Result<Snapshot, String> {
@@ -111,7 +112,7 @@ impl DeskCellStore {
             .ok_or("Desk cells V2 metadata is missing")?
             .value()
             .into_owned();
-        Store::from_snapshot(meta.daemon_device, read_snapshot(&read)?)
+        Store::from_snapshot(meta.host_device, read_snapshot(&read)?)
             .map(|store| store.since(known))
     }
 
@@ -268,13 +269,13 @@ impl DeskCellStore {
     /// Once, like every conversion: a project that already has its label is
     /// skipped. Deleted with the table it reads (`AGENT-LOG-DESIGN.md`).
     /// The workdirs the user has filed as projects: the labels that carry
-    /// a `Project`, name and path. Iris routes by these; the daemon's old
+    /// a `Project`, name and path. Iris routes by these; the agent host's old
     /// `projects` table is gone.
     /// Files a set of agents under one note, for a rig fixture: Home ranks
     /// agents through the note they sit under, so seeded agents nobody
     /// filed would never reach the queue.
     ///
-    /// Writes as the daemon's own device, like the conversions. Never runs
+    /// Writes as the agent host's own device, like the conversions. Never runs
     /// on its own; only `rho debug seed-agents` calls it.
     pub async fn seed_desk_rows(
         &self,
@@ -284,7 +285,7 @@ impl DeskCellStore {
         let mut write = self.db.write().await;
         let mut meta = load_meta_from_write(&mut write)?;
         let snapshot = read_snapshot_from_write(&mut write)?;
-        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        let mut store = Store::from_snapshot(meta.host_device, snapshot)?;
         let created_at = rho_desk_client::protocol::cells::Timestamp {
             unix_ms: rho_agent_types::UnixMs::now().0 as i64,
             precision: rho_desk_client::protocol::cells::TimestampPrecision::Millisecond,
@@ -324,7 +325,7 @@ impl DeskCellStore {
 
     /// The client's half of a sync: cells it holds that this store's
     /// frontier does not cover. The desk is the client's, so this is how
-    /// the daemon catches up — a write made while it was away, or one that
+    /// the agent host catches up — a write made while it was away, or one that
     /// never made it off the wire, arrives here at the next handshake
     /// rather than living on one device forever.
     pub async fn apply_cells(&self, cells: Snapshot) -> Result<(), String> {
@@ -339,7 +340,7 @@ impl DeskCellStore {
             .value()
             .into_owned();
         let snapshot = read_snapshot_from_write(&mut write)?;
-        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        let mut store = Store::from_snapshot(meta.host_device, snapshot)?;
         store.merge(cells)?;
         persist_cells_and_verdicts(&mut write, &store.snapshot())?;
         meta.frontier = store.version().clone();
@@ -367,7 +368,7 @@ impl DeskCellStore {
             .value()
             .into_owned();
         let snapshot = read_snapshot_from_write(&mut write)?;
-        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        let mut store = Store::from_snapshot(meta.host_device, snapshot)?;
         // Whatever the mutation says, it is merged. A stamp the store has
         // already counted merges as itself, an older one loses to what beat
         // it, and a newer one wins: last-writer-wins is the whole of the
@@ -504,21 +505,21 @@ fn load_meta_from_write(write: &mut WriteTxn) -> Result<CellMeta, String> {
         .ok_or_else(|| "Desk cells V2 metadata is missing".into())
 }
 
-fn daemon_node_namespace(meta: &CellMeta) -> Result<u16, String> {
+fn host_node_namespace(meta: &CellMeta) -> Result<u16, String> {
     meta.device_node_namespaces
         .iter()
-        .find_map(|(device, namespace)| (*device == meta.daemon_device).then_some(*namespace))
-        .ok_or_else(|| "Desk daemon node namespace is missing".into())
+        .find_map(|(device, namespace)| (*device == meta.host_device).then_some(*namespace))
+        .ok_or_else(|| "Desk agent host node namespace is missing".into())
 }
 
-fn next_daemon_version(meta: &CellMeta) -> Result<u64, String> {
+fn next_host_version(meta: &CellMeta) -> Result<u64, String> {
     meta.frontier
         .values()
         .copied()
         .max()
         .unwrap_or(0)
         .checked_add(1)
-        .ok_or_else(|| "Desk daemon version exhausted".into())
+        .ok_or_else(|| "Desk agent host version exhausted".into())
 }
 
 fn persist_accepted_mutation(
@@ -578,16 +579,16 @@ fn subject_bounds(id: &Id) -> Result<(), String> {
 
 /// Opens the cell tables, making the empty state on a database that has
 /// none. The conversions that used to run here are gone: each ran once on
-/// every daemon it was ever going to run on.
+/// every agent host it was ever going to run on.
 pub fn initialize(write: &mut WriteTxn) -> Result<(), String> {
     let meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {
-            let daemon_device = DeviceId(*uuid::Uuid::new_v4().as_bytes());
+            let host_device = DeviceId(*uuid::Uuid::new_v4().as_bytes());
             CellMeta {
-                daemon_device,
+                host_device,
                 frontier: Version::new(),
-                device_node_namespaces: vec![(daemon_device, 1)],
+                device_node_namespaces: vec![(host_device, 1)],
                 next_node_namespace: 2,
             }
         }
@@ -855,7 +856,7 @@ mod tests {
             let mut write = db.write().await;
             initialize(&mut write).unwrap();
             let mut meta = load_meta_from_write(&mut write).unwrap();
-            let mut cells = Store::new(meta.daemon_device);
+            let mut cells = Store::new(meta.host_device);
             cells
                 .write(unit.clone(), Property::DeferUntil(Some(wake)))
                 .unwrap();
@@ -863,7 +864,7 @@ mod tests {
                 .write(unit.clone(), Property::SlackSnoozedAt(stood_at.clone()))
                 .unwrap();
             let stamp = Stamp {
-                device: meta.daemon_device,
+                device: meta.host_device,
                 version: 1,
             };
             let mut snapshot = cells.snapshot();
@@ -910,9 +911,9 @@ mod tests {
 
     /// Writes one note at the root the way a client does. A note is
     /// whatever the user has said about it, so this is the whole of one.
-    /// The client's half of a sync. A write the daemon never heard about --
+    /// The client's half of a sync. A write the agent host never heard about --
     /// made while it was down, or lost on the wire -- comes back at the
-    /// next handshake, because the store is the client's and the daemon
+    /// next handshake, because the store is the client's and the agent host
     /// catches up from it.
     #[tokio::test]
     async fn a_clients_catch_up_cells_merge_and_move_the_frontier() {
@@ -920,7 +921,7 @@ mod tests {
         let device = DeviceId([21; 16]);
         let id = seed_note(&store, device).await;
 
-        // A client's own store, holding a write this daemon has not seen.
+        // A client's own store, holding a write this agent host has not seen.
         let away = DeviceId([22; 16]);
         let mut client =
             Store::from_snapshot(away, store.sync_since(&Version::new()).unwrap()).unwrap();
@@ -950,7 +951,7 @@ mod tests {
         assert_eq!(
             store.frontier().unwrap().get(&away).copied(),
             Some(9),
-            "the daemon counts the away device's write as its own now"
+            "the agent host counts the away device's write as its own now"
         );
         // Nothing to send is not an error, and it writes nothing.
         store
@@ -1097,7 +1098,7 @@ mod tests {
 
         // A device that was away writes from its own version, however far
         // ahead of the frontier that leaves it: a batch made offline is
-        // exactly the write that would jump, and the daemon takes it.
+        // exactly the write that would jump, and the agent host takes it.
         let offline = DeviceId([7; 16]);
         let name = |id: &Id, text: &str| CellWrite {
             id: id.clone(),
@@ -1197,7 +1198,7 @@ mod tests {
             }
             writes
         };
-        // Where the new note lands is the client's to write; the daemon
+        // Where the new note lands is the client's to write; the agent host
         // merges the mutation and the parent comes out as it was sent.
         store
             .apply_mutation(
@@ -1291,7 +1292,7 @@ mod tests {
         };
 
         // A defer whose entry names only the wake time used to be refused
-        // as an unapplied verdict. The daemon merges it now, pace and all
+        // as an unapplied verdict. The agent host merges it now, pace and all
         // left as they stood: what a verdict writes is the client's to say.
         let only_the_wake_time = defer(next_version(&store), vec![wakes.clone()]);
         store
@@ -1685,7 +1686,7 @@ mod tests {
             let mut write = db.write().await;
             initialize(&mut write).unwrap();
             let mut meta = load_meta_from_write(&mut write).unwrap();
-            let mut cells = Store::new(meta.daemon_device);
+            let mut cells = Store::new(meta.host_device);
             cells
                 .write(label.clone(), Property::Name("rho".into()))
                 .unwrap();

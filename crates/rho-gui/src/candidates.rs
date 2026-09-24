@@ -50,7 +50,7 @@ pub(crate) struct HostNodes {
     /// recently anything under it was touched.
     heading_agents: HashMap<Id, Vec<rho_agent_types::AgentId>>,
     /// Whether the client held the host's desk when these nodes were
-    /// read, from its own replica or from the daemon. An empty desk and a
+    /// read, from its own replica or from the agent host. An empty desk and a
     /// desk nobody has loaded yet look identical from the nodes alone, and
     /// they mean opposite things: the first says the user has said
     /// nothing, the second says nobody has read the store.

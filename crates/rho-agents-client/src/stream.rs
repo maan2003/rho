@@ -1,5 +1,5 @@
-//! One host's agents stream: the daemon's journal and live tails to the
-//! model, the model's follow and the window's focus back to the daemon.
+//! One host's agents stream: the agent host's journal and live tails to the
+//! model, the model's follow and the window's focus back to the agent host.
 //!
 //! The host opens it on every connection
 //! ([`rho_agent_hosts::HostStream`]); what is said on it and where its frames
@@ -107,8 +107,8 @@ impl HostStream for AgentStream {
         "agents"
     }
 
-    /// The daemon's frames to the model, this client's frames to the
-    /// daemon, for as long as the connection lasts. Ends with an error
+    /// The agent host's frames to the model, this client's frames to the
+    /// agent host, for as long as the connection lasts. Ends with an error
     /// when either direction does.
     fn run(&self, dialer: Dialer) -> BoxFuture<'static, anyhow::Result<()>> {
         let host = self.host;

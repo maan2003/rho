@@ -1,4 +1,4 @@
-//! A real daemon, workset worker, Sway capture, and MoQ over the GUI
+//! A real agent host, workset worker, Sway capture, and MoQ over the GUI
 //! connection.
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -41,14 +41,17 @@ fn main() -> Result<()> {
         .join("../..")
         .canonicalize()?;
     let bin = root.join("target/debug");
-    let rho = bin.join("rho");
-    ensure!(rho.is_file(), "build rho and rho-agent-worker first");
+    let host = bin.join("rho-agent-host");
+    ensure!(
+        host.is_file(),
+        "build rho-agent-host and rho-agent-worker first"
+    );
     let socket = temp.path().join("rho.sock");
-    let log = temp.path().join("daemon.log");
+    let log = temp.path().join("agent-host.log");
     let out = std::fs::File::create(&log)?;
-    let mut command = Command::new(&rho);
+    let mut command = Command::new(&host);
     command
-        .args(["daemon", "--iroh", "--socket-path"])
+        .args(["--iroh", "--socket-path"])
         .arg(&socket)
         .arg("--claude-config-dir")
         .arg(temp.path().join("claude"))
@@ -58,17 +61,17 @@ fn main() -> Result<()> {
         .env("XDG_RUNTIME_DIR", &runtime)
         .stdout(Stdio::null())
         .stderr(out);
-    let mut daemon = Child(command.spawn()?);
+    let mut agent_host = Child(command.spawn()?);
     let result=tokio::runtime::Runtime::new()?.block_on(async {
         let deadline=tokio::time::Instant::now()+Duration::from_secs(60);
         let (mut local,endpoint)=loop {
-            if let Some(status)=daemon.0.try_wait()? { anyhow::bail!("daemon exited: {status}"); }
+            if let Some(status)=agent_host.0.try_wait()? { anyhow::bail!("agent host exited: {status}"); }
             let text=std::fs::read_to_string(&log)?;
-            let endpoint=text.lines().find_map(|line|line.strip_prefix("rho daemon iroh endpoint: ")).map(str::to_owned);
+            let endpoint=text.lines().find_map(|line|line.strip_prefix("rho-agent-host iroh endpoint: ")).map(str::to_owned);
             if let Some(endpoint)=endpoint {
                 if let Ok(stream)=rho_rpc::connect_unix(&socket).await { break (stream,endpoint); }
             }
-            ensure!(tokio::time::Instant::now()<deadline,"daemon startup timed out");
+            ensure!(tokio::time::Instant::now()<deadline,"agent host startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         write_open(&mut local,&rho_desktop_client::protocol::Open::Sessions).await?;
@@ -233,7 +236,7 @@ layout { background-color "#315b97"; }
             }))?)?;
             tokio::signal::ctrl_c().await?;
         }
-        println!("wayland_stream passed: session advertisements and crash cleanup; in-process desktop VP9 frame through direct daemon relay; idle/static/unsubscribe counters verified; RPC survived viewer detach");
+        println!("wayland_stream passed: session advertisements and crash cleanup; in-process desktop VP9 frame through direct agent host relay; idle/static/unsubscribe counters verified; RPC survived viewer detach");
         Ok::<(),anyhow::Error>(())
     });
     if result.is_err() {

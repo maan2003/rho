@@ -1,14 +1,14 @@
-//! Root entity: owns the attached daemons, the canonical agent states, the
+//! Root entity: owns the attached agent hosts, the canonical agent states, the
 //! registry, and one persistent [`AgentModel`] per opened agent.
 //!
 //! All protocol events flow through [`Workspace`]; queued frame runs are
 //! merged per agent, and views receive summarized changes rather than the
 //! protocol itself.
 //!
-//! Several daemons can be attached at once. Agent ids are
+//! Several agent hosts can be attached at once. Agent ids are
 //! already unique across machines, so the client-side state stays keyed by
 //! id alone; what the host is needed for is routing — which socket a command
-//! travels down — and for the few places where a daemon-side *name* (a
+//! travels down — and for the few places where a host-side *name* (a
 //! repository path, a short agent label) is only unique within one machine.
 
 #[path = "workspace_phone.rs"]
@@ -85,7 +85,7 @@ pub(crate) struct DeskArrival {
     pub(crate) node_namespace: u16,
     pub(crate) delta: rho_desk_client::protocol::cells::Snapshot,
     pub(crate) bodies: Vec<rho_desk_client::protocol::cells::BodySnapshot>,
-    /// Where these cells came from, for the log: the daemon's answer or
+    /// Where these cells came from, for the log: the agent host's answer or
     /// this client's own copy.
     pub(crate) from: &'static str,
 }
@@ -376,7 +376,7 @@ fn undo_sequence_insert_position(existing: impl Iterator<Item = u64>, sequence: 
 pub struct Workspace {
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
-    /// them, and the daemon's live tail. Also the focus set every host
+    /// them, and the agent host's live tail. Also the focus set every host
     /// is told. Everyone else is a digest in the registry.
     active: ActiveAgents,
     /// Every transcript this client holds open, and the rendered state a
@@ -387,7 +387,7 @@ pub struct Workspace {
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
     models: HashMap<AgentId, Entity<AgentModel>>,
-    /// Weak project cache keyed by daemon-side workspace identity, qualified
+    /// Weak project cache keyed by host-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
     /// Artifact surfaces hold the strong references; when the last file
     /// closes, the remote channel and cache entry naturally expire.
@@ -414,8 +414,8 @@ pub struct Workspace {
     /// is the root, which is also what an ordinary draft sends.
     draft_area: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
-    /// kept intact until the daemon confirms creation, so a rejected request
-    /// (bad working directory, say) never loses the message.
+    /// kept intact until the agent host confirms creation, so a rejected
+    /// request (bad working directory, say) never loses the message.
     /// Which host the pending draft agent was sent to, so its confirmation
     /// can be recognized and the compose surface reset.
     awaiting_draft_agent: Option<HostId>,
@@ -425,7 +425,7 @@ pub struct Workspace {
     /// before that frame types into the surface the reader is leaving.
     insert_when_shown: bool,
     /// The area the next agent this client asks for is filed under. The
-    /// daemon never writes it: the agent exists because the registry says
+    /// agent host never writes it: the agent exists because the registry says
     /// so, and where it is shown is the user's own fact.
     pending_agent_filing: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
     /// Hosts that have been reached at least once. A host attaches blind;
@@ -567,7 +567,7 @@ pub struct Workspace {
     /// The SSH Git approval prompt, one of the three modal overlays:
     /// see [`crate::git_approval::GitApproval`].
     git_approval: crate::git_approval::GitApproval,
-    /// Whether the desk is listening, on whose daemon, and whether the
+    /// Whether the desk is listening, on whose agent host, and whether the
     /// microphone is open: see [`crate::voice::Voice`].
     voice: crate::voice::Voice,
     _event_task: Task<()>,
@@ -649,7 +649,7 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The workdirs this daemon offers: the labels in its store that carry
+    /// The workdirs this agent host offers: the labels in its store that carry
     /// a `Project`.
     fn refresh_workdirs(&mut self, host: HostId) {
         let repositories = self
@@ -700,7 +700,7 @@ impl Workspace {
 
     /// Shows an agent's transcript from the mirror the client already
     /// holds: the fold, for a reader who opened it before any live frame,
-    /// or with the daemon down. The live frame rides on its tail.
+    /// or with the agent host down. The live frame rides on its tail.
     fn seed_transcript_from_mirror(&mut self, agent_id: AgentId) -> bool {
         if self.transcripts.is_open(&agent_id) {
             return false;
@@ -1117,7 +1117,7 @@ impl Workspace {
         // The desk is this client's and its replica is on this disk, so it
         // is read without a socket. Home's first draw then shows the
         // user's own verdicts instead of a list that waits to hear from a
-        // daemon and deals what they put away yesterday. The file was
+        // agent host and deals what they put away yesterday. The file was
         // opened by `main` before any window, so the read finds it.
         for host in this.hosts.ids() {
             this.open_desk_from_replica(host, window, cx);
@@ -1159,9 +1159,9 @@ impl Workspace {
         this
     }
 
-    /// Attaches a daemon. The name is registered with the registry first so
-    /// that labels and chrome can qualify by host from the moment the host
-    /// exists, not only once it answers.
+    /// Attaches an agent host. The name is registered with the registry first
+    /// so that labels and chrome can qualify by host from the moment the
+    /// host exists, not only once it answers.
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
         let agents_client = &self.agents_client;
         let desk_streams = &self.desk_streams;
@@ -1205,7 +1205,7 @@ impl Workspace {
         rho_agent_hosts::saved::save(&db, &specs);
     }
 
-    /// Forgets a daemon: its transcripts, surfaces, and cached projects go
+    /// Forgets an agent host: its transcripts, surfaces, and cached projects go
     /// with it, and its connection is torn down by the drop.
     pub(crate) fn detach_host(
         &mut self,
@@ -1241,7 +1241,7 @@ impl Workspace {
         self.selection.forget(|agent_id| gone.contains(&agent_id));
         self.refresh_dashboard(cx);
         for agent_id in departed {
-            // The agent is gone with its daemon, so its transcript is a
+            // The agent is gone with its agent host, so its transcript is a
             // place that no longer exists: one call, and no context can
             // land on it again.
             self.forget_surface(&SurfaceKey::Transcript(agent_id));
@@ -1262,8 +1262,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The daemon an agent lives on. `None` only before its first summary or
-    /// creation notice has landed.
+    /// The agent host an agent lives on. `None` only before its first summary
+    /// or creation notice has landed.
     fn host_of(&self, agent_id: AgentId) -> Option<HostId> {
         self.registry.host_of_agent(agent_id)
     }
@@ -1284,9 +1284,9 @@ impl Workspace {
         Some(self.hosts.connection(self.host_of(agent_id)?)?.link())
     }
 
-    /// Routes an agent-scoped command to the daemon that owns the agent.
+    /// Routes an agent-scoped command to the agent host that owns the agent.
     /// Commands for an agent whose host is unknown or gone are dropped: the
-    /// daemon that could act on it is not there to hear them.
+    /// agent host that could act on it is not there to hear them.
     fn send_to_agent(&self, agent_id: AgentId, command: AgentCommand, cx: &mut Context<Self>) {
         if let Some(host) = self.host_of(agent_id) {
             self.call(host, command, cx, |_, (), _| {});
@@ -1327,14 +1327,14 @@ impl Workspace {
         self.desk_streams.send(host, frame);
     }
 
-    /// Whether the daemon behind an agent is answering. Acting on an agent
+    /// Whether the agent host behind an agent is answering. Acting on an agent
     /// whose own host is down must fail even when other hosts are fine.
     fn agent_online(&self, agent_id: AgentId) -> bool {
         self.host_of(agent_id)
             .is_some_and(|host| self.hosts.is_online(host))
     }
 
-    /// Any daemon answering: the precondition for actions that choose their
+    /// Any agent host answering: the precondition for actions that choose their
     /// host from user input rather than an existing agent.
     fn connected(&self) -> bool {
         self.hosts.any_online()
@@ -1752,7 +1752,7 @@ impl Workspace {
     /// on the desk at all can be different. Scopes merge, and a whole one
     /// swallows the rest.
     /// Cells that have arrived, from either place they can come from: the
-    /// daemon's answer to a handshake, or the client's own copy of what a
+    /// agent host's answer to a handshake, or the client's own copy of what a
     /// previous session was told. The two are the same event as far as
     /// every reader is concerned, which is the whole point of the copy —
     /// there is no moment when the client has no desk and every reader
@@ -1805,7 +1805,7 @@ impl Workspace {
     }
 
     /// The desk this client last held for the host, off its own disk,
-    /// before a word has been exchanged with the daemon. A host the copy
+    /// before a word has been exchanged with the agent host. A host the copy
     /// has never held is left alone: that is the one case where the
     /// client really has not read a store, and the readers that ask
     /// `is_loaded` are right to wait.
@@ -2188,7 +2188,7 @@ impl Workspace {
         match frame {
             DeskFrame::Opened => {
                 // The copy comes first, so what the client already read is
-                // on screen before the daemon has said anything, and so
+                // on screen before the agent host has said anything, and so
                 // that the handshake below asks from the version it holds
                 // rather than from nothing.
                 self.open_desk_from_replica(host, window, cx);
@@ -2210,7 +2210,7 @@ impl Workspace {
                     node_namespace,
                     delta,
                     bodies,
-                    from: "daemon",
+                    from: "agent host",
                 },
                 window,
                 cx,
@@ -2260,11 +2260,11 @@ impl Workspace {
                 self.hosts.set_status(host, HostStatus::Online);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.selection.active_pane(), ActivePane::Startup) {
-                    // The startup scaffold guessed before daemon data existed;
+                    // The startup scaffold guessed before agent host data existed;
                     // refresh it now that workdir names and topics are known.
                     self.seed_draft(false, window, cx);
                 }
-                // The focus set is this client's to keep; a daemon that
+                // The focus set is this client's to keep; an agent host that
                 // just came up is told it whole.
                 self.send_agent_focus_to(host);
                 self.update_statuses(cx);
@@ -2306,7 +2306,7 @@ impl Workspace {
             }
             ConnEvent::Disconnected(reason) => {
                 self.desktop_sessions.remove(&host);
-                // A daemon that goes is a daemon that is no longer asking;
+                // An agent host that goes is an agent host that is no longer asking;
                 // the request still has to be answered, or it is left
                 // blocked on a channel nobody will send on.
                 if self.git_approval.answer(GitApprovalDecision::Done) {
@@ -2314,7 +2314,7 @@ impl Workspace {
                 }
                 // The host's agents stay in the rail with their retained
                 // transcripts: losing a connection is not losing the work.
-                // Only detaching (`space h d`) forgets a daemon.
+                // Only detaching (`space h d`) forgets an agent host.
                 self.hosts
                     .set_status(host, HostStatus::Disconnected(reason.clone()));
                 self.replay_hosts.insert(host);
@@ -2342,7 +2342,7 @@ impl Workspace {
                 response,
             } => {
                 // Deliberately not has_modal_overlay: an open menu does
-                // not deny the request. Denying answers the daemon with a
+                // not deny the request. Denying answers the agent host with a
                 // no, and a menu is a choice with nothing typed into it,
                 // reopened at no cost — a prompt has the reader's text in
                 // it, and that is what "another prompt is active" means.
@@ -2378,17 +2378,17 @@ impl Workspace {
                 }
             }
         }
-        // Every daemon event funnels through here, so this one call is
+        // Every agent host event funnels through here, so this one call is
         // the event-driven replacement for reconciling on render.
         self.refresh_dashboard(cx);
     }
 
-    /// How a daemon names itself in error text: bare when it is the only
+    /// How an agent host names itself in error text: bare when it is the only
     /// one, otherwise by host.
     fn error_source(&self, host: HostId) -> String {
         match self.hosts.len() > 1 {
-            true => format!("rho daemon {}", self.hosts.host_label(host)),
-            false => "rho daemon".to_owned(),
+            true => format!("rho-agent-host {}", self.hosts.host_label(host)),
+            false => "rho-agent-host".to_owned(),
         }
     }
 
@@ -2478,7 +2478,7 @@ impl Workspace {
         }
         self.voice.unmute();
         // Voice follows what the user is looking at: start on the selected
-        // agent's daemon.
+        // agent's agent host.
         let host = self
             .selection
             .selected_agent()
@@ -2505,7 +2505,7 @@ impl Workspace {
         let Some(host) = host.or(self.voice.host()).or_else(|| self.hosts.primary()) else {
             self.notice_on(
                 None,
-                "voice: no daemon attached",
+                "voice: no agent host attached",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -2587,7 +2587,7 @@ impl Workspace {
             cx,
         );
         // Engagement bump: keeps display-time staleness correct between
-        // topic refreshes (the daemon persists the same timestamp).
+        // topic refreshes (the agent host persists the same timestamp).
         self.registry.touch_agent(agent_id);
         self.mark_agent_prompt_sent(agent_id, cx);
         cx.notify();
@@ -2616,7 +2616,7 @@ impl Workspace {
     /// Submitting the compose surface creates the agent: the workdir field
     /// picks the working directory, the topic is whatever the draft
     /// inherited. The buffers are not cleared here — they survive until the
-    /// daemon confirms creation.
+    /// agent host confirms creation.
     fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(content) = self.draft_model.read(cx).content(cx) else {
             // Enter in the workdir field with nothing to send: jump to the
@@ -2724,7 +2724,7 @@ impl Workspace {
         let agent_id = match reply {
             Ok(agent_id) => agent_id,
             // A failed creation keeps the draft buffers; the user fixes the
-            // workdir and submits again. The daemon's whole cause is what
+            // workdir and submits again. The agent host's whole cause is what
             // the draft shows, so the reason a creation refused is readable
             // for longer than an echo.
             Err(error) => {
@@ -2903,14 +2903,14 @@ impl Workspace {
         self.connected()
     }
 
-    /// The selected agent's daemon must be answering for an agent-scoped
+    /// The selected agent's agent host must be answering for an agent-scoped
     /// command to mean anything; another host being up is no help.
     fn require_agent_online(&mut self, agent_id: AgentId, cx: &mut Context<Self>) -> bool {
         if !self.agent_online(agent_id) {
             let host = self
                 .host_of(agent_id)
                 .map(|host| self.hosts.host_label(host))
-                .unwrap_or_else(|| "its daemon".to_owned());
+                .unwrap_or_else(|| "its agent host".to_owned());
             let message = format!("not connected to {host}");
             self.notice_on(Some(&agent_id), &message, StyleClass::SystemInfo, cx);
         }
@@ -3286,7 +3286,7 @@ impl Workspace {
             self.echo("todo: the note is unavailable", StyleClass::SystemInfo, cx);
         }
         // The pace was echoed here only because the verdict's own words
-        // waited on the daemon. They are said as the verdict is made now,
+        // waited on the agent host. They are said as the verdict is made now,
         // and a second line over the top of them would take the card's
         // name back off the bar.
     }
@@ -3390,8 +3390,8 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        // A project is a label carrying the URL the daemon clones. A path
-        // would have the daemon read the user's checkout, which it no
+        // A project is a label carrying the URL the agent host clones. A path
+        // would have the agent host read the user's checkout, which it no
         // longer does.
         if !rho_agents_client::create::is_repository_url(&path) {
             let message = format!("a project is a repository URL, not a path: `{path}`");
@@ -3406,7 +3406,7 @@ impl Workspace {
             }
         };
         // The name the user gave is the label's path, else the
-        // repository's own name; the description was the daemon's and has
+        // repository's own name; the description was the agent host's and has
         // no fact to live in.
         let _ = description;
         let path_name = name.unwrap_or_else(|| {
@@ -3622,7 +3622,7 @@ impl Workspace {
         else {
             self.notice_on(
                 None,
-                "new page: no daemon is connected",
+                "new page: no agent host is connected",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -3675,7 +3675,7 @@ impl Workspace {
         let Some(host) = host.filter(|host| self.hosts.is_online(*host)) else {
             self.notice_on(
                 None,
-                "performance snapshot: no daemon is connected",
+                "performance snapshot: no agent host is connected",
                 StyleClass::SystemInfo,
                 cx,
             );
@@ -3723,7 +3723,7 @@ impl Workspace {
         .detach();
     }
 
-    /// The attached daemons and how each is doing, as one notice line.
+    /// The attached agent hosts and how each is doing, as one notice line.
     pub(crate) fn cmd_hosts(&mut self, cx: &mut Context<Self>) {
         let listing = self
             .hosts
@@ -3741,8 +3741,8 @@ impl Workspace {
         self.notice_on(None, &listing, StyleClass::SystemInfo, cx);
     }
 
-    /// Attaches a daemon named on the spot, for a machine that is not worth
-    /// putting in the host list.
+    /// Attaches an agent host named on the spot, for a machine that is not
+    /// worth putting in the host list.
     pub(crate) fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
         let spec = match HostSpec::parse(spec, "rho") {
             Ok(spec) => spec,
@@ -3769,7 +3769,8 @@ impl Workspace {
         );
     }
 
-    /// Detaches a daemon by name, dropping everything the client held for it.
+    /// Detaches an agent host by name, dropping everything the client held for
+    /// it.
     pub(crate) fn cmd_host_detach(
         &mut self,
         name: &str,
@@ -4154,7 +4155,7 @@ impl Workspace {
     }
 
     /// (Re)writes the draft scaffold with the derived default workdir; the
-    /// field stays empty when nothing daemon-side suggests one.
+    /// field stays empty when nothing host-side suggests one.
     fn seed_draft(&mut self, force_header: bool, window: &mut Window, cx: &mut Context<Self>) {
         let label = self
             .draft_default_workdir()
@@ -5025,7 +5026,7 @@ impl Workspace {
         let told = self.seed_transcript_from_mirror(*agent_id);
         let (view, _) = self.ensure_agent_model(*agent_id, window, cx);
         // Seeding the store is not showing it: a view that already exists
-        // (the daemon answers for every agent on connecting, with nothing
+        // (the agent host answers for every agent on connecting, with nothing
         // loaded) renders what it last synced, which was a blank page.
         if told {
             self.sync_agent_model(*agent_id, &view, FrameSummary::everything(), false, cx);
@@ -5116,7 +5117,7 @@ impl Workspace {
     }
 
     /// Puts the host in this process: the streams its calls open arrive on
-    /// the receiver, for the test to answer as the daemon would.
+    /// the receiver, for the test to answer as the agent host would.
     #[cfg(test)]
     pub(crate) fn host_in_process_for_test(
         &self,
@@ -5317,7 +5318,7 @@ impl Workspace {
     }
 
     /// Reconciles the dashboard against the current world. Event-driven,
-    /// with no flag to remember: the daemon funnel (`handle_event`),
+    /// with no flag to remember: the agent host funnel (`handle_event`),
     /// desk buffer edit subscriptions, draft edit subscriptions, the
     /// editor selection subscription, and the verbs each call this at
     /// their source. The reconcile is idempotent and cheap, so calling
@@ -5656,7 +5657,7 @@ impl Workspace {
 
     /// A transcript handed in whole, for a test that drives the view
     /// without a mirror to fold. Not an event: `rho-agent-hosts` carries what a
-    /// daemon said, and no daemon says this.
+    /// agent host said, and no agent host says this.
     #[cfg(any(test, feature = "walk-support"))]
     pub(crate) fn seed_transcript_for_test(
         &mut self,
@@ -5743,7 +5744,7 @@ impl Workspace {
 
     /// The note surface for a node, built on first open and kept after, so
     /// the cursor and scroll survive leaving and coming back. `None` while
-    /// the node's body has not arrived from the daemon yet.
+    /// the node's body has not arrived from the agent host yet.
     fn note_view_for(
         &mut self,
         host: HostId,
@@ -5988,7 +5989,7 @@ impl Workspace {
         Some((card.host, card.node_id))
     }
 
-    /// A note-body edit, on its way to the daemon as a text operation.
+    /// A note-body edit, on its way to the agent host as a text operation.
     pub(crate) fn send_desk_text(
         &mut self,
         host: HostId,
@@ -6026,7 +6027,7 @@ impl Workspace {
         };
         let stamp = mutation.stamp;
         // A created note needs its buffer before anything can be typed into
-        // it, and the daemon's answer may be a frame away.
+        // it, and the agent host's answer may be a frame away.
         self.desk_buffers.give_buffers(host, &self.desk, &delta, cx);
         self.sync_tree_delta(host, &delta, window, cx);
         self.send_desk(host, frame);
@@ -6054,7 +6055,7 @@ impl Workspace {
 
     /// The verdict is made: the undo is armed, the dealer is told, and the
     /// card leaves. Reached as soon as the write is in the client's own
-    /// replica, which is where the desk lives; the daemon is a copy this
+    /// replica, which is where the desk lives; the agent host is a copy this
     /// client syncs through and the verdict does not wait on it.
     fn complete_tree_verdict(
         &mut self,
@@ -7498,7 +7499,7 @@ impl Workspace {
             false => format!("label: {path}"),
         };
         // Filing the card in view is a verdict on it like any other, so it
-        // is registered for undo and its word waits for the daemon's
+        // is registered for undo and its word waits for the agent host's
         // acceptance. Undo takes the label back off; a shallower label the
         // minimal-set rule took off in the same mutation is not put back,
         // because the log entry states the one cell the verdict names.
@@ -7675,9 +7676,9 @@ impl Workspace {
     }
 
     /// Writes a done verdict on each node and leaves one undo entry for the
-    /// lot. Unlike a dealt verdict this does not wait for the daemon's
+    /// lot. Unlike a dealt verdict this does not wait for the agent host's
     /// answer before arming the undo: there is no card in front of the user
-    /// to hold, and a mutation the daemon refuses simply has no verdict
+    /// to hold, and a mutation the agent host refuses simply has no verdict
     /// event for the undo to find, which reports itself.
     pub(crate) fn mark_cards_done(
         &mut self,
@@ -7705,7 +7706,7 @@ impl Workspace {
                 continue;
             }
             // Each note gets its own log entry, so `shift-u` puts the whole
-            // batch back and the daemon checks each cursor against the one
+            // batch back and the agent host checks each cursor against the one
             // that was there.
             let Some((writes, event)) =
                 self.desk
@@ -7802,7 +7803,7 @@ impl Workspace {
             return;
         };
         match entry.state.clone() {
-            // Nothing was written, so there is nothing to ask the daemon
+            // Nothing was written, so there is nothing to ask the agent host
             // for: the cursor goes back and the card is dealt again.
             VerdictUndoState::SlackCursor { .. } => {
                 self.complete_verdict_undo(entry, window, cx);
@@ -8044,10 +8045,10 @@ impl Workspace {
 
     /// The usage screen, built once and kept. A series that arrives while
     /// another screen is in view still lands in it.
-    /// Show `chart` over `days`: ask the daemon for the range it needs, hand
-    /// the screen what this client already holds so it draws at once, and
-    /// display it. Picking another chart from the menu comes back through
-    /// here and redraws the same surface.
+    /// Show `chart` over `days`: ask the agent host for the range it needs,
+    /// hand the screen what this client already holds so it draws at once,
+    /// and display it. Picking another chart from the menu comes back
+    /// through here and redraws the same surface.
     /// Asks every host the same usage question; the answers merge as
     /// they come.
     fn ask_every_host<C: rho_rpc::protocol::Call + Clone>(

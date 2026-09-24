@@ -3744,7 +3744,7 @@ fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return
                             cells.cells.iter().any(|cell| cell.id == node),
                         _ => false,
                     }),
-                "and the sync after it returns carries the write to the daemon"
+                "and the sync after it returns carries the write to the agent host"
             );
         })
         .unwrap();

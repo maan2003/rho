@@ -474,7 +474,7 @@ impl PrMonitor {
             self.deliver(
                 watch.subscriber,
                 format!(
-                    "PR monitor is blocked for {}.\n\nAction: user_help_required\nError: {}\n\nThe daemon will retry with backoff. Notify your parent so external chat stays informed, and do not claim the PR is still being monitored successfully until this clears.",
+                    "PR monitor is blocked for {}.\n\nAction: user_help_required\nError: {}\n\nThe agent host will retry with backoff. Notify your parent so external chat stays informed, and do not claim the PR is still being monitored successfully until this clears.",
                     watch.url,
                     error
                 ),

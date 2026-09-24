@@ -17,7 +17,7 @@ fn main() {
         return;
     }
     common::run("", |base| async move {
-        let daemon_cwd = std::env::current_dir().unwrap();
+        let host_cwd = std::env::current_dir().unwrap();
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
         let work = std::path::Path::new("/src");
@@ -50,7 +50,7 @@ fn main() {
             std::fs::read_to_string(work.join("project/value")).unwrap(),
             "python"
         );
-        assert_eq!(std::env::current_dir().unwrap(), daemon_cwd);
+        assert_eq!(std::env::current_dir().unwrap(), host_cwd);
 
         assert!(
             std::process::Command::new("kill")

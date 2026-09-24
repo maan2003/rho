@@ -85,7 +85,7 @@ pub struct FsViewConfig {
     pub workset_state: Option<PathBuf>,
     /// The directory holding this process's own executable when it lies
     /// outside `/nix/store` (a cargo build), bound read-only at its host
-    /// path so a development daemon can launch its sibling sidecars.
+    /// path so a development agent host can launch its sibling sidecars.
     pub own_binaries: Option<PathBuf>,
 }
 
@@ -362,7 +362,7 @@ fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     )?;
     // direnv under Rho's configuration (VIEW.md 3): everything under /src
     // is trusted, the layout lives in the workset's state directory, and
-    // `use flake` puts the daemon's find fork and cargo's bin first.
+    // `use flake` puts the agent host's find fork and cargo's bin first.
     fs::create_dir_all(etc.join("rho/direnv"))?;
     fs::write(
         etc.join("rho/direnv/direnv.toml"),

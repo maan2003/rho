@@ -18,7 +18,7 @@ use crate::protocol::cells::{
 use crate::protocol::stream::ClientFrame as DeskClientFrame;
 
 struct HostDesk {
-    /// What the daemon has told us, kept so that a poke can be read
+    /// What the agent host has told us, kept so that a poke can be read
     /// against it and a sync can ask for the rest.
     confirmed: Store,
     /// What the reader sees: `confirmed` plus every mutation still in
@@ -38,15 +38,15 @@ struct HostDesk {
     /// What the sources say right now, recomputed by the workspace rather
     /// than stored: the registry's agents and the Slack mirror's units.
     sources: Sources,
-    /// The text replica namespace the daemon assigned this connection.
+    /// The text replica namespace the agent host assigned this connection.
     namespace: u16,
-    /// The store these cells were counted in, said by the daemon and kept
+    /// The store these cells were counted in, said by the agent host and kept
     /// so the next handshake can name it. A version means nothing outside
     /// the store that counted it, so cells that arrive under another name
     /// are not news about this desk; they are a different desk, and what
     /// this one holds is thrown away rather than merged.
     store: DeviceId,
-    /// A `Sync` is in flight; the daemon answers exactly one.
+    /// A `Sync` is in flight; the agent host answers exactly one.
     syncing: bool,
     /// The newest frontier poked while a sync was in flight. A poke that
     /// races its response must not be dropped, so it is answered after.
@@ -56,7 +56,7 @@ struct HostDesk {
 impl HostDesk {
     /// The stamp a new mutation carries: past everything this GUI has
     /// observed, so it beats its own earlier writes and cannot jump more
-    /// than one past the daemon's global maximum.
+    /// than one past the agent host's global maximum.
     fn next_stamp(&self, device: DeviceId) -> Stamp {
         let version = self
             .view
@@ -567,7 +567,7 @@ impl Synced {
 }
 
 /// The store, as the client reads and writes it. One interface: today it
-/// talks to a daemon, and the wire carries cells rather than commands, so
+/// talks to an agent host, and the wire carries cells rather than commands, so
 /// a local store is the same shape.
 pub struct Desk {
     /// This client's identity in the store, taken from the replica's
@@ -641,7 +641,7 @@ impl Desk {
     }
 
     /// The handshake, sent on connect and after every poke. `known` is what
-    /// this GUI already holds, so the daemon answers with the difference.
+    /// this GUI already holds, so the agent host answers with the difference.
     pub fn sync(&mut self, host: HostId) -> DeskClientFrame {
         let device = self.device();
         let (known, store, bodies) = match self.hosts.get_mut(&host) {
@@ -671,12 +671,12 @@ impl Desk {
         }
     }
 
-    /// The daemon's answer, and what goes back for it.
+    /// The agent host's answer, and what goes back for it.
     ///
     /// Sync is two ways because the store is the client's: the answer says
-    /// what the daemon has that this client lacks, and what this client
-    /// has above the daemon's frontier goes the other way in the same
-    /// breath. Without that half a verdict taken while the daemon was away
+    /// what the agent host has that this client lacks, and what this client
+    /// has above the agent host's frontier goes the other way in the same
+    /// breath. Without that half a verdict taken while the agent host was away
     /// would sit on this disk and reach no other device, since nothing
     /// replays a write that was never sent.
     ///
@@ -693,7 +693,7 @@ impl Desk {
     ) -> Synced {
         let frontier = delta.version.clone();
         // The copy's own share of the delta, taken before the merges
-        // consume it. `delta.version` is the daemon's frontier, which is
+        // consume it. `delta.version` is the agent host's frontier, which is
         // what `confirmed` holds once the merge lands, so what is written
         // down and what the next `Sync` asks from are one number.
         let held = delta.clone();
@@ -712,7 +712,7 @@ impl Desk {
         // in flight, the map and the copy on disk — and what arrives is
         // taken as a first sync. The delta that comes with a name the
         // client did not have is the whole store, not a difference; that
-        // is what the daemon answers a name it does not know.
+        // is what the agent host answers a name it does not know.
         let reset = self
             .hosts
             .get(&host)
@@ -766,7 +766,7 @@ impl Desk {
             }
         }
         // The delta is already in both stores, and nothing ever takes a
-        // write back out of the middle any more: the daemon merges what
+        // write back out of the middle any more: the agent host merges what
         // it is sent rather than judging it, so the view needs no replay
         // queue behind it.
         // Written down before anything is drawn from it, and only once
@@ -792,7 +792,7 @@ impl Desk {
             crate::cache::write_delta(name, store, namespace, held, bodies.clone());
         }
         let mut back = Vec::new();
-        // The client's half of the answer. Empty when the daemon is level
+        // The client's half of the answer. Empty when the agent host is level
         // with this replica, which is every sync in the ordinary case: the
         // cells it just sent are in the view and count as its own.
         if let Some(desk) = self.hosts.get(&host) {
@@ -845,7 +845,7 @@ impl Desk {
         Some(self.sync(host))
     }
 
-    /// The daemon lost our place in its event stream: start over.
+    /// The agent host lost our place in its event stream: start over.
     pub fn resync_required(&mut self, host: HostId) -> DeskClientFrame {
         if let Some(desk) = self.hosts.get_mut(&host) {
             desk.syncing = false;
@@ -902,9 +902,9 @@ impl Desk {
     /// newer operation that arrived on its own: the two are queued
     /// independently, so the merge is by operation, not by replacement.
     /// Keeps a local edit in the replica, next to sending it on. The
-    /// daemon never sends a client its own operations back, so text typed
+    /// agent host never sends a client its own operations back, so text typed
     /// here and only sent would be missing from the mirror on the next
-    /// cold open: the note would read empty until a daemon answered.
+    /// cold open: the note would read empty until an agent host answered.
     pub fn keep_text(
         &mut self,
         host: HostId,
@@ -1287,14 +1287,14 @@ impl Desk {
     /// True while the host has answered a handshake, so callers can tell an
     /// empty desk from one that has not arrived yet.
     /// The client holds this host's desk: from its own replica on disk or
-    /// from the daemon, which are the same thing to every reader.
+    /// from the agent host, which are the same thing to every reader.
     pub fn is_loaded(&self, host: HostId) -> bool {
         self.hosts.contains_key(&host)
     }
 
     /// A write this GUI makes. It is done when it is here: the view takes
     /// it, the map takes it, and the replica on disk takes it, all before
-    /// the message goes out. The daemon is a copy this client syncs
+    /// the message goes out. The agent host is a copy this client syncs
     /// through, so nothing about the write waits on it. The delta goes
     /// back to the caller, which is what the map and the dealer are
     /// brought up on.
@@ -1334,7 +1334,7 @@ impl Desk {
             tracing::error!(%error, "refusing to send an invalid Desk mutation");
             return None;
         }
-        // Written down here rather than when the daemon answers. A verdict
+        // Written down here rather than when the agent host answers. A verdict
         // the reader has been shown is theirs, and a client that is closed
         // before the round trip finishes must open holding it.
         if let Some(name) = name {
@@ -1998,7 +1998,7 @@ impl Desk {
 
     /// Re-creates a captured subtree under the cursor's parent. Returns the
     /// new root, the creation writes, and the text each new note wants once
-    /// the daemon has accepted them.
+    /// the agent host has accepted them.
     #[allow(clippy::type_complexity)]
     pub fn paste_writes(
         &mut self,
@@ -2146,7 +2146,7 @@ impl Desk {
                     id: note.clone(),
                     property: Property::PaceDays(pace),
                 });
-                // The entry is built by the same constructor the daemon
+                // The entry is built by the same constructor the agent host
                 // checks it against, so the writer and the checker cannot
                 // drift. It also marks the dealt thing done: the todo is
                 // what handles it, and without that the dealer offers it
@@ -2165,7 +2165,7 @@ impl Desk {
                 )
                 .ok()?;
                 // Every change the entry states has to be a write too, or
-                // the daemon rejects the verdict as unapplied. That is how
+                // the agent host rejects the verdict as unapplied. That is how
                 // the dealt thing is handled: a state for a note, and the
                 // cursor for a Slack unit or an agent.
                 for change in &changes {
@@ -2196,7 +2196,7 @@ impl Desk {
                 return Some((writes, (id.clone(), event)));
             }
         };
-        // The writes come out of the same constructor the daemon checks the
+        // The writes come out of the same constructor the agent host checks the
         // entry against, so a verdict that touches two facts (a snooze, which
         // zeroes the pace as well) cannot drift between writer and checker.
         let view = &self.hosts.get(&host)?.view;

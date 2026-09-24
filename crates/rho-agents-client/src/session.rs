@@ -10,7 +10,7 @@ use rho_agent_types::AgentId;
 pub const MAX_ACTIVE_AGENTS: usize = 4;
 
 /// The agents a client holds whole: every event, the transcript folded
-/// from them, and the daemon's live tail. Everything else is a digest.
+/// from them, and the agent host's live tail. Everything else is a digest.
 /// The most recently looked-at stay; leaving drops the rest.
 #[derive(Default)]
 pub struct ActiveAgents {

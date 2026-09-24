@@ -260,7 +260,7 @@ impl DeskServer {
                 // Nothing here is a verdict on what the user wrote: the two
                 // conditions below are about this stream, and they end it the
                 // same way the text path does. The desk is the client's, and
-                // the daemon holds a copy so that clients can sync through it.
+                // the agent host holds a copy so that clients can sync through it.
                 let Some(session) = session.as_ref() else {
                     anyhow::bail!("Desk stream must sync before writing");
                 };
@@ -335,7 +335,7 @@ mod tests {
 
     /// A device is one GUI, and the newest window wins it.
     ///
-    /// The user's GUI panicked and restarted; the daemon still held the old
+    /// The user's GUI panicked and restarted; the agent host still held the old
     /// connection's binding, and the restarted GUI was refused with "Desk
     /// device already has an active writer connection" until the transport
     /// gave up on the dead one — over iroh that is the ten minutes of
@@ -386,7 +386,7 @@ mod tests {
             }],
             verdict: None,
         };
-        // The daemon no longer answers a write with a refusal, so the one
+        // The agent host no longer answers a write with a refusal, so the one
         // condition that is about the connection rather than about what the
         // user wrote ends the stream, the way the text path already
         // did. Two authors in one CRDT namespace is not a thing to carry on

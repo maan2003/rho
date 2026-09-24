@@ -3,7 +3,7 @@
 `rho eval` runs the real agent loop and the selected role's tool surface in-process,
 using configured provider credentials but a temporary database and (by default)
 an empty temporary working directory. It does not connect to or restart the
-running daemon. `high-eng` is GPT-6 Astra, using the same role profile as the GUI.
+running agent host. `high-eng` is GPT-6 Astra, using the same role profile as the GUI.
 These evaluations make paid/provider-metered requests.
 The native eval roles are `mini-eng`, `med-eng`, and `high-eng`; all use the Python notebook.
 

@@ -1,4 +1,4 @@
-//! The agents part of the daemon, and the parts about one agent's workset:
+//! The agents part of the agent host, and the parts about one agent's workset:
 //! its terminals, shells and workspace files. The agents session carries
 //! the journal, the live tails, new agents and the quota; requests,
 //! terminals, shells and workspace channels are streams of their own.
@@ -632,7 +632,7 @@ fn claude_accounts(
     })
 }
 
-/// Attaches a dedicated Comint-style shell stream. The daemon retains the
+/// Attaches a dedicated Comint-style shell stream. The agent host retains the
 /// process when this client detaches.
 async fn serve_shell<R, W>(
     services: Arc<Services>,
@@ -753,7 +753,7 @@ fn rho_pager_program() -> std::ffi::OsString {
     "rho-pager".into()
 }
 
-/// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
+/// Serves a stream dedicated to one host-owned terminal: spawns or attaches
 /// (per [`TerminalOpen`](rho_terminal::protocol::TerminalOpen)), replies
 /// `Opened::Ready`, then pumps
 /// [`rho_terminal::protocol`] frames until either side closes. Closing only
@@ -839,7 +839,7 @@ async fn terminal_attach(
         .await
 }
 
-/// The daemon's terminals, or one agent's.
+/// The agent host's terminals, or one agent's.
 async fn terminal_list(
     services: &Arc<Services>,
     agent: Option<&str>,

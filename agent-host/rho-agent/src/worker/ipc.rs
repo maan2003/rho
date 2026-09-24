@@ -44,14 +44,14 @@ pub(super) enum Control {
     Rewind(u32),
 }
 
-/// A notebook host function the daemon answers for the worker.
+/// A notebook host function the agent host answers for the worker.
 #[derive(Debug, Encode, Decode)]
 pub(crate) enum SharedCall {
     Agent(crate::multi_agent_tools::AgentCall),
     Papercut(crate::papercut::PapercutArgs),
 }
 
-/// How the daemon answered a [`SharedCall`]: text for the model either way.
+/// How the agent host answered a [`SharedCall`]: text for the model either way.
 #[derive(Encode, Decode)]
 pub(super) enum SharedReply {
     Ok(String),

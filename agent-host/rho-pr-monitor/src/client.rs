@@ -76,7 +76,7 @@ impl OctoClient {
             let chunk = chunk?;
             anyhow::ensure!(
                 bytes.len().saturating_add(chunk.len()) <= 48 * 1024 * 1024,
-                "CI logs exceed the 48 MiB daemon protocol limit"
+                "CI logs exceed the 48 MiB agent host protocol limit"
             );
             bytes.extend_from_slice(&chunk);
         }

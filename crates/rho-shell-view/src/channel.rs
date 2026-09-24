@@ -35,7 +35,7 @@ async fn call<C: Call>(dialer: &rho_agent_hosts::Dialer, call: C) -> anyhow::Res
     rho_rpc::protocol::call(&mut stream, call).await
 }
 
-/// One attachment to an agent's daemon-owned Comint-style shell. Dropping
+/// One attachment to an agent's host-owned Comint-style shell. Dropping
 /// `input` detaches this GUI but does not stop the shell process.
 pub struct ShellChannel {
     pub frames: futures_mpsc::Receiver<ShellServerFrame>,

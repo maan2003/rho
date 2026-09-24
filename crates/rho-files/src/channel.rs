@@ -18,7 +18,7 @@ pub fn open(
 }
 
 /// One workspace file channel. Dropping the owner cancels the transport and
-/// tears down its daemon-side watcher.
+/// tears down its host-side watcher.
 pub struct WorkspaceChannel {
     pub outgoing: futures_mpsc::Sender<WorkspaceClientFrame>,
     pub incoming: futures_mpsc::Receiver<anyhow::Result<WorkspaceServerFrame>>,
@@ -32,7 +32,7 @@ async fn dial(
     let mut stream = dialer.open(None).await?;
     write_open(&mut stream, &Open { workspace }).await?;
     if let Opened::Refused { reason } = read_frame(&mut stream).await? {
-        anyhow::bail!("daemon refused workspace file channel: {reason}")
+        anyhow::bail!("agent host refused workspace file channel: {reason}")
     }
 
     let channel = stream.into_channel(rho_rpc::ChannelConfig {

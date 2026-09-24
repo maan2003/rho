@@ -21,7 +21,7 @@ impl Server {
         loop {
             let (stream, _) = self.listener.accept().await?;
             // A stale client or incompatible protocol version is scoped to
-            // that socket; it must not terminate the daemon's listener.
+            // that socket; it must not terminate the agent host's listener.
             if let Ok(connection) = ServerConnection::from_stream(stream).await {
                 return Ok(connection);
             }

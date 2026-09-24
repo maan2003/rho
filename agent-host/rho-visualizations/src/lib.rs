@@ -19,7 +19,7 @@ pub struct Visualization {
     pub content: Vec<u8>,
 }
 
-/// Opaque immutable visualization storage over the daemon's RhoDB.
+/// Opaque immutable visualization storage over the agent host's RhoDB.
 #[derive(Clone)]
 pub struct VisualizationStore {
     db: RhoDb,

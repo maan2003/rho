@@ -1,18 +1,18 @@
-//! The client's own copy of what the daemon told it about every agent.
+//! The client's own copy of what the agent host told it about every agent.
 //!
 //! The registry folds transcripts in memory, which is enough while the
-//! daemon is up and nothing at all after a restart: the rails would be
+//! agent host is up and nothing at all after a restart: the rails would be
 //! blank until the whole log arrived again. This keeps the same rows on
 //! disk - every `Log` entry, keyed by agent and position, one journal
 //! cursor per host, and the attention the view derived - so the GUI comes
-//! up already knowing them and asks the daemon only for what came after.
+//! up already knowing them and asks the agent host only for what came after.
 //!
 //! What the rails read is not folded again at startup: the digest of
 //! every agent is written in the same transaction as the rows it folds,
 //! and read back whole. The rows themselves are read only for the few
 //! agents whose transcript is open.
 //!
-//! It is a copy, never a source. Every row here came from the daemon or
+//! It is a copy, never a source. Every row here came from the agent host or
 //! from the view's own fold of it; anything doubted is thrown away and
 //! asked for again from the start.
 
@@ -29,16 +29,16 @@ use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 /// Where this client stands in a host's journal, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
-/// cursor counts in; a daemon with another one starts the copy over.
+/// cursor counts in; an agent host with another one starts the copy over.
 const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v6");
 /// Which host an agent was heard from, so a host's rows can go together.
 const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v4");
 /// One agent's mirror, ordered by position, agent first: a range read
 /// gives one agent's events and nothing else.
 /// The version in the name is the story's format, not redb's. A fold that
-/// drops something the daemon sent cannot be repaired from what is on
+/// drops something the agent host sent cannot be repaired from what is on
 /// disk — the rows here are all the client has — so the version moves and
-/// the old table goes, and the copy starts over from the daemon's raw log
+/// the old table goes, and the copy starts over from the agent host's raw log
 /// with the cursor beside it. That is why `HOSTS` moves with it: a cursor
 /// kept past the rows it counted would ask only for what is new.
 ///
@@ -50,7 +50,7 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// presentation was replaced by one-shot titles. Old projections must refetch.
 /// v5: ordered response items replace flattened text and calls.
 /// v6: nothing new in the fold; retired Gemini agents were deleted from
-/// the daemon, and rows naming their role no longer decode.
+/// the agent host, and rows naming their role no longer decode.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
     TableDefinition::new("gui_mirror_events_v6");
 /// What the registry made of an agent's rows, as of the newest row held:
@@ -87,7 +87,7 @@ const RETIRED_TABLES: [&str; 19] = [
     "gui_agent_story_v1",
     "gui_agent_attention_v1",
     // The story's v1 and v2 rows and the cursors that counted them.
-    // Deleted rather than migrated: the daemon has the raw log and the
+    // Deleted rather than migrated: the agent host has the raw log and the
     // client re-derives.
     "gui_mirror_events_v1",
     "gui_mirror_host_v1",
@@ -176,7 +176,7 @@ enum Write {
     Verdict(AgentId, Verdict),
     /// Digests folded again at startup, from rows already held.
     Digests(Vec<(AgentId, AgentSnapshot)>),
-    /// Everything heard from a host, gone: its daemon has another
+    /// Everything heard from a host, gone: its agent host has another
     /// database, or this client doubts what it holds.
     Reset(String),
     Flush(mpsc::SyncSender<()>),
@@ -192,12 +192,12 @@ enum Write {
 /// `AgentSnapshot` were written under `rho_gui::mirror` before 09-07 and
 /// under `crate::cache` after it, and both are on disk in the
 /// wild, so no single name opens both. Every row in these four tables is
-/// a copy of something the daemon still has, and the crate's own rule is
+/// a copy of something the agent host still has, and the crate's own rule is
 /// that anything doubted is thrown away and asked for again, so the
 /// answer here is to drop and re-copy rather than to name.
 ///
 /// `VERDICTS` is not passed through this: a verdict is the user's own
-/// word about an agent and the daemon has no copy of it, so that one
+/// word about an agent and the agent host has no copy of it, so that one
 /// stays pinned by name and is never dropped.
 fn open_or_rebuild<K, V>(write: &mut rho_db::WriteTxn, definition: TableDefinition<K, V>)
 where
@@ -625,7 +625,7 @@ mod recorded_names {
 
     /// redb refuses a table whose recorded value type differs from the
     /// one it is opened with, and `Sen` records the Rust path. These are
-    /// the paths the daemon's and every client's transcript tables were
+    /// the paths the agent host's and every client's transcript tables were
     /// written under; a type that moves has to keep recording its old one.
     #[test]
     fn stored_types_keep_the_names_their_tables_recorded() {
@@ -810,7 +810,7 @@ mod tests {
     }
 
     /// A mirror written before `StoredHost` and `AgentSnapshot` left
-    /// rho-gui opens, and the rows the daemon can send again are the
+    /// rho-gui opens, and the rows the agent host can send again are the
     /// only ones thrown away.
     ///
     /// The old names are spelled out rather than referenced so that
@@ -882,7 +882,7 @@ mod tests {
         assert_eq!(
             kept.get(&agent_id(1)).map(|held| held.value().into_owned()),
             Some(verdict),
-            "the user's verdict went with the tables the daemon can \
+            "the user's verdict went with the tables the agent host can \
              replace; nothing else holds it"
         );
     }
@@ -953,7 +953,7 @@ mod tests {
             db.read().open_table(UNRELATED).get(&1).unwrap().value(),
             "keep me"
         );
-        // Refill from the migrated daemon as on Follow{since:0}; preserve user
+        // Refill from the migrated agent host as on Follow{since:0}; preserve user
         // disposition when the rebuilt agent first appears again.
         write(&mirror, "local", 7, entries);
         mirror.flush();

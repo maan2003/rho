@@ -1,15 +1,13 @@
-//! The `rho` command: daemon launcher and utility subcommands.
-//!
-//! Interactive use lives in rho-gui; this binary hosts the daemon itself
-//! plus the terminal-friendly plumbing around it — auth, PR and debug
-//! tools.
+//! The `rho` command, run on an agent host: tools agents call from their
+//! shell (PRs, visualizations, the Wayland session, evaluations) and the
+//! plumbing around the host (auth, Claude accounts, iroh trust, debug and
+//! protocol logs). The host itself is the `rho-agent-host` binary.
 
 use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use rho_agent_host::DaemonArgs;
 use rho_agent_host::debug::DebugArgs;
 use rho_agent_hosts::protocol as host;
 use rho_agents_client::protocol as agents;
@@ -41,16 +39,6 @@ pub fn main() -> Result<()> {
             },
         );
     }
-    if let Command::Daemon(mut daemon_args) = args.command {
-        let profiler = rho_agent_host::DaemonProfiler::start(&mut daemon_args)?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-        let result = runtime.block_on(rho_agent_host::run(daemon_args));
-        drop(runtime);
-        return profiler.finish(result);
-    }
     if let Command::Wayland(args) = args.command {
         return wayland::run(args);
     }
@@ -68,7 +56,6 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
         Command::ClaudeAccount(args) => run_claude_account(args).await,
-        Command::Daemon(_) => unreachable!("daemon runs before the shared async runtime"),
         Command::Debug(args) => {
             rho_agent_host::debug::run(args).await?;
             Ok(())
@@ -101,8 +88,8 @@ fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> Strin
     }
 }
 
-/// Approves a pending iroh enrollment over the daemon's Unix socket, so
-/// trust decisions always come from a local user on the daemon host.
+/// Approves a pending iroh enrollment over the agent host's Unix socket, so
+/// trust decisions always come from a local user on the agent host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
     let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
         .socket()
@@ -128,26 +115,22 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     Ok(())
 }
 
-/// One call of the daemon, starting the daemon if it is not running. A
+/// One call of the agent host, starting the agent host if it is not running. A
 /// refusal is an error.
-pub(crate) async fn daemon_call<C: Call>(
-    socket_path: &std::path::Path,
-    call: C,
-) -> Result<C::Reply> {
-    let mut daemon = connect_or_start_daemon(socket_path).await?;
-    daemon.open(&call.open()).await?;
-    daemon.recv::<Answer<C::Reply>>().await?.into_result()
+pub(crate) async fn host_call<C: Call>(socket_path: &std::path::Path, call: C) -> Result<C::Reply> {
+    let mut agent_host = connect_or_start_host(socket_path).await?;
+    agent_host.open(&call.open()).await?;
+    agent_host.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
-pub(crate) async fn connect_or_start_daemon(socket_path: &std::path::Path) -> Result<UiClient> {
+pub(crate) async fn connect_or_start_host(socket_path: &std::path::Path) -> Result<UiClient> {
     if let Ok(client) = UiClient::connect(socket_path).await {
         return Ok(client);
     }
 
-    let exe = std::env::current_exe()?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("daemon");
-    command
+    // The host is its own binary, installed beside this one.
+    let host = std::env::current_exe()?.with_file_name("rho-agent-host");
+    std::process::Command::new(host)
         .arg("--socket-path")
         .arg(socket_path)
         .stdin(std::process::Stdio::null())
@@ -174,7 +157,6 @@ struct Args {
 enum Command {
     Auth(AuthArgs),
     ClaudeAccount(ClaudeAccountArgs),
-    Daemon(DaemonArgs),
     Debug(DebugArgs),
     /// Run a headless agent evaluation; JSONL output, temporary state, real
     /// provider.
@@ -201,7 +183,6 @@ enum CliCommand {
     },
     /// Manage the Claude accounts agents run on.
     ClaudeAccount(ClaudeAccountArgs),
-    Daemon(DaemonArgs),
     Debug(DebugArgs),
     /// Run a headless agent evaluation; JSONL output, temporary state, real
     /// provider.
@@ -235,7 +216,7 @@ pub(crate) enum ClaudeAccountCommand {
 }
 
 /// Accounts are directories, so making one is a local matter; which one
-/// agents run on is the daemon's, so listing and switching go through it.
+/// agents run on is the agent host's, so listing and switching go through it.
 /// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
 /// view namespace outside an agent; agents get the same directory by mount.
 async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
@@ -243,10 +224,10 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
         .socket()
         .to_owned();
     let list = match &args.command {
-        ClaudeAccountCommand::List => daemon_call(&socket_path, agents::ClaudeAccounts).await?,
+        ClaudeAccountCommand::List => host_call(&socket_path, agents::ClaudeAccounts).await?,
         ClaudeAccountCommand::Use { name } => {
             let call = agents::SetClaudeAccount { name: name.clone() };
-            daemon_call(&socket_path, call).await?
+            host_call(&socket_path, call).await?
         }
         ClaudeAccountCommand::Login { name } => {
             let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
@@ -278,7 +259,7 @@ pub(crate) struct IrohArgs {
 pub(crate) enum IrohCommand {
     /// Approve a pending iroh client enrollment by its displayed code.
     Approve { code: String },
-    /// Directly trust an endpoint in daemon memory (for use through SSH).
+    /// Directly trust an endpoint in agent host memory (for use through SSH).
     TrustInMemory { endpoint_id: String },
     /// Revoke a previously enrolled iroh client endpoint.
     Revoke { endpoint_id: String },
@@ -366,7 +347,6 @@ impl Args {
         let command = match cli.command {
             CliCommand::Auth { command } => Command::Auth(command),
             CliCommand::ClaudeAccount(args) => Command::ClaudeAccount(args),
-            CliCommand::Daemon(args) => Command::Daemon(args),
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),

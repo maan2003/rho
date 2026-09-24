@@ -1,4 +1,4 @@
-# The machines this client can reach: one connection per attached daemon,
+# The machines this client can reach: one connection per attached agent host,
 # the handshake, and the events it produces. Holds no agent, desk or window
 # state; everything that wants to say something to a machine goes through it.
 # Without the `client` feature it is the host protocol alone, for the host.

@@ -2,8 +2,8 @@
 //!
 //! `rig new` clones a snapshot — a reflink clone where the filesystem has
 //! them, so the base snapshot stays pristine and a rig costs almost nothing.
-//! `rig up` stands the rig up on that copy: its own daemon, the fakes, and the
-//! GUI headless in an isolated Wayland session with the profiler on.
+//! `rig up` stands the rig up on that copy: its own agent host, the fakes, and
+//! the GUI headless in an isolated Wayland session with the profiler on.
 //!
 //! A rig is not reset between sessions. That is the point of the accumulated
 //! QA desk: agents created, verdicts given, notes filed and threads read stay
@@ -34,9 +34,9 @@ use crate::profile::{self, Summary};
 use crate::snapshot::human;
 use crate::streams::{Incoming, Streams};
 
-/// How long to wait for the daemon's socket and the fake's readiness line.
+/// How long to wait for the agent host's socket and the fake's readiness line.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long the last session's daemon gets to let go of the store.
+/// How long the last session's agent host gets to let go of the store.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the GUI's profile sidecars get to land after it has exited.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -45,7 +45,7 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum RigCommand {
     /// Clone a snapshot into a rig that can be run.
     New(NewArgs),
-    /// Start the daemon, the fakes and the headless GUI on a rig.
+    /// Start the agent host, the fakes and the headless GUI on a rig.
     Up(UpArgs),
     /// Stop everything the rig runs, leaving its state as the run left it.
     Down(NameArgs),
@@ -88,7 +88,7 @@ pub struct UpArgs {
     #[arg(long, value_enum, default_value_t = Binaries::Profiling)]
     binaries: Binaries,
 
-    /// Leave the GUI down; bring up only the daemon and the fakes.
+    /// Leave the GUI down; bring up only the agent host and the fakes.
     #[arg(long)]
     no_gui: bool,
 
@@ -247,8 +247,8 @@ fn new(args: NewArgs) -> Result<()> {
     }
     // A snapshot taken with `--gui-state` holds a second device's half: the
     // mirror, the inbox, the journal, the desk device. It is laid over the
-    // daemon's state after the clone, because a rig runs one state directory
-    // and the GUI reads its files from the same place the daemon does.
+    // agent host's state after the clone, because a rig runs one state directory
+    // and the GUI reads its files from the same place the agent host does.
     let gui = snapshot.join("gui-state").join("rho");
     if gui.is_dir() {
         for relative in paths::GUI_SNAPSHOT_CONTENTS {
@@ -304,7 +304,7 @@ fn up(args: UpArgs) -> Result<()> {
     // sessions in one afternoon ran a GUI three hours older than the tree
     // and were reported as a commit that was never in them.
     let mut identities = vec![
-        Identity::of("daemon", bin.daemon()),
+        Identity::of("agent host", bin.agent_host()),
         Identity::of("rho", bin.rho()),
         Identity::of("fake_slack", bin.fake_slack()),
     ];
@@ -387,7 +387,7 @@ fn up(args: UpArgs) -> Result<()> {
     // Anything still running from the last session is the last session's, not
     // this one's.
     stop_gui(&root, &bin, &args.name);
-    stop_daemon(&root);
+    stop_host(&root);
 
     let runtime = root.join("run");
     fs::create_dir_all(runtime.join("rho"))?;
@@ -403,12 +403,12 @@ fn up(args: UpArgs) -> Result<()> {
         model.openai_base_url, model.pid
     );
 
-    // The rig daemon is its own node: no `--iroh`, no identity of the user's.
-    let log = fs::File::create(root.join("logs").join("daemon.log"))?;
-    let daemon = command(bin.daemon(), &root)
+    // The rig agent host is its own node: no `--iroh`, no identity of the user's.
+    let log = fs::File::create(root.join("logs").join("agent-host.log"))?;
+    let agent_host = command(bin.agent_host(), &root)
         .arg("--socket-path")
         .arg(&socket)
-        // Named outright, not left to the environment. A daemon that resolves
+        // Named outright, not left to the environment. An agent host that resolves
         // its Claude directory from `$HOME` reads the user's transcripts the
         // moment it is started any way but this one.
         .arg("--claude-config-dir")
@@ -418,20 +418,20 @@ fn up(args: UpArgs) -> Result<()> {
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
-        .with_context(|| format!("start {}", bin.daemon().display()))?;
-    let pid = daemon.id();
-    fs::write(root.join("run").join("daemon.pid"), pid.to_string())?;
-    wait_for(&socket, "the daemon's socket")?;
-    // A socket on disk is not a daemon: the last one's may still be there, and
+        .with_context(|| format!("start {}", bin.agent_host().display()))?;
+    let pid = agent_host.id();
+    fs::write(root.join("run").join("agent-host.pid"), pid.to_string())?;
+    wait_for(&socket, "the agent host's socket")?;
+    // A socket on disk is not an agent host: the last one's may still be there, and
     // this one may have died opening the store. Ask the process.
     if !alive(pid) {
         bail!(
-            "the daemon exited at startup; the last lines of {}:\n{}",
-            root.join("logs").join("daemon.log").display(),
-            tail(&root.join("logs").join("daemon.log"), 5)
+            "the agent host exited at startup; the last lines of {}:\n{}",
+            root.join("logs").join("agent-host.log").display(),
+            tail(&root.join("logs").join("agent-host.log"), 5)
         );
     }
-    println!("daemon  up on {} (pid {pid})", socket.display());
+    println!("agent host  up on {} (pid {pid})", socket.display());
 
     let slack = start_fake_slack(&root, &bin)?;
     println!(
@@ -492,10 +492,10 @@ fn up(args: UpArgs) -> Result<()> {
     save(&root, &rig)?;
     let tree_commit = crate::snapshot::tree_commit().unwrap_or_else(|| "unknown".to_owned());
     println!(
-        "RIG_READY tree_commit={tree_commit} rho_qa_sha256={} fake_sha256={} daemon_sha256={} rig={} session={}",
+        "RIG_READY tree_commit={tree_commit} rho_qa_sha256={} fake_sha256={} host_sha256={} rig={} session={}",
         sha256_file(&std::env::current_exe()?)?,
         sha256_file(&bin.fake_model())?,
-        sha256_file(&bin.daemon())?,
+        sha256_file(&bin.agent_host())?,
         args.name,
         rig.sessions.len(),
     );
@@ -530,7 +530,7 @@ fn down(name: &str) -> Result<()> {
     file_application_log(&root, name);
     record_drive(&root, name);
     file_drive_log(&root, name);
-    stop_daemon(&root);
+    stop_host(&root);
     println!("rig {name} down; its state is as the run left it");
     summarize_session(&root)
 }
@@ -746,8 +746,8 @@ fn status(name: &str) -> Result<()> {
     println!("  state    {}", state_size(&root));
     let socket = root.join("run").join("rho").join("rho.sock");
     println!(
-        "  daemon   {}",
-        match daemon_pid(&root) {
+        "  agent host   {}",
+        match host_pid(&root) {
             Some(pid) if alive(pid) => format!("running, pid {pid}, {}", socket.display()),
             _ => "down".to_owned(),
         }
@@ -1007,10 +1007,10 @@ fn holder() -> Option<String> {
 }
 
 /// Whether something is already running on this rig, and what to say about
-/// it. The daemon's pid is the lock: it is written by `up` and outlives the
+/// it. The agent host's pid is the lock: it is written by `up` and outlives the
 /// shell that started it, and `rig.json`'s last session says whose it is.
 fn holding_session(root: &Path, rig: &Rig) -> Option<String> {
-    let pid = read_pid(&root.join("run").join("daemon.pid")).filter(|pid| alive(*pid))?;
+    let pid = read_pid(&root.join("run").join("agent-host.pid")).filter(|pid| alive(*pid))?;
     let last = rig.sessions.last();
     let at = last.map_or("at an unknown time", |session| session.at.as_str());
     let binaries = last.map_or("unknown", |session| session.binaries.as_str());
@@ -1041,7 +1041,7 @@ fn holding_session(root: &Path, rig: &Rig) -> Option<String> {
     let touched = touch_line(root, &rig.name);
     Some(format!(
         "rig {} is already up: session {}, held by {whose}, started {at} on \
-         {binaries} binaries (daemon pid {pid}); {touched}.\n{what_to_do}",
+         {binaries} binaries (agent_host pid {pid}); {touched}.\n{what_to_do}",
         rig.name,
         rig.sessions.len(),
     ))
@@ -1094,14 +1094,15 @@ fn stop_gui(root: &Path, bin: &Build, session: &str) {
         .status();
 }
 
-/// Stop the daemon and the fake, and wait for them to be gone.
+/// Stop the agent host and the fake, and wait for them to be gone.
 ///
-/// Waiting is the point. redb allows one writer process, so a daemon started
-/// while the last one is still shutting down dies with `DatabaseAlreadyOpen` —
-/// and it dies after its socket is already on disk, so everything downstream
-/// looks up and the GUI simply says "reconnecting" for ever.
-fn stop_daemon(root: &Path) {
-    for name in ["daemon.pid", "fake-model.pid", "fake-slack.pid"] {
+/// Waiting is the point. redb allows one writer process, so an agent host
+/// started while the last one is still shutting down dies with
+/// `DatabaseAlreadyOpen` — and it dies after its socket is already on disk, so
+/// everything downstream looks up and the GUI simply says "reconnecting" for
+/// ever.
+fn stop_host(root: &Path) {
+    for name in ["agent-host.pid", "fake-model.pid", "fake-slack.pid"] {
         let path = root.join("run").join(name);
         if let Some(pid) = read_pid(&path) {
             terminate(pid);
@@ -1222,12 +1223,12 @@ async fn probe_async(name: &str) -> Result<()> {
 }
 
 /// The rig's environment: its own XDG dirs and nothing of the user's. The
-/// state dir is the copied state, which is what makes the daemon run on the
+/// state dir is the copied state, which is what makes the agent host run on the
 /// snapshot rather than on the user's store.
 ///
 /// `CLAUDE_CONFIG_DIR` is here for the binaries that still read it (the `rho`
-/// CLI); the daemon is told its Claude directory by argument instead, so a
-/// rig daemon is sealed whether or not it inherits this environment.
+/// CLI); the agent host is told its Claude directory by argument instead, so a
+/// rig agent host is sealed whether or not it inherits this environment.
 fn command(program: PathBuf, root: &Path) -> Command {
     let mut command = Command::new(program);
     command
@@ -1255,7 +1256,7 @@ impl Build {
         self.dir.join("rho")
     }
 
-    fn daemon(&self) -> PathBuf {
+    fn agent_host(&self) -> PathBuf {
         self.dir.join("rho-agent-host")
     }
 
@@ -1542,8 +1543,8 @@ fn wait_for(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn daemon_pid(root: &Path) -> Option<u32> {
-    read_pid(&root.join("run").join("daemon.pid"))
+fn host_pid(root: &Path) -> Option<u32> {
+    read_pid(&root.join("run").join("agent-host.pid"))
 }
 
 /// The last `lines` lines of a log, for an error that should not need the

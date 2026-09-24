@@ -154,7 +154,7 @@ fn run(
 ) -> Result<(), String> {
     // Filesystem state (not the process or descriptor table) is private to
     // this thread and the threads it starts: Python chdir must not move the
-    // daemon or another notebook. The caller then installs its workspace view.
+    // agent host or another notebook. The caller then installs its workspace view.
     if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
         return Err(format!(
             "unshare notebook cwd: {}",

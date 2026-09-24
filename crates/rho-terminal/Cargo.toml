@@ -1,4 +1,4 @@
-# A daemon-owned terminal shown as a surface: the wire display state, the
+# A host-owned terminal shown as a surface: the wire display state, the
 # input stream, the viewport with its raw and normal modes, and the actions
 # and colours that belong to it. Owned by no workspace; the window shows it.
 # Without the `client` feature it is the terminal protocol alone, for the

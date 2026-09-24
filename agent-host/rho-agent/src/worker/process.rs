@@ -1,4 +1,4 @@
-//! Daemon ownership of a workset process and its single connection.
+//! Agent host ownership of a workset process and its single connection.
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -233,7 +233,9 @@ impl Process {
                     rustix::process::Signal::TERM,
                 ))?;
                 if rustix::process::getppid() != Some(parent) {
-                    return Err(std::io::Error::other("daemon exited during workset launch"));
+                    return Err(std::io::Error::other(
+                        "agent host exited during workset launch",
+                    ));
                 }
                 Ok(())
             });
@@ -351,7 +353,7 @@ impl Process {
             // Cancelled callers cannot release admission before an enqueued
             // operation replies or the execution process has actually exited.
             pending_close.lock().expect("poison").clear();
-            // Mountpoint cleanup remains in the daemon's host-root frame.
+            // Mountpoint cleanup remains in the agent host's host-root frame.
             drop(root);
             closed.send_replace(true);
         });

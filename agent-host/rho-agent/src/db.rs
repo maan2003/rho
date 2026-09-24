@@ -115,7 +115,7 @@ pub enum QuotaProvider {
 pub struct QuotaObservationRecord {
     pub provider: QuotaProvider,
     pub model: QuotaModel,
-    /// The daemon-local OAuth namespace for ChatGPT observations. Claude and
+    /// The host-local OAuth namespace for ChatGPT observations. Claude and
     /// legacy observations are unscoped.
     pub auth_namespace: Option<String>,
     pub observed_at: UnixMillis,

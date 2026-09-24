@@ -1,5 +1,5 @@
 //! The mirror store's wire protocol and naming, shared by the keeper the
-//! daemon runs (`rho-git-server`) and its clients (`rho-git-client`, the
+//! agent host runs (`rho-git-server`) and its clients (`rho-git-client`, the
 //! `git` wrapper agents run).
 //!
 //! A client connects to the keeper's unix socket, writes one request line

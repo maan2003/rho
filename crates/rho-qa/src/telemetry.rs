@@ -94,7 +94,7 @@ struct Frame {
     cursors: u64,
 }
 
-/// A stage, as much of one as the summaries read. The daemon also emits
+/// A stage, as much of one as the summaries read. The agent host also emits
 /// `transforms` and `affected_offsets`, which nothing here reports yet;
 /// serde drops what the struct does not name, so they come back by being
 /// added when there is a summary that wants them.
@@ -111,7 +111,7 @@ struct Stage {
     new_rows: u64,
 }
 
-/// One piece of work. The daemon also emits `start_ns`, which no summary
+/// One piece of work. The agent host also emits `start_ns`, which no summary
 /// reads: the work lines are ranked by duration, not placed on a timeline.
 #[derive(Deserialize, Default)]
 struct Work {

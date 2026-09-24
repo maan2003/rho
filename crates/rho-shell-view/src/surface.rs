@@ -50,7 +50,7 @@ pub struct ShellModel {
     exited: bool,
     disconnected: bool,
     submitting: bool,
-    daemon_prompt: String,
+    host_prompt: String,
     display_prompt: String,
     shell_state: crate::protocol::ShellState,
     _read_task: gpui::Task<()>,
@@ -124,7 +124,7 @@ impl ShellModel {
             exited: false,
             disconnected: false,
             submitting: false,
-            daemon_prompt: "> ".to_owned(),
+            host_prompt: "> ".to_owned(),
             display_prompt: "> ".to_owned(),
             shell_state: crate::protocol::ShellState::default(),
             _read_task: read_task,
@@ -177,7 +177,7 @@ impl ShellModel {
         editor
     }
 
-    /// Seals the current draft locally at once, while the daemon
+    /// Seals the current draft locally at once, while the agent host
     /// acknowledgement determines whether it became authoritative. A failed
     /// submission is restored rather than silently discarded.
     pub fn submit(&mut self, cx: &mut Context<Self>) {
@@ -209,7 +209,7 @@ impl ShellModel {
                         model.submitting = false;
                         if accepted {
                             if !model.exited && !model.disconnected {
-                                let prompt = model.daemon_prompt.clone();
+                                let prompt = model.host_prompt.clone();
                                 model.set_prompt(&prompt, cx);
                             }
                         } else {
@@ -276,10 +276,10 @@ impl ShellModel {
                     self.mark_disconnected(cx);
                     return;
                 }
-                self.daemon_prompt.clone_from(&state.prompt);
+                self.host_prompt.clone_from(&state.prompt);
                 self.shell_state = state;
                 if !self.submitting {
-                    let prompt = self.daemon_prompt.clone();
+                    let prompt = self.host_prompt.clone();
                     self.set_prompt(&prompt, cx);
                 }
             }
@@ -433,9 +433,9 @@ impl ShellModel {
             ShellServerFrame::Prompt { prompt, cwd } => {
                 self.shell_state.prompt.clone_from(&prompt);
                 self.shell_state.cwd = cwd;
-                self.daemon_prompt = prompt;
+                self.host_prompt = prompt;
                 if !self.submitting {
-                    let prompt = self.daemon_prompt.clone();
+                    let prompt = self.host_prompt.clone();
                     self.set_prompt(&prompt, cx);
                 }
             }

@@ -1,9 +1,9 @@
 //! The SSH Git approval prompt.
 //!
-//! A daemon that wants to reach out over SSH asks first, and the answer is
+//! An agent host that wants to reach out over SSH asks first, and the answer is
 //! the user's: approving one is a decision about which machine talks to
-//! which. The daemon is blocked on a channel while it waits, so every way
-//! out of this state has to answer — allow, deny, the daemon giving up, or
+//! which. The agent host is blocked on a channel while it waits, so every way
+//! out of this state has to answer — allow, deny, the agent host giving up, or
 //! the connection dropping. Nothing here may quietly forget a request.
 //!
 //! It is one of the three modal overlays, with the minibuffer and the
@@ -15,7 +15,7 @@ use gpui::{AnyElement, App, FocusHandle, TextStyle, Window, div};
 use rho_agent_hosts::connection::GitApprovalDecision;
 use theme::ActiveTheme as _;
 
-/// A request waiting for the user's answer, and the channel the daemon is
+/// A request waiting for the user's answer, and the channel the agent host is
 /// blocked on.
 struct Pending {
     request_id: u64,
@@ -63,7 +63,7 @@ impl GitApproval {
     }
 
     /// Answers the waiting request, and says whether there was one. The
-    /// daemon is blocked until this happens, which is why every caller
+    /// agent host is blocked until this happens, which is why every caller
     /// that ends the prompt goes through here.
     pub(crate) fn answer(&mut self, decision: GitApprovalDecision) -> bool {
         let Some(pending) = self.pending.take() else {
@@ -73,7 +73,7 @@ impl GitApproval {
         true
     }
 
-    /// The daemon has finished with this request on its own. Answers
+    /// The agent host has finished with this request on its own. Answers
     /// whether it was the one being waited on — another request's `Done`
     /// says nothing about this one.
     pub(crate) fn done(&mut self, request_id: u64) -> bool {

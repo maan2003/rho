@@ -151,7 +151,7 @@ pub struct LegacyProject {
     pub path: Utf8PathBuf,
 }
 
-/// A repository, by the URL the daemon clones. There is no project id and
+/// A repository, by the URL the agent host clones. There is no project id and
 /// no project row: a label with one of these is what a project is, so
 /// what a thing inherits is the URL itself rather than a hop through
 /// another thing.
@@ -522,7 +522,7 @@ pub struct TodoCadence {
 
 /// The facts a verdict records in its log entry.
 ///
-/// One definition for both sides: the GUI logs exactly this, and the daemon
+/// One definition for both sides: the GUI logs exactly this, and the agent host
 /// checks a submitted entry against it, so the two can never drift.
 /// `before` is what the property held, which only the writer knows;
 /// `cadence` is required for `todo`, whose changes describe the note the
@@ -590,7 +590,7 @@ pub fn verdict_changes(
         return match verdict {
             // Nothing in the store: done on a Slack unit is the mirror's
             // cursor moving, and moving it is the caller's. An empty change
-            // list would be a verdict the daemon has nothing to check, so
+            // list would be a verdict the agent host has nothing to check, so
             // this says so rather than writing a cell nobody reads.
             Verdict::Done => Err("a Slack unit's done is rho's cursor, not a cell".to_owned()),
             // A mute is Slack's too (8 Sep): a thread the user is done
@@ -1201,7 +1201,7 @@ mod tests {
     /// A merge that fails part-way leaves the store exactly as it was.
     ///
     /// This is the whole of what the old whole-store copy bought: half a
-    /// mutation is a store nobody wrote, and the daemon refuses a mutation
+    /// mutation is a store nobody wrote, and the agent host refuses a mutation
     /// after some of its cells have already been taken. The copy is gone
     /// and what was displaced is put back instead, so the guarantee is
     /// checked here rather than assumed from the shape of the code: the
@@ -1672,7 +1672,7 @@ mod tests {
             .unwrap()
         };
         // Done is refused rather than written: there is no cell for it, and
-        // a verdict the daemon has nothing to check is not a verdict.
+        // a verdict the agent host has nothing to check is not a verdict.
         assert!(
             verdict_changes(
                 &unit,
@@ -1713,43 +1713,47 @@ mod tests {
     }
 
     #[test]
-    fn daemon_and_gui_round_trip_only_cells_since_the_peer_version() {
-        let mut daemon = Store::new(device(1));
+    fn host_and_gui_round_trip_only_cells_since_the_peer_version() {
+        let mut agent_host = Store::new(device(1));
         let mut gui = Store::new(device(2));
         gui.write(note(1), Property::CreatedAt(timestamp(10)))
             .unwrap();
-        let daemon_version = daemon.version().clone();
-        daemon.merge(gui.since(&daemon_version)).unwrap();
+        let host_version = agent_host.version().clone();
+        agent_host.merge(gui.since(&host_version)).unwrap();
         let gui_version = gui.version().clone();
-        daemon.write(note(1), Property::State(State::Done)).unwrap();
-        let delta = daemon.since(&gui_version);
+        agent_host
+            .write(note(1), Property::State(State::Done))
+            .unwrap();
+        let delta = agent_host.since(&gui_version);
         assert_eq!(delta.cells.len(), 1);
         gui.merge(delta).unwrap();
-        assert_eq!(gui.snapshot(), daemon.snapshot());
+        assert_eq!(gui.snapshot(), agent_host.snapshot());
     }
 
     #[test]
-    fn two_guis_converge_through_one_daemon() {
-        let mut daemon = Store::new(device(1));
+    fn two_guis_converge_through_one_host() {
+        let mut agent_host = Store::new(device(1));
         let mut first = Store::new(device(2));
         let mut second = Store::new(device(3));
         first
             .write(note(1), Property::CreatedAt(timestamp(10)))
             .unwrap();
-        daemon.merge(first.since(daemon.version())).unwrap();
-        second.merge(daemon.since(second.version())).unwrap();
+        agent_host.merge(first.since(agent_host.version())).unwrap();
+        second.merge(agent_host.since(second.version())).unwrap();
         first
             .write(note(1), Property::Deadline(Some(timestamp(20))))
             .unwrap();
         second
             .write(note(1), Property::DeferUntil(Some(timestamp(15))))
             .unwrap();
-        daemon.merge(first.since(daemon.version())).unwrap();
-        daemon.merge(second.since(daemon.version())).unwrap();
-        first.merge(daemon.since(first.version())).unwrap();
-        second.merge(daemon.since(second.version())).unwrap();
-        assert_eq!(first.snapshot(), daemon.snapshot());
-        assert_eq!(second.snapshot(), daemon.snapshot());
+        agent_host.merge(first.since(agent_host.version())).unwrap();
+        agent_host
+            .merge(second.since(agent_host.version()))
+            .unwrap();
+        first.merge(agent_host.since(first.version())).unwrap();
+        second.merge(agent_host.since(second.version())).unwrap();
+        assert_eq!(first.snapshot(), agent_host.snapshot());
+        assert_eq!(second.snapshot(), agent_host.snapshot());
     }
 
     /// A body is asked for by what is held of it, and answered with the

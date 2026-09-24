@@ -1,6 +1,6 @@
 //! What the usage screen draws, reduced once when the series arrives.
 //!
-//! The daemon sends the raw thing: every quota sample it observed, every
+//! The agent host sends the raw thing: every quota sample it observed, every
 //! hourly cost bucket, every agent's rolling spend. A chart is a few hundred
 //! pixels wide, so drawing from that directly means a frame walks ten
 //! thousand samples to paint eight hundred columns, every frame, for as long

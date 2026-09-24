@@ -87,11 +87,11 @@ impl PromptCacheKey {
 ///
 /// The prompt cache key is persisted with the agent and outlives any single
 /// session, while the debug sequence counter lives in the task and restarts at
-/// zero whenever the task is rebuilt — a daemon restart, a resumed agent. Those
-/// two together used to name the same file twice and silently overwrite the
-/// older run, so the run token goes in the name as well. Seconds first, so a
-/// directory listing for one agent still sorts chronologically; random tail so
-/// two tasks started in the same second stay apart.
+/// zero whenever the task is rebuilt — an agent host restart, a resumed agent.
+/// Those two together used to name the same file twice and silently overwrite
+/// the older run, so the run token goes in the name as well. Seconds first, so
+/// a directory listing for one agent still sorts chronologically; random tail
+/// so two tasks started in the same second stay apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DebugRun(u64, u16);
 

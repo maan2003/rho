@@ -119,17 +119,17 @@ fn configure_octo_git_transport(environment: &mut Vec<(OsString, OsString)>) -> 
     Ok(())
 }
 
-/// Puts the directories this daemon was told to use into the environment its
-/// agents are spawned with.
+/// Puts the directories this agent host was told to use into the environment
+/// its agents are spawned with.
 ///
 /// `login_environment` starts from a cleared environment and a login shell,
 /// so what comes back is whatever that shell chose and none of what this
-/// daemon was named. An agent would then work in the XDG defaults under HOME
-/// and read a Claude config home nobody named, agreeing with the daemon only
-/// by luck. What the daemon resolved wins here; the two directories it has no
-/// say over are passed on as it was started with them, or left to the login
-/// shell when it was started without them.
-fn apply_daemon_directories(
+/// agent host was named. An agent would then work in the XDG defaults under
+/// HOME and read a Claude config home nobody named, agreeing with the agent
+/// host only by luck. What the agent host resolved wins here; the two
+/// directories it has no say over are passed on as it was started with them, or
+/// left to the login shell when it was started without them.
+fn apply_host_directories(
     environment: &mut Vec<(OsString, OsString)>,
     state_dir: &camino::Utf8Path,
     claude: &rho_claude::accounts::ClaudePaths,
@@ -237,17 +237,17 @@ fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
 fn lock_runtime_directory(
     paths: &rho_rpc::protocol::RuntimePaths,
 ) -> anyhow::Result<std::fs::File> {
-    let path = paths.daemon_lock();
+    let path = paths.host_lock();
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
-        .with_context(|| format!("open daemon runtime lock {}", path.display()))?;
+        .with_context(|| format!("open agent host runtime lock {}", path.display()))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         anyhow::bail!(
-            "refusing to start: runtime directory {} is owned by another daemon (lock file {})",
+            "refusing to start: runtime directory {} is owned by another agent host (lock file {})",
             paths.directory().display(),
             path.display()
         );
@@ -285,12 +285,12 @@ fn start_runtime_sockets(
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
-    prepare_socket_path(paths.socket(), "rho daemon")?;
+    prepare_socket_path(paths.socket(), "rho-agent-host")?;
     prepare_socket_path(&octo_socket, "octo")?;
     let octo_listener = tokio::net::UnixListener::bind(&octo_socket)
         .with_context(|| format!("bind octo socket {}", octo_socket.display()))?;
     let listener = tokio::net::UnixListener::bind(paths.socket())
-        .with_context(|| format!("bind rho daemon socket {}", paths.socket().display()))?;
+        .with_context(|| format!("bind rho-agent-host socket {}", paths.socket().display()))?;
     spawn_octo_server(octo_listener, secrets)?;
     Ok(RuntimeSockets {
         paths,
@@ -323,7 +323,7 @@ pub fn configure_embedded_environment() {
 }
 
 #[derive(Clone, Debug, clap::Args)]
-pub struct DaemonArgs {
+pub struct HostArgs {
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
     /// Also listen for remote UI clients over iroh (relay-backed).
@@ -346,19 +346,19 @@ pub struct DaemonArgs {
     pub anthropic_base_url: Option<String>,
     /// The Claude config directory to run against, with accounts beside it
     /// as `<dir>-accounts`. Named outright by a rig, whose Claude state is
-    /// its own; without it the daemon uses the user's, `$CLAUDE_CONFIG_DIR`
-    /// or `~/.claude`. Deliberately not an `env =` argument: a daemon
+    /// its own; without it the agent host uses the user's, `$CLAUDE_CONFIG_DIR`
+    /// or `~/.claude`. Deliberately not an `env =` argument: an agent host
     /// pointed at a rig's state directory picked the user's transcripts up
     /// out of the environment and rebuilt agent rows from them.
     #[arg(long, value_name = "DIR")]
     pub claude_config_dir: Option<camino::Utf8PathBuf>,
 }
 
-pub struct DaemonProfiler(Option<rho_profiling::CpuProfiler>);
+pub struct HostProfiler(Option<rho_profiling::CpuProfiler>);
 
-impl DaemonProfiler {
+impl HostProfiler {
     /// Start profiling before the async runtime creates worker threads.
-    pub fn start(args: &mut DaemonArgs) -> anyhow::Result<Self> {
+    pub fn start(args: &mut HostArgs) -> anyhow::Result<Self> {
         Ok(Self(
             args.cpu_profile
                 .take()
@@ -370,22 +370,22 @@ impl DaemonProfiler {
     pub fn finish(self, result: anyhow::Result<()>) -> anyhow::Result<()> {
         if let Some(profiler) = self.0 {
             match profiler.finish() {
-                Ok(path) => eprintln!("rho daemon: wrote CPU profile to {}", path.display()),
+                Ok(path) => eprintln!("rho-agent-host: wrote CPU profile to {}", path.display()),
                 Err(error) if result.is_err() => {
-                    eprintln!("rho daemon: failed to write CPU profile: {error:#}");
+                    eprintln!("rho-agent-host: failed to write CPU profile: {error:#}");
                 }
-                Err(error) => return Err(error.context("write daemon CPU profile")),
+                Err(error) => return Err(error.context("write agent host CPU profile")),
             }
         }
         result
     }
 }
 
-pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
+pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let platform_secrets = PlatformSecrets::from_fd_store();
     let runtime = start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
 
-    // The daemon's own cwd must never matter: agents each carry their own
+    // The agent host's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
     // any code still depending on process cwd fails loudly.
     let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
@@ -407,7 +407,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         Some(dir) => rho_claude::accounts::ClaudePaths::at(dir),
         None => rho_claude::accounts::ClaudePaths::from_env()?,
     };
-    eprintln!("rho daemon: Claude configuration {}", claude.config_home());
+    eprintln!(
+        "rho-agent-host: Claude configuration {}",
+        claude.config_home()
+    );
 
     let mut user_environment = login_environment()?;
     if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
@@ -431,7 +434,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         );
         set_environment_value(&mut user_environment, "ANTHROPIC_BASE_URL", endpoint);
     }
-    apply_daemon_directories(&mut user_environment, &state_dir, &claude);
+    apply_host_directories(&mut user_environment, &state_dir, &claude);
     let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(db_path);
@@ -470,7 +473,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         Ok(worksets) => worksets,
         Err(error) => {
             eprintln!(
-                "rho daemon: clone store server unavailable, clones fetch for themselves: {error:#}"
+                "rho-agent-host: clone store server unavailable, clones fetch for themselves: {error:#}"
             );
             rho_fs_view::Worksets::open(
                 &state_dir,
@@ -485,7 +488,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
                 .await?;
-        eprintln!("rho daemon iroh endpoint: {}", listener.endpoint_id());
+        eprintln!("rho-agent-host iroh endpoint: {}", listener.endpoint_id());
         Some((listener, auth))
     } else {
         None
@@ -558,7 +561,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
                     if let Err(error) = serve_connection(services, iroh_auth, connection).await {
-                        eprintln!("rho daemon connection error: {error:#}");
+                        eprintln!("rho-agent-host connection error: {error:#}");
                     }
                 });
             }
@@ -594,7 +597,7 @@ async fn run_iroh_listener(
         let connection = match approved {
             Ok(connection) => connection,
             Err(error) => {
-                eprintln!("rho daemon iroh authentication error: {error:#}");
+                eprintln!("rho-agent-host iroh authentication error: {error:#}");
                 continue;
             }
         };
@@ -651,7 +654,7 @@ async fn run_iroh_listener(
                     }
                     .await;
                     if let Err(error) = result {
-                        eprintln!("rho daemon iroh connection error: {error:#}");
+                        eprintln!("rho-agent-host iroh connection error: {error:#}");
                     }
                 });
             }
@@ -823,7 +826,7 @@ impl GitTransportBroker {
     }
 }
 
-/// Everything the daemon owns that a connection may need: the agent pool,
+/// Everything the agent host owns that a connection may need: the agent pool,
 /// the database, the stores, the locks and the brokers. It is not a
 /// registry of agents — the pool is that — but the one bundle a connection
 /// is handed so it does not carry a dozen handles of its own.
@@ -846,7 +849,8 @@ struct Services {
     quota: tokio::sync::watch::Sender<()>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
-    /// The Claude configuration this daemon runs against, resolved in `run`.
+    /// The Claude configuration this agent host runs against, resolved in
+    /// `run`.
     claude: rho_claude::accounts::ClaudePaths,
     git_transport: GitTransportBroker,
     /// At most one GUI owns the voice session's microphone and playback.
@@ -1072,10 +1076,10 @@ fn spawn_inference_projection(services: Arc<Services>) {
     });
 }
 
-/// Repo roots must be absolute (the daemon's cwd is meaningless by design):
-/// agents start on daemon-made clones, so both workdir registration and
+/// Repo roots must be absolute (the agent host's cwd is meaningless by design):
+/// agents start on host-made clones, so both workdir registration and
 /// agent creation take repos. A leading `~` expands
-/// to the daemon's home: clients may run on another machine, so path
+/// to the agent host's home: clients may run on another machine, so path
 /// interpretation belongs here.
 const MAX_INPUT_IMAGES: usize = 20;
 const MAX_IMAGE_BASE64_BYTES: usize = 10 * 1024 * 1024;
@@ -1165,18 +1169,18 @@ fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
 }
 
 #[cfg(test)]
-mod daemon_directory_tests {
+mod host_directory_tests {
     use std::ffi::OsString;
 
-    use super::apply_daemon_directories;
+    use super::apply_host_directories;
 
-    /// The environment an agent gets says where this daemon works, not where
-    /// a login shell would have gone. A rig daemon's agent otherwise writes
-    /// under the rig's HOME by XDG default and reads a Claude config home
-    /// nobody named; the capture carries neither, and a stale value from the
-    /// login shell has to lose to the daemon's.
+    /// The environment an agent gets says where this agent host works, not
+    /// where a login shell would have gone. A rig agent host's agent
+    /// otherwise writes under the rig's HOME by XDG default and reads a
+    /// Claude config home nobody named; the capture carries neither, and a
+    /// stale value from the login shell has to lose to the agent host's.
     #[test]
-    fn the_daemon_names_the_directories_its_agents_work_in() {
+    fn the_host_names_the_directories_its_agents_work_in() {
         let root = tempfile::tempdir().unwrap();
         let root = camino::Utf8Path::from_path(root.path()).unwrap();
         let state_dir = root.join("state").join("rho");
@@ -1184,10 +1188,10 @@ mod daemon_directory_tests {
 
         let mut environment: Vec<(OsString, OsString)> = vec![
             ("PATH".into(), "/usr/bin".into()),
-            // What a login shell left behind: the user's, not this daemon's.
+            // What a login shell left behind: the user's, not this agent host's.
             ("XDG_STATE_HOME".into(), "/home/someone/.local/state".into()),
         ];
-        apply_daemon_directories(&mut environment, &state_dir, &claude);
+        apply_host_directories(&mut environment, &state_dir, &claude);
 
         let value = |name: &str| {
             environment
@@ -1208,7 +1212,7 @@ mod daemon_directory_tests {
             Some("/usr/bin"),
             "the rest is left alone"
         );
-        // The two the daemon has no say over: passed on as it was started
+        // The two the agent host has no say over: passed on as it was started
         // with them, absent when it was started without them.
         for name in ["XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
             assert_eq!(
@@ -1247,7 +1251,7 @@ mod tests {
 
         assert!(paths.socket().exists());
         assert!(paths.octo_socket().exists());
-        assert!(paths.daemon_lock().exists());
+        assert!(paths.host_lock().exists());
         assert!(!paths.browser_socket().exists());
         assert!(!paths.pr_logs().exists());
         assert_eq!(
@@ -1261,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_daemon_is_refused_while_first_holds_runtime_lock() {
+    async fn second_host_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
             rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
@@ -1273,7 +1277,7 @@ mod tests {
             Some(paths.socket().to_owned()),
             PlatformSecrets::default(),
         ) {
-            Ok(_) => panic!("second daemon acquired the runtime directory"),
+            Ok(_) => panic!("second agent host acquired the runtime directory"),
             Err(error) => error,
         };
         let message = format!("{error:#}");
@@ -1283,7 +1287,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains(&paths.daemon_lock().display().to_string()),
+            message.contains(&paths.host_lock().display().to_string()),
             "{message}"
         );
         drop(first);
@@ -1317,7 +1321,7 @@ mod tests {
         let contender = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(paths.daemon_lock())
+            .open(paths.host_lock())
             .unwrap();
 
         let result = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -1584,7 +1588,7 @@ where
         let agent = services.resolve_display_agent_id(&agent).await?;
         let process = services.pool.execution(agent).await?;
         #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("agent desktops require a Linux daemon");
+        anyhow::bail!("agent desktops require a Linux agent host");
         #[cfg(target_os = "linux")]
         {
             let rho_agent::WorksetReply::Desktop { socket } = process

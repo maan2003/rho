@@ -1887,11 +1887,11 @@ mod tests {
         assert_eq!(
             protocol.request(QueuedSubmission {
                 execution: 1,
-                command: "echo daemon-owned".into(),
+                command: "echo host-owned".into(),
             }),
             Some(Request::Execute {
                 execution: 1,
-                command: "echo daemon-owned".into(),
+                command: "echo host-owned".into(),
             })
         );
         assert!(

@@ -1,7 +1,7 @@
 //! The voice protocol of a host, [`rho_rpc::protocol::Protocol::Voice`].
 //!
 //! The stream performs OAuth signaling and publishes client-local semantic
-//! context. Provider control events stay on the daemon's OpenAI sideband.
+//! context. Provider control events stay on the agent host's OpenAI sideband.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 

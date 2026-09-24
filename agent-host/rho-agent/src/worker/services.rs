@@ -1,4 +1,4 @@
-//! Daemon-owned transactions and policy. Requests are bound to one agent;
+//! Host-owned transactions and policy. Requests are bound to one agent;
 //! callers cannot choose another agent id or send arbitrary database writes.
 use std::sync::Arc;
 
@@ -136,7 +136,7 @@ impl Services {
                 .lock()
                 .expect("poison")
                 .take()
-                .expect("one daemon connection");
+                .expect("one agent host connection");
             let (outgoing, mut messages) = mpsc::channel::<Message<'static>>(32);
             let mut calls = JoinSet::new();
             // Whether this loop's tail has been told since it was last not
@@ -274,7 +274,7 @@ impl Services {
                         let head = self.db.read().get_agent(self.agent);
                         anyhow::ensure!(
                             call.allowed(head.config.role),
-                            "not an available daemon-owned tool"
+                            "not an available host-owned tool"
                         );
                         let tools = crate::multi_agent_tools::MultiAgentTools::new(
                             Arc::downgrade(&pool),
@@ -569,7 +569,7 @@ mod tests {
         drop(host);
         assert!(server.await.unwrap().is_err());
 
-        // The daemon committed, but the worker never received its reply.
+        // The agent host committed, but the worker never received its reply.
         // Neither transport nor store client is allowed to resend the append.
         let (client, mut server) = crate::worker::testing::pair();
         let host = client.host();

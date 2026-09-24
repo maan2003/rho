@@ -1008,7 +1008,7 @@ fn undo_verdict_binding_is_confined_to_normal_mode(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut TestAppContext) {
-    // The daemon validates the log entry against exactly these three
+    // The agent host validates the log entry against exactly these three
     // changes, and rejects the whole mutation otherwise: a todo that only
     // logged the new note's arrival never reached the tree.
     use rho_desk_client::protocol::cells::{Property, PropertyKey};
@@ -1305,7 +1305,7 @@ fn transcript_of(
         .expect("read transcript")
 }
 
-/// Feeds the transcript back with one change, as a daemon that saw more
+/// Feeds the transcript back with one change, as an agent host that saw more
 /// of the turn would.
 fn feed_edit(
     workspace: &WindowHandle<Workspace>,
@@ -1829,7 +1829,7 @@ async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppCont
     let mut desk = DeskFixture::new();
     let looped = desk.note(None, "the loop");
     let under = desk.note(Some(looped.clone()), "beneath it");
-    // The cell the daemon could hand over: the row filed under itself.
+    // The cell the agent host could hand over: the row filed under itself.
     desk.set(
         looped.clone(),
         rho_desk_client::protocol::cells::Property::Parent(Some(looped.clone())),
@@ -3722,7 +3722,7 @@ fn messages_surface_renders_in_order_and_follows_new_entries(cx: &mut TestAppCon
             assert!(workspace.messages_following(cx));
         })
         .expect("append while messages are open");
-    assert!(buffer_text(&workspace, cx).ends_with("[rho daemon error: third]\n"));
+    assert!(buffer_text(&workspace, cx).ends_with("[rho-agent-host error: third]\n"));
 }
 
 #[gpui::test]
@@ -4079,7 +4079,7 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
             .expect("read messages"),
         "submit should reach the workspace and report the failed send"
     );
-    // Draft submissions keep the buffer until the daemon confirms creation,
+    // Draft submissions keep the buffer until the agent host confirms creation,
     // so a failed send never loses the message.
     assert!(
         text.contains("hello rho"),
@@ -4088,7 +4088,7 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn upload_gui_telemetry_action_reports_when_no_daemon_is_connected(cx: &mut TestAppContext) {
+fn upload_gui_telemetry_action_reports_when_no_host_is_connected(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.dispatch_action(*workspace, crate::UploadGuiTelemetry);
     assert!(
@@ -4096,16 +4096,16 @@ fn upload_gui_telemetry_action_reports_when_no_daemon_is_connected(cx: &mut Test
             .update(cx, |workspace, _, cx| workspace
                 .message_log_texts(cx)
                 .iter()
-                .any(
-                    |message| message.contains("performance snapshot: no daemon is connected")
-                ))
+                .any(|message| message.contains(
+                    "performance snapshot: no agent host is connected"
+                )))
             .expect("read messages"),
         "telemetry action should reach the workspace and fail nonfatally"
     );
 }
 
 /// Restore flow: the agent's first frame is a snapshot that already carries
-/// `context_used` (daemon loaded it from the event log / transcript). The
+/// `context_used` (agent host loaded it from the event log / transcript). The
 /// status chips must show it without any live turn happening.
 #[gpui::test]
 fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
@@ -4511,7 +4511,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
         ("s 3 h", SnoozeUnit::Hours, 3),
         ("s 2 w", SnoozeUnit::Weeks, 2),
     ] {
-        // A card apiece: a verdict waits on the daemon before the deal
+        // A card apiece: a verdict waits on the agent host before the deal
         // moves on, so one desk cannot hold three of them.
         let mut desk = DeskFixture::new();
         desk.due_note(None, "Card to snooze");
@@ -4555,7 +4555,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
                     "{keys}: woke at {wrote:?}, expected about {expected:?}"
                 );
                 // The words are said now: the verdict is done when it is
-                // written here, and the bar does not wait for a daemon.
+                // written here, and the bar does not wait for an agent host.
                 assert_eq!(
                     workspace.echo_text_for_test(),
                     Some(format!("{said}: Card to snooze").as_str()),
@@ -6480,15 +6480,15 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
 }
 
 #[gpui::test]
-fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppContext) {
+fn a_verdict_the_host_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppContext) {
     // The write is done on the client, so nothing on this side is waiting
     // to be told it happened -- and nothing replays it either. A verdict
-    // taken while the daemon was away, or one lost on the wire, would
+    // taken while the agent host was away, or one lost on the wire, would
     // reach no other device ever again if the handshake did not carry it
-    // back. Sync is two ways: the answer says what the daemon has, and
-    // what this client holds above the daemon's frontier goes with it.
+    // back. Sync is two ways: the answer says what the agent host has, and
+    // what this client holds above the agent host's frontier goes with it.
     let mut desk = DeskFixture::new();
-    let note = desk.note(None, "Written while the daemon was away");
+    let note = desk.note(None, "Written while the agent host was away");
     desk.set(
         note.clone(),
         rho_desk_client::protocol::cells::Property::DeferUntil(Some(
@@ -6512,7 +6512,7 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     cx.run_until_parked();
     // Sent and dropped: the fixture's store never takes this mutation, the
-    // way a daemon that was not running never took it.
+    // way an agent host that was not running never took it.
     workspace
         .update(cx, |workspace, _, _| {
             take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
@@ -6531,14 +6531,14 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
                 })
         })
         .unwrap()
-        .expect("the client sends the cells the daemon's frontier lacks");
+        .expect("the client sends the cells the agent host's frontier lacks");
     assert!(
         sent_back.cells.iter().any(|cell| cell.id == note
             && cell.property
                 == rho_desk_client::protocol::cells::Property::State(
                     rho_desk_client::protocol::cells::State::Done
                 )),
-        "the verdict the daemon never heard is in what goes back: {:?}",
+        "the verdict the agent host never heard is in what goes back: {:?}",
         sent_back.cells
     );
 
@@ -6548,13 +6548,13 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     assert_eq!(
         desk.store.facts(&note).state,
         rho_desk_client::protocol::cells::State::Done,
-        "the daemon holds the write it missed"
+        "the agent host holds the write it missed"
     );
 }
 
 #[gpui::test]
 fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut TestAppContext) {
-    // Two GUIs on one desk: the first deals a verdict, the daemon accepts
+    // Two GUIs on one desk: the first deals a verdict, the agent host accepts
     // it, and the second sees it only because the poke made it sync.
     let mut desk = DeskFixture::new();
     let note = desk.note(None, "Shared card");
@@ -6589,7 +6589,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
         })
         .unwrap();
 
-    // The daemon now holds the verdict; the second device is only poked.
+    // The agent host now holds the verdict; the second device is only poked.
     desk.store.apply_mutation(&mutation).unwrap();
     let frontier = desk.store.version().clone();
     second
@@ -7616,7 +7616,7 @@ fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppCo
 }
 
 /// The thing behind a surface can go while the surface sits in history: a
-/// daemon is detached and its agents go with it. Back must not land on a
+/// agent host is detached and its agents go with it. Back must not land on a
 /// transcript of an agent that no longer exists.
 ///
 /// Two things keep that, and this test asks only for the result. The close
@@ -7627,7 +7627,7 @@ fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppCo
 /// call on every death path so no path has to know which of the two saved
 /// it.
 #[gpui::test]
-fn back_never_lands_on_a_transcript_whose_daemon_is_gone(cx: &mut TestAppContext) {
+fn back_never_lands_on_a_transcript_whose_host_is_gone(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let agent_id = agent(91);
     let mut desk = DeskFixture::new();
@@ -7678,7 +7678,7 @@ fn back_never_lands_on_a_transcript_whose_daemon_is_gone(cx: &mut TestAppContext
             assert_ne!(
                 workspace.current_surface_key_for_test(),
                 crate::pane::SurfaceKey::Transcript(agent_id),
-                "back showed a transcript whose daemon had been detached"
+                "back showed a transcript whose agent host had been detached"
             );
         })
         .unwrap();
@@ -7769,7 +7769,7 @@ fn notes_for_this_makes_a_note_about_the_surfaces_node(cx: &mut TestAppContext) 
         .unwrap();
 }
 
-/// A desk as the daemon would hand it over: cells the client merges, plus a
+/// A desk as the agent host would hand it over: cells the client merges, plus a
 /// text history per note. Tests build one and send it as `DeskSynced`.
 /// A head as `Ready` carries it: the least an agent can say about itself,
 /// with the story empty. Tests that care about a title or a running turn
@@ -7831,10 +7831,10 @@ pub(super) struct DeskFixture {
 }
 
 impl DeskFixture {
-    /// The text replica namespace the daemon gives this connection.
+    /// The text replica namespace the agent host gives this connection.
     const NAMESPACE: u16 = 42;
-    const DAEMON_NAMESPACE: u16 = 1;
-    /// The store the fixture's daemon answers as. Cells are only news
+    const HOST_NAMESPACE: u16 = 1;
+    /// The store the fixture's agent host answers as. Cells are only news
     /// about a desk when they are counted in the store the client holds,
     /// so every sync says which one that is.
     pub(super) const STORE: rho_desk_client::protocol::cells::DeviceId =
@@ -7860,7 +7860,7 @@ impl DeskFixture {
         self.file(id.clone(), parent);
         if !text.is_empty() {
             let mut buffer = text::Buffer::new(
-                text::ReplicaId::new(Self::DAEMON_NAMESPACE),
+                text::ReplicaId::new(Self::HOST_NAMESPACE),
                 text::BufferId::new(self.next_node + 1).unwrap(),
                 "",
             );
@@ -8068,7 +8068,7 @@ impl DeskFixture {
     }
 }
 
-/// The daemon's answer to the one mutation the GUI just sent.
+/// The agent host's answer to the one mutation the GUI just sent.
 fn take_desk_mutation(
     workspace: &mut Workspace,
     host: HostId,
@@ -9294,7 +9294,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     );
     workspace
         .update(cx, |workspace, _, _| {
-            // The daemon is never told where to file it: the client writes
+            // The agent host is never told where to file it: the client writes
             // that fact itself once the agent exists.
             assert_eq!(
                 workspace.pending_agent_filing_for_test(),
@@ -9644,7 +9644,7 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
 }
 
 /// A todo on a Slack unit has to write the cursor it says it moved. The
-/// daemon rejects a verdict whose entry states a change the mutation does
+/// agent host rejects a verdict whose entry states a change the mutation does
 /// not make, so a missing write is not a stale card, it is a refusal.
 #[gpui::test]
 fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
@@ -10832,7 +10832,7 @@ fn an_agents_state_comes_from_its_head() {
     );
 }
 
-/// A creation the daemon refuses says why on the draft. The echo area is
+/// A creation the agent host refuses says why on the draft. The echo area is
 /// two seconds long, so the whole cause used to be gone before the reader
 /// could act on it, and a creation just quietly did not happen.
 #[gpui::test]
@@ -10897,7 +10897,7 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
         refusal
             .as_deref()
             .is_some_and(|text| text.contains("no such repository")),
-        "the draft keeps the daemon's whole cause: {refusal:?}"
+        "the draft keeps the agent host's whole cause: {refusal:?}"
     );
 }
 
@@ -11888,7 +11888,7 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
         })
         .unwrap();
 
-    // The daemon answers under a name the client has never counted in.
+    // The agent host answers under a name the client has never counted in.
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_desk_event(HostId::default(), now.synced(), window, cx);
@@ -11914,9 +11914,9 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
 }
 
 /// The client's copy of the desk is a desk like any other. Cells that
-/// come off its own disk go through the same door the daemon's answer
+/// come off its own disk go through the same door the agent host's answer
 /// does, so a verdict the user gave in a previous session is in hand
-/// before a word is exchanged with the daemon — which is the whole reason
+/// before a word is exchanged with the agent host — which is the whole reason
 /// the copy exists, and the state the two cold-open guards were written
 /// against.
 #[gpui::test]
@@ -11935,7 +11935,7 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
         )),
     );
     // What the replica would have handed back: the cells of a previous
-    // session, with no daemon behind them.
+    // session, with no agent host behind them.
     let held = match desk.synced() {
         rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
         _ => unreachable!("the fixture's sync is a Synced"),
@@ -11958,7 +11958,7 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
                 window,
                 cx,
             );
-            // No `DeskSynced` from a daemon: this is the copy being opened.
+            // No `DeskSynced` from an agent host: this is the copy being opened.
             workspace.desk_arrived(
                 HostId::default(),
                 crate::workspace::DeskArrival {
@@ -12033,7 +12033,7 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
 
 /// Home is drawn from the replica with nothing to talk to. The desk lives
 /// on the client, so a cold start owes the reader their own verdicts
-/// before any daemon answers — and the file opens on the model thread the
+/// before any agent host answers — and the file opens on the model thread the
 /// constructor starts, so the read in `Workspace::new` finds nothing and
 /// the one that counts is the one the open itself asks for.
 #[gpui::test]
@@ -12080,7 +12080,7 @@ fn a_cold_open_draws_home_from_the_replica_with_no_host_reachable(cx: &mut TestA
     let text = home_text(&workspace, cx);
     assert!(
         text.contains("release notes"),
-        "the desk the client already holds is on Home without a daemon: {text}"
+        "the desk the client already holds is on Home without an agent host: {text}"
     );
 }
 
@@ -12096,7 +12096,7 @@ fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext)
         .unwrap()
 }
 
-/// Text typed here is kept here. The daemon never sends a client its own
+/// Text typed here is kept here. The agent host never sends a client its own
 /// operations back, so a note written on this client and only sent would
 /// be gone from the mirror at the next cold open, and the sync that
 /// follows would ask for words it wrote itself.
@@ -12148,7 +12148,7 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
 
 /// The text a client already holds is asked about, not asked for. The
 /// replica holds the note's history, so the sync that follows a cold
-/// open says how much of it is here and the daemon answers with the rest;
+/// open says how much of it is here and the agent host answers with the rest;
 /// before this every sync carried the whole desk's prose.
 #[gpui::test]
 fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppContext) {
@@ -12175,7 +12175,7 @@ fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppC
         .expect("the note whose words came off the disk is named");
     assert!(
         !held.is_empty(),
-        "and what is held of it is said, so the daemon sends only the rest: {held:?}"
+        "and what is held of it is said, so the agent host sends only the rest: {held:?}"
     );
 }
 
