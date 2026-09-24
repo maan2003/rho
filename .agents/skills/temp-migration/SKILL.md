@@ -53,7 +53,7 @@ Still verify against a real or copied DB when possible:
 ```sh
 cargo run -q -p rho-cli -- debug migrate
 cargo run -q -p rho-cli -- debug agents
-cargo check -p rho-agent -p rho-daemon -p rho-cli
+cargo check -p rho-agent -p rho-agent-host -p rho-cli
 ```
 
 If old rows fail with `MissingRequiredField`, you need either a migration or a temporary compatible decode shape.
@@ -165,7 +165,7 @@ Keep the custom decode private/temporary and delete it with the migration. Only 
 Useful checks:
 
 ```sh
-cargo check -p rho-agent -p rho-daemon -p rho-cli
+cargo check -p rho-agent -p rho-agent-host -p rho-cli
 cargo run -q -p rho-cli -- debug migrate
 cargo run -q -p rho-cli -- debug agents
 ```

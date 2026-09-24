@@ -18,32 +18,23 @@ inbound world, like Slack. The GUI is the product.
 
 - `rho-gui` stands alone. It keeps its own database, runs Slack itself,
   and syncs the desk. It is usually remote, on a laptop or a phone.
-- Agent hosts (`rho-agent-host`) are machines the GUI attaches to. They run
-  agents, one worker process per workset.
+- Agent hosts are machines the GUI attaches to. Everything only they
+  build lives in `agent-host/`, which has its own `AGENTS.md`.
+- `crates/` holds the GUI and what both sides share. The GUI reaches a
+  host only through protocols: each client crate owns its protocol in a
+  `protocol` module, and everything else in it sits behind the `client`
+  feature, which only the GUI turns on.
 
 ## Security
 
-GUI:
-- Everything it shows is untrusted: Slack, transcripts, model output.
-  Nothing displayed acts without the user.
+- Everything the GUI shows is untrusted: Slack, transcripts, model
+  output. Nothing displayed acts without the user.
 - It holds the Slack token and the key it authenticates to hosts with.
-
-Agent host:
-- An authenticated client can do anything the user can: it starts
-  agents, and agents run code. Client authentication is the boundary.
-- Credentials stay on the host. They never reach agent context, logs or
-  clients.
-- Tool output and web content are untrusted input to the model.
-- Agents are not sandboxed; the workset view is hygiene, not isolation.
-
-Resource limits are robustness, not security. Add one only when
-exhaustion is obvious and likely.
 
 ## Working here
 
 - Docs say why; the code says what. Rules that must hold are Linked
-  Specs next to the code they govern (`linked-specs` skill); records
-  exist for the `rho-agent` runtime loop in `agent-host/rho-agent/specs/`.
+  Specs next to the code they govern (`linked-specs` skill).
 - `ARCHITECTURE.md` and `SECURITY.md` are being broken down into specs
   and crate docs. Treat them as history, not as rules.
 - Vendored subtrees (`vendor/*`, `crates/senax-encoder`) are first-class
