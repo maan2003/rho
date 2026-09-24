@@ -11921,7 +11921,7 @@ dependencies = [
 [[package]]
 name = "redb-derive"
 version = "0.1.0"
-source = "git+https://github.com/cberner/redb?rev=32f8a1368f766fee33042a7f88abe3173d529ffe#32f8a1368f766fee33042a7f88abe3173d529ffe"
+source = "git+https://github.com/cberner/redb?rev=f551b96f43d36314db076ad38a49c8eb6e8ee311#f551b96f43d36314db076ad38a49c8eb6e8ee311"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12235,6 +12235,7 @@ dependencies = [
  "rho-inference",
  "rho-rpc",
  "rho-shell",
+ "rho-terminal",
  "rho-tool-shell",
  "rho-web-search",
  "rustix 1.1.4",
@@ -12430,6 +12431,7 @@ dependencies = [
  "rho-files",
  "rho-fs-view",
  "rho-inference",
+ "rho-terminal",
  "rho-visualizations",
  "serde",
  "serde_json",
@@ -12495,6 +12497,7 @@ dependencies = [
  "rho-profiling",
  "rho-rpc",
  "rho-shell",
+ "rho-terminal",
  "rho-visualizations",
  "rustix-openpty",
  "senax-encoder",
@@ -13088,12 +13091,14 @@ dependencies = [
 name = "rho-terminal"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
  "futures",
  "gpui",
  "rho-agent-host-proto",
- "rho-agents-client",
  "rho-hosts",
  "rho-rpc",
+ "senax-encoder",
  "settings",
  "theme",
  "theme_settings",

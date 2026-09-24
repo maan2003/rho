@@ -6,14 +6,13 @@
 
 use std::time::Duration;
 
-use rho_agent_host_proto::term::{
+use rho_agent_host_proto::{NewAgent, Opened, StartMode, read_frame, write_frame, write_open};
+use rho_agent_types::AgentId;
+use rho_terminal::protocol as term;
+use rho_terminal::protocol::{
     ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalList, TerminalOpen,
     WireScreen,
 };
-use rho_agent_host_proto::{
-    NewAgent, Opened, StartMode, read_frame, term, write_frame, write_open,
-};
-use rho_agent_types::AgentId;
 
 fn main() -> anyhow::Result<()> {
     let unshare = std::process::Command::new("unshare")

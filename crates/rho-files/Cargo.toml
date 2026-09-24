@@ -13,7 +13,6 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ["client"]
 client = [
   "dep:anyhow",
   "dep:buffer_diff",

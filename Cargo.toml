@@ -131,7 +131,7 @@ rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-fake-model = { path = "crates/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
-rho-files = { path = "crates/rho-files", default-features = false }
+rho-files = { path = "crates/rho-files" }
 rho-git-client = { path = "crates/rho-git/client" }
 rho-git-proto = { path = "crates/rho-git/proto" }
 rho-git-server = { path = "crates/rho-git/server" }
@@ -241,9 +241,11 @@ noq-proto = { path = "vendor/noq/noq-proto" }
 # Local redb fork: compaction keeps relocating pages past one it cannot
 # move lower, instead of stopping at the first such page.
 redb = { path = "vendor/redb" }
-# Upstream fix for integer comparison ambiguity in the derive's expansion,
-# exposed by alacritty_terminal's `impl PartialOrd<Column> for usize`.
-redb-derive = { git = "https://github.com/cberner/redb", rev = "32f8a1368f766fee33042a7f88abe3173d529ffe" }
+# Upstream fixes for ambiguities in the derive's expansion: integer comparison,
+# exposed by alacritty_terminal's `impl PartialOrd<Column> for usize`, and
+# `as_ref` on a single field's bytes, exposed by the GUI crates' `AsRef` impls.
+# Later revisions change the TypeName of structs with user-defined fields.
+redb-derive = { git = "https://github.com/cberner/redb", rev = "f551b96f43d36314db076ad38a49c8eb6e8ee311" }
 tree-sitter-language = { path = "vendor/tree-sitter-language" }
 
 # Share MoQ model primitives with its Iroh transport.

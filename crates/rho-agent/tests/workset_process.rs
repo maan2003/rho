@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rho_agent::pool::AgentPool;
 use rho_agent::{StartPlace, WorksetAction, WorksetAttach, WorksetReply};
-use rho_agent_host_proto::term::{TermClientFrame, TermServerFrame};
+use rho_terminal::protocol::{TermClientFrame, TermServerFrame};
 
 #[tokio::test]
 async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {

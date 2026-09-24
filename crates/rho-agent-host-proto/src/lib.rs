@@ -80,7 +80,6 @@ pub mod realtime;
 pub mod server;
 pub mod shell;
 pub mod shell_kernel;
-pub mod term;
 pub mod transcript;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -1045,13 +1044,6 @@ mod tests {
         });
         opens_as(agents::Open::Session);
         opens_as(desk::Open);
-        opens_as(term::Open::Terminal {
-            agent: "eng-test".to_owned(),
-            terminal_id: 3,
-            open: term::TerminalOpen::Create { attach: true },
-            cols: 80,
-            rows: 24,
-        });
         opens_as(shell::Open::Request(
             shell::ShellStart {
                 agent: "eng-test".to_owned(),

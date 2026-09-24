@@ -31,11 +31,11 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
 use anyhow::Context as _;
-use rho_agent_host_proto::term::{
+use rho_agent_types::AgentId;
+use rho_terminal::protocol::{
     TermCell, TermCellFlags, TermColor, TermCursor, TermCursorShape, TermRow, TermScreen,
     TermServerFrame,
 };
-use rho_agent_types::AgentId;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -85,7 +85,7 @@ pub enum ClientInput {
         rows: u16,
     },
     /// Encoded against the terminal's live modes when the session applies it.
-    Keystroke(rho_agent_host_proto::term::TermKeystroke),
+    Keystroke(rho_terminal::protocol::TermKeystroke),
     Paste(String),
     Scroll {
         lines: i16,
@@ -946,7 +946,7 @@ fn set_nonblocking(fd: &OwnedFd) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::term::{ScrollbackItem, WireScreen};
+    use rho_terminal::protocol::{ScrollbackItem, WireScreen};
 
     use super::*;
 

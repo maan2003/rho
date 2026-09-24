@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use redb::{TableDefinition, Value as _};
+use redb::TableDefinition;
 use redb_derive::{Key, Value as RedbValue};
 use rho_agent_types::{
     AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, AgentWant, EngineerIntelligence, Place,

@@ -46,7 +46,7 @@ pub enum Attach {
 #[derive(Encode, Decode)]
 pub enum Reply {
     Done,
-    Terminals(Vec<rho_agent_host_proto::term::TerminalInfo>),
+    Terminals(Vec<rho_terminal::protocol::TerminalInfo>),
     Shells(Vec<rho_agent_host_proto::shell::ShellInfo>),
     Error(String),
     Desktop { socket: String },
@@ -178,7 +178,7 @@ impl Execution {
                     .list()
                     .await
                     .into_iter()
-                    .map(|entry| rho_agent_host_proto::term::TerminalInfo {
+                    .map(|entry| rho_terminal::protocol::TerminalInfo {
                         agent: entry.agent_id.encoded(),
                         terminal_id: entry.terminal_id,
                         title: entry.title.unwrap_or_default(),
@@ -278,7 +278,7 @@ impl Execution {
                 };
                 let input = async {
                     while let Some(bytes) = incoming.recv().await {
-                        use rho_agent_host_proto::term::TermClientFrame as F;
+                        use rho_terminal::protocol::TermClientFrame as F;
 
                         use crate::terminal::ClientInput as I;
                         let input = match decode::<F>(&bytes)? {

@@ -1284,6 +1284,11 @@ impl Workspace {
         self.agents(self.host_of(agent_id)?)
     }
 
+    /// How to reach the host an agent lives on, while it is attached.
+    fn link_for(&self, agent_id: AgentId) -> Option<rho_hosts::Link> {
+        Some(self.hosts.connection(self.host_of(agent_id)?)?.link())
+    }
+
     /// Routes an agent-scoped command to the daemon that owns the agent.
     /// Commands for an agent whose host is unknown or gone are dropped: the
     /// daemon that could act on it is not there to hear them.
@@ -4959,10 +4964,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let Some(agents) = self.agents_for(agent_id) else {
+        let Some(link) = self.link_for(agent_id) else {
             return;
         };
-        let task = agents.open_terminal(agent_id.encoded(), new, 80, 24);
+        let task = rho_terminal::channel::open(&link, agent_id.encoded(), new, 80, 24);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {

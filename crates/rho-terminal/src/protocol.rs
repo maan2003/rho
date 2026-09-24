@@ -1,9 +1,9 @@
 //! Wire vocabulary for workset-owned terminals.
 //!
-//! The terminals part of a host, [`crate::Part::Terminal`]. A terminal
-//! stream is opened by [`Open::Terminal`]; after [`crate::Opened::Ready`]
-//! an attached stream carries senax frames of [`TermClientFrame`] and
-//! [`TermServerFrame`].
+//! The terminals part of a host, [`rho_agent_host_proto::Part::Terminal`]. A
+//! terminal stream is opened by [`Open::Terminal`]; after
+//! [`rho_agent_host_proto::Opened::Ready`] an attached stream carries senax
+//! frames of [`TermClientFrame`] and [`TermServerFrame`].
 //!
 //! The protocol is deliberately dumb on the client side: the workset owns the
 //! only terminal emulator, and the wire carries *display state* — cell rows,
@@ -18,7 +18,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
     /// A daemon-owned terminal for an agent. Answered with
-    /// [`crate::Opened`]; an attached stream then carries
+    /// [`rho_agent_host_proto::Opened`]; an attached stream then carries
     /// [`TermClientFrame`] and [`TermServerFrame`], the first of them a
     /// snapshot of the screen preceded by history. Otherwise the terminal
     /// runs headless and the stream closes.
@@ -33,20 +33,20 @@ pub enum Open {
         cols: u16,
         rows: u16,
     },
-    /// One call, answered with one [`crate::Answer`]; then the stream
-    /// closes.
+    /// One call, answered with one [`rho_agent_host_proto::Answer`]; then the
+    /// stream closes.
     Request(Request),
 }
 
-crate::calls! {
+rho_agent_host_proto::calls! {
     /// Every call the terminals answer, as it goes on the wire.
     pub enum Request {
         TerminalList(TerminalList) -> Vec<TerminalInfo>;
     }
 }
 
-impl crate::PartOpen for Open {
-    const PART: crate::Part = crate::Part::Terminal;
+impl rho_agent_host_proto::PartOpen for Open {
+    const PART: rho_agent_host_proto::Part = rho_agent_host_proto::Part::Terminal;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {

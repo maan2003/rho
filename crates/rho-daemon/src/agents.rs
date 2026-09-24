@@ -14,11 +14,10 @@ use rho_agent_host_proto::agents::{
     QuotaHistory, QuotaUsage, RecordVisualization, Request, ServerFrame, SetAuthAccountEnabled,
     SetClaudeAccount, Visualization, VisualizationContent,
 };
-use rho_agent_host_proto::{
-    AgentCommand, Answer, Call, NewAgent, Opened, shell, term, write_frame,
-};
+use rho_agent_host_proto::{AgentCommand, Answer, Call, NewAgent, Opened, shell, write_frame};
 use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
 use rho_db::RhoDb;
+use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::{
@@ -757,7 +756,7 @@ fn rho_pager_program() -> std::ffi::OsString {
 }
 
 /// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
-/// (per [`TerminalOpen`](rho_agent_host_proto::term::TerminalOpen)), replies
+/// (per [`TerminalOpen`](rho_terminal::protocol::TerminalOpen)), replies
 /// `Opened::Ready`, then pumps
 /// [`rho_agent_host_proto::term`] frames until either side closes. Closing only
 /// detaches; the terminal keeps running. A headless create replies and
@@ -769,7 +768,7 @@ async fn serve_terminal<R, W>(
     mut writer: W,
     agent: String,
     terminal_id: u64,
-    open: rho_agent_host_proto::term::TerminalOpen,
+    open: rho_terminal::protocol::TerminalOpen,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()>
@@ -777,10 +776,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let create = matches!(
-        open,
-        rho_agent_host_proto::term::TerminalOpen::Create { .. }
-    );
+    let create = matches!(open, rho_terminal::protocol::TerminalOpen::Create { .. });
     let attached = terminal_attach(&services, &agent, terminal_id, create, cols, rows).await;
     let client = match attached {
         Ok(attached) => attached,
@@ -798,14 +794,14 @@ where
     write_frame(&mut writer, &Opened::Ready).await?;
     if matches!(
         open,
-        rho_agent_host_proto::term::TerminalOpen::Create { attach: false }
+        rho_terminal::protocol::TerminalOpen::Create { attach: false }
     ) {
         // Headless create: the terminal keeps running with no clients.
         return Ok(());
     }
 
     client
-        .relay::<_, _, rho_agent_host_proto::term::TermClientFrame, rho_agent_host_proto::term::TermServerFrame>(
+        .relay::<_, _, rho_terminal::protocol::TermClientFrame, rho_terminal::protocol::TermServerFrame>(
             reader, writer,
         )
         .await
@@ -849,7 +845,7 @@ async fn terminal_attach(
 async fn terminal_list(
     services: &Arc<Services>,
     agent: Option<&str>,
-) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
+) -> anyhow::Result<Vec<rho_terminal::protocol::TerminalInfo>> {
     let filter = match agent {
         Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,

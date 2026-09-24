@@ -44,6 +44,8 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 uuid.workspace = true
 
+rho-terminal.workspace = true
+
 [dev-dependencies]
 rho-shell.workspace = true
 tokio-tungstenite.workspace = true
