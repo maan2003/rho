@@ -275,7 +275,7 @@ mod tests {
         let envelope = protocol::Open::of(&open).unwrap();
         assert_eq!(envelope.unpack::<T>().unwrap(), open);
         let other = protocol::Open {
-            protocol: Protocol::Desk,
+            protocol: Protocol::Agents,
             open: envelope.open.clone(),
         };
         assert!(other.unpack::<T>().is_err());

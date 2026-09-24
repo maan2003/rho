@@ -26,6 +26,10 @@ const MERGED: TableDefinition<&[u8], Sen<Stored>> = TableDefinition::new("ledger
 /// The newest segment read of every other device. Only grows, so a host
 /// cannot hand back an older segment as news.
 const SEEN: TableDefinition<[u8; 16], u64> = TableDefinition::new("ledger_seen_v1");
+/// Other devices' segments that came before this device had a key, kept
+/// to be read once it has one.
+const PENDING: TableDefinition<([u8; 16], u64), Sen<Segment>> =
+    TableDefinition::new("ledger_pending_v1");
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct SelfRecord {
@@ -154,6 +158,7 @@ impl Ledger {
         write.open_table(OWN);
         write.open_table(MERGED);
         write.open_table(SEEN);
+        write.open_table(PENDING);
         let mut table = write.open_table(SELF);
         if table.get(()).is_none() {
             let mut device = [0; 16];
@@ -206,10 +211,11 @@ impl Ledger {
             .collect()
     }
 
-    /// Takes the key the user's devices share, and returns the base every
-    /// host should now hold of this device. Reading with one key and then
+    /// Takes the key the user's devices share. Returns the base every host
+    /// should now hold of this device, and what reading the segments that
+    /// came before the key made of them. Reading with one key and then
     /// another would mix two ledgers, so a key is set once.
-    pub async fn set_key(&self, key: LedgerKey) -> anyhow::Result<Option<Segment>> {
+    pub async fn set_key(&self, key: LedgerKey) -> anyhow::Result<(Option<Segment>, Received)> {
         let mut write = self.db.write().await;
         let mut table = write.open_table(SELF);
         let mut me = table
@@ -222,13 +228,29 @@ impl Ledger {
                 held == key.0,
                 "this device already holds another ledger key"
             );
-            return Ok(None);
+            return Ok((None, Received::default()));
         }
         me.key = Some(key.0);
         table.insert((), SenValue::borrowed(&me));
         drop(table);
+        let mut pending: BTreeMap<DeviceId, Vec<Segment>> = BTreeMap::new();
+        {
+            let mut table = write.open_table(PENDING);
+            let held: Vec<(([u8; 16], u64), Segment)> = table
+                .iter()
+                .map(|(key, segment)| (key.value(), segment.value().into_owned()))
+                .collect();
+            for ((device, seq), segment) in held {
+                table.remove((device, seq));
+                pending.entry(DeviceId(device)).or_default().push(segment);
+            }
+        }
+        let mut received = Received::default();
+        for (device, segments) in pending {
+            read_segments(&mut write, &key.0, device, segments, &mut received);
+        }
         write.commit();
-        Ok(self.base_for(0))
+        Ok((self.base_for(0), received))
     }
 
     /// The merged value at `key`.
@@ -349,64 +371,88 @@ impl Ledger {
 
     /// Reads another device's segments, in order, and merges what they
     /// hold. A segment already read, or older than one read, is skipped.
+    /// Without a key they are kept, to be read once there is one.
     pub async fn receive(&self, device: DeviceId, segments: Vec<Segment>) -> Received {
         let mut received = Received::default();
         let me = self.me();
         if device == me.device || segments.is_empty() {
             return received;
         }
-        let Some(key) = me.key else {
-            received.needs_key = true;
-            return received;
-        };
         let mut write = self.db.write().await;
-        let mut seen = write
-            .open_table(SEEN)
-            .get(device.0)
-            .map_or(0, |seq| seq.value());
-        let mut clock = me.clock;
-        let mut moved: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        {
-            let mut merged = write.open_table(MERGED);
-            for segment in segments {
-                if segment.seq <= seen {
-                    continue;
-                }
-                let Some(entries) =
-                    seal::open(&key, device, segment.seq, segment.base, &segment.sealed)
-                else {
-                    received.unreadable = true;
-                    break;
-                };
-                for entry in &entries {
-                    clock = clock.max((entry.stamp.millis, entry.stamp.counter));
-                    if merge(&mut merged, entry) {
-                        moved.insert(entry.key.clone(), entry.value.clone());
+        match me.key {
+            Some(key) => read_segments(&mut write, &key, device, segments, &mut received),
+            None => {
+                received.needs_key = true;
+                let mut pending = write.open_table(PENDING);
+                for segment in segments {
+                    // A base covers everything before it.
+                    if segment.base {
+                        let older: Vec<u64> = pending
+                            .range((device.0, 0)..(device.0, segment.seq))
+                            .map(|(key, _)| key.value().1)
+                            .collect();
+                        for seq in older {
+                            pending.remove((device.0, seq));
+                        }
                     }
+                    pending.insert((device.0, segment.seq), SenValue::borrowed(&segment));
                 }
-                seen = segment.seq;
-            }
-        }
-        write.open_table(SEEN).insert(device.0, seen);
-        {
-            let mut table = write.open_table(SELF);
-            let mut me = table
-                .get(())
-                .expect("the ledger's own row")
-                .value()
-                .into_owned();
-            if clock > me.clock {
-                me.clock = clock;
-                table.insert((), SenValue::borrowed(&me));
             }
         }
         write.commit();
-        received.changes = moved
-            .into_iter()
-            .map(|(key, value)| Change { key, value })
-            .collect();
         received
     }
+}
+
+/// Opens `segments` of `device` with `key` and merges what they hold into
+/// `received`, advancing what has been seen of the device and the clock.
+fn read_segments(
+    write: &mut rho_db::WriteTxn,
+    key: &[u8; 32],
+    device: DeviceId,
+    segments: Vec<Segment>,
+    received: &mut Received,
+) {
+    let mut seen = write
+        .open_table(SEEN)
+        .get(device.0)
+        .map_or(0, |seq| seq.value());
+    let mut me = write
+        .open_table(SELF)
+        .get(())
+        .expect("the ledger's own row")
+        .value()
+        .into_owned();
+    let mut clock = me.clock;
+    let mut moved: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    {
+        let mut merged = write.open_table(MERGED);
+        for segment in segments {
+            if segment.seq <= seen {
+                continue;
+            }
+            let Some(entries) = seal::open(key, device, segment.seq, segment.base, &segment.sealed)
+            else {
+                received.unreadable = true;
+                break;
+            };
+            for entry in &entries {
+                clock = clock.max((entry.stamp.millis, entry.stamp.counter));
+                if merge(&mut merged, entry) {
+                    moved.insert(entry.key.clone(), entry.value.clone());
+                }
+            }
+            seen = segment.seq;
+        }
+    }
+    write.open_table(SEEN).insert(device.0, seen);
+    if clock > me.clock {
+        me.clock = clock;
+        write.open_table(SELF).insert((), SenValue::borrowed(&me));
+    }
+    received
+        .changes
+        .extend(moved.into_iter().map(|(key, value)| Change { key, value }));
 }
 
 #[cfg(test)]
@@ -549,7 +595,7 @@ mod tests {
         let (laptop, phone) = (device(None).await, device(Some(key)).await);
         let (_, segment) = laptop.ledger.write(vec![put("a", "1")]).await;
         assert!(segment.is_none(), "nothing to seal with yet");
-        let base = laptop.ledger.set_key(key).await.unwrap().unwrap();
+        let base = laptop.ledger.set_key(key).await.unwrap().0.unwrap();
         assert!(base.base);
         phone
             .ledger
@@ -557,6 +603,28 @@ mod tests {
             .await;
         assert_eq!(value(&phone, "a").as_deref(), Some("1"));
         assert!(laptop.ledger.set_key(LedgerKey::generate()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn segments_that_came_before_the_key_are_read_once_it_is_set() {
+        let key = LedgerKey::generate();
+        let (laptop, phone) = (device(Some(key)).await, device(None).await);
+        let (_, first) = laptop.ledger.write(vec![put("a", "1")]).await;
+        let (_, second) = laptop.ledger.write(vec![put("b", "2")]).await;
+        let received = phone
+            .ledger
+            .receive(
+                laptop.ledger.device(),
+                vec![first.unwrap(), second.unwrap()],
+            )
+            .await;
+        assert!(received.needs_key);
+        assert_eq!(value(&phone, "a"), None);
+        let (_, received) = phone.ledger.set_key(key).await.unwrap();
+        assert_eq!(received.changes.len(), 2);
+        assert_eq!(value(&phone, "a").as_deref(), Some("1"));
+        assert_eq!(value(&phone, "b").as_deref(), Some("2"));
+        assert_eq!(phone.ledger.known()[&laptop.ledger.device()], 2);
     }
 
     #[tokio::test]

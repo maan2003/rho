@@ -113,6 +113,7 @@ pub(crate) enum Command {
     HostAttach,
     HostDetach,
     HostAuth,
+    LedgerKey,
     // Projects.
     ProjectAdd,
     ProjectRemove,
@@ -492,6 +493,7 @@ pub(crate) fn hosts_menu() -> Menu {
         .item("a", "attach…", MenuAction::Command(Command::HostAttach))
         .item("d", "detach…", MenuAction::Command(Command::HostDetach))
         .item("u", "auth…", MenuAction::Command(Command::HostAuth))
+        .item("k", "ledger key…", MenuAction::Command(Command::LedgerKey))
 }
 
 /// Creation, the one verb: everything new starts here and is filed where

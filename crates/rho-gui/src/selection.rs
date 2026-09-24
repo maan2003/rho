@@ -7,7 +7,7 @@
 //! of them the point is in.
 //!
 //! The panes named here are today's: the startup screen, the draft and an
-//! agent. As the desk and Slack screens move out of the workspace this
+//! agent. As more screens move out of the workspace this
 //! grows their panes too; it is the window's list, not the agents crate's.
 
 use rho_agent_types::AgentId;

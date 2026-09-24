@@ -1,25 +1,11 @@
-//! The desk protocol of a host, [`rho_rpc::protocol::Protocol::Desk`]: the
-//! words of a note, as a text CRDT, the ids the store leans on ([`cells`]), and
-//! the stream that syncs them ([`stream`]).
-//!
-//! The convergent movable tree that used to live here is gone: the store
-//! holds facts about typed ids (`cells`), and a note's body is the only
-//! document mechanics left.
+//! The desk's types: the words of a note, as a text CRDT, and the ids the
+//! store leaned on ([`cells`]).
 
 use clock::{Global, Lamport, ReplicaId};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use text::{EditOperation, FullOffset, Operation, UndoOperation};
 
 pub mod cells;
-pub mod stream;
-
-/// Opens a desk stream ([`stream`]).
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct Open;
-
-impl rho_rpc::protocol::ProtocolOpen for Open {
-    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Desk;
-}
 
 /// Lamport timestamp used by structural operations.
 #[derive(

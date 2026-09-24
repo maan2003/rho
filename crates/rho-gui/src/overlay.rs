@@ -35,11 +35,6 @@ impl OverlayFocus {
         self.0 = Some(handle);
     }
 
-    /// What the chain will return to, if anything.
-    pub(crate) fn target(&self) -> Option<&FocusHandle> {
-        self.0.as_ref()
-    }
-
     /// Gives focus back and ends the chain. Answers with the handle to
     /// focus, or `None` when there is nothing remembered and the caller
     /// should fall back to the active surface.

@@ -376,8 +376,8 @@ mod tests {
     }
 }
 
-/// QMux only covers the local desktop-to-agent host byte transport. The remote GUI
-/// still uses independent QUIC streams on its existing authenticated Iroh
+/// QMux only covers the local desktop-to-agent host byte transport. The remote
+/// GUI still uses independent QUIC streams on its existing authenticated Iroh
 /// connection.
 pub async fn local_client<S>(stream: S, origin: origin::Producer) -> Result<Session>
 where

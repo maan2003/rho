@@ -17,18 +17,15 @@ use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
 use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
-use rho_desk_client::protocol::stream::ClientFrame as DeskClientFrame;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
 mod call_punctuation;
-mod dashboard_cost;
 mod editor_shutdown;
 mod elision_block_geometry;
 mod elision_caret;
 mod elision_paging;
 mod elision_unfold;
-mod find_cost;
 mod fold_accounting_streaming;
 mod fold_cost;
 mod fold_widen_bias;
@@ -499,349 +496,6 @@ fn phone_entry_disables_modal_editing_app_wide(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut TestAppContext) {
-    // Two notes that want attention: what the feed deals are nodes.
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "First phone card");
-    desk.due_note(None, "Second phone card");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    let first = workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.phone_feed_for_test(cx));
-            workspace.current_deal_card_for_test(cx).unwrap().0
-        })
-        .unwrap();
-
-    cx.update_window(*workspace, |_, window, cx| {
-        for event in [
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Started,
-                position: point(px(200.), px(600.)),
-                timestamp: std::time::Duration::ZERO,
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Moved,
-                position: point(px(200.), px(300.)),
-                timestamp: std::time::Duration::from_millis(80),
-                ..Default::default()
-            },
-        ] {
-            window.dispatch_event(event.to_platform_input(), cx);
-        }
-    })
-    .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.phone_motion_for_test(), (-300., None));
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        window.dispatch_event(
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Ended,
-                position: point(px(200.), px(300.)),
-                timestamp: std::time::Duration::from_millis(100),
-                ..Default::default()
-            }
-            .to_platform_input(),
-            cx,
-        );
-    })
-    .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.phone_motion_for_test(),
-                (0., Some((-300., -800.)))
-            );
-        })
-        .unwrap();
-    cx.executor()
-        .advance_clock(std::time::Duration::from_millis(200));
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.phone_feed_for_test(cx));
-            assert_ne!(workspace.current_deal_card_for_test(cx).unwrap().0, first);
-            assert_eq!(
-                workspace.phone_last_gesture_for_test(),
-                Some("flick up · moved")
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn the_phone_feed_opens_when_the_first_card_arrives_after_it_did(cx: &mut TestAppContext) {
-    // A Slack thread becomes a node only once the mirror has synced, so the
-    // phone's first draw can find an empty queue. The feed is the deal: it
-    // has to open itself when the card lands.
-    let workspace = test_workspace(cx);
-    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.current_deal_card_for_test(cx).is_none());
-        })
-        .unwrap();
-
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Arrived after the feed");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.current_deal_card_for_test(cx).is_some());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
-    // Two notes that want attention: what the feed deals are nodes.
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "First resize card");
-    desk.due_note(None, "Second resize card");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    let first = workspace
-        .update(cx, |workspace, window, cx| {
-            let identity = workspace.current_deal_card_for_test(cx).unwrap().0;
-            workspace.phone_start_snap_for_test(window, cx);
-            identity
-        })
-        .unwrap();
-
-    cx.simulate_window_resize(*workspace, size(px(800.), px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.executor()
-        .advance_clock(std::time::Duration::from_millis(200));
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(workspace.current_deal_card_for_test(cx).unwrap().0, first);
-            assert_eq!(workspace.phone_last_gesture_for_test(), None);
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
-    // The feed deals nodes: one note that wants attention.
-    let mut desk = DeskFixture::new();
-    let node_id = desk.due_note(None, "Keep this phone card");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let id = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id,
-    };
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.dispatch_action(*workspace, crate::MinibufferCancel);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.phone_feed_for_test(cx));
-            assert_eq!(workspace.current_deal_card_for_test(cx).unwrap().0, id);
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn phone_back_from_a_surface_reveals_the_hidden_feed_card(cx: &mut TestAppContext) {
-    // The feed deals nodes: one note that wants attention.
-    let mut desk = DeskFixture::new();
-    let node_id = desk.due_note(None, "Feed stays put");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let expected = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id,
-    };
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.enter_draft(None, window, cx);
-            workspace.phone_back_for_test(window, cx);
-            assert!(workspace.phone_feed_for_test(cx));
-            assert!(workspace.phone_feed_is_active_for_test());
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).unwrap().0,
-                expected
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    // The feed deals nodes: one note that wants attention.
-    let mut desk = DeskFixture::new();
-    let node_id = desk.due_note(None, "Last phone card");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let expected = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id,
-    };
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.run_until_parked();
-    // The verdict is done when it is written here; the mutation on the wire
-    // is a copy going out, not a question.
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(workspace.current_deal_card_for_test(cx), None);
-            workspace.phone_remember_last_verdict_for_test();
-        })
-        .unwrap();
-
-    cx.update_window(*workspace, |_, window, cx| {
-        for event in [
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Started,
-                position: point(px(200.), px(250.)),
-                timestamp: std::time::Duration::ZERO,
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Moved,
-                position: point(px(200.), px(550.)),
-                timestamp: std::time::Duration::from_millis(80),
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Ended,
-                position: point(px(200.), px(550.)),
-                timestamp: std::time::Duration::from_millis(100),
-                ..Default::default()
-            },
-        ] {
-            window.dispatch_event(event.to_platform_input(), cx);
-        }
-    })
-    .unwrap();
-    cx.run_until_parked();
-    // The undo is a mutation like any other, and the card is back already.
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).unwrap().0,
-                expected
-            );
-            assert!(workspace.phone_feed_is_active_for_test());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext) {
-    // Nothing sits above the first root, and its child follows it out of the
-    // tree, so the cursor has to fall to the next root. Landing on neither
-    // used to swallow the next structure keypress.
-    let mut desk = DeskFixture::new();
-    let first = desk.note(None, "First root");
-    desk.note(Some(first.clone()), "Its child");
-    let second = desk.note(None, "Second root");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-            assert_eq!(
-                workspace.desk.row_after_delete(HostId::default(), &first),
-                Some(second)
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn touch_editing_strips_vim_from_live_editors(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assets::Assets.load_test_fonts(cx);
@@ -886,52 +540,6 @@ pub(super) fn bind_test_keymaps(cx: &mut App) {
     crate::bind_rho_key_overrides(cx);
 }
 
-/// `45sm` is 45 minutes and `2sd` two days: the unit picks the span, the
-/// count multiplies it, and the words the bar says name the time it lands on.
-#[test]
-fn a_snooze_lands_on_its_unit_and_says_the_time() {
-    use chrono::TimeZone as _;
-
-    use crate::workspace::{SnoozeUnit, snooze_target};
-
-    let now = chrono::Local
-        .with_ymd_and_hms(2026, 9, 3, 14, 30, 0)
-        .earliest()
-        .expect("a local afternoon");
-    let (at, said) = snooze_target(SnoozeUnit::Minutes, 45, now);
-    assert_eq!(
-        at.unix_ms,
-        (now + chrono::Duration::minutes(45)).timestamp_millis()
-    );
-    assert_eq!(
-        at.precision,
-        rho_desk_client::protocol::cells::TimestampPrecision::Millisecond
-    );
-    assert_eq!(said, "snooze until 15:15");
-
-    // Three hours from half past two crosses no day, so the hour is enough.
-    let (_, said) = snooze_target(SnoozeUnit::Hours, 3, now);
-    assert_eq!(said, "snooze until 17:30");
-    // Twelve does cross it, and then the bar names the day as well.
-    let (_, said) = snooze_target(SnoozeUnit::Hours, 12, now);
-    assert_eq!(said, "snooze until Fri 4 Sep 02:30");
-
-    // Days and weeks land on a date, as a defer always has.
-    let (at, said) = snooze_target(SnoozeUnit::Days, 2, now);
-    assert_eq!(
-        at.precision,
-        rho_desk_client::protocol::cells::TimestampPrecision::Day
-    );
-    assert_eq!(said, "snooze until Sat 5 Sep");
-    let (_, said) = snooze_target(SnoozeUnit::Weeks, 1, now);
-    assert_eq!(said, "snooze until Thu 10 Sep");
-}
-
-/// Deal mode took `d`, `x`, `s`, `t` and `f` from every card, so a card
-/// could not be read like the buffer it is. The verdicts moved into the
-/// transient `tab` opens, and the letters belong to vim again on
-/// every surface. `shift-u` is the exception: undoing a verdict is the same
-/// verb wherever the card is.
 #[gpui::test]
 fn the_verdict_letters_belong_to_vim_on_a_card(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
@@ -945,10 +553,10 @@ fn the_verdict_letters_belong_to_vim_on_a_card(cx: &mut TestAppContext) {
             KeyContext::parse("Editor vim_mode=normal vim_operator=none").unwrap(),
         ];
         let verdicts: [&dyn gpui::Action; 4] = [
-            &crate::DashboardDealDone,
-            &crate::DashboardDealMute,
-            &crate::DashboardDealTodo,
-            &crate::DashboardDealFile,
+            &crate::DealDone,
+            &crate::DealMute,
+            &crate::DealTodo,
+            &crate::DealFile,
         ];
         for key in ["d", "x", "s", "t", "f"] {
             let (bindings, _) =
@@ -996,7 +604,7 @@ fn undo_verdict_binding_is_confined_to_normal_mode(cx: &mut TestAppContext) {
             KeyContext::parse("Editor vim_mode=helix_normal vim_operator=none").unwrap(),
         ]));
         assert!(!resolves(&[
-            KeyContext::parse("RhoDashboard").unwrap(),
+            KeyContext::parse("RhoHome").unwrap(),
             KeyContext::parse("Editor vim_mode=insert vim_operator=none").unwrap(),
         ]));
         assert!(!resolves(&[
@@ -1007,103 +615,7 @@ fn undo_verdict_binding_is_confined_to_normal_mode(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut TestAppContext) {
-    // The agent host validates the log entry against exactly these three
-    // changes, and rejects the whole mutation otherwise: a todo that only
-    // logged the new note's arrival never reached the tree.
-    use rho_desk_client::protocol::cells::{Property, PropertyKey};
-
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "Named card");
-    let woke = rho_desk_client::protocol::cells::Timestamp {
-        unix_ms: 1_577_836_800_000,
-        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-    };
-    desk.set(note.clone(), Property::DeferUntil(Some(woke)));
-    desk.set(note.clone(), Property::PaceDays(1));
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealTodo);
-    cx.run_until_parked();
-
-    let created = workspace
-        .update(cx, |workspace, _, _| {
-            let mutation = take_desk_mutation(workspace, HostId::default()).expect("todo mutation");
-            let Some((
-                verdict_node,
-                rho_desk_client::protocol::cells::VerdictEvent::Applied {
-                    verdict, changes, ..
-                },
-            )) = mutation.verdict.clone()
-            else {
-                panic!("the todo verdict did not log an applied entry");
-            };
-            assert_eq!(verdict_node, note, "the entry hangs off the dealt heading");
-            let rho_desk_client::protocol::cells::Verdict::Todo { note: created } = verdict else {
-                panic!("the entry is not a todo");
-            };
-            assert_eq!(changes.len(), 4);
-            assert!(changes.iter().filter(|change| change.id == created).count() == 3);
-            let change = |key: PropertyKey| {
-                changes
-                    .iter()
-                    .find(|change| change.key == key)
-                    .unwrap_or_else(|| panic!("no change for {key:?}"))
-                    .clone()
-            };
-            let deleted = change(PropertyKey::Deleted);
-            assert_eq!(deleted.before, Some(Property::Deleted(true)));
-            assert_eq!(deleted.after, Some(Property::Deleted(false)));
-            let defer = change(PropertyKey::DeferUntil);
-            assert_eq!(defer.before, Some(Property::DeferUntil(None)));
-            assert!(matches!(defer.after, Some(Property::DeferUntil(Some(_)))));
-            let pace = change(PropertyKey::PaceDays);
-            assert_eq!(pace.before, Some(Property::PaceDays(0)));
-            assert!(matches!(pace.after, Some(Property::PaceDays(_))));
-            // The dealt node is handled by the todo: without this the dealer
-            // offers the same card again the moment the note exists.
-            let state = change(PropertyKey::State);
-            assert_eq!(state.id, note);
-            assert_eq!(
-                state.after,
-                Some(Property::State(
-                    rho_desk_client::protocol::cells::State::Done
-                ))
-            );
-            assert!(mutation.writes.iter().any(|write| write.id == note
-                && write.property
-                    == Property::State(rho_desk_client::protocol::cells::State::Done)));
-            // The new note is parented on the heading it was written on.
-            assert!(mutation.writes.iter().any(|write| write.id == created
-                && write.property == Property::Parent(Some(note.clone()))));
-            created
-        })
-        .unwrap();
-
-    // A note with no words of its own comes back in a week saying only
-    // `defer …`; it carries the words of the card it was written on.
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let buffer = workspace
-                .desk_buffers
-                .buffer(HostId::default(), &created)
-                .expect("the todo note has a buffer")
-                .clone();
-            assert_eq!(buffer.read(cx).text(), "Named card");
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn undo_verdict_reaches_the_desk_tree_outside_a_deal(cx: &mut TestAppContext) {
+fn undo_verdict_reaches_home_outside_a_deal(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
 
     cx.update(bind_test_keymaps);
@@ -1118,110 +630,30 @@ fn undo_verdict_reaches_the_desk_tree_outside_a_deal(cx: &mut TestAppContext) {
                 .first()
                 .is_some_and(|binding| binding.action().partial_eq(&crate::UndoVerdict))
         };
-        // The desk itself, with no card on screen: vim binds `shift-u` one
-        // level up, so without this the verb is lost on the tree.
+        // Home itself, with no card on screen: vim binds `shift-u` one
+        // level up, so without this the verb is lost on Home.
         for mode in ["normal", "helix_normal"] {
             assert!(
                 resolves(&[
                     KeyContext::parse("RhoGui").unwrap(),
-                    KeyContext::parse("RhoDashboard").unwrap(),
+                    KeyContext::parse("RhoHome").unwrap(),
                     KeyContext::parse(&format!(
                         "Editor VimControl vim_mode={mode} vim_operator=none"
                     ))
                     .unwrap(),
                 ]),
-                "shift-u did not reach UndoVerdict on the tree in {mode}"
+                "shift-u did not reach UndoVerdict on Home in {mode}"
             );
         }
         // Typing is still typing.
         assert!(!resolves(&[
             KeyContext::parse("RhoGui").unwrap(),
-            KeyContext::parse("RhoDashboard").unwrap(),
+            KeyContext::parse("RhoHome").unwrap(),
             KeyContext::parse("Editor VimControl vim_mode=insert vim_operator=none").unwrap(),
         ]));
     });
 }
 
-/// Written when the map's `DashboardNewSibling` was the verb and the
-/// question was whether it could work with no row to stand on. The map is
-/// gone and `n n` is the route, but the subject is the same one: a reader
-/// with an empty desk can still write its first note, and it lands at the
-/// root rather than nowhere.
-#[gpui::test]
-fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let desk = DeskFixture::new();
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "space n n");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("first note mutation");
-            assert!(
-                mutation
-                    .writes
-                    .iter()
-                    .any(|write| matches!(write.id, rho_desk_client::protocol::cells::Id::Note(_))),
-                "the first row on an empty desk is not a note"
-            );
-            assert!(
-                mutation.writes.iter().any(|write| write.property
-                    == rho_desk_client::protocol::cells::Property::Parent(None)),
-                "the first row on an empty desk is not a root"
-            );
-        })
-        .unwrap();
-}
-
-/// A workspace sitting on the desk map. Cold start lands on Home now, so
-/// tests about the map, the prompt, or the tree open it the way Home's root
-/// menu does.
-fn overview_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_startup_overview_for_test(window, cx);
-        })
-        .unwrap();
-    workspace
-}
-
-/// `tab`, as a keystroke: the verdicts over a card, Home over none, and
-/// Home again from the verdict menu's own row.
-fn press_tab(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
-    cx.simulate_keystrokes(**workspace, "tab");
-    cx.run_until_parked();
-}
-
-/// A frame, so what a row put off to the next one (the desk rebuild it
-/// schedules) has run before the test reads the desk.
-fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .expect("draw a frame");
-    cx.run_until_parked();
-}
-
-/// No test dials anything. Every test workspace names a host, and
-/// `connection::spawn` read `cfg!(test)` to decide whether to start the
-/// supervisor behind it, true only inside rho-agent-hosts' own tests, so this
-/// binary got a live supervisor dialing a socket that is not there and
-/// reconnecting on a timer. When a test ended, the App took its tokio
-/// runtime with it, and a supervisor still being polled panicked inside
-/// tokio's timer on a worker thread: "A Tokio 1.x context was found, but
-/// it is being shutdown". Under load the suite was slow enough for that
-/// window to open, which is why it was seen once and not again.
 #[test]
 fn a_test_host_connection_has_nothing_dialing_behind_it() {
     assert!(
@@ -1239,163 +671,6 @@ pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace>
         target,
     }];
     cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx))
-}
-
-/// An overlay chain — transient to minibuffer to a Git approval and back —
-/// leaves the reader in the mode it found them in. Written when the map
-/// gave the reader a second mode to be in at rest; the map is gone, so the
-/// mode under every overlay here is the surface's, and the rule that the
-/// chain does not quietly change it is the same rule.
-#[gpui::test]
-fn modal_overlays_preserve_surface_mode(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let workspace = overview_workspace(cx);
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.select_agent(None, window, cx);
-            assert!(!workspace.is_dashboard_mode(window, cx));
-            workspace.prompt_open_file(window, cx);
-            assert!(!workspace.is_dashboard_mode(window, cx));
-        })
-        .expect("open surface prompt");
-    cx.dispatch_action(*workspace, crate::MinibufferCancel);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(!workspace.is_dashboard_mode(window, cx));
-            let (response, _decision) = tokio::sync::oneshot::channel();
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::GitTransportApproval {
-                    request_id: 2,
-                    prompt: "approve surface Git operation".to_owned(),
-                    response,
-                },
-                window,
-                cx,
-            );
-            assert!(!workspace.is_dashboard_mode(window, cx));
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::GitTransportDone { request_id: 2 },
-                window,
-                cx,
-            );
-            assert!(!workspace.is_dashboard_mode(window, cx));
-        })
-        .expect("inspect restored surface mode");
-}
-
-fn agent(id: u64) -> AgentId {
-    AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).unwrap()
-}
-
-/// The transcript the workspace holds for this agent, to edit and feed back.
-fn transcript_of(
-    workspace: &WindowHandle<Workspace>,
-    cx: &mut TestAppContext,
-    agent_id: AgentId,
-) -> UiAgentState {
-    workspace
-        .update(cx, |workspace, _, _| {
-            workspace.transcript_for_test(agent_id)
-        })
-        .expect("read transcript")
-}
-
-/// Feeds the transcript back with one change, as an agent host that saw more
-/// of the turn would.
-fn feed_edit(
-    workspace: &WindowHandle<Workspace>,
-    cx: &mut TestAppContext,
-    agent_id: AgentId,
-    edit: impl FnOnce(&mut UiAgentState),
-) {
-    let mut state = transcript_of(workspace, cx, agent_id);
-    edit(&mut state);
-    feed_frame(workspace, cx, agent_id, state);
-}
-
-/// Applies an edit and hands back the state after it, for a run of frames
-/// built up one on the last.
-fn edited_in(state: &mut UiAgentState, edit: impl FnOnce(&mut UiAgentState)) -> UiAgentState {
-    edit(state);
-    state.clone()
-}
-
-/// The assistant message at `index` keeps its first `keep_bytes` and grows
-/// by `value`; past the end, a new message begins.
-fn stream_text(state: &mut UiAgentState, index: usize, keep_bytes: usize, value: &str) {
-    if index == state.blocks.len() {
-        state.blocks.push(Arc::new(assistant("", None)));
-    }
-    let UiBlock::AssistantMessage { text, .. } = Arc::make_mut(&mut state.blocks[index]) else {
-        panic!("block {index} is not an assistant message");
-    };
-    text.truncate(keep_bytes);
-    text.push_str(value);
-}
-
-fn stream_tool_arguments(state: &mut UiAgentState, index: usize, keep_bytes: usize, value: &str) {
-    let UiBlock::Tool(tool) = Arc::make_mut(&mut state.blocks[index]) else {
-        panic!("block {index} is not a tool");
-    };
-    tool.arguments.truncate(keep_bytes);
-    tool.arguments.push_str(value);
-}
-
-fn replace_block(state: &mut UiAgentState, index: usize, block: UiBlock) {
-    if index == state.blocks.len() {
-        state.blocks.push(Arc::new(block));
-    } else {
-        state.blocks[index] = Arc::new(block);
-    }
-}
-
-fn feed_frame(
-    workspace: &WindowHandle<Workspace>,
-    cx: &mut TestAppContext,
-    agent_id: AgentId,
-    state: UiAgentState,
-) {
-    workspace
-        .update(cx, |workspace, window, cx| {
-            // Transcript rendering tests use a selected agent explicitly;
-            // production startup no longer derives selection from a frame.
-            if workspace.is_startup_pane() {
-                workspace.select_agent(Some(agent_id), window, cx);
-            }
-            workspace.seed_transcript_for_test(agent_id, state, window, cx);
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-}
-
-fn feed_frames(
-    workspace: &WindowHandle<Workspace>,
-    cx: &mut TestAppContext,
-    frames: impl IntoIterator<Item = (AgentId, UiAgentState)>,
-) {
-    let frames = frames.into_iter().collect::<Vec<_>>();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            if workspace.is_startup_pane()
-                && let Some((agent_id, _)) = frames.first()
-            {
-                workspace.select_agent(Some(*agent_id), window, cx);
-            }
-            for (agent_id, state) in frames {
-                workspace.seed_transcript_for_test(agent_id, state, window, cx);
-            }
-        })
-        .expect("update workspace");
-    cx.update_window((*workspace).into(), |_, window, cx| {
-        window.simulate_next_frame(cx);
-    })
-    .expect("flush queued frames");
-    cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -1639,532 +914,6 @@ fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext
             })
         })
         .expect("inspect custom blocks")
-}
-
-#[gpui::test]
-fn dashboard_has_no_persistent_masthead_block(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let editor = workspace.dashboard_editor();
-            editor.update(cx, |editor, cx| {
-                let snapshot = editor.snapshot(window, cx);
-                let custom_blocks = snapshot
-                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
-                    .filter(|(_, block)| matches!(block, Block::Custom(_)))
-                    .count();
-                assert_eq!(custom_blocks, 0);
-            });
-        })
-        .unwrap();
-}
-
-/// Slice 3's claim, read off the display map itself: a `Changed` for one
-/// agent costs no display-map resync at all. Before the slice it rebuilt the
-/// whole tree, and every buffer disabled its header one at a time.
-#[gpui::test]
-fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
-    // The trace is a process-wide ring shared with any test running beside
-    // this one, so the counting is by thread. Nothing turns it back off:
-    // the flag is only ever set, and the ring is bounded.
-    gpui::profiler::set_editor_trace_enabled(true);
-    let _claim = gpui::profiler::claim_editor_trace_for_this_thread();
-    // SAFETY: gettid has no arguments or memory-safety preconditions.
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) as u64 };
-    let mut timings = gpui::profiler::EditorTimingCollector::new();
-    let mut block_map_syncs = move || {
-        let mine = timings
-            .collect_unseen()
-            .into_iter()
-            .filter(|timing| {
-                timing.tid == tid
-                    && matches!(timing.kind, gpui::profiler::EditorTimingKind::BlockMapSync)
-            })
-            .collect::<Vec<_>>();
-        let rows: u64 = mine
-            .iter()
-            .map(|timing| timing.old_rows.max(timing.new_rows))
-            .sum();
-        (mine.len(), rows)
-    };
-
-    let mut desk = DeskFixture::new();
-    let parent = desk.note(None, "Desk");
-    let agents = (1..=8).map(agent).collect::<Vec<_>>();
-    for (nth, id) in agents.iter().enumerate() {
-        desk.agent_row(parent.clone(), *id);
-        desk.note(Some(parent.clone()), &format!("note {nth}"));
-    }
-
-    let workspace = overview_workspace(cx);
-    cx.run_until_parked();
-    block_map_syncs();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    agents
-                        .iter()
-                        .enumerate()
-                        .map(|(nth, id)| story::UiAgentHead {
-                            generated_title: Some(format!("agent {nth}")),
-                            ..ui_head(*id)
-                        })
-                        .collect(),
-                    100,
-                ),
-                window,
-                cx,
-            );
-        })
-        .expect("build the desk");
-    cx.run_until_parked();
-    // What the build costs is the rig's question, not this test's: the
-    // pathology needed thousands of filed agents, not eight.
-    block_map_syncs();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                rho_agents_client::stream::AgentFrame::Log {
-                    entries: story::head_entries(story::UiAgentHead {
-                        generated_title: Some("renamed".to_owned()),
-                        ..ui_head(agents[2])
-                    }),
-                },
-                window,
-                cx,
-            );
-        })
-        .expect("one agent's title changes");
-    cx.run_until_parked();
-    let (syncs, rows) = block_map_syncs();
-    assert_eq!(
-        (syncs, rows),
-        (0, 0),
-        "a change to one agent resynced the display map"
-    );
-}
-
-/// A burst of quiet cells costs the rows it names, whatever the desk is
-/// sized. Every one of these verdicts moves a note's state where it sits
-/// and moves no shape, so each is patched into the dealer's source where
-/// it landed; none of them takes the source again, and none of them reads
-/// the whole map. A hundred rows is where the whole-map copy this path
-/// used to make was worth 25 microseconds an event, and the user's desk
-/// is ten times that.
-#[gpui::test]
-async fn a_burst_of_quiet_cells_costs_its_own_rows(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let parent = desk.note(None, "Desk");
-    let notes = (0..100)
-        .map(|nth| desk.note(Some(parent.clone()), &format!("note {nth}")))
-        .collect::<Vec<_>>();
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .expect("build the desk");
-    cx.run_until_parked();
-
-    let (taken, patched) = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.deal_work_for_test()
-        })
-        .expect("read the dealer's work");
-    let burst = 8;
-    for note in notes.iter().take(burst) {
-        workspace
-            .update(cx, |workspace, window, cx| {
-                assert!(workspace.apply_verdict_for_test(
-                    HostId::default(),
-                    note,
-                    rho_desk_client::desk::DeskVerdict::Done,
-                    window,
-                    cx,
-                ));
-            })
-            .expect("mark a note done");
-    }
-    cx.run_until_parked();
-
-    let (taken_after, patched_after) = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.deal_work_for_test()
-        })
-        .expect("read the dealer's work");
-    assert_eq!(
-        taken_after, taken,
-        "a hundred quiet rows made the source be taken again"
-    );
-    assert_eq!(
-        patched_after - patched,
-        burst,
-        "each quiet cell is one patch and no more"
-    );
-}
-
-/// A note that is its own parent does not hang the desk.
-///
-/// The store can be told anything: a Parent cell naming the row it sits on
-/// is one write, and two devices filing each other's notes under one
-/// another is two. Every walk up the tree — a breadcrumb, a heading's
-/// context, an agent finding the note above it — follows the parent field
-/// without a guard, so a chain that comes back around is not a wrong answer
-/// but no answer at all: the frame never ends. The store client resolves it
-/// where the tree is built, so what the desk hands on is a forest and the
-/// row is drawn at the top, which is where a thing with nowhere above it
-/// belongs. If this ever fails it fails by hanging, which is the fault
-/// itself.
-#[gpui::test]
-async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let looped = desk.note(None, "the loop");
-    let under = desk.note(Some(looped.clone()), "beneath it");
-    // The cell the agent host could hand over: the row filed under itself.
-    desk.set(
-        looped.clone(),
-        rho_desk_client::protocol::cells::Property::Parent(Some(looped.clone())),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .expect("build the desk");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let nodes = workspace.desk.nodes(HostId::default()).to_vec();
-            let loop_node = nodes
-                .iter()
-                .find(|node| node.id == looped)
-                .expect("the self-filed row is on the desk");
-            assert_eq!(
-                loop_node.parent, None,
-                "a parent that comes back to the row is no parent at all"
-            );
-            assert!(
-                nodes.iter().any(|node| node.id == under),
-                "what was filed under it is still on the desk"
-            );
-        })
-        .expect("read the desk");
-}
-
-/// A shape that moved is the one case that composes the map. Filing a
-/// note writes its parent, which is where the row sits, so the dealer
-/// cannot patch it where it was: the source is taken again. This is the
-/// other half of the quiet-cell rule, and it is here so that cutting the
-/// cost of a quiet delta cannot quietly cut the correctness of a loud one.
-#[gpui::test]
-async fn filing_a_note_moves_the_shape_and_takes_the_source(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let parent = desk.note(None, "Desk");
-    let other = desk.note(Some(parent.clone()), "elsewhere");
-    let notes = (0..16)
-        .map(|nth| desk.note(Some(parent.clone()), &format!("note {nth}")))
-        .collect::<Vec<_>>();
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .expect("build the desk");
-    cx.run_until_parked();
-
-    let (taken, _) = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.deal_work_for_test()
-        })
-        .expect("read the dealer's work");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.apply_verdict_for_test(
-                HostId::default(),
-                &notes[3],
-                rho_desk_client::desk::DeskVerdict::File {
-                    parent: other.clone()
-                },
-                window,
-                cx,
-            ));
-        })
-        .expect("file one note");
-    cx.run_until_parked();
-
-    let (taken_after, _) = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.deal_work_for_test()
-        })
-        .expect("read the dealer's work");
-    assert!(
-        taken_after > taken,
-        "a row moved and the source was patched where it no longer is"
-    );
-}
-
-/// A verdict costs the cells it writes. Marking one note done moves that
-/// note's state where it sits and moves no shape, so the dealer's source
-/// is patched where the verdict landed rather than taken again. Written
-/// against the map's compose-and-redraw counters; the map is gone and the
-/// dealer's source is what stands behind the cards now, but the rule the
-/// test guards — one event, one row's worth of work — is the same one.
-#[gpui::test]
-async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let parent = desk.note(None, "Desk");
-    let notes = (0..16)
-        .map(|nth| desk.note(Some(parent.clone()), &format!("note {nth}")))
-        .collect::<Vec<_>>();
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .expect("build the desk");
-    cx.run_until_parked();
-
-    // What the build costs is not the question; what one verdict costs
-    // after it is. Marking a note done writes that note's cells and
-    // nothing else, so it must draw that note's row and nothing else.
-    let (taken, patched) = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.deal_work_for_test()
-        })
-        .expect("read the dealer's work");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.apply_verdict_for_test(
-                HostId::default(),
-                &notes[7],
-                rho_desk_client::desk::DeskVerdict::Done,
-                window,
-                cx,
-            ));
-        })
-        .expect("mark one note done");
-    cx.run_until_parked();
-
-    let (taken_after, patched_after) = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.deal_work_for_test()
-        })
-        .expect("read the dealer's work");
-    assert_eq!(
-        taken_after, taken,
-        "a verdict takes the source again: the rows and their order did not move"
-    );
-    assert!(
-        patched_after > patched,
-        "a verdict patched nothing, so the card it wrote is stale"
-    );
-    // And it is the verdict the reader sees, not just cheap work.
-    workspace
-        .update(cx, |workspace, _, _| {
-            let node = workspace
-                .desk
-                .node(HostId::default(), &notes[7])
-                .expect("the note is still on the map");
-            assert_eq!(
-                node.state,
-                rho_desk_client::protocol::cells::State::Done,
-                "the row the verdict named says so"
-            );
-        })
-        .expect("read the map");
-}
-
-/// The ranking is kept, not made again. A `Changed` for one agent makes
-/// that agent's card and nothing else: the desk it is filed on, the notes
-/// beside it and the other agents under the same note all stand. Before
-/// this the read rebuilt every card from a walk of every node, so the cost
-/// of one agent moving was the size of the desk.
-#[gpui::test]
-fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let parent = desk.note(None, "Desk");
-    let agents = (1..=8).map(agent).collect::<Vec<_>>();
-    for (nth, id) in agents.iter().enumerate() {
-        desk.agent_row(parent.clone(), *id);
-        desk.note(Some(parent.clone()), &format!("note {nth}"));
-    }
-
-    let workspace = overview_workspace(cx);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    agents
-                        .iter()
-                        .enumerate()
-                        .map(|(nth, id)| story::UiAgentHead {
-                            generated_title: Some(format!("agent {nth}")),
-                            ..ui_head(*id)
-                        })
-                        .collect(),
-                    100,
-                ),
-                window,
-                cx,
-            );
-            for id in &agents {
-                story::feed(
-                    workspace,
-                    HostId::default(),
-                    story_wanting(*id, UnixMs(1)),
-                    window,
-                    cx,
-                );
-            }
-        })
-        .expect("build the desk");
-    cx.run_until_parked();
-
-    // What the build costs is not this test's question; what one change
-    // costs after it is. Every agent is asking, so every one of them has a
-    // card to make again.
-    let before = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.cards_made_for_test()
-        })
-        .expect("read the count");
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                rho_agents_client::stream::AgentFrame::Log {
-                    entries: story::head_entries(story::UiAgentHead {
-                        generated_title: Some("renamed".to_owned()),
-                        ..ui_head(agents[2])
-                    }),
-                },
-                window,
-                cx,
-            );
-        })
-        .expect("one agent's title changes");
-    cx.run_until_parked();
-
-    let after = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard.cards_made_for_test()
-        })
-        .expect("read the count");
-    assert!(
-        before >= agents.len(),
-        "the desk was supposed to make a card per asking agent, made {before}"
-    );
-    assert_eq!(
-        after - before,
-        1,
-        "a change to one agent made {} cards",
-        after - before
-    );
-}
-
-fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
-    let editor = active_editor(workspace, cx);
-    editor_excerpt_boundary_count(workspace, &editor, cx)
-}
-
-fn editor_excerpt_boundary_count(
-    workspace: &WindowHandle<Workspace>,
-    editor: &Entity<Editor>,
-    cx: &mut TestAppContext,
-) -> usize {
-    workspace
-        .update(cx, |_, window, cx| {
-            editor.update(cx, |editor, cx| {
-                let snapshot = editor.snapshot(window, cx);
-                snapshot
-                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
-                    .filter(|(_, block)| {
-                        matches!(
-                            block,
-                            Block::ExcerptBoundary { .. } | Block::BufferHeader { .. }
-                        )
-                    })
-                    .count()
-            })
-        })
-        .expect("inspect excerpt boundaries")
-}
-
-fn user(text: &str) -> UiBlock {
-    UiBlock::UserMessage {
-        text: text.to_owned(),
-    }
-}
-
-fn agent_message(sender: AgentId, text: &str) -> UiBlock {
-    UiBlock::AgentMessage {
-        sender,
-        text: text.to_owned(),
-    }
-}
-
-fn assistant(text: &str, phase: Option<UiMessagePhase>) -> UiBlock {
-    UiBlock::AssistantMessage {
-        text: text.to_owned(),
-        phase,
-    }
-}
-
-fn tool(
-    id: &str,
-    status: UiToolStatus,
-    started_at: Option<u64>,
-    finished_at: Option<u64>,
-) -> UiTool {
-    UiTool {
-        timing: Default::default(),
-        id: id.to_owned(),
-        name: "shell_command".to_owned(),
-        arguments: "echo ok".to_owned(),
-        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
-        preview: None,
-        status,
-        output: None,
-        error: None,
-        started_at: started_at.map(UnixMs),
-        finished_at: finished_at.map(UnixMs),
-        metadata: None,
-    }
-}
-
-fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
-    let blocks = history.into_iter().chain(live).map(Arc::new).collect();
-    UiAgentState {
-        exec_timings: Default::default(),
-        blocks,
-        status: UiAgentStatus::Streaming,
-        context_used: None,
-        usage: Default::default(),
-    }
-}
-
-fn long_working_text() -> String {
-    "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n".to_owned()
 }
 
 #[gpui::test]
@@ -4266,815 +3015,6 @@ fn terminal_escape_chord_parses() {
     }
 }
 
-#[test]
-fn filing_completion_keeps_duplicate_heading_identity() {
-    assert_eq!(
-        crate::minibuffer::completion_start("Project Al", true),
-        0,
-        "filing completion replaces the whole partial title"
-    );
-    let first = rho_desk_client::protocol::cells::Id::Note(rho_desk_client::protocol::cells::Uuid(
-        [1_u8; 16],
-    ));
-    let second = rho_desk_client::protocol::cells::Id::Note(
-        rho_desk_client::protocol::cells::Uuid([2_u8; 16]),
-    );
-    let destinations = vec![
-        (
-            "Project Alpha".into(),
-            "Work / Project Alpha".into(),
-            HostId(3),
-            first,
-        ),
-        (
-            "Project Alpha".into(),
-            "Work / Project Alpha".into(),
-            HostId(3),
-            second.clone(),
-        ),
-    ];
-    let candidate = crate::minibuffer::Candidate {
-        value: "Project Alpha".into(),
-        description: "Work / Project Alpha".into(),
-    };
-    assert_eq!(
-        crate::workspace::resolve_filing_destination(&destinations, &candidate, 1),
-        Some((HostId(3), second))
-    );
-    assert!(!candidate.value.contains("7:2"));
-    assert!(!candidate.description.contains("7:2"));
-}
-
-#[gpui::test]
-fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut TestAppContext) {
-    // Filing is a verdict on the card's own node: one `Labeled` write, and
-    // an undo that takes the label off again.
-    let mut desk = DeskFixture::new();
-    let destination = desk.label("rho");
-    let dealt = desk.due_note(None, "Deal QA note");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: dealt.clone(),
-                })
-            );
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.run_until_parked();
-    // The completion is visibly selected but untouched, exactly as in the
-    // dealer flow: bare Enter accepts it rather than submitting an empty name.
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
-            assert!(
-                mutation.writes.iter().any(|write| write.id == dealt
-                    && write.property
-                        == rho_desk_client::protocol::cells::Property::Labeled {
-                            label: destination.clone(),
-                            present: true,
-                        }),
-                "the card is filed by the label it was dealt under: {:?}",
-                mutation.writes
-            );
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-            assert_eq!(workspace.echo_text_for_test(), Some("label: rho"));
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::UndoVerdict);
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("filing undo mutation");
-            assert!(
-                mutation.writes.iter().any(|write| write.id == dealt
-                    && write.property
-                        == rho_desk_client::protocol::cells::Property::Labeled {
-                            label: destination.clone(),
-                            present: false,
-                        }),
-                "undoing takes the label back off: {:?}",
-                mutation.writes
-            );
-        })
-        .unwrap();
-}
-
-/// `tab` is the verdicts, over the card in view, and the letters they used
-/// to steal stay vim's. This is the whole of the change: the key opens a
-/// menu that says what the keys are, and `d` in it writes exactly what deal
-/// mode's `d` wrote.
-#[gpui::test]
-fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let dealt = desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    press_tab(&workspace, cx);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.verdict_transient_open(),
-                "tab over a card opens the verdicts"
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "d");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.verdict_transient_open(), "the menu closes on d");
-            let mutation = take_desk_mutation(workspace, HostId::default()).expect("done mutation");
-            assert!(mutation.writes.iter().any(|write| write.id == dealt
-                && write.property
-                    == rho_desk_client::protocol::cells::Property::State(
-                        rho_desk_client::protocol::cells::State::Done
-                    )));
-        })
-        .unwrap();
-}
-
-/// Filing says where a card is shown, not whether it exists. An agent
-/// nobody put under a note still asks for the user, so it is dealt, at the
-/// root and with no breadcrumb.
-#[gpui::test]
-fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) {
-    let agent_id = agent(41);
-    let desk = DeskFixture::new();
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        story_pos: story::UiStoryPos(4),
-                        spawn_name: Some("nobody filed me".to_owned()),
-                        ..ui_head(agent_id)
-                    }],
-                    50,
-                ),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(agent_id, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    workspace
-        .update(cx, |workspace, window, cx| workspace.pull_card(window, cx))
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let (identity, kind) = workspace
-                .current_deal_card_for_test(cx)
-                .expect("the unfiled agent is dealt");
-            assert_eq!(kind, crate::dashboard::DealCardKind::Agent);
-            assert_eq!(
-                identity.node_id,
-                rho_desk_client::protocol::cells::Id::Agent(agent_id),
-                "the card stands for the agent itself, not a note over it"
-            );
-            // Opening it must reach the transcript. With no note behind the
-            // card, a target looked up by node alone finds nothing and
-            // opens an empty page instead.
-            assert_eq!(
-                workspace.card_target_for_test(identity),
-                crate::dashboard::CardTarget::Agent(agent_id)
-            );
-        })
-        .unwrap();
-}
-
-/// Snooze end to end through the transient, every unit the fingers know.
-/// It was an operator in deal mode, `ss` for a day and `45sm` for
-/// forty-five minutes; the count now goes inside the menu, where the units
-/// are written down, and lands on exactly the same time. `s` is still a
-/// day on its own, which is what makes the habit survive the move.
-#[gpui::test]
-fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
-    use crate::workspace::{SnoozeUnit, snooze_target};
-
-    cx.update(bind_test_keymaps);
-    // The keys as fingers type them, and the time the same span lands on
-    // when the workspace works it out for itself.
-    for (keys, unit, count) in [
-        ("s s", SnoozeUnit::Days, 1usize),
-        ("s 7 d", SnoozeUnit::Days, 7),
-        ("s 4 5 m", SnoozeUnit::Minutes, 45),
-        ("s 3 h", SnoozeUnit::Hours, 3),
-        ("s 2 w", SnoozeUnit::Weeks, 2),
-    ] {
-        // A card apiece: a verdict waits on the agent host before the deal
-        // moves on, so one desk cannot hold three of them.
-        let mut desk = DeskFixture::new();
-        desk.due_note(None, "Card to snooze");
-        let workspace = test_workspace(cx);
-        workspace
-            .update(cx, |workspace, window, cx| {
-                story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-                workspace.pull_card(window, cx);
-                workspace.clear_sent_for_test(HostId::default());
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        let (expected, said) = snooze_target(unit, count as i64, chrono::Local::now());
-        press_tab(&workspace, cx);
-        cx.simulate_keystrokes(*workspace, keys);
-        cx.run_until_parked();
-        workspace
-            .update(cx, |workspace, _, _| {
-                assert!(
-                    !workspace.verdict_transient_open(),
-                    "{keys}: the menu closes once the unit lands"
-                );
-                let mutation = take_desk_mutation(workspace, HostId::default())
-                    .unwrap_or_else(|| panic!("{keys}: snooze mutation"));
-                let wrote = mutation
-                    .writes
-                    .iter()
-                    .find_map(|write| match &write.property {
-                        rho_desk_client::protocol::cells::Property::DeferUntil(Some(at)) => {
-                            Some(*at)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| panic!("{keys}: a snooze writes a wake time"));
-                assert_eq!(wrote.precision, expected.precision, "{keys}");
-                // A minute count is worked out twice a moment apart, so the
-                // two answers differ by the time the test itself took.
-                assert!(
-                    (wrote.unix_ms - expected.unix_ms).abs() < 5_000,
-                    "{keys}: woke at {wrote:?}, expected about {expected:?}"
-                );
-                // The words are said now: the verdict is done when it is
-                // written here, and the bar does not wait for an agent host.
-                assert_eq!(
-                    workspace.echo_text_for_test(),
-                    Some(format!("{said}: Card to snooze").as_str()),
-                    "{keys}"
-                );
-            })
-            .unwrap();
-    }
-}
-
-/// The verdicts are a buffer under the point, not a strip at the bottom:
-/// they open beside the row the reader is on and the point does not move to
-/// make room for them. Both halves matter — a menu that stole the point
-/// would answer about the wrong card when it closed.
-#[gpui::test]
-fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let before = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .active_editor(cx)
-                .read(cx)
-                .selections
-                .newest_anchor()
-                .head()
-        })
-        .unwrap();
-
-    press_tab(&workspace, cx);
-    cx.run_until_parked();
-    let after = workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.verdict_transient_open(), "the verdicts are open");
-            workspace
-                .active_editor(cx)
-                .read(cx)
-                .selections
-                .newest_anchor()
-                .head()
-        })
-        .unwrap();
-    assert_eq!(before, after, "the point did not move to open the menu");
-
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                !workspace.verdict_transient_open(),
-                "escape closes the verdicts"
-            );
-            assert_eq!(
-                workspace
-                    .active_editor(cx)
-                    .read(cx)
-                    .selections
-                    .newest_anchor()
-                    .head(),
-                before,
-                "and the point came back to where it was"
-            );
-        })
-        .unwrap();
-}
-
-/// The root menu takes the keyboard, so `tab` no longer reaches Home
-/// while it is open: with a menu up, the key belongs to the menu. Three steps
-/// down and three escapes back, with the point where it started — the whole
-/// way back, not one step of it. The buffer is not touched on the way: the
-/// menu is drawn at the bottom of the window, over the surface, so no row is
-/// added to make room for it.
-#[gpui::test]
-fn the_root_menu_opens_at_the_bottom_and_escape_retraces_it(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let point = |workspace: &Workspace, cx: &App| {
-        workspace
-            .active_editor(cx)
-            .read(cx)
-            .selections
-            .newest_anchor()
-            .head()
-    };
-    // How many rows the surface draws. A block in the buffer would show up
-    // here as rows the buffer does not have; a thing drawn over the window
-    // cannot.
-    let drawn_rows = |workspace: &mut Workspace, window: &mut gpui::Window, cx: &mut App| {
-        workspace
-            .active_editor(cx)
-            .update(cx, |editor, cx| editor.snapshot(window, cx))
-            .display_snapshot
-            .max_point()
-            .row()
-            .0
-    };
-    let before = workspace
-        .update(cx, |workspace, _, cx| point(workspace, cx))
-        .unwrap();
-    let rows_before = workspace
-        .update(cx, |workspace, window, cx| {
-            drawn_rows(workspace, window, cx)
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let subject = workspace.subject(window, cx);
-            workspace.open_menu(crate::transient::root_menu(&subject), window, cx);
-            assert_eq!(workspace.menu_title_for_test(), Some("rho"));
-            assert_eq!(
-                drawn_rows(workspace, window, cx),
-                rows_before,
-                "the menu drew no rows into the buffer"
-            );
-            assert!(
-                !workspace.verdict_transient_open(),
-                "the root menu is not the verdicts, so tab is not Home"
-            );
-            assert_eq!(point(workspace, cx), before, "the point did not move");
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "h");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.menu_title_for_test(),
-                Some("hosts"),
-                "h replaces the root menu over the same row"
-            );
-            assert_eq!(point(workspace, cx), before, "and still does not move it");
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.menu_title_for_test(),
-                Some("rho"),
-                "escape goes back to the menu it came from, not out"
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(workspace.menu_title_for_test(), None, "and then out");
-            assert_eq!(point(workspace, cx), before, "the point came back");
-            assert_eq!(
-                drawn_rows(workspace, window, cx),
-                rows_before,
-                "and the buffer is the length it always was"
-            );
-        })
-        .unwrap();
-}
-
-/// The phone draws the same menu. Not the same picture — a thumb needs a
-/// target, not a row — but the same items, reached by tapping the row a key
-/// would have run, with the same stack behind `back`.
-#[gpui::test]
-fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
-    cx.update_window(*workspace, |_, window, cx| {
-        window.simulate_next_frame(cx);
-    })
-    .expect("draw phone frame");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_menu(crate::transient::phone_root_menu(), window, cx);
-            let sheet = workspace.menu_sheet().expect("a sheet to draw");
-            assert_eq!(sheet.title, "menu");
-            assert_eq!(
-                sheet
-                    .rows
-                    .iter()
-                    .map(|row| row.description.as_str())
-                    .collect::<Vec<_>>(),
-                ["Slack", "Agents", "Status"]
-            );
-            assert!(
-                !sheet.has_back,
-                "the root of the sheet has nothing under it"
-            );
-        })
-        .unwrap();
-
-    // Tapping "Status" is the same step `i` would have taken.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.run_menu_at(2, window, cx);
-            let sheet = workspace.menu_sheet().expect("the submenu draws");
-            assert_eq!(sheet.title, "status");
-            assert!(sheet.has_back, "and the sheet says there is a way back");
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.menu_dismiss(window, cx);
-            assert_eq!(workspace.menu_title_for_test(), Some("menu"));
-            workspace.menu_dismiss(window, cx);
-            assert_eq!(workspace.menu_title_for_test(), None, "and then out");
-        })
-        .unwrap();
-}
-
-/// The sheet has to be *drawn*, not merely open. The menu keeps its rows and
-/// its title whether or not anything puts them on screen, so a test that asks
-/// the workspace what the sheet says passes while the phone shows nothing at
-/// all — which is exactly what happened: the overlay was drawn only for the
-/// bottom strip the menus used to be, and a migrated menu opened into an
-/// empty screen. This taps
-/// where the last row lands, which fails if nothing is drawn there.
-#[gpui::test]
-fn the_phone_sheet_is_drawn_where_a_thumb_can_reach_it(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_menu(crate::transient::phone_root_menu(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // The sheet sits on the bottom edge and its last row is "Status", so the
-    // bottom of the screen is that row — the target a thumb actually has.
-    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
-    visual.simulate_click(
-        gpui::point(gpui::px(200.), gpui::px(790.)),
-        gpui::Modifiers::none(),
-    );
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.menu_title_for_test(),
-                Some("status"),
-                "a tap on the drawn sheet ran the row it landed on"
-            );
-        })
-        .unwrap();
-}
-
-/// Desktop rows are the same commands as their keys, rather than labels
-/// that can only be read.
-#[gpui::test]
-fn a_desktop_transient_row_dispatches_when_clicked(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(800.), gpui::px(600.)));
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_menu(crate::transient::phone_root_menu(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // The three-row transient is pinned to the bottom. Its middle row is
-    // Agents, whose keyboard equivalent is `a`.
-    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
-    visual.simulate_click(
-        gpui::point(gpui::px(50.), gpui::px(568.)),
-        gpui::Modifiers::none(),
-    );
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.menu_title_for_test(),
-                Some("agent"),
-                "clicking the rendered Agents row ran its menu action"
-            );
-        })
-        .unwrap();
-}
-
-/// Escape out of the snooze units goes back to the verdicts, not out of the
-/// menu: back returns, here as everywhere.
-#[gpui::test]
-fn escape_in_a_submenu_returns_to_the_menu_it_came_from(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    press_tab(&workspace, cx);
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "s");
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.verdict_transient_open(),
-                "escape left the units and came back to the verdicts"
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace.verdict_transient_open(),
-                "the second escape leaves the menu"
-            );
-        })
-        .unwrap();
-}
-
-/// A second `tab` is Home: the first put the verdicts on screen and the
-/// menu's own `tab` row says the next one leaves. The second press reaches
-/// the menu, not the editor, so it is the menu's row that answers it.
-#[gpui::test]
-fn a_second_tab_leaves_the_card_for_home(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    press_tab(&workspace, cx);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.verdict_transient_open());
-            assert_ne!(workspace.current_surface_name_for_test(), "home");
-        })
-        .unwrap();
-
-    press_tab(&workspace, cx);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace.verdict_transient_open(),
-                "the second tab closes the verdicts"
-            );
-            assert_eq!(
-                workspace.current_surface_name_for_test(),
-                "home",
-                "and leaves the card for Home"
-            );
-        })
-        .unwrap();
-}
-
-/// A snoozed todo comes back from zero: the pace it climbed at before goes
-/// with the verdict, or the card would return already halfway up the curve.
-#[gpui::test]
-fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let dealt = desk.due_note(None, "Paced card");
-    desk.set(
-        dealt.clone(),
-        rho_desk_client::protocol::cells::Property::PaceDays(7),
-    );
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealSnooze);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("snooze mutation");
-            assert!(mutation.writes.iter().any(|write| write.id == dealt
-                && write.property == rho_desk_client::protocol::cells::Property::PaceDays(0)));
-            let Some((_, rho_desk_client::protocol::cells::VerdictEvent::Applied { changes, .. })) =
-                mutation.verdict
-            else {
-                panic!("the snooze records an applied verdict");
-            };
-            // The entry says what it put back, so an undo restores the pace.
-            let paced = changes
-                .iter()
-                .find(|change| {
-                    change.key == rho_desk_client::protocol::cells::PropertyKey::PaceDays
-                })
-                .expect("the pace is part of the verdict");
-            assert_eq!(
-                paced.before,
-                Some(rho_desk_client::protocol::cells::Property::PaceDays(7))
-            );
-            assert_eq!(
-                paced.after,
-                Some(rho_desk_client::protocol::cells::Property::PaceDays(0))
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.note(None, "Somewhere to file");
-    let dealt = desk.due_note(None, "First filing");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.dispatch_action(*workspace, crate::MinibufferCancel);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                take_desk_mutation(workspace, HostId::default()).is_none(),
-                "a cancelled prompt files nothing"
-            );
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: dealt,
-                }),
-                "the card the reader was looking at is still the one dealt"
-            );
-        })
-        .unwrap();
-}
-
 #[gpui::test]
 fn undo_verdict_with_empty_stack_echoes(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -5086,114 +3026,6 @@ fn undo_verdict_with_empty_stack_echoes(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-#[gpui::test]
-fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppContext) {
-    // A woken note with a cadence: dealt, then undone back to exactly the
-    // cells the verdict replaced.
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "Named card");
-    let woke = rho_desk_client::protocol::cells::Timestamp {
-        unix_ms: 1_577_836_800_000,
-        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-    };
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(woke)),
-    );
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::PaceDays(1),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-
-    macro_rules! verdict_and_undo {
-        ($action:expr, $echo:expr) => {{
-            cx.dispatch_action(*workspace, $action);
-            cx.run_until_parked();
-            let stamp = workspace
-                .update(cx, |workspace, _, _| {
-                    let mutation = take_desk_mutation(workspace, HostId::default())
-                        .expect("verdict mutation");
-                    assert!(matches!(
-                        mutation.verdict,
-                        Some((_, rho_desk_client::protocol::cells::VerdictEvent::Applied { .. }))
-                    ));
-                    // Said as the verdict is made, not a round trip later.
-                    assert_eq!(workspace.echo_text_for_test(), Some($echo));
-                    mutation.stamp
-                })
-                .unwrap();
-            cx.dispatch_action(*workspace, crate::UndoVerdict);
-            workspace
-                .update(cx, |workspace, _, _| {
-                    let mutation =
-                        take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
-                    // Undo is the log's own inverse, not a replayed edit.
-                    assert!(matches!(
-                        mutation.verdict,
-                        Some((_, rho_desk_client::protocol::cells::VerdictEvent::Undone { of })) if of == stamp
-                    ));
-                    let node = workspace
-                        .desk_cells_snapshot_for_test(HostId::default())
-                        .into_iter()
-                        .find(|candidate| candidate.id == note)
-                        .unwrap();
-                    assert_eq!(node.state, rho_desk_client::protocol::cells::State::Open);
-                    assert_eq!(node.defer_until, Some(woke));
-                    assert_eq!(node.pace_days, 1);
-                })
-                .unwrap();
-            workspace
-                .update(cx, |workspace, _, cx| {
-                    assert_eq!(
-                        workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                        Some(crate::dashboard::DealCardId {
-                            host: HostId::default(),
-                            node_id: note.clone(),
-                        })
-                    );
-                    assert!(workspace.dashboard_deal_mode_for_test(cx));
-                })
-                .unwrap();
-        }};
-    }
-
-    verdict_and_undo!(crate::DashboardDealDone, "done: Named card");
-    verdict_and_undo!(crate::DashboardDealMute, "mute: Named card");
-    // The snooze operator's default unit is a day, and the bar says the day
-    // it comes back on rather than the distance.
-    let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1))
-        .format("%a %-d %b")
-        .to_string();
-    let snoozed = format!("snooze until {tomorrow}: Named card");
-    verdict_and_undo!(crate::DashboardDealSnooze, snoozed.as_str());
-    verdict_and_undo!(crate::DashboardDealTodo, "todo: Named card");
-
-    // The echo belongs to the card the verdict was taken on, and it is said
-    // as the verdict is made rather than a round trip later.
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.echo_text_for_test(), Some("done: Named card"));
-        })
-        .unwrap();
-}
-
-/// Over a surface that is no card, `tab` has no verdicts to open, so it
-/// goes Home in one press; from Home it is the way back.
 #[gpui::test]
 fn tab_over_no_card_opens_home(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
@@ -5693,8 +3525,8 @@ fn searching_a_transcript_composes_the_history_it_looks_through(cx: &mut TestApp
 }
 
 /// A key means one thing per context. `n` and `N` are the search repeat on
-/// the two surfaces that have a search, and the next unread on the two that
-/// read rooms — by their own contexts, not by which binding was loaded
+/// the transcript, and the next unread in a room — by their own
+/// contexts, not by which binding was loaded
 /// last.
 #[gpui::test]
 fn n_is_the_search_repeat_where_there_is_a_search_and_the_next_unread_where_there_is_a_room(
@@ -5725,7 +3557,8 @@ fn n_is_the_search_repeat_where_there_is_a_search_and_the_next_unread_where_ther
             ]
         };
         for mode in ["normal", "helix_normal"] {
-            for name in ["RhoTranscript", "RhoDashboard"] {
+            let name = "RhoTranscript";
+            {
                 let searchable = surface(name, mode);
                 assert_eq!(
                     routes("n", &searchable),
@@ -6480,156 +4313,6 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
 }
 
 #[gpui::test]
-fn a_verdict_the_host_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppContext) {
-    // The write is done on the client, so nothing on this side is waiting
-    // to be told it happened -- and nothing replays it either. A verdict
-    // taken while the agent host was away, or one lost on the wire, would
-    // reach no other device ever again if the handshake did not carry it
-    // back. Sync is two ways: the answer says what the agent host has, and
-    // what this client holds above the agent host's frontier goes with it.
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "Written while the agent host was away");
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 1_577_836_800_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.run_until_parked();
-    // Sent and dropped: the fixture's store never takes this mutation, the
-    // way an agent host that was not running never took it.
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
-        })
-        .unwrap();
-
-    let sent_back = workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace
-                .take_desk_frames_for_test(HostId::default())
-                .into_iter()
-                .find_map(|frame| match frame {
-                    DeskClientFrame::CellsApply { cells } => Some(cells),
-                    _ => None,
-                })
-        })
-        .unwrap()
-        .expect("the client sends the cells the agent host's frontier lacks");
-    assert!(
-        sent_back.cells.iter().any(|cell| cell.id == note
-            && cell.property
-                == rho_desk_client::protocol::cells::Property::State(
-                    rho_desk_client::protocol::cells::State::Done
-                )),
-        "the verdict the agent host never heard is in what goes back: {:?}",
-        sent_back.cells
-    );
-
-    // And it merges there, which is the whole point: the other devices can
-    // read it now.
-    desk.store.merge(sent_back).unwrap();
-    assert_eq!(
-        desk.store.facts(&note).state,
-        rho_desk_client::protocol::cells::State::Done,
-        "the agent host holds the write it missed"
-    );
-}
-
-#[gpui::test]
-fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut TestAppContext) {
-    // Two GUIs on one desk: the first deals a verdict, the agent host accepts
-    // it, and the second sees it only because the poke made it sync.
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "Shared card");
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 1_577_836_800_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-
-    let first = test_workspace(cx);
-    let second = test_workspace(cx);
-    for workspace in [&first, &second] {
-        workspace
-            .update(cx, |workspace, window, cx| {
-                story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-                workspace.pull_card(window, cx);
-                workspace.clear_sent_for_test(HostId::default());
-            })
-            .unwrap();
-    }
-    cx.run_until_parked();
-
-    cx.dispatch_action(*first, crate::DashboardDealDone);
-    cx.run_until_parked();
-    let mutation = first
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation")
-        })
-        .unwrap();
-
-    // The agent host now holds the verdict; the second device is only poked.
-    desk.store.apply_mutation(&mutation).unwrap();
-    let frontier = desk.store.version().clone();
-    second
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                workspace
-                    .desk_cells_snapshot_for_test(HostId::default())
-                    .into_iter()
-                    .find(|node| node.id == note)
-                    .map(|node| node.state),
-                Some(rho_desk_client::protocol::cells::State::Open),
-                "the poke has not arrived yet"
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                rho_desk_client::stream::DeskFrame::CellsAvailable { frontier },
-                window,
-                cx,
-            );
-            let sync = workspace
-                .take_desk_frames_for_test(HostId::default())
-                .into_iter()
-                .any(|frame| matches!(frame, DeskClientFrame::Sync { .. }));
-            assert!(sync, "a poke asks for the delta rather than carrying it");
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            assert_eq!(
-                workspace
-                    .desk_cells_snapshot_for_test(HostId::default())
-                    .into_iter()
-                    .find(|node| node.id == note)
-                    .map(|node| node.state),
-                Some(rho_desk_client::protocol::cells::State::Done),
-                "the verdict from the other device is visible here"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn unnamed_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let summary = rho_agents_client::protocol::QuotaSummary {
@@ -6772,92 +4455,6 @@ fn q_closes_a_standalone_draft_and_goes_back(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// A discarded draft must not stay in surface history: `q` on it takes it
-/// out, and stepping back must not walk into the thing that was thrown
-/// away. Written on a heading draft when `r` on a map row was what opened
-/// one; a draft is now opened from the composer, and the rule is the same.
-#[gpui::test]
-fn q_discards_a_draft_from_surface_history(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.note(None, "unstaffed heading");
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.configure_surface_history_for_test(&["previous"], window, cx);
-            workspace.select_agent(None, window, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "draft");
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "q");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_ne!(workspace.current_surface_name_for_test(), "draft");
-            assert!(
-                !workspace
-                    .surface_history_for_test()
-                    .contains(&"draft".to_owned()),
-                "discarded draft remained in surface history"
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "f24");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_ne!(
-                workspace.current_surface_name_for_test(),
-                "draft",
-                "history reopened the discarded draft"
-            )
-        })
-        .unwrap();
-}
-
-/// Discarding a draft leaves the history cursor where it was, on the
-/// surface the reader was actually reading.
-#[gpui::test]
-fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.note(None, "unstaffed heading");
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.configure_surface_history_for_test(&["current"], window, cx);
-            workspace.select_agent(None, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "q");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.current_surface_name_for_test(),
-                "current",
-                "discarding the draft left the reader somewhere other than what was under it"
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "f24");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_ne!(
-                workspace.current_surface_name_for_test(),
-                "draft",
-                "forward walked back into the discarded draft"
-            );
-        })
-        .unwrap();
-}
-
-/// Closing after stepping back lands on the next one back. There is no
-/// forward: a stack the reader has walked past is a stack that is shorter,
-/// which is what "history is a stack" costs and buys.
 #[gpui::test]
 fn q_after_stepping_back_lands_on_the_next_surface_back(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
@@ -7125,389 +4722,6 @@ fn a_slack_card_is_read_with_the_conversations_own_keys(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext) {
-    // Reading a Slack conversation elsewhere quiets the thread while the
-    // deal is still open: its node loses the facts the card was drawn from.
-    // The verdict must still land and still end the deal.
-    let mut desk = DeskFixture::new();
-    let dealt = desk.due_note(None, "can you look at the deploy?");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.dashboard_deal_mode_for_test(cx));
-            desk.set(
-                dealt,
-                rho_desk_client::protocol::cells::Property::DeferUntil(None),
-            );
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                !workspace.dashboard_deal_mode_for_test(cx),
-                "a verdict on a card that went quiet still ends the deal"
-            );
-        })
-        .unwrap();
-}
-
-/// A `thread` node is the thread's identity and its verdicts; what the
-/// card says comes from the Slack mirror. With nothing in the mirror there
-/// is nothing to say, so the node is not dealt as a blank card.
-#[gpui::test]
-fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let dealable = desk.due_note(None, "a note that does want attention");
-    desk.thread_row(None, "C1", "500.0");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: dealable,
-                }),
-                "the only card is the one with something to say"
-            );
-        })
-        .unwrap();
-}
-
-/// Whether a Slack unit is a card is the crate's answer and nothing else:
-/// the reason it sends is already the join of rho's own cursor and Slack's
-/// read mark, so a unit it has stopped asking about is not a card here,
-/// whatever the store holds. The backlog command, which is the one place
-/// that acts on every card at once, sees only what is still open.
-#[gpui::test]
-fn a_slack_unit_the_crate_has_stopped_asking_about_is_not_a_card(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let open = desk.thread_row(None, "C1", "500.0");
-    let settled = desk.thread_row(None, "C1", "600.0");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            let sources = desk
-                .slack_sources()
-                .into_iter()
-                .map(|source| match source.unit.thread.as_deref() {
-                    // Dealt with: `d` here, or read on the phone. Either
-                    // way the crate has stopped asking.
-                    Some("600.0") => rho_desk_client::desk::SlackSource {
-                        reason: None,
-                        ..source
-                    },
-                    _ => source,
-                })
-                .collect();
-            workspace.set_slack_sources_for_test(HostId::default(), sources, window, cx);
-            let cards = workspace.dashboard.open_thread_cards();
-            assert_eq!(
-                cards
-                    .iter()
-                    .map(|(card, _)| card.node_id.clone())
-                    .collect::<Vec<_>>(),
-                vec![open],
-                "the thread nothing is asking about is not a card"
-            );
-            // The closed one is still findable, which is what lets a newer
-            // message rebind and reopen it.
-            assert_eq!(
-                workspace
-                    .dashboard
-                    .thread_card_id(&crate::dashboard::SlackUnit {
-                        workspace: "acme".to_owned(),
-                        channel: "C1".to_owned(),
-                        thread: Some("600.0".to_owned()),
-                    })
-                    .map(|card| card.node_id),
-                Some(settled)
-            );
-        })
-        .unwrap();
-}
-
-/// Creation: `n` from anywhere, the area always asked, and the labels the
-/// thing in context carries offered first, so Enter alone files the new
-/// thing where the reader already is. The area is a label: a thing is
-/// placed by what it carries and carries no parent.
-#[gpui::test]
-fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let elsewhere = desk.label("elsewhere");
-    let here = desk.label("here");
-    let context = desk.note(None, "the area in view");
-    desk.labelled(context.clone(), here.clone());
-
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.focus_tree_node_for_test(HostId::default(), context.clone(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let areas = workspace.areas_for_test(cx);
-            assert!(areas.contains(&("here".to_owned(), "label".to_owned())));
-            assert!(areas.contains(&("elsewhere".to_owned(), "label".to_owned())));
-            assert!(
-                !areas.iter().any(|(path, _)| path == "the area in view"),
-                "a note is not an area a thing can be filed under: {areas:?}"
-            );
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-
-    // `space n n`, then bare Enter on the offered context row.
-    cx.simulate_keystrokes(*workspace, "space n n");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
-            assert!(
-                mutation.writes.iter().any(|write| write.property
-                    == rho_desk_client::protocol::cells::Property::Labeled {
-                        label: here.clone(),
-                        present: true,
-                    }),
-                "Enter on the first row gives the note the label the cursor's thing carries"
-            );
-            assert!(
-                !mutation.writes.iter().any(|write| matches!(
-                    write.property,
-                    rho_desk_client::protocol::cells::Property::Parent(Some(_))
-                )),
-                "nothing is placed by a parent: {:?}",
-                mutation.writes
-            );
-            let _ = &elsewhere;
-            let _ = &context;
-        })
-        .unwrap();
-}
-
-/// Create from here, on a Slack message. The reader is looking at a
-/// thread that carries a label; `n n` and Enter make the note without
-/// asking where it goes: it takes the labels the message carries, which is
-/// the same place, and says it is about the message. About is provenance —
-/// the label is what puts the note on the map.
-#[gpui::test]
-fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let label = desk.label("rho");
-    let node = desk.thread_row(None, "C1", "600.0");
-    desk.labelled(node.clone(), label.clone());
-
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(
-                HostId::default(),
-                desk.slack_sources(),
-                window,
-                cx,
-            );
-            // The message is the only card, so Home's cursor is on it: the
-            // reader is looking at the thread.
-            workspace.sync_tree_dashboard(HostId::default(), window, cx);
-            // The reader is on the message. The Slack conversation surface
-            // wants a live session, which this harness has none of; the
-            // message's own surface names the same node, which is what
-            // `here` reads.
-            workspace.open_note(HostId::default(), node.clone(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.context_area(cx),
-                Some((HostId::default(), node.clone())),
-                "the message the reader is on is what `here` means"
-            );
-        })
-        .unwrap();
-
-    // `space n n`, then bare Enter: the first row is `here`.
-    cx.simulate_keystrokes(*workspace, "space n n");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
-            assert!(
-                mutation.writes.iter().any(|write| write.property
-                    == rho_desk_client::protocol::cells::Property::About(node.clone())),
-                "the note says what it came from: {:?}",
-                mutation.writes
-            );
-            assert!(
-                mutation.writes.iter().any(|write| write.property
-                    == rho_desk_client::protocol::cells::Property::Labeled {
-                        label: label.clone(),
-                        present: true,
-                    }),
-                "and is placed where the message is, without being asked: {:?}",
-                mutation.writes
-            );
-            assert!(
-                !mutation.writes.iter().any(|write| matches!(
-                    write.property,
-                    rho_desk_client::protocol::cells::Property::Parent(Some(_))
-                )),
-                "nothing is placed by a parent: {:?}",
-                mutation.writes
-            );
-        })
-        .unwrap();
-}
-
-/// The finder's candidate source over a real desk tree: every node arrives
-/// as its full path, and submitting one opens the surface that path names.
-#[gpui::test]
-fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    // A page node makes the dashboard look at the browser, which is a
-    // global rather than a field.
-    cx.update(|cx| {
-        let dir = std::env::temp_dir();
-        rho_browser::init(&dir, dir.join("rho-gui-test-nonexistent-browser.sock"), cx);
-    });
-    let agent_id = agent(31);
-    let page_id = rho_browser::PageId(uuid::Uuid::from_u128(7));
-
-    let mut desk = DeskFixture::new();
-    let root = desk.note(None, "nixos");
-    let topic = desk.note(Some(root), "poco on linux");
-    desk.agent_row(topic.clone(), agent_id);
-    // With no live browser record, a page row says only that it is one.
-    desk.page_row(topic, page_id);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        story_pos: story::UiStoryPos(1),
-                        spawn_name: Some("warm agent".into()),
-                        ..ui_head(agent_id)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let paths = workspace
-                .find_candidates(cx)
-                .into_iter()
-                .map(|candidate| (candidate.path, candidate.kind))
-                .collect::<Vec<_>>();
-            for expected in [
-                ("nixos".to_owned(), "topic"),
-                ("nixos › poco on linux".to_owned(), "topic"),
-                ("nixos › poco on linux › warm agent".to_owned(), "agent"),
-                ("nixos › poco on linux › page".to_owned(), "page"),
-            ] {
-                assert!(
-                    paths.contains(&expected),
-                    "{expected:?} missing from {paths:?}"
-                );
-            }
-            // The whole point of the path: initials across segments find it.
-            assert_eq!(
-                crate::find::rank(
-                    &paths
-                        .iter()
-                        .map(|(path, _)| (path.clone(), 0))
-                        .collect::<Vec<_>>(),
-                    "nixpocowarm",
-                )
-                .first()
-                .map(|index| paths[*index].0.clone()),
-                Some("nixos › poco on linux › warm agent".to_owned())
-            );
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_find(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "n i x p o c o w a r m");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace
-                    .current_surface_name_for_test()
-                    .starts_with("warm agent"),
-                "enter on an agent's path opens that agent, not {}",
-                workspace.current_surface_name_for_test()
-            );
-        })
-        .unwrap();
-}
-
-/// The finder's chord must survive the bundled keymaps: `ctrl-shift-f` is
-/// Zed's project search and vim binds a great deal at this depth.
-#[gpui::test]
 fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
 
@@ -7538,240 +4752,6 @@ fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
     });
 }
 
-/// A note is one text, not one line: the body runs as long as it wants and
-/// the first line is what everything else calls it.
-#[gpui::test]
-fn a_notes_title_is_its_first_line_and_the_body_is_the_note(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let root = desk.note(None, "nixos");
-    desk.note(
-        Some(root),
-        "poco on linux\nthe screen is the hard part\nand the modem after it",
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let paths = workspace
-                .find_candidates(cx)
-                .into_iter()
-                .map(|candidate| candidate.path)
-                .collect::<Vec<_>>();
-            assert!(
-                paths.contains(&"nixos › poco on linux".to_owned()),
-                "the path is the first line, not the whole note: {paths:?}"
-            );
-            assert!(
-                !paths.iter().any(|path| path.contains("hard part")),
-                "the body never reaches a path: {paths:?}"
-            );
-        })
-        .unwrap();
-}
-
-/// The note surface: the body is the node's own text, and the children hang
-/// under it, so a note is read where it lives rather than on the map.
-#[gpui::test]
-fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "poco on linux\nthe screen is the hard part");
-    let first = desk.note(Some(topic.clone()), "modem firmware");
-    let second = desk.note(Some(topic.clone()), "battery calibration");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.open_note(HostId::default(), topic.clone(), window, cx));
-            assert_eq!(
-                workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::DeskNode {
-                    host: HostId::default(),
-                    node_id: topic.clone(),
-                }
-            );
-            assert_eq!(
-                workspace.note_children_for_test(HostId::default(), topic),
-                vec![first, second]
-            );
-        })
-        .unwrap();
-}
-
-/// The thing behind a surface can go while the surface sits in history: a
-/// agent host is detached and its agents go with it. Back must not land on a
-/// transcript of an agent that no longer exists.
-///
-/// Two things keep that, and this test asks only for the result. The close
-/// paths call the machine's `forget`, which is where the invariant is
-/// tested (`rho_window::history`); and an agent's context is that agent's,
-/// so when the agent goes the whole arrangement goes with it and there is
-/// no stack left to walk. Belt and braces, deliberately: `forget` is one
-/// call on every death path so no path has to know which of the two saved
-/// it.
-#[gpui::test]
-fn back_never_lands_on_a_transcript_whose_host_is_gone(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let agent_id = agent(91);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "nixos");
-    desk.agent_row(topic, agent_id);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        story_pos: story::UiStoryPos(1),
-                        spawn_name: Some("doomed agent".into()),
-                        ..ui_head(agent_id)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-            workspace.open_agent(agent_id, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Transcript(agent_id)
-            );
-            // Somewhere else, so the transcript is behind the reader rather
-            // than under them.
-            workspace.open_home(window, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
-            workspace.cmd_host_detach("local", window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.step_surface_back_for_test(window, cx);
-            assert_ne!(
-                workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::Transcript(agent_id),
-                "back showed a transcript whose agent host had been detached"
-            );
-        })
-        .unwrap();
-}
-
-/// "Notes for this" from a surface that is not a note: the note says it is
-/// about the thing on screen and is placed where that thing is, and
-/// pressing the key again returns to it rather than making a second one.
-/// Nothing is filed under the agent — a thing carries no parent — so
-/// About is what the second press finds it by.
-#[gpui::test]
-fn notes_for_this_makes_a_note_about_the_surfaces_node(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let agent_id = agent(77);
-    let mut desk = DeskFixture::new();
-    let label = desk.label("nixos");
-    let topic = desk.note(None, "the old outline");
-    let agent_node = desk.agent_row(topic, agent_id);
-    desk.labelled(agent_node.clone(), label.clone());
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        story_pos: story::UiStoryPos(1),
-                        spawn_name: Some("warm agent".into()),
-                        ..ui_head(agent_id)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-            workspace.open_agent(agent_id, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let created = workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_notes_for_surface(window, cx);
-            let crate::pane::SurfaceKey::DeskNode { node_id, .. } =
-                workspace.current_surface_key_for_test()
-            else {
-                panic!("notes for this opens the note surface");
-            };
-            let facts = workspace
-                .desk
-                .facts(HostId::default(), &node_id)
-                .expect("the note the key just made");
-            assert_eq!(
-                facts.about,
-                Some(agent_node.clone()),
-                "the note says what it is about"
-            );
-            assert!(
-                facts.labels.contains(&label),
-                "and is where the agent is: {:?}",
-                facts.labels
-            );
-            assert_eq!(
-                facts.parent, None,
-                "nothing is placed by a parent, least of all a note for a thing"
-            );
-            node_id
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_agent(agent_id, window, cx);
-            workspace.open_notes_for_surface(window, cx);
-            assert_eq!(
-                workspace.current_surface_key_for_test(),
-                crate::pane::SurfaceKey::DeskNode {
-                    host: HostId::default(),
-                    node_id: created,
-                },
-                "the second press opens the note that already exists"
-            );
-        })
-        .unwrap();
-}
-
-/// A desk as the agent host would hand it over: cells the client merges, plus a
-/// text history per note. Tests build one and send it as `DeskSynced`.
-/// A head as `Ready` carries it: the least an agent can say about itself,
-/// with the story empty. Tests that care about a title or a running turn
-/// set those fields with struct update syntax.
 fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
     story::UiAgentHead {
         agent_id,
@@ -7817,1304 +4797,6 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::Ag
             },
         ],
     )
-}
-
-pub(super) struct DeskFixture {
-    store: rho_desk_client::protocol::cells::Store,
-    bodies: Vec<rho_desk_client::protocol::cells::BodySnapshot>,
-    next_node: u64,
-    /// The Slack units the fixture made rows for, with the newest message
-    /// the mirror would report for each.
-    slack_units: Vec<(rho_desk_client::protocol::cells::SlackUnit, String)>,
-}
-
-impl DeskFixture {
-    /// The text replica namespace the agent host gives this connection.
-    const NAMESPACE: u16 = 42;
-    const HOST_NAMESPACE: u16 = 1;
-    /// The store the fixture's agent host answers as. Cells are only news
-    /// about a desk when they are counted in the store the client holds,
-    /// so every sync says which one that is.
-    pub(super) const STORE: rho_desk_client::protocol::cells::DeviceId =
-        rho_desk_client::protocol::cells::DeviceId([5; 16]);
-
-    pub(super) fn new() -> Self {
-        let device = rho_desk_client::protocol::cells::DeviceId([9; 16]);
-        Self {
-            store: rho_desk_client::protocol::cells::Store::new(device),
-            bodies: Vec::new(),
-            next_node: 0,
-            slack_units: Vec::new(),
-        }
-    }
-
-    fn note(
-        &mut self,
-        parent: Option<rho_desk_client::protocol::cells::Id>,
-        text: &str,
-    ) -> rho_desk_client::protocol::cells::Id {
-        self.next_node += 1;
-        let id = rho_desk_client::protocol::cells::Id::Note(Self::uuid(self.next_node));
-        self.file(id.clone(), parent);
-        if !text.is_empty() {
-            let mut buffer = text::Buffer::new(
-                text::ReplicaId::new(Self::HOST_NAMESPACE),
-                text::BufferId::new(self.next_node + 1).unwrap(),
-                "",
-            );
-            let operation =
-                rho_desk_client::protocol::TextOperation::from_text(&buffer.edit([(0..0, text)]));
-            self.bodies
-                .push(rho_desk_client::protocol::cells::BodySnapshot {
-                    id: id.clone(),
-                    operations: vec![operation],
-                    transactions: Vec::new(),
-                });
-        }
-        id
-    }
-
-    /// A note the dealer will deal. A plain note is never dealt, so the
-    /// mark that makes it want attention is part of the seed.
-    fn due_note(
-        &mut self,
-        parent: Option<rho_desk_client::protocol::cells::Id>,
-        text: &str,
-    ) -> rho_desk_client::protocol::cells::Id {
-        let id = self.note(parent, text);
-        self.set(
-            id.clone(),
-            rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-                rho_desk_client::protocol::cells::Timestamp {
-                    unix_ms: 1_600_000_000_000,
-                    precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-                },
-            )),
-        );
-        id
-    }
-
-    /// A Slack thread the user filed. Nothing creates it: the unit is the
-    /// id, and filing it is the only fact the store holds.
-    pub(super) fn thread_row(
-        &mut self,
-        parent: Option<rho_desk_client::protocol::cells::Id>,
-        channel: &str,
-        thread_ts: &str,
-    ) -> rho_desk_client::protocol::cells::Id {
-        let unit = rho_desk_client::protocol::cells::SlackUnit {
-            workspace: "acme".to_owned(),
-            channel: channel.to_owned(),
-            thread: Some(thread_ts.to_owned()),
-        };
-        self.slack_units.push((unit.clone(), thread_ts.to_owned()));
-        let id = rho_desk_client::protocol::cells::Id::Slack(unit);
-        self.file(id.clone(), parent);
-        id
-    }
-
-    /// What the mirror says about the rows `thread_row` made: every unit
-    /// has one message from someone else and nothing handled yet, which is
-    /// the state a card is dealt in.
-    pub(super) fn slack_sources(&self) -> Vec<rho_desk_client::desk::SlackSource> {
-        self.slack_units
-            .iter()
-            .map(|(unit, newest)| rho_desk_client::desk::SlackSource {
-                unit: unit.clone(),
-                title: "any update?".to_owned(),
-                newest: rho_desk_client::protocol::cells::SlackTs(newest.clone()),
-                newest_from_other: Some(rho_desk_client::protocol::cells::SlackTs(newest.clone())),
-                reason: Some(rho_slack::model::Attention::FollowedThread),
-            })
-            .collect()
-    }
-
-    /// A registered project: a label that names a workdir. Projects live
-    /// in the store rather than on the wire, so this is where a test says
-    /// one exists.
-    fn project(&mut self, name: &str, url: &str) -> rho_desk_client::protocol::cells::Id {
-        self.next_node += 1;
-        let id = rho_desk_client::protocol::cells::Id::Label(Self::uuid(self.next_node));
-        self.file(id.clone(), None);
-        self.set(
-            id.clone(),
-            rho_desk_client::protocol::cells::Property::Name(name.to_owned()),
-        );
-        self.set(
-            id.clone(),
-            rho_desk_client::protocol::cells::Property::Repository(Some(
-                rho_desk_client::protocol::cells::Repository {
-                    url: url.to_owned(),
-                },
-            )),
-        );
-        id
-    }
-
-    /// A label the user made, and the act of putting one on a row. A label
-    /// is placement: the row keeps whatever parent it already had.
-    fn label(&mut self, name: &str) -> rho_desk_client::protocol::cells::Id {
-        self.next_node += 1;
-        let id = rho_desk_client::protocol::cells::Id::Label(Self::uuid(self.next_node));
-        self.file(id.clone(), None);
-        self.set(
-            id.clone(),
-            rho_desk_client::protocol::cells::Property::Name(name.to_owned()),
-        );
-        id
-    }
-
-    fn labelled(
-        &mut self,
-        id: rho_desk_client::protocol::cells::Id,
-        label: rho_desk_client::protocol::cells::Id,
-    ) {
-        self.set(
-            id,
-            rho_desk_client::protocol::cells::Property::Labeled {
-                label,
-                present: true,
-            },
-        );
-    }
-
-    /// An agent the user filed under a note.
-    fn agent_row(
-        &mut self,
-        parent: rho_desk_client::protocol::cells::Id,
-        agent_id: AgentId,
-    ) -> rho_desk_client::protocol::cells::Id {
-        let id = rho_desk_client::protocol::cells::Id::Agent(agent_id);
-        self.file(id.clone(), Some(parent));
-        id
-    }
-
-    /// A page the user filed under a note.
-    fn page_row(
-        &mut self,
-        parent: rho_desk_client::protocol::cells::Id,
-        page_id: rho_browser::PageId,
-    ) -> rho_desk_client::protocol::cells::Id {
-        let id = rho_desk_client::protocol::cells::Id::Page(rho_desk_client::protocol::PageId(
-            *page_id.0.as_bytes(),
-        ));
-        self.file(id.clone(), Some(parent));
-        id
-    }
-
-    /// The two facts a filing is: where the user put it, and when.
-    fn file(
-        &mut self,
-        id: rho_desk_client::protocol::cells::Id,
-        parent: Option<rho_desk_client::protocol::cells::Id>,
-    ) {
-        self.next_node += 1;
-        let created_at = rho_desk_client::protocol::cells::Timestamp {
-            unix_ms: 1_600_000_000_000 + self.next_node as i64,
-            precision: rho_desk_client::protocol::cells::TimestampPrecision::Millisecond,
-        };
-        self.set(
-            id.clone(),
-            rho_desk_client::protocol::cells::Property::Parent(parent),
-        );
-        self.set(
-            id,
-            rho_desk_client::protocol::cells::Property::CreatedAt(created_at),
-        );
-    }
-
-    /// A distinct id for every row, however many there are.
-    ///
-    /// This used to be one byte repeated, which was fine until a desk with
-    /// more rows than a byte counts: the counter wrapped, a note was handed
-    /// the root's id, and filing it under the root made the root its own
-    /// parent. Every walk up the tree then ran forever, which read as the
-    /// desk hanging above a certain size rather than as an id collision.
-    fn uuid(counter: u64) -> rho_desk_client::protocol::cells::Uuid {
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&counter.to_be_bytes());
-        rho_desk_client::protocol::cells::Uuid(bytes)
-    }
-
-    pub(super) fn set(
-        &mut self,
-        id: rho_desk_client::protocol::cells::Id,
-        property: rho_desk_client::protocol::cells::Property,
-    ) {
-        self.store.write(id, property).unwrap();
-    }
-
-    /// The same desk as the replica on disk holds it, for a client that
-    /// opens with nothing to talk to.
-    pub(super) fn held(&self) -> rho_desk_client::cache::HeldDesk {
-        rho_desk_client::cache::HeldDesk {
-            known: true,
-            namespace: Self::NAMESPACE,
-            store: Self::STORE,
-            snapshot: self.store.snapshot(),
-            bodies: self.bodies.clone(),
-        }
-    }
-
-    pub(super) fn synced(&self) -> rho_desk_client::stream::DeskFrame {
-        rho_desk_client::stream::DeskFrame::Synced {
-            store: Self::STORE,
-            node_namespace: Self::NAMESPACE,
-            delta: self.store.snapshot(),
-            bodies: self.bodies.clone(),
-        }
-    }
-}
-
-/// The agent host's answer to the one mutation the GUI just sent.
-fn take_desk_mutation(
-    workspace: &mut Workspace,
-    host: HostId,
-) -> Option<rho_desk_client::protocol::cells::CellMutation> {
-    workspace
-        .take_desk_frames_for_test(host)
-        .into_iter()
-        .find_map(|frame| match frame {
-            DeskClientFrame::MutationApply { mutation } => Some(mutation),
-            _ => None,
-        })
-}
-
-#[gpui::test]
-fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
-    cx.update(init_test_app);
-    let home = cx.add_window(crate::home::HomeView::new);
-
-    // Empty first: the glance still answers, in the deal bar's own words.
-    let text = home
-        .update(cx, |home, _, cx| {
-            let editor = home.editor().clone();
-            editor.read(cx).buffer().read(cx).snapshot(cx).text()
-        })
-        .unwrap();
-    assert_eq!(text, "nothing needs attention\n");
-
-    let card = |node: u64| crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id: rho_desk_client::protocol::cells::Id::Note(DeskFixture::uuid(node)),
-    };
-    let rows = crate::home::HomeRows {
-        next: vec![crate::home::HomeRow {
-            title: "#design › release date".to_owned(),
-            label: "needs reply · 1.9h".to_owned(),
-            card: card(1),
-            skipped: false,
-        }],
-        running: vec![crate::home::RunningRow {
-            agent_id: agent(1),
-            name: "eng-5pha".to_owned(),
-            topic: "phone feed".to_owned(),
-            elapsed: "12m".to_owned(),
-            last_line: "wiring the flick recogniser".to_owned(),
-        }],
-        later: vec![crate::home::HomeRow {
-            title: "#random".to_owned(),
-            label: "quiet · 5.4d".to_owned(),
-            card: card(2),
-            skipped: false,
-        }],
-    };
-    let text = home
-        .update(cx, |home, _, cx| {
-            home.set_rows(rows, cx);
-            let editor = home.editor().clone();
-            editor.read(cx).buffer().read(cx).snapshot(cx).text()
-        })
-        .unwrap();
-    assert_eq!(
-        text,
-        concat!(
-            "next\n",
-            "  #design › release date  needs reply · 1.9h\n",
-            "running\n",
-            "  eng-5pha  phone feed  12m   wiring the flick recogniser\n",
-            "later\n",
-            "  #random  quiet · 5.4d\n",
-        ),
-        "later comes last so the periphery falls off the bottom"
-    );
-}
-
-#[gpui::test]
-fn a_cold_start_lands_on_home_and_says_what_is_waiting(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Ship the release");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
-            assert!(
-                workspace.current_deal_card_for_test(cx).is_none(),
-                "sitting down deals nothing"
-            );
-        })
-        .unwrap();
-    let text = buffer_text(&workspace, cx);
-    assert!(text.contains("next"), "home text: {text:?}");
-    assert!(text.contains("Ship the release"), "home text: {text:?}");
-    // The same words the deal bar uses for the same card.
-    assert!(text.contains("deferred · woke"), "home text: {text:?}");
-}
-
-#[gpui::test]
-fn a_pull_opens_the_top_card_and_the_next_pull_passes_over_it(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let first = desk.due_note(None, "Ship the release");
-    let second = desk.due_note(None, "Book the venue");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: first.clone(),
-                }),
-                "one pull opens the most important card"
-            );
-            // The second pull is a fresh ranking of the same world: the card
-            // just read is passed over, so the next one comes up.
-            workspace.pull_card(window, cx);
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: second,
-                }),
-                "the second pull moves on rather than cycling on one card"
-            );
-            // Both cards have been passed over now, so there is nothing left
-            // to open and the glance is the answer.
-            workspace.pull_card(window, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let note = desk.due_note(None, "Ship the release");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            // Nothing else is waiting, so passing over the only card lands
-            // on Home.
-            workspace.pull_card(window, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        text.contains("Ship the release"),
-        "a skipped card is still open, so Home still shows it: {text:?}"
-    );
-    assert!(
-        text.contains("skipped"),
-        "and Home says the reader has passed over it: {text:?}"
-    );
-
-    // The note wakes again at a new time: the skip was against the position
-    // the card had, and that position has moved.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            desk.set(
-                note.clone(),
-                rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-                    rho_desk_client::protocol::cells::Timestamp {
-                        unix_ms: 1_600_086_400_000,
-                        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-                    },
-                )),
-            );
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: note,
-                }),
-                "the skip is void once the card's own position moves past it"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn space_j_pulls_a_card_even_with_a_surface_ahead_in_history(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Ship the release");
-    desk.due_note(None, "Book the venue");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            // Two surfaces recorded, so there is a surface behind the
-            // reader that a history step would land on.
-            workspace.configure_surface_history_for_test(&["one", "two"], window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let behind = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.surface_history_for_test()[0].clone()
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DealOpen);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_ne!(
-                workspace.current_surface_name_for_test(),
-                behind,
-                "space j gives the most important thing, never what history holds"
-            );
-            assert!(
-                workspace.current_deal_card_for_test(cx).is_some(),
-                "it opened a card: {:?}",
-                workspace.current_surface_name_for_test()
-            );
-        })
-        .unwrap();
-}
-#[gpui::test]
-fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let top = desk.due_note(None, "Ship the release");
-    desk.due_note(None, "Book the venue");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
-            // The row under Home's cursor is the card a verdict is about,
-            // the same rule as the row under the map's cursor.
-            assert!(workspace.open_verdict_transient(window, cx));
-        })
-        .unwrap();
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation = take_desk_mutation(workspace, HostId::default()).expect("verdict");
-            assert!(
-                mutation.writes.iter().any(|write| write.id == top
-                    && write.property
-                        == rho_desk_client::protocol::cells::Property::State(
-                            rho_desk_client::protocol::cells::State::Done
-                        )),
-                "the row under the cursor is what closes"
-            );
-            assert_eq!(
-                workspace.current_surface_name_for_test(),
-                "home",
-                "and the reader is left on the list they were reading"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "First in the queue");
-    let second = desk.due_note(None, "Second in the queue");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // The cursor picks a row out of the hand rather than taking the top.
-    let editor = active_editor(&workspace, cx);
-    workspace
-        .update(cx, |_, window, cx| {
-            editor.update(cx, |editor, cx| {
-                let snapshot = editor.buffer().read(cx).snapshot(cx);
-                let offset = snapshot
-                    .text()
-                    .find("Second in the queue")
-                    .expect("second row");
-                editor.change_selections(
-                    editor::SelectionEffects::no_scroll(),
-                    window,
-                    cx,
-                    |selections| {
-                        let offset = editor::MultiBufferOffset(offset);
-                        selections.select_ranges([offset..offset]);
-                    },
-                );
-            });
-        })
-        .expect("place cursor on the second row");
-
-    cx.dispatch_action(*workspace, crate::HomeOpenRow);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                workspace.dashboard_deal_mode_for_test(cx),
-                "a row opens as a deal in every respect"
-            );
-            let (identity, _) = workspace
-                .current_deal_card_for_test(cx)
-                .expect("the row was dealt");
-            assert_eq!(
-                identity,
-                crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: second,
-                },
-                "the dealt card is the row the cursor was on"
-            );
-        })
-        .unwrap();
-}
-
-/// A Home row that names a thing can take a verdict, filed or not. An
-/// agent the user has not filed has no row on the desk, so the lookup that
-/// answers "which node is this agent" found nothing and the row fell
-/// through to the surface — and Home is a list that stands for no node, so
-/// the row named nothing: `tab` opened nothing and said nothing.
-/// Filing an agent is one of the things that key is for, so the row that
-/// most needs the menu was the one that could not open it.
-/// The draft's start field stops offering an agent the user muted, and the
-/// handle still reaches it. A mute is about what rho draws, not about
-/// taking the agent away: without the second half of that, muting would be
-/// a one-way door with no way back except remembering the handle.
-#[gpui::test]
-fn a_muted_agent_is_not_offered_as_a_start_target(cx: &mut TestAppContext) {
-    let hidden = agent(43);
-    let seen = agent(44);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "phone feed");
-    let hidden_node = desk.agent_row(topic.clone(), hidden);
-    desk.agent_row(topic, seen);
-    desk.set(
-        hidden_node,
-        rho_desk_client::protocol::cells::Property::State(
-            rho_desk_client::protocol::cells::State::Muted,
-        ),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(hidden), ui_head(seen)], 40),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let hidden_handle = workspace.registry.agent_id_label(hidden);
-            let offered = workspace
-                .live_agent_targets()
-                .into_iter()
-                .map(|candidate| candidate.value)
-                .collect::<Vec<_>>();
-            assert!(
-                offered.contains(&workspace.registry.agent_id_label(seen)),
-                "the agent that was not muted is still offered: {offered:?}"
-            );
-            assert!(
-                !offered.contains(&hidden_handle),
-                "the muted agent is offered as a target: {offered:?}"
-            );
-            assert_eq!(
-                workspace.registry.agent_by_label(&hidden_handle),
-                Some(hidden),
-                "and the handle still reaches it, so a mute is not a one-way door"
-            );
-        })
-        .unwrap();
-}
-
-/// The other half of the same rule: an agent the user muted, whose turn
-/// ended asking for them, is not a card either. The mute and the asking
-/// arrive from different places and only the card says which won.
-#[gpui::test]
-fn a_muted_agent_asking_for_the_user_is_not_a_card(cx: &mut TestAppContext) {
-    let hidden = agent(41);
-    let seen = agent(42);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "phone feed");
-    let hidden_node = desk.agent_row(topic.clone(), hidden);
-    desk.agent_row(topic, seen);
-    desk.set(
-        hidden_node,
-        rho_desk_client::protocol::cells::Property::State(
-            rho_desk_client::protocol::cells::State::Muted,
-        ),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(hidden), ui_head(seen)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(hidden, UnixMs(1)),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(seen, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace
-                    .dashboard
-                    .agent_card_id(seen)
-                    .is_some_and(|card| workspace.dashboard.node_is_open(card)),
-                "the agent that was not muted is asking and has its card"
-            );
-            assert!(
-                !workspace
-                    .dashboard
-                    .agent_card_id(hidden)
-                    .is_some_and(|card| workspace.dashboard.node_is_open(card)),
-                "the muted agent is carded despite the mute"
-            );
-        })
-        .unwrap();
-}
-
-/// The same rule for the other verdict that is not a cursor: an agent
-/// snoozed until a time still ahead is off Home even when it starts a turn
-/// and says something. Snoozing a working agent left it on Home, so
-/// "not until tomorrow" lasted until the agent's next move.
-#[gpui::test]
-fn a_snoozed_agent_is_off_home_when_its_turn_runs(cx: &mut TestAppContext) {
-    let snoozed = agent(51);
-    let seen = agent(52);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "phone feed");
-    let snoozed_node = desk.agent_row(topic.clone(), snoozed);
-    desk.agent_row(topic, seen);
-    desk.set(
-        snoozed_node,
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 4_000_000_000_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![
-                        story::UiAgentHead {
-                            activity: Some("wiring the flick recogniser".to_owned()),
-                            turn_running: true,
-                            ..ui_head(snoozed)
-                        },
-                        story::UiAgentHead {
-                            activity: Some("reading the mirror".to_owned()),
-                            turn_running: true,
-                            ..ui_head(seen)
-                        },
-                    ],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            let home = workspace.home_view().expect("home is in view");
-            home.update(cx, |home, cx| {
-                let editor = home.editor().clone();
-                editor.read(cx).buffer().read(cx).snapshot(cx).text()
-            })
-        })
-        .unwrap();
-    assert!(
-        text.contains("reading the mirror"),
-        "the agent nobody snoozed is still running on Home: {text}"
-    );
-    assert!(
-        !text.contains("wiring the flick recogniser"),
-        "the snoozed agent is drawn on Home while it runs: {text}"
-    );
-}
-
-/// The verdict taken while the agent is on screen, which is the sequence
-/// the user reported: open the transcript, snooze it a day, go back to
-/// Home, and the agent is listed again. A delta that moves no rows takes
-/// the patched path through `desk_changed`, and that path rebuilt Home
-/// only when the delta also moved a filing. A Verdict Defer moves neither
-/// shape nor filing, so Home kept the rows it had built before the
-/// verdict and went on listing the agent the user had just put away —
-/// until some later verdict happened to take a path that did rebuild it.
-#[gpui::test]
-fn a_snooze_taken_now_leaves_home_at_once(cx: &mut TestAppContext) {
-    let snoozed = agent(53);
-    let seen = agent(54);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "phone feed");
-    let snoozed_node = desk.agent_row(topic.clone(), snoozed);
-    desk.agent_row(topic, seen);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![
-                        story::UiAgentHead {
-                            activity: Some("wiring the flick recogniser".to_owned()),
-                            turn_running: true,
-                            ..ui_head(snoozed)
-                        },
-                        story::UiAgentHead {
-                            activity: Some("reading the mirror".to_owned()),
-                            turn_running: true,
-                            ..ui_head(seen)
-                        },
-                    ],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let home_text = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                let home = workspace.home_view().expect("home is in view");
-                home.update(cx, |home, cx| {
-                    let editor = home.editor().clone();
-                    editor.read(cx).buffer().read(cx).snapshot(cx).text()
-                })
-            })
-            .unwrap()
-    };
-    let before = home_text(cx);
-    assert!(
-        before.contains("wiring the flick recogniser"),
-        "the agent is on Home before the verdict: {before}"
-    );
-
-    // The verdict itself, taken the way the user takes it: on the agent's
-    // own transcript. The row already exists, so the shape is held and the
-    // client's own write comes back as a delta patched where it lands.
-    let _ = snoozed_node;
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.select_agent(Some(snoozed), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, Some(1), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    // Back the way the user comes back: the surface behind, not a fresh
-    // Home. Opening Home again would rebuild it and hide the fault.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.cmd_surface_back(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let after = home_text(cx);
-    assert!(
-        after.contains("reading the mirror"),
-        "the agent nobody snoozed is still running on Home: {after}"
-    );
-    assert!(
-        !after.contains("wiring the flick recogniser"),
-        "the agent is still on Home after the snooze it was given: {after}"
-    );
-}
-
-/// The same verdict with Home never leaving the screen. The agent already
-/// has a row, so the delta the client's own write makes moves no shape and
-/// no filing, and that was the one delta that did not rebuild Home: the
-/// rows drawn under the reader's cursor were the rows from before the
-/// verdict they had just given.
-#[gpui::test]
-fn a_snooze_taken_on_home_leaves_home_at_once(cx: &mut TestAppContext) {
-    let snoozed = agent(55);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "phone feed");
-    desk.agent_row(topic, snoozed);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        activity: Some("wiring the flick recogniser".to_owned()),
-                        turn_running: true,
-                        ..ui_head(snoozed)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let home = workspace
-        .update(cx, |workspace, _, _| workspace.home_view())
-        .unwrap()
-        .expect("home is in view");
-    let home_text = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |_, _, cx| {
-                home.update(cx, |home, cx| {
-                    let editor = home.editor().clone();
-                    editor.read(cx).buffer().read(cx).snapshot(cx).text()
-                })
-            })
-            .unwrap()
-    };
-    let before = home_text(cx);
-    assert!(
-        before.contains("wiring the flick recogniser"),
-        "the agent is on Home before the verdict: {before}"
-    );
-
-    // The cursor on the agent's row, which is what the verdict lands on.
-    workspace
-        .update(cx, |_, _, cx| {
-            home.update(cx, |home, cx| {
-                let editor = home.editor().clone();
-                editor.update(cx, |editor, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    let text = snapshot.buffer_snapshot().text();
-                    let row = text
-                        .lines()
-                        .position(|line| line.contains("wiring the flick recogniser"))
-                        .expect("the running row is drawn") as u32;
-                    editor.selections.change_with(&snapshot, |selections| {
-                        selections.select_ranges([
-                            language::Point::new(row, 0)..language::Point::new(row, 0)
-                        ]);
-                    });
-                });
-            });
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, Some(1), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let after = home_text(cx);
-    assert!(
-        !after.contains("wiring the flick recogniser"),
-        "the agent is still on Home after the snooze it was given: {after}"
-    );
-}
-
-/// An agent the user muted is not on Home while it runs. A mute is not a
-/// cursor: it is the user saying "not this agent", and a running turn
-/// decides how loudly an agent may ask, not whether it may ask at all.
-/// Home's running list asked neither, so muting a working agent did
-/// nothing a reader could see until the turn ended.
-#[gpui::test]
-fn a_muted_agent_is_off_home_even_while_its_turn_runs(cx: &mut TestAppContext) {
-    let hidden = agent(31);
-    let seen = agent(32);
-    let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "phone feed");
-    let hidden_node = desk.agent_row(topic.clone(), hidden);
-    desk.agent_row(topic, seen);
-    // Muting an agent is a state on its node; that is the whole of it.
-    desk.set(
-        hidden_node,
-        rho_desk_client::protocol::cells::Property::State(
-            rho_desk_client::protocol::cells::State::Muted,
-        ),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![
-                        story::UiAgentHead {
-                            activity: Some("wiring the flick recogniser".to_owned()),
-                            turn_running: true,
-                            ..ui_head(hidden)
-                        },
-                        story::UiAgentHead {
-                            activity: Some("reading the mirror".to_owned()),
-                            turn_running: true,
-                            ..ui_head(seen)
-                        },
-                    ],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            let home = workspace.home_view().expect("home is in view");
-            home.update(cx, |home, cx| {
-                let editor = home.editor().clone();
-                editor.read(cx).buffer().read(cx).snapshot(cx).text()
-            })
-        })
-        .unwrap();
-    assert!(
-        text.contains("reading the mirror"),
-        "the agent the user did not mute is still running on Home: {text}"
-    );
-    assert!(
-        !text.contains("wiring the flick recogniser"),
-        "the muted agent is drawn on Home while it runs: {text}"
-    );
-}
-
-#[gpui::test]
-fn the_verdicts_open_over_an_unfiled_running_agents_home_row(cx: &mut TestAppContext) {
-    let running = agent(31);
-    let mut desk = DeskFixture::new();
-    desk.note(None, "phone feed");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        activity: Some("wiring the flick recogniser".to_owned()),
-                        turn_running: true,
-                        ..ui_head(running)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // The cursor on the running row, which is the last one Home draws here.
-    let home = workspace
-        .update(cx, |workspace, _, _| workspace.home_view())
-        .unwrap()
-        .expect("home is in view");
-    workspace
-        .update(cx, |_, _, cx| {
-            home.update(cx, |home, cx| {
-                let editor = home.editor().clone();
-                editor.update(cx, |editor, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    let text = snapshot.buffer_snapshot().text();
-                    let row = text
-                        .lines()
-                        .position(|line| line.contains("wiring the flick recogniser"))
-                        .expect("the running row is drawn") as u32;
-                    editor.selections.change_with(&snapshot, |selections| {
-                        selections.select_ranges([
-                            language::Point::new(row, 0)..language::Point::new(row, 0)
-                        ]);
-                    });
-                });
-            });
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                workspace.context_area(cx),
-                Some((
-                    HostId::default(),
-                    rho_desk_client::protocol::cells::Id::Agent(running)
-                )),
-                "the row names the agent it watches, filed or not"
-            );
-            assert!(
-                workspace.open_verdict_transient(window, cx),
-                "tab opens the verdicts over it"
-            );
-        })
-        .unwrap();
-}
-
-/// The runtime titles an agent from the first thing said to it, which is a
-/// guess; a name is the user saying which agent this is. It is written on
-/// the desk, so it reaches the row the same way the labels do, and the
-/// runtime's title is what a nameless agent still reads as.
-#[gpui::test]
-fn a_renamed_running_agents_home_row_reads_the_new_name(cx: &mut TestAppContext) {
-    let running = agent(31);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "phone feed");
-    desk.agent_row(heading, running);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        activity: Some("wiring the flick recogniser".to_owned()),
-                        turn_running: true,
-                        ..ui_head(running)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert!(
-        !buffer_text(&workspace, cx).contains("the recogniser rig"),
-        "the agent has no name yet"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.name_agent(running, "the recogniser rig".to_owned(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        text.contains("the recogniser rig"),
-        "the running row reads the name the user gave it, got {text:?}"
-    );
-
-    // Taking the name off gives the runtime's title back rather than
-    // leaving the row nameless.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.name_agent(running, String::new(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        !text.contains("the recogniser rig  "),
-        "the name is gone from the row, got {text:?}"
-    );
-}
-
-/// Where the user filed an agent is half of which agent it is: two of them
-/// on the same kind of work read as one name said twice until the row says
-/// where each one lives. The labels are the ones the registry already holds
-/// for the agent, so the row costs a lookup and a join.
-#[gpui::test]
-fn a_labelled_agents_home_row_reads_its_labels(cx: &mut TestAppContext) {
-    let running = agent(31);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "phone feed");
-    let row = desk.agent_row(heading, running);
-    let rho = desk.label("rho");
-    let cargo = desk.label("cargo");
-    desk.labelled(row.clone(), rho);
-    desk.labelled(row, cargo);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        activity: Some("wiring the flick recogniser".to_owned()),
-                        turn_running: true,
-                        ..ui_head(running)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let tag = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.registry.agent_id_label(running)
-        })
-        .unwrap();
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        text.contains(&format!("{tag} · rho › cargo")),
-        "the running row names the agent and then where it is filed, got {text:?}"
-    );
-}
-
-#[gpui::test]
-fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
-    let running = agent(31);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "phone feed");
-    desk.agent_row(heading, running);
-    let head = |activity: &str| story::UiAgentHead {
-        activity: Some(activity.to_owned()),
-        turn_running: true,
-        ..ui_head(running)
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![head("wiring the flick recogniser")], 40),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let tag = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.registry.agent_id_label(running)
-        })
-        .unwrap();
-    let text = buffer_text(&workspace, cx);
-    assert!(text.contains("running"), "home text: {text:?}");
-    assert!(text.contains(&tag), "home text: {text:?}");
-    assert!(text.contains("phone feed"), "home text: {text:?}");
-    assert!(
-        text.contains("wiring the flick recogniser"),
-        "home text: {text:?}"
-    );
-
-    // The next line the agent says edits that row and nothing else.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![head("unfurl box: background tint")], 40),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        text.contains("unfurl box: background tint"),
-        "home text: {text:?}"
-    );
-    assert!(
-        !text.contains("wiring the flick recogniser"),
-        "the row kept a stale line: {text:?}"
-    );
 }
 
 #[gpui::test]
@@ -9191,134 +4873,6 @@ fn the_phone_feed_is_home_when_there_is_nothing_to_deal(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-fn home_starts_with_the_cursor_on_the_first_row(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let first = desk.due_note(None, "First in the queue");
-    desk.due_note(None, "Second in the queue");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // No motion: the first Enter deals rather than landing on a heading.
-    cx.dispatch_action(*workspace, crate::HomeOpenRow);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let (identity, _) = workspace
-                .current_deal_card_for_test(cx)
-                .expect("the top row was dealt");
-            assert_eq!(
-                identity,
-                crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: first,
-                }
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    // The one registered project is the workdir the draft inherits, and
-    // the label the thing in context carries is the area offered first: an
-    // area is a label now, and a thing carries no parent.
-    let area = desk.project("rho", "https://example.test/rho-test-repo.git");
-    let context = desk.due_note(None, "the area in view");
-    desk.labelled(context.clone(), area.clone());
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(Vec::new(), 1),
-                window,
-                cx,
-            );
-            workspace.force_host_online(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // `space n a`, then bare Enter on the offered context row: the row the
-    // cursor is on in Home.
-    cx.simulate_keystrokes(*workspace, "space n a");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "draft");
-            assert_eq!(
-                workspace.draft_area_for_test(),
-                Some((HostId::default(), context.clone())),
-                "Enter alone is create-from-here: the thing in view, not a place picked for it"
-            );
-        })
-        .unwrap();
-    let mut host = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.host_in_process_for_test(HostId::default())
-        })
-        .unwrap();
-
-    let editor = active_editor(&workspace, cx);
-    workspace
-        .update(cx, |_, window, cx| {
-            editor.update(cx, |editor, cx| {
-                editor.insert("look at the deploy", window, cx)
-            });
-        })
-        .expect("type the first message");
-    cx.dispatch_action(*workspace, crate::SubmitPrompt);
-    cx.run_until_parked();
-
-    let calls = story::calls(&mut host);
-    assert!(
-        calls
-            .iter()
-            .any(|(call, _)| matches!(call, rho_agents_client::protocol::Request::New(_))),
-        "the draft started an agent"
-    );
-    workspace
-        .update(cx, |workspace, _, _| {
-            // The agent host is never told where to file it: the client writes
-            // that fact itself once the agent exists.
-            assert_eq!(
-                workspace.pending_agent_filing_for_test(),
-                Some((HostId::default(), context.clone())),
-                "the agent was not filed from where it was made"
-            );
-            // And what it writes when the agent arrives is the place the
-            // thing in view is in, plus where the agent came from.
-            let cells = workspace.new_thing_cells(
-                HostId::default(),
-                Some(&(HostId::default(), context.clone())),
-            );
-            assert!(
-                cells.contains(&rho_desk_client::protocol::cells::Property::Labeled {
-                    label: area.clone(),
-                    present: true,
-                }) && cells.contains(&rho_desk_client::protocol::cells::Property::About(
-                    context.clone()
-                )),
-                "the agent wears the note's label and says what it is about: {cells:?}"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn a_cold_start_leaves_no_draft_in_the_timeline(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
@@ -9343,1419 +4897,6 @@ fn a_cold_start_leaves_no_draft_in_the_timeline(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-#[gpui::test]
-fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "unstaffed heading");
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "shift-r");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace.dashboard_has_new_draft_for_test(),
-                "shift-r still makes an agent; `space n a` is the one way"
-            );
-        })
-        .unwrap();
-}
-
-// `marking_the_backlog_moves_every_cursor_and_undoes_as_one` was here. It
-// is in `slack_tests.rs` now, against the fake server: what it asserts is
-// the cursor each unit lands on, and the cursor lives in the session.
-
-// `a_done_slack_unit_is_not_reopened_by_anything_slack_replays` was here.
-// It asserted the replay property through the store's cursor, and the
-// cursor is the Slack mirror's now: the property is
-// `a_unit_the_reader_marked_done_stays_closed_until_someone_writes_past_it`
-// in rho-slack's model, where both halves of the join are.
-
-/// A snooze leaves the cursor alone, so the messages the user has not
-/// handled are still theirs when it ends — and it is not a cursor either:
-/// a message arriving during the snooze does not bring the card back. A
-/// snooze used to be voided by the next reply, which made "not until
-/// Monday" mean "until somebody writes".
-///
-/// The wake time is the whole of it (9 Sep). The `SlackSnoozedAt` cell
-/// that recorded where the unit stood is retired: nothing ever read it,
-/// so it never held the snooze, and this test is what says the snooze
-/// holds without it.
-#[gpui::test]
-fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let node = desk.thread_row(None, "C1", "500.0");
-    let unit = rho_desk_client::protocol::cells::SlackUnit {
-        workspace: "acme".to_owned(),
-        channel: "C1".to_owned(),
-        thread: Some("500.0".to_owned()),
-    };
-    let card = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id: node.clone(),
-    };
-    let source = |from_other: &str| {
-        vec![rho_desk_client::desk::SlackSource {
-            unit: unit.clone(),
-            title: "any update?".to_owned(),
-            newest: rho_desk_client::protocol::cells::SlackTs("600.0".to_owned()),
-            newest_from_other: Some(rho_desk_client::protocol::cells::SlackTs(
-                from_other.to_owned(),
-            )),
-            reason: Some(rho_slack::model::Attention::FollowedThread),
-        }]
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(HostId::default(), source("600.0"), window, cx);
-            assert!(workspace.apply_verdict_for_test(
-                HostId::default(),
-                &node,
-                rho_desk_client::desk::DeskVerdict::Defer {
-                    until: rho_desk_client::protocol::cells::Timestamp {
-                        unix_ms: 4_000_000_000_000,
-                        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-                    },
-                },
-                window,
-                cx,
-            ));
-            let facts = workspace
-                .desk
-                .facts_of_slack_unit(Some(HostId::default()), &unit)
-                .unwrap();
-            assert_eq!(
-                facts.slack_handled_through, None,
-                "a snooze is not a close: what was unhandled is still theirs"
-            );
-            assert!(
-                workspace.dashboard.node_defer_until(card.clone()).is_some(),
-                "the card is put down until the snooze ends"
-            );
-
-            workspace.set_slack_sources_for_test(HostId::default(), source("700.0"), window, cx);
-            assert!(
-                workspace.dashboard.node_defer_until(card.clone()).is_some(),
-                "somebody writing during the snooze does not end it"
-            );
-            assert!(
-                workspace.dashboard.node_is_open(card),
-                "the unit is still open — the snooze is when it is asked about, not whether"
-            );
-        })
-        .unwrap();
-}
-
-// `a_done_on_another_device_closes_the_card_here` was here. A done does
-// not cross machines through the store any more: rho's own half of the
-// cursor is local to the machine, and what crosses is Slack's read mark,
-// which the outbox pushes for exactly this reason. That path is end to end
-// in rho-slack's transport tests, in
-// `a_mark_from_another_client_lands_here_and_survives_a_reconnect`.
-
-// `a_muted_slack_unit_stays_off_home_until_it_is_opened` was here. A mute
-// on a Slack unit is Slack's now, not a cell: the unit is muted there and
-// the card closes because the crate has stopped asking. Against a real
-// session and the fake in `slack_tests.rs`,
-// `a_mute_is_made_in_slack_and_undone_there`.
-
-/// Two agents filed under one note are two cards. Taking the note as the
-/// topic collapsed them into one, so every agent under a note but the
-/// loudest was missing from Home entirely. An errored agent is one of
-/// them, and it reads as errored rather than as finished work.
-#[gpui::test]
-fn every_agent_under_a_note_is_its_own_card(cx: &mut TestAppContext) {
-    let asking = agent(51);
-    let dead = agent(52);
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "rig agents");
-    desk.agent_row(note.clone(), asking);
-    desk.agent_row(note, dead);
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(asking), ui_head(dead)], 60),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(asking, UnixMs(1)),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story::story(
-                    dead,
-                    vec![
-                        story::UiStoryEvent::UserMessage {
-                            text: "go".to_owned(),
-                            at: UnixMs(0),
-                        },
-                        story::UiStoryEvent::TurnStarted { at: UnixMs(0) },
-                        story::UiStoryEvent::TurnEnded {
-                            outcome: story::UiTurnOutcome::Errored {
-                                message: "the deploy script exited 1".to_owned(),
-                            },
-                            at: UnixMs(1),
-                        },
-                    ],
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        text.contains("waiting on reply"),
-        "the asking agent: {text:?}"
-    );
-    assert!(
-        text.contains("errored ·"),
-        "the dead turn waits on the user and says so: {text:?}"
-    );
-}
-
-/// `d` on an agent closes its card, and the card comes back only when the
-/// story tells something past the cursor the verdict wrote. Being filed
-/// under a note does not exempt it: filing says where, not whether.
-#[gpui::test]
-fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppContext) {
-    let agent_id = agent(42);
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "rig agents");
-    desk.agent_row(note, agent_id);
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(agent_id)], 50),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(agent_id, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    workspace
-        .update(cx, |workspace, window, cx| workspace.pull_card(window, cx))
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let (identity, _) = workspace
-                .current_deal_card_for_test(cx)
-                .expect("the agent asks, so it is dealt");
-            assert!(workspace.apply_verdict_for_test(
-                HostId::default(),
-                &identity.node_id,
-                rho_desk_client::desk::DeskVerdict::Done,
-                window,
-                cx,
-            ));
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                workspace
-                    .current_deal_card_for_test(cx)
-                    .map(|(id, kind)| (id.node_id, kind)),
-                None,
-                "the verdict handled everything the story had told"
-            );
-            // Something new past the cursor is the card again.
-            story::feed(
-                workspace,
-                HostId::default(),
-                story::story(
-                    agent_id,
-                    vec![
-                        story::UiStoryEvent::Wants {
-                            want: story::UiAgentWant::Ask,
-                            summary: None,
-                            at: UnixMs(2),
-                        },
-                        story::UiStoryEvent::TurnEnded {
-                            outcome: story::UiTurnOutcome::Completed,
-                            at: UnixMs(2),
-                        },
-                    ],
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    workspace
-        .update(cx, |workspace, window, cx| workspace.pull_card(window, cx))
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                workspace.current_deal_card_for_test(cx).is_some(),
-                "the agent asked again past the cursor"
-            );
-        })
-        .unwrap();
-}
-
-/// A todo on a Slack unit has to write the cursor it says it moved. The
-/// agent host rejects a verdict whose entry states a change the mutation does
-/// not make, so a missing write is not a stale card, it is a refusal.
-#[gpui::test]
-fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let node = desk.thread_row(None, "C1", "500.0");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(
-                HostId::default(),
-                desk.slack_sources(),
-                window,
-                cx,
-            );
-            let (writes, (_, event)) = workspace
-                .desk
-                .verdict_writes(
-                    HostId::default(),
-                    &node,
-                    rho_desk_client::desk::DeskVerdict::Todo {
-                        defer_until: rho_desk_client::protocol::cells::Timestamp {
-                            unix_ms: 1_000,
-                            precision: rho_desk_client::protocol::cells::TimestampPrecision::Minute,
-                        },
-                        pace: 3,
-                    },
-                )
-                .expect("the unit has a source, so it can take a verdict");
-            let rho_desk_client::protocol::cells::VerdictEvent::Applied { changes, .. } = event
-            else {
-                panic!("a dealt verdict is applied");
-            };
-            for change in &changes {
-                let after = change.after.clone().expect("a change writes a fact");
-                assert!(
-                    writes
-                        .iter()
-                        .any(|write| write.id == change.id && write.property == after),
-                    "the mutation is missing {:?} on {:?}",
-                    change.key,
-                    change.id
-                );
-            }
-        })
-        .unwrap();
-}
-
-// `undoing_a_mute_puts_the_unit_back_as_it_was` was here. There is no
-// state to put back: undoing a mute unmutes in Slack, which is the second
-// half of `a_mute_is_made_in_slack_and_undone_there` in `slack_tests.rs`.
-
-// `a_thread_unfollowed_in_slack_closes_its_card` was here. The card closes
-// because the crate drops the thread from Slack's follow list, not because
-// anything is written, so the test needs a session: it is the one of the
-// same name in `slack_tests.rs`.
-
-/// A body is text: enter is a newline on the map and on the note surface
-/// alike. Both used to fall through to the transcript prompt's submit
-/// binding, which ate the key and kept every note one line long.
-#[gpui::test]
-fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "first line");
-
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let body = |workspace: &Workspace, node_id, cx: &gpui::App| {
-        workspace
-            .desk_buffers
-            .buffer(HostId::default(), node_id)
-            .expect("the note has a body")
-            .read(cx)
-            .text()
-    };
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.open_note(HostId::default(), note.clone(), window, cx));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "a enter s e c o n d");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(body(workspace, &note, cx), "first line\nsecond");
-        })
-        .unwrap();
-}
-
-/// `n n` from Home. A note is its own surface, so that surface has to come
-/// into view: with Home as the landing surface the note and its insert
-/// cursor were both behind a surface that never appeared, and the title
-/// the reader typed went nowhere. Where it files is the cursor's business
-/// and `new_note_files_itself_under_the_area_the_cursor_is_on` has it.
-#[gpui::test]
-fn a_new_note_from_home_opens_the_note_itself(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.note(None, "the area in view");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "space n n");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
-            assert_eq!(
-                workspace.current_surface_name_for_test(),
-                "note",
-                "the note is its own surface, so the note is what the reader sees"
-            );
-            assert!(
-                workspace.insert_when_shown_for_test(),
-                "the row is ready for its title rather than reading it as commands"
-            );
-        })
-        .unwrap();
-}
-
-/// `n a` from Home: the draft opens ready to type. It used to open in
-/// normal mode, so the first characters of the message were read as vim
-/// commands and the reader watched the start of their sentence vanish.
-#[gpui::test]
-fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.note(None, "the area in view");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "space n a");
-    cx.run_until_parked();
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "draft");
-        })
-        .unwrap();
-
-    // The insert itself lands on the frame the page is drawn in, which the
-    // headless test window never asks for; what is asserted here is that
-    // the draft asked for it. The typing was checked in the rig.
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.insert_when_shown_for_test(),
-                "the draft opened in normal mode, so the message loses its first characters"
-            );
-        })
-        .unwrap();
-}
-
-/// `f` names a label by path: `rho/agent` is the label `agent` under the
-/// label `rho`, both minted on the spot if they are new, and the label is
-/// then where the thing is: it hangs under the label and no longer under
-/// the place it was in.
-#[gpui::test]
-fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext) {
-    use rho_desk_client::protocol::cells::{Id, Property};
-
-    let mut desk = DeskFixture::new();
-    let area = desk.note(None, "Verdict agent");
-    let thing = desk.note(Some(area.clone()), "Deal QA note");
-
-    cx.update(bind_test_keymaps);
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let label = workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("label mutation");
-            // Two labels are minted, the outer one first, and the inner one
-            // hangs under it. Nothing the reader sees is an id.
-            let names = mutation
-                .writes
-                .iter()
-                .filter_map(|write| match &write.property {
-                    Property::Name(name) => Some((write.id.clone(), name.clone())),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(names.len(), 2);
-            assert_eq!(names[0].1, "rho");
-            assert_eq!(names[1].1, "agent");
-            assert!(matches!(names[0].0, Id::Label(_)));
-            assert!(mutation.writes.iter().any(|write| write.id == names[1].0
-                && write.property == Property::Parent(Some(names[0].0.clone()))));
-            assert!(mutation.writes.iter().any(|write| {
-                write.id == thing
-                    && write.property
-                        == Property::Labeled {
-                            label: names[1].0.clone(),
-                            present: true,
-                        }
-            }));
-            assert_eq!(workspace.echo_text_for_test(), Some("label: rho/agent"));
-            names[1].0.clone()
-        })
-        .unwrap();
-
-    // A thing is placed by the labels it carries: the label it now carries
-    // is where it is, and the note it was filed under yields to it. Taking
-    // the label off below puts that place back.
-    workspace
-        .update(cx, |workspace, _, _| {
-            let places = workspace
-                .desk_cells_snapshot_for_test(HostId::default())
-                .into_iter()
-                .filter(|node| node.id == thing)
-                .map(|node| node.under)
-                .collect::<Vec<_>>();
-            assert_eq!(places, vec![Some(label.clone())]);
-        })
-        .unwrap();
-
-    // Both places are reachable. The map drew each as its own row; the
-    // finder is what names a thing by where it sits now, and a label is a
-    // second name for the same thing rather than a second thing.
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let paths = workspace
-                .find_candidates(cx)
-                .into_iter()
-                .flat_map(|candidate| {
-                    std::iter::once(candidate.path)
-                        .chain(candidate.labels.into_iter().map(|label| label.name))
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                paths.iter().any(|path| path.starts_with("rho/agent › ")),
-                "the label path is not offered: {paths:?}"
-            );
-        })
-        .unwrap();
-
-    // The same path a second time is the same two labels, not two more, and
-    // naming a label the thing already carries takes it off.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
-            let mutation = take_desk_mutation(workspace, HostId::default()).expect("label removal");
-            assert!(
-                !mutation
-                    .writes
-                    .iter()
-                    .any(|write| matches!(write.property, Property::Name(_))),
-                "the labels already exist"
-            );
-            assert!(mutation.writes.iter().any(|write| {
-                write.id == thing
-                    && write.property
-                        == Property::Labeled {
-                            label: label.clone(),
-                            present: false,
-                        }
-            }));
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("label removed: rho/agent")
-            );
-            assert_eq!(
-                workspace
-                    .desk_cells_snapshot_for_test(HostId::default())
-                    .into_iter()
-                    .filter(|node| node.id == thing)
-                    .count(),
-                1,
-                "the thing is back in one place"
-            );
-            assert_eq!(
-                workspace
-                    .desk_cells_snapshot_for_test(HostId::default())
-                    .into_iter()
-                    .find(|node| node.id == thing)
-                    .and_then(|node| node.under),
-                Some(area.clone()),
-                "the place it was in is where it is again"
-            );
-        })
-        .unwrap();
-}
-
-/// Undo puts back the state the verdict changed, not the one cell it is
-/// named after: filing a thing carrying `rho` under `rho/agent` moves two
-/// cells, so undoing it takes `rho/agent` off and puts `rho` back on.
-#[gpui::test]
-fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let dealt = desk.due_note(None, "Deal QA note");
-    let rho = desk.label("rho");
-    desk.labelled(dealt.clone(), rho.clone());
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.label_card(HostId::default(), dealt.clone(), "rho/agent", window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let (_stamp, agent) = workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
-            let agent = workspace
-                .desk
-                .label_paths(HostId::default())
-                .into_iter()
-                .find(|(_, path)| path == "rho/agent")
-                .map(|(id, _)| id)
-                .expect("the deeper label exists");
-            assert!(
-                mutation.writes.iter().any(|write| write.id == dealt
-                    && write.property
-                        == rho_desk_client::protocol::cells::Property::Labeled {
-                            label: rho.clone(),
-                            present: false,
-                        }),
-                "the shallower label comes off with the filing: {:?}",
-                mutation.writes
-            );
-            (mutation.stamp, agent)
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::UndoVerdict);
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation = take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
-            let wrote = |label: &rho_desk_client::protocol::cells::Id, present: bool| {
-                mutation.writes.iter().any(|write| {
-                    write.id == dealt
-                        && write.property
-                            == rho_desk_client::protocol::cells::Property::Labeled {
-                                label: label.clone(),
-                                present,
-                            }
-                })
-            };
-            assert!(
-                wrote(&agent, false),
-                "undo takes the label the filing put on back off: {:?}",
-                mutation.writes
-            );
-            assert!(
-                wrote(&rho, true),
-                "and puts back the one it took off: {:?}",
-                mutation.writes
-            );
-        })
-        .unwrap();
-}
-
-/// The set kept is the smallest one that says where the thing is. A thing
-/// carrying `rho` filed under `rho/agent` is under `rho` by the label's own
-/// nesting, so `rho` comes off in the same mutation rather than sitting
-/// beside it saying the same thing; and labelling it `rho` again after that
-/// says nothing at all, so nothing is written.
-#[gpui::test]
-fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let thing = desk.note(None, "the flick recogniser");
-    let rho = desk.label("rho");
-    desk.labelled(thing.clone(), rho.clone());
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let carried = |workspace: &mut Workspace| {
-        let mut paths = workspace
-            .desk
-            .facts(HostId::default(), &thing)
-            .expect("the thing has facts")
-            .labels
-            .iter()
-            .filter_map(|label| {
-                workspace
-                    .desk
-                    .label_paths(HostId::default())
-                    .into_iter()
-                    .find(|(id, _)| id == label)
-                    .map(|(_, path)| path)
-            })
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths
-    };
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                carried(workspace),
-                vec!["rho/agent".to_owned()],
-                "the deeper label replaces the one it is nested under"
-            );
-
-            // The shallower one again is a no-op: the thing is already
-            // under it, and the picker says so instead of growing the set.
-            workspace.clear_sent_for_test(HostId::default());
-            workspace.label_card(HostId::default(), thing.clone(), "rho", window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                carried(workspace),
-                vec!["rho/agent".to_owned()],
-                "labelling it with a label it is already under writes nothing"
-            );
-            assert!(
-                take_desk_mutation(workspace, HostId::default()).is_none(),
-                "and sends nothing"
-            );
-        })
-        .unwrap();
-}
-
-/// A thing under two labels is drawn under each: labels are a second axis,
-/// and a primary label would be the parent again under another name.
-#[gpui::test]
-fn a_thing_under_two_labels_is_drawn_under_each(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let thing = desk.note(None, "the flick recogniser");
-    let rho = desk.label("rho");
-    let phone = desk.label("phone");
-    desk.labelled(thing.clone(), rho.clone());
-    desk.labelled(thing.clone(), phone.clone());
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let rows = workspace.desk_cells_snapshot_for_test(HostId::default());
-            let under = rows
-                .iter()
-                .filter(|node| node.id == thing)
-                .map(|node| node.under.clone())
-                .collect::<Vec<_>>();
-            assert_eq!(under.len(), 2, "one row per label, got {under:?}");
-            assert!(under.contains(&Some(rho)) && under.contains(&Some(phone)));
-        })
-        .unwrap();
-}
-
-/// The picker offers labels and nothing else: a thing is placed by what it
-/// carries and carries no parent, so a note is not a place to file under.
-#[gpui::test]
-fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let area = desk.note(None, "Verdict agent");
-    let dealt = desk.due_note(None, "Deal QA note");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.label_card(HostId::default(), area.clone(), "rho", window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace
-                    .filing_destinations_for_test()
-                    .iter()
-                    .any(|(path, kind, _, id)| path == "rho"
-                        && *kind == "label"
-                        && matches!(id, rho_desk_client::protocol::cells::Id::Label(_))),
-                "the label is a place to file under"
-            );
-            assert!(
-                !workspace
-                    .filing_destinations_for_test()
-                    .iter()
-                    .any(|(path, ..)| path == "Verdict agent"),
-                "a note is not a place a thing can be filed under"
-            );
-            let _ = &dealt;
-        })
-        .unwrap();
-}
-
-/// `f` is the one filing key: a label path in the picker puts that label
-/// on the thing, and the same path again takes it off, so a thing carries
-/// as many labels as the user says while sitting in one place.
-#[gpui::test]
-fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestAppContext) {
-    use rho_desk_client::protocol::cells::{Id, Property};
-
-    let mut desk = DeskFixture::new();
-    let dealt = desk.due_note(None, "Deal QA note");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "r h o");
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    let (label, _stamp) = workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("label mutation");
-            let label = mutation
-                .writes
-                .iter()
-                .find_map(|write| match &write.property {
-                    Property::Name(name) if name == "rho" => Some(write.id.clone()),
-                    _ => None,
-                })
-                .expect("the path mints the label it names");
-            assert!(matches!(label, Id::Label(_)));
-            assert!(
-                mutation.writes.iter().any(|write| write.id == dealt
-                    && write.property
-                        == Property::Labeled {
-                            label: label.clone(),
-                            present: true,
-                        }),
-                "picking a label path labels the thing"
-            );
-            assert!(
-                !mutation
-                    .writes
-                    .iter()
-                    .any(|write| write.id == dealt && write.property == Property::Parent(None)),
-                "and leaves its place alone"
-            );
-            (label, mutation.stamp)
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "r h o");
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("unlabel mutation");
-            assert!(
-                mutation.writes.iter().any(|write| write.id == dealt
-                    && write.property
-                        == Property::Labeled {
-                            label: label.clone(),
-                            present: false,
-                        }),
-                "the same path again takes the label off"
-            );
-        })
-        .unwrap();
-}
-
-/// A label is what a project is: it carries the workdir itself, and a
-/// thing made in the label is made in that workdir. There is no project
-/// row in between, so the path a new agent inherits is the label's own.
-#[gpui::test]
-fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContext) {
-    use rho_desk_client::protocol::cells::{Id, Property, Repository, Uuid};
-
-    let mut desk = DeskFixture::new();
-    let label = Id::Label(Uuid([7; 16]));
-    desk.file(label.clone(), None);
-    desk.set(label.clone(), Property::Name("rho".to_owned()));
-    desk.set(
-        label.clone(),
-        Property::Repository(Some(Repository {
-            url: "https://example.test/rho.git".to_owned(),
-        })),
-    );
-    let area = desk.note(None, "Verdict agent");
-    desk.set(
-        area.clone(),
-        Property::Labeled {
-            label: label.clone(),
-            present: true,
-        },
-    );
-    let under = desk.note(Some(area.clone()), "Deal QA note");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace
-                    .area_workdir_for_test(HostId::default(), area.clone())
-                    .map(|workdir| workdir.path.to_string()),
-                Some("https://example.test/rho.git".to_owned()),
-                "the label the area carries names the repository"
-            );
-            assert_eq!(
-                workspace
-                    .area_workdir_for_test(HostId::default(), under.clone())
-                    .map(|workdir| workdir.path.to_string()),
-                Some("https://example.test/rho.git".to_owned()),
-                "and it carries down the ancestry like any other inheritance"
-            );
-        })
-        .unwrap();
-}
-
-/// Find ranks over the label paths as well as the place: the reader
-/// remembers `rho/agent` as readily as where the thing sits, so `rhoag`
-/// reaches it.
-#[gpui::test]
-fn find_matches_a_thing_by_the_label_it_carries(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let area = desk.note(None, "Verdict agent");
-    let thing = desk.note(Some(area.clone()), "Deal QA note");
-    let elsewhere = desk.note(None, "Backlog");
-    let _ = desk.note(Some(elsewhere.clone()), "something else entirely");
-
-    cx.update(bind_test_keymaps);
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let candidates = workspace.find_candidates(cx);
-            let labelled = candidates
-                .iter()
-                .find(|candidate| candidate.path.ends_with("Deal QA note"))
-                .expect("the labelled thing is findable");
-            assert!(
-                labelled
-                    .labels
-                    .iter()
-                    .any(|name| name.name.starts_with("rho/agent")),
-                "the label path is one of its names, got {:?}",
-                labelled.labels
-            );
-            let names = candidates
-                .iter()
-                .map(|candidate| (candidate.names_for_test(), candidate.recency))
-                .collect::<Vec<_>>();
-            let best = crate::find::rank_names(&names, "rhoag")
-                .first()
-                .copied()
-                .expect("rhoag matches the label path");
-            assert!(
-                candidates[best].path.ends_with("Deal QA note"),
-                "the label path is what `rhoag` names, got {:?}",
-                candidates[best].path
-            );
-        })
-        .unwrap();
-}
-
-/// An agent nobody filed is still findable, and it answers to the words
-/// the user last said to it as well as to its name: that is what the
-/// reader remembers, and a spawn name they never gave it is not.
-#[gpui::test]
-fn find_reaches_an_unfiled_agent_by_what_the_user_said(cx: &mut TestAppContext) {
-    let agent_id = agent(61);
-    let desk = DeskFixture::new();
-
-    cx.update(bind_test_keymaps);
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(agent_id)], 70),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story::story(
-                    agent_id,
-                    vec![
-                        story::UiStoryEvent::UserMessage {
-                            text: "rebuild the search index".to_owned(),
-                            at: UnixMs(1),
-                        },
-                        story::UiStoryEvent::TurnEnded {
-                            outcome: story::UiTurnOutcome::Completed,
-                            at: UnixMs(2),
-                        },
-                    ],
-                ),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let candidates = workspace.find_candidates(cx);
-            assert!(
-                candidates
-                    .iter()
-                    .any(|candidate| candidate.target == crate::find::FindTarget::Agent(agent_id)),
-                "the unfiled agent is a candidate"
-            );
-            let names = candidates
-                .iter()
-                .map(|candidate| (candidate.names_for_test(), candidate.recency))
-                .collect::<Vec<_>>();
-            let best = crate::find::rank_names(&names, "searchindex")
-                .first()
-                .copied()
-                .expect("the words the user said match");
-            assert_eq!(
-                candidates[best].target,
-                crate::find::FindTarget::Agent(agent_id),
-                "what the user said names the agent, got {:?}",
-                candidates[best].path
-            );
-        })
-        .unwrap();
-}
-
-/// A tab opened from a page belongs under that page. The browser is the
-/// only thing that knows where a tab came from, so the map joins it in
-/// live; nothing about a tab is ever written to the store.
-#[gpui::test]
-fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
-    use rho_desk_client::protocol::cells::Id;
-
-    let page = |last: u8| {
-        rho_browser::PageId(uuid::Uuid::from_bytes([
-            1, 2, 3, 4, 5, 6, 0x47, 8, 0x89, 10, 11, 12, 13, 14, 15, last,
-        ]))
-    };
-    let desk_page =
-        |id: rho_browser::PageId| Id::Page(rho_desk_client::protocol::PageId(*id.0.as_bytes()));
-    let origin = page(1);
-    let burst = [page(2), page(3), page(4)];
-    let alone = page(5);
-
-    // The messages the extension really sends, through the native host's
-    // own entry point: a search page, three tabs ctrl-clicked out of it,
-    // and one tab the reader opened for its own sake.
-    let announce = |id: rho_browser::PageId, opened_from: Option<rho_browser::PageId>| {
-        rho_browser::native_host::record_page_metadata(&serde_json::json!({
-            "event": "page-metadata",
-            "page_id": id.to_string(),
-            "title": format!("tab {}", id.0.as_bytes()[15]),
-            "url": "https://example.com/",
-            "opened_from": opened_from.map(|id| id.to_string()).unwrap_or_default(),
-        }));
-    };
-    announce(origin, None);
-    for tab in burst {
-        announce(tab, Some(origin));
-    }
-    announce(alone, None);
-
-    // The browser has to exist in this process for its tabs to mean
-    // anything; with none there are no tabs, which is what every other
-    // test sees.
-    let browser_dir = tempfile::tempdir().unwrap();
-    cx.update(|cx| {
-        rho_browser::init(
-            browser_dir.path(),
-            browser_dir.path().join("browser.sock"),
-            cx,
-        )
-    });
-
-    let mut desk = DeskFixture::new();
-    let project = desk.label("Release research");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.sync_tree_dashboard(HostId::default(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let places = |workspace: &Workspace, id: &Id| {
-        workspace
-            .desk_cells_snapshot_for_test(HostId::default())
-            .into_iter()
-            .filter(|node| &node.id == id)
-            .map(|node| node.under)
-            .collect::<Vec<_>>()
-    };
-    workspace
-        .update(cx, |workspace, _, _| {
-            for tab in burst {
-                assert_eq!(
-                    places(workspace, &desk_page(tab)),
-                    vec![Some(desk_page(origin))],
-                    "a ctrl-clicked tab reads as a group under the page it came from"
-                );
-            }
-            // The origin is drawn even though the reader has said nothing
-            // about it, or the burst would land at the root instead.
-            assert_eq!(places(workspace, &desk_page(origin)), vec![None]);
-            // A tab opened for its own sake belongs to nothing, and the
-            // map does not show every tab.
-            assert!(places(workspace, &desk_page(alone)).is_empty());
-        })
-        .unwrap();
-
-    // Filing the origin carries the group with it: the tabs still derive
-    // their place from the origin, wherever the reader puts it.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.file_page(
-                origin,
-                Some((HostId::default(), project.clone())),
-                rho_journal::CreateMethod::New,
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                places(workspace, &desk_page(origin)),
-                vec![Some(project.clone())]
-            );
-            for tab in burst {
-                assert_eq!(
-                    places(workspace, &desk_page(tab)),
-                    vec![Some(desk_page(origin))],
-                    "the group moved with the page it hangs under"
-                );
-            }
-        })
-        .unwrap();
-
-    // A tab the reader files themselves stops deriving its place: the
-    // origin is where it sits until they say otherwise, not after.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.file_page(
-                burst[0],
-                Some((HostId::default(), project.clone())),
-                rho_journal::CreateMethod::New,
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(places(workspace, &desk_page(burst[0])), vec![Some(project)]);
-        })
-        .unwrap();
-}
-
-/// A verdict is about the thing the reader is on. The tap opens over a
-/// page row the dealer has no card for, `f` files that page, and the card a
-/// dealt surface holds is never taken by a cursor sitting somewhere else.
-#[gpui::test]
-fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppContext) {
-    use rho_desk_client::protocol::cells::{Id, Property};
-
-    let page = |last: u8| {
-        rho_browser::PageId(uuid::Uuid::from_bytes([
-            2, 3, 4, 5, 6, 7, 0x47, 9, 0x8a, 11, 12, 13, 14, 15, 16, last,
-        ]))
-    };
-    let desk_page =
-        |id: rho_browser::PageId| Id::Page(rho_desk_client::protocol::PageId(*id.0.as_bytes()));
-    let origin = page(1);
-    let tab = page(2);
-    let announce = |id: rho_browser::PageId, opened_from: Option<rho_browser::PageId>| {
-        rho_browser::native_host::record_page_metadata(&serde_json::json!({
-            "event": "page-metadata",
-            "page_id": id.to_string(),
-            "title": format!("tab {}", id.0.as_bytes()[15]),
-            "url": "https://example.com/",
-            "opened_from": opened_from.map(|id| id.to_string()).unwrap_or_default(),
-        }));
-    };
-    announce(origin, None);
-    announce(tab, Some(origin));
-    let browser_dir = tempfile::tempdir().unwrap();
-    cx.update(|cx| {
-        rho_browser::init(
-            browser_dir.path(),
-            browser_dir.path().join("browser.sock"),
-            cx,
-        )
-    });
-
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    let dealt = desk.due_note(None, "Deal QA note");
-    // A second card, so Home has a list rather than a single row.
-    let queued = desk.due_note(None, "Queued QA note");
-    // A note the dealer holds no card for, to open over Home.
-    let aside = desk.note(None, "An aside");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            // The reader opened the search page, which is what puts it on
-            // the map; the tab ctrl-clicked out of it needs nothing written.
-            workspace.file_page(
-                origin,
-                None,
-                rho_journal::CreateMethod::TabBirth,
-                window,
-                cx,
-            );
-            workspace.sync_tree_dashboard(HostId::default(), window, cx);
-            workspace.pull_card(window, cx);
-            // The page is filed but not opened: the dealt surface is what
-            // the reader is on, and the surface in view still decides.
-            assert_eq!(
-                workspace.label_target(cx),
-                Some((HostId::default(), dealt.clone())),
-                "the dealt surface keeps its own card"
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // The reader leaves the deal for Home and then opens the page. Home
-    // keeps a cursor of its own on the queue, which is the trap: the page
-    // is the surface in front, so the page is what they are looking at.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_home(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            // Home puts its own cursor on the most important card, which is
-            // the trap: the map is what the reader is looking at.
-            let home = workspace.home_view().expect("Home is the surface");
-            assert_eq!(
-                home.update(cx, |home, cx| home.cursor_target(cx)),
-                crate::home::HomeTarget::Card(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: dealt.clone(),
-                }),
-                "Home ranks fresh, so the card just read is still on top"
-            );
-            // The page's own surface is a live browser view, which this
-            // harness has no window for; the note beside it is a surface it
-            // can show, and "the thing in view is not Home's cursor card"
-            // is the same shape either way.
-            workspace.open_note(HostId::default(), aside.clone(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                workspace.label_target(cx),
-                Some((HostId::default(), aside.clone())),
-                "the surface in view is what a verdict is about"
-            );
-            assert!(
-                workspace.open_verdict_transient(window, cx),
-                "the tap opens over a thing the dealer has no card for"
-            );
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "r h o");
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("label mutation");
-            let label = mutation
-                .writes
-                .iter()
-                .find_map(|write| match &write.property {
-                    Property::Name(name) if name == "rho" => Some(write.id.clone()),
-                    _ => None,
-                })
-                .expect("the path mints the label it names");
-            assert!(
-                mutation.writes.iter().any(|write| write.id == aside
-                    && write.property
-                        == Property::Labeled {
-                            label: label.clone(),
-                            present: true,
-                        }),
-                "the note the reader is on is what gets labelled"
-            );
-            assert!(
-                !mutation
-                    .writes
-                    .iter()
-                    .any(|write| write.id == dealt || write.id == queued),
-                "and the cards on Home are left alone"
-            );
-            // The tab is not written anywhere: it hangs under the origin
-            // because the browser says so, wherever the origin is filed.
-            assert_eq!(
-                workspace
-                    .desk_cells_snapshot_for_test(HostId::default())
-                    .into_iter()
-                    .filter(|node| node.id == desk_page(tab))
-                    .map(|node| node.under)
-                    .collect::<Vec<_>>(),
-                vec![Some(desk_page(origin))],
-                "the group the page carries comes with it"
-            );
-        })
-        .unwrap();
-}
-
-/// `space n a` after an agent has been read: the draft that opens is the
-/// one that submits. Selection is what routes enter, so a stale one sent
-/// the message to the agent's own empty prompt and dropped it silently.
 #[gpui::test]
 fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
@@ -10791,48 +4932,6 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
     );
 }
 
-/// An agent surface says what the agent is doing, from its head. Borrowing
-/// the Home card's words left a running agent's line blank, because a
-/// running agent has no card.
-#[test]
-fn an_agents_state_comes_from_its_head() {
-    use rho_agents_client::AgentFacts;
-
-    let now = chrono::Local::now().fixed_offset();
-    let running = AgentFacts {
-        turn_running: true,
-        turn_started_at: Some(UnixMs((now.timestamp_millis() - 5 * 60_000).unsigned_abs())),
-        ..AgentFacts::default()
-    };
-    assert_eq!(
-        crate::dashboard::agent_state_label(&running, now).as_deref(),
-        Some("working · 5m")
-    );
-    let running_since_before = AgentFacts {
-        turn_started_at: None,
-        ..running
-    };
-    assert_eq!(
-        crate::dashboard::agent_state_label(&running_since_before, now).as_deref(),
-        Some("working"),
-        "a head that says a turn runs without saying since when still reads as working"
-    );
-    let errored = AgentFacts {
-        turn_running: false,
-        turn_started_at: None,
-        errored: true,
-        last_turn_ended: Some(UnixMs((now.timestamp_millis() - 60_000).unsigned_abs())),
-        ..AgentFacts::default()
-    };
-    assert_eq!(
-        crate::dashboard::agent_state_label(&errored, now).as_deref(),
-        Some("errored · 1m ago")
-    );
-}
-
-/// A creation the agent host refuses says why on the draft. The echo area is
-/// two seconds long, so the whole cause used to be gone before the reader
-/// could act on it, and a creation just quietly did not happen.
 #[gpui::test]
 fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
@@ -10899,25 +4998,6 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     );
 }
 
-/// `n a` into a label makes the agent a member of it, and an area that is
-/// not a label files it nowhere: a thing carries no parent, so there is no
-/// parent to write instead.
-#[test]
-fn a_new_thing_is_filed_by_its_label_and_never_by_a_parent() {
-    use rho_desk_client::protocol::cells::{Id, Property};
-
-    let label = Id::Label(rho_desk_client::protocol::cells::Uuid([3; 16]));
-    assert!(matches!(
-        crate::workspace::filing_property(label),
-        Some(Property::Labeled { present: true, .. })
-    ));
-    let note = Id::Note(rho_desk_client::protocol::cells::Uuid([4; 16]));
-    assert_eq!(crate::workspace::filing_property(note), None);
-}
-
-/// Enter in the workdir row sends the draft. The prompt's own enter is
-/// insert-only and tab leaves the cursor in normal mode, so a message
-/// written and then corrected in a field could not be sent at all.
 #[gpui::test]
 fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
@@ -10993,50 +5073,6 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
         .expect("role row");
 }
 
-/// A draft stands for no card: it is a message being written, not a thing
-/// that was dealt. With no node of its own it wore whichever card the
-/// cursor had left behind, label, why and all.
-#[gpui::test]
-fn a_draft_wears_no_other_cards_label(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Card in view");
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                workspace.open_card_in_view(cx).is_some(),
-                "the pulled card is what is in view"
-            );
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.new_agent_in_area(None, window, cx);
-        })
-        .expect("open a new-agent draft");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.open_card_in_view(cx).map(|card| card.identity),
-                None,
-                "the draft in front of it stands for no card"
-            );
-        })
-        .unwrap();
-}
-
-/// Where enter goes in a draft's header row, as the keymap resolves it: to
-/// the draft's own submit, over vim's normal-mode motion.
 #[gpui::test]
 fn enter_in_a_draft_field_routes_to_the_drafts_submit(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
@@ -11097,70 +5133,8 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("read the rows");
 }
 
-/// A verdict says which card it took. The echo used to name the path above
-/// the card, so `done` over an agent filed under a label said the label.
-#[gpui::test]
-fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
-    let agent_id = agent(42);
-    let desk = DeskFixture::new();
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        story_pos: story::UiStoryPos(4),
-                        spawn_name: Some("the deploy".to_owned()),
-                        ..ui_head(agent_id)
-                    }],
-                    50,
-                ),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(agent_id, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
-            assert_eq!(workspace.echo_text_for_test(), Some("done: the deploy"));
-        })
-        .unwrap();
-}
-
-/// The tag this test's fold carries, so the fold is this test's and no
-/// other's.
 enum FoldedInThisTest {}
 
-/// A row takes its scale from the sync that wrote it, so every path to the
-/// wrap map has to carry the scales the display map holds — folding above
-/// all, because folding is also what flushes a pending buffer edit. A
-/// transcript composes history and then folds it, and the fold's own sync is
-/// what wraps the rows composition just wrote: wrapped without their scale
-/// they come out 1.12 too wide and nothing rewrites them.
 #[gpui::test]
 fn a_fold_wraps_the_rows_it_flushes_at_their_scale(cx: &mut TestAppContext) {
     cx.update(init_test_app);
@@ -11414,589 +5388,6 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
     );
 }
 
-/// The verdicts open over a running agent on Home, so they have to land on
-/// it. An agent nobody has filed has no row on the desk, and a verdict that
-/// wanted a row opened its menu over the agent and then refused: `tab s s`
-/// said "snooze: nothing under the deal". The verdicts are the one door to
-/// a verdict now, so a door that opens and refuses is the whole of it.
-#[gpui::test]
-fn a_verdict_lands_on_a_running_agent_nobody_filed(cx: &mut TestAppContext) {
-    let loose = agent(31);
-    // Nothing is filed: the desk has never heard of this agent, which is
-    // every agent the user started and did not put anywhere.
-    let desk = DeskFixture::new();
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        turn_running: true,
-                        ..ui_head(loose)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-            workspace.open_home(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let home = workspace.home_view().expect("Home is the surface");
-            assert_eq!(
-                home.update(cx, |home, cx| home.cursor_target(cx)),
-                crate::home::HomeTarget::Agent(loose),
-                "the only row Home has is the running agent"
-            );
-            assert!(
-                workspace.open_verdict_transient(window, cx),
-                "the verdicts open over the row"
-            );
-            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, None, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace
-                    .dashboard
-                    .agent_put_down(loose, chrono::Local::now().fixed_offset()),
-                "and what they opened them for is what happens: the agent is \
-                 put down until tomorrow"
-            );
-        })
-        .unwrap();
-    let text = buffer_text(&workspace, cx);
-    assert!(
-        !text.contains("running"),
-        "the row it was on is gone with it, got {text:?}"
-    );
-}
-
-/// The user's verdict on an agent lives in the store, so a client that has
-/// not read the store yet cannot say the agent is not already put down. It
-/// dealt anyway: `loose_agent_card` asked its guard with `is_some_and`, so
-/// no desk read as no verdict, and every agent wanting the user went into
-/// `next` — including the ones snoozed yesterday. A restart was enough to
-/// deal a snoozed agent again, for as long as the first sync took, and on a
-/// large desk that is long enough to act on.
-#[gpui::test]
-fn an_agent_is_not_dealt_before_the_desk_that_holds_its_verdict(cx: &mut TestAppContext) {
-    let waiting = agent(31);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "rho");
-    desk.agent_row(heading, waiting);
-
-    let workspace = test_workspace(cx);
-    // The mirror arrives first and the desk has not answered: a client
-    // between opening and its first sync.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(waiting)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(waiting, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let dealt = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .hand(cx)
-                    .cards
-                    .iter()
-                    .filter_map(|card| card.agent_id)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap()
-    };
-    assert!(
-        dealt(cx).is_empty(),
-        "nothing is dealt out of a store nobody has read"
-    );
-
-    // The desk answers, and the agent is dealt: waiting for the store is
-    // not the same as never dealing.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert_eq!(
-        dealt(cx),
-        vec![waiting],
-        "and once it has answered the card goes out"
-    );
-}
-
-/// Home's running list reads the same verdict as the dealer and used to
-/// read it its own way: `agent_put_down` asked every deal source and there
-/// were none, so `any` was false and a snoozed agent read as running. On a
-/// rig, on the user's own desk, that put two snoozed agents back on Home
-/// for the first half second after the client restarted.
-#[gpui::test]
-fn a_running_row_is_not_drawn_before_the_desk_that_holds_its_verdict(cx: &mut TestAppContext) {
-    let running = agent(31);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "rho");
-    desk.agent_row(heading, running);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(
-                    vec![story::UiAgentHead {
-                        turn_running: true,
-                        ..ui_head(running)
-                    }],
-                    40,
-                ),
-                window,
-                cx,
-            );
-            workspace.open_home(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert!(
-        !buffer_text(&workspace, cx).contains("running"),
-        "no desk has answered, so nothing is said about the agent either way"
-    );
-
-    // The desk answers and the row is drawn, because waiting for the store
-    // is not the same as never drawing.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let text = buffer_text(&workspace, cx);
-    assert!(text.contains("running"), "home text: {text:?}");
-}
-
-/// The other half of the cold-open question: a card that did go out and
-/// is then put down by the store. The hand is derived from the dealer's
-/// cards every time it is asked, and a desk that arrives takes the host's
-/// cards whole, so the card is not sticky — it is re-derived away rather
-/// than left standing in the queue.
-#[gpui::test]
-fn a_dealt_card_leaves_the_hand_when_the_desk_says_it_was_put_down(cx: &mut TestAppContext) {
-    let waiting = agent(31);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "rho");
-    desk.agent_row(heading, waiting);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(waiting)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(waiting, UnixMs(1)),
-                window,
-                cx,
-            );
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let dealt = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .hand(cx)
-                    .cards
-                    .iter()
-                    .filter_map(|card| card.agent_id)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap()
-    };
-    assert_eq!(
-        dealt(cx),
-        vec![waiting],
-        "the desk said nothing, so it deals"
-    );
-
-    // The user's snooze, arriving from the store after the card went out.
-    desk.set(
-        rho_desk_client::protocol::cells::Id::Agent(waiting),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 4_000_000_000_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert!(
-        dealt(cx).is_empty(),
-        "a dealt card does not outlive the verdict that put it down"
-    );
-}
-
-/// Naming is the verdict menu's `n`, and its subject is the card in view.
-/// It used to be `space a n`, which took the agent under the point: the
-/// same shape as the done that went before it, and the same way to write
-/// the user's own words about one thing onto another.
-#[gpui::test]
-fn the_verdict_menu_names_the_card_in_view(cx: &mut TestAppContext) {
-    let waiting = agent(41);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "rho");
-    desk.agent_row(heading, waiting);
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(waiting)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(waiting, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.pull_card(window, cx);
-            workspace.clear_sent_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    press_tab(&workspace, cx);
-    cx.simulate_keystrokes(*workspace, "n");
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "f i x space t h e space l i n k e r");
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("the name mutation");
-            let wrote = mutation
-                .writes
-                .iter()
-                .find(|write| write.id == rho_desk_client::protocol::cells::Id::Agent(waiting))
-                .expect("the name lands on the agent of the card in view");
-            assert_eq!(
-                wrote.property,
-                rho_desk_client::protocol::cells::Property::Name("fix the linker".to_owned())
-            );
-        })
-        .unwrap();
-}
-
-/// The shape that would let a snooze be read off the wrong node: an agent
-/// filed under a heading and carrying a label, so the dealer can reach it
-/// through the heading's subtree as well as on its own. The verdict is on
-/// `Id::Agent` either way, so both readers have to see it; a heading path
-/// that asked the heading's node instead would deal the card.
-#[gpui::test]
-fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppContext) {
-    let put_away = agent(41);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "rho");
-    desk.agent_row(heading, put_away);
-    let label = desk.label("linker");
-    desk.labelled(rho_desk_client::protocol::cells::Id::Agent(put_away), label);
-    desk.set(
-        rho_desk_client::protocol::cells::Id::Agent(put_away),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 4_000_000_000_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(put_away)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(put_away, UnixMs(1)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let dealt = workspace
-                .hand(cx)
-                .cards
-                .iter()
-                .filter_map(|card| card.agent_id)
-                .collect::<Vec<_>>();
-            assert!(
-                !dealt.contains(&put_away),
-                "the snooze is on the agent's own row, and every path to it reads that row: {dealt:?}"
-            );
-        })
-        .unwrap();
-}
-
-/// A version counts writes per device inside one store. Carried to
-/// another store the same numbers name writes that never happened, so a
-/// replica that turns out to have been counted somewhere else is not a
-/// desk running behind: it is a different desk. What the client holds
-/// goes whole and the cells that come under the new name stand alone —
-/// otherwise the user would be reading one desk made of two stores, with
-/// verdicts in it that nothing on this side can ever take back.
-#[gpui::test]
-fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppContext) {
-    let put_away = agent(41);
-    let held_store = rho_desk_client::protocol::cells::DeviceId([9; 16]);
-
-    // What the copy handed back: a snoozed agent, counted in a store that
-    // is no longer the one answering.
-    let mut old = DeskFixture::new();
-    let heading = old.note(None, "rho");
-    old.agent_row(heading, put_away);
-    old.set(
-        rho_desk_client::protocol::cells::Id::Agent(put_away),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 4_000_000_000_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-    let held = match old.synced() {
-        rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
-        _ => unreachable!("the fixture's sync is a Synced"),
-    };
-
-    // The store now answering has the same agent filed, and says nothing
-    // about a snooze: the user never gave that verdict here.
-    let mut now = DeskFixture::new();
-    let elsewhere = now.note(None, "rho");
-    now.agent_row(elsewhere, put_away);
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(put_away)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(put_away, UnixMs(1)),
-                window,
-                cx,
-            );
-            workspace.desk_arrived(
-                HostId::default(),
-                crate::workspace::DeskArrival {
-                    from: "test",
-                    store: held_store,
-                    node_namespace: 42,
-                    delta: held.0,
-                    bodies: held.1,
-                },
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let dealt = workspace
-                .hand(cx)
-                .cards
-                .iter()
-                .filter_map(|card| card.agent_id)
-                .collect::<Vec<_>>();
-            assert!(
-                !dealt.contains(&put_away),
-                "the copy's snooze holds while the copy is what the client has: {dealt:?}"
-            );
-        })
-        .unwrap();
-
-    // The agent host answers under a name the client has never counted in.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_desk_event(HostId::default(), now.synced(), window, cx);
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let dealt = workspace
-                .hand(cx)
-                .cards
-                .iter()
-                .filter_map(|card| card.agent_id)
-                .collect::<Vec<_>>();
-            assert!(
-                dealt.contains(&put_away),
-                "the snooze was counted in a store that is not this one, so it went with the rest of that desk: {dealt:?}"
-            );
-        })
-        .unwrap();
-}
-
-/// The client's copy of the desk is a desk like any other. Cells that
-/// come off its own disk go through the same door the agent host's answer
-/// does, so a verdict the user gave in a previous session is in hand
-/// before a word is exchanged with the agent host — which is the whole reason
-/// the copy exists, and the state the two cold-open guards were written
-/// against.
-#[gpui::test]
-fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut TestAppContext) {
-    let put_away = agent(41);
-    let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "rho");
-    desk.agent_row(heading, put_away);
-    desk.set(
-        rho_desk_client::protocol::cells::Id::Agent(put_away),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 4_000_000_000_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-    // What the replica would have handed back: the cells of a previous
-    // session, with no agent host behind them.
-    let held = match desk.synced() {
-        rho_desk_client::stream::DeskFrame::Synced { delta, bodies, .. } => (delta, bodies),
-        _ => unreachable!("the fixture's sync is a Synced"),
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ready_with(vec![ui_head(put_away)], 40),
-                window,
-                cx,
-            );
-            story::feed(
-                workspace,
-                HostId::default(),
-                story_wanting(put_away, UnixMs(1)),
-                window,
-                cx,
-            );
-            // No `DeskSynced` from an agent host: this is the copy being opened.
-            workspace.desk_arrived(
-                HostId::default(),
-                crate::workspace::DeskArrival {
-                    from: "test",
-                    store: DeskFixture::STORE,
-                    node_namespace: 42,
-                    delta: held.0,
-                    bodies: held.1,
-                },
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    next_frame(cx, workspace);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let dealt = workspace
-                .hand(cx)
-                .cards
-                .iter()
-                .filter_map(|card| card.agent_id)
-                .collect::<Vec<_>>();
-            assert!(
-                !dealt.contains(&put_away),
-                "the snooze was read off the copy, so the card does not go out: {dealt:?}"
-            );
-        })
-        .unwrap();
-}
-
-/// Home is a row in the buffer picker from any surface.
-///
-/// The picker lists the context's own surfaces, and a context that has
-/// never shown Home -- Slack's is the one the reader is in most -- offered
-/// every surface except the one they want back. Home is every context's,
-/// so the row is there whether or not it has been opened, and choosing it
-/// opens it.
 #[gpui::test]
 fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -12029,59 +5420,6 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
         .unwrap();
 }
 
-/// Home is drawn from the replica with nothing to talk to. The desk lives
-/// on the client, so a cold start owes the reader their own verdicts
-/// before any agent host answers — and the file opens on the model thread the
-/// constructor starts, so the read in `Workspace::new` finds nothing and
-/// the one that counts is the one the open itself asks for.
-#[gpui::test]
-fn a_cold_open_draws_home_from_the_replica_with_no_host_reachable(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "release notes");
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::Name("release notes".into()),
-    );
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::PaceDays(1),
-    );
-    desk.set(
-        note.clone(),
-        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
-            rho_desk_client::protocol::cells::Timestamp {
-                unix_ms: 1_000_000_000_000,
-                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-            },
-        )),
-    );
-
-    let workspace = test_workspace(cx);
-    cx.run_until_parked();
-    let before = home_text(&workspace, cx);
-    assert!(
-        !before.contains("release notes"),
-        "nothing is on Home before the replica is read: {before}"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .desk_replica_for_test
-                .insert("local".to_owned(), desk.held());
-            workspace.open_desk_from_replica(HostId::default(), window, cx);
-            workspace.refresh_home(cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let text = home_text(&workspace, cx);
-    assert!(
-        text.contains("release notes"),
-        "the desk the client already holds is on Home without an agent host: {text}"
-    );
-}
-
 fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
     workspace
         .update(cx, |workspace, _, cx| {
@@ -12094,87 +5432,624 @@ fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext)
         .unwrap()
 }
 
-/// Text typed here is kept here. The agent host never sends a client its own
-/// operations back, so a note written on this client and only sent would
-/// be gone from the mirror at the next cold open, and the sync that
-/// follows would ask for words it wrote itself.
-#[gpui::test]
-fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "release notes");
-
+fn overview_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     let workspace = test_workspace(cx);
-    cx.run_until_parked();
-    let sync = workspace
+    workspace
         .update(cx, |workspace, window, cx| {
-            workspace
-                .desk_replica_for_test
-                .insert("local".to_owned(), desk.held());
-            workspace.open_desk_from_replica(HostId::default(), window, cx);
-            let timestamp = rho_desk_client::protocol::TreeClock {
-                value: 9,
-                replica_id: 7,
-            };
-            let operation = rho_desk_client::protocol::TextOperation::Edit {
-                timestamp,
-                version: Vec::new(),
-                ranges: vec![(0, 0)],
-                new_text: vec!["typed here".into()],
-            };
-            workspace.desk.keep_text(
-                HostId::default(),
-                note.clone(),
-                &operation,
-                &rho_desk_client::protocol::TextTransaction {
-                    id: timestamp,
-                    edit_ids: vec![timestamp],
-                },
-            );
-            workspace.desk.sync(HostId::default())
+            workspace.open_startup_overview_for_test(window, cx);
         })
         .unwrap();
-
-    let DeskClientFrame::Sync { bodies, .. } = sync else {
-        panic!("the handshake is a Sync");
-    };
-    assert_eq!(
-        bodies.get(&note).and_then(|held| held.get(&7)).copied(),
-        Some(9),
-        "the operation this client wrote counts as held: {bodies:?}"
-    );
+    workspace
 }
 
-/// The text a client already holds is asked about, not asked for. The
-/// replica holds the note's history, so the sync that follows a cold
-/// open says how much of it is here and the agent host answers with the rest;
-/// before this every sync carried the whole desk's prose.
-#[gpui::test]
-fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "release notes");
-
-    let workspace = test_workspace(cx);
+/// `tab`, as a keystroke: the verdicts over a card, Home over none, and
+/// Home again from the verdict menu's own row.
+fn press_tab(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    cx.simulate_keystrokes(**workspace, "tab");
     cx.run_until_parked();
-    let sync = workspace
+}
+
+/// A frame, so deferred redraws have run before the test reads the surface.
+fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("draw a frame");
+    cx.run_until_parked();
+}
+
+fn agent(id: u64) -> AgentId {
+    AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).unwrap()
+}
+
+/// The transcript the workspace holds for this agent, to edit and feed back.
+fn transcript_of(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+) -> UiAgentState {
+    workspace
+        .update(cx, |workspace, _, _| {
+            workspace.transcript_for_test(agent_id)
+        })
+        .expect("read transcript")
+}
+
+/// Feeds the transcript back with one change, as an agent host that saw more
+/// of the turn would.
+fn feed_edit(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+    edit: impl FnOnce(&mut UiAgentState),
+) {
+    let mut state = transcript_of(workspace, cx, agent_id);
+    edit(&mut state);
+    feed_frame(workspace, cx, agent_id, state);
+}
+
+/// Applies an edit and hands back the state after it, for a run of frames
+/// built up one on the last.
+fn edited_in(state: &mut UiAgentState, edit: impl FnOnce(&mut UiAgentState)) -> UiAgentState {
+    edit(state);
+    state.clone()
+}
+
+/// The assistant message at `index` keeps its first `keep_bytes` and grows
+/// by `value`; past the end, a new message begins.
+fn stream_text(state: &mut UiAgentState, index: usize, keep_bytes: usize, value: &str) {
+    if index == state.blocks.len() {
+        state.blocks.push(Arc::new(assistant("", None)));
+    }
+    let UiBlock::AssistantMessage { text, .. } = Arc::make_mut(&mut state.blocks[index]) else {
+        panic!("block {index} is not an assistant message");
+    };
+    text.truncate(keep_bytes);
+    text.push_str(value);
+}
+
+fn stream_tool_arguments(state: &mut UiAgentState, index: usize, keep_bytes: usize, value: &str) {
+    let UiBlock::Tool(tool) = Arc::make_mut(&mut state.blocks[index]) else {
+        panic!("block {index} is not a tool");
+    };
+    tool.arguments.truncate(keep_bytes);
+    tool.arguments.push_str(value);
+}
+
+fn replace_block(state: &mut UiAgentState, index: usize, block: UiBlock) {
+    if index == state.blocks.len() {
+        state.blocks.push(Arc::new(block));
+    } else {
+        state.blocks[index] = Arc::new(block);
+    }
+}
+
+fn feed_frame(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+    state: UiAgentState,
+) {
+    workspace
         .update(cx, |workspace, window, cx| {
-            workspace
-                .desk_replica_for_test
-                .insert("local".to_owned(), desk.held());
-            workspace.open_desk_from_replica(HostId::default(), window, cx);
-            workspace.desk.sync(HostId::default())
+            // Transcript rendering tests use a selected agent explicitly;
+            // production startup no longer derives selection from a frame.
+            if workspace.is_startup_pane() {
+                workspace.select_agent(Some(agent_id), window, cx);
+            }
+            workspace.seed_transcript_for_test(agent_id, state, window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+}
+
+fn feed_frames(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    frames: impl IntoIterator<Item = (AgentId, UiAgentState)>,
+) {
+    let frames = frames.into_iter().collect::<Vec<_>>();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            if workspace.is_startup_pane()
+                && let Some((agent_id, _)) = frames.first()
+            {
+                workspace.select_agent(Some(*agent_id), window, cx);
+            }
+            for (agent_id, state) in frames {
+                workspace.seed_transcript_for_test(agent_id, state, window, cx);
+            }
+        })
+        .expect("update workspace");
+    cx.update_window((*workspace).into(), |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("flush queued frames");
+    cx.run_until_parked();
+}
+
+fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
+    let editor = active_editor(workspace, cx);
+    editor_excerpt_boundary_count(workspace, &editor, cx)
+}
+
+fn editor_excerpt_boundary_count(
+    workspace: &WindowHandle<Workspace>,
+    editor: &Entity<Editor>,
+    cx: &mut TestAppContext,
+) -> usize {
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                snapshot
+                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
+                    .filter(|(_, block)| {
+                        matches!(
+                            block,
+                            Block::ExcerptBoundary { .. } | Block::BufferHeader { .. }
+                        )
+                    })
+                    .count()
+            })
+        })
+        .expect("inspect excerpt boundaries")
+}
+
+fn user(text: &str) -> UiBlock {
+    UiBlock::UserMessage {
+        text: text.to_owned(),
+    }
+}
+
+fn agent_message(sender: AgentId, text: &str) -> UiBlock {
+    UiBlock::AgentMessage {
+        sender,
+        text: text.to_owned(),
+    }
+}
+
+fn assistant(text: &str, phase: Option<UiMessagePhase>) -> UiBlock {
+    UiBlock::AssistantMessage {
+        text: text.to_owned(),
+        phase,
+    }
+}
+
+fn tool(
+    id: &str,
+    status: UiToolStatus,
+    started_at: Option<u64>,
+    finished_at: Option<u64>,
+) -> UiTool {
+    UiTool {
+        timing: Default::default(),
+        id: id.to_owned(),
+        name: "shell_command".to_owned(),
+        arguments: "echo ok".to_owned(),
+        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
+        preview: None,
+        status,
+        output: None,
+        error: None,
+        started_at: started_at.map(UnixMs),
+        finished_at: finished_at.map(UnixMs),
+        metadata: None,
+    }
+}
+
+fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
+    let blocks = history.into_iter().chain(live).map(Arc::new).collect();
+    UiAgentState {
+        exec_timings: Default::default(),
+        blocks,
+        status: UiAgentStatus::Streaming,
+        context_used: None,
+        usage: Default::default(),
+    }
+}
+
+fn long_working_text() -> String {
+    "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n".to_owned()
+}
+
+/// A done verdict records the story position, not only a local hidden card.
+/// Undo takes that exact ledger mark back and the same story asks again.
+#[gpui::test]
+fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let agent_id = agent(701);
+    let node = rho_dealer::NodeId::Agent(agent_id);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 702),
+                window, cx,
+            );
+            story::feed(workspace, HostId::default(), story_wanting(agent_id, UnixMs(100)), window, cx);
+            assert!(workspace.hand().iter().any(|card| card.node == node));
+            workspace.pull_card(window, cx);
+            assert_eq!(workspace.current_deal_card_for_test(cx).map(|card| card.0), Some(node.clone()));
+            workspace.verdict_done(window, cx);
+            assert!(matches!(workspace.attention.marks.get(&node).handled, Some(rho_dealer::marks::Cursor::Story(pos)) if pos > 0));
+            assert!(!workspace.hand().iter().any(|card| card.node == node));
+            workspace.undo_verdict(window, cx);
+            assert_eq!(workspace.attention.marks.get(&node).handled, None);
+            assert!(workspace.hand().iter().any(|card| card.node == node));
         })
         .unwrap();
+}
 
-    let DeskClientFrame::Sync { bodies, .. } = sync else {
-        panic!("the handshake is a Sync");
-    };
-    let held = bodies
-        .get(&note)
-        .expect("the note whose words came off the disk is named");
-    assert!(
-        !held.is_empty(),
-        "and what is held of it is said, so the agent host sends only the rest: {held:?}"
-    );
+#[gpui::test]
+fn a_future_snooze_hides_an_agent_until_the_mark_ripens(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, NodeId, marks};
+    let workspace = test_workspace(cx);
+    let agent_id = agent(703);
+    let node = NodeId::Agent(agent_id);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 704),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(agent_id, UnixMs(100)),
+                window,
+                cx,
+            );
+            assert!(workspace.hand().iter().any(|card| card.node == node));
+            workspace.write_marks(
+                vec![marks::snooze(&node, Some(DateMark::at(4_000_000_000_000)))],
+                cx,
+            );
+            assert!(!workspace.hand().iter().any(|card| card.node == node));
+            workspace.write_marks(vec![marks::snooze(&node, Some(DateMark::at(1_000)))], cx);
+            assert!(workspace.hand().iter().any(|card| card.node == node));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn toggling_a_label_twice_restores_the_note_and_find_uses_its_path(cx: &mut TestAppContext) {
+    use rho_dealer::marks;
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(vec![marks::body(&note, "Frost report\nDetails")], cx);
+            let (on, _) = workspace.toggle_label(&note, "ops/weather", cx).unwrap();
+            assert!(on);
+            let label = workspace.attention.marks.label_at("ops/weather").unwrap();
+            assert!(workspace.attention.marks.get(&note).labels.contains(&label));
+            let candidate = workspace
+                .find_candidates(cx)
+                .into_iter()
+                .find(|candidate| candidate.target == crate::find::FindTarget::Node(note.clone()))
+                .unwrap();
+            assert!(
+                candidate
+                    .names_for_test()
+                    .iter()
+                    .any(|name| name == "ops/weather › Frost report")
+            );
+            assert!(
+                workspace
+                    .find_rows_for_test("ops/weather", cx)
+                    .iter()
+                    .any(|row| row.value.contains("Frost report"))
+            );
+            workspace.open_node(&note, window, cx);
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Note(note.clone())
+            );
+            let (on, _) = workspace.toggle_label(&note, "ops/weather", cx).unwrap();
+            assert!(!on);
+            assert!(!workspace.attention.marks.get(&note).labels.contains(&label));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn creating_a_note_from_a_label_files_it_and_home_reads_the_dated_card(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, NodeId, marks};
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let label = workspace.mint_label("writing/reviews", cx).unwrap();
+            workspace.open_note(&NodeId::Label(label), window, cx);
+            let areas = workspace.areas_for_test(cx);
+            assert!(areas.iter().any(|(path, _)| path == "writing/reviews"));
+            let note = workspace.create_note(Some(&NodeId::Label(label)), cx);
+            workspace.write_marks(
+                vec![
+                    marks::body(&note, "Review the patch"),
+                    marks::todo(
+                        &note,
+                        Some(marks::Todo {
+                            wakes: Some(DateMark::at(1_000)),
+                            deadline: None,
+                            pace_days: 3,
+                        }),
+                    ),
+                ],
+                cx,
+            );
+            assert!(workspace.attention.marks.get(&note).labels.contains(&label));
+            assert!(workspace.hand().iter().any(|card| card.node == note));
+            workspace.open_home(window, cx);
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    assert!(home_text(&workspace, cx).contains("Review the patch"));
+}
+
+#[gpui::test]
+fn a_phone_flick_moves_from_one_dated_card_to_the_next(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, marks};
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            for title in ["First phone card", "Second phone card"] {
+                let note = workspace.create_note(None, cx);
+                workspace.write_marks(
+                    vec![
+                        marks::body(&note, title),
+                        marks::todo(
+                            &note,
+                            Some(marks::Todo {
+                                wakes: Some(DateMark::at(1_000)),
+                                deadline: None,
+                                pace_days: 3,
+                            }),
+                        ),
+                    ],
+                    cx,
+                );
+            }
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    let first = workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.phone_feed_for_test(cx));
+            workspace.current_deal_card_for_test(cx).unwrap().0
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        for (phase, y, millis) in [
+            (TouchPhase::Started, 600., 0),
+            (TouchPhase::Moved, 300., 80),
+            (TouchPhase::Ended, 300., 100),
+        ] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(1),
+                    phase,
+                    position: point(px(200.), px(y)),
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.phone_feed_for_test(cx));
+            assert_ne!(workspace.current_deal_card_for_test(cx).unwrap().0, first);
+            assert_eq!(
+                workspace.phone_last_gesture_for_test(),
+                Some("flick up · moved")
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn the_new_note_and_agent_area_picker_files_at_the_label_in_view(cx: &mut TestAppContext) {
+    use rho_dealer::NodeId;
+    let workspace = test_workspace(cx);
+    let label = workspace
+        .update(cx, |workspace, window, cx| {
+            let label = workspace.mint_label("software/rho", cx).unwrap();
+            workspace.open_note(&NodeId::Label(label), window, cx);
+            let areas = workspace.areas_for_test(cx);
+            assert!(
+                areas
+                    .iter()
+                    .any(|(path, kind)| path == "software/rho" && kind == "label")
+            );
+            assert!(
+                areas
+                    .iter()
+                    .any(|(path, kind)| path == "here" && kind == "what is on screen")
+            );
+            workspace.begin_new(crate::create::NewKind::Agent, window, cx);
+            assert!(workspace.minibuffer.is_some(), "agent asks for an area");
+            label
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(workspace.draft_area_for_test(), Some(NodeId::Label(label)));
+            workspace.open_note(&NodeId::Label(label), window, cx);
+            workspace.begin_new(crate::create::NewKind::Note, window, cx);
+            assert!(workspace.minibuffer.is_some(), "note asks for an area");
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            let crate::pane::SurfaceKey::Note(NodeId::Note(id)) =
+                workspace.current_surface_key_for_test()
+            else {
+                panic!("new note opens its own surface");
+            };
+            assert!(
+                workspace
+                    .attention
+                    .marks
+                    .get(&NodeId::Note(id))
+                    .labels
+                    .contains(&label)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_note_todo_writes_its_pace_and_undo_restores_the_old_date(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, marks};
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            let old = marks::Todo {
+                wakes: Some(DateMark::at(1_000)),
+                deadline: None,
+                pace_days: 2,
+            };
+            workspace.write_marks(
+                vec![
+                    marks::body(&note, "Pay invoice"),
+                    marks::todo(&note, Some(old)),
+                ],
+                cx,
+            );
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(note.clone())
+            );
+            workspace.verdict_todo(Some(9), window, cx);
+            assert_eq!(
+                workspace.attention.marks.get(&note).todo.unwrap().pace_days,
+                9
+            );
+            workspace.undo_verdict(window, cx);
+            assert_eq!(workspace.attention.marks.get(&note).todo, Some(old));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn muting_a_dated_note_takes_it_out_of_the_hand_until_undo(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, marks};
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(
+                vec![
+                    marks::body(&note, "Read contract"),
+                    marks::todo(
+                        &note,
+                        Some(marks::Todo {
+                            wakes: Some(DateMark::at(1_000)),
+                            deadline: None,
+                            pace_days: 2,
+                        }),
+                    ),
+                ],
+                cx,
+            );
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(note.clone())
+            );
+            workspace.verdict_mute(window, cx);
+            assert!(workspace.attention.marks.get(&note).muted);
+            assert!(!workspace.hand().iter().any(|card| card.node == note));
+            workspace.undo_verdict(window, cx);
+            assert!(!workspace.attention.marks.get(&note).muted);
+            assert!(workspace.hand().iter().any(|card| card.node == note));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn flicking_down_from_an_empty_phone_feed_undoes_its_last_verdict(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, marks};
+    let workspace = test_workspace(cx);
+    let note = workspace
+        .update(cx, |workspace, _, cx| {
+            let note = workspace.create_note(None, cx);
+            workspace.write_marks(
+                vec![
+                    marks::body(&note, "Last phone card"),
+                    marks::todo(
+                        &note,
+                        Some(marks::Todo {
+                            wakes: Some(DateMark::at(1_000)),
+                            deadline: None,
+                            pace_days: 3,
+                        }),
+                    ),
+                ],
+                cx,
+            );
+            note
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    next_frame(cx, workspace);
+    cx.dispatch_action(*workspace, crate::DealDone);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.current_deal_card_for_test(cx), None);
+            workspace.phone_remember_last_verdict_for_test();
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        for (phase, y, millis) in [
+            (TouchPhase::Started, 250., 0),
+            (TouchPhase::Moved, 550., 80),
+            (TouchPhase::Ended, 550., 100),
+        ] {
+            window.dispatch_event(
+                TouchEvent {
+                    id: TouchId(1),
+                    phase,
+                    position: point(px(200.), px(y)),
+                    timestamp: std::time::Duration::from_millis(millis),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+        }
+    })
+    .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(note.clone())
+            );
+            assert!(workspace.phone_feed_is_active_for_test());
+            assert!(workspace.attention.marks.get(&note).todo.is_some());
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -12219,6 +6094,79 @@ fn desktop_advertisements_are_agent_scoped_and_disappear(cx: &mut TestAppContext
                 cx,
             );
             assert!(workspace.available_desktops(agent(1)).is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn q_discards_a_draft_from_surface_history(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["previous"], window, cx);
+            workspace.select_agent(None, window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "draft");
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "q");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_ne!(workspace.current_surface_name_for_test(), "draft");
+            assert!(
+                !workspace
+                    .surface_history_for_test()
+                    .contains(&"draft".to_owned()),
+                "discarded draft remained in surface history"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                "draft",
+                "history reopened the discarded draft"
+            )
+        })
+        .unwrap();
+}
+
+/// Discarding a draft leaves the history cursor where it was, on the
+
+#[gpui::test]
+fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["current"], window, cx);
+            workspace.select_agent(None, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "q");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "current",
+                "discarding the draft left the reader somewhere other than what was under it"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                "draft",
+                "forward walked back into the discarded draft"
+            );
         })
         .unwrap();
 }

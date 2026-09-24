@@ -33,7 +33,6 @@ rho-claude-usage.workspace = true
 rho-agent-types.workspace = true
 rho-agents-client.workspace = true
 rho-db.workspace = true
-rho-desk-server.workspace = true
 rho-ledger-server.workspace = true
 rho-inference.workspace = true
 rho-image.workspace = true

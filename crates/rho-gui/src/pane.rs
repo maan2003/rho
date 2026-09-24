@@ -6,7 +6,6 @@
 
 use camino::Utf8PathBuf;
 use rho_agent_types::AgentId;
-use rho_agents_client::HostId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlackInventoryKind {
@@ -31,15 +30,13 @@ pub enum SurfaceKey {
     /// and an empty queue land.
     Home,
     Messages,
-    /// What the desk has spent: the four usage charts, one screen. Which
+    /// What the agents have spent: the four usage charts, one screen. Which
     /// chart is showing is the screen's own state and not its identity, so
     /// picking another from the menu redraws this surface rather than
     /// opening a second one.
     Usage,
-    DeskNode {
-        host: HostId,
-        node_id: rho_desk_client::protocol::cells::Id,
-    },
+    /// A note, or a label and what carries it.
+    Note(rho_dealer::NodeId),
     Transcript(AgentId),
     File {
         agent_id: AgentId,

@@ -313,6 +313,22 @@ impl RhoDb {
         }
     }
 
+    /// A database held in memory and gone with its last handle, for a
+    /// test or a window with no state directory.
+    pub fn in_memory() -> Self {
+        let database = Database::builder()
+            .set_cache_size(CACHE_SIZE)
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("open in-memory rho-db");
+        Self {
+            database: Arc::new(database),
+            path: Path::new("").into(),
+            write_lock: Arc::new(Mutex::new(())),
+            observer: Arc::new(OnceLock::new()),
+            _lock: None,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

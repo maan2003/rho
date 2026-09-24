@@ -78,7 +78,7 @@ impl PhoneScrollEdge {
 enum PhoneTransition {
     /// Boxed: a card is far larger than a sequence number, and the stack
     /// holds mostly the latter.
-    Flick(Box<crate::dashboard::DealCard>),
+    Flick(Box<rho_dealer::Card>),
     Verdict(u64),
 }
 
@@ -164,7 +164,7 @@ pub(super) struct PhoneUi {
     /// A card arrived while the feed sat empty. The feed is the deal, so it
     /// has to be opened again; only a redraw has the window to do it.
     pub(super) feed_retry: bool,
-    pub(super) dashboard_focus: FocusHandle,
+    pub(super) feed_focus: FocusHandle,
 }
 
 impl PhoneUi {
@@ -172,8 +172,8 @@ impl PhoneUi {
         let forced = std::env::var("RHO_PHONE").is_ok_and(|value| value == "1");
         Self {
             // The first render activates the projection. This keeps native
-            // construction's seeded draft out of the phone history so the
-            // Desk is always the permanent initial root, including with the
+            // construction's seeded draft out of the phone history so
+            // Home is always the permanent initial root, including with the
             // environment override.
             enabled: false,
             forced,
@@ -187,7 +187,7 @@ impl PhoneUi {
             feed_surface: None,
             stack: Vec::new(),
             feed_retry: false,
-            dashboard_focus: cx.focus_handle(),
+            feed_focus: cx.focus_handle(),
         }
     }
 
@@ -309,13 +309,6 @@ impl Workspace {
             self.phone.drag_offset = Pixels::ZERO;
             self.phone.snap = None;
             self.update_statuses(cx);
-            if self.dashboard.set_phone_browse_mode(false) {
-                cx.defer_in(window, |this, _window, cx| this.refresh_dashboard(cx));
-            }
-            self.dashboard
-                .editor()
-                .update(cx, |editor, _| editor.set_read_only(false));
-            window.focus(&self.dashboard.focus_handle(cx), cx);
             cx.defer(|cx| {
                 theme_settings::reset_buffer_font_size(cx);
                 theme_settings::reset_ui_font_size(cx);
@@ -343,7 +336,7 @@ impl Workspace {
             let focus = if model.read(cx).selection_in_prompt(editor, cx) {
                 editor.focus_handle(cx)
             } else {
-                this.phone.dashboard_focus.clone()
+                this.phone.feed_focus.clone()
             };
             window.focus(&focus, cx);
         });
@@ -370,33 +363,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn phone_motion_for_test(&self) -> (f32, Option<(f32, f32)>) {
-        (
-            self.phone.drag_offset.as_f32(),
-            self.phone
-                .snap
-                .map(|snap| (snap.from.as_f32(), snap.to.as_f32())),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_start_snap_for_test(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.start_phone_snap(
-            px(-300.),
-            px(-800.),
-            Some(rho_journal::PhoneFlickDirection::Up),
-            window,
-            cx,
-        );
-    }
-
-    #[cfg(test)]
     pub(crate) fn phone_remember_last_verdict_for_test(&mut self) {
-        let sequence = self.verdict_undo.last().unwrap().sequence;
+        let sequence = self.attention.last_undo().unwrap();
         self.phone
             .transitions
             .push(PhoneTransition::Verdict(sequence));
@@ -408,11 +376,6 @@ impl Workspace {
             .stack
             .iter()
             .any(|(_, candidate)| candidate == key)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_back_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.phone_back(window, cx);
     }
 
     fn phone_surface(&self) -> Option<Surface> {
@@ -440,7 +403,7 @@ impl Workspace {
         self.active_context = context;
         self.show_history_surface(context, surface);
         self.sync_selection_to_focus(cx);
-        window.focus(&self.phone.dashboard_focus, cx);
+        window.focus(&self.phone.feed_focus, cx);
     }
 
     pub(super) fn phone_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -494,8 +457,9 @@ impl Workspace {
 
     fn phone_deal_scroll_edge(&mut self, cx: &mut Context<Self>) -> PhoneScrollEdge {
         let editor = match &self.active_surface().view {
-            super::SurfaceView::DeskNode(editor)
-            | super::SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
+            super::SurfaceView::Note(editor) | super::SurfaceView::Transcript { editor, .. } => {
+                Some(editor.clone())
+            }
             _ => None,
         };
         let Some(editor) = editor else {
@@ -641,7 +605,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let source = direction.and_then(|_| self.open_card_in_view(cx).map(|card| card.identity));
+        let source = direction.and_then(|_| self.open_card_in_view(cx).map(|card| card.node));
         let generation = self.phone.next_snap_generation;
         self.phone.next_snap_generation = self.phone.next_snap_generation.wrapping_add(1);
         self.phone.snap = Some(PhoneSnap {
@@ -665,7 +629,7 @@ impl Workspace {
                     && this.phone.stack.is_empty()
                     && this
                         .card_in_view(cx)
-                        .is_some_and(|card| Some(&card.identity) == source.as_ref())
+                        .is_some_and(|card| Some(&card.node) == source.as_ref())
                 {
                     this.commit_phone_flick(direction, window, cx);
                 }
@@ -689,12 +653,12 @@ impl Workspace {
                 Some(PhoneTransition::Flick(card)) => {
                     // Flicking back is taking the skip back: the card is the
                     // one to look at again, so it opens as it was.
-                    self.dashboard.clear_skip(&card.identity);
+                    self.attention.dealer.clear_skip(&card.node);
                     self.open_card(*card, window, cx);
-                    self.refresh_dashboard(cx);
+                    self.invalidate_dealer_signals(cx);
                 }
                 Some(PhoneTransition::Verdict(sequence))
-                    if self.verdict_undo.last().map(|entry| entry.sequence) == Some(sequence) =>
+                    if self.attention.last_undo() == Some(sequence) =>
                 {
                     self.undo_verdict(window, cx)
                 }
@@ -703,7 +667,7 @@ impl Workspace {
         }
         let after = self.open_card_in_view(cx);
         let moved_card =
-            before.as_ref().map(|card| &card.identity) != after.as_ref().map(|card| &card.identity);
+            before.as_ref().map(|card| &card.node) != after.as_ref().map(|card| &card.node);
         if direction == rho_journal::PhoneFlickDirection::Up
             && moved_card
             && let Some(card) = before
@@ -770,7 +734,7 @@ impl Workspace {
                 let font_size = text_style.font_size.to_pixels(window.rem_size());
                 let font = text_style.font();
                 phone_deal_header_text(
-                    &card.breadcrumb,
+                    &Self::card_path(&card),
                     &card.label,
                     window.viewport_size().width,
                     |text| {
@@ -819,7 +783,7 @@ impl Workspace {
             let body = self.render_surface(&self.active_surface().clone());
             let card = div()
                 .id("phone-deal-card")
-                .track_focus(&self.phone.dashboard_focus)
+                .track_focus(&self.phone.feed_focus)
                 .size_full()
                 .relative()
                 .flex()
@@ -855,7 +819,7 @@ impl Workspace {
             let colors = cx.theme().colors();
             return div()
                 .id("phone-feed-empty")
-                .track_focus(&self.phone.dashboard_focus)
+                .track_focus(&self.phone.feed_focus)
                 .size_full()
                 .flex()
                 .flex_col()
@@ -929,8 +893,7 @@ impl Workspace {
                         .min_h_0()
                         .w_full()
                         .overflow_hidden()
-                        .track_focus(&self.phone.dashboard_focus)
-                        .child(self.render_rail(false, text_style, cx)),
+                        .track_focus(&self.phone.feed_focus),
                 )
                 .child(self.render_phone_bar(cx))
                 .into_any_element()
@@ -943,7 +906,7 @@ impl Workspace {
             .push(PhoneTransition::Verdict(sequence));
     }
 
-    pub(super) fn phone_snap_in_progress(&self) -> bool {
+    pub(crate) fn phone_snap_in_progress(&self) -> bool {
         self.phone.snap.is_some()
     }
 
@@ -975,17 +938,17 @@ impl Workspace {
         if self.phone.snap.is_some() {
             return;
         }
-        let before = self.open_card_in_view(cx).map(|card| card.identity);
-        let undo_before = self.verdict_undo.last().map(|entry| entry.sequence);
+        let before = self.open_card_in_view(cx).map(|card| card.node);
+        let undo_before = self.attention.last_undo();
         run(self, window, cx);
         cx.defer_in(window, move |this, _window, cx| {
-            let after = this.open_card_in_view(cx).map(|card| card.identity);
+            let after = this.open_card_in_view(cx).map(|card| card.node);
             if before.is_some() && before != after {
                 // A verdict that wrote a cell finished inside `run` and
                 // told the phone itself; what is left here is the one that
                 // only moved the card, which still owes the strip its
                 // transition and its record.
-                if let Some(sequence) = this.verdict_undo.last().map(|entry| entry.sequence)
+                if let Some(sequence) = this.attention.last_undo()
                     && Some(sequence) != undo_before
                 {
                     this.phone
@@ -1028,7 +991,7 @@ impl Workspace {
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
                             rho_journal::PhoneVerdict::Done,
-                            Box::new(crate::DashboardDealDone),
+                            Box::new(crate::DealDone),
                             window,
                             cx,
                         );
@@ -1040,7 +1003,7 @@ impl Workspace {
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
                             rho_journal::PhoneVerdict::Mute,
-                            Box::new(crate::DashboardDealMute),
+                            Box::new(crate::DealMute),
                             window,
                             cx,
                         );
@@ -1061,7 +1024,7 @@ impl Workspace {
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
                             rho_journal::PhoneVerdict::Todo,
-                            Box::new(crate::DashboardDealTodo),
+                            Box::new(crate::DealTodo),
                             window,
                             cx,
                         );
@@ -1073,7 +1036,7 @@ impl Workspace {
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
                             rho_journal::PhoneVerdict::File,
-                            Box::new(crate::DashboardDealFile),
+                            Box::new(crate::DealFile),
                             window,
                             cx,
                         );
@@ -1085,7 +1048,7 @@ impl Workspace {
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
                             rho_journal::PhoneVerdict::Reply,
-                            Box::new(crate::DashboardDealReply),
+                            Box::new(crate::DealReply),
                             window,
                             cx,
                         );

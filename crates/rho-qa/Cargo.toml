@@ -37,6 +37,5 @@ tempfile.workspace = true
 bytes.workspace = true
 rho-db.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
-rho-desk-client = { workspace = true, features = ["client"] }
 senax-encoder.workspace = true
 text.workspace = true

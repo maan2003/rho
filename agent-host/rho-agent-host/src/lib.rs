@@ -824,8 +824,6 @@ impl GitTransportBroker {
 struct Services {
     pool: Arc<AgentPool>,
     db: RhoDb,
-    /// The host's copy of the desk, which serves every desk stream.
-    desk: rho_desk_server::DeskServer,
     /// Every device's sealed ledger, kept and passed between them.
     ledger: rho_ledger_server::LedgerServer,
     visualizations: rho_visualizations::VisualizationStore,
@@ -865,13 +863,11 @@ impl Services {
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
-        let desk = rho_desk_server::DeskServer::open(db.clone()).await?;
         let ledger = rho_ledger_server::LedgerServer::open(db.clone()).await;
         let registry = Self {
             pool,
             db,
             claude,
-            desk,
             ledger,
             visualizations,
             inference,
@@ -1036,7 +1032,6 @@ where
 {
     match open.protocol {
         Protocol::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
-        Protocol::Desk => services.desk.serve(reader, writer).await,
         Protocol::Ledger => services.ledger.serve(reader, writer).await,
         Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,

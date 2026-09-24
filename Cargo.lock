@@ -12561,7 +12561,6 @@ dependencies = [
  "rho-claude",
  "rho-claude-usage",
  "rho-db",
- "rho-desk-server",
  "rho-desktop-client",
  "rho-desktop-media",
  "rho-desktop-proto",
@@ -12776,7 +12775,6 @@ dependencies = [
  "rho-agents-client",
  "rho-claude",
  "rho-db",
- "rho-desk-client",
  "rho-desktop-client",
  "rho-files",
  "rho-fs-view",
@@ -12822,50 +12820,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-desk-client"
+name = "rho-dealer"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
- "camino",
  "chrono",
- "clock",
- "futures",
- "prefix-id",
- "rand 0.8.7",
- "redb",
- "rho-agent-hosts",
  "rho-agent-types",
- "rho-agents-client",
- "rho-db",
- "rho-desk-client",
- "rho-rpc",
- "rho-slack",
  "senax-encoder",
- "tempfile",
- "text",
- "tokio",
- "tracing",
  "uuid",
 ]
 
 [[package]]
-name = "rho-desk-server"
+name = "rho-desk-client"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
+ "camino",
+ "clock",
  "redb",
  "rho-agent-types",
  "rho-db",
- "rho-desk-client",
- "rho-rpc",
  "senax-encoder",
- "tempfile",
  "text",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -13093,6 +13069,7 @@ dependencies = [
  "rho-agents-view",
  "rho-browser",
  "rho-db",
+ "rho-dealer",
  "rho-desk-client",
  "rho-desktop-client",
  "rho-desktop-proto",
@@ -13100,6 +13077,7 @@ dependencies = [
  "rho-files",
  "rho-iroh-auth",
  "rho-journal",
+ "rho-ledger",
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
@@ -13202,7 +13180,7 @@ dependencies = [
  "redb",
  "rho-agent-types",
  "rho-db",
- "rho-desk-client",
+ "rho-dealer",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -13313,7 +13291,6 @@ dependencies = [
  "rho-agent-types",
  "rho-agents-client",
  "rho-db",
- "rho-desk-client",
  "rho-fake-model",
  "rho-gui",
  "rho-rpc",

@@ -1,12 +1,10 @@
 //! The Rho GPUI client views and native application integration.
 
+pub(crate) mod attention;
 pub(crate) mod browser;
-pub(crate) mod candidates;
 pub(crate) mod chime;
 pub(crate) mod commands;
 pub(crate) mod create;
-pub mod dashboard;
-pub mod desk_view;
 pub(crate) mod find;
 pub(crate) mod git_approval;
 pub mod home;
@@ -51,49 +49,22 @@ actions!(
         AgentPrevious,
         AgentNext,
         AgentNew,
-        DashboardCancelDraft,
-        DashboardReply,
-        DashboardSubmit,
-        DashboardNow,
-        DashboardArchive,
-        DashboardBack,
-        DashboardJump,
-        DashboardGoto,
-        DashboardToggleAgentTree,
-        DashboardCycleGlobal,
-        DashboardHeadingBelow,
-        DashboardHeadingAbove,
-        DashboardDemote,
-        DashboardPromote,
-        DashboardNewSibling,
-        DashboardNewChild,
-        DashboardMoveSubtreeUp,
-        DashboardMoveSubtreeDown,
-        DashboardDeleteEmpty,
-        DashboardDeleteRow,
-        DashboardYankRow,
-        DashboardPasteRow,
-        DashboardPasteRowBefore,
-        DashboardUndo,
-        DashboardRenameTopic,
-        DashboardDealExit,
-        DashboardDealNext,
-        DashboardDealDone,
-        DashboardDealMute,
-        DashboardDealSnooze,
-        DashboardDealSnoozeMinutes,
-        DashboardDealSnoozeHours,
-        DashboardDealSnoozeWeeks,
-        DashboardDealRoomSnooze,
-        DashboardDealTodo,
+        DealExit,
+        DealNext,
+        DealDone,
+        DealMute,
+        DealSnooze,
+        DealSnoozeMinutes,
+        DealSnoozeHours,
+        DealSnoozeWeeks,
+        DealRoomSnooze,
+        DealTodo,
         UndoVerdict,
-        DashboardDealReply,
-        DashboardDealRefresh,
-        DashboardDealFile,
+        DealReply,
+        DealRefresh,
+        DealFile,
         TaskBoard,
         BrowserExit,
-        RailFocus,
-        RailOpen,
         RootTransient,
         MinibufferConfirm,
         MinibufferCancel,
@@ -273,7 +244,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("ctrl-shift-v", PastePrompt, Some("RhoGui > Editor")),
         // Shift-Escape belongs to the VimFx-style browser layer: it leaves
         // Ignore mode. Keep one explicit Rho escape hatch outside that
-        // vocabulary for returning to the Desk from any website.
+        // vocabulary for returning to rho from any website.
         KeyBinding::new(
             "ctrl-shift-escape",
             BrowserExit,
@@ -342,8 +313,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // transient item, so practiced
     // sequences run at full speed without the menu ever flashing. Bound for
     // normal-mode editors (vim or helix flavor — helix reports
-    // `vim_mode == helix_normal`); the dashboard is an editor too, so the
-    // same contexts cover it.
+    // `vim_mode == helix_normal`); Home is an editor too, so the same
+    // contexts cover it.
     for context in [
         "RhoTerminalNormal",
         "RhoGui > Editor && vim_mode == normal",
@@ -368,19 +339,17 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     ]);
     // `n` and `N` repeat the last search. Vim's own do nothing in this app:
     // they go through a pane's search bar and there is no pane, which is why
-    // `/` is the host's in the first place. Bound in the two contexts that
-    // have a buffer search and nowhere else — a key means one thing per
+    // `/` is the host's in the first place. Bound in the context that
+    // has a buffer search and nowhere else — a key means one thing per
     // context, and the Slack rooms keep their own `shift-n` for the next
     // unread by their own binding, not by being loaded after this one.
-    for surface in ["RhoTranscript", "RhoDashboard"] {
-        for mode in ["normal", "helix_normal"] {
-            let context =
-                format!("{surface} > Editor && vim_mode == {mode} && vim_operator == none");
-            cx.bind_keys([
-                KeyBinding::new("n", SearchRepeat, Some(&context)),
-                KeyBinding::new("shift-n", SearchRepeatReverse, Some(&context)),
-            ]);
-        }
+    for mode in ["normal", "helix_normal"] {
+        let context =
+            format!("RhoTranscript > Editor && vim_mode == {mode} && vim_operator == none");
+        cx.bind_keys([
+            KeyBinding::new("n", SearchRepeat, Some(&context)),
+            KeyBinding::new("shift-n", SearchRepeatReverse, Some(&context)),
+        ]);
     }
     // Slack reads the same way: `enter` opens the row or the thread the
     // cursor is on, `i` goes to the composer and `enter` there sends, `q`
@@ -529,41 +498,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("enter", GitApprovalDeny, Some("RhoGitApproval")),
         KeyBinding::new("escape", GitApprovalDeny, Some("RhoGitApproval")),
     ]);
-    // Desk verbs, vim-native: text editing stays pure vim everywhere.
-    // Talking to agents is one verb: `r` on a heading line opens a draft —
-    // a reply when the heading is staffed, a first message when it isn't —
-    // and propagates to vim (replace-char) anywhere else. Making an agent
-    // is `space n a` from anywhere. Done lives in the verdict menu and
-    // nowhere else, so `o`, `d`, and `x` keep their vim meaning.
-    // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
-    cx.bind_keys([
-        KeyBinding::new(
-            "ctrl-z",
-            DashboardUndo,
-            Some("RhoDashboard > Editor && !VimDeal"),
-        ),
-        // Enter sends from insert mode, but only inside draft rows —
-        // ephemeral message buffers, not document text (esc-o for the
-        // rare multi-line message). The handler propagates everywhere
-        // else so enter stays a newline in the desk itself.
-        KeyBinding::new(
-            "enter",
-            DashboardSubmit,
-            Some("RhoDashboard > Editor && vim_mode == insert && !showing_completions"),
-        ),
-        KeyBinding::new(
-            "q",
-            DashboardCancelDraft,
-            Some("RhoDashboard > Editor && vim_mode == insert"),
-        ),
-        // Not in insert: enter is a newline in the body being typed, and
-        // this binding outranks the submit and newline ones below it.
-        KeyBinding::new(
-            "enter",
-            RailOpen,
-            Some("RhoDashboard > Editor && !VimDeal && vim_mode != insert"),
-        ),
-    ]);
     for context in [
         "RhoNote > Editor && vim_mode == normal && !VimDeal",
         "RhoNote > Editor && vim_mode == helix_normal && !VimDeal",
@@ -578,39 +512,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         editor::actions::Newline,
         Some("RhoNote > Editor && vim_mode == insert"),
     )]);
-    for context in [
-        "RhoDashboard > Editor && vim_mode == normal && !VimDeal",
-        "RhoDashboard > Editor && vim_mode == helix_normal && !VimDeal",
-    ] {
-        cx.bind_keys([
-            KeyBinding::new("enter", RailOpen, Some(context)),
-            KeyBinding::new("r", DashboardReply, Some(context)),
-            KeyBinding::new("shift-tab", DashboardCycleGlobal, Some(context)),
-            KeyBinding::new("> >", DashboardDemote, Some(context)),
-            KeyBinding::new("< <", DashboardPromote, Some(context)),
-            KeyBinding::new("alt-enter", DashboardNewSibling, Some(context)),
-            KeyBinding::new("alt-shift-enter", DashboardNewChild, Some(context)),
-            KeyBinding::new("alt-up", DashboardMoveSubtreeUp, Some(context)),
-            KeyBinding::new("alt-down", DashboardMoveSubtreeDown, Some(context)),
-            KeyBinding::new("backspace", DashboardDeleteEmpty, Some(context)),
-            KeyBinding::new("d d", DashboardDeleteRow, Some(context)),
-            KeyBinding::new("y y", DashboardYankRow, Some(context)),
-            KeyBinding::new("p", DashboardPasteRow, Some(context)),
-            KeyBinding::new("shift-p", DashboardPasteRowBefore, Some(context)),
-            KeyBinding::new("u", DashboardUndo, Some(context)),
-            KeyBinding::new("g n", DashboardNow, Some(context)),
-            KeyBinding::new("g t", DashboardToggleAgentTree, Some(context)),
-            KeyBinding::new("g a", DashboardArchive, Some(context)),
-            KeyBinding::new("g b", DashboardBack, Some(context)),
-            KeyBinding::new("g h", DashboardJump, Some(context)),
-            // Not `c r`: a `c` prefix would shadow helix's change verb.
-            KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
-            // Undoing a verdict is the same verb whether or not a card is
-            // still on screen: a done row on the desk is undone from the
-            // desk. Bound here so it outranks vim's own `shift-u`.
-            KeyBinding::new("shift-u", UndoVerdict, Some(context)),
-        ]);
-    }
     // The top of a transcript is the top of its history, and history is
     // composed as it is asked for, so `gg` here is the transcript's own:
     // it composes everything on the way. Anywhere else the action gives
@@ -628,8 +529,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // the same verb whether or not the card is still on screen.
     for context in [
         "RhoGui > Editor",
-        "RhoGui > RhoDashboard > Editor",
-        "RhoDashboard > Editor",
         "RhoSlackConversation > Editor",
         "RhoSlackList > Editor",
     ] {
@@ -677,7 +576,21 @@ mod tests;
 
 /// The dealer's policy constants as the journal records them at session start.
 pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
-    dashboard::dealer_policy_snapshot()
+    use rho_dealer::curve::*;
+    rho_journal::DealerPolicySnapshot {
+        queue_floor: DEAL_QUEUE_FLOOR,
+        skip_cooldown_minutes: SKIP_COOLDOWN.num_minutes(),
+        blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
+        blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
+        fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
+        thread_reply_head_start: THREAD_REPLY_HEAD_START,
+        channel_traffic_head_start: CHANNEL_TRAFFIC_HEAD_START,
+        channel_answered_drop: CHANNEL_ANSWERED_DROP,
+        lamp_threshold: LAMP_THRESHOLD,
+        chime_threshold: CHIME_THRESHOLD,
+        agent_recency_bonus: AGENT_RECENCY_BONUS,
+        agent_recency_window_ms: AGENT_RECENCY_WINDOW_MS,
+    }
 }
 
 pub mod wayland_view;

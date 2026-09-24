@@ -167,8 +167,6 @@ pub enum Protocol {
     /// The agents: their journal and what is asked of them
     /// (`rho-agents-client`).
     Agents,
-    /// The desk (`rho-desk-client`).
-    Desk,
     /// The desktops in the host's worksets, and a live view of one
     /// (`rho-desktop-client`).
     Desktop,
@@ -699,7 +697,7 @@ mod tests {
         round_trips(envelope.clone());
         assert_eq!(envelope.unpack::<Open>().unwrap(), Open::Session);
         let other = super::Open {
-            protocol: Protocol::Desk,
+            protocol: Protocol::Agents,
             open: envelope.open.clone(),
         };
         assert!(other.unpack::<Open>().is_err());

@@ -7,9 +7,8 @@
 //! that down at the newest entry reaches the dealer.
 
 use gpui::TestAppContext;
-use rho_agents_client::HostId;
 
-use super::{bind_test_keymaps, story, test_workspace};
+use super::{bind_test_keymaps, test_workspace};
 use crate::workspace::Workspace;
 
 /// Up then down is where the reader started. Three surfaces, two steps back,
@@ -107,69 +106,6 @@ fn the_chords_and_the_function_keys_are_the_same_two_steps(cx: &mut TestAppConte
         .unwrap();
 }
 
-/// Down at the newest entry deals: there is nothing forward, so the next
-/// thing that asks for attention is opened and appended, and up from it is
-/// where the reader was.
-#[gpui::test]
-fn down_at_the_newest_entry_deals(cx: &mut TestAppContext) {
-    let mut desk = super::DeskFixture::new();
-    desk.due_note(None, "Card in view");
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let before = workspace
-        .update(cx, |workspace, _, _| {
-            (
-                workspace.current_surface_name_for_test(),
-                workspace.surface_history_ahead_for_test(),
-            )
-        })
-        .unwrap();
-    assert!(
-        before.1.is_empty(),
-        "nothing has been stepped back through, so down cannot step forward"
-    );
-
-    cx.simulate_keystrokes(*workspace, "f20");
-    cx.run_until_parked();
-
-    let dealt = workspace
-        .update(cx, |workspace, _, _| {
-            (
-                workspace.current_surface_name_for_test(),
-                workspace.surface_history_for_test(),
-            )
-        })
-        .unwrap();
-    assert_ne!(
-        dealt.0, before.0,
-        "down at the newest entry opened the card that asks for attention"
-    );
-    assert_eq!(
-        dealt.1.first().map(String::as_str),
-        Some(before.0.as_str()),
-        "and up from the dealt surface is where the reader was"
-    );
-
-    cx.simulate_keystrokes(*workspace, "f21");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), before.0);
-        })
-        .unwrap();
-}
-
-/// A new open with the cursor in the middle appends and never truncates,
-/// which is what the old workspace history did and what was restored. What
-/// was ahead of the reader is behind them afterwards, still reachable.
 #[gpui::test]
 fn opening_with_the_cursor_in_the_middle_keeps_what_was_ahead(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);

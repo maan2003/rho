@@ -31,8 +31,8 @@ members = [
   "crates/rho-journal",
   "crates/rho-desk-client",
   "crates/rho-ledger",
+  "crates/rho-dealer",
   "crates/rho-desktop-client",
-  "agent-host/rho-desk-server",
   "agent-host/rho-ledger-server",
   "agent-host/rho-openai-realtime",
   "agent-host/rho-pr-monitor",
@@ -144,8 +144,8 @@ rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-desk-client = { path = "crates/rho-desk-client" }
 rho-ledger = { path = "crates/rho-ledger" }
+rho-dealer = { path = "crates/rho-dealer" }
 rho-desktop-client = { path = "crates/rho-desktop-client" }
-rho-desk-server = { path = "agent-host/rho-desk-server" }
 rho-ledger-server = { path = "agent-host/rho-ledger-server" }
 rho-openai-realtime = { path = "agent-host/rho-openai-realtime" }
 rho-pr-monitor = { path = "agent-host/rho-pr-monitor" }

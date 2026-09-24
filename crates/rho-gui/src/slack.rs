@@ -6,7 +6,7 @@
 
 use anyhow::Context as _;
 use gpui::AppContext as _;
-use rho_desk_client::protocol::cells::SlackUnit;
+use rho_dealer::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, NextUnread, Unit};
@@ -27,7 +27,7 @@ const NOT_WHILE_EDITING: &str =
 /// in the composer to send as a new message if the reader still wants them.
 const REWRITE_LOST: &str = "slack: that message was deleted; your rewrite is in the composer";
 
-use crate::dashboard::SlackFacts;
+use crate::attention::SlackFacts;
 use crate::minibuffer::Candidate;
 use crate::pane::{SlackInventoryKind, SurfaceKey};
 use crate::workspace::{ContextId, SurfaceView, Workspace};
@@ -204,7 +204,7 @@ impl Workspace {
     }
 }
 
-/// The Slack client the desk holds, and whether it can be trusted.
+/// The Slack client the GUI holds, and whether it can be trusted.
 ///
 /// One session for the whole client, started from the first registered
 /// workspace and not before: a reader with no Slack never opens one. The
@@ -222,11 +222,6 @@ impl Slack {
     /// The session if one has been started.
     pub(crate) fn session(&self) -> Option<gpui::Entity<Session>> {
         self.session.clone()
-    }
-
-    /// Whether a session has been started at all.
-    pub(crate) fn started(&self) -> bool {
-        self.session.is_some()
     }
 
     /// Keeps a session that has just been started.
@@ -691,9 +686,6 @@ impl Workspace {
             workspace.refresh_slack_inventories(window, cx)
         }));
         self.slack.start(session);
-        // The session is the other half of the seed. Whichever half arrives
-        // second runs it; the marker in the mirror is what makes it once.
-        self.seed_slack_cursors(cx);
     }
 
     /// The host services the Slack surfaces borrow: editor chrome and the
@@ -753,30 +745,6 @@ impl Workspace {
             for (unit, before) in cursors {
                 session.undo_handled(unit, before, cx);
             }
-        });
-    }
-
-    /// The one-time seed: what the store's `handled_through` cells said
-    /// becomes rho's local cursor, once, at the first start that has both
-    /// the session and the cells. The cells are not read again and nothing
-    /// deletes them -- they are the record of verdicts made before the
-    /// cursor lived in the mirror.
-    ///
-    /// One pass over the store's facts, once per workspace ever, so the
-    /// per-event cost rule is untouched.
-    pub(crate) fn seed_slack_cursors(&mut self, cx: &mut gpui::Context<Self>) {
-        let Some(session) = self.slack.session() else {
-            return;
-        };
-        if session.read(cx).handled_seeded() {
-            return;
-        }
-        let cells = self.desk.slack_handled_cells();
-        session.update(cx, |session, _| {
-            for (unit, ts) in cells {
-                session.seed_handled(&model_unit(&unit), &Ts(ts.0));
-            }
-            session.set_handled_seeded();
         });
     }
 
@@ -974,7 +942,7 @@ impl Workspace {
                 match element_type.as_str() {
                     "button" => {
                         if let Some(url) = interaction.action.payload["url"].as_str() {
-                            self.create_browser_page(url.to_owned(), None, window, cx);
+                            self.create_browser_page(url.to_owned(), window, cx);
                         } else {
                             view.update(cx, |view, cx| view.run_interaction(interaction, None, cx));
                         }
@@ -1025,7 +993,7 @@ impl Workspace {
                 if let Some(target) = archive {
                     self.open_slack_search_target(target, window, cx);
                 } else {
-                    self.create_browser_page(link, None, window, cx);
+                    self.create_browser_page(link, window, cx);
                 }
                 return;
             }
@@ -1904,10 +1872,8 @@ impl Workspace {
             return;
         };
         let key = &key;
-        let Some(card) = self.dashboard.thread_card_id(unit) else {
-            return;
-        };
-        if !self.dashboard.node_is_open(card.clone()) {
+        let node = rho_dealer::NodeId::Slack(unit.clone());
+        if !self.hand().iter().any(|card| card.node == node) {
             return;
         }
         let thread = self
@@ -1919,7 +1885,7 @@ impl Workspace {
             thread,
             by: rho_journal::IgnoredBy::Slack,
         });
-        self.refresh_dashboard(cx);
+        self.invalidate_dealer_signals(cx);
     }
 
     /// `mark read before`: the backlog older than a cutoff, marked read in
@@ -1949,8 +1915,8 @@ impl Workspace {
                     }],
                 }
             }),
-            std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
-                workspace.slack_mark_read_before(&input, window, cx);
+            std::rc::Rc::new(|workspace: &mut Workspace, input, _, cx| {
+                workspace.slack_mark_read_before(&input, cx);
             }),
             window,
             cx,
@@ -1970,12 +1936,7 @@ impl Workspace {
         Some((plan.conversations.len(), plan.threads.len()))
     }
 
-    pub(crate) fn slack_mark_read_before(
-        &mut self,
-        input: &str,
-        window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
+    pub(crate) fn slack_mark_read_before(&mut self, input: &str, cx: &mut gpui::Context<Self>) {
         let text = mark_cutoff_text(input);
         let Some(cutoff) = parse_mark_cutoff(&text, chrono::Local::now()) else {
             self.echo(
@@ -1999,41 +1960,33 @@ impl Workspace {
         // again on the next start. Every unit the plan covers gets one, at
         // the newest message at or before the cutoff, so anything that
         // arrived since is still theirs.
-        let host = self.hosts.owner();
         let workspace_name = session.read(cx).model().workspace().clone();
-        let mut nodes: Vec<(
-            rho_desk_client::protocol::cells::Id,
-            rho_desk_client::protocol::cells::SlackTs,
-        )> = plan
+        let mut units: Vec<(SlackUnit, Ts)> = plan
             .conversations
             .iter()
             .map(|(channel, ts)| {
-                (
-                    rho_desk_client::protocol::cells::Id::Slack(SlackUnit {
-                        workspace: workspace_name.0.clone(),
-                        channel: channel.0.clone(),
-                        thread: None,
-                    }),
-                    rho_desk_client::protocol::cells::SlackTs(ts.0.clone()),
-                )
+                let unit = SlackUnit {
+                    workspace: workspace_name.0.clone(),
+                    channel: channel.0.clone(),
+                    thread: None,
+                };
+                (unit, ts.clone())
             })
-            .chain(plan.threads.iter().map(|(key, ts)| {
-                (
-                    rho_desk_client::protocol::cells::Id::Slack(store_unit_of(key)),
-                    rho_desk_client::protocol::cells::SlackTs(ts.0.clone()),
-                )
-            }))
+            .chain(
+                plan.threads
+                    .iter()
+                    .map(|(key, ts)| (store_unit_of(key), ts.clone())),
+            )
             .collect();
         // A card older than the cutoff whose unit Slack has nothing unread
         // for is backlog just the same, closed at its own newest.
         let model = session.read(cx).model();
-        for (node, cursor) in cards_before(self.dashboard.open_thread_cards(), model, host, before)
-        {
-            if !nodes.iter().any(|(known, _)| known == &node) {
-                nodes.push((node, cursor));
+        for (unit, cursor) in cards_before(&self.hand(), model, before) {
+            if !units.iter().any(|(known, _)| known == &unit) {
+                units.push((unit, cursor));
             }
         }
-        if conversations == 0 && threads == 0 && nodes.is_empty() {
+        if conversations == 0 && threads == 0 && units.is_empty() {
             self.echo(
                 &format!("mark read before {text}: nothing that old"),
                 StyleClass::SystemInfo,
@@ -2042,12 +1995,7 @@ impl Workspace {
             return;
         }
         session.update(cx, |session, cx| session.mark_read_before(plan, cx));
-        let closed = match host {
-            Some(host) => {
-                self.mark_cards_done(host, nodes, "mark read before".to_owned(), window, cx)
-            }
-            None => 0,
-        };
+        let closed = self.mark_slack_done(units, "mark read before".to_owned(), cx);
         rho_journal::record(rho_journal::Event::SlackMarkedReadBefore {
             cutoff: text.clone(),
             conversations,
@@ -3081,9 +3029,7 @@ impl Workspace {
                 // The mirror moved, so the join every Slack card is derived
                 // from has to be rebuilt: a unit that started to matter is a
                 // row the moment the message lands, with nothing written.
-                if let Some(host) = self.hosts.owner() {
-                    self.sync_tree_dashboard(host, window, cx);
-                }
+                self.refresh_slack_wants(cx);
                 self.invalidate_dealer_signals(cx);
             }
             SessionEvent::Notice(text) => {
@@ -3137,8 +3083,8 @@ fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> rho_journal::Slack
 }
 
 impl Workspace {
-    /// The unit a conversation surface stands for: the desk's own id for
-    /// what is on screen, whether or not the desk has a card for it. Only
+    /// The unit a conversation surface stands for: the dealer's own id for
+    /// what is on screen, whether or not the hand has a card for it. Only
     /// the workspace's name comes from the session, so this is `None`
     /// exactly when there is no session at all.
     pub(crate) fn slack_surface_unit(&self, source: &Source, cx: &gpui::App) -> Option<SlackUnit> {
@@ -3147,17 +3093,13 @@ impl Workspace {
         Some(unit_of_source(&workspace, source))
     }
 
-    /// What every tracked unit is currently about. The dealer reads this
-    /// live from the mirror rather than storing any of it in the tree.
-    ///
-    /// Whether a unit is a *card* is not decided here any more: each one
-    /// carries `reason`, which is the crate's answer to whether Slack
-    /// itself would be badging it, and the desk closes the ones it says
-    /// nothing for. A mention read on the phone this morning has a reason
-    /// of `None` and is not handed to anybody.
-    /// The Slack facts the desk is built from. The crate answers what it is
-    /// asking about and in what words; this is the map from its cards onto
-    /// the desk's own cells, and it decides nothing.
+    /// What every tracked unit is currently about, read live from the
+    /// mirror. The crate answers what it is asking about and in what words;
+    /// this is the map from its cards onto the dealer's units, and it
+    /// decides nothing. Each carries `reason`, the crate's answer to whether
+    /// Slack itself would be badging it, and a unit with none makes no
+    /// want: a mention read on the phone this morning is not handed to
+    /// anybody.
     pub(crate) fn slack_thread_facts(
         &self,
         cx: &gpui::App,
@@ -3171,51 +3113,35 @@ impl Workspace {
         session
             .tracked_cards(now.timestamp_millis())
             .into_iter()
-            .filter_map(|card| {
-                let raised_at = chrono::DateTime::from_timestamp_millis(card.first_seen_ms)?
-                    .with_timezone(&now.timezone())
-                    .fixed_offset();
-                Some((
+            .map(|card| {
+                (
                     store_unit(workspace, &card.unit),
                     SlackFacts {
                         title: card.title,
                         conversation: card.conversation.clone(),
                         reason: card.attention,
-                        raised_at,
                         wait_days: card.wait_days,
                         latest: card.newest.0,
-                        newest_from_other: card.newest_from_other.map(|ts| ts.0),
                         others_replied: card.others_replied,
                     },
-                ))
+                )
             })
             .collect()
     }
 }
 
-/// Which open thread cards this host's cutoff closes. Whether the cutoff
+/// Which Slack cards in the hand a cutoff closes. Whether the cutoff
 /// closes a unit at all is Slack's question and `Model::closed_by` answers
-/// it — a unit the mirror has nothing to say about is left alone; which
-/// cards belong to this host is the desk's, and that is all that is decided
-/// here.
-fn cards_before(
-    cards: Vec<(crate::dashboard::DealCardId, SlackUnit)>,
-    model: &Model,
-    host: Option<rho_agents_client::HostId>,
-    before: f64,
-) -> Vec<(
-    rho_desk_client::protocol::cells::Id,
-    rho_desk_client::protocol::cells::SlackTs,
-)> {
-    cards
-        .into_iter()
-        .filter(|(card, _)| Some(card.host) == host)
-        .filter_map(|(card, thread)| {
-            let closed = model.closed_by(&model_unit(&thread), before)?;
-            Some((
-                card.node_id,
-                rho_desk_client::protocol::cells::SlackTs(closed.0),
-            ))
+/// it; a unit the mirror has nothing to say about is left alone.
+fn cards_before(hand: &[rho_dealer::Card], model: &Model, before: f64) -> Vec<(SlackUnit, Ts)> {
+    hand.iter()
+        .filter_map(|card| match &card.node {
+            rho_dealer::NodeId::Slack(unit) => Some(unit),
+            _ => None,
+        })
+        .filter_map(|unit| {
+            let closed = model.closed_by(&model_unit(unit), before)?;
+            Some((unit.clone(), closed))
         })
         .collect()
 }
@@ -3477,25 +3403,21 @@ mod tests {
         for ts in ["100.0", "900.0"] {
             model.note_message(&message(ts, Some(ts), "U1", "any update?"), 0);
         }
-        let host = rho_agents_client::HostId::default();
-        let node = |counter: u8| {
-            rho_desk_client::protocol::cells::Id::Note(rho_desk_client::protocol::cells::Uuid(
-                [counter; 16],
-            ))
+        let card = |unit: SlackUnit| rho_dealer::Card {
+            node: rho_dealer::NodeId::Slack(unit),
+            kind: rho_dealer::CardKind::Slack,
+            title: String::new(),
+            context: String::new(),
+            label: String::new(),
+            priority: 1.0,
+            cursor: String::new(),
+            skipped: false,
         };
-        let card = |node_id| crate::dashboard::DealCardId { host, node_id };
-        let cards = vec![
-            (card(node(1)), thread_ref_of("100.0")),
-            (card(node(2)), thread_ref_of("900.0")),
-            (card(node(3)), thread_ref_of("50.0")),
-        ];
+        let hand = ["100.0", "900.0", "50.0"].map(|ts| card(thread_ref_of(ts)));
 
         assert_eq!(
-            cards_before(cards, &model, Some(host), 500.0),
-            vec![(
-                node(1),
-                rho_desk_client::protocol::cells::SlackTs("100.0".to_owned())
-            )],
+            cards_before(&hand, &model, 500.0),
+            vec![(thread_ref_of("100.0"), Ts("100.0".to_owned()))],
             "the newer thread stays, and one the mirror has nothing on is left alone"
         );
     }

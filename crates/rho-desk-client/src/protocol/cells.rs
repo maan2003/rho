@@ -51,14 +51,6 @@ impl PartialOrd for Stamp {
 )]
 pub struct Uuid(pub [u8; 16]);
 
-impl Uuid {
-    pub fn random() -> Self {
-        let mut bytes = [0u8; 16];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
-        Self(bytes)
-    }
-}
-
 /// What Slack calls a place a conversation happens: a direct or group
 /// conversation, a channel, or a followed thread. Never a message, which is
 /// what made a done thread come back the moment history loaded.

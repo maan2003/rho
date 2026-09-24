@@ -19,13 +19,13 @@ use gpui::{App, Context, Entity, HighlightStyle, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_agent_types::AgentId;
+use rho_dealer::curve::{LAMP_THRESHOLD, age_label};
+use rho_dealer::{Card, CardKind, NodeId};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
 
-use crate::dashboard::{DealCard, DealCardId, DealCardKind, LAMP_THRESHOLD, age_label};
-
 /// Home's own highlight-key space, clear of the transcript's semantic slots
-/// at zero, the dashboard's and Slack's at the top, and the shell's ANSI
+/// at zero, Slack's at the top, and the shell's ANSI
 /// block at half. Buckets grow upwards from here.
 const HOME_KEY_BASE: usize = usize::MAX / 3;
 
@@ -39,7 +39,7 @@ pub(crate) const HOME_CAP: usize = 5;
 pub(crate) struct HomeRow {
     pub title: String,
     pub label: String,
-    pub card: DealCardId,
+    pub card: NodeId,
     /// Passed over by a pull. The card is still open and still ranked here;
     /// the word is how Home says the reader has already seen it.
     pub skipped: bool,
@@ -74,11 +74,11 @@ impl HomeRows {
 /// Splits the dealer's hand at the lamp threshold. Above it something is
 /// asking; below it the card is merely around, which is exactly the line
 /// the lamp already draws, so Home cannot disagree with the lamp.
-pub(crate) fn split_hand(cards: &[DealCard], title: impl Fn(&DealCard) -> String) -> HomeRows {
-    let row = |card: &DealCard| HomeRow {
+pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> HomeRows {
+    let row = |card: &Card| HomeRow {
         title: title(card),
         label: card.label.clone(),
-        card: card.identity.clone(),
+        card: card.node.clone(),
         skipped: card.skipped,
     };
     HomeRows {
@@ -98,20 +98,16 @@ pub(crate) fn split_hand(cards: &[DealCard], title: impl Fn(&DealCard) -> String
     }
 }
 
-/// What a card is called on a Home row. An agent is its tag, a thread is
-/// its conversation and what it is about, and everything else is the desk
-/// path the deal bar shows.
-pub(crate) fn card_title(card: &DealCard, agent_tag: impl Fn(AgentId) -> String) -> String {
-    match card.kind {
-        DealCardKind::Agent => card
-            .agent_id
-            .map_or_else(|| card.breadcrumb.clone(), agent_tag),
-        DealCardKind::Thread => match &card.room {
-            Some(room) if !card.breadcrumb.is_empty() => format!("{room} › {}", card.breadcrumb),
-            Some(room) => room.clone(),
-            None => card.breadcrumb.clone(),
-        },
-        DealCardKind::Desk => card.breadcrumb.clone(),
+/// What a card is called on a Home row. An agent is its tag, a Slack card
+/// is its conversation and what it is about, and anything else is its
+/// title.
+pub(crate) fn card_title(card: &Card, agent_tag: impl Fn(AgentId) -> String) -> String {
+    match (card.kind, &card.node) {
+        (CardKind::Agent, NodeId::Agent(agent_id)) => agent_tag(*agent_id),
+        (CardKind::Slack, _) if card.context.is_empty() => card.title.clone(),
+        (CardKind::Slack, _) if card.title.is_empty() => card.context.clone(),
+        (CardKind::Slack, _) => format!("{} › {}", card.context, card.title),
+        _ => card.title.clone(),
     }
 }
 
@@ -135,7 +131,7 @@ pub(crate) fn running_elapsed_label(facts: &rho_agents_client::AgentFacts, now_m
 /// and opens nothing of its own: a row is a card, and a card is dealt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HomeTarget {
-    Card(DealCardId),
+    Card(NodeId),
     Agent(AgentId),
     /// A section heading or the empty line: nothing to open.
     None,
@@ -146,7 +142,7 @@ pub(crate) enum HomeTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum HomeKey {
     Section(&'static str),
-    Card(DealCardId),
+    Card(NodeId),
     Agent(AgentId),
     Empty,
 }
@@ -463,30 +459,18 @@ impl gpui::Render for HomeView {
 
 #[cfg(test)]
 mod tests {
-    use rho_agents_client::HostId;
-
     use super::*;
 
-    fn card(title: &str, priority: f64) -> DealCard {
-        DealCard {
-            skipped: false,
+    fn card(title: &str, priority: f64) -> Card {
+        Card {
+            node: NodeId::Note(uuid::Uuid::nil()),
+            kind: CardKind::Dated,
+            title: title.to_owned(),
+            context: String::new(),
             label: format!("needs reply · {priority}"),
             priority,
-            host: HostId::default(),
-            topic_node_id: rho_desk_client::protocol::cells::Id::Note(
-                rho_desk_client::protocol::cells::Uuid([0; 16]),
-            ),
-            agent_id: None,
-            agent_tag: None,
-            breadcrumb: title.to_owned(),
-            room: None,
-            kind: DealCardKind::Desk,
-            identity: DealCardId {
-                host: HostId::default(),
-                node_id: rho_desk_client::protocol::cells::Id::Note(
-                    rho_desk_client::protocol::cells::Uuid([0; 16]),
-                ),
-            },
+            cursor: String::new(),
+            skipped: false,
         }
     }
 
@@ -499,7 +483,7 @@ mod tests {
         for below in 0..7 {
             cards.push(card(&format!("around {below}"), 0.4 - below as f64 * 0.1));
         }
-        let rows = split_hand(&cards, |card| card.breadcrumb.clone());
+        let rows = split_hand(&cards, |card| card.title.clone());
         assert_eq!(rows.next.len(), HOME_CAP);
         assert_eq!(rows.later.len(), HOME_CAP);
         assert_eq!(rows.next[0].title, "asking 0", "the dealer's order stands");
@@ -507,7 +491,7 @@ mod tests {
 
         // Exactly at the threshold the lamp is on, so the row is asking.
         let rows = split_hand(&[card("on the line", LAMP_THRESHOLD)], |card| {
-            card.breadcrumb.clone()
+            card.title.clone()
         });
         assert_eq!(rows.next.len(), 1);
         assert!(rows.later.is_empty());
@@ -515,10 +499,10 @@ mod tests {
 
     #[test]
     fn a_row_says_what_the_deal_bar_says() {
-        let thread = DealCard {
-            room: Some("#design".to_owned()),
-            breadcrumb: "can you look at the deploy?".to_owned(),
-            kind: DealCardKind::Thread,
+        let thread = Card {
+            context: "#design".to_owned(),
+            title: "can you look at the deploy?".to_owned(),
+            kind: CardKind::Slack,
             label: "needs reply · 1.9h".to_owned(),
             skipped: false,
             ..card("", 2.0)
@@ -529,10 +513,12 @@ mod tests {
         assert_eq!(rows.next[0].title, "#design › can you look at the deploy?");
         assert_eq!(rows.next[0].label, "needs reply · 1.9h");
 
-        let agent = DealCard {
-            agent_id: Some(AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap()),
-            kind: DealCardKind::Agent,
-            breadcrumb: "slack polish".to_owned(),
+        let agent = Card {
+            node: NodeId::Agent(
+                AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap(),
+            ),
+            kind: CardKind::Agent,
+            title: "slack polish".to_owned(),
             ..card("", 1.0)
         };
         assert_eq!(

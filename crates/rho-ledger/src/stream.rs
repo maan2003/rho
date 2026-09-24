@@ -62,13 +62,15 @@ impl LedgerStreams {
         moved
     }
 
-    /// Takes the key the user's devices share and puts everything this
-    /// device wrote before it to every host. The hosts' streams read
-    /// again once they reconnect.
+    /// Takes the key the user's devices share, puts everything this device
+    /// wrote before it to every host, and reads what other devices wrote
+    /// while it had none.
     pub async fn set_key(&self, key: LedgerKey) -> anyhow::Result<()> {
-        if let Some(base) = self.ledger.set_key(key).await? {
+        let (base, received) = self.ledger.set_key(key).await?;
+        if let Some(base) = base {
             let _ = self.puts.send(base);
         }
+        self.report(received);
         Ok(())
     }
 
@@ -76,6 +78,19 @@ impl LedgerStreams {
     /// connection.
     pub fn stream(self: &Arc<Self>) -> Arc<dyn HostStream> {
         Arc::new(LedgerStream(Arc::clone(self)))
+    }
+}
+
+impl LedgerStreams {
+    fn report(&self, received: crate::Received) {
+        if received.needs_key {
+            let _ = self.events.unbounded_send(LedgerEvent::NeedsKey);
+        }
+        if !received.changes.is_empty() {
+            let _ = self
+                .events
+                .unbounded_send(LedgerEvent::Changed(received.changes));
+        }
     }
 }
 
@@ -141,14 +156,7 @@ impl LedgerStreams {
                         .events
                         .unbounded_send(LedgerEvent::Unreadable { device });
                 }
-                if received.needs_key {
-                    let _ = self.events.unbounded_send(LedgerEvent::NeedsKey);
-                }
-                if !received.changes.is_empty() {
-                    let _ = self
-                        .events
-                        .unbounded_send(LedgerEvent::Changed(received.changes));
-                }
+                self.report(received);
             }
         };
         let write = async {

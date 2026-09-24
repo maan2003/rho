@@ -11,7 +11,6 @@ use rho_agent_types::{
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
 use rho_agents_client::stream::AgentFrame;
-use rho_desk_client::stream::DeskFrame;
 use rho_rpc::protocol::{Answer, Open, read_frame, write_frame};
 use senax_encoder::{Packer, Unpacker};
 
@@ -278,7 +277,6 @@ thread_local! {
 pub enum Frame {
     Control(ConnEvent),
     Agents(AgentFrame),
-    Desk(DeskFrame),
     Many(Vec<Frame>),
 }
 
@@ -294,13 +292,7 @@ impl From<AgentFrame> for Frame {
     }
 }
 
-impl From<DeskFrame> for Frame {
-    fn from(frame: DeskFrame) -> Self {
-        Self::Desk(frame)
-    }
-}
-
-/// One frame into the workspace: a control- or desk-stream event straight in,
+/// One frame into the workspace: a control event straight in,
 /// an agents-stream frame through the same `ingest` the model thread runs,
 /// called inline so a test stays in one thread and can assert in the frame
 /// it fed.
@@ -313,7 +305,6 @@ pub fn feed(
 ) {
     match frame.into() {
         Frame::Control(event) => workspace.handle_event(host, event, window, cx),
-        Frame::Desk(frame) => workspace.handle_desk_event(host, frame, window, cx),
         Frame::Agents(frame) => {
             let followed = workspace.followed();
             let events = MODEL.with(|model| {

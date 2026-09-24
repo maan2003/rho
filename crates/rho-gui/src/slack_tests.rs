@@ -2937,18 +2937,15 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
         "mentions, DMs and followed threads update in-app cards without desktop popups"
     );
 
-    // And every one of them ranks above the floor the dealer drops cards at.
-    let now = chrono::Local::now().fixed_offset();
-    for (unit, facts) in &facts {
-        if facts.reason.is_none() {
-            continue;
-        }
-        let (label, priority) = crate::dashboard::thread_card_facts(facts, now);
-        assert!(
-            priority > crate::dashboard::DEAL_QUEUE_FLOOR,
-            "{unit:?} says {label:?} at {priority}, which the dealer drops"
-        );
-    }
+    let hand = workspace
+        .update(cx, |workspace, _, _| workspace.hand())
+        .unwrap();
+    assert!(
+        hand.iter()
+            .filter(|card| matches!(card.node, rho_dealer::NodeId::Slack(_)))
+            .count()
+            >= 4
+    );
 }
 
 /// Opening a conversation tells Slack nothing about what has been read.
@@ -3070,7 +3067,7 @@ async fn workspace_with_slack(
 async fn wait_for_reasons(
     cx: &mut TestAppContext,
     workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
-    wanted: &[rho_desk_client::protocol::cells::SlackUnit],
+    wanted: &[rho_dealer::SlackUnit],
 ) {
     for _ in 0..300 {
         cx.run_until_parked();
@@ -3090,8 +3087,8 @@ async fn wait_for_reasons(
     panic!("the fake's units never asked for the reader");
 }
 
-fn slack_unit(channel: &str, thread: Option<&str>) -> rho_desk_client::protocol::cells::SlackUnit {
-    rho_desk_client::protocol::cells::SlackUnit {
+fn slack_unit(channel: &str, thread: Option<&str>) -> rho_dealer::SlackUnit {
+    rho_dealer::SlackUnit {
         workspace: "acme".to_owned(),
         channel: channel.to_owned(),
         thread: thread.map(str::to_owned),
@@ -3101,7 +3098,7 @@ fn slack_unit(channel: &str, thread: Option<&str>) -> rho_desk_client::protocol:
 fn reason_of(
     workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
     cx: &mut TestAppContext,
-    unit: &rho_desk_client::protocol::cells::SlackUnit,
+    unit: &rho_dealer::SlackUnit,
 ) -> Option<rho_slack::model::Attention> {
     workspace
         .update(cx, |workspace, _, cx| {
@@ -3235,22 +3232,14 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
     wait_for_reasons(cx, &workspace, &[direct.clone(), mention.clone()]).await;
 
     let closed = workspace
-        .update(cx, |workspace, window, cx| {
-            let cursor = |ts: &str| rho_desk_client::protocol::cells::SlackTs(ts.to_owned());
-            workspace.mark_cards_done(
-                rho_agents_client::HostId::default(),
+        .update(cx, |workspace, _, cx| {
+            let cursor = |ts: &str| rho_slack::types::Ts(ts.to_owned());
+            workspace.mark_slack_done(
                 vec![
-                    (
-                        rho_desk_client::protocol::cells::Id::Slack(direct.clone()),
-                        cursor("1800000100.000000"),
-                    ),
-                    (
-                        rho_desk_client::protocol::cells::Id::Slack(mention.clone()),
-                        cursor("1800000200.000000"),
-                    ),
+                    (direct.clone(), cursor("1800000100.000000")),
+                    (mention.clone(), cursor("1800000200.000000")),
                 ],
                 "mark read before".to_owned(),
-                window,
                 cx,
             )
         })
@@ -3268,8 +3257,7 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
     );
     assert_eq!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .verdict_undo_count_for_test())
+            .update(cx, |workspace, _, _| workspace.attention.undo.len())
             .unwrap(),
         1,
         "one keystroke leaves one thing to undo"
@@ -3287,90 +3275,12 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
     );
     assert_eq!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .verdict_undo_count_for_test())
+            .update(cx, |workspace, _, _| workspace.attention.undo.len())
             .unwrap(),
         0
     );
 }
 
-/// A unit is a virtual node: it is Slack's ids and nothing rho writes, and
-/// it becomes a row of rho's own only when a cell is written that Slack has
-/// no place for — a snooze, a name, labels, About. The done cursor is not
-/// one of those. So a unit the mirror has stopped mentioning is off the map
-/// even though the `SlackHandledThrough` cell an older rho wrote for it is
-/// still in the store: nothing deletes those cells, the desk stops reading
-/// them. A unit the user did name stays, because the name is theirs.
-#[gpui::test]
-fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppContext) {
-    let mut desk = crate::tests::DeskFixture::new();
-    // Asking: the mirror still has something to say about it.
-    let asking = desk.thread_row(None, "C1", "500.0");
-    // Stale: no source, and one cell, the cursor a version of rho before
-    // 8 Sep wrote when the user pressed `d`.
-    let stale = rho_desk_client::protocol::cells::Id::Slack(slack_unit("C2", Some("300.0")));
-    desk.set(
-        stale.clone(),
-        rho_desk_client::protocol::cells::Property::SlackHandledThrough(
-            rho_desk_client::protocol::cells::SlackTs("300.5".to_owned()),
-        ),
-    );
-    // Named: no source either, but the name is a fact Slack has nowhere to
-    // keep, so the unit is a node of rho's own.
-    let named = rho_desk_client::protocol::cells::Id::Slack(slack_unit("C3", Some("400.0")));
-    desk.set(
-        named.clone(),
-        rho_desk_client::protocol::cells::Property::Name("the release".to_owned()),
-    );
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            crate::tests::story::feed(
-                workspace,
-                rho_agents_client::HostId::default(),
-                desk.synced(),
-                window,
-                cx,
-            );
-            workspace.set_slack_sources_for_test(
-                rho_agents_client::HostId::default(),
-                desk.slack_sources(),
-                window,
-                cx,
-            );
-            let rows = workspace
-                .desk
-                .nodes(rho_agents_client::HostId::default())
-                .iter()
-                .map(|node| node.id.clone())
-                .collect::<Vec<_>>();
-            assert!(
-                rows.contains(&asking),
-                "the unit the mirror is still asking about is a row"
-            );
-            assert!(
-                rows.contains(&named),
-                "the name is rho's own, so the unit it is on is a row: {rows:?}"
-            );
-            assert!(
-                !rows.contains(&stale),
-                "a cursor cell is not a node: {rows:?}"
-            );
-        })
-        .unwrap();
-}
-
-/// A mute is Slack's (8 Sep): a channel or direct message is muted there,
-/// and rho writes no cell of its own. The card closes because Slack has
-/// stopped asking -- the crate reads the muted set -- and `shift-u` unmutes
-/// there, which is the only thing that brings it back. Before this the mute
-/// was a `State(Muted)` cell that drifted the moment the user muted or
-/// unmuted in another client, and opening the unit here silently unmuted it
-/// for them everywhere.
-///
-/// Was: `tests.rs`, `a_muted_slack_unit_stays_off_home_until_it_is_opened`
-/// and `undoing_a_mute_puts_the_unit_back_as_it_was`, both against the cell.
 #[gpui::test]
 async fn a_mute_is_made_in_slack_and_undone_there(cx: &mut TestAppContext) {
     use rho_slack::fake::Fake;
@@ -3490,8 +3400,7 @@ async fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
     );
     assert_eq!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .verdict_undo_count_for_test())
+            .update(cx, |workspace, _, _| workspace.attention.undo.len())
             .unwrap(),
         0,
         "a verdict made in another client is not this one's to undo"
@@ -3519,239 +3428,6 @@ async fn wait_for_muted(
     fake.muted()
 }
 
-/// `tab` over a Slack conversation opens the verdicts, and `tab` again,
-/// from the menu's own row, is Home.
-///
-/// The same rule as an agent card: HOME-DESIGN says the verdicts open on
-/// any surface that is a card, and a Slack conversation is one. It held
-/// only for a unit the dealer had a card for, so walking into a channel
-/// Slack was quiet about answered `tab` with Home -- and a channel is
-/// exactly where the reader wants `x`, `s` or a name.
-#[gpui::test]
-async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
-    cx: &mut TestAppContext,
-) {
-    use rho_slack::fake::Fake;
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    cx.executor().allow_parking();
-    let fake = cx
-        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
-        .await
-        .unwrap()
-        .unwrap();
-    seed_workspace(&fake);
-
-    // A desk of the primary host's, so the unit the fake is asking about
-    // is a row and the dealer has a card to deal.
-    let desk = crate::tests::DeskFixture::new();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            crate::tests::story::feed(
-                workspace,
-                rho_agents_client::HostId::default(),
-                desk.synced(),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-
-    let state = tempfile::tempdir().expect("a state directory of this test's own");
-    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
-    fake.push_frame(
-        serde_json::json!({"type": "message", "channel": "D1", "ts": "1800000100.000000", "user": "UA", "text": "are you around?"}),
-    );
-    let unit = slack_unit("D1", None);
-    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
-
-    // The dealt card.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.pull_card(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.verdict_transient_open(),
-                "tab over the dealt Slack card opens the verdicts"
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace.verdict_transient_open(),
-                "the menu's own tab row closes it"
-            );
-            assert!(workspace.home_in_view(), "and lands on Home");
-        })
-        .unwrap();
-
-    // And a channel walked into rather than dealt: nothing is asking about
-    // `#random`, so before this it had no node and `tab` left for Home.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_slack_source(
-                crate::slack::unit_source(&slack_unit("C2", None)),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.verdict_transient_open(),
-                "tab over a conversation the dealer has no card for opens them too"
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.home_in_view(), "and tab again is Home from there");
-        })
-        .unwrap();
-}
-
-/// A Slack unit belongs to one host, the first configured, whether it is
-/// answering or not. Cells written back when the desk followed whichever
-/// host was up landed on the second host, and they are read from where they
-/// are rather than migrated: the unit is one row, on its owner, carrying
-/// what the other host holds, and the second host draws no row of its own.
-#[gpui::test]
-fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut TestAppContext) {
-    let owner = rho_agents_client::HostId::default();
-    let other = rho_agents_client::HostId(1);
-    let unit = slack_unit("C1", None);
-    let id = rho_desk_client::protocol::cells::Id::Slack(unit.clone());
-
-    // What the write made while the owner was away left behind: a name is a
-    // fact Slack has nowhere to keep, so it is the unit's own row.
-    let mut elsewhere = crate::tests::DeskFixture::new();
-    elsewhere.set(
-        id.clone(),
-        rho_desk_client::protocol::cells::Property::Name("the release".to_owned()),
-    );
-    let here = crate::tests::DeskFixture::new();
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            crate::tests::story::feed(workspace, owner, here.synced(), window, cx);
-            crate::tests::story::feed(workspace, other, elsewhere.synced(), window, cx);
-            // The owner comes back.
-            crate::tests::story::feed(workspace, owner, here.synced(), window, cx);
-
-            let rows = |host| {
-                workspace
-                    .desk
-                    .nodes(host)
-                    .iter()
-                    .filter(|node| {
-                        matches!(node.id, rho_desk_client::protocol::cells::Id::Slack(_))
-                    })
-                    .map(|node| (node.id.clone(), node.name.clone()))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                rows(owner),
-                vec![(id.clone(), Some("the release".to_owned()))],
-                "one row, on the owner, with the facts the other host holds"
-            );
-            assert!(
-                rows(other).is_empty(),
-                "and no second row on the host the cells happen to sit on"
-            );
-            assert_eq!(
-                workspace
-                    .desk
-                    .facts_of_slack_unit(Some(owner), &unit)
-                    .and_then(|facts| facts.name),
-                Some("the release".to_owned()),
-                "and asking the owner about the unit finds them"
-            );
-        })
-        .unwrap();
-}
-
-/// The other half of the same rule: the owner being away is not a refusal.
-/// The desk lives on this client, so a verdict on a Slack unit lands in the
-/// owner's own replica while it is quiet, and the sync after it returns
-/// carries it up. Writing it on whichever host was answering instead is
-/// what split a unit's cells across two stores.
-#[gpui::test]
-fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return(
-    cx: &mut TestAppContext,
-) {
-    let host = rho_agents_client::HostId::default();
-    let mut desk = crate::tests::DeskFixture::new();
-    let node = desk.thread_row(None, "C1", "500.0");
-    let unit = slack_unit("C1", Some("500.0"));
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            crate::tests::story::feed(workspace, host, desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(host, desk.slack_sources(), window, cx);
-            // The host of this workspace has never answered.
-            assert!(
-                workspace.apply_verdict_for_test(
-                    host,
-                    &node,
-                    rho_desk_client::desk::DeskVerdict::Defer {
-                        until: rho_desk_client::protocol::cells::Timestamp {
-                            unix_ms: 4_000_000_000_000,
-                            precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
-                        },
-                    },
-                    window,
-                    cx,
-                ),
-                "a quiet owner does not refuse the write"
-            );
-            assert!(
-                workspace
-                    .desk
-                    .facts_of_slack_unit(Some(host), &unit)
-                    .is_some_and(|facts| facts.defer_until.is_some()),
-                "it is in the owner's own replica while the owner is away"
-            );
-            workspace.clear_sent_for_test(host);
-
-            // The owner returns and says where it stands, which is before
-            // the write.
-            workspace.force_host_online(host);
-            crate::tests::story::feed(workspace, host, desk.synced(), window, cx);
-            assert!(
-                workspace
-                    .take_desk_frames_for_test(host)
-                    .iter()
-                    .any(|frame| match frame {
-                        rho_desk_client::protocol::stream::ClientFrame::CellsApply { cells } =>
-                            cells.cells.iter().any(|cell| cell.id == node),
-                        _ => false,
-                    }),
-                "and the sync after it returns carries the write to the agent host"
-            );
-        })
-        .unwrap();
-}
-
-/// The people picker must not duplicate the already-completed first recipient
-/// when completion replaces the second recipient. The real fake checks users.
 #[gpui::test]
 async fn new_message_picker_opens_a_group_and_sends(cx: &mut TestAppContext) {
     let (workspace, fake, _state) = slack_workspace(cx).await;
@@ -4297,7 +3973,7 @@ async fn slack_keyboard_send_honors_broadcast_toggle(cx: &mut TestAppContext) {
                     panic!("conversation")
                 };
                 assert_eq!(view.read(cx).also_send_to_channel(), broadcast);
-                view.clone()
+                gpui::Entity::clone(view)
                     .update(cx, |view, cx| view.set_compose_for_test(text.into(), cx));
                 workspace.slack_compose(window, cx);
             })
@@ -4933,6 +4609,42 @@ async fn quoted_previews_expand_without_rewriting_source_or_losing_their_inset(
             assert!(view.toggle_cursor_preview(window, cx));
             assert!(!view.display_text_for_test(cx).contains("LAST QUOTED LINE"));
             assert_eq!(view.transcript_text_for_test(cx), collapsed_source);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAppContext) {
+    use rho_dealer::{DateMark, NodeId, marks};
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let state = tempfile::tempdir().unwrap();
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    fake.push_frame(serde_json::json!({
+        "type": "message", "channel": "D1", "ts": "1800000100.000000",
+        "user": "UA", "text": "are you around?"
+    }));
+    let unit = slack_unit("D1", None);
+    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
+    let node = NodeId::Slack(unit);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.hand().iter().any(|card| card.node == node));
+            workspace.write_marks(
+                vec![marks::snooze(&node, Some(DateMark::at(4_000_000_000_000)))],
+                cx,
+            );
+            assert!(!workspace.hand().iter().any(|card| card.node == node));
+            workspace.write_marks(vec![marks::snooze(&node, Some(DateMark::at(1_000)))], cx);
+            assert!(workspace.hand().iter().any(|card| card.node == node));
         })
         .unwrap();
 }

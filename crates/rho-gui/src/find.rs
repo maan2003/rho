@@ -2,7 +2,7 @@
 //!
 //! The reader knows what a thing is called and roughly where it sits, not
 //! which surface it lives on, so there is one prompt rather than one per
-//! kind: agents, pages, topics and Slack conversations all arrive as a
+//! kind: agents, notes, labels and Slack conversations all arrive as a
 //! path (`nixos › poco on linux`) and `enter` opens whichever surface that
 //! path names.
 //!
@@ -20,14 +20,9 @@
 //! A word that is a label path entire — `rho/agent` — is the reader
 //! naming a filing rather than spelling a thing, so everything filed
 //! there is what they asked for, agents first and newest first.
-//!
-//! `find_candidates` is the single seam onto the tree. Slice 2 swaps what
-//! it yields from a path string to a `NodeId` without the prompt or the
-//! scorer noticing.
 
 use gpui::{App, Context, Window};
 use rho_agent_types::AgentId;
-use rho_agents_client::HostId;
 
 use crate::minibuffer::Candidate;
 use crate::workspace::Workspace;
@@ -64,13 +59,8 @@ const DELIMITERS: [char; 6] = ['-', '_', '.', ':', '#', '@'];
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum FindTarget {
     Agent(AgentId),
-    Page(rho_browser::PageId),
-    /// A heading: opens its first agent, or a draft under it, exactly as
-    /// `enter` on the dashboard row does.
-    Topic {
-        host: HostId,
-        node_id: rho_desk_client::protocol::cells::Id,
-    },
+    /// A note or a label: opens its own surface.
+    Node(rho_dealer::NodeId),
     Slack(rho_slack::session::Source),
 }
 
@@ -178,54 +168,6 @@ fn bonus_at(chars: &[char], index: usize) -> i32 {
 
 // How much work one keystroke in the finder actually did.
 //
-// A keystroke has two halves and both can grow with the desk, so both are
-// counted, separately, because they grow for different reasons and a sum
-// hides the smaller one: building a candidate — the node itself and each
-// ancestor its breadcrumb walks to the root — and scoring one, where a
-// step is a visit to a cell of the alignment. Summed, a scan introduced
-// into the build is a third of a total the scoring dominates and passes a
-// ratio that should have caught it; that is not a hypothetical, it is what
-// this counter did before it was split.
-//
-// This is the machine's own work: a busy machine does not change it.
-//
-// Thread-local because the suite runs tests concurrently in one process: a
-// shared counter reads as one test's work plus its neighbours', which is a
-// number that cannot be wrong in any way you can see.
-#[cfg(test)]
-thread_local! {
-    static WALK_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static SCORE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// One node visited, or one ancestor of it, while the candidate set is
-/// built.
-#[cfg(test)]
-pub(crate) fn charge_walk(steps: usize) {
-    WALK_STEPS.with(|counted| counted.set(counted.get() + steps as u64));
-}
-
-#[cfg(not(test))]
-pub(crate) fn charge_walk(_steps: usize) {}
-
-#[cfg(test)]
-fn charge_score(steps: usize) {
-    SCORE_STEPS.with(|counted| counted.set(counted.get() + steps as u64));
-}
-
-#[cfg(not(test))]
-fn charge_score(_steps: usize) {}
-
-/// What the finder has done since this was last asked: the candidate set
-/// walked, and the matcher run.
-#[cfg(test)]
-pub(crate) fn take_find_steps() -> (u64, u64) {
-    (
-        WALK_STEPS.with(|counted| counted.replace(0)),
-        SCORE_STEPS.with(|counted| counted.replace(0)),
-    )
-}
-
 /// Scores `query` against `path`, or `None` when the query is not a
 /// subsequence of it. An empty query matches everything at zero.
 pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
@@ -253,7 +195,6 @@ pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
         let mut row = vec![None; chars.len()];
         // One row is one pass over the path, whether or not any character
         // of it matches.
-        charge_score(chars.len());
         for index in 0..chars.len() {
             if folded[index] != *needle {
                 continue;
@@ -269,22 +210,19 @@ pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
                 // A match after the first looks back over every earlier
                 // alignment: the part that is not linear in the path, and
                 // the part a cheaper scorer would remove.
-                Some(previous) => {
-                    charge_score(index);
-                    previous[..index]
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(earlier, score)| {
-                            let score = (*score)?;
-                            let gap = (index - earlier - 1) as i32;
-                            Some(if gap == 0 {
-                                score + here + BONUS_CONSECUTIVE
-                            } else {
-                                score + here + GAP_START + GAP_EXTENSION * (gap - 1)
-                            })
+                Some(previous) => previous[..index]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(earlier, score)| {
+                        let score = (*score)?;
+                        let gap = (index - earlier - 1) as i32;
+                        Some(if gap == 0 {
+                            score + here + BONUS_CONSECUTIVE
+                        } else {
+                            score + here + GAP_START + GAP_EXTENSION * (gap - 1)
                         })
-                        .max()
-                }
+                    })
+                    .max(),
             };
         }
         if row.iter().all(Option::is_none) {
@@ -434,46 +372,84 @@ pub(crate) fn slack_candidates(
 
 impl Workspace {
     /// Every node the finder can reach, as its full path and what opening
-    /// it means. The one seam onto the tree: slice 2 changes what a target
-    /// carries, not the prompt.
+    /// it means.
     pub(crate) fn find_candidates(&self, cx: &App) -> Vec<FindCandidate> {
-        let mut candidates =
-            crate::candidates::find_candidates(&self.desk, &self.desk_buffers, &self.registry, cx);
+        use rho_dealer::NodeId;
+        let marks = &self.attention.marks;
+        let paths: std::collections::HashMap<uuid::Uuid, String> =
+            marks.labels().into_iter().collect();
+        // A thing is as often remembered by what it is filed under as by
+        // its name, so each label names it too.
+        let labelled = |node: &NodeId, title: &str| {
+            marks
+                .get(node)
+                .labels
+                .iter()
+                .filter_map(|label| paths.get(label))
+                .map(|path| LabelName::new(path, title))
+                .collect::<Vec<_>>()
+        };
+        let mut candidates = Vec::new();
+        for (node, node_marks) in marks.notes() {
+            if node_marks.deleted {
+                continue;
+            }
+            let title = self.node_title(node);
+            candidates.push(FindCandidate {
+                labels: labelled(node, &title),
+                aka: Vec::new(),
+                path: title,
+                kind: "note",
+                target: FindTarget::Node(node.clone()),
+                recency: node_marks.created_ms.unwrap_or_default(),
+            });
+        }
+        for (label, path) in &paths {
+            candidates.push(FindCandidate {
+                labels: Vec::new(),
+                aka: Vec::new(),
+                path: path.clone(),
+                kind: "label",
+                target: FindTarget::Node(NodeId::Label(*label)),
+                recency: 0,
+            });
+        }
+        // An agent created by an agent belongs to its creator and is not
+        // found; a muted one is gone for good.
+        for agent_id in self.registry.known_agents().copied() {
+            let node = NodeId::Agent(agent_id);
+            if marks.get(&node).muted || !self.registry.created_by_user(agent_id) {
+                continue;
+            }
+            let hit = rho_agents_client::find::hit(
+                &self.registry,
+                agent_id,
+                marks.get(&node).name.clone(),
+            );
+            candidates.push(FindCandidate {
+                labels: labelled(&node, &hit.title),
+                aka: hit.aka,
+                path: hit.title,
+                kind: "agent",
+                target: FindTarget::Agent(agent_id),
+                recency: hit.recency,
+            });
+        }
         let mut slack = self.slack_find_candidates(cx);
-        // A Slack room is findable because Slack says it exists rather than
-        // because the tree holds a row for it, so its labels are joined on
-        // here instead of coming down with the node.
-        if let Some(host) = self.hosts.owner() {
-            let paths = self
-                .desk
-                .label_paths(host)
-                .into_iter()
-                .collect::<std::collections::HashMap<_, _>>();
-            let workspace_name = self
-                .slack
-                .session()
-                .map(|session| session.read(cx).model().workspace().clone());
+        // A Slack room is findable because Slack says it exists, so its
+        // labels are joined on here.
+        if let Some(name) = self
+            .slack
+            .session()
+            .map(|session| session.read(cx).model().workspace().clone())
+        {
             for candidate in &mut slack {
                 let FindTarget::Slack(source) = &candidate.target else {
                     continue;
                 };
-                let Some(name) = &workspace_name else {
-                    continue;
-                };
-                let unit = crate::slack::unit_of_source(name, source);
-                let Some(facts) = self
-                    .desk
-                    .facts(host, &rho_desk_client::protocol::cells::Id::Slack(unit))
-                else {
-                    continue;
-                };
+                let node = NodeId::Slack(crate::slack::unit_of_source(&name, source));
                 let title = candidate.path.clone();
-                candidate.labels = facts
-                    .labels
-                    .iter()
-                    .filter_map(|label| paths.get(label))
-                    .map(|path| LabelName::new(path, &title))
-                    .collect();
+                candidate.labels = labelled(&node, &title);
             }
         }
         candidates.extend(slack);
@@ -525,25 +501,6 @@ impl Workspace {
         self.find_rows_over_for_test(Vec::new(), input, cx)
     }
 
-    /// What the picker's open costs: the whole candidate set and the names
-    /// it will be ranked by, which is the frame the reader pays for.
-    #[cfg(test)]
-    pub(crate) fn find_snapshot_for_test(
-        &self,
-        slack: Vec<FindCandidate>,
-        cx: &App,
-    ) -> FindSnapshot {
-        let mut candidates = self.find_candidates(cx);
-        candidates.extend(slack);
-        FindSnapshot::of(candidates)
-    }
-
-    /// What a keystroke costs: the ranking, over a set already in hand.
-    #[cfg(test)]
-    pub(crate) fn find_rows_in_for_test(snapshot: &FindSnapshot, input: &str) -> Vec<Candidate> {
-        snapshot.rows(input)
-    }
-
     /// The same keystroke with `slack` standing in for what a connected
     /// session would have contributed.
     ///
@@ -551,7 +508,7 @@ impl Workspace {
     /// and standing up a real session — a client, a mirror, a socket — to
     /// count them would measure the session rather than the finder. So the
     /// rows are handed in and everything after them is the real path:
-    /// `find_candidates` builds the desk's half exactly as the completion
+    /// `find_candidates` builds the rest exactly as the completion
     /// closure does, the two halves are concatenated the same way, and the
     /// ranking is the ranking.
     #[cfg(test)]
@@ -638,12 +595,8 @@ impl Workspace {
     ) {
         match target {
             FindTarget::Agent(agent_id) => self.open_agent(agent_id, window, cx),
-            FindTarget::Page(page_id) => self.open_browser_page(page_id, window, cx),
-            // A node opens its own surface, and a note's surface is the
-            // note: the staffed-heading shortcut belonged to the desk,
-            // where a heading had nowhere else to go.
-            FindTarget::Topic { host, node_id } => {
-                self.open_note(host, node_id, window, cx);
+            FindTarget::Node(node) => {
+                self.open_note(&node, window, cx);
             }
             FindTarget::Slack(source) => self.open_slack_source(source, window, cx),
         }
@@ -887,14 +840,9 @@ mod tests {
             filed_agent("rig › older", 1, "rho/agent", 10),
             filed_agent("rig › newer", 2, "rho/agent", 20),
             FindCandidate {
-                kind: "topic",
+                kind: "note",
                 labels: vec![LabelName::new("rho/agent", "the topic")],
-                target: FindTarget::Topic {
-                    host: HostId::default(),
-                    node_id: rho_desk_client::protocol::cells::Id::Note(
-                        rho_desk_client::protocol::cells::Uuid([7; 16]),
-                    ),
-                },
+                target: FindTarget::Node(rho_dealer::NodeId::Note(uuid::Uuid::from_bytes([7; 16]))),
                 recency: 40,
                 ..agent_row("rig › the topic", 4)
             },

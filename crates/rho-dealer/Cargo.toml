@@ -1,0 +1,16 @@
+# The dealer: what wants the user, how much, and in what order; and the
+# user's own marks on things, as the ledger holds them.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-dealer"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rho-agent-types.workspace = true
+senax-encoder.workspace = true
+uuid.workspace = true

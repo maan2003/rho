@@ -1,4 +1,4 @@
-//! The usage screen: what the desk has spent, drawn as a buffer.
+//! The usage screen: what the agents have spent, drawn as a buffer.
 //!
 //! One screen, four charts, chosen from `space s u`. Like every other screen
 //! here it is a buffer with the point in it — the title and the totals are
@@ -806,7 +806,7 @@ fn grid_color(cx: &App) -> Hsla {
 }
 
 /// Stable visual order for the alphabetically sorted auth namespaces shown
-/// in both the dashboard masthead and the rate-limit graph.
+/// in the rate-limit graph.
 pub(crate) fn quota_auth_color(index: usize) -> Hsla {
     const COLORS: [u32; 6] = [
         0x22d3ee, // cyan

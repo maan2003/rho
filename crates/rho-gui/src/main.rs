@@ -148,7 +148,7 @@ struct FrameRecord {
 ///
 /// The frame log accounts for time inside `Window::draw`, so the work that
 /// makes the *next* frame late is in neither it nor the editor log: a run
-/// could say a desk sync was slow only through a telemetry report the user
+/// could say a sync was slow only through a telemetry report the user
 /// sent, which is not something a rig can produce. `owners` against
 /// `work_units` is the per-event side of the cost rule, the way
 /// `input_rows` is for a stage.
@@ -307,9 +307,6 @@ fn run() -> Result<()> {
     if let Err(error) = rho_agents_client::cache::init(db.clone()) {
         tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the agent host");
     }
-    if let Err(error) = rho_desk_client::cache::init(db.clone()) {
-        tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the agent host");
-    }
     rho_agents_client::cache::set_state_dir(client_state_dir.clone());
     let specs = host_specs(&args, &db)?;
     let local_socket = specs.iter().find_map(|spec| match &spec.target {
@@ -380,7 +377,6 @@ fn run() -> Result<()> {
                 // file redb finds unclean, and the next start rebuilds its
                 // allocator from every page to be sure of it.
                 rho_agents_client::cache::close();
-                rho_desk_client::cache::close();
                 std::future::ready(())
             })
             .detach();

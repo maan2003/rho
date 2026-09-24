@@ -66,7 +66,9 @@ rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
-rho-desk-client = { workspace = true, features = ["client"] }
+rho-dealer = { workspace = true }
+rho-desk-client = { workspace = true }
+rho-ledger = { workspace = true, features = ["client"] }
 rho-desktop-client = { workspace = true, features = ["client"] }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
@@ -131,7 +133,6 @@ rho-slack = { workspace = true, features = ["ui", "fake"] }
 # be at the scale the user runs at rather than at a scale chosen here.
 rho-fake-slack.workspace = true
 rho-agent-hosts = { workspace = true, features = ["test-support"] }
-rho-desk-client = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
 editor = { path = "../../vendor/zed/crates/editor", features = [
   "wrap-test-support",

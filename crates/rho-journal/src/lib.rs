@@ -107,27 +107,25 @@ pub enum NodeIdentity {
     },
 }
 
-impl From<rho_desk_client::protocol::cells::Id> for NodeIdentity {
-    fn from(id: rho_desk_client::protocol::cells::Id) -> Self {
-        use rho_desk_client::protocol::cells::Id;
+impl From<rho_dealer::NodeId> for NodeIdentity {
+    fn from(id: rho_dealer::NodeId) -> Self {
+        use rho_dealer::NodeId;
         match id {
-            Id::Note(uuid) => Self::Note { uuid: uuid.0 },
-            Id::Label(uuid) => Self::Label { uuid: uuid.0 },
-            Id::Agent(agent) => Self::Agent {
+            NodeId::Note(uuid) => Self::Note {
+                uuid: *uuid.as_bytes(),
+            },
+            NodeId::Label(uuid) => Self::Label {
+                uuid: *uuid.as_bytes(),
+            },
+            NodeId::Agent(agent) => Self::Agent {
                 agent: agent.encoded(),
             },
-            Id::Host(seed) => Self::Host { seed },
-            Id::Page(page) => Self::Page { uuid: page.0 },
-            Id::Slack(unit) => Self::Slack {
+            NodeId::Slack(unit) => Self::Slack {
                 workspace: unit.workspace,
                 channel: unit.channel,
                 thread: unit.thread,
             },
-            Id::PullRequest { repo, number } => Self::PullRequest { repo, number },
-            Id::File { host, path } => Self::File {
-                host,
-                path: path.to_string(),
-            },
+            NodeId::PullRequest { repo, number } => Self::PullRequest { repo, number },
         }
     }
 }
