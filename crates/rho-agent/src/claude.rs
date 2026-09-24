@@ -1868,7 +1868,7 @@ impl ClaudeLoop {
             queued: self.state.queued_inputs.len(),
         };
         self.host
-            .publish_queue(self.state.queued_inputs.iter().map(queued_item).collect());
+            .publish_queue(self.state.queued_inputs.iter().cloned().collect());
         self.host.published();
     }
 
@@ -2102,29 +2102,6 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
         InputKind::Message { content } => !is_compact_command(content),
         InputKind::Compaction => true,
     });
-}
-
-/// A queued input as the wire tells it.
-fn queued_item(input: &QueuedInput) -> rho_agent_host_proto::transcript::QueuedItem {
-    use rho_agent_host_proto::transcript::QueuedItem;
-    match &input.kind {
-        InputKind::Message { content } => QueuedItem::Message {
-            from: match input.source {
-                crate::MessageSender::User => None,
-                crate::MessageSender::Agent { id } => Some(id),
-            },
-            text: content
-                .iter()
-                .map(|part| match part {
-                    ContentPart::Text { text } => text.as_str(),
-                    ContentPart::Image { .. } => "[image]",
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            delivery: input.delivery,
-        },
-        InputKind::Compaction => QueuedItem::Compaction,
-    }
 }
 
 /// The oldest queued message left the queue: Claude has it now.

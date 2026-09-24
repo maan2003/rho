@@ -3,10 +3,10 @@
 //! place that knows what changed, so it says so here instead of a
 //! reader diffing snapshots.
 
+use rho_agent::{AgentStateKind, InputKind, QueuedInput};
 use rho_agent_host_proto::transcript::{Item, Live, QueuedItem, TextPhase};
+use rho_agent_types::ContentPart;
 use rho_inference::types::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
-
-use crate::AgentStateKind;
 
 /// Remembers what was last told so the next tell is only the change.
 /// `reset` forgets it all; the next tell then says everything again,
@@ -167,7 +167,7 @@ pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
             id: id.as_str().to_owned(),
             name: name.as_str().to_owned(),
             arguments: arguments.to_string(),
-            format: (*tool_type).into(),
+            format: crate::transcript::arguments_format(*tool_type),
         },
         StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
             return None;
@@ -287,17 +287,39 @@ fn join(parts: &[AStr]) -> String {
         .join("\n")
 }
 
+/// A queued input as the wire tells it.
+pub fn queued_item(input: &QueuedInput) -> QueuedItem {
+    match &input.kind {
+        InputKind::Message { content } => QueuedItem::Message {
+            from: match input.source {
+                rho_agent::MessageSender::User => None,
+                rho_agent::MessageSender::Agent { id } => Some(id),
+            },
+            text: content
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => text.as_str(),
+                    ContentPart::Image { .. } => "[image]",
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            delivery: input.delivery,
+        },
+        InputKind::Compaction => QueuedItem::Compaction,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
     use std::sync::Arc;
 
+    use rho_agent::FailedInferenceResponse;
     use rho_agent_types::MessagePhase;
     use rho_inference::types::{AppendString, PendingInferenceResponse};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
-    use crate::FailedInferenceResponse;
 
     #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
     struct TestProviderData;

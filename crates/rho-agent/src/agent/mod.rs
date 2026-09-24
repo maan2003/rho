@@ -25,7 +25,9 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use rho_agent_types::{AgentId, ContentPart, MessageDelivery, ToolOutputStatus, UnixMs};
+use rho_agent_types::{
+    AgentId, ContentPart, MessageDelivery, ToolOutputStatus, TurnEdge, TurnOutcome, UnixMs,
+};
 #[cfg(test)]
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
@@ -41,7 +43,7 @@ use crate::boundary::{
 };
 use crate::db::{
     AgentHead, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket,
-    AgentUsageModel, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMillis,
+    AgentUsageModel, EngineerIntelligence, UnixMillis,
 };
 #[cfg(test)]
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};

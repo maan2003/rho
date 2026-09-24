@@ -38,10 +38,9 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
-use rho_agent_host_proto::transcript::AgentWant;
 #[cfg(test)]
 use rho_agent_host_proto::transcript::LogEntry;
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, AgentWant};
 use rho_hosts::HostId;
 
 use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
@@ -843,10 +842,8 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{
-        AgentPos, RuntimeKind, Seq, SpawnedBy, TranscriptEvent, TurnEdge, TurnOutcome,
-    };
-    use rho_agent_types::{AgentIdDomain, UnixMs};
+    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
+    use rho_agent_types::{AgentIdDomain, AgentPos, Seq, TurnEdge, TurnOutcome, UnixMs};
 
     use super::*;
 

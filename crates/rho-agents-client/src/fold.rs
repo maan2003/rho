@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use rho_agent_host_proto::AgentUsageBucket;
 use rho_agent_host_proto::transcript::{
-    AgentPos, AgentWant, PresentationField, RuntimeKind, SpawnedBy, Speaker, ToolOutcome,
-    ToolStatus, TranscriptEvent, TurnEdge, TurnOutcome,
+    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
 };
-use rho_agent_types::{AgentId, AgentRole, Place, UnixMs};
+use rho_agent_types::{
+    AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, TurnEdge, TurnOutcome,
+    UnixMs,
+};
 
 use crate::HostId;
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};

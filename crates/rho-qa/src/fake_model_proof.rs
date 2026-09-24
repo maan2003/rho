@@ -16,9 +16,9 @@ use rho_agent_host_proto::agents::{
     ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
 };
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
+use rho_agent_host_proto::transcript::{DetailBody, TranscriptEvent};
 use rho_agent_host_proto::{AgentCommand, NewAgent, StartMode};
-use rho_agent_types::{AgentId, AgentRole, ContentPart, MessageDelivery};
+use rho_agent_types::{AgentId, AgentPos, AgentRole, ContentPart, MessageDelivery, Seq, TurnEdge};
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;
 use serde_json::json;

@@ -8,11 +8,10 @@ use anyhow::{Context as _, Result, bail};
 use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::control::ServerFrame as ControlFrame;
-use rho_agent_host_proto::transcript::Seq;
 use rho_agent_host_proto::{
     AgentCommand, Answer, NewAgent, Open, agents, host, read_frame, write_frame,
 };
-use rho_agent_types::AgentId;
+use rho_agent_types::{AgentId, Seq};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 

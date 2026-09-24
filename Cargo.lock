@@ -12828,7 +12828,6 @@ dependencies = [
  "rand 0.8.7",
  "redb",
  "reqwest 0.12.28",
- "rho-agent-host-proto",
  "rho-agent-types",
  "rho-db",
  "rpassword",

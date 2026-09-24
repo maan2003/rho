@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
-use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
-use rho_agent_types::AgentId;
+use rho_agent_host_proto::transcript::{LogEntry, TranscriptEvent};
+use rho_agent_types::{AgentId, AgentPos, Seq};
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 
 use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
@@ -651,7 +651,8 @@ mod recorded_names {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
+    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy};
+    use rho_agent_types::{TurnEdge, TurnOutcome};
 
     use super::*;
 

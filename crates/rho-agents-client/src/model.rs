@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_host_proto::agents::ClientFrame;
-use rho_agent_host_proto::transcript::{AgentPos, Live, LogEntry, Seq, TranscriptEvent};
-use rho_agent_types::AgentId;
+use rho_agent_host_proto::transcript::{Live, LogEntry, TranscriptEvent};
+use rho_agent_types::{AgentId, AgentPos, Seq};
 use rho_hosts::HostStream;
 
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
@@ -539,8 +539,8 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{PresentationField, RuntimeKind, SpawnedBy};
-    use rho_agent_types::AgentRole;
+    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy};
+    use rho_agent_types::{AgentRole, PresentationField};
 
     use super::*;
 

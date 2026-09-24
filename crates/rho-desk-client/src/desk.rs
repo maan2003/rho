@@ -87,7 +87,7 @@ pub struct AgentSource {
     pub errored: Option<StoryPos>,
     /// What the last finished turn says it asks of the user, and where it
     /// said so.
-    pub wants: Option<(rho_agent_host_proto::transcript::AgentWant, StoryPos)>,
+    pub wants: Option<(rho_agent_types::AgentWant, StoryPos)>,
 }
 
 impl AgentSource {
@@ -522,8 +522,8 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     })
 }
 
-fn agent_pos(pos: StoryPos) -> rho_agent_host_proto::transcript::AgentPos {
-    rho_agent_host_proto::transcript::AgentPos(pos.0)
+fn agent_pos(pos: StoryPos) -> rho_agent_types::AgentPos {
+    rho_agent_types::AgentPos(pos.0)
 }
 
 /// The user's verdict on an agent, as the store holds it.

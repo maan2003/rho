@@ -65,7 +65,9 @@ impl Services {
     }
 
     pub(super) async fn worker_failed(&self, error: String) {
-        use crate::db::{AgentWriteTxnExt as _, TurnEdge, TurnOutcome};
+        use rho_agent_types::{TurnEdge, TurnOutcome};
+
+        use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
             kind: crate::AgentStateKind::Error(crate::FailedInferenceResponse {
                 partial_response: Default::default(),
@@ -86,9 +88,13 @@ impl Services {
         if let Some(pool) = self.pool.upgrade() {
             pool.settle_turn(self.agent).await;
             if pool.is_live(self.agent) {
-                for live in crate::live::Teller::default().tell(&status.kind) {
-                    crate::transcript::tell_live(&self.db, self.agent, live);
-                }
+                crate::journal::tell_status(
+                    &self.db,
+                    self.agent,
+                    Arc::new(status.clone()),
+                    None,
+                    true,
+                );
             }
         }
         self.status.send_replace(status);
@@ -133,7 +139,9 @@ impl Services {
                 .expect("one daemon connection");
             let (outgoing, mut messages) = mpsc::channel::<Message<'static>>(32);
             let mut calls = JoinSet::new();
-            let mut teller = crate::live::Teller::default();
+            // Whether this loop's tail has been told since it was last not
+            // live; the first status after that is told whole.
+            let mut told = false;
             let result = tokio::select! {
                 result = async {
                     loop {
@@ -173,18 +181,17 @@ impl Services {
                                 continue;
                             }
                             Message::Status { status, queue, reset } => {
-                                if reset { teller.reset(); }
                                 if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
-                                    if let Some(queue) = queue
-                                        && let Some(live) = teller.tell_queue(&queue)
-                                    {
-                                        crate::transcript::tell_live(&self.db, self.agent, live);
-                                    }
-                                    for live in teller.tell(&status.kind) {
-                                        crate::transcript::tell_live(&self.db, self.agent, live);
-                                    }
+                                    crate::journal::tell_status(
+                                        &self.db,
+                                        self.agent,
+                                        Arc::new(status.clone()),
+                                        queue.map(Arc::from),
+                                        reset || !told,
+                                    );
+                                    told = true;
                                 } else {
-                                    teller.reset();
+                                    told = false;
                                 }
                                 self.status.send_replace(status);
                                 continue;

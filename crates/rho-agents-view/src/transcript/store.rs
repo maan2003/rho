@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_agent_host_proto::transcript::{AgentPos, TranscriptEvent};
-use rho_agent_types::AgentId;
+use rho_agent_host_proto::transcript::TranscriptEvent;
+use rho_agent_types::{AgentId, AgentPos};
 use rho_agents_client::TranscriptFold;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::{AgentStore, FrameSummary};

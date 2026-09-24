@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 pub use rho_agent_types::MessageDelivery;
-use rho_agent_types::{ContentPart, UnixMs};
+use rho_agent_types::{AgentWant, ContentPart, TurnEdge, TurnOutcome, UnixMs};
 pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
 pub use rho_inference::types::MessageSender;
 use rho_inference::types::{
@@ -22,8 +22,7 @@ use rho_inference::types::{
 use senax_encoder::{Decode, Encode};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, AgentWant, ClaudeRewind,
-    PresentationField, SessionBinding, TurnEdge, TurnOutcome,
+    AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, ClaudeRewind, SessionBinding,
 };
 
 pub mod agent;
@@ -35,8 +34,8 @@ pub use agent::{AgentHandle, render_agent_surface};
 
 pub mod db;
 mod image_tool;
+pub mod journal;
 mod lazy;
-pub mod live;
 pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
@@ -44,7 +43,6 @@ pub mod prompt;
 pub mod shell;
 pub mod terminal;
 mod title;
-pub mod transcript;
 mod worker;
 pub use worker::{
     Process as WorksetProcess, WorksetAction, WorksetAttach, WorksetClient, WorksetReply,

@@ -3,7 +3,7 @@
 //! the live tails, new agents and the quota; requests, terminals, shells
 //! and workspace channels are streams of their own.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -17,7 +17,7 @@ use rho_agent_host_proto::agents::{
     VisualizationContent,
 };
 use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Opened, write_frame};
-use rho_agent_types::WorkspaceInfo;
+use rho_agent_types::{Seq, WorkspaceInfo};
 use rho_db::RhoDb;
 use tokio::sync::{broadcast, mpsc};
 
@@ -245,72 +245,66 @@ where
     result
 }
 
-/// Contiguous by seq is the whole contract for rows. The daemon remembers
-/// the last seq it sent; an append that is not the next one, or a lagged
-/// subscription, sends it back to the journal from there. Rows the
-/// mirror leaves behind (`strip` says nothing) advance the seq without a
-/// message.
+/// Rows are read from the journal, never from the feed: an append only
+/// says a row landed, and the connection pages the journal from the last
+/// seq it sent. A lagged subscription does the same. Rows the transcript
+/// leaves behind (`strip` says nothing) advance the seq without a message.
 ///
-/// Live deltas are forwarded only once the loops have been asked to tell
-/// their tails whole, which happens after the catch-up: a delta from
-/// before that would be an append to a tail the client does not hold.
-/// After a lag the same is done again, since deltas were lost.
+/// Each connection tells each loop's tail itself, from the loop's status:
+/// a teller that has told nothing tells the tail whole, so a connection
+/// that just caught up, or lost statuses to a lag, starts from nothing.
+/// The loops are asked for their status once caught up, so an idle one
+/// is told too.
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
-    since: rho_agent_host_proto::transcript::Seq,
+    since: Seq,
 ) -> tokio::task::JoinHandle<()> {
-    use rho_agent::transcript::Feed;
+    use rho_agent::journal::Feed;
     tokio::spawn(async move {
         // Subscribed before the catch-up read, so a row appended during it
         // is queued rather than lost; the seq drops the duplicates.
-        let mut feed = rho_agent::transcript::feed(&services.db);
+        let mut feed = rho_agent::journal::feed(&services.db);
         let mut sent = since;
         if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
             return;
         }
-        let mut told = false;
+        let mut tellers = HashMap::<AgentId, crate::live::Teller>::new();
         services.pool.tell_tails().await;
         loop {
             match feed.recv().await {
-                Ok(Feed::Live { agent_id, live }) => {
-                    // The first whole tell for a loop starts with a phase
-                    // (`Requesting`, `Waiting`, `Idle`); anything before
-                    // one is from before the ask and is dropped.
-                    if !told {
-                        told = !matches!(
-                            live,
-                            rho_agent_host_proto::transcript::Live::Item { .. }
-                                | rho_agent_host_proto::transcript::Live::Appended { .. }
-                        );
-                        if !told {
-                            continue;
-                        }
+                Ok(Feed::Status {
+                    agent_id,
+                    status,
+                    queue,
+                    reset,
+                }) => {
+                    let teller = tellers.entry(agent_id).or_default();
+                    if reset {
+                        teller.reset();
                     }
-                    if outgoing_tx
-                        .send(rho_agent_host_proto::agents::ServerFrame::Live { agent_id, live })
-                        .is_err()
-                    {
-                        return;
+                    let queue = queue.and_then(|queue| {
+                        let items = queue
+                            .iter()
+                            .map(crate::live::queued_item)
+                            .collect::<Vec<_>>();
+                        teller.tell_queue(&items)
+                    });
+                    for live in queue.into_iter().chain(teller.tell(&status.kind)) {
+                        if outgoing_tx
+                            .send(rho_agent_host_proto::agents::ServerFrame::Live {
+                                agent_id,
+                                live,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
                 Ok(Feed::Appended(appended)) => {
-                    if appended.seq <= sent {
-                        continue;
-                    }
-                    if appended.seq != sent.next() {
-                        if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
-                            return;
-                        }
-                        continue;
-                    }
-                    sent = appended.seq;
-                    if let Some(entry) = appended.entry()
-                        && outgoing_tx
-                            .send(rho_agent_host_proto::agents::ServerFrame::Log {
-                                entries: vec![entry],
-                            })
-                            .is_err()
+                    if appended.seq > sent
+                        && !send_journal_from(&services.db, &outgoing_tx, &mut sent).await
                     {
                         return;
                     }
@@ -319,7 +313,7 @@ fn spawn_log_follow(
                     if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
                         return;
                     }
-                    told = false;
+                    tellers.clear();
                     services.pool.tell_tails().await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -333,7 +327,7 @@ fn spawn_log_follow(
 async fn send_journal_from(
     db: &RhoDb,
     outgoing_tx: &mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
-    sent: &mut rho_agent_host_proto::transcript::Seq,
+    sent: &mut rho_agent_types::Seq,
 ) -> bool {
     loop {
         let page = db.read().journal_since(*sent, LOG_PAGE);
@@ -348,7 +342,7 @@ async fn send_journal_from(
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: rho_agent::transcript::strip(&event)?,
+                    event: crate::transcript::strip(&event)?,
                 })
             })
             .collect::<Vec<_>>();
@@ -1003,7 +997,7 @@ where
 fn agent_detail(
     db: &RhoDb,
     agent_id: AgentId,
-    pos: rho_agent_host_proto::transcript::AgentPos,
+    pos: rho_agent_types::AgentPos,
 ) -> rho_agent_host_proto::transcript::DetailBody {
     use rho_agent_host_proto::transcript::DetailBody;
     let event = db.read().agent_event(agent_id, pos.into());
@@ -1034,7 +1028,7 @@ fn agent_detail(
                         _ => None,
                     })
                     .flatten()
-                    .filter_map(rho_agent::transcript::item)
+                    .filter_map(crate::transcript::item)
                     .collect(),
             ),
             NativeEvent::RequestFailed { partial, .. } => DetailBody::Response(
@@ -1046,7 +1040,7 @@ fn agent_detail(
                         | rho_inference::types::StreamingContextItemState::Finished(item) => item
                             .to_context_item()
                             .ok()
-                            .and_then(|item| rho_agent::transcript::item(&item)),
+                            .and_then(|item| crate::transcript::item(&item)),
                         _ => None,
                     })
                     .collect(),
@@ -1082,7 +1076,7 @@ fn agent_detail(
                 .filter_map(|slot| match slot {
                     rho_inference::types::StreamingContextItemState::Pending(item)
                     | rho_inference::types::StreamingContextItemState::Finished(item) => {
-                        rho_agent::live::to_item(item)
+                        crate::live::to_item(item)
                     }
                     rho_inference::types::StreamingContextItemState::Empty => None,
                 })

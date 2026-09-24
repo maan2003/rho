@@ -55,10 +55,10 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{
-        AgentPos, RuntimeKind, SpawnedBy, TranscriptEvent, TurnEdge, TurnOutcome,
+    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
+    use rho_agent_types::{
+        AgentIdDomain, AgentPos, MessageDelivery, TurnEdge, TurnOutcome, UnixMs,
     };
-    use rho_agent_types::{AgentIdDomain, MessageDelivery, UnixMs};
     use rho_hosts::HostId;
 
     use super::*;

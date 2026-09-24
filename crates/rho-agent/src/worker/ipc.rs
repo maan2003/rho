@@ -5,14 +5,14 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::UnixMs;
+use rho_agent_types::{TurnEdge, UnixMs};
 use rho_inference::types::ExecId;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::AgentEvent;
 use crate::db::{
-    AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding, TurnEdge,
+    AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding,
 };
 
 pub(super) const VERSION: u32 = 7;
@@ -139,7 +139,7 @@ pub(super) enum Message<'a> {
     Named(AgentHead),
     Status {
         status: crate::AgentStatus,
-        queue: Option<Vec<rho_agent_host_proto::transcript::QueuedItem>>,
+        queue: Option<Vec<crate::QueuedInput>>,
         reset: bool,
     },
     HistoryBatch {
@@ -200,7 +200,7 @@ impl Drop for Pending {
 /// its existing status slot; the writer snapshots only when it can send.
 #[derive(Default)]
 struct Publication {
-    queue: Mutex<Option<Vec<rho_agent_host_proto::transcript::QueuedItem>>>,
+    queue: Mutex<Option<Vec<crate::QueuedInput>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
     full: std::sync::atomic::AtomicBool,
@@ -414,7 +414,7 @@ impl Host {
         self.tell_tail();
     }
 
-    pub(crate) fn publish_queue(&self, queue: Vec<rho_agent_host_proto::transcript::QueuedItem>) {
+    pub(crate) fn publish_queue(&self, queue: Vec<crate::QueuedInput>) {
         *self.publication.queue.lock().expect("poison") = Some(queue);
     }
 

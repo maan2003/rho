@@ -426,8 +426,8 @@ mod tests {
 
     #[test]
     fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
-        use rho_agent_host_proto::transcript::{AgentPos, TranscriptEvent};
-        use rho_agent_types::{ExecMilestone, UnixMs};
+        use rho_agent_host_proto::transcript::TranscriptEvent;
+        use rho_agent_types::{AgentPos, ExecMilestone, UnixMs};
 
         use crate::fold::TranscriptFold;
         let mut store = AgentStore::default();

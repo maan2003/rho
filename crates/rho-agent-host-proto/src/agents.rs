@@ -7,10 +7,10 @@
 //! a [`ServerFrame`]. Whatever else is asked of the agents is a stream of
 //! its own: one [`Call`], or a terminal, shell or workspace channel.
 
-use rho_agent_types::{AgentId, WorkspaceInfo};
+use rho_agent_types::{AgentId, AgentPos, Seq, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
-use crate::transcript::{AgentPos, DetailBody, Live, LogEntry, Seq};
+use crate::transcript::{DetailBody, Live, LogEntry};
 use crate::{
     AgentCommand, AgentCostSeries, AgentUsageSeries, AuthState, NewAgent, QuotaSeries,
     QuotaSummary, shell, term,

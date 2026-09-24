@@ -9,10 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-pub use rho_agent_host_proto::transcript::{
-    AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome,
-};
-use rho_agent_types::UnixMs;
+use rho_agent_types::{AgentWant, Seq, TurnEdge, UnixMs};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_fs_view::{Place, WorksetMode};
 use rho_inference::PromptCacheKey;
@@ -21,7 +18,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
 use crate::AgentEvent;
-use crate::transcript::{Feed, Journal, LogAppended};
+use crate::journal::{Feed, Journal, LogAppended};
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -213,7 +210,7 @@ fn usage_model(config: &AgentConfig) -> AgentUsageModel {
 }
 
 /// The model a runtime and binding bill as.
-pub(crate) fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) -> AgentUsageModel {
+pub fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) -> AgentUsageModel {
     match runtime {
         AgentRuntime::Rho { .. } => match binding.deep_model() {
             Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
@@ -291,14 +288,14 @@ impl AgentEventPos {
     }
 }
 
-impl From<AgentEventPos> for rho_agent_host_proto::transcript::AgentPos {
+impl From<AgentEventPos> for rho_agent_types::AgentPos {
     fn from(pos: AgentEventPos) -> Self {
         Self(pos.pos)
     }
 }
 
-impl From<rho_agent_host_proto::transcript::AgentPos> for AgentEventPos {
-    fn from(pos: rho_agent_host_proto::transcript::AgentPos) -> Self {
+impl From<rho_agent_types::AgentPos> for AgentEventPos {
+    fn from(pos: rho_agent_types::AgentPos) -> Self {
         Self { pos: pos.0 }
     }
 }
@@ -1079,7 +1076,6 @@ impl AgentWriteTxnExt for WriteTxn {
                 seq: Seq(seq),
                 agent_id,
                 pos: pos.into(),
-                event: crate::transcript::strip(event),
             };
             self.after_commit(move || {
                 let _ = appends.send(Feed::Appended(appended));

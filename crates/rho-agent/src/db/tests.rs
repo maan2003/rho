@@ -1,4 +1,4 @@
-use rho_agent_types::{ContentPart, UnixMs};
+use rho_agent_types::{ContentPart, TurnOutcome, UnixMs};
 use rho_db::RhoDb;
 use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
@@ -814,7 +814,7 @@ async fn deleting_an_agent_removes_every_row_it_owns() {
 async fn the_journal_names_every_row_in_write_order() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut feed = crate::transcript::feed(&db);
+    let mut feed = crate::journal::feed(&db);
 
     let mut write = db.write().await;
     write.init_agent_tables();
@@ -850,7 +850,7 @@ async fn the_journal_names_every_row_in_write_order() {
 
     // Every row was announced after commit, in the same order.
     let mut announced = Vec::new();
-    while let Ok(crate::transcript::Feed::Appended(appended)) = feed.try_recv() {
+    while let Ok(crate::journal::Feed::Appended(appended)) = feed.try_recv() {
         announced.push((appended.seq.0, appended.agent_id, appended.pos.0));
     }
     assert_eq!(

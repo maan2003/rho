@@ -559,15 +559,6 @@ pub fn text_content(parts: &[ContentPart]) -> String {
     output
 }
 
-impl From<ToolType> for rho_agent_host_proto::transcript::ArgumentsFormat {
-    fn from(tool_type: ToolType) -> Self {
-        match tool_type {
-            ToolType::Function => Self::Json,
-            ToolType::Custom => Self::Text,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

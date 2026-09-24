@@ -4,11 +4,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use rho_agent_host_proto::transcript::{
-    AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
-};
+use rho_agent_host_proto::transcript::{LogEntry, TranscriptEvent};
 use rho_agent_host_proto::{Answer, Open, agents, read_frame, write_frame};
-use rho_agent_types::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
+use rho_agent_types::{
+    AgentId, AgentPos, AgentRole, MessageDelivery, Place, PresentationField, Seq, TurnEdge, UnixMs,
+};
 use rho_agents_client::stream::AgentFrame;
 use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::ConnEvent;
@@ -16,8 +16,8 @@ use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agent_host_proto::transcript::RuntimeKind;
 pub type UiSpawnedBy = rho_agent_host_proto::transcript::SpawnedBy;
-pub type UiAgentWant = rho_agent_host_proto::transcript::AgentWant;
-pub type UiTurnOutcome = rho_agent_host_proto::transcript::TurnOutcome;
+pub type UiAgentWant = rho_agent_types::AgentWant;
+pub type UiTurnOutcome = rho_agent_types::TurnOutcome;
 
 /// A position in an agent's story, as the old `Ready` named it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]

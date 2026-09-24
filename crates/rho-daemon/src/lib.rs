@@ -22,8 +22,10 @@ use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 mod agents;
 pub mod debug;
 mod host;
+mod live;
 mod realtime;
 mod secret_store;
+mod transcript;
 mod usage;
 pub mod workspace_channel;
 

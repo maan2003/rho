@@ -723,7 +723,7 @@ impl Workspace {
         &mut self,
         agent_id: AgentId,
         rows: &[(
-            rho_agent_host_proto::transcript::AgentPos,
+            rho_agent_types::AgentPos,
             rho_agent_host_proto::transcript::TranscriptEvent,
         )],
         window: &mut Window,
@@ -5520,7 +5520,7 @@ impl Workspace {
         /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
         fn story_pos(
-            pos: rho_agent_host_proto::transcript::AgentPos,
+            pos: rho_agent_types::AgentPos,
         ) -> rho_agent_host_proto::desk::cells::StoryPos {
             rho_agent_host_proto::desk::cells::StoryPos(pos.0)
         }
