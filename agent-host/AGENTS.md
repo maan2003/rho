@@ -19,10 +19,6 @@ plus the plumbing around the host.
 - A change to any protocol's messages changes the wire; bump the epoch
   in `rho_rpc::protocol`. Packed structs carry a hash of their field
   names and types, so a rename changes the wire too.
-- A table records its stored types by name, without module paths
-  (`rho-db::Sen<CellMeta>`), so they can move between modules and
-  crates freely. Renaming one changes what its tables recorded, and
-  needs a migration.
 
 ## Security
 
