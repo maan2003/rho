@@ -47,8 +47,11 @@ async fn evaluates_once_then_hits_and_repins() {
     let watched = resolver().with_watcher(rho_watch::Watcher::global().unwrap());
     watched.resolve(&flake).await.unwrap();
     let start = std::time::Instant::now();
+    for _ in 0..100 {
+        watched.resolve(&flake).await.unwrap();
+    }
+    eprintln!("kept: {:?}", start.elapsed() / 100);
     let (kept, diagnostics) = watched.resolve(&flake).await.unwrap();
-    eprintln!("kept: {:?}", start.elapsed());
     assert_eq!(kept.id, first.id);
     assert!(diagnostics.is_empty());
 

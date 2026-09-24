@@ -18,6 +18,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -455,7 +456,7 @@ impl GitDirs {
 
 /// Finds, pins or evaluates dev shells for one process.
 pub struct Resolver {
-    cache: Option<Client>,
+    cache: Option<Arc<Client>>,
     /// The shared cache directory: GC roots and activation scripts. Bound
     /// at its host path in views, where the Nix daemon resolves the roots.
     dir: PathBuf,
@@ -472,11 +473,24 @@ type Slot = (PathBuf, String);
 /// Shells resolved before, each until something it was built from changes.
 struct Hot {
     watcher: rho_watch::Watcher,
-    shells: Mutex<HashMap<Slot, (Resolved, rho_watch::Subscription)>>,
+    shells: Mutex<HashMap<Slot, Kept>>,
     /// What each flake's last shell watched, to watch before resolving it
     /// again.
     watches: Mutex<HashMap<Slot, Watch>>,
 }
+
+/// A shell [`Resolver::hot`] uses without asking the builder.
+struct Kept {
+    resolved: Resolved,
+    subscription: rho_watch::Subscription,
+    /// When the daemon last heard the entry was used.
+    reported: Instant,
+}
+
+/// How often a kept shell in use is reported used, to stay among the
+/// pinned. Reporting every use would cost each command a round trip and a
+/// database commit.
+const REPORT_USE_EVERY: Duration = Duration::from_secs(60);
 
 static RESOLVER: OnceLock<Arc<Resolver>> = OnceLock::new();
 
@@ -545,7 +559,7 @@ impl Resolver {
     /// activation scripts go.
     pub fn new(cache: Option<Client>, dir: PathBuf, builder: PathBuf, environment: Vec<(OsString, OsString)>) -> Self {
         Self {
-            cache,
+            cache: cache.map(Arc::new),
             dir,
             builder,
             environment,
@@ -595,24 +609,31 @@ impl Resolver {
     async fn hot(&self, flake: &Flake) -> Option<Resolved> {
         let hot = self.hot.as_ref()?;
         let slot = slot(flake);
-        let resolved = {
+        let (resolved, report) = {
             let mut shells = hot.shells.lock().unwrap();
-            let (resolved, subscription) = shells.get(&slot)?;
-            if !matches!(subscription.changed(), Ok(false)) {
+            let kept = shells.get_mut(&slot)?;
+            // An environment unpinned while kept may have been collected.
+            if !matches!(kept.subscription.changed(), Ok(false))
+                || !Path::new(&kept.resolved.env_store_path).exists()
+            {
                 shells.remove(&slot);
                 return None;
             }
-            resolved.clone()
-        };
-        if let (Some(cache), Some(id)) = (&self.cache, resolved.id) {
-            // Without the daemon, the shell is as valid as before.
-            if let Ok(false) = cache.used(id).await
-                && let Ok(false) = self.pin(&resolved.env_store_path).await
-            {
-                let _ = cache.forget(id).await;
-                hot.shells.lock().unwrap().remove(&slot);
-                return None;
+            let report = kept.reported.elapsed() >= REPORT_USE_EVERY;
+            if report {
+                kept.reported = Instant::now();
             }
+            (kept.resolved.clone(), report)
+        };
+        if report && let (Some(cache), Some(id)) = (self.cache.clone(), resolved.id) {
+            let pin = self.pin_command(&resolved.env_store_path);
+            tokio::spawn(async move {
+                if let Ok(false) = cache.used(id).await
+                    && let Ok(false) = pinned(pin).await
+                {
+                    let _ = cache.forget(id).await;
+                }
+            });
         }
         Some(resolved)
     }
@@ -636,17 +657,20 @@ impl Resolver {
             env_store_path: shell.env_store_path,
             watch: shell.watch,
         };
-        self.keep(flake, &resolved, before).await;
+        self.keep(flake, resolved.clone(), before).await;
         Ok((resolved, diagnostics))
     }
 
     /// Keep `resolved` for [`Self::hot`] if nothing it was built from can
     /// have changed since the builder checked it unseen: watched from
     /// before, or watched now and confirmed by checking again.
-    async fn keep(&self, flake: &Flake, resolved: &Resolved, before: Option<(Watch, rho_watch::Subscription)>) {
-        let (Some(hot), Some(id)) = (&self.hot, resolved.id) else {
+    async fn keep(&self, flake: &Flake, mut resolved: Resolved, before: Option<(Watch, rho_watch::Subscription)>) {
+        let Some(hot) = &self.hot else {
             return;
         };
+        if resolved.id.is_none() {
+            return;
+        }
         hot.watches.lock().unwrap().insert(slot(flake), resolved.watch.clone());
         let subscription = match before {
             Some((watch, subscription))
@@ -659,16 +683,25 @@ impl Resolver {
                     return;
                 };
                 let Ok((again, _)) = self.build(flake).await else { return };
-                if again.id != Some(id) || !again.watch.within(&resolved.watch) {
+                if again.id.is_none()
+                    || again.env_store_path != resolved.env_store_path
+                    || !again.watch.within(&resolved.watch)
+                {
                     return;
                 }
+                // The entry checked last is the one to report used.
+                resolved.id = again.id;
                 subscription
             }
         };
-        hot.shells
-            .lock()
-            .unwrap()
-            .insert(slot(flake), (resolved.clone(), subscription));
+        hot.shells.lock().unwrap().insert(
+            slot(flake),
+            Kept {
+                resolved,
+                subscription,
+                reported: Instant::now(),
+            },
+        );
     }
 
     async fn subscribe(&self, hot: &Hot, watch: Watch) -> Option<(Watch, rho_watch::Subscription)> {
@@ -702,16 +735,11 @@ impl Resolver {
         Ok(path)
     }
 
-    /// Pin `env_store_path` with a GC root; `false` if it is gone.
-    async fn pin(&self, env_store_path: &str) -> Result<bool> {
+    /// The builder pinning `env_store_path` with a GC root, for [`pinned`].
+    fn pin_command(&self, env_store_path: &str) -> tokio::process::Command {
         let mut command = self.builder_command();
         command.arg("pin").arg(env_store_path).arg(gc_root(&roots_dir(&self.dir), env_store_path));
-        let output = run(command).await?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(PIN_GONE) => Ok(false),
-            _ => bail!("pinning {env_store_path} failed: {}", String::from_utf8_lossy(&output.stderr)),
-        }
+        command
     }
 
     /// Run `rho-devshell-builder shell` for `flake`.
@@ -751,6 +779,17 @@ fn slot(flake: &Flake) -> Slot {
 
 /// `rho-devshell-builder pin`'s exit status for a path already collected.
 pub const PIN_GONE: i32 = 3;
+
+/// Run a [`Resolver::pin_command`]: whether the environment is pinned,
+/// `false` if it is gone.
+async fn pinned(command: tokio::process::Command) -> Result<bool> {
+    let output = run(command).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(PIN_GONE) => Ok(false),
+        _ => bail!("pinning failed: {}", String::from_utf8_lossy(&output.stderr)),
+    }
+}
 
 const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
 

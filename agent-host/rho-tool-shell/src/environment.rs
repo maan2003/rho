@@ -74,9 +74,20 @@ struct Snapshot {
 /// A cached shell an environment was activated from.
 struct Source {
     flake: PathBuf,
-    eval_id: u64,
+    /// [`Built::shell`].
+    shell: String,
     contents: HashSet<PathBuf>,
     names: HashSet<PathBuf>,
+}
+
+impl Source {
+    /// Whether `built` is this shell again, depending on nothing the
+    /// source's watches miss.
+    fn holds(&self, built: &Built) -> bool {
+        built.shell.as_ref() == Some(&self.shell)
+            && built.watch.iter().all(|path| self.contents.contains(path))
+            && built.watch_names.iter().all(|path| self.names.contains(path))
+    }
 }
 
 impl Worker {
@@ -324,8 +335,9 @@ fn discover(cwd: &Path) -> Result<Discovery> {
 
 /// A flake's shell, for one generation.
 struct Built {
-    /// The cache entry, if the shell could be cached.
-    eval_id: Option<u64>,
+    /// The shell's environment store path, if the shell could be cached:
+    /// two builds with the same one activate the same environment.
+    shell: Option<String>,
     /// Bash applying the shell to the caller's environment, `shellHook`
     /// included, then rho's `PATH` policy.
     activation: String,
@@ -347,7 +359,7 @@ async fn resolved_shell(flake: PathBuf) -> Result<(Built, Vec<u8>)> {
     activation.push_str(rho_devshell::AFTER_SHELL);
     Ok((
         Built {
-            eval_id: resolved.id,
+            shell: resolved.id.map(|_| resolved.env_store_path),
             activation,
             watch: resolved.watch.contents.into_iter().collect(),
             watch_names: resolved.watch.names.into_iter().collect(),
@@ -414,9 +426,9 @@ async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Resu
                 diagnostics.extend(hook_output);
                 contents.extend(built.watch.iter().cloned());
                 names.extend(built.watch_names.iter().cloned());
-                let source = built.eval_id.map(|eval_id| Source {
+                let source = built.shell.map(|shell| Source {
                     flake: flake.clone(),
-                    eval_id,
+                    shell,
                     contents: built.watch.into_iter().collect(),
                     names: built.watch_names.into_iter().collect(),
                 });
@@ -429,7 +441,7 @@ async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Resu
         // An uncacheable shell cannot be confirmed and is kept as built.
         let still_valid = discover(&key.cwd)? == discovery
             && match &source {
-                Some(source) => build(shells, &source.flake).await?.0.eval_id == Some(source.eval_id),
+                Some(source) => source.holds(&build(shells, &source.flake).await?.0),
                 None => true,
             };
         if still_valid && !watches.changed()? {
@@ -461,7 +473,7 @@ async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<
     let names = source.names.union(&discovery.names).cloned().collect();
     let watches = watch(&source.contents, &names)?;
     let (built, diagnostics) = build(shells, &source.flake).await?;
-    if built.eval_id != Some(source.eval_id) || discover(&key.cwd)? != discovery || watches.changed()? {
+    if !source.holds(&built) || discover(&key.cwd)? != discovery || watches.changed()? {
         return Ok(None);
     }
     Ok(Some((
@@ -507,7 +519,7 @@ mod tests {
                     std::hash::Hash::hash(&std::fs::read(flake.join(name)).ok(), &mut hasher);
                 }
                 let built = Built {
-                    eval_id: Some(std::hash::Hasher::finish(&hasher)),
+                    shell: Some(format!("{:x}", std::hash::Hasher::finish(&hasher))),
                     activation: format!(". {}/env.sh", flake.display()),
                     watch: vec![flake.join("env.sh"), flake.join("extra")],
                     watch_names: Vec::new(),
@@ -608,7 +620,7 @@ mod tests {
         fixture.write("env.sh", "printf x >> evaluations\n");
         fixture.run("true", None).await;
         // Same contents, new inode: the watch fires, the builder hits the
-        // same entry, and the shell hook does not run again.
+        // same shell, and the shell hook does not run again.
         fixture.write("replacement", "printf x >> evaluations\n");
         std::fs::rename(
             fixture.root.path().join("replacement"),
