@@ -50,7 +50,6 @@ use rho_desk_client::Desk;
 use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
-use rho_window::selection::{ActivePane, Selection};
 use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
@@ -60,6 +59,7 @@ use crate::desk_view::DeskBuffers;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
 use crate::search;
+use crate::selection::{ActivePane, Selection};
 
 /// One context's viewport and the stack behind it, over Rho's own surface
 /// identity. The machine is `rho-window`'s and names nothing above it.

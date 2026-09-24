@@ -804,7 +804,7 @@ impl DraftModel {
         else {
             return;
         };
-        let block = style::attachment_block(anchor, &self.attachments);
+        let block = style::attachment_block(anchor, crate::attachment_labels(&self.attachments));
         for editor in self.live_editors() {
             let block = block.clone();
             let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));

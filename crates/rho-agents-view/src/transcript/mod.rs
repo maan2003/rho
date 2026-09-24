@@ -51,12 +51,12 @@ use rho_agents_client::state::{UiAgentState, UiBlock};
 use rho_agents_client::store::{FrameSummary, IncrementalUpdate};
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
-use rho_window::visualization::Visualization;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
 use crate::render::{
     BlockKind, RenderedBlock, block_kind, block_visible, render_block_with_agent_labels,
 };
+use crate::visualization::Visualization;
 
 mod store;
 

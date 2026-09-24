@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
@@ -26,6 +27,7 @@ rustc-hash = "2.1.0"
 settings = { path = "../../vendor/zed/crates/settings" }
 serde_json.workspace = true
 text = { path = "../../vendor/zed/crates/text" }
+theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
 tracing.workspace = true
 tree-sitter = "0.26"

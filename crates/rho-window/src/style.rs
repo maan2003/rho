@@ -13,7 +13,6 @@ use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockSt
 use gpui::prelude::*;
 use gpui::{App, FontWeight, HighlightStyle, Hsla, div};
 use multi_buffer::Anchor;
-use rho_agent_types::ContentPart;
 use theme::ActiveTheme as _;
 
 /// How much larger a user message renders than everything around it.
@@ -184,22 +183,9 @@ pub fn role_chip_style(family: RoleFamily, cx: &App) -> HighlightStyle {
     }
 }
 
-/// One editor row of compact media chips below a writable prompt.
-pub fn attachment_block(anchor: Anchor, attachments: &[ContentPart]) -> BlockProperties<Anchor> {
-    let labels = attachments
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Image { media_type, data } => Some(format!(
-                "{} · {} KB",
-                media_type
-                    .strip_prefix("image/")
-                    .unwrap_or(media_type)
-                    .to_ascii_uppercase(),
-                data.len().div_ceil(1024)
-            )),
-            ContentPart::Text { .. } => None,
-        })
-        .collect::<Vec<_>>();
+/// One editor row of compact media chips below a writable prompt, one
+/// chip per label.
+pub fn attachment_block(anchor: Anchor, labels: Vec<String>) -> BlockProperties<Anchor> {
     BlockProperties {
         placement: BlockPlacement::Below(anchor),
         height: Some(1),
@@ -283,7 +269,7 @@ mod tests {
     #[test]
     fn every_block_the_chrome_draws_starts_with_a_height() {
         assert!(
-            attachment_block(Anchor::Min, &[]).height.is_some(),
+            attachment_block(Anchor::Min, Vec::new()).height.is_some(),
             "the attachment chips are measured"
         );
         assert!(

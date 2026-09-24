@@ -12303,6 +12303,7 @@ dependencies = [
 name = "rho-agents-view"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "collections",
  "editor",
@@ -12318,6 +12319,7 @@ dependencies = [
  "serde_json",
  "settings",
  "text",
+ "theme",
  "theme_settings",
  "tracing",
  "tree-sitter",
@@ -13158,7 +13160,6 @@ dependencies = [
 name = "rho-window"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "camino",
  "editor",
  "fs",
@@ -13167,8 +13168,6 @@ dependencies = [
  "languages",
  "multi_buffer",
  "node_runtime",
- "rho-agent-types",
- "rho-agents-client",
  "text",
  "theme",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
