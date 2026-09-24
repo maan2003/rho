@@ -6,8 +6,9 @@
 
 use std::time::Duration;
 
-use rho_agent_host_proto::{NewAgent, Opened, StartMode, read_frame, write_frame, write_open};
+use rho_agent_host_proto::{Opened, read_frame, write_frame, write_open};
 use rho_agent_types::AgentId;
+use rho_agents_client::protocol::{NewAgent, StartMode};
 use rho_terminal::protocol as term;
 use rho_terminal::protocol::{
     ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalList, TerminalOpen,

@@ -22,8 +22,8 @@ use gpui::{
     AnyElement, App, Bounds, Context, Entity, Hsla, PathBuilder, Pixels, Point, TextStyle, Window,
     canvas, div, point, px, rgb,
 };
-use rho_agent_host_proto::{AgentCostSeries, AgentUsageSeries};
 use rho_agents_client::HostId;
+use rho_agents_client::protocol::{AgentCostSeries, AgentUsageSeries};
 use rho_agents_client::usage::{
     AgentCostSummary, ChartPoint, CostSummary, QuotaSummary, SeriesColor, ShareSummary,
 };
@@ -188,11 +188,11 @@ impl Chart {
 enum Series {
     None,
     Quota {
-        series: Vec<rho_agent_host_proto::QuotaSeries>,
+        series: Vec<rho_agents_client::protocol::QuotaSeries>,
         active_auth_namespaces: Vec<String>,
     },
-    Global(Vec<rho_agent_host_proto::AgentUsageSeries>),
-    AgentCost(Vec<Vec<rho_agent_host_proto::AgentCostSeries>>),
+    Global(Vec<rho_agents_client::protocol::AgentUsageSeries>),
+    AgentCost(Vec<Vec<rho_agents_client::protocol::AgentCostSeries>>),
 }
 
 /// What the block paints: already the size of the picture.
@@ -278,7 +278,7 @@ impl UsageView {
 
     pub(crate) fn quota_arrived(
         &mut self,
-        series: Vec<rho_agent_host_proto::QuotaSeries>,
+        series: Vec<rho_agents_client::protocol::QuotaSeries>,
         active_auth_namespaces: Vec<String>,
         cx: &mut Context<Self>,
     ) {
@@ -294,7 +294,7 @@ impl UsageView {
 
     pub(crate) fn global_usage_arrived(
         &mut self,
-        series: Vec<rho_agent_host_proto::AgentUsageSeries>,
+        series: Vec<rho_agents_client::protocol::AgentUsageSeries>,
         cx: &mut Context<Self>,
     ) {
         if !matches!(self.chart, Chart::ModelCost | Chart::UsageShare) {
@@ -306,7 +306,7 @@ impl UsageView {
 
     pub(crate) fn agent_cost_arrived(
         &mut self,
-        series: Vec<Vec<rho_agent_host_proto::AgentCostSeries>>,
+        series: Vec<Vec<rho_agents_client::protocol::AgentCostSeries>>,
         cx: &mut Context<Self>,
     ) {
         if self.chart != Chart::AgentCost {

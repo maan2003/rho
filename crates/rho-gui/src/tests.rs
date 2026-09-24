@@ -2141,7 +2141,7 @@ fn tool(
         id: id.to_owned(),
         name: "shell_command".to_owned(),
         arguments: "echo ok".to_owned(),
-        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
         preview: None,
         status,
         output: None,
@@ -2550,7 +2550,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     id: format!("t1.{}", blocks_count - 1),
                     name: "shell_command".to_owned(),
                     arguments: format!("echo {tick}"),
-                    format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                    format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                     preview: None,
                     status: UiToolStatus::Running,
                     output: None,
@@ -3376,7 +3376,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 id: "tool-1".to_owned(),
                 name: "shell_command".to_owned(),
                 arguments: "echo".to_owned(),
-                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -3458,7 +3458,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),
-                format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                 preview: None,
                 status: UiToolStatus::Running,
                 output: None,
@@ -4156,7 +4156,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
     feed_edit(&workspace, cx, agent(1), |state| {
         state.usage = rho_agents_client::state::UiAgentUsage {
             provider: "fable".to_owned(),
-            total: rho_agent_host_proto::AgentUsageBucket {
+            total: rho_agents_client::protocol::AgentUsageBucket {
                 input_tokens: 1_000_000,
                 cache_read_tokens: 1_000_000,
                 cache_write_tokens: 1_000_000,
@@ -4218,7 +4218,7 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             context_used: Some(62_300),
             usage: rho_agents_client::state::UiAgentUsage {
                 provider: "fable".to_owned(),
-                total: rho_agent_host_proto::AgentUsageBucket {
+                total: rho_agents_client::protocol::AgentUsageBucket {
                     input_tokens: 1_000_000,
                     ..Default::default()
                 },
@@ -6077,7 +6077,7 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         id: "tool-1".to_owned(),
         name: "shell".to_owned(),
         arguments: r#"{"command":"echo **bold** and _under_"}"#.to_owned(),
-        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
+        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
         preview: None,
         status: UiToolStatus::Success,
         output: None,
@@ -6622,7 +6622,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
 #[gpui::test]
 fn unnamed_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
-    let summary = rho_agent_host_proto::QuotaSummary {
+    let summary = rho_agents_client::protocol::QuotaSummary {
         model: "gpt".to_owned(),
         auth_namespace: None,
         remaining_percent: 40,
@@ -9279,7 +9279,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     assert!(
         calls
             .iter()
-            .any(|(call, _)| matches!(call, rho_agent_host_proto::agents::Request::New(_))),
+            .any(|(call, _)| matches!(call, rho_agents_client::protocol::Request::New(_))),
         "the draft started an agent"
     );
     workspace
@@ -10862,7 +10862,7 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     assert_eq!(calls.len(), 1, "the draft makes one call");
     let (call, mut stream) = calls.pop().unwrap();
     assert!(
-        matches!(call, rho_agent_host_proto::agents::Request::New(_)),
+        matches!(call, rho_agents_client::protocol::Request::New(_)),
         "the draft asked for a new agent: {call:?}"
     );
     story::answer(

@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
-use rho_agent_host_proto::transcript::{LogEntry, TranscriptEvent};
 use rho_agent_types::{AgentId, AgentPos, Seq};
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 
+use crate::protocol::transcript::{LogEntry, TranscriptEvent};
 use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 
 /// Where this client stands in a host's journal, by the host's name. The
@@ -619,8 +619,9 @@ pub fn flush() {
 
 #[cfg(test)]
 mod recorded_names {
-    use rho_agent_host_proto::transcript::TranscriptEvent;
     use rho_db::Sen;
+
+    use crate::protocol::transcript::TranscriptEvent;
 
     /// redb refuses a table whose recorded value type differs from the
     /// one it is opened with, and `Sen` records the Rust path. These are
@@ -651,10 +652,10 @@ mod recorded_names {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy};
     use rho_agent_types::{TurnEdge, TurnOutcome};
 
     use super::*;
+    use crate::protocol::transcript::{RuntimeKind, SpawnedBy};
 
     fn agent_id(counter: u64) -> AgentId {
         AgentId::from_counter(counter, &rho_agent_types::AgentIdDomain(7)).expect("agent id")

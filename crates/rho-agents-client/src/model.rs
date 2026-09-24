@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::agents::ClientFrame;
-use rho_agent_host_proto::transcript::{Live, LogEntry, TranscriptEvent};
 use rho_agent_types::{AgentId, AgentPos, Seq};
 use rho_hosts::HostStream;
 
+use crate::protocol::ClientFrame;
+use crate::protocol::transcript::{Live, LogEntry, TranscriptEvent};
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
 use crate::{HostId, Verdict};
 
@@ -53,9 +53,7 @@ pub enum ModelMsg {
         agent_counter: u64,
     },
     /// Which provider accounts the host's agents may run on.
-    Auth {
-        auth: rho_agent_host_proto::AuthState,
-    },
+    Auth { auth: crate::protocol::AuthState },
     /// An agent was created on the host, by any client or agent, and the
     /// agent-id counter moved to `agent_counter`.
     AgentCreated {
@@ -64,7 +62,7 @@ pub enum ModelMsg {
     },
     /// The host's quota: every account's latest usage.
     QuotaUsage {
-        summaries: Vec<rho_agent_host_proto::QuotaSummary>,
+        summaries: Vec<crate::protocol::QuotaSummary>,
     },
 }
 
@@ -539,10 +537,10 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy};
     use rho_agent_types::{AgentRole, PresentationField};
 
     use super::*;
+    use crate::protocol::transcript::{RuntimeKind, SpawnedBy};
 
     const HOST: HostId = HostId(0);
 
@@ -597,7 +595,7 @@ mod tests {
     fn live(agent_id: AgentId) -> AgentFrame {
         AgentFrame::Live {
             agent_id,
-            live: rho_agent_host_proto::transcript::Live::Idle,
+            live: crate::protocol::transcript::Live::Idle,
         }
     }
 

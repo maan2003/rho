@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
-use rho_agent_host_proto::{AuthState, QuotaSeries, QuotaSummary};
 use rho_hosts::{HostId, Hosts};
+
+use crate::protocol::{AuthState, QuotaSeries, QuotaSummary};
 
 #[derive(Default)]
 pub struct Quotas {

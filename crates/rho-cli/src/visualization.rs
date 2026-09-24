@@ -1,7 +1,7 @@
 use std::io::Read as _;
 
 use anyhow::bail;
-use rho_agent_host_proto::agents::RecordVisualization;
+use rho_agents_client::protocol::RecordVisualization;
 use rho_visualizations::{MAX_VISUALIZATION_BYTES, SVG_MIME_TYPE};
 
 use crate::{RecordVisualizationArgs, daemon_call};

@@ -37,3 +37,7 @@ rho-rpc = { workspace = true, optional = true }
 settings = { path = "../../vendor/zed/crates/settings", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings", optional = true }
+
+[dev-dependencies]
+# The tests exercise the client too.
+rho-terminal = { path = ".", features = ["client"] }

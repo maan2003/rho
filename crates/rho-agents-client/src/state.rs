@@ -1,9 +1,10 @@
 //! How a client draws an agent: the block list and status it folds from
 //! the mirror and the live tail. Nothing here crosses the wire.
 
-use rho_agent_host_proto::transcript::{ArgumentsFormat, TextPhase};
 use rho_agent_types::{MessageDelivery, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+
+use crate::protocol::transcript::{ArgumentsFormat, TextPhase};
 
 /// One agent's transcript as a client draws it: a flat block list plus a
 /// coarse status. Folded on the client from the mirror, with the runtime's
@@ -28,7 +29,7 @@ pub struct UiAgentState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiAgentUsage {
     pub provider: String,
-    pub total: rho_agent_host_proto::AgentUsageBucket,
+    pub total: crate::protocol::AgentUsageBucket,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

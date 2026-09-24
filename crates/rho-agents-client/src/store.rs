@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rho_agent_host_proto::transcript::{Item, Live, QueuedItem};
 use rho_agent_types::AgentId;
 
+use crate::protocol::transcript::{Item, Live, QueuedItem};
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -426,10 +426,10 @@ mod tests {
 
     #[test]
     fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
-        use rho_agent_host_proto::transcript::TranscriptEvent;
         use rho_agent_types::{AgentPos, ExecMilestone, UnixMs};
 
         use crate::fold::TranscriptFold;
+        use crate::protocol::transcript::TranscriptEvent;
         let mut store = AgentStore::default();
         let mut transcript = TranscriptFold::default();
         store.apply_live(agent(), Live::Requesting);
@@ -441,7 +441,7 @@ mod tests {
                     id: "exec-1".into(),
                     name: "exec".into(),
                     arguments: "print(1)".into(),
-                    format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                    format: crate::protocol::transcript::ArgumentsFormat::Text,
                 },
             },
         );

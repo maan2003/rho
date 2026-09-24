@@ -8,16 +8,16 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_agent_host_proto::transcript::TranscriptEvent;
 use rho_agent_types::{AgentId, AgentPos};
 use rho_agents_client::TranscriptFold;
+use rho_agents_client::protocol::transcript::TranscriptEvent;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::{AgentStore, FrameSummary};
 
 /// One change to an agent's transcript: a delta to the runtime's live
 /// tail, or the fold of its mirror made again.
 pub enum TranscriptFrame {
-    Live(rho_agent_host_proto::transcript::Live),
+    Live(rho_agents_client::protocol::transcript::Live),
     /// The mirror's fold, whole. What an agent's first read hands, and
     /// nothing else: a transcript is handed once and appended to after.
     Fold(UiAgentState),

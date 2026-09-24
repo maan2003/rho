@@ -4,8 +4,8 @@
 //! reader diffing snapshots.
 
 use rho_agent::{AgentStateKind, InputKind, QueuedInput};
-use rho_agent_host_proto::transcript::{Item, Live, QueuedItem, TextPhase};
 use rho_agent_types::ContentPart;
+use rho_agents_client::protocol::transcript::{Item, Live, QueuedItem, TextPhase};
 use rho_inference::types::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
 
 /// Remembers what was last told so the next tell is only the change.

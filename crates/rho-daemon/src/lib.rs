@@ -11,10 +11,9 @@ use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent_host_proto::host::GitProviderFrame;
 use rho_agent_host_proto::server::{Server, ServerConnection};
-use rho_agent_host_proto::{
-    AuthState, JoinTarget, Open, Opened, Part, StartMode, read_frame, write_frame,
-};
+use rho_agent_host_proto::{Open, Opened, Part, read_frame, write_frame};
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
+use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};

@@ -28,7 +28,6 @@ use gpui::{
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
-use rho_agent_host_proto::{AgentCommand, NewAgent, agents};
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
@@ -36,10 +35,11 @@ use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
 };
+use rho_agents_client::protocol::{AgentCommand, NewAgent};
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
-use rho_agents_client::{AgentMap, HostId};
+use rho_agents_client::{AgentMap, HostId, protocol as agents};
 use rho_agents_view::agent_view::AgentModel;
 use rho_agents_view::draft::DraftModel;
 use rho_agents_view::messages::MessageLog;
@@ -726,7 +726,7 @@ impl Workspace {
         agent_id: AgentId,
         rows: &[(
             rho_agent_types::AgentPos,
-            rho_agent_host_proto::transcript::TranscriptEvent,
+            rho_agents_client::protocol::transcript::TranscriptEvent,
         )],
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5155,7 +5155,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn merged_quota_summaries_for_test(
         &self,
-    ) -> Vec<rho_agent_host_proto::QuotaSummary> {
+    ) -> Vec<rho_agents_client::protocol::QuotaSummary> {
         self.quotas.merged_summaries(&self.hosts)
     }
 
@@ -8079,7 +8079,7 @@ impl Workspace {
     fn quota_history_arrived(
         &mut self,
         host: HostId,
-        series: Vec<rho_agent_host_proto::QuotaSeries>,
+        series: Vec<rho_agents_client::protocol::QuotaSeries>,
         cx: &mut Context<Self>,
     ) {
         self.quotas.set_history(host, series);
@@ -8093,7 +8093,7 @@ impl Workspace {
     fn global_usage_arrived(
         &mut self,
         host: HostId,
-        series: Vec<rho_agent_host_proto::AgentUsageSeries>,
+        series: Vec<rho_agents_client::protocol::AgentUsageSeries>,
         cx: &mut Context<Self>,
     ) {
         self.usage.record_global(host, series);
@@ -8106,7 +8106,7 @@ impl Workspace {
     fn agent_cost_arrived(
         &mut self,
         host: HostId,
-        series: Vec<rho_agent_host_proto::AgentCostSeries>,
+        series: Vec<rho_agents_client::protocol::AgentCostSeries>,
         cx: &mut Context<Self>,
     ) {
         self.usage.record_agent_cost(host, series);

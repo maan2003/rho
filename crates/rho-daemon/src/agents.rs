@@ -9,13 +9,13 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_agent_host_proto::agents::{
-    AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame, GlobalUsage, Open,
-    QuotaHistory, QuotaUsage, RecordVisualization, Request, ServerFrame, SetAuthAccountEnabled,
-    SetClaudeAccount, Visualization, VisualizationContent,
-};
-use rho_agent_host_proto::{AgentCommand, Answer, Call, NewAgent, Opened, write_frame};
+use rho_agent_host_proto::{Answer, Call, Opened, write_frame};
 use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
+use rho_agents_client::protocol::{
+    AgentCommand, AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame,
+    GlobalUsage, NewAgent, Open, QuotaHistory, QuotaUsage, RecordVisualization, Request,
+    ServerFrame, SetAuthAccountEnabled, SetClaudeAccount, Visualization, VisualizationContent,
+};
 use rho_db::RhoDb;
 use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
@@ -318,7 +318,7 @@ where
 /// is told too.
 fn spawn_log_follow(
     services: Arc<Services>,
-    outgoing_tx: mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
+    outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     since: Seq,
 ) -> tokio::task::JoinHandle<()> {
     use rho_agent::journal::Feed;
@@ -353,10 +353,7 @@ fn spawn_log_follow(
                     });
                     for live in queue.into_iter().chain(teller.tell(&status.kind)) {
                         if outgoing_tx
-                            .send(rho_agent_host_proto::agents::ServerFrame::Live {
-                                agent_id,
-                                live,
-                            })
+                            .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
                             .is_err()
                         {
                             return;
@@ -387,7 +384,7 @@ fn spawn_log_follow(
 /// when the connection is gone.
 async fn send_journal_from(
     db: &RhoDb,
-    outgoing_tx: &mpsc::UnboundedSender<rho_agent_host_proto::agents::ServerFrame>,
+    outgoing_tx: &mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
     sent: &mut rho_agent_types::Seq,
 ) -> bool {
     loop {
@@ -399,7 +396,7 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
-                Some(rho_agent_host_proto::transcript::LogEntry {
+                Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
@@ -409,7 +406,7 @@ async fn send_journal_from(
             .collect::<Vec<_>>();
         if !entries.is_empty()
             && outgoing_tx
-                .send(rho_agent_host_proto::agents::ServerFrame::Log { entries })
+                .send(rho_agents_client::protocol::ServerFrame::Log { entries })
                 .is_err()
         {
             return false;
@@ -1032,8 +1029,8 @@ fn agent_detail(
     db: &RhoDb,
     agent_id: AgentId,
     pos: rho_agent_types::AgentPos,
-) -> rho_agent_host_proto::transcript::DetailBody {
-    use rho_agent_host_proto::transcript::DetailBody;
+) -> rho_agents_client::protocol::transcript::DetailBody {
+    use rho_agents_client::protocol::transcript::DetailBody;
     let event = db.read().agent_event(agent_id, pos.into());
     if let Some(native) = event.as_ref().and_then(rho_agent::AgentEvent::native_event) {
         use rho_agent::native::NativeEvent;
@@ -1085,14 +1082,17 @@ fn agent_detail(
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
                 (!text.is_empty())
-                    .then_some(rho_agent_host_proto::transcript::Item::Text { text, phase: None })
+                    .then_some(rho_agents_client::protocol::transcript::Item::Text {
+                        text,
+                        phase: None,
+                    })
                     .into_iter()
                     .chain(calls.into_iter().map(|call| {
-                        rho_agent_host_proto::transcript::Item::ToolCall {
+                        rho_agents_client::protocol::transcript::Item::ToolCall {
                             id: call.id,
                             name: call.name,
                             arguments: call.arguments,
-                            format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
+                            format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
                         }
                     }))
                     .collect(),
@@ -1122,9 +1122,9 @@ fn agent_detail(
 
 fn detail_result(
     result: &rho_inference::types::ToolResult,
-) -> rho_agent_host_proto::transcript::DetailResult {
-    use rho_agent_host_proto::transcript::ToolStatus;
-    rho_agent_host_proto::transcript::DetailResult {
+) -> rho_agents_client::protocol::transcript::DetailResult {
+    use rho_agents_client::protocol::transcript::ToolStatus;
+    rho_agents_client::protocol::transcript::DetailResult {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
             rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
@@ -1138,10 +1138,10 @@ fn detail_result(
 
 fn detail_update(
     update: &rho_inference::types::ToolUpdate,
-) -> rho_agent_host_proto::transcript::DetailResult {
-    rho_agent_host_proto::transcript::DetailResult {
+) -> rho_agents_client::protocol::transcript::DetailResult {
+    rho_agents_client::protocol::transcript::DetailResult {
         id: update.call_id.as_str().to_owned(),
-        status: rho_agent_host_proto::transcript::ToolStatus::Success,
+        status: rho_agents_client::protocol::transcript::ToolStatus::Success,
         output: update.recorded_output().to_owned(),
         error: None,
     }

@@ -19,13 +19,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use rho_agent_host_proto::agents::{
-    ClientFrame as AgentsClientFrame, ServerFrame as AgentsServerFrame,
-};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::transcript::TranscriptEvent;
-use rho_agent_host_proto::{JoinTarget, NewAgent, StartMode};
 use rho_agent_types::{AgentRole, ContentPart};
+use rho_agents_client::protocol::transcript::TranscriptEvent;
+use rho_agents_client::protocol::{
+    ClientFrame as AgentsClientFrame, JoinTarget, NewAgent, ServerFrame as AgentsServerFrame,
+    StartMode,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1185,7 +1185,7 @@ async fn probe_async(name: &str) -> Result<()> {
                     }
                     let completed_reply = matches!(
                         &entry.event,
-                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agent_host_proto::transcript::Item::ToolCall { .. }))
+                        TranscriptEvent::Replied { items, .. } if !items.iter().any(|item| matches!(item, rho_agents_client::protocol::transcript::Item::ToolCall { .. }))
                     );
                     if matches!(&entry.event, TranscriptEvent::Replied { .. }) {
                         replies += 1;

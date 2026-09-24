@@ -5,12 +5,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::{
-    AgentCommand, Answer, NewAgent, agents, read_frame, write_frame, write_open,
-};
+use rho_agent_host_proto::{Answer, read_frame, write_frame, write_open};
 use rho_agent_types::{AgentId, Seq};
+use rho_agents_client::protocol as agents;
+use rho_agents_client::protocol::{AgentCommand, ClientFrame, NewAgent, ServerFrame};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 

@@ -5,7 +5,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rho_agent_host_proto::{NewAgent, Opened, agents, host, read_frame, write_open};
+use rho_agent_host_proto::{Opened, host, read_frame, write_open};
+use rho_agents_client::protocol as agents;
+use rho_agents_client::protocol::NewAgent;
 
 struct Child(std::process::Child);
 impl Drop for Child {
@@ -74,7 +76,7 @@ fn main() -> Result<()> {
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
         let agent=rho_agent_host_proto::client::call(&socket,NewAgent {
-            role:Default::default(), start:rho_agent_host_proto::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
+            role:Default::default(), start:rho_agents_client::protocol::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
             mode:rho_agent_types::WorksetMode::Exposed,content:None,
         }).await.context("agent creation failed")?;
         let desktop_name = "preview".to_owned();

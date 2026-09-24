@@ -24,7 +24,7 @@ prefix-id = { workspace = true, features = ["redb"] }
 redb = { workspace = true }
 rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
-rho-agents-client = { workspace = true }
+rho-agents-client = { workspace = true, features = ["client"] }
 rho-db = { workspace = true }
 rho-hosts = { workspace = true }
 rho-slack = { workspace = true }

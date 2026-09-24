@@ -55,6 +55,8 @@ theme = { path = "../../vendor/zed/crates/theme", optional = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The tests exercise the client too.
+rho-files = { path = ".", features = ["client"] }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",
 ] }

@@ -38,13 +38,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
-#[cfg(test)]
-use rho_agent_host_proto::transcript::LogEntry;
 use rho_agent_types::{AgentId, AgentWant};
 use rho_hosts::HostId;
 
 use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
 use crate::now_ms;
+#[cfg(test)]
+use crate::protocol::transcript::LogEntry;
 
 const LABEL_HEADROOM: u64 = 200;
 
@@ -842,10 +842,10 @@ impl AgentMap {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
     use rho_agent_types::{AgentIdDomain, AgentPos, Seq, TurnEdge, TurnOutcome, UnixMs};
 
     use super::*;
+    use crate::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
 
     fn created(at: u64) -> TranscriptEvent {
         child_of(None, at)

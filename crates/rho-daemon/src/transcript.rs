@@ -6,10 +6,10 @@
 
 use rho_agent::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
 use rho_agent::{AgentEvent, InputKind, QueuedInput};
-use rho_agent_host_proto::transcript::{
+use rho_agent_types::{PresentationField, UnixMs};
+use rho_agents_client::protocol::transcript::{
     ArgumentsFormat, Item, RuntimeKind, SpawnedBy, ToolOutcome, ToolStatus, TranscriptEvent, Usage,
 };
-use rho_agent_types::{PresentationField, UnixMs};
 #[cfg(test)]
 use rho_inference::types::ContextBlock;
 use rho_inference::types::{InferenceResponseItem, MessageSender, ToolType};
@@ -178,7 +178,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
         // reply, the results a request that carried them.
         AgentEvent::Transcript { line, at, .. } => match line {
             rho_agent::TranscriptLine::User { text } => TranscriptEvent::ClaudeMessage {
-                speaker: rho_agent_host_proto::transcript::Speaker::User,
+                speaker: rho_agents_client::protocol::transcript::Speaker::User,
                 text: text.clone(),
                 at: *at,
             },
@@ -200,7 +200,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
                         arguments: call.arguments.clone(),
                         // A transcript call is Claude's, and Claude's tools
                         // are all schema'd: its arguments are always JSON.
-                        format: rho_agent_host_proto::transcript::ArgumentsFormat::Json,
+                        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Json,
                     }))
                     .collect(),
                 compacted: false,
@@ -441,17 +441,19 @@ mod tests {
                 items: vec![
                     Item::Text {
                         text: "before".into(),
-                        phase: Some(rho_agent_host_proto::transcript::TextPhase::Commentary)
+                        phase: Some(rho_agents_client::protocol::transcript::TextPhase::Commentary)
                     },
                     Item::ToolCall {
                         id: "middle".into(),
                         name: "exec".into(),
                         arguments: "print(42)".into(),
-                        format: rho_agent_host_proto::transcript::ArgumentsFormat::Text,
+                        format: rho_agents_client::protocol::transcript::ArgumentsFormat::Text,
                     },
                     Item::Text {
                         text: "after".into(),
-                        phase: Some(rho_agent_host_proto::transcript::TextPhase::FinalAnswer)
+                        phase: Some(
+                            rho_agents_client::protocol::transcript::TextPhase::FinalAnswer
+                        )
                     },
                 ],
                 compacted: false,

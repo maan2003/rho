@@ -10,14 +10,14 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
-use rho_agent_host_proto::agents::{self, ClientFrame, ServerFrame};
-use rho_agent_host_proto::transcript::{Live, LogEntry};
-use rho_agent_host_proto::{AuthState, QuotaSummary, read_frame, write_frame, write_open};
+use rho_agent_host_proto::{read_frame, write_frame, write_open};
 use rho_agent_types::{AgentId, Seq};
 use rho_hosts::{Dialer, HostStream};
 
 use crate::HostId;
 use crate::model::ToModel;
+use crate::protocol::transcript::{Live, LogEntry};
+use crate::protocol::{self, AuthState, ClientFrame, QuotaSummary, ServerFrame};
 
 /// What a host says on its agents stream.
 pub enum AgentFrame {
@@ -118,7 +118,7 @@ impl HostStream for AgentStream {
         Box::pin(async move {
             // Bulk priority: a catch-up must not hold up anything interactive.
             let mut socket = dialer.open(None).await?;
-            write_open(&mut socket, &agents::Open::Session).await?;
+            write_open(&mut socket, &protocol::Open::Session).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);
             let mut commands = commands.lock().await;
             while commands.try_recv().is_ok() {}

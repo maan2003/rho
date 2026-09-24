@@ -7,16 +7,16 @@
 
 use std::sync::Arc;
 
-use rho_agent_host_proto::AgentUsageBucket;
-use rho_agent_host_proto::transcript::{
-    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
-};
 use rho_agent_types::{
     AgentId, AgentPos, AgentRole, AgentWant, Place, PresentationField, TurnEdge, TurnOutcome,
     UnixMs,
 };
 
 use crate::HostId;
+use crate::protocol::AgentUsageBucket;
+use crate::protocol::transcript::{
+    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
+};
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiToolStatus};
 
 /// How much an agent wants the user, as the view decided.
@@ -722,10 +722,10 @@ fn delivered(queued: UiBlock) -> UiBlock {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{ArgumentsFormat, Item, ToolOutcome, Usage};
     use rho_agent_types::MessageDelivery;
 
     use super::*;
+    use crate::protocol::transcript::{ArgumentsFormat, Item, ToolOutcome, Usage};
     use crate::state::UiTool;
 
     pub(crate) fn test_place() -> Place {
@@ -761,7 +761,7 @@ mod tests {
     /// had. Handing the state whole made a row cost every row above it.
     #[test]
     fn committed_items_keep_live_order_and_phase_and_rewind_together() {
-        use rho_agent_host_proto::transcript::{ArgumentsFormat, Item, TextPhase};
+        use crate::protocol::transcript::{ArgumentsFormat, Item, TextPhase};
         let items = vec![
             Item::Text {
                 text: "before".into(),

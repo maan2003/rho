@@ -225,7 +225,7 @@ const MOVED: &[(&str, &str)] = &[
         "rho_desk::cells::DeviceId",
     ),
     (
-        "rho_agent_host_proto::transcript::TranscriptEvent",
+        "rho_agents_client::protocol::transcript::TranscriptEvent",
         "rho_ui_proto::mirror::MirrorEvent",
     ),
     (

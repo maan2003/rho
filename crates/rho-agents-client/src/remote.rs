@@ -5,8 +5,9 @@
 use std::future::Future;
 
 use rho_agent_host_proto::Call;
-use rho_agent_host_proto::agents::{self, VisualizationContent};
 use rho_hosts::{Dialer, Link};
+
+use crate::protocol::{self, VisualizationContent};
 
 /// One host's agents, as a client reaches them. Cheap to clone; valid
 /// across reconnects, since each use dials whatever connection is up.
@@ -41,7 +42,7 @@ impl AgentsLink {
         &self,
         id: String,
     ) -> impl Future<Output = anyhow::Result<VisualizationContent>> + Send + 'static {
-        self.call(agents::Visualization { id })
+        self.call(protocol::Visualization { id })
     }
 }
 

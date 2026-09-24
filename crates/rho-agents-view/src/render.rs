@@ -8,8 +8,8 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_agent_host_proto::transcript::ArgumentsFormat;
 use rho_agent_types::{AgentId, MessageDelivery};
+use rho_agents_client::protocol::transcript::ArgumentsFormat;
 use rho_agents_client::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_window::style::StyleClass;
 

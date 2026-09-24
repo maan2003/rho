@@ -55,7 +55,6 @@ pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> Age
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
     use rho_agent_types::{
         AgentIdDomain, AgentPos, MessageDelivery, TurnEdge, TurnOutcome, UnixMs,
     };
@@ -63,6 +62,7 @@ mod tests {
 
     use super::*;
     use crate::MirroredAgent;
+    use crate::protocol::transcript::{RuntimeKind, SpawnedBy, TranscriptEvent};
 
     fn agent() -> AgentId {
         AgentId::from_counter(1, &AgentIdDomain(0)).expect("an agent id")

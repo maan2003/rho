@@ -45,3 +45,7 @@ rho-window = { workspace = true, optional = true }
 text = { path = "../../vendor/zed/crates/text", optional = true }
 theme = { path = "../../vendor/zed/crates/theme", optional = true }
 tokio = { workspace = true, features = ["sync", "io-util", "macros", "rt"], optional = true }
+
+[dev-dependencies]
+# The tests exercise the client too.
+rho-shell-view = { path = ".", features = ["client"] }
