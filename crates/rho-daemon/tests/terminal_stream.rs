@@ -6,11 +6,13 @@
 
 use std::time::Duration;
 
-use rho_agent_host_proto::agents::TerminalList;
 use rho_agent_host_proto::term::{
-    ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalOpen, WireScreen,
+    ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalList, TerminalOpen,
+    WireScreen,
 };
-use rho_agent_host_proto::{NewAgent, Open, Opened, StartMode, agents, read_frame, write_frame};
+use rho_agent_host_proto::{
+    NewAgent, Opened, StartMode, read_frame, term, write_frame, write_open,
+};
 use rho_agent_types::AgentId;
 
 fn main() -> anyhow::Result<()> {
@@ -89,7 +91,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     // Create an agent on a clone of the temp repository.
     let agent_id = tokio::time::timeout(
         Duration::from_secs(30),
-        rho_agent_host_proto::client::agents(
+        rho_agent_host_proto::client::call(
             &socket_path,
             NewAgent {
                 role: Default::default(),
@@ -119,7 +121,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
     wait_for_line(&mut stream, "e2e-done").await?;
 
     // The listing sees the running terminal.
-    let list = rho_agent_host_proto::client::agents(
+    let list = rho_agent_host_proto::client::call(
         &socket_path,
         TerminalList {
             agent: Some(agent_id.encoded()),
@@ -148,7 +150,7 @@ async fn open_terminal(
     create: bool,
 ) -> anyhow::Result<rho_rpc::Stream> {
     let mut stream = rho_rpc::connect_unix(socket_path).await?;
-    let open = Open::Agents(agents::Open::Terminal {
+    let open = term::Open::Terminal {
         agent: agent_id.encoded(),
         terminal_id: 7,
         open: if create {
@@ -158,8 +160,8 @@ async fn open_terminal(
         },
         cols: 80,
         rows: 24,
-    });
-    write_frame(&mut stream, &open).await?;
+    };
+    write_open(&mut stream, &open).await?;
     match tokio::time::timeout(Duration::from_secs(30), read_frame(&mut stream)).await?? {
         Opened::Ready => Ok(stream),
         Opened::Refused { reason } => anyhow::bail!("refused: {reason}"),

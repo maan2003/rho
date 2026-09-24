@@ -242,7 +242,7 @@ pub fn calls(
     while let Ok(mut stream) = streams.try_recv() {
         let open = futures::executor::block_on(read_frame::<_, Open>(&mut stream))
             .expect("a stream opens by saying what it is for");
-        if let Open::Agents(agents::Open::Request(request)) = open {
+        if let Ok(agents::Open::Request(request)) = open.unpack() {
             calls.push((request, stream));
         }
     }

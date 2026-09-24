@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rho_agent_host_proto::{NewAgent, Open, Opened, agents, host, read_frame, write_frame};
+use rho_agent_host_proto::{NewAgent, Opened, agents, host, read_frame, write_open};
 
 struct Child(std::process::Child);
 impl Drop for Child {
@@ -68,12 +68,12 @@ fn main() -> Result<()> {
             ensure!(tokio::time::Instant::now()<deadline,"daemon startup timed out");
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        write_frame(&mut local,&Open::Host(host::Open::Desktops)).await?;
+        write_open(&mut local,&host::Open::Desktops).await?;
         let repo=temp.path().join("repo");
         std::fs::create_dir(&repo)?;
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
-        let agent=rho_agent_host_proto::client::agents(&socket,NewAgent {
+        let agent=rho_agent_host_proto::client::call(&socket,NewAgent {
             role:Default::default(), start:rho_agent_host_proto::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
             mode:rho_agent_types::WorksetMode::Exposed,content:None,
         }).await.context("agent creation failed")?;
@@ -114,7 +114,7 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==(false,0,0),"video work exists without subscriber");
         let endpoint:iroh::EndpointId=endpoint.parse()?;
         let client=rho_rpc::bind_ephemeral_iroh_client().await?;
-        rho_agent_host_proto::client::host(&socket,host::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await.context("trust")?;
+        rho_agent_host_proto::client::call(&socket,host::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await.context("trust")?;
         let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_agent_host_proto::IROH_ALPN)).await??;
         ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id()).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
         let mux=rho_rpc::media::Mux::new(connection.clone());
@@ -123,7 +123,7 @@ layout { background-color "#315b97"; }
         let transport=mux.session(1)?;
         let (send,recv)=connection.open_bi().await?;
         let mut input=rho_rpc::Stream::new(recv,send);
-        write_frame(&mut input,&Open::Host(host::Open::Wayland {media_id:1,agent:agent.encoded(),session:desktop_name.clone()})).await?;
+        write_open(&mut input,&host::Open::Wayland {media_id:1,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,Opened>(&mut input).await?,Opened::Ready),"open failed");
         let origin=rho_desktop_media::media::origin();
         let media=rho_desktop_media::media::subscribe(transport,origin.clone()).await.context("fixed video stream")?;
@@ -160,7 +160,7 @@ layout { background-color "#315b97"; }
         let transport2=mux.session(2)?;
         let (send2,recv2)=connection.open_bi().await?;
         let mut input2=rho_rpc::Stream::new(recv2,send2);
-        write_frame(&mut input2,&Open::Host(host::Open::Wayland {media_id:2,agent:agent.encoded(),session:desktop_name.clone()})).await?;
+        write_open(&mut input2,&host::Open::Wayland {media_id:2,agent:agent.encoded(),session:desktop_name.clone()}).await?;
         ensure!(matches!(read_frame::<_,Opened>(&mut input2).await?,Opened::Ready),"second viewer open failed");
         let origin2=rho_desktop_media::media::origin();
         let media2=rho_desktop_media::media::subscribe(transport2,origin2.clone()).await?;
@@ -192,7 +192,7 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==stopped,"video work survived unsubscribe");
         let (send,recv)=connection.open_bi().await?;
         let mut rpc=rho_rpc::Stream::new(recv,send);
-        agents::call(&mut rpc,agents::QuotaUsage).await.context("RPC failed after detach")?;
+        rho_agent_host_proto::call(&mut rpc,agents::QuotaUsage).await.context("RPC failed after detach")?;
         uni.abort(); bi.abort();
         client.close().await;
         // A second named desktop is advertised, then excluded after a crash

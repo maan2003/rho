@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context as _;
 use futures::FutureExt as _;
 use rho_agent_host_proto::host::{self, GitProviderFrame, Open as HostOpen};
-use rho_agent_host_proto::{
-    GitProvided, GitService, GitTransportRequest, Open, read_frame, write_frame,
-};
+use rho_agent_host_proto::{GitProvided, GitService, GitTransportRequest, read_frame, write_open};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// Set when the client is going away, before its tokio runtime is dropped.
@@ -114,9 +112,12 @@ pub enum GitApprovalDecision {
 pub(crate) type ChannelDialer = rho_rpc::Dialer;
 
 /// One call of the machine on a stream of its own. A refusal is an error.
-async fn dial_call<C: host::Call>(dialer: ChannelDialer, call: C) -> anyhow::Result<C::Reply> {
+async fn dial_call<C: rho_agent_host_proto::Call>(
+    dialer: ChannelDialer,
+    call: C,
+) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    host::call(&mut stream, call).await
+    rho_agent_host_proto::call(&mut stream, call).await
 }
 
 async fn dial_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
@@ -224,7 +225,7 @@ impl Connection {
 
     /// Makes one call of the machine on a stream of its own. The answer
     /// needs no particular executor; a refusal is an error.
-    pub fn call<C: host::Call>(
+    pub fn call<C: rho_agent_host_proto::Call>(
         &self,
         call: C,
     ) -> impl Future<Output = anyhow::Result<C::Reply>> + Send + 'static {
@@ -455,7 +456,7 @@ async fn provide_git_transport(
         Some(stream) => stream,
         None => dialer.open(Some(1)).await?,
     };
-    write_frame(&mut stream, &Open::Host(HostOpen::GitProvider)).await?;
+    write_open(&mut stream, &HostOpen::GitProvider).await?;
     let limit = Arc::new(tokio::sync::Semaphore::new(1));
     let requests = Arc::new(Mutex::new(
         HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
@@ -719,13 +720,13 @@ async fn report_git_transport_decision(
     claim: bool,
 ) -> anyhow::Result<()> {
     let mut stream = dial_stream(dialer).await?;
-    write_frame(
+    write_open(
         &mut stream,
-        &Open::Host(HostOpen::GitProvide {
+        &HostOpen::GitProvide {
             request_id,
             provider_id,
             claim,
-        }),
+        },
     )
     .await?;
     let _: GitProvided = read_frame(&mut stream).await?;
@@ -738,13 +739,13 @@ async fn open_git_transport_provider(
     provider_id: u64,
 ) -> anyhow::Result<Option<rho_rpc::Stream>> {
     let mut stream = dial_stream(dialer).await?;
-    write_frame(
+    write_open(
         &mut stream,
-        &Open::Host(HostOpen::GitProvide {
+        &HostOpen::GitProvide {
             request_id,
             provider_id,
             claim: true,
-        }),
+        },
     )
     .await?;
     match read_frame(&mut stream).await? {

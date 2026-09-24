@@ -12,7 +12,7 @@ use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent_host_proto::host::GitProviderFrame;
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
-    AuthState, JoinTarget, Open, Opened, StartMode, read_frame, write_frame,
+    AuthState, JoinTarget, Open, Opened, Part, StartMode, read_frame, write_frame,
 };
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_db::RhoDb;
@@ -621,11 +621,14 @@ async fn run_iroh_listener(
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
-                        if let Open::Host(rho_agent_host_proto::host::Open::Wayland {
+                        let host_open = (open.part == Part::Host)
+                            .then(|| open.unpack::<rho_agent_host_proto::host::Open>())
+                            .transpose()?;
+                        if let Some(rho_agent_host_proto::host::Open::Wayland {
                             media_id,
                             agent,
                             session,
-                        }) = open
+                        }) = host_open
                         {
                             let transport = media.session(media_id)?;
                             send.set_priority(100)?;
@@ -636,13 +639,12 @@ async fn run_iroh_listener(
                             )
                             .await;
                         }
-                        if matches!(
-                            open,
-                            Open::Agents(
-                                rho_agent_host_proto::agents::Open::Terminal { .. }
-                                    | rho_agent_host_proto::agents::Open::Shell { .. }
-                            ) | Open::Host(rho_agent_host_proto::host::Open::Realtime { .. })
-                        ) {
+                        if matches!(open.part, Part::Terminal | Part::Shell)
+                            || matches!(
+                                host_open,
+                                Some(rho_agent_host_proto::host::Open::Realtime { .. })
+                            )
+                        {
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
@@ -1035,10 +1037,16 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match open {
-        Open::Agents(open) => agents::serve(services, open, reader, writer).await,
-        Open::Desk => services.desk.serve(reader, writer).await,
-        Open::Host(open) => host::serve(services, iroh_auth, open, reader, writer).await,
+    match open.part {
+        Part::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
+        Part::Desk => services.desk.serve(reader, writer).await,
+        Part::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,
+        Part::Terminal => agents::serve_terminals(services, open.unpack()?, reader, writer).await,
+        Part::Shell => agents::serve_shells(services, open.unpack()?, reader, writer).await,
+        Part::Workspace => {
+            let rho_agent_host_proto::workspace::Open { workspace } = open.unpack()?;
+            agents::serve_workspace_channel(services, reader, writer, workspace).await
+        }
     }
 }
 

@@ -1,7 +1,7 @@
-//! The agents part of the daemon: every stream opened by
-//! [`rho_agent_host_proto::Open::Agents`]. Its session carries the journal,
-//! the live tails, new agents and the quota; requests, terminals, shells
-//! and workspace channels are streams of their own.
+//! The agents part of the daemon, and the parts about one agent's workset:
+//! its terminals, shells and workspace files. The agents session carries
+//! the journal, the live tails, new agents and the quota; requests,
+//! terminals, shells and workspace channels are streams of their own.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,12 +10,13 @@ use std::sync::atomic::Ordering;
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent_host_proto::agents::{
-    AgentCostDistribution, Call, ClaudeAccountList, ClaudeAccounts, ClientFrame, GlobalUsage, Open,
+    AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame, GlobalUsage, Open,
     QuotaHistory, QuotaUsage, RecordVisualization, Request, ServerFrame, SetAuthAccountEnabled,
-    SetClaudeAccount, ShellClose, ShellList, ShellStart, TerminalList, Visualization,
-    VisualizationContent,
+    SetClaudeAccount, Visualization, VisualizationContent,
 };
-use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Opened, write_frame};
+use rho_agent_host_proto::{
+    AgentCommand, Answer, Call, NewAgent, Opened, shell, term, write_frame,
+};
 use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
 use rho_db::RhoDb;
 use tokio::sync::{broadcast, mpsc};
@@ -38,7 +39,22 @@ where
     match open {
         Open::Session => serve_session(services, reader, writer).await,
         Open::Request(request) => serve_call(&services, request, &mut writer).await,
-        Open::Terminal {
+    }
+}
+
+/// Serves one terminals stream: a terminal, or a call about them.
+pub(crate) async fn serve_terminals<R, W>(
+    services: Arc<Services>,
+    open: term::Open,
+    reader: R,
+    mut writer: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match open {
+        term::Open::Terminal {
             agent,
             terminal_id,
             open,
@@ -57,9 +73,55 @@ where
             )
             .await
         }
-        Open::Shell { agent } => serve_shell(services, reader, writer, agent).await,
-        Open::Workspace { workspace } => {
-            serve_workspace_channel(services, reader, writer, workspace).await
+        term::Open::Request(term::Request::TerminalList(call)) => {
+            respond(
+                &mut writer,
+                call,
+                |term::TerminalList { agent }| async move {
+                    terminal_list(&services, agent.as_deref()).await
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// Serves one shells stream: an attached shell, or a call about them.
+pub(crate) async fn serve_shells<R, W>(
+    services: Arc<Services>,
+    open: shell::Open,
+    reader: R,
+    mut writer: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let request = match open {
+        shell::Open::Attach { agent } => {
+            return serve_shell(services, reader, writer, agent).await;
+        }
+        shell::Open::Request(request) => request,
+    };
+    let writer = &mut writer;
+    match request {
+        shell::Request::ShellStart(call) => {
+            respond(writer, call, |shell::ShellStart { agent }| async move {
+                shell_start(&services, &agent).await
+            })
+            .await
+        }
+        shell::Request::ShellList(call) => {
+            respond(writer, call, |shell::ShellList { agent }| async move {
+                shell_list(&services, agent.as_deref()).await
+            })
+            .await
+        }
+        shell::Request::ShellClose(call) => {
+            respond(writer, call, |shell::ShellClose { agent }| async move {
+                shell_close(&services, &agent).await
+            })
+            .await
         }
     }
 }
@@ -471,30 +533,6 @@ where
             )
             .await
         }
-        Request::TerminalList(call) => {
-            respond(writer, call, |TerminalList { agent }| async move {
-                terminal_list(services, agent.as_deref()).await
-            })
-            .await
-        }
-        Request::ShellStart(call) => {
-            respond(writer, call, |ShellStart { agent }| async move {
-                shell_start(services, &agent).await
-            })
-            .await
-        }
-        Request::ShellList(call) => {
-            respond(writer, call, |ShellList { agent }| async move {
-                shell_list(services, agent.as_deref()).await
-            })
-            .await
-        }
-        Request::ShellClose(call) => {
-            respond(writer, call, |ShellClose { agent }| async move {
-                shell_close(services, &agent).await
-            })
-            .await
-        }
     }
 }
 
@@ -833,7 +871,7 @@ async fn terminal_list(
 }
 
 /// Serves a bounded typed file channel rooted in one workspace checkout.
-async fn serve_workspace_channel<R, W>(
+pub(crate) async fn serve_workspace_channel<R, W>(
     services: Arc<Services>,
     mut reader: R,
     mut writer: W,

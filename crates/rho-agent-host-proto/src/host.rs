@@ -1,7 +1,7 @@
-//! The machine itself, opened by [`crate::Open::Host`]: desktops, voice,
-//! Git transport, and one-shot administration ([`Call`]).
+//! The machine itself, [`crate::Part::Host`]: desktops, voice,
+//! Git transport, and one-shot administration ([`crate::Call`]).
 
-use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::{GitTransportRequest, PrCommand};
 
@@ -15,8 +15,8 @@ pub enum Open {
     /// host's Git remote helpers. The host pushes [`GitProviderFrame`]s for
     /// as long as the stream is open.
     GitProvider,
-    /// One [`Call`], answered with one [`crate::Answer`]; then the stream
-    /// closes.
+    /// One [`crate::Call`], answered with one [`crate::Answer`]; then the
+    /// stream closes.
     Request(Request),
     /// A voice session. Answered with [`crate::realtime::Opened`]; after
     /// the answer the stream carries [`crate::realtime::RealtimeClientFrame`]
@@ -59,14 +59,6 @@ pub enum GitProviderFrame {
     Done { request_id: u64 },
 }
 
-/// A one-shot call on the machine: a stream of its own that opens with
-/// [`Open::Request`] and is answered with one [`crate::Answer`] of its
-/// reply.
-pub trait Call: Into<Request> + Send + 'static {
-    type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
-    const PRIORITY: Option<i32> = Some(1);
-}
-
 calls! {
     /// Every call the machine answers, as it goes on the wire.
     pub enum Request {
@@ -87,18 +79,15 @@ calls! {
     }
 }
 
-/// Makes one call on `stream`, a stream opened for it. A refusal is an
-/// error.
-pub async fn call<S, C>(stream: &mut S, call: C) -> anyhow::Result<C::Reply>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    C: Call,
-{
-    let open = crate::Open::Host(Open::Request(call.into()));
-    crate::write_frame(stream, &open).await?;
-    crate::read_frame::<_, crate::Answer<C::Reply>>(stream)
-        .await?
-        .into_result()
+impl crate::PartOpen for Open {
+    const PART: crate::Part = crate::Part::Host;
+
+    fn debug_reply(&self, frame: &[u8]) -> Option<String> {
+        match self {
+            Self::Request(request) => Some(request.debug_answer(frame)),
+            _ => None,
+        }
+    }
 }
 
 /// How the remote helper should reach `host`: PAT-backed GitHub HTTP or

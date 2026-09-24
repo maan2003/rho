@@ -6,7 +6,7 @@ use std::future::Future;
 use futures::StreamExt as _;
 use rho_agent_host_proto::host::Open as HostOpen;
 use rho_agent_host_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
-use rho_agent_host_proto::{Open, read_frame, write_frame};
+use rho_agent_host_proto::{read_frame, write_open};
 use rho_rtc::{RtcEvent, RtcSession, SdpAnswer};
 
 struct RealtimeChannel {
@@ -28,7 +28,7 @@ pub(crate) fn start(
 async fn dial(dialer: rho_hosts::Dialer, offer_sdp: String) -> anyhow::Result<RealtimeChannel> {
     // Interactive streams outrank the sessions (priority 1 and below).
     let mut stream = dialer.open(Some(50)).await?;
-    write_frame(&mut stream, &Open::Host(HostOpen::Realtime { offer_sdp })).await?;
+    write_open(&mut stream, &HostOpen::Realtime { offer_sdp }).await?;
     let answer_sdp = match read_frame(&mut stream).await? {
         rho_agent_host_proto::realtime::Opened::Answer { answer_sdp } => answer_sdp,
         rho_agent_host_proto::realtime::Opened::Refused { reason } => anyhow::bail!("{reason}"),

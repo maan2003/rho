@@ -1,7 +1,22 @@
-//! Typed frames for a dedicated workspace file channel.
+//! The workspace files part of a host, [`crate::Part::Workspace`]: a
+//! dedicated file channel for one agent's workspace.
 
 use camino::Utf8PathBuf;
+use rho_agent_types::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
+
+/// File access for one agent's workspace. Answered with
+/// [`crate::Opened`]; after `Ready` the stream carries
+/// [`WorkspaceClientFrame`] and [`WorkspaceServerFrame`], and closing it
+/// closes the channel and its filesystem watcher.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Open {
+    pub workspace: WorkspaceInfo,
+}
+
+impl crate::PartOpen for Open {
+    const PART: crate::Part = crate::Part::Workspace;
+}
 
 /// Largest file accepted by the workspace editor protocol.
 pub const MAX_FILE_LEN: usize = 8 * 1024 * 1024;

@@ -1,7 +1,6 @@
 //! One host's agents, as the client reaches them: calls, terminals,
 //! shells, workspace channels and visualizations, each on a stream of its
-//! own opened by [`Open::Agents`]. The session beside them is
-//! [`crate::stream`].
+//! own. The session beside them is [`crate::stream`].
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::agents::{self, Call, VisualizationContent};
-use rho_agent_host_proto::{Open, Opened, read_frame, write_frame};
+use rho_agent_host_proto::agents::{self, VisualizationContent};
+use rho_agent_host_proto::{Call, Opened, read_frame, shell, term, write_frame, write_open};
 use rho_agent_types::WorkspaceInfo;
 use rho_hosts::{Dialer, Link};
 
@@ -69,7 +68,7 @@ impl AgentsLink {
         &self,
         agent: String,
     ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
-        self.call(agents::ShellClose { agent })
+        self.call(shell::ShellClose { agent })
     }
 
     /// Dials a dedicated workspace file stream and runs the handshake.
@@ -92,7 +91,7 @@ impl AgentsLink {
 /// One call on a stream of its own. A refusal is an error.
 async fn dial_call<C: Call>(dialer: Dialer, call: C) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    agents::call(&mut stream, call).await
+    rho_agent_host_proto::call(&mut stream, call).await
 }
 
 async fn dial_stream(dialer: Dialer) -> anyhow::Result<rho_rpc::Stream> {
@@ -114,9 +113,9 @@ async fn dial_channel(
     workspace: WorkspaceInfo,
 ) -> anyhow::Result<WorkspaceChannel> {
     let mut stream = dialer.open(None).await?;
-    write_frame(
+    write_open(
         &mut stream,
-        &Open::Agents(agents::Open::Workspace { workspace }),
+        &rho_agent_host_proto::workspace::Open { workspace },
     )
     .await?;
     if let Opened::Refused { reason } = read_frame(&mut stream).await? {
@@ -165,7 +164,7 @@ async fn dial_terminal_list(
     dialer: Dialer,
     agent: String,
 ) -> anyhow::Result<Vec<rho_agent_host_proto::term::TerminalInfo>> {
-    dial_call(dialer, agents::TerminalList { agent: Some(agent) }).await
+    dial_call(dialer, term::TerminalList { agent: Some(agent) }).await
 }
 
 /// Dials a dedicated terminal stream: attach the agent's first running
@@ -191,7 +190,7 @@ async fn dial_terminal(
             None => (0, true),
         }
     };
-    let open = Open::Agents(agents::Open::Terminal {
+    let open = term::Open::Terminal {
         agent,
         terminal_id,
         open: if create {
@@ -201,9 +200,9 @@ async fn dial_terminal(
         },
         cols,
         rows,
-    });
+    };
     let mut stream = dial_stream(dialer).await?;
-    write_frame(&mut stream, &open).await?;
+    write_open(&mut stream, &open).await?;
     if let Opened::Refused { reason } = read_frame(&mut stream).await? {
         anyhow::bail!("{reason}")
     }
@@ -225,11 +224,11 @@ async fn dial_terminal(
 
 /// Starts the agent's shell when none runs, then attaches.
 async fn start_and_dial_shell(dialer: Dialer, agent: String) -> anyhow::Result<ShellChannel> {
-    let list = agents::ShellList {
+    let list = shell::ShellList {
         agent: Some(agent.clone()),
     };
     if dial_call(dialer.clone(), list).await?.is_empty() {
-        let start = agents::ShellStart {
+        let start = shell::ShellStart {
             agent: agent.clone(),
         };
         dial_call(dialer.clone(), start).await?;
@@ -239,7 +238,7 @@ async fn start_and_dial_shell(dialer: Dialer, agent: String) -> anyhow::Result<S
 
 async fn dial_shell(dialer: Dialer, agent: String) -> anyhow::Result<ShellChannel> {
     let mut stream = dial_stream(dialer).await?;
-    write_frame(&mut stream, &Open::Agents(agents::Open::Shell { agent })).await?;
+    write_open(&mut stream, &shell::Open::Attach { agent }).await?;
     if let Opened::Refused { reason } = read_frame(&mut stream).await? {
         anyhow::bail!("{reason}")
     }

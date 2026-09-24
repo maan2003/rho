@@ -6,7 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use anyhow::{Context, Result};
 use reqwest::Url;
 use rho_agent_host_proto::host::GitTransportPolicy;
-use rho_agent_host_proto::{GitService, GitTransportRequest, Open, Opened, host};
+use rho_agent_host_proto::{GitService, GitTransportRequest, Opened, host};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 fn main() -> Result<()> {
@@ -64,7 +64,7 @@ async fn query_pat_available(host: &str) -> Result<bool> {
     let socket = rho_agent_host_proto::RuntimePaths::from_env()?
         .socket()
         .to_owned();
-    rho_agent_host_proto::client::host(
+    rho_agent_host_proto::client::call(
         &socket,
         GitTransportPolicy {
             host: host.to_owned(),
@@ -201,9 +201,9 @@ async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> 
         .await
         .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
     client
-        .send(&Open::Host(host::Open::GitTransport {
+        .open(&host::Open::GitTransport {
             request: request.clone(),
-        }))
+        })
         .await?;
     match client.recv().await? {
         Opened::Ready => {}

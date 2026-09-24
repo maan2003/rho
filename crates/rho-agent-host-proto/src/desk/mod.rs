@@ -11,6 +11,14 @@ use text::{EditOperation, FullOffset, Operation, UndoOperation};
 pub mod cells;
 pub mod stream;
 
+/// Opens a desk stream ([`stream`]).
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Open;
+
+impl crate::PartOpen for Open {
+    const PART: crate::Part = crate::Part::Desk;
+}
+
 /// Lamport timestamp used by structural operations.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,

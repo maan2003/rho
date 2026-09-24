@@ -1,10 +1,10 @@
 //! Wire vocabulary for workset-owned Comint-style shell sessions.
 //!
-//! A shell is started by [`crate::agents::Request::ShellStart`] and a stream
-//! attached to it by [`crate::agents::Open::Shell`]. The workset owns the
-//! process and its canonical structured state; clients project that state into
-//! a read-only buffer, keep their pending input locally, and submit complete
-//! commands.
+//! The shells part of a host, [`crate::Part::Shell`]. A shell is started
+//! by [`ShellStart`] and a stream attached to it by [`Open::Attach`]. The
+//! workset owns the process and its canonical structured state; clients project
+//! that state into a read-only buffer, keep their pending input locally, and
+//! submit complete commands.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -12,6 +12,57 @@ pub use crate::shell_kernel::{
     MAX_ACTIVE_PAGERS, MAX_COMMAND_BYTES, MAX_PAGER_BYTES, MAX_PAGER_LINES, PagerAction,
     command_fits,
 };
+
+/// What a shells stream is for.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub enum Open {
+    /// Attaches to an agent's running shell ([`ShellStart`]). Answered with
+    /// [`crate::Opened`], then [`ShellServerFrame`]s. Closing the stream
+    /// only detaches; the shell keeps running.
+    Attach { agent: String },
+    /// One call, answered with one [`crate::Answer`]; then the stream
+    /// closes.
+    Request(Request),
+}
+
+crate::calls! {
+    /// Every call the shells answer, as it goes on the wire.
+    pub enum Request {
+        ShellStart(ShellStart) -> ();
+        ShellList(ShellList) -> Vec<ShellInfo>;
+        ShellClose(ShellClose) -> ();
+    }
+}
+
+impl crate::PartOpen for Open {
+    const PART: crate::Part = crate::Part::Shell;
+
+    fn debug_reply(&self, frame: &[u8]) -> Option<String> {
+        match self {
+            Self::Request(request) => Some(request.debug_answer(frame)),
+            Self::Attach { .. } => None,
+        }
+    }
+}
+
+/// Starts the daemon-owned Comint-style shell for an agent. Attaching is
+/// [`Open::Attach`].
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellStart {
+    pub agent: String,
+}
+
+/// Running shells, of one agent if it names one.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellList {
+    pub agent: Option<String>,
+}
+
+/// Stops an agent's running shell gracefully.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct ShellClose {
+    pub agent: String,
+}
 
 /// Maximum structured SGR runs retained for one output stream.
 pub const MAX_STYLE_SPANS: usize = 4096;
@@ -47,7 +98,7 @@ pub struct ShellStyleSpan {
     pub style: ShellTextStyle,
 }
 
-/// One workset-owned shell returned by [`crate::agents::ShellList`].
+/// One workset-owned shell returned by [`ShellList`].
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ShellInfo {
     /// Encoded agent id ("eng-ht08").

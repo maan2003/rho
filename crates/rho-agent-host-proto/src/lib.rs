@@ -14,10 +14,10 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 /// Declares a part's one-shot calls. Each is a type of its own that names
 /// its answer ([`Call::Reply`]); `Request` is what goes on the wire, one
-/// variant per call. A call is answered with one [`Answer`] of its reply
+/// variant per call, and the part's own `Open` in scope carries it as
+/// `Open::Request`. A call is answered with one [`Answer`] of its reply
 /// type, on a stream of its own.
-///
-/// [`Call::Reply`]: agents::Call::Reply
+#[macro_export]
 macro_rules! calls {
     (
         $(#[$enum_meta:meta])*
@@ -29,17 +29,24 @@ macro_rules! calls {
         }
     ) => {
         $(#[$enum_meta])*
-        #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+        #[derive(
+            Clone,
+            Debug,
+            PartialEq,
+            senax_encoder::Encode,
+            senax_encoder::Decode,
+            senax_encoder::Pack,
+            senax_encoder::Unpack,
+        )]
         pub enum Request {
             $($(#[$meta])* $variant($call),)*
         }
 
         impl Request {
             /// Its answer, read from `frame`, as a protocol log prints it.
-            #[cfg(not(target_family = "wasm"))]
-            pub(crate) fn debug_answer(&self, frame: &[u8]) -> String {
+            pub fn debug_answer(&self, frame: &[u8]) -> String {
                 match self {
-                    $(Self::$variant(_) => crate::debug_frame::<crate::Answer<$reply>>(frame),)*
+                    $(Self::$variant(_) => $crate::debug_frame::<$crate::Answer<$reply>>(frame),)*
                 }
             }
         }
@@ -51,9 +58,14 @@ macro_rules! calls {
                 }
             }
 
-            impl Call for $call {
+            impl $crate::Call for $call {
+                type Open = Open;
                 type Reply = $reply;
                 $(const PRIORITY: Option<i32> = $priority;)?
+
+                fn open(self) -> Open {
+                    Open::Request(self.into())
+                }
             }
         )*
     };
@@ -81,9 +93,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/20";
+pub const IROH_ALPN: &[u8] = b"rho/ui/21";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP20";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP21";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,19 +178,115 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
         .to_owned())
 }
 
-/// The first frame on every stream: which part of the host it is for.
-/// Everything after it is that part's own, starting with its own opening
-/// frame, so neither side ever reads a frame meant for another part.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub enum Open {
-    /// The agents: their journal, what is asked of them, their terminals
-    /// and shells ([`agents`]).
-    Agents(agents::Open),
+/// Which part of the host a stream is for. Each part's messages belong to
+/// the crate that speaks it, so this names the parts and nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum Part {
+    /// The agents: their journal and what is asked of them
+    /// (`rho-agents-client`).
+    Agents,
     /// The desk ([`desk::stream`]).
     Desk,
     /// The machine itself: desktops, voice, Git transport and
     /// administration ([`host`]).
-    Host(host::Open),
+    Host,
+    /// An agent's terminals (`rho-terminal`).
+    Terminal,
+    /// An agent's shell (`rho-shell-view`).
+    Shell,
+    /// An agent's workspace files (`rho-files`).
+    Workspace,
+}
+
+/// The first frame on every stream: which part it is for, and that part's
+/// own opening, packed. Everything after it is the part's own, so neither
+/// side ever reads a frame meant for another part.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct Open {
+    pub part: Part,
+    pub open: Vec<u8>,
+}
+
+/// A part's own opening frame.
+pub trait PartOpen: Packer + Unpacker + std::fmt::Debug + Send + Sync {
+    const PART: Part;
+
+    /// A reply on a stream this opened, as a protocol log prints it; `None`
+    /// for a stream frame, which the log does not read.
+    fn debug_reply(&self, _frame: &[u8]) -> Option<String> {
+        None
+    }
+}
+
+impl Open {
+    pub fn of<T: PartOpen>(open: &T) -> anyhow::Result<Self> {
+        Ok(Self {
+            part: T::PART,
+            open: senax_encoder::pack(open)
+                .context("pack part opening")?
+                .to_vec(),
+        })
+    }
+
+    /// The part's own opening. Fails if the stream is for another part.
+    pub fn unpack<T: PartOpen>(&self) -> anyhow::Result<T> {
+        anyhow::ensure!(
+            self.part == T::PART,
+            "{:?} stream opened as {:?}",
+            T::PART,
+            self.part
+        );
+        senax_encoder::unpack(&mut self.open.as_slice()).context("unpack part opening")
+    }
+}
+
+/// Opens a stream for a part: the first frame on it.
+pub async fn write_open<W, T>(writer: &mut W, open: &T) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: PartOpen,
+{
+    write_frame(writer, &Open::of(open)?).await
+}
+
+/// A one-shot call: a stream of its own, opened with the part's
+/// `Open::Request` ([`calls!`]) and answered with one [`Answer`] of its
+/// reply.
+pub trait Call: Send + 'static {
+    type Open: PartOpen;
+    type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
+    /// The stream's priority: above the sessions unless the answer is bulk.
+    const PRIORITY: Option<i32> = Some(1);
+
+    fn open(self) -> Self::Open;
+}
+
+/// Makes one call on `stream`, a stream opened for it. A refusal is an
+/// error.
+pub async fn call<S, C>(stream: &mut S, call: C) -> anyhow::Result<C::Reply>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: Call,
+{
+    write_open(stream, &call.open()).await?;
+    read_frame::<_, Answer<C::Reply>>(stream)
+        .await?
+        .into_result()
+}
+
+/// A stream's opening as a protocol log prints it, read as part `T`, or
+/// with `reply` a reply on it.
+pub fn describe_as<T: PartOpen>(open: &Open, reply: Option<&[u8]>) -> String {
+    let opened = match open.unpack::<T>() {
+        Ok(opened) => opened,
+        Err(error) => return format!("(undecodable: {error:#})"),
+    };
+    match reply {
+        None => format!("{:?} {opened:#?}", open.part),
+        Some(frame) => opened
+            .debug_reply(frame)
+            .unwrap_or_else(|| "(stream frame)".to_owned()),
+    }
 }
 
 /// The answer to opening a stream the host can refuse.
@@ -460,8 +568,8 @@ impl<T: Packer + Unpacker> From<anyhow::Result<T>> for Answer<T> {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn debug_frame<T: Unpacker + std::fmt::Debug>(mut frame: &[u8]) -> String {
+#[doc(hidden)]
+pub fn debug_frame<T: Unpacker + std::fmt::Debug>(mut frame: &[u8]) -> String {
     match senax_encoder::unpack::<T>(&mut frame) {
         Ok(value) => format!("{value:#?}"),
         Err(error) => format!("(undecodable: {error})"),
@@ -641,10 +749,14 @@ pub fn append_protocol_log_record(
     Ok(())
 }
 
+/// Prints a protocol log. `describe` reads a part's frames, which this
+/// crate does not know: a stream's opening with `None`, a reply on it with
+/// the reply's frame ([`describe_as`]).
 #[cfg(not(target_family = "wasm"))]
 pub fn print_protocol_log(
     path: impl AsRef<std::path::Path>,
     output: &mut impl std::io::Write,
+    describe: impl Fn(&Open, Option<&[u8]>) -> String,
 ) -> anyhow::Result<()> {
     let mut input = std::fs::File::open(path).context("open protocol log")?;
     let mut opened = None;
@@ -660,36 +772,27 @@ pub fn print_protocol_log(
             .get(4..)
             .filter(|payload| payload.len() == payload_len)
             .context("protocol log frame length mismatch")?;
-        match direction {
+        let message = match direction {
             ProtocolLogDirection::ClientToServer => {
-                let message: Open =
+                let open: Open =
                     senax_encoder::unpack(&mut payload).context("unpack client frame")?;
-                writeln!(
-                    output,
-                    "{unix_ms} {} {}B {message:#?}",
-                    direction.label(),
-                    frame.len()
-                )?;
-                opened = Some(message);
+                let message = describe(&open, None);
+                opened = Some(open);
+                message
             }
             // What the host answers is the opened part's own; only a
-            // request's reply is read here.
-            ProtocolLogDirection::ServerToClient => {
-                let message = match &opened {
-                    Some(Open::Agents(agents::Open::Request(request))) => {
-                        request.debug_answer(payload)
-                    }
-                    Some(Open::Host(host::Open::Request(request))) => request.debug_answer(payload),
-                    _ => "(stream frame)".to_owned(),
-                };
-                writeln!(
-                    output,
-                    "{unix_ms} {} {}B {message}",
-                    direction.label(),
-                    frame.len()
-                )?;
-            }
-        }
+            // request's reply is read.
+            ProtocolLogDirection::ServerToClient => match &opened {
+                Some(open) => describe(open, Some(payload)),
+                None => "(stream frame)".to_owned(),
+            },
+        };
+        writeln!(
+            output,
+            "{unix_ms} {} {}B {message}",
+            direction.label(),
+            frame.len()
+        )?;
     }
 }
 
@@ -764,7 +867,7 @@ mod tests {
 
     #[test]
     fn protocol_log_records_full_length_prefixed_frame() {
-        let open = Open::Host(host::Open::Request(host::Snapshot.into()));
+        let open = Open::of(&host::Open::Request(host::Snapshot.into())).unwrap();
         let frame = protocol_frame_bytes(&open).unwrap();
         let mut log = Vec::new();
         append_protocol_log_record(&mut log, 123, ProtocolLogDirection::ClientToServer, &frame)
@@ -785,7 +888,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP19\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -813,7 +916,7 @@ mod tests {
             .into(),
             host::Snapshot.into(),
         ] {
-            round_trips(Open::Host(host::Open::Request(request)));
+            round_trips(host::Open::Request(request));
         }
         for request in [
             agents::SetAuthAccountEnabled {
@@ -825,10 +928,6 @@ mod tests {
             agents::RecordVisualization {
                 mime_type: "image/svg+xml".to_owned(),
                 content: b"<svg viewBox=\"0 0 1 1\"/>".to_vec(),
-            }
-            .into(),
-            agents::ShellStart {
-                agent: "eng-test".to_owned(),
             }
             .into(),
             agents::QuotaUsage.into(),
@@ -847,7 +946,7 @@ mod tests {
             }
             .into(),
         ] {
-            round_trips::<Open>(Open::Agents(agents::Open::Request(request)));
+            round_trips(agents::Open::Request(request));
         }
         round_trips(Answer::Done(vec![AgentUsageSeries {
             model: "fable".to_owned(),
@@ -882,7 +981,7 @@ mod tests {
     /// A reply reads as its call's own type in a protocol log.
     #[test]
     fn protocol_log_prints_answers_by_their_call() {
-        let request: agents::Request = agents::ShellList { agent: None }.into();
+        let request: shell::Request = shell::ShellList { agent: None }.into();
         let answer = senax_encoder::pack(&Answer::Done(Vec::<shell::ShellInfo>::new())).unwrap();
         assert!(request.debug_answer(&answer).starts_with("Done("));
     }
@@ -916,6 +1015,18 @@ mod tests {
         ));
     }
 
+    /// A part's opening survives the envelope, and reads as no other part.
+    fn opens_as<T: PartOpen + PartialEq>(open: T) {
+        let envelope = Open::of(&open).unwrap();
+        round_trips(envelope.clone());
+        assert_eq!(envelope.unpack::<T>().unwrap(), open);
+        let other = match T::PART {
+            Part::Desk => envelope.unpack::<host::Open>().err(),
+            _ => envelope.unpack::<desk::Open>().err(),
+        };
+        assert!(other.is_some());
+    }
+
     #[test]
     fn stream_openings_round_trip() {
         let request = GitTransportRequest {
@@ -926,27 +1037,29 @@ mod tests {
             service: GitService::ReceivePack,
             planned_refs: Some(vec!["refs/heads/main".to_owned()]),
         };
-        for open in [
-            Open::Host(host::Open::Desktops),
-            Open::Host(host::Open::GitProvider),
-            Open::Agents(agents::Open::Session),
-            Open::Desk,
-            Open::Host(host::Open::GitTransport { request }),
-            Open::Host(host::Open::GitProvide {
-                request_id: 9,
-                provider_id: 4,
-                claim: true,
-            }),
-            Open::Agents(agents::Open::Terminal {
+        opens_as(host::Open::Desktops);
+        opens_as(host::Open::GitProvider);
+        opens_as(host::Open::GitTransport { request });
+        opens_as(host::Open::GitProvide {
+            request_id: 9,
+            provider_id: 4,
+            claim: true,
+        });
+        opens_as(agents::Open::Session);
+        opens_as(desk::Open);
+        opens_as(term::Open::Terminal {
+            agent: "eng-test".to_owned(),
+            terminal_id: 3,
+            open: term::TerminalOpen::Create { attach: true },
+            cols: 80,
+            rows: 24,
+        });
+        opens_as(shell::Open::Request(
+            shell::ShellStart {
                 agent: "eng-test".to_owned(),
-                terminal_id: 3,
-                open: term::TerminalOpen::Create { attach: true },
-                cols: 80,
-                rows: 24,
-            }),
-        ] {
-            round_trips(open);
-        }
+            }
+            .into(),
+        ));
         round_trips(Opened::Refused {
             reason: "not running".to_owned(),
         });

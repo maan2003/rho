@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rho_agent_host_proto::host::Open as HostOpen;
-use rho_agent_host_proto::{Open, Opened, read_frame, write_frame};
+use rho_agent_host_proto::{Opened, read_frame, write_open};
 use rho_desktop_media::codec::{Decoder, RetainedFrame};
 use rho_desktop_proto::Input;
 use tokio::sync::{mpsc, watch};
@@ -88,13 +88,13 @@ async fn open_stream(
     let (send, recv) = connection.open_bi().await?;
     send.set_priority(100)?;
     let mut stream = rho_rpc::Stream::new(recv, send);
-    write_frame(
+    write_open(
         &mut stream,
-        &Open::Host(HostOpen::Wayland {
+        &HostOpen::Wayland {
             media_id: id,
             agent,
             session,
-        }),
+        },
     )
     .await?;
     if let Opened::Refused { reason } = read_frame(&mut stream).await? {

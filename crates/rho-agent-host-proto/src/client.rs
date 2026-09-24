@@ -6,35 +6,20 @@ use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::{
-    Answer, Open, ProtocolLogDirection, agents, append_protocol_log_record, host,
+    Answer, Call, Open, PartOpen, ProtocolLogDirection, append_protocol_log_record,
     protocol_frame_bytes, read_frame, write_frame,
 };
 
-/// One call of the agents, on a stream of its own over the daemon's Unix
-/// socket. A refusal is an error.
-pub async fn agents<C: agents::Call>(
-    socket: impl AsRef<Path>,
-    call: C,
-) -> anyhow::Result<C::Reply> {
+/// One call, on a stream of its own over the daemon's Unix socket. A
+/// refusal is an error.
+pub async fn call<C: Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<C::Reply> {
     let mut client = Client::connect(socket).await?;
-    client
-        .send(&Open::Agents(agents::Open::Request(call.into())))
-        .await?;
-    client.recv::<Answer<C::Reply>>().await?.into_result()
-}
-
-/// One call of the machine, on a stream of its own over the daemon's Unix
-/// socket. A refusal is an error.
-pub async fn host<C: host::Call>(socket: impl AsRef<Path>, call: C) -> anyhow::Result<C::Reply> {
-    let mut client = Client::connect(socket).await?;
-    client
-        .send(&Open::Host(host::Open::Request(call.into())))
-        .await?;
+    client.open(&call.open()).await?;
     client.recv::<Answer<C::Reply>>().await?.into_result()
 }
 
 /// Raw async client for one stream over the daemon's Unix socket. The first
-/// frame sent is an [`Open`].
+/// frame sent is an [`Open`] ([`Client::open`]).
 pub struct Client {
     stream: rho_rpc::Stream,
     logger: Option<ProtocolLogger>,
@@ -51,6 +36,11 @@ impl Client {
             stream,
             logger: ProtocolLogger::from_env(),
         }
+    }
+
+    /// Opens the stream for a part: the first frame sent.
+    pub async fn open<T: PartOpen>(&mut self, open: &T) -> anyhow::Result<()> {
+        self.send(&Open::of(open)?).await
     }
 
     pub async fn send<T: Packer>(&mut self, frame: &T) -> anyhow::Result<()> {

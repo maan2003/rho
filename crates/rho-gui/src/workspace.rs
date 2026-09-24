@@ -1295,7 +1295,7 @@ impl Workspace {
 
     /// Makes one call of a host's agents. `on_reply` hears the answer; a
     /// refusal, or a host that went before answering, is a notice instead.
-    fn call<C: agents::Call>(
+    fn call<C: rho_agent_host_proto::Call>(
         &self,
         host: HostId,
         call: C,
@@ -8061,7 +8061,7 @@ impl Workspace {
     /// here and redraws the same surface.
     /// Asks every host the same usage question; the answers merge as
     /// they come.
-    fn ask_every_host<C: agents::Call + Clone>(
+    fn ask_every_host<C: rho_agent_host_proto::Call + Clone>(
         &self,
         call: C,
         cx: &mut Context<Self>,

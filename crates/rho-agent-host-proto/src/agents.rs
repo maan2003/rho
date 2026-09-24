@@ -1,19 +1,18 @@
-//! The agents part of a host, opened by [`crate::Open::Agents`].
+//! The agents part of a host, [`crate::Part::Agents`].
 //!
 //! Its session ([`Open::Session`]) carries the host's journal and its
 //! agents' live tails: a stream of its own, so a catch-up of thousands of
 //! pages never queues ahead of anything else, and its reader is the agents
 //! client alone. Every frame after the opening one is a [`ClientFrame`] or
-//! a [`ServerFrame`]. Whatever else is asked of the agents is a stream of
-//! its own: one [`Call`], or a terminal, shell or workspace channel.
+//! a [`ServerFrame`]. Whatever else is asked of the agents is one call
+//! ([`Open::Request`]) on a stream of its own.
 
-use rho_agent_types::{AgentId, AgentPos, Seq, WorkspaceInfo};
-use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
+use rho_agent_types::{AgentId, AgentPos, Seq};
+use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::transcript::{DetailBody, Live, LogEntry};
 use crate::{
-    AgentCommand, AgentCostSeries, AgentUsageSeries, AuthState, NewAgent, QuotaSeries,
-    QuotaSummary, shell, term,
+    AgentCommand, AgentCostSeries, AgentUsageSeries, AuthState, NewAgent, QuotaSeries, QuotaSummary,
 };
 
 /// What an agents stream is for.
@@ -21,44 +20,9 @@ use crate::{
 pub enum Open {
     /// The journal and the live tails, for as long as the client stays.
     Session,
-    /// One [`Call`], answered with one [`crate::Answer`]; then the stream
-    /// closes.
+    /// One [`crate::Call`], answered with one [`crate::Answer`]; then the
+    /// stream closes.
     Request(Request),
-    /// A daemon-owned terminal for an agent. Answered with
-    /// [`crate::Opened`]; an attached stream then carries
-    /// [`term::TermClientFrame`] and [`term::TermServerFrame`], the first of
-    /// them a snapshot of the screen preceded by history. Otherwise the
-    /// terminal runs headless and the stream closes.
-    Terminal {
-        /// Display handle or id prefix, resolved by the daemon ("eng-ht08").
-        agent: String,
-        /// Client-chosen id, unique among the agent's running terminals
-        /// ([`TerminalList`] enumerates them).
-        terminal_id: u64,
-        open: term::TerminalOpen,
-        /// The client's viewport, applied to the PTY (last writer wins).
-        cols: u16,
-        rows: u16,
-    },
-    /// Attaches to an agent's running shell ([`ShellStart`]).
-    /// Answered with [`crate::Opened`], then [`shell`] frames. Closing the
-    /// stream only detaches; the shell keeps running.
-    Shell { agent: String },
-    /// File access for one agent's workspace. Answered with
-    /// [`crate::Opened`]; after `Ready` the stream carries
-    /// [`crate::workspace::WorkspaceClientFrame`] and
-    /// [`crate::workspace::WorkspaceServerFrame`], and closing it closes the
-    /// channel and its filesystem watcher.
-    Workspace { workspace: WorkspaceInfo },
-}
-
-/// A one-shot call on the agents: a stream of its own that opens with
-/// [`Open::Request`] and is answered with one [`crate::Answer`] of its
-/// reply.
-pub trait Call: Into<Request> + Send + 'static {
-    type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
-    /// The stream's priority: above the sessions unless the answer is bulk.
-    const PRIORITY: Option<i32> = Some(1);
 }
 
 calls! {
@@ -67,10 +31,6 @@ calls! {
         /// Answered with the new agent's id.
         New(NewAgent) -> AgentId;
         Command(AgentCommand) -> ();
-        TerminalList(TerminalList) -> Vec<term::TerminalInfo>;
-        ShellStart(ShellStart) -> ();
-        ShellList(ShellList) -> Vec<shell::ShellInfo>;
-        ShellClose(ShellClose) -> ();
         // Bulk: an answer that waits behind interactive traffic.
         Visualization(Visualization) -> VisualizationContent, priority None;
         /// Answered with the recorded visualization's id.
@@ -86,44 +46,15 @@ calls! {
     }
 }
 
-/// Makes one call on `stream`, a stream opened for it. A refusal is an
-/// error.
-pub async fn call<S, C>(stream: &mut S, call: C) -> anyhow::Result<C::Reply>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    C: Call,
-{
-    let open = crate::Open::Agents(Open::Request(call.into()));
-    crate::write_frame(stream, &open).await?;
-    crate::read_frame::<_, crate::Answer<C::Reply>>(stream)
-        .await?
-        .into_result()
-}
+impl crate::PartOpen for Open {
+    const PART: crate::Part = crate::Part::Agents;
 
-/// Every running terminal, of one agent if it names one (display handle or
-/// id prefix).
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct TerminalList {
-    pub agent: Option<String>,
-}
-
-/// Starts the daemon-owned Comint-style shell for an agent. Attaching is
-/// [`Open::Shell`].
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct ShellStart {
-    pub agent: String,
-}
-
-/// Running shells, of one agent if it names one.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct ShellList {
-    pub agent: Option<String>,
-}
-
-/// Stops an agent's running shell gracefully.
-#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
-pub struct ShellClose {
-    pub agent: String,
+    fn debug_reply(&self, frame: &[u8]) -> Option<String> {
+        match self {
+            Self::Request(request) => Some(request.debug_answer(frame)),
+            Self::Session => None,
+        }
+    }
 }
 
 /// A recorded visualization.

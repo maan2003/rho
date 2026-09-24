@@ -1,16 +1,15 @@
-//! The machine part of the daemon: every stream opened by
-//! [`rho_agent_host_proto::Open::Host`]: desktops, voice, Git transport,
-//! and administration.
+//! The machine part of the daemon, [`rho_agent_host_proto::Part::Host`]:
+//! desktops, voice, Git transport, and administration.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_agent_host_proto::host::{
-    Call, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
+    GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
     IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
 };
-use rho_agent_host_proto::{Answer, GitProvided, Opened, write_frame};
+use rho_agent_host_proto::{Answer, Call, GitProvided, Opened, write_frame};
 use tokio::sync::mpsc;
 
 use crate::{GitProviderClaim, Services, debug, realtime};

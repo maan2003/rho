@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use rho_agent_host_proto::agents::{ClientFrame, ServerFrame};
 use rho_agent_host_proto::client::Client;
-use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Open, agents, read_frame, write_frame};
+use rho_agent_host_proto::{
+    AgentCommand, Answer, NewAgent, agents, read_frame, write_frame, write_open,
+};
 use rho_agent_types::{AgentId, Seq};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
@@ -35,7 +37,7 @@ impl Streams {
     /// `socket`, and reads its journal head. Nothing is followed yet.
     pub async fn open(agents: Client, socket: &Path) -> Result<Self> {
         let mut agents = agents.into_stream();
-        write_frame(&mut agents, &Open::Agents(agents::Open::Session)).await?;
+        write_open(&mut agents, &agents::Open::Session).await?;
         let ServerFrame::JournalHead { journal_head, .. } = read_frame(&mut agents).await? else {
             bail!("the agents stream did not open with its journal head");
         };
@@ -72,15 +74,17 @@ impl Streams {
         self.call(command, |()| None);
     }
 
-    fn call<C: agents::Call>(&self, call: C, answered: fn(C::Reply) -> Option<Incoming>) {
+    fn call<C: rho_agent_host_proto::Call>(
+        &self,
+        call: C,
+        answered: fn(C::Reply) -> Option<Incoming>,
+    ) {
         let socket = self.socket.clone();
         let tx = self.incoming_tx.clone();
         tokio::spawn(async move {
             let answer = async {
                 let mut client = Client::connect(&socket).await?;
-                client
-                    .send(&Open::Agents(agents::Open::Request(call.into())))
-                    .await?;
+                client.open(&call.open()).await?;
                 client.recv::<Answer<C::Reply>>().await
             }
             .await;

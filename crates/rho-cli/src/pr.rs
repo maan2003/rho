@@ -5,7 +5,7 @@ use anyhow::{Context as _, bail};
 use rho_agent_host_proto::PrCommand;
 use rho_agent_host_proto::host::{PlatformSecretsSet, PlatformStatus, Pr, PrOutput};
 
-use crate::{PrArgs, PrCliCommand, host_call};
+use crate::{PrArgs, PrCliCommand, daemon_call};
 
 pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     if matches!(&args.command, PrCliCommand::Init) {
@@ -40,7 +40,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
             output,
             data,
             is_error,
-        } = host_call(&socket_path, call).await?;
+        } = daemon_call(&socket_path, call).await?;
         if is_error {
             bail!(output);
         }
@@ -135,7 +135,7 @@ async fn init(args: PrArgs) -> anyhow::Result<()> {
     let call = PlatformSecretsSet {
         secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
     };
-    match host_call(&socket_path, call).await? {
+    match daemon_call(&socket_path, call).await? {
         PlatformStatus {
             running: true,
             detail,

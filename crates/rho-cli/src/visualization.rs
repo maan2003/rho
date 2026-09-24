@@ -4,7 +4,7 @@ use anyhow::bail;
 use rho_agent_host_proto::agents::RecordVisualization;
 use rho_visualizations::{MAX_VISUALIZATION_BYTES, SVG_MIME_TYPE};
 
-use crate::{RecordVisualizationArgs, agents_call};
+use crate::{RecordVisualizationArgs, daemon_call};
 
 pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
     let mut content = Vec::new();
@@ -22,7 +22,7 @@ pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
         mime_type: SVG_MIME_TYPE.to_owned(),
         content,
     };
-    let id = agents_call(&socket_path, call).await?;
+    let id = daemon_call(&socket_path, call).await?;
     println!("{id}");
     Ok(())
 }
