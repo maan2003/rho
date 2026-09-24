@@ -576,79 +576,10 @@ fn subject_bounds(id: &Id) -> Result<(), String> {
     Ok(())
 }
 
-// TEMPORARY MIGRATION: remove once every agent host has opened its
-// database with it. `CellMeta::host_device` was recorded as `daemon_device`.
-mod legacy {
-    use redb::TableDefinition;
-    use rho_db::{Lenient, SenValue, WriteTxn};
-    use senax_encoder::{Decode, Encode};
-
-    use super::{DeviceId, Version};
-
-    const META: TableDefinition<(), Lenient<CellMeta>> =
-        TableDefinition::new("rho_desk_cell_meta_v2");
-
-    #[derive(Clone, Debug, Encode, Decode)]
-    struct CellMeta {
-        daemon_device: DeviceId,
-        frontier: Version,
-        device_node_namespaces: Vec<(DeviceId, u16)>,
-        next_node_namespace: u16,
-    }
-
-    pub(super) fn rename_host_device(write: &mut WriteTxn) {
-        let Some(Some(old)) = write.open_table(META).get(&()).map(|meta| meta.value()) else {
-            return;
-        };
-        let meta = super::CellMeta {
-            host_device: old.daemon_device,
-            frontier: old.frontier,
-            device_node_namespaces: old.device_node_namespaces,
-            next_node_namespace: old.next_node_namespace,
-        };
-        write
-            .open_table(super::META)
-            .insert(&(), SenValue::owned(meta));
-    }
-
-    #[cfg(test)]
-    #[tokio::test]
-    async fn the_host_device_survives_its_rename() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
-        let device = DeviceId([7; 16]);
-        let mut write = db.write().await;
-        write
-            .open_table(TableDefinition::<(), rho_db::Sen<CellMeta>>::new(
-                "rho_desk_cell_meta_v2",
-            ))
-            .insert(
-                &(),
-                SenValue::owned(CellMeta {
-                    daemon_device: device,
-                    frontier: Version::new(),
-                    device_node_namespaces: vec![(device, 1)],
-                    next_node_namespace: 2,
-                }),
-            );
-        write.commit();
-        super::DeskCellStore::new(db.clone()).await.unwrap();
-        let read = db.read();
-        let meta = read
-            .open_table(super::META)
-            .get(&())
-            .unwrap()
-            .value()
-            .into_owned();
-        assert_eq!(meta.host_device, device);
-    }
-}
-
 /// Opens the cell tables, making the empty state on a database that has
 /// none. The conversions that used to run here are gone: each ran once on
 /// every agent host it was ever going to run on.
 pub fn initialize(write: &mut WriteTxn) -> Result<(), String> {
-    legacy::rename_host_device(write);
     let meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {
