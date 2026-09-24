@@ -160,17 +160,6 @@ mod tests {
         format!("{}={target}", spec.name)
     }
 
-    /// redb refuses a table whose recorded value type differs from the one
-    /// it is opened with, and `Sen` records the Rust path: the crate was
-    /// renamed, so the saved set keeps answering to its old one.
-    #[test]
-    fn the_saved_set_keeps_the_name_its_table_recorded() {
-        assert_eq!(
-            <Sen<SavedHosts> as redb::Value>::type_name().name(),
-            "rho-db::Sen<rho_hosts::saved::SavedHosts>"
-        );
-    }
-
     /// What was attached is what the next start attaches, in the same
     /// order: the order is the host numbering and who owns Slack.
     #[test]

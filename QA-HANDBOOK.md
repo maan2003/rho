@@ -114,8 +114,8 @@ believing any case that ran after it.
 The other half of R1 is the client. An agent host can be alive and its socket fine
 while the GUI never gets past "connecting", and the reason is only in the
 Wayland session's `application.log` (under the rig's `run/rho-wayland/<name>/`).
-That is where a store-schema mismatch shows up: redb records the Rust path of a
-table's value type, so a crate rename makes the client panic with
+That is where a store-schema mismatch shows up: redb records the name of a
+table's value type, so renaming a stored type makes the client panic with
 `TableTypeMismatch` on a table the agent host is perfectly happy with. Found on the
 rig by eng-b8os during the map cut, which no unit test would have caught. If
 the GUI says "connecting" and the agent host is up, read that log before anything

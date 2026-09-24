@@ -336,6 +336,27 @@ impl InternalTableDefinition {
         }
     }
 
+    // Rho fork: see `WriteTransaction::retype_table`. Returns whether a name changed.
+    pub(crate) fn retype(&mut self, retype: &mut dyn FnMut(&str) -> Option<String>) -> bool {
+        let (InternalTableDefinition::Normal {
+            key_type,
+            value_type,
+            ..
+        }
+        | InternalTableDefinition::Multimap {
+            key_type,
+            value_type,
+            ..
+        }) = self;
+        let mut changed = false;
+        for type_name in [key_type, value_type] {
+            if let Some(name) = retype(type_name.name()) {
+                changed |= type_name.rename(name);
+            }
+        }
+        changed
+    }
+
     fn private_key_type(&self) -> TypeName {
         match self {
             InternalTableDefinition::Normal { key_type, .. }

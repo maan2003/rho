@@ -13,7 +13,7 @@
 //! prints their cells whether they are put away or not.
 
 use redb::TableDefinition;
-use rho_db::{RecordedTypeName, RhoDb, SenAs};
+use rho_db::{RhoDb, Sen};
 use rho_desk_client::protocol::cells::{Cell, DeviceId, Id, Property, PropertyKey, Stamp, Version};
 use senax_encoder::{Decode, Encode};
 
@@ -29,40 +29,15 @@ struct CellAddress {
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct CellMeta {
-    #[senax(rename = "daemon_device")]
     host_device: DeviceId,
     frontier: Version,
     device_node_namespaces: Vec<(DeviceId, u16)>,
     next_node_namespace: u16,
 }
 
-/// The names the agent host's tables were written under. redb records the
-/// Rust path of a value type and refuses a table that says another one,
-/// so a reader outside `rho-agent-host` has to answer to the agent host's
-/// names.
-#[derive(Debug)]
-struct AddressAsHostWroteIt;
-#[derive(Debug)]
-struct MetaAsHostWroteIt;
-#[derive(Debug)]
-struct CellAsHostWroteIt;
-
-impl RecordedTypeName for AddressAsHostWroteIt {
-    const NAME: &'static str = "rho-db::Sen<rho_daemon::desk_cells::CellAddress>";
-}
-impl RecordedTypeName for MetaAsHostWroteIt {
-    const NAME: &'static str = "rho-db::Sen<rho_daemon::desk_cells::CellMeta>";
-}
-impl RecordedTypeName for CellAsHostWroteIt {
-    const NAME: &'static str = "rho-db::Sen<rho_desk::cells::Cell>";
-}
-
-const CELLS: TableDefinition<
-    SenAs<CellAddress, AddressAsHostWroteIt>,
-    SenAs<Cell, CellAsHostWroteIt>,
-> = TableDefinition::new("rho_desk_facts_v1");
-const META: TableDefinition<(), SenAs<CellMeta, MetaAsHostWroteIt>> =
-    TableDefinition::new("rho_desk_cell_meta_v2");
+const CELLS: TableDefinition<Sen<CellAddress>, Sen<Cell>> =
+    TableDefinition::new("rho_desk_facts_v1");
+const META: TableDefinition<(), Sen<CellMeta>> = TableDefinition::new("rho_desk_cell_meta_v2");
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);

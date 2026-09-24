@@ -588,6 +588,25 @@ impl TableTreeMut {
         Ok(())
     }
 
+    // Rho fork: see `WriteTransaction::retype_table`
+    pub(crate) fn retype_table(
+        &mut self,
+        name: &str,
+        table_type: TableType,
+        retype: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<bool, TableError> {
+        // Rewrite the definition as stored, not the pending update (see rename_table)
+        let Some(mut definition) = self.tree.get(&name)?.map(|guard| guard.value()) else {
+            return Err(TableError::TableDoesNotExist(name.to_string()));
+        };
+        definition.check_match_untyped(table_type, name)?;
+        if !definition.retype(retype) {
+            return Ok(false);
+        }
+        self.tree.insert(&name, &definition)?;
+        Ok(true)
+    }
+
     pub(crate) fn delete_table(
         &mut self,
         name: &str,

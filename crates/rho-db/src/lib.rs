@@ -187,161 +187,42 @@ where
         bytes
     }
 
+    /// `T`'s name without module paths, so a type can move between
+    /// modules and crates without its tables refusing to open.
     fn type_name() -> TypeName {
-        TypeName::new(&format!("rho-db::Sen<{}>", recorded_path::<T>()))
+        TypeName::new(&format!(
+            "rho-db::Sen<{}>",
+            short_type_name(std::any::type_name::<T>())
+        ))
     }
 }
 
-/// Stored types that moved, by their path now and the path their tables
-/// recorded. redb refuses a table whose recorded type differs from the one
-/// it is opened with, so a type keeps answering to its old name.
-const MOVED: &[(&str, &str)] = &[
-    (
-        "rho_desk_server::store::CellAddress",
-        "rho_daemon::desk_cells::CellAddress",
-    ),
-    (
-        "rho_desk_server::store::VerdictKey",
-        "rho_daemon::desk_cells::VerdictKey",
-    ),
-    (
-        "rho_desk_server::store::CellMeta",
-        "rho_daemon::desk_cells::CellMeta",
-    ),
-    (
-        "rho_desk_client::protocol::cells::Cell",
-        "rho_desk::cells::Cell",
-    ),
-    (
-        "rho_desk_client::protocol::cells::VerdictEvent",
-        "rho_desk::cells::VerdictEvent",
-    ),
-    (
-        "rho_desk_client::protocol::cells::Id",
-        "rho_desk::cells::Id",
-    ),
-    (
-        "rho_desk_client::protocol::cells::BodySnapshot",
-        "rho_desk::cells::BodySnapshot",
-    ),
-    (
-        "rho_desk_client::protocol::cells::Stamp",
-        "rho_desk::cells::Stamp",
-    ),
-    (
-        "rho_desk_client::protocol::cells::CellMutation",
-        "rho_desk::cells::CellMutation",
-    ),
-    (
-        "rho_desk_client::protocol::cells::DeviceId",
-        "rho_desk::cells::DeviceId",
-    ),
-    (
-        "rho_agents_client::protocol::transcript::TranscriptEvent",
-        "rho_ui_proto::mirror::MirrorEvent",
-    ),
-    (
-        "rho_desk_client::cache::StoredDeskHost",
-        "rho_mirror::desk::StoredDeskHost",
-    ),
-    (
-        "rho_desk_client::cache::CellKey",
-        "rho_mirror::desk::CellKey",
-    ),
-    (
-        "rho_desk_client::cache::VerdictKey",
-        "rho_mirror::desk::VerdictKey",
-    ),
-    (
-        "rho_desk_client::cache::BodyKey",
-        "rho_mirror::desk::BodyKey",
-    ),
-    (
-        "rho_agents_client::cache::StoredHost",
-        "rho_mirror::mirror::StoredHost",
-    ),
-    (
-        "rho_agents_client::cache::AgentSnapshot",
-        "rho_mirror::mirror::AgentSnapshot",
-    ),
-    (
-        "rho_agent_hosts::saved::SavedHosts",
-        "rho_hosts::saved::SavedHosts",
-    ),
-];
-
-fn recorded_path<T>() -> &'static str {
-    let path = std::any::type_name::<T>();
-    MOVED
-        .iter()
-        .find(|(now, _)| *now == path)
-        .map_or(path, |(_, then)| then)
+/// `path` with every module path dropped: `alloc::vec::Vec<a::b::C>`
+/// becomes `Vec<C>`.
+fn short_type_name(path: &str) -> String {
+    let mut short = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(start) = rest.find(|c: char| c.is_alphanumeric() || c == '_') {
+        short.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        match rest[end..].strip_prefix("::") {
+            Some(after) => rest = after,
+            None => {
+                short.push_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+    }
+    short.push_str(rest);
+    short
 }
 
 impl<T> redb::Key for Sen<T>
 where
     T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
-{
-    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
-        data1.cmp(data2)
-    }
-}
-
-/// The name redb recorded for a table's key or value type. A migration
-/// reads rows the old code wrote, and redb checks the name the table was
-/// created with, so the reader has to answer to a name its own types no
-/// longer have.
-pub trait RecordedTypeName {
-    const NAME: &'static str;
-}
-
-/// A [`Sen`] that answers to a recorded name rather than to `T`'s own. It
-/// encodes and decodes exactly as `Sen<T>` does; only the name differs.
-#[derive(Debug)]
-pub struct SenAs<T, N>(std::marker::PhantomData<(T, N)>);
-
-impl<T, N> redb::Value for SenAs<T, N>
-where
-    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
-    N: RecordedTypeName + Debug,
-{
-    type SelfType<'a>
-        = SenValue<'a, T>
-    where
-        Self: 'a;
-
-    type AsBytes<'a>
-        = BytesMut
-    where
-        Self: 'a;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        <Sen<T> as redb::Value>::from_bytes(data)
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-    where
-        Self: 'b,
-    {
-        <Sen<T> as redb::Value>::as_bytes(value)
-    }
-
-    fn type_name() -> TypeName {
-        TypeName::new(N::NAME)
-    }
-}
-
-impl<T, N> redb::Key for SenAs<T, N>
-where
-    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
-    N: RecordedTypeName + Debug,
 {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
         data1.cmp(data2)
@@ -411,6 +292,36 @@ where
     }
 }
 
+// TEMPORARY MIGRATION: remove once every database has been opened by a
+// build with it. Tables recorded `Sen<T>` under `T`'s full path; they now
+// record its short name, see `Sen::type_name`.
+fn shorten_recorded_names(write: &redb::WriteTransaction) -> bool {
+    const SEN: &str = "rho-db::Sen<";
+    let tables = write
+        .list_tables()
+        .expect("list rho-db tables")
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for table in tables {
+        changed |= write
+            .retype_table(table, |name| {
+                if !name.contains(SEN) {
+                    return None;
+                }
+                let short = name
+                    .split(SEN)
+                    .map(short_type_name)
+                    .collect::<Vec<_>>()
+                    .join(SEN)
+                    // Renamed when it moved, under the old name recorded.
+                    .replace("rho-db::Sen<MirrorEvent>", "rho-db::Sen<TranscriptEvent>");
+                Some(short)
+            })
+            .expect("shorten rho-db type names");
+    }
+    changed
+}
+
 impl RhoDb {
     pub fn open(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
@@ -422,6 +333,13 @@ impl RhoDb {
             .set_cache_size(CACHE_SIZE)
             .create(path)
             .expect("open rho-db");
+
+        let write = database.begin_write().expect("begin rho-db write txn");
+        if shorten_recorded_names(&write) {
+            write.commit().expect("commit rho-db type names");
+        } else {
+            write.abort().expect("abort rho-db write txn");
+        }
 
         Self {
             database: Arc::new(database),
@@ -619,6 +537,8 @@ impl WriteTxn {
         self.inner
             .restore_savepoint(&savepoint)
             .expect("restore rho-db persistent savepoint");
+        // TEMPORARY MIGRATION: a savepoint taken before it keeps the old names.
+        shorten_recorded_names(&self.inner);
         true
     }
 
@@ -651,10 +571,8 @@ impl WriteTxn {
     }
 
     /// Opens a table, or `None` if the file records it under other
-    /// key/value types. redb writes the Rust path of a value type into
-    /// the table, so a type that moves between crates makes every
-    /// database written before the move unopenable; a caller that can
-    /// rebuild the table would rather be told than panicked at.
+    /// key/value types; a caller that can rebuild the table would rather
+    /// be told than panicked at.
     pub fn try_open_table<K, V>(
         &mut self,
         definition: TableDefinition<K, V>,
@@ -813,6 +731,85 @@ mod tests {
         name: String,
         #[senax(default)]
         tags: Vec<String>,
+    }
+
+    #[test]
+    fn sen_records_names_without_module_paths() {
+        assert_eq!(
+            <Sen<TestRecord> as redb::Value>::type_name().name(),
+            "rho-db::Sen<TestRecord>"
+        );
+        assert_eq!(
+            <Sen<Vec<Option<TestKey>>> as redb::Value>::type_name().name(),
+            "rho-db::Sen<Vec<Option<TestKey>>>"
+        );
+        assert_eq!(
+            short_type_name("(a::B, alloc::vec::Vec<c_d::e::F<u8>>, [x::Y; 2])"),
+            "(B, Vec<F<u8>>, [Y; 2])"
+        );
+    }
+
+    /// `Sen<TestRecord>` as databases recorded it before names were short.
+    #[derive(Debug)]
+    struct FullPath;
+
+    impl redb::Value for FullPath {
+        type SelfType<'a> = SenValue<'a, TestRecord>;
+        type AsBytes<'a> = BytesMut;
+
+        fn fixed_width() -> Option<usize> {
+            None
+        }
+
+        fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+        where
+            Self: 'a,
+        {
+            <Sen<TestRecord> as redb::Value>::from_bytes(data)
+        }
+
+        fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> BytesMut
+        where
+            Self: 'b,
+        {
+            <Sen<TestRecord> as redb::Value>::as_bytes(value)
+        }
+
+        fn type_name() -> TypeName {
+            TypeName::new("rho-db::Sen<rho_gui::journal::TestRecord>")
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_shortens_the_names_tables_recorded() {
+        const FULL: TableDefinition<u64, FullPath> = TableDefinition::new("items");
+        const SHORT: TableDefinition<u64, Sen<TestRecord>> = TableDefinition::new("items");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rho.redb");
+        {
+            let database = Database::create(&path).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(FULL)
+                .unwrap()
+                .insert(
+                    7,
+                    SenValue::owned(TestRecord {
+                        name: "moved".to_owned(),
+                        tags: Vec::new(),
+                    }),
+                )
+                .unwrap();
+            write.commit().unwrap();
+        }
+
+        // Twice: the second open finds nothing left to rename.
+        for _ in 0..2 {
+            let db = RhoDb::open(&path);
+            let read = db.read();
+            let record = read.open_table(SHORT).get(7).unwrap().value().into_owned();
+            assert_eq!(record.name, "moved");
+        }
     }
 
     #[tokio::test]

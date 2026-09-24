@@ -56,7 +56,6 @@ struct VerdictKey {
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct CellMeta {
-    #[senax(rename = "daemon_device")]
     host_device: DeviceId,
     frontier: Version,
     device_node_namespaces: Vec<(DeviceId, u16)>,
@@ -577,10 +576,79 @@ fn subject_bounds(id: &Id) -> Result<(), String> {
     Ok(())
 }
 
+// TEMPORARY MIGRATION: remove once every agent host has opened its
+// database with it. `CellMeta::host_device` was recorded as `daemon_device`.
+mod legacy {
+    use redb::TableDefinition;
+    use rho_db::{Lenient, SenValue, WriteTxn};
+    use senax_encoder::{Decode, Encode};
+
+    use super::{DeviceId, Version};
+
+    const META: TableDefinition<(), Lenient<CellMeta>> =
+        TableDefinition::new("rho_desk_cell_meta_v2");
+
+    #[derive(Clone, Debug, Encode, Decode)]
+    struct CellMeta {
+        daemon_device: DeviceId,
+        frontier: Version,
+        device_node_namespaces: Vec<(DeviceId, u16)>,
+        next_node_namespace: u16,
+    }
+
+    pub(super) fn rename_host_device(write: &mut WriteTxn) {
+        let Some(Some(old)) = write.open_table(META).get(&()).map(|meta| meta.value()) else {
+            return;
+        };
+        let meta = super::CellMeta {
+            host_device: old.daemon_device,
+            frontier: old.frontier,
+            device_node_namespaces: old.device_node_namespaces,
+            next_node_namespace: old.next_node_namespace,
+        };
+        write
+            .open_table(super::META)
+            .insert(&(), SenValue::owned(meta));
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn the_host_device_survives_its_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = rho_db::RhoDb::open(directory.path().join("rho.redb"));
+        let device = DeviceId([7; 16]);
+        let mut write = db.write().await;
+        write
+            .open_table(TableDefinition::<(), rho_db::Sen<CellMeta>>::new(
+                "rho_desk_cell_meta_v2",
+            ))
+            .insert(
+                &(),
+                SenValue::owned(CellMeta {
+                    daemon_device: device,
+                    frontier: Version::new(),
+                    device_node_namespaces: vec![(device, 1)],
+                    next_node_namespace: 2,
+                }),
+            );
+        write.commit();
+        super::DeskCellStore::new(db.clone()).await.unwrap();
+        let read = db.read();
+        let meta = read
+            .open_table(super::META)
+            .get(&())
+            .unwrap()
+            .value()
+            .into_owned();
+        assert_eq!(meta.host_device, device);
+    }
+}
+
 /// Opens the cell tables, making the empty state on a database that has
 /// none. The conversions that used to run here are gone: each ran once on
 /// every agent host it was ever going to run on.
 pub fn initialize(write: &mut WriteTxn) -> Result<(), String> {
+    legacy::rename_host_device(write);
     let meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {
@@ -767,22 +835,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn private_table_types_keep_the_names_the_desk_database_recorded() {
-        assert_eq!(
-            <Sen<CellAddress> as redb::Value>::type_name().name(),
-            "rho-db::Sen<rho_daemon::desk_cells::CellAddress>"
-        );
-        assert_eq!(
-            <Sen<VerdictKey> as redb::Value>::type_name().name(),
-            "rho-db::Sen<rho_daemon::desk_cells::VerdictKey>"
-        );
-        assert_eq!(
-            <Sen<CellMeta> as redb::Value>::type_name().name(),
-            "rho-db::Sen<rho_daemon::desk_cells::CellMeta>"
-        );
-    }
 
     async fn fixture_store() -> DeskCellStore {
         let directory = tempfile::tempdir().unwrap();
@@ -1412,75 +1464,57 @@ mod tests {
     /// A row a newer build wrote, in this build's tables, encoded exactly
     /// as senax encodes the real thing. The variant names are what the ids
     /// are hashed from, so a name this build has never heard of is the
-    /// same thing on the wire as a variant it does not have yet.
-    #[derive(Debug, Encode, Decode)]
-    enum LaterProperty {
-        Haunted(bool),
+    /// same thing on the wire as a variant it does not have yet. The types
+    /// share the real ones' names, which are what their tables record.
+    mod later {
+        use rho_desk_client::protocol::cells::{FactChange, Id, Stamp};
+        use rho_desk_client::protocol::{TextTransaction, TreeClock};
+        use senax_encoder::{Decode, Encode};
+
+        #[derive(Debug, Encode, Decode)]
+        pub(super) enum Property {
+            Haunted(bool),
+        }
+
+        #[derive(Debug, Encode, Decode)]
+        pub(super) struct Cell {
+            pub(super) id: Id,
+            pub(super) property: Property,
+            pub(super) stamp: Stamp,
+        }
+
+        #[derive(Debug, Encode, Decode)]
+        pub(super) enum Verdict {
+            Haunt,
+        }
+
+        #[derive(Debug, Encode, Decode)]
+        pub(super) enum VerdictEvent {
+            Applied {
+                verdict: Verdict,
+                at: Stamp,
+                changes: Vec<FactChange>,
+            },
+        }
+
+        #[derive(Debug, Encode, Decode)]
+        pub(super) enum TextOperation {
+            Haunt { timestamp: TreeClock },
+        }
+
+        #[derive(Debug, Encode, Decode)]
+        pub(super) struct BodySnapshot {
+            pub(super) id: Id,
+            pub(super) operations: Vec<TextOperation>,
+            pub(super) transactions: Vec<TextTransaction>,
+        }
     }
 
-    #[derive(Debug, Encode, Decode)]
-    struct LaterCell {
-        id: Id,
-        property: LaterProperty,
-        stamp: Stamp,
-    }
-
-    #[derive(Debug, Encode, Decode)]
-    enum LaterVerdict {
-        Haunt,
-    }
-
-    #[derive(Debug, Encode, Decode)]
-    enum LaterVerdictEvent {
-        Applied {
-            verdict: LaterVerdict,
-            at: Stamp,
-            changes: Vec<FactChange>,
-        },
-    }
-
-    #[derive(Debug)]
-    struct CellName;
-
-    impl rho_db::RecordedTypeName for CellName {
-        const NAME: &'static str = "rho-db::Sen<rho_desk::cells::Cell>";
-    }
-
-    #[derive(Debug, Encode, Decode)]
-    enum LaterTextOperation {
-        Haunt {
-            timestamp: rho_desk_client::protocol::TreeClock,
-        },
-    }
-
-    #[derive(Debug, Encode, Decode)]
-    struct LaterBody {
-        id: Id,
-        operations: Vec<LaterTextOperation>,
-        transactions: Vec<rho_desk_client::protocol::TextTransaction>,
-    }
-
-    #[derive(Debug)]
-    struct BodyName;
-
-    impl rho_db::RecordedTypeName for BodyName {
-        const NAME: &'static str = "rho-db::Sen<rho_desk::cells::BodySnapshot>";
-    }
-
-    #[derive(Debug)]
-    struct VerdictEventName;
-
-    impl rho_db::RecordedTypeName for VerdictEventName {
-        const NAME: &'static str = "rho-db::Sen<rho_desk::cells::VerdictEvent>";
-    }
-
-    const LATER_CELLS: TableDefinition<Sen<CellAddress>, rho_db::SenAs<LaterCell, CellName>> =
+    const LATER_CELLS: TableDefinition<Sen<CellAddress>, Sen<later::Cell>> =
         TableDefinition::new("rho_desk_facts_v1");
-    const LATER_VERDICTS: TableDefinition<
-        Sen<VerdictKey>,
-        rho_db::SenAs<LaterVerdictEvent, VerdictEventName>,
-    > = TableDefinition::new("rho_desk_fact_verdicts_v1");
-    const LATER_BODIES: TableDefinition<Sen<Id>, rho_db::SenAs<LaterBody, BodyName>> =
+    const LATER_VERDICTS: TableDefinition<Sen<VerdictKey>, Sen<later::VerdictEvent>> =
+        TableDefinition::new("rho_desk_fact_verdicts_v1");
+    const LATER_BODIES: TableDefinition<Sen<Id>, Sen<later::BodySnapshot>> =
         TableDefinition::new("rho_desk_note_body_v1");
 
     #[tokio::test]
@@ -1504,9 +1538,9 @@ mod tests {
                 id: later.clone(),
                 key: PropertyKey::Name,
             }),
-            SenValue::owned(LaterCell {
+            SenValue::owned(later::Cell {
                 id: later.clone(),
-                property: LaterProperty::Haunted(true),
+                property: later::Property::Haunted(true),
                 stamp,
             }),
         );
@@ -1515,8 +1549,8 @@ mod tests {
                 id: later.clone(),
                 stamp,
             }),
-            SenValue::owned(LaterVerdictEvent::Applied {
-                verdict: LaterVerdict::Haunt,
+            SenValue::owned(later::VerdictEvent::Applied {
+                verdict: later::Verdict::Haunt,
                 at: stamp,
                 changes: Vec::new(),
             }),
@@ -1527,9 +1561,9 @@ mod tests {
         let unreadable_note = Id::Note(Uuid::random());
         write.open_table(LATER_BODIES).insert(
             SenValue::owned(unreadable_note.clone()),
-            SenValue::owned(LaterBody {
+            SenValue::owned(later::BodySnapshot {
                 id: unreadable_note.clone(),
-                operations: vec![LaterTextOperation::Haunt {
+                operations: vec![later::TextOperation::Haunt {
                     timestamp: rho_desk_client::protocol::TreeClock {
                         value: 1,
                         replica_id: 9,

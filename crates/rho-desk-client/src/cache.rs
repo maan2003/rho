@@ -562,65 +562,6 @@ pub fn reset_host(host: &str) {
 }
 
 #[cfg(test)]
-mod recorded_names {
-    use rho_db::Sen;
-
-    use crate::protocol::cells;
-
-    /// redb refuses a table whose recorded value type differs from the
-    /// one it is opened with, and `Sen` records the Rust path. These are
-    /// the paths the client's desk tables were written
-    /// under; a type that moves has to keep recording its old one.
-    #[test]
-    fn stored_types_keep_the_names_their_tables_recorded() {
-        fn name<T>() -> String
-        where
-            Sen<T>: redb::Value,
-        {
-            <Sen<T> as redb::Value>::type_name().name().to_owned()
-        }
-        assert_eq!(name::<cells::Cell>(), "rho-db::Sen<rho_desk::cells::Cell>");
-        assert_eq!(
-            name::<cells::VerdictEvent>(),
-            "rho-db::Sen<rho_desk::cells::VerdictEvent>"
-        );
-        assert_eq!(name::<cells::Id>(), "rho-db::Sen<rho_desk::cells::Id>");
-        assert_eq!(
-            name::<cells::BodySnapshot>(),
-            "rho-db::Sen<rho_desk::cells::BodySnapshot>"
-        );
-        assert_eq!(
-            name::<cells::Stamp>(),
-            "rho-db::Sen<rho_desk::cells::Stamp>"
-        );
-        assert_eq!(
-            name::<cells::CellMutation>(),
-            "rho-db::Sen<rho_desk::cells::CellMutation>"
-        );
-        assert_eq!(
-            name::<cells::DeviceId>(),
-            "rho-db::Sen<rho_desk::cells::DeviceId>"
-        );
-        assert_eq!(
-            name::<super::StoredDeskHost>(),
-            "rho-db::Sen<rho_mirror::desk::StoredDeskHost>"
-        );
-        assert_eq!(
-            name::<super::CellKey>(),
-            "rho-db::Sen<rho_mirror::desk::CellKey>"
-        );
-        assert_eq!(
-            name::<super::VerdictKey>(),
-            "rho-db::Sen<rho_mirror::desk::VerdictKey>"
-        );
-        assert_eq!(
-            name::<super::BodyKey>(),
-            "rho-db::Sen<rho_mirror::desk::BodyKey>"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::cells::{Property, Store, Uuid};
