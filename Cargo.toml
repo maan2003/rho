@@ -19,7 +19,7 @@ members = [
   "crates/rho-desktop-proto",
   "crates/rho-desktop-media",
   "crates/rho-db",
-  "crates/rho-fake-model",
+  "agent-host/rho-fake-model",
   "crates/rho-fake-slack",
   "crates/rho-files",
   "agent-host/rho-git/client",
@@ -128,7 +128,7 @@ rho-cli = { path = "agent-host/rho-cli" }
 rho-context-config = { path = "agent-host/rho-context-config" }
 rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-db = { path = "crates/rho-db" }
-rho-fake-model = { path = "crates/rho-fake-model" }
+rho-fake-model = { path = "agent-host/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
 rho-git-client = { path = "agent-host/rho-git/client" }
