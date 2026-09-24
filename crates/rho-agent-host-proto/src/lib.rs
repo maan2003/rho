@@ -3,7 +3,6 @@
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-pub mod desk;
 pub mod host;
 pub mod realtime;
 
@@ -147,11 +146,11 @@ mod tests {
     fn opens_as<T: PartOpen + PartialEq>(open: T) {
         let envelope = Open::of(&open).unwrap();
         assert_eq!(envelope.unpack::<T>().unwrap(), open);
-        let other = match T::PART {
-            Part::Desk => envelope.unpack::<host::Open>().err(),
-            _ => envelope.unpack::<desk::Open>().err(),
+        let other = Open {
+            part: Part::Desk,
+            open: envelope.open.clone(),
         };
-        assert!(other.is_some());
+        assert!(other.unpack::<T>().is_err());
     }
 
     #[test]
@@ -172,6 +171,5 @@ mod tests {
             provider_id: 4,
             claim: true,
         });
-        opens_as(desk::Open);
     }
 }

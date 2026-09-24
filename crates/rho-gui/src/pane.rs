@@ -38,7 +38,7 @@ pub enum SurfaceKey {
     Usage,
     DeskNode {
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
     },
     Transcript(AgentId),
     File {

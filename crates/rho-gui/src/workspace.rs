@@ -27,7 +27,6 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
-use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
@@ -47,6 +46,7 @@ use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
 };
 use rho_desk_client::Desk;
+use rho_desk_client::protocol::stream::ClientFrame as DeskClientFrame;
 use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::{ConnEvent, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
@@ -81,10 +81,10 @@ type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 pub(crate) struct DeskArrival {
     /// The store the cells were counted in. Cells under a name the client
     /// was not holding are a different desk, not this one running behind.
-    pub(crate) store: rho_agent_host_proto::desk::cells::DeviceId,
+    pub(crate) store: rho_desk_client::protocol::cells::DeviceId,
     pub(crate) node_namespace: u16,
-    pub(crate) delta: rho_agent_host_proto::desk::cells::Snapshot,
-    pub(crate) bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
+    pub(crate) delta: rho_desk_client::protocol::cells::Snapshot,
+    pub(crate) bodies: Vec<rho_desk_client::protocol::cells::BodySnapshot>,
     /// Where these cells came from, for the log: the daemon's answer or
     /// this client's own copy.
     pub(crate) from: &'static str,
@@ -295,7 +295,7 @@ pub(crate) fn snooze_target(
     unit: SnoozeUnit,
     count: i64,
     now: chrono::DateTime<chrono::Local>,
-) -> (rho_agent_host_proto::desk::cells::Timestamp, String) {
+) -> (rho_desk_client::protocol::cells::Timestamp, String) {
     match unit {
         SnoozeUnit::Minutes | SnoozeUnit::Hours => {
             let ahead = match unit {
@@ -304,9 +304,9 @@ pub(crate) fn snooze_target(
             };
             let at = now + ahead;
             (
-                rho_agent_host_proto::desk::cells::Timestamp {
+                rho_desk_client::protocol::cells::Timestamp {
                     unix_ms: at.timestamp_millis(),
-                    precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
+                    precision: rho_desk_client::protocol::cells::TimestampPrecision::Millisecond,
                 },
                 snooze_said(at, now),
             )
@@ -352,8 +352,8 @@ enum VerdictUndoState {
         card: Box<crate::dashboard::DealCard>,
         verdict: crate::dashboard::DealerVerdict,
         host: HostId,
-        node: rho_agent_host_proto::desk::cells::Id,
-        at: rho_agent_host_proto::desk::cells::Stamp,
+        node: rho_desk_client::protocol::cells::Id,
+        at: rho_desk_client::protocol::cells::Stamp,
     },
     /// The done verdicts one `mark read before` wrote. It closed a backlog
     /// in one keystroke, so it comes back in one: `shift-u` undoes every
@@ -361,8 +361,8 @@ enum VerdictUndoState {
     MarkedReadBefore {
         host: HostId,
         nodes: Vec<(
-            rho_agent_host_proto::desk::cells::Id,
-            rho_agent_host_proto::desk::cells::Stamp,
+            rho_desk_client::protocol::cells::Id,
+            rho_desk_client::protocol::cells::Stamp,
         )>,
     },
 }
@@ -412,7 +412,7 @@ pub struct Workspace {
     /// transient edits these; the writable dashboard row owns the message.
     /// Where `n a` files the agent the draft page is composing. `None`
     /// is the root, which is also what an ordinary draft sends.
-    draft_area: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+    draft_area: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -427,7 +427,7 @@ pub struct Workspace {
     /// The area the next agent this client asks for is filed under. The
     /// daemon never writes it: the agent exists because the registry says
     /// so, and where it is shown is the user's own fact.
-    pending_agent_filing: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+    pending_agent_filing: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
     /// Hosts that have been reached at least once. A host attaches blind;
     /// until it is reached, its agents do not exist for this client.
     ready_hosts: HashSet<HostId>,
@@ -486,13 +486,12 @@ pub struct Workspace {
     pub(crate) desk_buffers: DeskBuffers,
     /// One note surface per node the reader has opened, kept so the body's
     /// cursor and scroll survive leaving and coming back.
-    note_views:
-        HashMap<(HostId, rho_agent_host_proto::desk::cells::Id), crate::note_view::NoteView>,
+    note_views: HashMap<(HostId, rho_desk_client::protocol::cells::Id), crate::note_view::NoteView>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
     desk_semantic_clipboard: Option<rho_desk_client::desk::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
-    desk_semantic_paste_target: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+    desk_semantic_paste_target: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     /// The browser pages the desk refers to, the ones on their way out, and
@@ -531,13 +530,9 @@ pub struct Workspace {
     /// What was last searched for and what is waiting to be searched, for
     /// every surface: see [`search`].
     search: search::Search,
-    pending_filing_destinations: Vec<(
-        String,
-        String,
-        HostId,
-        rho_agent_host_proto::desk::cells::Id,
-    )>,
-    pending_filing_selected: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+    pending_filing_destinations:
+        Vec<(String, String, HostId, rho_desk_client::protocol::cells::Id)>,
+    pending_filing_selected: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
     /// What the finder's highlighted row opens, carried from the prompt to
     /// its submit handler: the submitted text cannot tell two rows with the
     /// same path apart.
@@ -2748,8 +2743,8 @@ impl Workspace {
             let writes = self
                 .new_thing_cells(host, Some(&area))
                 .into_iter()
-                .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
-                    id: rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
+                .map(|property| rho_desk_client::protocol::cells::CellWrite {
+                    id: rho_desk_client::protocol::cells::Id::Agent(agent_id),
                     property,
                 })
                 .collect::<Vec<_>>();
@@ -3206,9 +3201,9 @@ impl Workspace {
             self.echo("name: no host for this agent", StyleClass::SystemInfo, cx);
             return;
         };
-        let writes = vec![rho_agent_host_proto::desk::cells::CellWrite {
-            id: rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
-            property: rho_agent_host_proto::desk::cells::Property::Name(name.clone()),
+        let writes = vec![rho_desk_client::protocol::cells::CellWrite {
+            id: rho_desk_client::protocol::cells::Id::Agent(agent_id),
+            property: rho_desk_client::protocol::cells::Property::Name(name.clone()),
         }];
         if self
             .apply_desk_writes(host, writes, None, window, cx)
@@ -3350,16 +3345,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let until = rho_agent_host_proto::desk::cells::Timestamp {
+        let until = rho_desk_client::protocol::cells::Timestamp {
             unix_ms: at.timestamp_millis(),
-            precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
+            precision: rho_desk_client::protocol::cells::TimestampPrecision::Millisecond,
         };
         self.deal_snooze_until(until, snooze_said(at, chrono::Local::now()), window, cx);
     }
 
     fn deal_snooze_until(
         &mut self,
-        until: rho_agent_host_proto::desk::cells::Timestamp,
+        until: rho_desk_client::protocol::cells::Timestamp,
         said: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3424,7 +3419,7 @@ impl Workspace {
         let Some(writes) = self.desk.repository_writes(
             workdir.host,
             &path_name,
-            Some(rho_agent_host_proto::desk::cells::Repository {
+            Some(rho_desk_client::protocol::cells::Repository {
                 url: workdir.path.to_string(),
             }),
         ) else {
@@ -3584,7 +3579,7 @@ impl Workspace {
     pub(crate) fn create_browser_page(
         &mut self,
         url: String,
-        parent: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+        parent: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -3615,7 +3610,7 @@ impl Workspace {
     pub(crate) fn file_page(
         &mut self,
         page: rho_browser::PageId,
-        parent: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+        parent: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
         method: rho_journal::CreateMethod,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3633,20 +3628,20 @@ impl Workspace {
             );
             return;
         };
-        let id = rho_agent_host_proto::desk::cells::Id::Page(rho_agent_host_proto::desk::PageId(
+        let id = rho_desk_client::protocol::cells::Id::Page(rho_desk_client::protocol::PageId(
             *page.0.as_bytes(),
         ));
         let at_root = parent.is_none();
         let filing = self
             .new_thing_cells(host, parent.as_ref())
             .into_iter()
-            .map(|property| rho_agent_host_proto::desk::cells::CellWrite {
+            .map(|property| rho_desk_client::protocol::cells::CellWrite {
                 id: id.clone(),
                 property,
             });
-        let writes = std::iter::once(rho_agent_host_proto::desk::cells::CellWrite {
+        let writes = std::iter::once(rho_desk_client::protocol::cells::CellWrite {
             id: id.clone(),
-            property: rho_agent_host_proto::desk::cells::Property::CreatedAt(
+            property: rho_desk_client::protocol::cells::Property::CreatedAt(
                 rho_desk_client::desk::now_timestamp(),
             ),
         })
@@ -4319,12 +4314,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn filing_destinations_for_test(
         &self,
-    ) -> &[(
-        String,
-        String,
-        HostId,
-        rho_agent_host_proto::desk::cells::Id,
-    )] {
+    ) -> &[(String, String, HostId, rho_desk_client::protocol::cells::Id)] {
         &self.pending_filing_destinations
     }
 
@@ -4334,7 +4324,7 @@ impl Workspace {
     pub(crate) fn area_workdir_for_test(
         &self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
     ) -> Option<HostPath> {
         self.area_workdir(host, node_id)
     }
@@ -5083,7 +5073,7 @@ impl Workspace {
     pub(crate) fn focus_tree_node_for_test(
         &mut self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5094,7 +5084,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn pending_agent_filing_for_test(
         &self,
-    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+    ) -> Option<(HostId, rho_desk_client::protocol::cells::Id)> {
         self.pending_agent_filing.clone()
     }
 
@@ -5106,7 +5096,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn draft_area_for_test(
         &self,
-    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+    ) -> Option<(HostId, rho_desk_client::protocol::cells::Id)> {
         self.draft_area.clone()
     }
 
@@ -5206,8 +5196,8 @@ impl Workspace {
     pub(crate) fn note_children_for_test(
         &self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
-    ) -> Vec<rho_agent_host_proto::desk::cells::Id> {
+        node_id: rho_desk_client::protocol::cells::Id,
+    ) -> Vec<rho_desk_client::protocol::cells::Id> {
         self.note_views
             .get(&(host, node_id))
             .map(|view| view.children())
@@ -5483,7 +5473,7 @@ impl Workspace {
                 && moved.as_ref().is_some_and(|agents| {
                     let touched = agents
                         .iter()
-                        .map(|agent_id| rho_agent_host_proto::desk::cells::Id::Agent(*agent_id))
+                        .map(|agent_id| rho_desk_client::protocol::cells::Id::Agent(*agent_id))
                         .collect::<BTreeSet<_>>();
                     dashboard.patch_deal_source(host, &touched, nodes)
                 })
@@ -5537,10 +5527,8 @@ impl Workspace {
     ) -> Option<rho_desk_client::desk::AgentSource> {
         /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
-        fn story_pos(
-            pos: rho_agent_types::AgentPos,
-        ) -> rho_agent_host_proto::desk::cells::StoryPos {
-            rho_agent_host_proto::desk::cells::StoryPos(pos.0)
+        fn story_pos(pos: rho_agent_types::AgentPos) -> rho_desk_client::protocol::cells::StoryPos {
+            rho_desk_client::protocol::cells::StoryPos(pos.0)
         }
 
         if self.registry.host_of_agent(agent) != Some(host) || self.registry.agent_muted(agent) {
@@ -5624,10 +5612,10 @@ impl Workspace {
                 .map(|(unit, facts)| rho_desk_client::desk::SlackSource {
                     unit,
                     title: facts.title,
-                    newest: rho_agent_host_proto::desk::cells::SlackTs(facts.latest),
+                    newest: rho_desk_client::protocol::cells::SlackTs(facts.latest),
                     newest_from_other: facts
                         .newest_from_other
-                        .map(rho_agent_host_proto::desk::cells::SlackTs),
+                        .map(rho_desk_client::protocol::cells::SlackTs),
                     reason: facts.reason,
                 })
                 .collect()
@@ -5640,9 +5628,9 @@ impl Workspace {
             rho_browser::live_pages()
                 .into_iter()
                 .map(|(page, opened_from)| rho_desk_client::desk::PageSource {
-                    page: rho_agent_host_proto::desk::PageId(*page.0.as_bytes()),
+                    page: rho_desk_client::protocol::PageId(*page.0.as_bytes()),
                     opened_from: opened_from
-                        .map(|id| rho_agent_host_proto::desk::PageId(*id.0.as_bytes())),
+                        .map(|id| rho_desk_client::protocol::PageId(*id.0.as_bytes())),
                 })
                 .collect()
         } else {
@@ -5686,7 +5674,7 @@ impl Workspace {
     pub(crate) fn apply_verdict_for_test(
         &mut self,
         host: HostId,
-        id: &rho_agent_host_proto::desk::cells::Id,
+        id: &rho_desk_client::protocol::cells::Id,
         verdict: rho_desk_client::desk::DeskVerdict,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5759,7 +5747,7 @@ impl Workspace {
     fn note_view_for(
         &mut self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&crate::note_view::NoteView> {
@@ -5787,7 +5775,7 @@ impl Workspace {
     pub(crate) fn open_tree_node(
         &mut self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -5818,7 +5806,7 @@ impl Workspace {
     pub(crate) fn open_note(
         &mut self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -5890,14 +5878,14 @@ impl Workspace {
         // for a place is still about it.
         if !cells
             .iter()
-            .any(|cell| matches!(cell, rho_agent_host_proto::desk::cells::Property::About(_)))
+            .any(|cell| matches!(cell, rho_desk_client::protocol::cells::Property::About(_)))
         {
-            cells.push(rho_agent_host_proto::desk::cells::Property::About(
+            cells.push(rho_desk_client::protocol::cells::Property::About(
                 node_id.clone(),
             ));
         }
         writes.extend(cells.into_iter().map(|property| {
-            rho_agent_host_proto::desk::cells::CellWrite {
+            rho_desk_client::protocol::cells::CellWrite {
                 id: created.clone(),
                 property,
             }
@@ -5941,8 +5929,8 @@ impl Workspace {
     pub(crate) fn new_thing_cells(
         &self,
         host: HostId,
-        area: Option<&(HostId, rho_agent_host_proto::desk::cells::Id)>,
-    ) -> Vec<rho_agent_host_proto::desk::cells::Property> {
+        area: Option<&(HostId, rho_desk_client::protocol::cells::Id)>,
+    ) -> Vec<rho_desk_client::protocol::cells::Property> {
         let Some((area_host, node_id)) = area else {
             return Vec::new();
         };
@@ -5952,7 +5940,7 @@ impl Workspace {
         if *area_host != host {
             return Vec::new();
         }
-        let mut cells = vec![rho_agent_host_proto::desk::cells::Property::About(
+        let mut cells = vec![rho_desk_client::protocol::cells::Property::About(
             node_id.clone(),
         )];
         cells.extend(
@@ -5961,7 +5949,7 @@ impl Workspace {
                 .into_iter()
                 .flat_map(|facts| facts.labels)
                 .map(
-                    |label| rho_agent_host_proto::desk::cells::Property::Labeled {
+                    |label| rho_desk_client::protocol::cells::Property::Labeled {
                         label,
                         present: true,
                     },
@@ -5973,7 +5961,7 @@ impl Workspace {
     pub(crate) fn surface_node(
         &self,
         cx: &App,
-    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+    ) -> Option<(HostId, rho_desk_client::protocol::cells::Id)> {
         let card = match &self.active_surface().key {
             SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
             SurfaceKey::Transcript(agent_id)
@@ -5992,7 +5980,7 @@ impl Workspace {
                 let unit = self.slack_surface_unit(source, cx)?;
                 return Some((
                     self.hosts.owner()?,
-                    rho_agent_host_proto::desk::cells::Id::Slack(unit),
+                    rho_desk_client::protocol::cells::Id::Slack(unit),
                 ));
             }
             _ => None,
@@ -6004,9 +5992,9 @@ impl Workspace {
     pub(crate) fn send_desk_text(
         &mut self,
         host: HostId,
-        id: rho_agent_host_proto::desk::cells::Id,
-        operation: rho_agent_host_proto::desk::TextOperation,
-        transaction: rho_agent_host_proto::desk::TextTransaction,
+        id: rho_desk_client::protocol::cells::Id,
+        operation: rho_desk_client::protocol::TextOperation,
+        transaction: rho_desk_client::protocol::TextTransaction,
         _cx: &mut Context<Self>,
     ) {
         self.send_desk(
@@ -6024,14 +6012,14 @@ impl Workspace {
     pub(crate) fn apply_desk_writes(
         &mut self,
         host: HostId,
-        writes: Vec<rho_agent_host_proto::desk::cells::CellWrite>,
+        writes: Vec<rho_desk_client::protocol::cells::CellWrite>,
         verdict: Option<(
-            rho_agent_host_proto::desk::cells::Id,
-            rho_agent_host_proto::desk::cells::VerdictEvent,
+            rho_desk_client::protocol::cells::Id,
+            rho_desk_client::protocol::cells::VerdictEvent,
         )>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<rho_agent_host_proto::desk::cells::Stamp> {
+    ) -> Option<rho_desk_client::protocol::cells::Stamp> {
         let (frame, delta) = self.desk.apply(host, writes, verdict)?;
         let DeskClientFrame::MutationApply { mutation } = &frame else {
             return None;
@@ -6051,7 +6039,7 @@ impl Workspace {
     pub(crate) fn fill_note_bodies(
         &mut self,
         host: HostId,
-        bodies: Vec<(rho_agent_host_proto::desk::cells::Id, String)>,
+        bodies: Vec<(rho_desk_client::protocol::cells::Id, String)>,
         cx: &mut Context<Self>,
     ) {
         for (node_id, text) in bodies {
@@ -7390,7 +7378,7 @@ impl Workspace {
     pub(crate) fn label_target(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+    ) -> Option<(HostId, rho_desk_client::protocol::cells::Id)> {
         // What the reader is on: the thing behind the surface in view, or
         // the row under the cursor when the map is what they are reading.
         // The card in hand is the target only when it is that thing, so
@@ -7419,7 +7407,7 @@ impl Workspace {
     fn card_target(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+    ) -> Option<(HostId, rho_desk_client::protocol::cells::Id)> {
         // Home is a list of cards, so its cursor names one the same way the
         // map's does.
         if self.home_in_view() {
@@ -7475,7 +7463,7 @@ impl Workspace {
     pub(crate) fn label_card(
         &mut self,
         host: HostId,
-        id: rho_agent_host_proto::desk::cells::Id,
+        id: rho_desk_client::protocol::cells::Id,
         path: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7497,8 +7485,8 @@ impl Workspace {
         };
         let removed = matches!(
             &event.1,
-            rho_agent_host_proto::desk::cells::VerdictEvent::Applied {
-                verdict: rho_agent_host_proto::desk::cells::Verdict::Label { present: false, .. },
+            rho_desk_client::protocol::cells::VerdictEvent::Applied {
+                verdict: rho_desk_client::protocol::cells::Verdict::Label { present: false, .. },
                 ..
             }
         );
@@ -7695,8 +7683,8 @@ impl Workspace {
         &mut self,
         host: HostId,
         nodes: Vec<(
-            rho_agent_host_proto::desk::cells::Id,
-            rho_agent_host_proto::desk::cells::SlackTs,
+            rho_desk_client::protocol::cells::Id,
+            rho_desk_client::protocol::cells::SlackTs,
         )>,
         verb: String,
         window: &mut Window,
@@ -7708,7 +7696,7 @@ impl Workspace {
             // A Slack unit is done at the cutoff and no further: the cursor
             // lands on the newest message at or before the age the user
             // named, and anything newer is still theirs.
-            if let rho_agent_host_proto::desk::cells::Id::Slack(unit) = &node {
+            if let rho_desk_client::protocol::cells::Id::Slack(unit) = &node {
                 cursors.extend(self.advance_slack_cursor(
                     &unit.clone(),
                     Some(rho_slack::types::Ts(cursor.0)),
@@ -7750,8 +7738,8 @@ impl Workspace {
         entry: VerdictUndo,
         host: HostId,
         nodes: Vec<(
-            rho_agent_host_proto::desk::cells::Id,
-            rho_agent_host_proto::desk::cells::Stamp,
+            rho_desk_client::protocol::cells::Id,
+            rho_desk_client::protocol::cells::Stamp,
         )>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7846,7 +7834,7 @@ impl Workspace {
 
     fn submit_tree_verdict(
         &mut self,
-        target_node: Option<rho_agent_host_proto::desk::cells::Id>,
+        target_node: Option<rho_desk_client::protocol::cells::Id>,
         dealt: rho_desk_client::desk::DeskVerdict,
         verdict: crate::dashboard::DealerVerdict,
         verb: String,
@@ -7911,7 +7899,7 @@ impl Workspace {
                 | rho_desk_client::desk::DeskVerdict::Todo { .. }
         );
         let slack_cursors = match (&node_id, moves_cursor) {
-            (rho_agent_host_proto::desk::cells::Id::Slack(unit), true) => self
+            (rho_desk_client::protocol::cells::Id::Slack(unit), true) => self
                 .advance_slack_cursor(&unit.clone(), None, cx)
                 .into_iter()
                 .collect(),
@@ -7924,7 +7912,7 @@ impl Workspace {
         if matches!(
             dealt,
             rho_desk_client::desk::DeskVerdict::Done | rho_desk_client::desk::DeskVerdict::Mute
-        ) && matches!(node_id, rho_agent_host_proto::desk::cells::Id::Slack(_))
+        ) && matches!(node_id, rho_desk_client::protocol::cells::Id::Slack(_))
         {
             let mut undo = self.next_verdict_undo(
                 verb,
@@ -7952,8 +7940,8 @@ impl Workspace {
         // A todo hangs a note under the card. Empty, it comes back in a week
         // reading only `defer …`, so it is given the card's own words.
         let todo_note = match &applied.1 {
-            rho_agent_host_proto::desk::cells::VerdictEvent::Applied {
-                verdict: rho_agent_host_proto::desk::cells::Verdict::Todo { note },
+            rho_desk_client::protocol::cells::VerdictEvent::Applied {
+                verdict: rho_desk_client::protocol::cells::Verdict::Todo { note },
                 ..
             } => Some(note.clone()),
             _ => None,
@@ -7996,7 +7984,7 @@ impl Workspace {
     /// so typing composes the first message straight away.
     pub(crate) fn new_agent_in_area(
         &mut self,
-        area: Option<(HostId, rho_agent_host_proto::desk::cells::Id)>,
+        area: Option<(HostId, rho_desk_client::protocol::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8042,7 +8030,7 @@ impl Workspace {
     fn area_workdir(
         &self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
     ) -> Option<HostPath> {
         if let Some(repository) = self.desk.inherited_workdir(host, &node_id) {
             return Some(HostPath {
@@ -8232,7 +8220,7 @@ impl Workspace {
     fn paste_desk_semantic_subtree(
         &mut self,
         host: HostId,
-        node_id: rho_agent_host_proto::desk::cells::Id,
+        node_id: rho_desk_client::protocol::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -9142,15 +9130,10 @@ impl Workspace {
 }
 
 pub(crate) fn resolve_filing_destination(
-    destinations: &[(
-        String,
-        String,
-        HostId,
-        rho_agent_host_proto::desk::cells::Id,
-    )],
+    destinations: &[(String, String, HostId, rho_desk_client::protocol::cells::Id)],
     candidate: &crate::minibuffer::Candidate,
     occurrence: usize,
-) -> Option<(HostId, rho_agent_host_proto::desk::cells::Id)> {
+) -> Option<(HostId, rho_desk_client::protocol::cells::Id)> {
     destinations
         .iter()
         .filter(|(value, description, _, _)| {
@@ -9771,11 +9754,11 @@ impl Render for Workspace {
 /// in. Only a label is a filing; everything else on the desk is a thing,
 /// and a thing is not a place.
 pub(crate) fn filing_property(
-    area: rho_agent_host_proto::desk::cells::Id,
-) -> Option<rho_agent_host_proto::desk::cells::Property> {
+    area: rho_desk_client::protocol::cells::Id,
+) -> Option<rho_desk_client::protocol::cells::Property> {
     match area {
-        label @ rho_agent_host_proto::desk::cells::Id::Label(_) => {
-            Some(rho_agent_host_proto::desk::cells::Property::Labeled {
+        label @ rho_desk_client::protocol::cells::Id::Label(_) => {
+            Some(rho_desk_client::protocol::cells::Property::Labeled {
                 label,
                 present: true,
             })

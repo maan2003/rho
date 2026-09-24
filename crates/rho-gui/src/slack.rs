@@ -6,7 +6,7 @@
 
 use anyhow::Context as _;
 use gpui::AppContext as _;
-use rho_agent_host_proto::desk::cells::SlackUnit;
+use rho_desk_client::protocol::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, NextUnread, Unit};
@@ -2002,25 +2002,25 @@ impl Workspace {
         let host = self.hosts.owner();
         let workspace_name = session.read(cx).model().workspace().clone();
         let mut nodes: Vec<(
-            rho_agent_host_proto::desk::cells::Id,
-            rho_agent_host_proto::desk::cells::SlackTs,
+            rho_desk_client::protocol::cells::Id,
+            rho_desk_client::protocol::cells::SlackTs,
         )> = plan
             .conversations
             .iter()
             .map(|(channel, ts)| {
                 (
-                    rho_agent_host_proto::desk::cells::Id::Slack(SlackUnit {
+                    rho_desk_client::protocol::cells::Id::Slack(SlackUnit {
                         workspace: workspace_name.0.clone(),
                         channel: channel.0.clone(),
                         thread: None,
                     }),
-                    rho_agent_host_proto::desk::cells::SlackTs(ts.0.clone()),
+                    rho_desk_client::protocol::cells::SlackTs(ts.0.clone()),
                 )
             })
             .chain(plan.threads.iter().map(|(key, ts)| {
                 (
-                    rho_agent_host_proto::desk::cells::Id::Slack(store_unit_of(key)),
-                    rho_agent_host_proto::desk::cells::SlackTs(ts.0.clone()),
+                    rho_desk_client::protocol::cells::Id::Slack(store_unit_of(key)),
+                    rho_desk_client::protocol::cells::SlackTs(ts.0.clone()),
                 )
             }))
             .collect();
@@ -3204,8 +3204,8 @@ fn cards_before(
     host: Option<rho_agents_client::HostId>,
     before: f64,
 ) -> Vec<(
-    rho_agent_host_proto::desk::cells::Id,
-    rho_agent_host_proto::desk::cells::SlackTs,
+    rho_desk_client::protocol::cells::Id,
+    rho_desk_client::protocol::cells::SlackTs,
 )> {
     cards
         .into_iter()
@@ -3214,7 +3214,7 @@ fn cards_before(
             let closed = model.closed_by(&model_unit(&thread), before)?;
             Some((
                 card.node_id,
-                rho_agent_host_proto::desk::cells::SlackTs(closed.0),
+                rho_desk_client::protocol::cells::SlackTs(closed.0),
             ))
         })
         .collect()
@@ -3479,7 +3479,7 @@ mod tests {
         }
         let host = rho_agents_client::HostId::default();
         let node = |counter: u8| {
-            rho_agent_host_proto::desk::cells::Id::Note(rho_agent_host_proto::desk::cells::Uuid(
+            rho_desk_client::protocol::cells::Id::Note(rho_desk_client::protocol::cells::Uuid(
                 [counter; 16],
             ))
         };
@@ -3494,7 +3494,7 @@ mod tests {
             cards_before(cards, &model, Some(host), 500.0),
             vec![(
                 node(1),
-                rho_agent_host_proto::desk::cells::SlackTs("100.0".to_owned())
+                rho_desk_client::protocol::cells::SlackTs("100.0".to_owned())
             )],
             "the newer thread stays, and one the mirror has nothing on is left alone"
         );

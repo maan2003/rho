@@ -8,13 +8,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rho_agent_host_proto::desk::cells::{
+use rho_agents_client::{Attention, HostId};
+
+use crate::protocol::cells::{
     BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, Repository,
     SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
     Uuid, Verdict, VerdictEvent, Version,
 };
-use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
-use rho_agents_client::{Attention, HostId};
+use crate::protocol::stream::ClientFrame as DeskClientFrame;
 
 struct HostDesk {
     /// What the daemon has told us, kept so that a poke can be read
@@ -28,7 +29,7 @@ struct HostDesk {
     /// rather than read off the buffers: the sync is sent before any
     /// buffer exists on a cold start, and the replica's own histories are
     /// what the client resumes from.
-    body_versions: BTreeMap<Id, rho_agent_host_proto::desk::cells::BodyVersion>,
+    body_versions: BTreeMap<Id, crate::protocol::cells::BodyVersion>,
     /// The map as it stands, in the order it is drawn, and where each id
     /// sits in it. Kept rather than made: a delta patches the rows it
     /// names, and only a change of shape walks the facts again.
@@ -122,10 +123,10 @@ pub struct SlackSource {
 /// the store, so everything about where it sits comes from here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageSource {
-    pub page: rho_agent_host_proto::desk::PageId,
+    pub page: crate::protocol::PageId,
     /// The page the reader opened this tab from: a ctrl-click, or a link
     /// that asked for a new tab. `None` for a tab opened for its own sake.
-    pub opened_from: Option<rho_agent_host_proto::desk::PageId>,
+    pub opened_from: Option<crate::protocol::PageId>,
 }
 
 /// The source facts a view joins the store with. Recomputed by the
@@ -141,8 +142,8 @@ pub struct Sources {
     /// scanning made a walk cost the nodes times the sources. The lists
     /// are private so these cannot drift from them.
     by_agent: HashMap<rho_agent_types::AgentId, usize>,
-    by_unit: HashMap<rho_agent_host_proto::desk::cells::SlackUnit, usize>,
-    by_page: HashMap<rho_agent_host_proto::desk::PageId, usize>,
+    by_unit: HashMap<crate::protocol::cells::SlackUnit, usize>,
+    by_page: HashMap<crate::protocol::PageId, usize>,
 }
 
 // How many source entries the walk has looked at. A lookup that scans
@@ -229,12 +230,12 @@ impl Sources {
         self.by_agent.get(&agent).map(|at| &self.agents[*at])
     }
 
-    fn unit(&self, unit: &rho_agent_host_proto::desk::cells::SlackUnit) -> Option<&SlackSource> {
+    fn unit(&self, unit: &crate::protocol::cells::SlackUnit) -> Option<&SlackSource> {
         charge_scan(1);
         self.by_unit.get(unit).map(|at| &self.slack[*at])
     }
 
-    fn page(&self, page: rho_agent_host_proto::desk::PageId) -> Option<&PageSource> {
+    fn page(&self, page: crate::protocol::PageId) -> Option<&PageSource> {
         charge_scan(1);
         self.by_page.get(&page).map(|at| &self.pages[*at])
     }
@@ -391,7 +392,7 @@ impl DeskNode {
         }
     }
 
-    pub fn page(&self) -> Option<rho_agent_host_proto::desk::PageId> {
+    pub fn page(&self) -> Option<crate::protocol::PageId> {
         match &self.id {
             Id::Page(page) => Some(*page),
             _ => None,
@@ -908,8 +909,8 @@ impl Desk {
         &mut self,
         host: HostId,
         id: Id,
-        operation: &rho_agent_host_proto::desk::TextOperation,
-        transaction: &rho_agent_host_proto::desk::TextTransaction,
+        operation: &crate::protocol::TextOperation,
+        transaction: &crate::protocol::TextTransaction,
     ) {
         let stamp = operation.timestamp();
         let Some(desk) = self.hosts.get_mut(&host) else {
@@ -1763,7 +1764,7 @@ impl Desk {
             instead_of,
         };
         let view = &self.hosts.get(&host)?.view;
-        let changes = rho_agent_host_proto::desk::cells::verdict_changes(
+        let changes = crate::protocol::cells::verdict_changes(
             id,
             &verdict,
             &|key| view.property(id, key).cloned(),
@@ -2092,11 +2093,7 @@ impl Desk {
     /// cursor. `None` for everything that is not an agent, and for an agent
     /// no source knows about, which is a verdict on a card that cannot be
     /// dealt.
-    fn agent_verdict(
-        &self,
-        host: HostId,
-        id: &Id,
-    ) -> Option<rho_agent_host_proto::desk::cells::AgentVerdict> {
+    fn agent_verdict(&self, host: HostId, id: &Id) -> Option<crate::protocol::cells::AgentVerdict> {
         let Id::Agent(agent) = id else {
             return None;
         };
@@ -2106,7 +2103,7 @@ impl Desk {
             .agents
             .iter()
             .find(|source| &source.agent == agent)
-            .map(|source| rho_agent_host_proto::desk::cells::AgentVerdict {
+            .map(|source| crate::protocol::cells::AgentVerdict {
                 newest: source.newest,
             })
     }
@@ -2128,7 +2125,7 @@ impl Desk {
         host: HostId,
         id: &Id,
         verdict: DeskVerdict,
-        agent: Option<rho_agent_host_proto::desk::cells::AgentVerdict>,
+        agent: Option<crate::protocol::cells::AgentVerdict>,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
             DeskVerdict::Done => (Verdict::Done, Vec::new()),
@@ -2156,11 +2153,11 @@ impl Desk {
                 // again the moment the note exists.
                 let verdict = Verdict::Todo { note };
                 let view = &self.hosts.get(&host)?.view;
-                let changes = rho_agent_host_proto::desk::cells::verdict_changes(
+                let changes = crate::protocol::cells::verdict_changes(
                     id,
                     &verdict,
                     &|key| view.property(id, key).cloned(),
-                    Some(rho_agent_host_proto::desk::cells::TodoCadence {
+                    Some(crate::protocol::cells::TodoCadence {
                         defer_until,
                         pace_days: pace,
                     }),
@@ -2203,7 +2200,7 @@ impl Desk {
         // entry against, so a verdict that touches two facts (a snooze, which
         // zeroes the pace as well) cannot drift between writer and checker.
         let view = &self.hosts.get(&host)?.view;
-        let changes = rho_agent_host_proto::desk::cells::verdict_changes(
+        let changes = crate::protocol::cells::verdict_changes(
             id,
             &verdict,
             &|key| view.property(id, key).cloned(),
@@ -2386,8 +2383,8 @@ mod tests {
     #[test]
     fn a_thing_filed_under_a_label_brings_its_subtree_and_leaves_the_root() {
         let label = Id::Label(Uuid([1; 16]));
-        let origin = Id::Page(rho_agent_host_proto::desk::PageId([2; 16]));
-        let tab = Id::Page(rho_agent_host_proto::desk::PageId([3; 16]));
+        let origin = Id::Page(crate::protocol::PageId([2; 16]));
+        let tab = Id::Page(crate::protocol::PageId([3; 16]));
         let nodes = BTreeMap::from([
             (label.clone(), node(label.clone(), None, &[])),
             (

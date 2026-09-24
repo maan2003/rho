@@ -8,10 +8,10 @@ use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
-use rho_agent_host_proto::desk::cells::{BodySnapshot, Id};
 use rho_agents_client::HostId;
 use rho_desk_client::Desk;
 use rho_desk_client::desk::{DeskCapture, DeskCaptureNode, DeskDelta, DeskNode};
+use rho_desk_client::protocol::cells::{BodySnapshot, Id};
 use text::{BufferId, ReplicaId};
 
 use crate::workspace::Workspace;
@@ -206,7 +206,7 @@ impl DeskBuffers {
         &mut self,
         host: HostId,
         id: &Id,
-        operation: rho_agent_host_proto::desk::TextOperation,
+        operation: rho_desk_client::protocol::TextOperation,
         cx: &mut Context<Workspace>,
     ) {
         let Ok(operation) = operation.to_text() else {
@@ -360,9 +360,9 @@ fn watch_note_buffer(
             is_local: true,
         } = event
         {
-            let operation = rho_agent_host_proto::desk::TextOperation::from_text(operation);
+            let operation = rho_desk_client::protocol::TextOperation::from_text(operation);
             let timestamp = operation.timestamp();
-            let transaction = rho_agent_host_proto::desk::TextTransaction {
+            let transaction = rho_desk_client::protocol::TextTransaction {
                 id: timestamp,
                 edit_ids: vec![timestamp],
             };

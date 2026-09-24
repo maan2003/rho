@@ -19,10 +19,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gpui::App;
-use rho_agent_host_proto::desk::cells::Id;
 use rho_agents_client::{AgentMap, HostId};
 use rho_desk_client::Desk;
 use rho_desk_client::desk::DeskNode;
+use rho_desk_client::protocol::cells::Id;
 
 use crate::desk_view::DeskBuffers;
 use crate::find::{FindCandidate, FindTarget};
@@ -42,7 +42,7 @@ pub(crate) struct HostNodes {
     /// which is what made dealing one expensive; it is an index instead.
     children: HashMap<Id, Vec<usize>>,
     by_agent: HashMap<rho_agent_types::AgentId, usize>,
-    by_page: HashMap<rho_agent_host_proto::desk::PageId, usize>,
+    by_page: HashMap<rho_desk_client::protocol::PageId, usize>,
     titles: HashMap<Id, String>,
     /// Every label's full filing path, `rho/agent`.
     label_paths: HashMap<Id, String>,
@@ -180,7 +180,7 @@ impl HostNodes {
     }
 
     /// The row a page is filed as, if it is filed at all.
-    pub(crate) fn page_node(&self, page: rho_agent_host_proto::desk::PageId) -> Option<&DeskNode> {
+    pub(crate) fn page_node(&self, page: rho_desk_client::protocol::PageId) -> Option<&DeskNode> {
         self.by_page.get(&page).map(|index| &self.nodes[*index])
     }
 

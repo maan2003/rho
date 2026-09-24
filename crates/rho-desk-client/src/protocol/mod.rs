@@ -1,4 +1,6 @@
-//! The words of a note, as a text CRDT, and the ids the store leans on.
+//! The desk part of a host, [`rho_rpc::parts::Part::Desk`]: the words of a
+//! note, as a text CRDT, the ids the store leans on ([`cells`]), and the
+//! stream that syncs them ([`stream`]).
 //!
 //! The convergent movable tree that used to live here is gone: the store
 //! holds facts about typed ids (`cells`), and a note's body is the only

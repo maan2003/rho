@@ -11,12 +11,12 @@ use gpui::{
     point, px, size,
 };
 use language::InlayId;
-use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
 use rho_agent_types::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
 use rho_agents_view::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
+use rho_desk_client::protocol::stream::ClientFrame as DeskClientFrame;
 use rho_hosts::connection::ConnEvent;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
@@ -905,7 +905,7 @@ fn a_snooze_lands_on_its_unit_and_says_the_time() {
     );
     assert_eq!(
         at.precision,
-        rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond
+        rho_desk_client::protocol::cells::TimestampPrecision::Millisecond
     );
     assert_eq!(said, "snooze until 15:15");
 
@@ -920,7 +920,7 @@ fn a_snooze_lands_on_its_unit_and_says_the_time() {
     let (at, said) = snooze_target(SnoozeUnit::Days, 2, now);
     assert_eq!(
         at.precision,
-        rho_agent_host_proto::desk::cells::TimestampPrecision::Day
+        rho_desk_client::protocol::cells::TimestampPrecision::Day
     );
     assert_eq!(said, "snooze until Sat 5 Sep");
     let (_, said) = snooze_target(SnoozeUnit::Weeks, 1, now);
@@ -1011,13 +1011,13 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     // The daemon validates the log entry against exactly these three
     // changes, and rejects the whole mutation otherwise: a todo that only
     // logged the new note's arrival never reached the tree.
-    use rho_agent_host_proto::desk::cells::{Property, PropertyKey};
+    use rho_desk_client::protocol::cells::{Property, PropertyKey};
 
     let mut desk = DeskFixture::new();
     let note = desk.note(None, "Named card");
-    let woke = rho_agent_host_proto::desk::cells::Timestamp {
+    let woke = rho_desk_client::protocol::cells::Timestamp {
         unix_ms: 1_577_836_800_000,
-        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
     };
     desk.set(note.clone(), Property::DeferUntil(Some(woke)));
     desk.set(note.clone(), Property::PaceDays(1));
@@ -1039,7 +1039,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("todo mutation");
             let Some((
                 verdict_node,
-                rho_agent_host_proto::desk::cells::VerdictEvent::Applied {
+                rho_desk_client::protocol::cells::VerdictEvent::Applied {
                     verdict, changes, ..
                 },
             )) = mutation.verdict.clone()
@@ -1047,7 +1047,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
                 panic!("the todo verdict did not log an applied entry");
             };
             assert_eq!(verdict_node, note, "the entry hangs off the dealt heading");
-            let rho_agent_host_proto::desk::cells::Verdict::Todo { note: created } = verdict else {
+            let rho_desk_client::protocol::cells::Verdict::Todo { note: created } = verdict else {
                 panic!("the entry is not a todo");
             };
             assert_eq!(changes.len(), 4);
@@ -1075,12 +1075,12 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             assert_eq!(
                 state.after,
                 Some(Property::State(
-                    rho_agent_host_proto::desk::cells::State::Done
+                    rho_desk_client::protocol::cells::State::Done
                 ))
             );
             assert!(mutation.writes.iter().any(|write| write.id == note
                 && write.property
-                    == Property::State(rho_agent_host_proto::desk::cells::State::Done)));
+                    == Property::State(rho_desk_client::protocol::cells::State::Done)));
             // The new note is parented on the heading it was written on.
             assert!(mutation.writes.iter().any(|write| write.id == created
                 && write.property == Property::Parent(Some(note.clone()))));
@@ -1170,15 +1170,15 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("first note mutation");
             assert!(
-                mutation.writes.iter().any(|write| matches!(
-                    write.id,
-                    rho_agent_host_proto::desk::cells::Id::Note(_)
-                )),
+                mutation
+                    .writes
+                    .iter()
+                    .any(|write| matches!(write.id, rho_desk_client::protocol::cells::Id::Note(_))),
                 "the first row on an empty desk is not a note"
             );
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_agent_host_proto::desk::cells::Property::Parent(None)),
+                    == rho_desk_client::protocol::cells::Property::Parent(None)),
                 "the first row on an empty desk is not a root"
             );
         })
@@ -1832,7 +1832,7 @@ async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppCont
     // The cell the daemon could hand over: the row filed under itself.
     desk.set(
         looped.clone(),
-        rho_agent_host_proto::desk::cells::Property::Parent(Some(looped.clone())),
+        rho_desk_client::protocol::cells::Property::Parent(Some(looped.clone())),
     );
 
     let workspace = test_workspace(cx);
@@ -1980,7 +1980,7 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
                 .expect("the note is still on the map");
             assert_eq!(
                 node.state,
-                rho_agent_host_proto::desk::cells::State::Done,
+                rho_desk_client::protocol::cells::State::Done,
                 "the row the verdict named says so"
             );
         })
@@ -4271,11 +4271,11 @@ fn filing_completion_keeps_duplicate_heading_identity() {
         0,
         "filing completion replaces the whole partial title"
     );
-    let first = rho_agent_host_proto::desk::cells::Id::Note(
-        rho_agent_host_proto::desk::cells::Uuid([1_u8; 16]),
-    );
-    let second = rho_agent_host_proto::desk::cells::Id::Note(
-        rho_agent_host_proto::desk::cells::Uuid([2_u8; 16]),
+    let first = rho_desk_client::protocol::cells::Id::Note(rho_desk_client::protocol::cells::Uuid(
+        [1_u8; 16],
+    ));
+    let second = rho_desk_client::protocol::cells::Id::Note(
+        rho_desk_client::protocol::cells::Uuid([2_u8; 16]),
     );
     let destinations = vec![
         (
@@ -4346,7 +4346,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
             assert!(
                 mutation.writes.iter().any(|write| write.id == dealt
                     && write.property
-                        == rho_agent_host_proto::desk::cells::Property::Labeled {
+                        == rho_desk_client::protocol::cells::Property::Labeled {
                             label: destination.clone(),
                             present: true,
                         }),
@@ -4370,7 +4370,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
             assert!(
                 mutation.writes.iter().any(|write| write.id == dealt
                     && write.property
-                        == rho_agent_host_proto::desk::cells::Property::Labeled {
+                        == rho_desk_client::protocol::cells::Property::Labeled {
                             label: destination.clone(),
                             present: false,
                         }),
@@ -4420,8 +4420,8 @@ fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("done mutation");
             assert!(mutation.writes.iter().any(|write| write.id == dealt
                 && write.property
-                    == rho_agent_host_proto::desk::cells::Property::State(
-                        rho_agent_host_proto::desk::cells::State::Done
+                    == rho_desk_client::protocol::cells::Property::State(
+                        rho_desk_client::protocol::cells::State::Done
                     )));
         })
         .unwrap();
@@ -4476,7 +4476,7 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
             assert_eq!(kind, crate::dashboard::DealCardKind::Agent);
             assert_eq!(
                 identity.node_id,
-                rho_agent_host_proto::desk::cells::Id::Agent(agent_id),
+                rho_desk_client::protocol::cells::Id::Agent(agent_id),
                 "the card stands for the agent itself, not a note over it"
             );
             // Opening it must reach the transcript. With no note behind the
@@ -4539,7 +4539,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
                     .writes
                     .iter()
                     .find_map(|write| match &write.property {
-                        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(at)) => {
+                        rho_desk_client::protocol::cells::Property::DeferUntil(Some(at)) => {
                             Some(*at)
                         }
                         _ => None,
@@ -4988,7 +4988,7 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
     let dealt = desk.due_note(None, "Paced card");
     desk.set(
         dealt.clone(),
-        rho_agent_host_proto::desk::cells::Property::PaceDays(7),
+        rho_desk_client::protocol::cells::Property::PaceDays(7),
     );
 
     cx.update(bind_test_keymaps);
@@ -5009,8 +5009,8 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("snooze mutation");
             assert!(mutation.writes.iter().any(|write| write.id == dealt
-                && write.property == rho_agent_host_proto::desk::cells::Property::PaceDays(0)));
-            let Some((_, rho_agent_host_proto::desk::cells::VerdictEvent::Applied { changes, .. })) =
+                && write.property == rho_desk_client::protocol::cells::Property::PaceDays(0)));
+            let Some((_, rho_desk_client::protocol::cells::VerdictEvent::Applied { changes, .. })) =
                 mutation.verdict
             else {
                 panic!("the snooze records an applied verdict");
@@ -5018,10 +5018,18 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
             // The entry says what it put back, so an undo restores the pace.
             let paced = changes
                 .iter()
-                .find(|change| change.key == rho_agent_host_proto::desk::cells::PropertyKey::PaceDays)
+                .find(|change| {
+                    change.key == rho_desk_client::protocol::cells::PropertyKey::PaceDays
+                })
                 .expect("the pace is part of the verdict");
-            assert_eq!(paced.before, Some(rho_agent_host_proto::desk::cells::Property::PaceDays(7)));
-            assert_eq!(paced.after, Some(rho_agent_host_proto::desk::cells::Property::PaceDays(0)));
+            assert_eq!(
+                paced.before,
+                Some(rho_desk_client::protocol::cells::Property::PaceDays(7))
+            );
+            assert_eq!(
+                paced.after,
+                Some(rho_desk_client::protocol::cells::Property::PaceDays(0))
+            );
         })
         .unwrap();
 }
@@ -5082,17 +5090,17 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     // cells the verdict replaced.
     let mut desk = DeskFixture::new();
     let note = desk.note(None, "Named card");
-    let woke = rho_agent_host_proto::desk::cells::Timestamp {
+    let woke = rho_desk_client::protocol::cells::Timestamp {
         unix_ms: 1_577_836_800_000,
-        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
     };
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(woke)),
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(woke)),
     );
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::PaceDays(1),
+        rho_desk_client::protocol::cells::Property::PaceDays(1),
     );
 
     let workspace = test_workspace(cx);
@@ -5114,7 +5122,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                         .expect("verdict mutation");
                     assert!(matches!(
                         mutation.verdict,
-                        Some((_, rho_agent_host_proto::desk::cells::VerdictEvent::Applied { .. }))
+                        Some((_, rho_desk_client::protocol::cells::VerdictEvent::Applied { .. }))
                     ));
                     // Said as the verdict is made, not a round trip later.
                     assert_eq!(workspace.echo_text_for_test(), Some($echo));
@@ -5129,14 +5137,14 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                     // Undo is the log's own inverse, not a replayed edit.
                     assert!(matches!(
                         mutation.verdict,
-                        Some((_, rho_agent_host_proto::desk::cells::VerdictEvent::Undone { of })) if of == stamp
+                        Some((_, rho_desk_client::protocol::cells::VerdictEvent::Undone { of })) if of == stamp
                     ));
                     let node = workspace
                         .desk_cells_snapshot_for_test(HostId::default())
                         .into_iter()
                         .find(|candidate| candidate.id == note)
                         .unwrap();
-                    assert_eq!(node.state, rho_agent_host_proto::desk::cells::State::Open);
+                    assert_eq!(node.state, rho_desk_client::protocol::cells::State::Open);
                     assert_eq!(node.defer_until, Some(woke));
                     assert_eq!(node.pace_days, 1);
                 })
@@ -6481,10 +6489,10 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     let note = desk.note(None, "Written while the daemon was away");
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 1_577_836_800_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -6525,8 +6533,8 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     assert!(
         sent_back.cells.iter().any(|cell| cell.id == note
             && cell.property
-                == rho_agent_host_proto::desk::cells::Property::State(
-                    rho_agent_host_proto::desk::cells::State::Done
+                == rho_desk_client::protocol::cells::Property::State(
+                    rho_desk_client::protocol::cells::State::Done
                 )),
         "the verdict the daemon never heard is in what goes back: {:?}",
         sent_back.cells
@@ -6537,7 +6545,7 @@ fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppC
     desk.store.merge(sent_back).unwrap();
     assert_eq!(
         desk.store.facts(&note).state,
-        rho_agent_host_proto::desk::cells::State::Done,
+        rho_desk_client::protocol::cells::State::Done,
         "the daemon holds the write it missed"
     );
 }
@@ -6550,10 +6558,10 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
     let note = desk.note(None, "Shared card");
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 1_577_836_800_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -6590,7 +6598,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
                     .into_iter()
                     .find(|node| node.id == note)
                     .map(|node| node.state),
-                Some(rho_agent_host_proto::desk::cells::State::Open),
+                Some(rho_desk_client::protocol::cells::State::Open),
                 "the poke has not arrived yet"
             );
             story::feed(
@@ -6612,7 +6620,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
                     .into_iter()
                     .find(|node| node.id == note)
                     .map(|node| node.state),
-                Some(rho_agent_host_proto::desk::cells::State::Done),
+                Some(rho_desk_client::protocol::cells::State::Done),
                 "the verdict from the other device is visible here"
             );
         })
@@ -7138,7 +7146,7 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
             assert!(workspace.dashboard_deal_mode_for_test(cx));
             desk.set(
                 dealt,
-                rho_agent_host_proto::desk::cells::Property::DeferUntil(None),
+                rho_desk_client::protocol::cells::Property::DeferUntil(None),
             );
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
@@ -7295,7 +7303,7 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
                 take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_agent_host_proto::desk::cells::Property::Labeled {
+                    == rho_desk_client::protocol::cells::Property::Labeled {
                         label: here.clone(),
                         present: true,
                     }),
@@ -7304,7 +7312,7 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
             assert!(
                 !mutation.writes.iter().any(|write| matches!(
                     write.property,
-                    rho_agent_host_proto::desk::cells::Property::Parent(Some(_))
+                    rho_desk_client::protocol::cells::Property::Parent(Some(_))
                 )),
                 "nothing is placed by a parent: {:?}",
                 mutation.writes
@@ -7372,13 +7380,13 @@ fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut Te
                 take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_agent_host_proto::desk::cells::Property::About(node.clone())),
+                    == rho_desk_client::protocol::cells::Property::About(node.clone())),
                 "the note says what it came from: {:?}",
                 mutation.writes
             );
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_agent_host_proto::desk::cells::Property::Labeled {
+                    == rho_desk_client::protocol::cells::Property::Labeled {
                         label: label.clone(),
                         present: true,
                     }),
@@ -7388,7 +7396,7 @@ fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut Te
             assert!(
                 !mutation.writes.iter().any(|write| matches!(
                     write.property,
-                    rho_agent_host_proto::desk::cells::Property::Parent(Some(_))
+                    rho_desk_client::protocol::cells::Property::Parent(Some(_))
                 )),
                 "nothing is placed by a parent: {:?}",
                 mutation.writes
@@ -7812,12 +7820,12 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> rho_agents_client::stream::Ag
 }
 
 pub(super) struct DeskFixture {
-    store: rho_agent_host_proto::desk::cells::Store,
-    bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
+    store: rho_desk_client::protocol::cells::Store,
+    bodies: Vec<rho_desk_client::protocol::cells::BodySnapshot>,
     next_node: u64,
     /// The Slack units the fixture made rows for, with the newest message
     /// the mirror would report for each.
-    slack_units: Vec<(rho_agent_host_proto::desk::cells::SlackUnit, String)>,
+    slack_units: Vec<(rho_desk_client::protocol::cells::SlackUnit, String)>,
 }
 
 impl DeskFixture {
@@ -7827,13 +7835,13 @@ impl DeskFixture {
     /// The store the fixture's daemon answers as. Cells are only news
     /// about a desk when they are counted in the store the client holds,
     /// so every sync says which one that is.
-    pub(super) const STORE: rho_agent_host_proto::desk::cells::DeviceId =
-        rho_agent_host_proto::desk::cells::DeviceId([5; 16]);
+    pub(super) const STORE: rho_desk_client::protocol::cells::DeviceId =
+        rho_desk_client::protocol::cells::DeviceId([5; 16]);
 
     pub(super) fn new() -> Self {
-        let device = rho_agent_host_proto::desk::cells::DeviceId([9; 16]);
+        let device = rho_desk_client::protocol::cells::DeviceId([9; 16]);
         Self {
-            store: rho_agent_host_proto::desk::cells::Store::new(device),
+            store: rho_desk_client::protocol::cells::Store::new(device),
             bodies: Vec::new(),
             next_node: 0,
             slack_units: Vec::new(),
@@ -7842,11 +7850,11 @@ impl DeskFixture {
 
     fn note(
         &mut self,
-        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+        parent: Option<rho_desk_client::protocol::cells::Id>,
         text: &str,
-    ) -> rho_agent_host_proto::desk::cells::Id {
+    ) -> rho_desk_client::protocol::cells::Id {
         self.next_node += 1;
-        let id = rho_agent_host_proto::desk::cells::Id::Note(Self::uuid(self.next_node));
+        let id = rho_desk_client::protocol::cells::Id::Note(Self::uuid(self.next_node));
         self.file(id.clone(), parent);
         if !text.is_empty() {
             let mut buffer = text::Buffer::new(
@@ -7855,9 +7863,9 @@ impl DeskFixture {
                 "",
             );
             let operation =
-                rho_agent_host_proto::desk::TextOperation::from_text(&buffer.edit([(0..0, text)]));
+                rho_desk_client::protocol::TextOperation::from_text(&buffer.edit([(0..0, text)]));
             self.bodies
-                .push(rho_agent_host_proto::desk::cells::BodySnapshot {
+                .push(rho_desk_client::protocol::cells::BodySnapshot {
                     id: id.clone(),
                     operations: vec![operation],
                     transactions: Vec::new(),
@@ -7870,16 +7878,16 @@ impl DeskFixture {
     /// mark that makes it want attention is part of the seed.
     fn due_note(
         &mut self,
-        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+        parent: Option<rho_desk_client::protocol::cells::Id>,
         text: &str,
-    ) -> rho_agent_host_proto::desk::cells::Id {
+    ) -> rho_desk_client::protocol::cells::Id {
         let id = self.note(parent, text);
         self.set(
             id.clone(),
-            rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-                rho_agent_host_proto::desk::cells::Timestamp {
+            rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+                rho_desk_client::protocol::cells::Timestamp {
                     unix_ms: 1_600_000_000_000,
-                    precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                    precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
                 },
             )),
         );
@@ -7890,17 +7898,17 @@ impl DeskFixture {
     /// id, and filing it is the only fact the store holds.
     pub(super) fn thread_row(
         &mut self,
-        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+        parent: Option<rho_desk_client::protocol::cells::Id>,
         channel: &str,
         thread_ts: &str,
-    ) -> rho_agent_host_proto::desk::cells::Id {
-        let unit = rho_agent_host_proto::desk::cells::SlackUnit {
+    ) -> rho_desk_client::protocol::cells::Id {
+        let unit = rho_desk_client::protocol::cells::SlackUnit {
             workspace: "acme".to_owned(),
             channel: channel.to_owned(),
             thread: Some(thread_ts.to_owned()),
         };
         self.slack_units.push((unit.clone(), thread_ts.to_owned()));
-        let id = rho_agent_host_proto::desk::cells::Id::Slack(unit);
+        let id = rho_desk_client::protocol::cells::Id::Slack(unit);
         self.file(id.clone(), parent);
         id
     }
@@ -7914,8 +7922,8 @@ impl DeskFixture {
             .map(|(unit, newest)| rho_desk_client::desk::SlackSource {
                 unit: unit.clone(),
                 title: "any update?".to_owned(),
-                newest: rho_agent_host_proto::desk::cells::SlackTs(newest.clone()),
-                newest_from_other: Some(rho_agent_host_proto::desk::cells::SlackTs(newest.clone())),
+                newest: rho_desk_client::protocol::cells::SlackTs(newest.clone()),
+                newest_from_other: Some(rho_desk_client::protocol::cells::SlackTs(newest.clone())),
                 reason: Some(rho_slack::model::Attention::FollowedThread),
             })
             .collect()
@@ -7924,18 +7932,18 @@ impl DeskFixture {
     /// A registered project: a label that names a workdir. Projects live
     /// in the store rather than on the wire, so this is where a test says
     /// one exists.
-    fn project(&mut self, name: &str, url: &str) -> rho_agent_host_proto::desk::cells::Id {
+    fn project(&mut self, name: &str, url: &str) -> rho_desk_client::protocol::cells::Id {
         self.next_node += 1;
-        let id = rho_agent_host_proto::desk::cells::Id::Label(Self::uuid(self.next_node));
+        let id = rho_desk_client::protocol::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
         self.set(
             id.clone(),
-            rho_agent_host_proto::desk::cells::Property::Name(name.to_owned()),
+            rho_desk_client::protocol::cells::Property::Name(name.to_owned()),
         );
         self.set(
             id.clone(),
-            rho_agent_host_proto::desk::cells::Property::Repository(Some(
-                rho_agent_host_proto::desk::cells::Repository {
+            rho_desk_client::protocol::cells::Property::Repository(Some(
+                rho_desk_client::protocol::cells::Repository {
                     url: url.to_owned(),
                 },
             )),
@@ -7945,25 +7953,25 @@ impl DeskFixture {
 
     /// A label the user made, and the act of putting one on a row. A label
     /// is placement: the row keeps whatever parent it already had.
-    fn label(&mut self, name: &str) -> rho_agent_host_proto::desk::cells::Id {
+    fn label(&mut self, name: &str) -> rho_desk_client::protocol::cells::Id {
         self.next_node += 1;
-        let id = rho_agent_host_proto::desk::cells::Id::Label(Self::uuid(self.next_node));
+        let id = rho_desk_client::protocol::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
         self.set(
             id.clone(),
-            rho_agent_host_proto::desk::cells::Property::Name(name.to_owned()),
+            rho_desk_client::protocol::cells::Property::Name(name.to_owned()),
         );
         id
     }
 
     fn labelled(
         &mut self,
-        id: rho_agent_host_proto::desk::cells::Id,
-        label: rho_agent_host_proto::desk::cells::Id,
+        id: rho_desk_client::protocol::cells::Id,
+        label: rho_desk_client::protocol::cells::Id,
     ) {
         self.set(
             id,
-            rho_agent_host_proto::desk::cells::Property::Labeled {
+            rho_desk_client::protocol::cells::Property::Labeled {
                 label,
                 present: true,
             },
@@ -7973,10 +7981,10 @@ impl DeskFixture {
     /// An agent the user filed under a note.
     fn agent_row(
         &mut self,
-        parent: rho_agent_host_proto::desk::cells::Id,
+        parent: rho_desk_client::protocol::cells::Id,
         agent_id: AgentId,
-    ) -> rho_agent_host_proto::desk::cells::Id {
-        let id = rho_agent_host_proto::desk::cells::Id::Agent(agent_id);
+    ) -> rho_desk_client::protocol::cells::Id {
+        let id = rho_desk_client::protocol::cells::Id::Agent(agent_id);
         self.file(id.clone(), Some(parent));
         id
     }
@@ -7984,10 +7992,10 @@ impl DeskFixture {
     /// A page the user filed under a note.
     fn page_row(
         &mut self,
-        parent: rho_agent_host_proto::desk::cells::Id,
+        parent: rho_desk_client::protocol::cells::Id,
         page_id: rho_browser::PageId,
-    ) -> rho_agent_host_proto::desk::cells::Id {
-        let id = rho_agent_host_proto::desk::cells::Id::Page(rho_agent_host_proto::desk::PageId(
+    ) -> rho_desk_client::protocol::cells::Id {
+        let id = rho_desk_client::protocol::cells::Id::Page(rho_desk_client::protocol::PageId(
             *page_id.0.as_bytes(),
         ));
         self.file(id.clone(), Some(parent));
@@ -7997,21 +8005,21 @@ impl DeskFixture {
     /// The two facts a filing is: where the user put it, and when.
     fn file(
         &mut self,
-        id: rho_agent_host_proto::desk::cells::Id,
-        parent: Option<rho_agent_host_proto::desk::cells::Id>,
+        id: rho_desk_client::protocol::cells::Id,
+        parent: Option<rho_desk_client::protocol::cells::Id>,
     ) {
         self.next_node += 1;
-        let created_at = rho_agent_host_proto::desk::cells::Timestamp {
+        let created_at = rho_desk_client::protocol::cells::Timestamp {
             unix_ms: 1_600_000_000_000 + self.next_node as i64,
-            precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Millisecond,
+            precision: rho_desk_client::protocol::cells::TimestampPrecision::Millisecond,
         };
         self.set(
             id.clone(),
-            rho_agent_host_proto::desk::cells::Property::Parent(parent),
+            rho_desk_client::protocol::cells::Property::Parent(parent),
         );
         self.set(
             id,
-            rho_agent_host_proto::desk::cells::Property::CreatedAt(created_at),
+            rho_desk_client::protocol::cells::Property::CreatedAt(created_at),
         );
     }
 
@@ -8022,16 +8030,16 @@ impl DeskFixture {
     /// the root's id, and filing it under the root made the root its own
     /// parent. Every walk up the tree then ran forever, which read as the
     /// desk hanging above a certain size rather than as an id collision.
-    fn uuid(counter: u64) -> rho_agent_host_proto::desk::cells::Uuid {
+    fn uuid(counter: u64) -> rho_desk_client::protocol::cells::Uuid {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&counter.to_be_bytes());
-        rho_agent_host_proto::desk::cells::Uuid(bytes)
+        rho_desk_client::protocol::cells::Uuid(bytes)
     }
 
     pub(super) fn set(
         &mut self,
-        id: rho_agent_host_proto::desk::cells::Id,
-        property: rho_agent_host_proto::desk::cells::Property,
+        id: rho_desk_client::protocol::cells::Id,
+        property: rho_desk_client::protocol::cells::Property,
     ) {
         self.store.write(id, property).unwrap();
     }
@@ -8062,7 +8070,7 @@ impl DeskFixture {
 fn take_desk_mutation(
     workspace: &mut Workspace,
     host: HostId,
-) -> Option<rho_agent_host_proto::desk::cells::CellMutation> {
+) -> Option<rho_desk_client::protocol::cells::CellMutation> {
     workspace
         .take_desk_frames_for_test(host)
         .into_iter()
@@ -8088,7 +8096,7 @@ fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
 
     let card = |node: u64| crate::dashboard::DealCardId {
         host: HostId::default(),
-        node_id: rho_agent_host_proto::desk::cells::Id::Note(DeskFixture::uuid(node)),
+        node_id: rho_desk_client::protocol::cells::Id::Note(DeskFixture::uuid(node)),
     };
     let rows = crate::home::HomeRows {
         next: vec![crate::home::HomeRow {
@@ -8230,10 +8238,10 @@ fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mu
         .update(cx, |workspace, window, cx| {
             desk.set(
                 note.clone(),
-                rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-                    rho_agent_host_proto::desk::cells::Timestamp {
+                rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+                    rho_desk_client::protocol::cells::Timestamp {
                         unix_ms: 1_600_086_400_000,
-                        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
                     },
                 )),
             );
@@ -8323,8 +8331,8 @@ fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppCo
             assert!(
                 mutation.writes.iter().any(|write| write.id == top
                     && write.property
-                        == rho_agent_host_proto::desk::cells::Property::State(
-                            rho_agent_host_proto::desk::cells::State::Done
+                        == rho_desk_client::protocol::cells::Property::State(
+                            rho_desk_client::protocol::cells::State::Done
                         )),
                 "the row under the cursor is what closes"
             );
@@ -8419,8 +8427,8 @@ fn a_muted_agent_is_not_offered_as_a_start_target(cx: &mut TestAppContext) {
     desk.agent_row(topic, seen);
     desk.set(
         hidden_node,
-        rho_agent_host_proto::desk::cells::Property::State(
-            rho_agent_host_proto::desk::cells::State::Muted,
+        rho_desk_client::protocol::cells::Property::State(
+            rho_desk_client::protocol::cells::State::Muted,
         ),
     );
 
@@ -8477,8 +8485,8 @@ fn a_muted_agent_asking_for_the_user_is_not_a_card(cx: &mut TestAppContext) {
     desk.agent_row(topic, seen);
     desk.set(
         hidden_node,
-        rho_agent_host_proto::desk::cells::Property::State(
-            rho_agent_host_proto::desk::cells::State::Muted,
+        rho_desk_client::protocol::cells::Property::State(
+            rho_desk_client::protocol::cells::State::Muted,
         ),
     );
 
@@ -8545,10 +8553,10 @@ fn a_snoozed_agent_is_off_home_when_its_turn_runs(cx: &mut TestAppContext) {
     desk.agent_row(topic, seen);
     desk.set(
         snoozed_node,
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 4_000_000_000_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -8805,8 +8813,8 @@ fn a_muted_agent_is_off_home_even_while_its_turn_runs(cx: &mut TestAppContext) {
     // Muting an agent is a state on its node; that is the whole of it.
     desk.set(
         hidden_node,
-        rho_agent_host_proto::desk::cells::Property::State(
-            rho_agent_host_proto::desk::cells::State::Muted,
+        rho_desk_client::protocol::cells::Property::State(
+            rho_desk_client::protocol::cells::State::Muted,
         ),
     );
 
@@ -8918,7 +8926,7 @@ fn the_verdicts_open_over_an_unfiled_running_agents_home_row(cx: &mut TestAppCon
                 workspace.context_area(cx),
                 Some((
                     HostId::default(),
-                    rho_agent_host_proto::desk::cells::Id::Agent(running)
+                    rho_desk_client::protocol::cells::Id::Agent(running)
                 )),
                 "the row names the agent it watches, filed or not"
             );
@@ -9298,10 +9306,10 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
                 Some(&(HostId::default(), context.clone())),
             );
             assert!(
-                cells.contains(&rho_agent_host_proto::desk::cells::Property::Labeled {
+                cells.contains(&rho_desk_client::protocol::cells::Property::Labeled {
                     label: area.clone(),
                     present: true,
-                }) && cells.contains(&rho_agent_host_proto::desk::cells::Property::About(
+                }) && cells.contains(&rho_desk_client::protocol::cells::Property::About(
                     context.clone()
                 )),
                 "the agent wears the note's label and says what it is about: {cells:?}"
@@ -9385,7 +9393,7 @@ fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
 fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let node = desk.thread_row(None, "C1", "500.0");
-    let unit = rho_agent_host_proto::desk::cells::SlackUnit {
+    let unit = rho_desk_client::protocol::cells::SlackUnit {
         workspace: "acme".to_owned(),
         channel: "C1".to_owned(),
         thread: Some("500.0".to_owned()),
@@ -9398,8 +9406,8 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
         vec![rho_desk_client::desk::SlackSource {
             unit: unit.clone(),
             title: "any update?".to_owned(),
-            newest: rho_agent_host_proto::desk::cells::SlackTs("600.0".to_owned()),
-            newest_from_other: Some(rho_agent_host_proto::desk::cells::SlackTs(
+            newest: rho_desk_client::protocol::cells::SlackTs("600.0".to_owned()),
+            newest_from_other: Some(rho_desk_client::protocol::cells::SlackTs(
                 from_other.to_owned(),
             )),
             reason: Some(rho_slack::model::Attention::FollowedThread),
@@ -9415,9 +9423,9 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
                 HostId::default(),
                 &node,
                 rho_desk_client::desk::DeskVerdict::Defer {
-                    until: rho_agent_host_proto::desk::cells::Timestamp {
+                    until: rho_desk_client::protocol::cells::Timestamp {
                         unix_ms: 4_000_000_000_000,
-                        precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                        precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
                     },
                 },
                 window,
@@ -9657,16 +9665,15 @@ fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
                     HostId::default(),
                     &node,
                     rho_desk_client::desk::DeskVerdict::Todo {
-                        defer_until: rho_agent_host_proto::desk::cells::Timestamp {
+                        defer_until: rho_desk_client::protocol::cells::Timestamp {
                             unix_ms: 1_000,
-                            precision:
-                                rho_agent_host_proto::desk::cells::TimestampPrecision::Minute,
+                            precision: rho_desk_client::protocol::cells::TimestampPrecision::Minute,
                         },
                         pace: 3,
                     },
                 )
                 .expect("the unit has a source, so it can take a verdict");
-            let rho_agent_host_proto::desk::cells::VerdictEvent::Applied { changes, .. } = event
+            let rho_desk_client::protocol::cells::VerdictEvent::Applied { changes, .. } = event
             else {
                 panic!("a dealt verdict is applied");
             };
@@ -9822,7 +9829,7 @@ fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
 /// the place it was in.
 #[gpui::test]
 fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::desk::cells::{Id, Property};
+    use rho_desk_client::protocol::cells::{Id, Property};
 
     let mut desk = DeskFixture::new();
     let area = desk.note(None, "Verdict agent");
@@ -9995,7 +10002,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
             assert!(
                 mutation.writes.iter().any(|write| write.id == dealt
                     && write.property
-                        == rho_agent_host_proto::desk::cells::Property::Labeled {
+                        == rho_desk_client::protocol::cells::Property::Labeled {
                             label: rho.clone(),
                             present: false,
                         }),
@@ -10010,11 +10017,11 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
-            let wrote = |label: &rho_agent_host_proto::desk::cells::Id, present: bool| {
+            let wrote = |label: &rho_desk_client::protocol::cells::Id, present: bool| {
                 mutation.writes.iter().any(|write| {
                     write.id == dealt
                         && write.property
-                            == rho_agent_host_proto::desk::cells::Property::Labeled {
+                            == rho_desk_client::protocol::cells::Property::Labeled {
                                 label: label.clone(),
                                 present,
                             }
@@ -10168,7 +10175,7 @@ fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
                     .iter()
                     .any(|(path, kind, _, id)| path == "rho"
                         && *kind == "label"
-                        && matches!(id, rho_agent_host_proto::desk::cells::Id::Label(_))),
+                        && matches!(id, rho_desk_client::protocol::cells::Id::Label(_))),
                 "the label is a place to file under"
             );
             assert!(
@@ -10188,7 +10195,7 @@ fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
 /// as many labels as the user says while sitting in one place.
 #[gpui::test]
 fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::desk::cells::{Id, Property};
+    use rho_desk_client::protocol::cells::{Id, Property};
 
     let mut desk = DeskFixture::new();
     let dealt = desk.due_note(None, "Deal QA note");
@@ -10271,7 +10278,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
 /// row in between, so the path a new agent inherits is the label's own.
 #[gpui::test]
 fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::desk::cells::{Id, Property, Repository, Uuid};
+    use rho_desk_client::protocol::cells::{Id, Property, Repository, Uuid};
 
     let mut desk = DeskFixture::new();
     let label = Id::Label(Uuid([7; 16]));
@@ -10449,7 +10456,7 @@ fn find_reaches_an_unfiled_agent_by_what_the_user_said(cx: &mut TestAppContext) 
 /// live; nothing about a tab is ever written to the store.
 #[gpui::test]
 fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::desk::cells::Id;
+    use rho_desk_client::protocol::cells::Id;
 
     let page = |last: u8| {
         rho_browser::PageId(uuid::Uuid::from_bytes([
@@ -10457,7 +10464,7 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
         ]))
     };
     let desk_page =
-        |id: rho_browser::PageId| Id::Page(rho_agent_host_proto::desk::PageId(*id.0.as_bytes()));
+        |id: rho_browser::PageId| Id::Page(rho_desk_client::protocol::PageId(*id.0.as_bytes()));
     let origin = page(1);
     let burst = [page(2), page(3), page(4)];
     let alone = page(5);
@@ -10585,7 +10592,7 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
 /// dealt surface holds is never taken by a cursor sitting somewhere else.
 #[gpui::test]
 fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::desk::cells::{Id, Property};
+    use rho_desk_client::protocol::cells::{Id, Property};
 
     let page = |last: u8| {
         rho_browser::PageId(uuid::Uuid::from_bytes([
@@ -10593,7 +10600,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
         ]))
     };
     let desk_page =
-        |id: rho_browser::PageId| Id::Page(rho_agent_host_proto::desk::PageId(*id.0.as_bytes()));
+        |id: rho_browser::PageId| Id::Page(rho_desk_client::protocol::PageId(*id.0.as_bytes()));
     let origin = page(1);
     let tab = page(2);
     let announce = |id: rho_browser::PageId, opened_from: Option<rho_browser::PageId>| {
@@ -10895,14 +10902,14 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
 /// parent to write instead.
 #[test]
 fn a_new_thing_is_filed_by_its_label_and_never_by_a_parent() {
-    use rho_agent_host_proto::desk::cells::{Id, Property};
+    use rho_desk_client::protocol::cells::{Id, Property};
 
-    let label = Id::Label(rho_agent_host_proto::desk::cells::Uuid([3; 16]));
+    let label = Id::Label(rho_desk_client::protocol::cells::Uuid([3; 16]));
     assert!(matches!(
         crate::workspace::filing_property(label),
         Some(Property::Labeled { present: true, .. })
     ));
-    let note = Id::Note(rho_agent_host_proto::desk::cells::Uuid([4; 16]));
+    let note = Id::Note(rho_desk_client::protocol::cells::Uuid([4; 16]));
     assert_eq!(crate::workspace::filing_property(note), None);
 }
 
@@ -11642,11 +11649,11 @@ fn a_dealt_card_leaves_the_hand_when_the_desk_says_it_was_put_down(cx: &mut Test
 
     // The user's snooze, arriving from the store after the card went out.
     desk.set(
-        rho_agent_host_proto::desk::cells::Id::Agent(waiting),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Id::Agent(waiting),
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 4_000_000_000_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -11717,11 +11724,11 @@ fn the_verdict_menu_names_the_card_in_view(cx: &mut TestAppContext) {
             let wrote = mutation
                 .writes
                 .iter()
-                .find(|write| write.id == rho_agent_host_proto::desk::cells::Id::Agent(waiting))
+                .find(|write| write.id == rho_desk_client::protocol::cells::Id::Agent(waiting))
                 .expect("the name lands on the agent of the card in view");
             assert_eq!(
                 wrote.property,
-                rho_agent_host_proto::desk::cells::Property::Name("fix the linker".to_owned())
+                rho_desk_client::protocol::cells::Property::Name("fix the linker".to_owned())
             );
         })
         .unwrap();
@@ -11739,16 +11746,13 @@ fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppCont
     let heading = desk.note(None, "rho");
     desk.agent_row(heading, put_away);
     let label = desk.label("linker");
-    desk.labelled(
-        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
-        label,
-    );
+    desk.labelled(rho_desk_client::protocol::cells::Id::Agent(put_away), label);
     desk.set(
-        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Id::Agent(put_away),
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 4_000_000_000_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -11802,7 +11806,7 @@ fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppCont
 #[gpui::test]
 fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppContext) {
     let put_away = agent(41);
-    let held_store = rho_agent_host_proto::desk::cells::DeviceId([9; 16]);
+    let held_store = rho_desk_client::protocol::cells::DeviceId([9; 16]);
 
     // What the copy handed back: a snoozed agent, counted in a store that
     // is no longer the one answering.
@@ -11810,11 +11814,11 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
     let heading = old.note(None, "rho");
     old.agent_row(heading, put_away);
     old.set(
-        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Id::Agent(put_away),
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 4_000_000_000_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -11916,11 +11920,11 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
     let heading = desk.note(None, "rho");
     desk.agent_row(heading, put_away);
     desk.set(
-        rho_agent_host_proto::desk::cells::Id::Agent(put_away),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Id::Agent(put_away),
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 4_000_000_000_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -12032,18 +12036,18 @@ fn a_cold_open_draws_home_from_the_replica_with_no_host_reachable(cx: &mut TestA
     let note = desk.note(None, "release notes");
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::Name("release notes".into()),
+        rho_desk_client::protocol::cells::Property::Name("release notes".into()),
     );
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::PaceDays(1),
+        rho_desk_client::protocol::cells::Property::PaceDays(1),
     );
     desk.set(
         note.clone(),
-        rho_agent_host_proto::desk::cells::Property::DeferUntil(Some(
-            rho_agent_host_proto::desk::cells::Timestamp {
+        rho_desk_client::protocol::cells::Property::DeferUntil(Some(
+            rho_desk_client::protocol::cells::Timestamp {
                 unix_ms: 1_000_000_000_000,
-                precision: rho_agent_host_proto::desk::cells::TimestampPrecision::Day,
+                precision: rho_desk_client::protocol::cells::TimestampPrecision::Day,
             },
         )),
     );
@@ -12103,11 +12107,11 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
                 .desk_replica_for_test
                 .insert("local".to_owned(), desk.held());
             workspace.open_desk_from_replica(HostId::default(), window, cx);
-            let timestamp = rho_agent_host_proto::desk::TreeClock {
+            let timestamp = rho_desk_client::protocol::TreeClock {
                 value: 9,
                 replica_id: 7,
             };
-            let operation = rho_agent_host_proto::desk::TextOperation::Edit {
+            let operation = rho_desk_client::protocol::TextOperation::Edit {
                 timestamp,
                 version: Vec::new(),
                 ranges: vec![(0, 0)],
@@ -12117,7 +12121,7 @@ fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) 
                 HostId::default(),
                 note.clone(),
                 &operation,
-                &rho_agent_host_proto::desk::TextTransaction {
+                &rho_desk_client::protocol::TextTransaction {
                     id: timestamp,
                     edit_ids: vec![timestamp],
                 },

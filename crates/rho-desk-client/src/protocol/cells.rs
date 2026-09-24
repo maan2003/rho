@@ -15,7 +15,7 @@ use camino::Utf8PathBuf;
 use rho_agent_types::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::desk::PageId;
+use crate::protocol::PageId;
 
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
@@ -371,8 +371,8 @@ impl Cell {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct BodySnapshot {
     pub id: Id,
-    pub operations: Vec<crate::desk::TextOperation>,
-    pub transactions: Vec<crate::desk::TextTransaction>,
+    pub operations: Vec<crate::protocol::TextOperation>,
+    pub transactions: Vec<crate::protocol::TextTransaction>,
 }
 
 /// How much of one note's text a client holds: the highest operation
@@ -401,7 +401,7 @@ impl BodySnapshot {
     /// lacks none: a body with nothing new in it is not sent at all,
     /// which is the point — the whole desk's prose rode on every sync.
     pub fn since(&self, version: &BodyVersion) -> Option<Self> {
-        let new = |stamp: &crate::desk::TreeClock| {
+        let new = |stamp: &crate::protocol::TreeClock| {
             version
                 .get(&stamp.replica_id)
                 .is_none_or(|held| stamp.value > *held)
@@ -462,7 +462,7 @@ impl BodySnapshot {
         buffer.apply_ops(
             self.operations
                 .iter()
-                .map(crate::desk::TextOperation::to_text)
+                .map(crate::protocol::TextOperation::to_text)
                 .collect::<Result<Vec<_>, _>>()?,
         );
         if buffer.has_deferred_ops() {
@@ -1783,11 +1783,11 @@ mod tests {
                 .map(|operation| operation.timestamp())
                 .collect::<Vec<_>>(),
             vec![
-                crate::desk::TreeClock {
+                crate::protocol::TreeClock {
                     value: 2,
                     replica_id: 1
                 },
-                crate::desk::TreeClock {
+                crate::protocol::TreeClock {
                     value: 1,
                     replica_id: 7
                 }
@@ -1818,9 +1818,9 @@ mod tests {
         assert_eq!(held.operations.len(), 2);
     }
 
-    fn edit(replica_id: u16, value: u32) -> crate::desk::TextOperation {
-        crate::desk::TextOperation::Edit {
-            timestamp: crate::desk::TreeClock { value, replica_id },
+    fn edit(replica_id: u16, value: u32) -> crate::protocol::TextOperation {
+        crate::protocol::TextOperation::Edit {
+            timestamp: crate::protocol::TreeClock { value, replica_id },
             version: Vec::new(),
             ranges: vec![(0, 0)],
             new_text: vec!["x".into()],

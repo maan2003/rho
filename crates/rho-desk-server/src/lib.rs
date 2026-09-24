@@ -3,7 +3,7 @@
 //! The desk is the user's: the client makes every cell and verdict, and a
 //! host keeps a copy so that devices can sync through it. [`DeskServer`] is
 //! that copy and the streams that reach it; [`store`] is the copy on disk.
-//! The wire is `rho_agent_host_proto::desk::stream`.
+//! The wire is `rho_desk_client::protocol::stream`.
 
 pub mod store;
 
@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use rho_agent_host_proto::desk::cells::DeviceId;
-use rho_agent_host_proto::desk::stream::{ClientFrame, ServerFrame};
 use rho_db::RhoDb;
+use rho_desk_client::protocol::cells::DeviceId;
+use rho_desk_client::protocol::stream::{ClientFrame, ServerFrame};
 use rho_rpc::parts::{read_frame_optional, write_frame};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
@@ -345,7 +345,7 @@ mod tests {
     /// device id would collide in the CRDT's per-device namespace.
     #[tokio::test]
     async fn a_newer_window_takes_the_device_and_the_displaced_one_may_not_write() {
-        use rho_agent_host_proto::desk::cells::{
+        use rho_desk_client::protocol::cells::{
             CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
         };
 
@@ -430,7 +430,7 @@ mod tests {
     /// older stream with `Displaced` as its last frame.
     #[tokio::test]
     async fn a_desk_stream_syncs_pokes_and_is_displaced() {
-        use rho_agent_host_proto::desk::cells::{
+        use rho_desk_client::protocol::cells::{
             CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
         };
         use rho_rpc::parts::{read_frame, write_frame};

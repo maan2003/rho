@@ -94,8 +94,8 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desk::TreeClock;
-    use crate::desk::cells::{CellWrite, Property, Stamp, Uuid};
+    use crate::protocol::TreeClock;
+    use crate::protocol::cells::{CellWrite, Property, Stamp, Uuid};
 
     fn round_trips<
         T: senax_encoder::Packer + senax_encoder::Unpacker + PartialEq + std::fmt::Debug,

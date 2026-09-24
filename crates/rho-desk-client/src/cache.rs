@@ -27,10 +27,11 @@ use std::path::Path;
 use std::sync::mpsc;
 
 use redb::TableDefinition;
-use rho_agent_host_proto::desk::cells::{
+use rho_db::{RhoDb, Sen, SenValue};
+
+use crate::protocol::cells::{
     BodySnapshot, Cell, DeviceId, Id, PropertyKey, Snapshot, Stamp, VerdictEvent, Version,
 };
-use rho_db::{RhoDb, Sen, SenValue};
 
 /// How far this client has read a host's store, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -562,8 +563,9 @@ pub fn reset_host(host: &str) {
 
 #[cfg(test)]
 mod recorded_names {
-    use rho_agent_host_proto::desk::cells;
     use rho_db::Sen;
+
+    use crate::protocol::cells;
 
     /// redb refuses a table whose recorded value type differs from the
     /// one it is opened with, and `Sen` records the Rust path. These are
@@ -620,9 +622,8 @@ mod recorded_names {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::desk::cells::{Property, Store, Uuid};
-
     use super::*;
+    use crate::protocol::cells::{Property, Store, Uuid};
 
     /// The store the daemon in these tests answers as.
     const DAEMON: DeviceId = DeviceId([5; 16]);
@@ -665,7 +666,7 @@ mod tests {
             .expect("the note's history is held");
         assert_eq!(
             body.version(),
-            rho_agent_host_proto::desk::cells::BodyVersion::from([(1, 2)]),
+            crate::protocol::cells::BodyVersion::from([(1, 2)]),
             "both operations are there, the first one not thrown away by the second delta"
         );
     }
@@ -706,9 +707,9 @@ mod tests {
         );
     }
 
-    fn edit(replica_id: u16, value: u32) -> rho_agent_host_proto::desk::TextOperation {
-        rho_agent_host_proto::desk::TextOperation::Edit {
-            timestamp: rho_agent_host_proto::desk::TreeClock { value, replica_id },
+    fn edit(replica_id: u16, value: u32) -> crate::protocol::TextOperation {
+        crate::protocol::TextOperation::Edit {
+            timestamp: crate::protocol::TreeClock { value, replica_id },
             version: Vec::new(),
             ranges: vec![(0, 0)],
             new_text: vec!["x".into()],

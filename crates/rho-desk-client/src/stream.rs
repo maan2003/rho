@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
-use rho_agent_host_proto::desk::stream::{ClientFrame, ServerFrame};
 use rho_hosts::{Dialer, HostId, HostStream};
 use rho_rpc::parts::{read_frame, write_frame, write_open};
+
+use crate::protocol::stream::{ClientFrame, ServerFrame};
 
 /// What a host says on its desk stream.
 pub enum DeskFrame {
@@ -23,19 +24,19 @@ pub enum DeskFrame {
     Opened,
     /// The answer to `Sync`.
     Synced {
-        store: rho_agent_host_proto::desk::cells::DeviceId,
+        store: crate::protocol::cells::DeviceId,
         node_namespace: u16,
-        delta: rho_agent_host_proto::desk::cells::Snapshot,
-        bodies: Vec<rho_agent_host_proto::desk::cells::BodySnapshot>,
+        delta: crate::protocol::cells::Snapshot,
+        bodies: Vec<crate::protocol::cells::BodySnapshot>,
     },
     /// The host's copy moved; sync if `frontier` is past what is held.
     CellsAvailable {
-        frontier: rho_agent_host_proto::desk::cells::Version,
+        frontier: crate::protocol::cells::Version,
     },
     /// A body edit, from whichever device made it.
     TextApplied {
-        id: rho_agent_host_proto::desk::cells::Id,
-        operation: rho_agent_host_proto::desk::TextOperation,
+        id: crate::protocol::cells::Id,
+        operation: crate::protocol::TextOperation,
     },
     /// The stream missed some of the host's pokes; sync again.
     ResyncRequired,
@@ -129,7 +130,7 @@ impl HostStream for DeskStream {
         Box::pin(async move {
             // Interactive streams outrank calls and sessions (priority 1 and below).
             let mut socket = dialer.open(Some(50)).await?;
-            write_open(&mut socket, &rho_agent_host_proto::desk::Open).await?;
+            write_open(&mut socket, &crate::protocol::Open).await?;
             let (mut reader, mut writer) = tokio::io::split(socket);
             let mut commands = commands.lock().await;
             // Written for the last stream; the handshake after `Opened`

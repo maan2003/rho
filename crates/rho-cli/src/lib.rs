@@ -88,11 +88,10 @@ async fn run(command: Command) -> Result<()> {
 
 /// A protocol log frame, read as the part it belongs to.
 fn describe_frame(open: &rho_rpc::parts::Open, reply: Option<&[u8]>) -> String {
-    use rho_agent_host_proto::desk;
     use rho_rpc::parts::{Part, describe_as};
     match open.part {
         Part::Agents => describe_as::<agents::Open>(open, reply),
-        Part::Desk => describe_as::<desk::Open>(open, reply),
+        Part::Desk => describe_as::<rho_desk_client::protocol::Open>(open, reply),
         Part::Host => describe_as::<host::Open>(open, reply),
         Part::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
         Part::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
