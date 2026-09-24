@@ -6,7 +6,7 @@
 //! The `boundary` module answers it. Everything here is mechanism — spawning,
 //! draining, persisting, publishing — and the transcript's sole writer. The
 //! loop writes the agent's raw log and, beside it, the story a reader gets
-//! (`AGENT-LOG-DESIGN.md`), records what each response cost, and keeps the
+//! records what each response cost, and keeps the
 //! presentation sidecar fed.
 //!
 //! `specs/ARCH-rho-agent.md` has the shape and the invariants.

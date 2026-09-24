@@ -310,8 +310,8 @@ fn source_change(held: &Sources, fresh: &Sources) -> SourceChange {
     }
 }
 
-/// A thing as a view shows it: the user's facts, placed by the rules in
-/// `STORE-DESIGN.md`. Nothing here is stored; changing a rule changes the
+/// A thing as a view shows it: the user's facts, placed by the view's
+/// rules. Nothing here is stored; changing a rule changes the
 /// view and moves no cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeskNode {

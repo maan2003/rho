@@ -6968,9 +6968,7 @@ fn q_on_home_is_a_no_op(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// The key table in `SLACK-DESIGN.md`, one assertion per row. A key that
-/// stops being bound is a documentation bug as much as a behaviour one, so
-/// this is the test that fails when the two drift apart.
+/// The Slack key table, one assertion per row.
 #[gpui::test]
 fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};

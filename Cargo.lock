@@ -12995,9 +12995,7 @@ dependencies = [
  "dirs",
  "libc",
  "rho-agent-types",
- "rho-git-client",
- "rho-git-proto",
- "rho-git-server",
+ "rho-git",
  "senax-encoder",
  "serde_json",
  "tempfile",
@@ -13005,26 +13003,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-git-client"
+name = "rho-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rho-git-proto",
- "rho-git-server",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "rho-git-proto"
-version = "0.1.0"
-
-[[package]]
-name = "rho-git-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rho-git-proto",
  "tempfile",
  "tokio",
 ]
@@ -13421,18 +13403,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "rho-touch-keyboard"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "js-sys",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]

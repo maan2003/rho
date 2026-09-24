@@ -562,7 +562,7 @@ impl Mirror {
     /// words. The other half of the same question is Slack's read mark, and
     /// what has been dealt with is the later of the two; this is the half
     /// that is rho's to keep, so it lives here beside the other rather than
-    /// in the store. `SLACK-DESIGN.md`, "How a Slack unit sits in rho".
+    /// in the store.
     pub fn handled(&self, scope: &Scope) -> Option<Ts> {
         match self.cursor(&format!("{}handled", scope.prefix())) {
             Some(StoredCursor::Stamp(ts)) => Some(Ts(ts)),

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{GitDaemon, git, patched_git, push_commit, setup_remote};
-use rho_git_proto::SOCKET_ENV;
-use rho_git_server::{MirrorStore, Refresh};
+use rho_git::protocol::SOCKET_ENV;
+use rho_git::server::{MirrorStore, Refresh};
 
 fn rho_git(cwd: &Path, socket: Option<&Path>, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(patched_git());

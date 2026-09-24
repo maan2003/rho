@@ -365,7 +365,7 @@ fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     if registry.exists() {
         symlink(registry, etc.join("nix/registry.json"))?;
     }
-    // Git's behaviour (VIEW.md 6); identity is environment.
+    // Git's behaviour; identity is environment.
     fs::write(
         etc.join("gitconfig"),
         "[core]\n\tpager = cat\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n",

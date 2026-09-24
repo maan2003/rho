@@ -2,7 +2,7 @@
 //!
 //! The viewport itself, and the stack of where the reader has been in it,
 //! is `rho_window::history::History` over these keys: one machine, held
-//! once per context (`RHO-WINDOW-DESIGN.md`).
+//! once per context.
 
 use camino::Utf8PathBuf;
 use rho_agent_types::AgentId;

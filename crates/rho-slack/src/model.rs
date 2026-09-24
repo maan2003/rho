@@ -384,7 +384,6 @@ pub struct Model {
     /// words. Slack's read mark says the same thing in Slack's, and what
     /// has been dealt with is the later of the two: reading on the phone
     /// counts, and so does pressing `d` here with the phone switched off.
-    /// `SLACK-DESIGN.md`, "How a Slack unit sits in rho".
     handled: BTreeMap<Unit, Ts>,
     /// The cursor moves this run that are not on disk yet. The session
     /// drains it and writes the rows; the model touches no file.

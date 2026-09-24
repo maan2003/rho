@@ -114,8 +114,8 @@ pub struct Timestamp {
     pub precision: TimestampPrecision,
 }
 
-/// A position in one agent's story: what the log calls the same thing
-/// (`AGENT-LOG-DESIGN.md`). Held here so a verdict on an agent can say how
+/// A position in one agent's story: what the log calls the same thing.
+/// Held here so a verdict on an agent can say how
 /// far it went without this crate knowing what a story event is.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
@@ -584,8 +584,7 @@ pub fn verdict_changes(
     // That cursor is not a cell any more (8 Sep). Where the reader is done
     // in a unit is rho's own half of a join with Slack's read mark, and
     // both halves live in the Slack mirror; the store keeps what the mirror
-    // cannot say, which is a mute and a snooze. `SLACK-DESIGN.md`, "How a
-    // Slack unit sits in rho".
+    // cannot say, which is a mute and a snooze.
     if let Id::Slack(_) = id {
         return match verdict {
             // Nothing in the store: done on a Slack unit is the mirror's
@@ -598,7 +597,7 @@ pub fn verdict_changes(
             // muted there, which is the word Slack has for it. Both are
             // the caller's to send, and neither is a cell -- rho kept a
             // private copy that drifted the moment the user muted or
-            // unmuted anywhere else. `SLACK-DESIGN.md`, "Mute is Slack's".
+            // unmuted anywhere else.
             Verdict::Mute => Err("a Slack unit's mute is Slack's, not a cell".to_owned()),
             // The cursor stays where it is, so the messages the user has
             // not handled are still theirs when the snooze ends. The
@@ -606,8 +605,7 @@ pub fn verdict_changes(
             // the unit stood when the user looked away was written for a
             // rule nobody ever built, and writing it needed the mirror's
             // newest message, so a snooze was refused outright when the
-            // caller had none. `SLACK-DESIGN.md`, "The unit nodes already
-            // in the store".
+            // caller had none.
             Verdict::Defer { until } => Ok(vec![
                 change(Property::DeferUntil(Some(*until))),
                 change(Property::PaceDays(0)),

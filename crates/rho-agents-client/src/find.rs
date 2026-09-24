@@ -16,7 +16,7 @@ use crate::map::AgentMap;
 /// This is a hit, not a card. A card claims the reader's attention and
 /// carries a reason for doing so; a hit only answers what was asked. When
 /// a card's reason becomes a type of its own, a hit gains one too — the
-/// same type, in its own place (`GUI-CRATES-DESIGN.md`).
+/// same type, in its own place.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentHit {
     pub agent_id: AgentId,

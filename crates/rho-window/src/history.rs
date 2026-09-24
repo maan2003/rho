@@ -11,7 +11,7 @@
 //! came from, because the reader came from there and a way back that stops
 //! at a boundary they never noticed crossing is not a way back.
 //! (Superseded: an earlier ruling made history per context and this machine
-//! a stack. The user overruled it. `RHO-WINDOW-DESIGN.md` says so at length.)
+//! a stack. The user overruled it.)
 //!
 //! Back restores the point by *keeping* the surface, not by replaying a line
 //! and a column: whatever the caller stores in an entry — an editor, a view,
@@ -42,7 +42,7 @@
 //! workspace history did: it appends at the end and moves the cursor there,
 //! leaving what was ahead of the reader behind them, reachable by going
 //! back. It does not truncate. That is a deliberate restoration, not an
-//! invention — see `RHO-WINDOW-DESIGN.md`.
+//! invention.
 
 use std::collections::HashMap;
 use std::hash::Hash;

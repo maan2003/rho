@@ -19,12 +19,10 @@ members = [
   "crates/rho-desktop-proto",
   "crates/rho-desktop-media",
   "crates/rho-db",
-  "crates/rho-fake-model",
+  "agent-host/rho-fake-model",
   "crates/rho-fake-slack",
   "crates/rho-files",
-  "agent-host/rho-git/client",
-  "agent-host/rho-git/proto",
-  "agent-host/rho-git/server",
+  "agent-host/rho-git",
   "crates/rho-gui",
   "crates/rho-agent-hosts",
   "agent-host/rho-image",
@@ -50,7 +48,6 @@ members = [
   "agent-host/rho-devshell-daemon",
   "agent-host/rho-watch",
   "crates/rho-transcript",
-  "crates/rho-touch-keyboard",
   "crates/rho-agent-types",
   "crates/rho-window",
   "agent-host/rho-visualizations",
@@ -72,7 +69,6 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MPL-2.0"
-readme = "README.md"
 repository = "https://github.com/maan2003/rho"
 rust-version = "1.89"
 version = "0.1.0"
@@ -135,12 +131,10 @@ rho-cli = { path = "agent-host/rho-cli" }
 rho-context-config = { path = "agent-host/rho-context-config" }
 rho-agent-host = { path = "agent-host/rho-agent-host" }
 rho-db = { path = "crates/rho-db" }
-rho-fake-model = { path = "crates/rho-fake-model" }
+rho-fake-model = { path = "agent-host/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
-rho-git-client = { path = "agent-host/rho-git/client" }
-rho-git-proto = { path = "agent-host/rho-git/proto" }
-rho-git-server = { path = "agent-host/rho-git/server" }
+rho-git = { path = "agent-host/rho-git" }
 rho-image = { path = "agent-host/rho-image" }
 rho-inference = { path = "agent-host/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }

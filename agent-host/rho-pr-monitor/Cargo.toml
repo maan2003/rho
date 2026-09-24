@@ -3,7 +3,6 @@ name = "rho-pr-monitor"
 description = "Durable GitHub pull-request monitoring and Engineer wakeups for Rho"
 edition.workspace = true
 license.workspace = true
-readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

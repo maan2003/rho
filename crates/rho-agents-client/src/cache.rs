@@ -21,7 +21,7 @@ use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
 use rho_agent_types::{AgentId, AgentPos, Seq};
-use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
+use rho_db::{RhoDb, Sen, SenValue};
 
 use crate::protocol::transcript::{LogEntry, TranscriptEvent};
 use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
@@ -61,21 +61,9 @@ const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
 /// has it again.
-const VERDICTS: TableDefinition<AgentId, SenAs<Verdict, VerdictName>> =
+const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
     TableDefinition::new("gui_agent_verdict_v1");
 
-/// The name this table was written under, from before `Verdict` moved
-/// with the registry into `rho-agents`. redb records the Rust path of a
-/// value type and refuses a database whose table says another one, so a
-/// crate that is renamed takes every user's mirror with it unless the
-/// name is pinned here. What is on disk is unchanged; only the path in
-/// the type's name moved.
-#[derive(Debug)]
-struct VerdictName;
-
-impl RecordedTypeName for VerdictName {
-    const NAME: &'static str = "rho-db::Sen<rho_registry::fold::Verdict>";
-}
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
 const RETIRED_TABLES: [&str; 19] = [
@@ -618,39 +606,6 @@ pub fn flush() {
 }
 
 #[cfg(test)]
-mod recorded_names {
-    use rho_db::Sen;
-
-    use crate::protocol::transcript::TranscriptEvent;
-
-    /// redb refuses a table whose recorded value type differs from the
-    /// one it is opened with, and `Sen` records the Rust path. These are
-    /// the paths the agent host's and every client's transcript tables were
-    /// written under; a type that moves has to keep recording its old one.
-    #[test]
-    fn stored_types_keep_the_names_their_tables_recorded() {
-        fn name<T>() -> String
-        where
-            Sen<T>: redb::Value,
-        {
-            <Sen<T> as redb::Value>::type_name().name().to_owned()
-        }
-        assert_eq!(
-            name::<TranscriptEvent>(),
-            "rho-db::Sen<rho_ui_proto::mirror::MirrorEvent>"
-        );
-        assert_eq!(
-            name::<super::StoredHost>(),
-            "rho-db::Sen<rho_mirror::mirror::StoredHost>"
-        );
-        assert_eq!(
-            name::<super::AgentSnapshot>(),
-            "rho-db::Sen<rho_mirror::mirror::AgentSnapshot>"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use rho_agent_types::{TurnEdge, TurnOutcome};
 
@@ -809,83 +764,6 @@ mod tests {
         assert!(mirror.read_events(gone).is_empty());
     }
 
-    /// A mirror written before `StoredHost` and `AgentSnapshot` left
-    /// rho-gui opens, and the rows the agent host can send again are the
-    /// only ones thrown away.
-    ///
-    /// The old names are spelled out rather than referenced so that
-    /// renaming anything in the code cannot rename what this checks
-    /// against. A verdict written under its pin stands beside the
-    /// emptiness: without it this test would pass on a mirror that
-    /// dropped every table it has.
-    #[test]
-    fn a_mirror_written_before_its_types_moved_crates_still_opens() {
-        #[derive(Debug)]
-        struct HostAsWrittenInRhoGui;
-
-        impl RecordedTypeName for HostAsWrittenInRhoGui {
-            const NAME: &'static str = "rho-db::Sen<rho_gui::mirror::StoredHost>";
-        }
-
-        #[derive(Debug)]
-        struct SnapshotAsWrittenInRhoGui;
-
-        impl RecordedTypeName for SnapshotAsWrittenInRhoGui {
-            const NAME: &'static str = "rho-db::Sen<rho_gui::mirror::AgentSnapshot>";
-        }
-
-        const OLD_HOSTS: TableDefinition<&str, SenAs<StoredHost, HostAsWrittenInRhoGui>> =
-            TableDefinition::new("gui_mirror_host_v2");
-        const OLD_DIGESTS: TableDefinition<
-            AgentId,
-            SenAs<AgentSnapshot, SnapshotAsWrittenInRhoGui>,
-        > = TableDefinition::new("gui_agent_digest_v1");
-
-        let dir = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(rho_db::client::path(dir.path()));
-        let verdict = Verdict {
-            handled_through: AgentPos(7),
-            muted: true,
-        };
-        futures::executor::block_on(async {
-            let mut write = db.write().await;
-            let host = StoredHost {
-                machine_seed: 3,
-                seq: Seq(11),
-            };
-            write
-                .open_table(OLD_HOSTS)
-                .insert("desk", SenValue::borrowed(&host));
-            write
-                .open_table(VERDICTS)
-                .insert(agent_id(1), SenValue::borrowed(&verdict));
-            // Opened so the file records its old type too; a digest
-            // without a host is not loaded, so the row itself would not
-            // be seen either way.
-            write.open_table(OLD_DIGESTS);
-            write.commit();
-        });
-        drop(db);
-
-        // The panic this reproduces was inside `open`, before anything a
-        // caller could catch, so the assertion is that it returns at all.
-        let mirror = Mirror::open(dir.path()).expect("open a mirror an older build wrote");
-        let loaded = mirror.load();
-        assert!(
-            loaded.hosts.is_empty(),
-            "the cursor was kept though its table was rebuilt, so the \
-             client would ask only for what came after rows it no longer \
-             has: {:?}",
-            loaded.hosts
-        );
-        let kept = mirror.db.read().open_table(VERDICTS);
-        assert_eq!(
-            kept.get(&agent_id(1)).map(|held| held.value().into_owned()),
-            Some(verdict),
-            "the user's verdict went with the tables the agent host can \
-             replace; nothing else holds it"
-        );
-    }
     #[test]
     fn canonical_history_retires_all_old_projections_but_keeps_user_verdicts() {
         const OLD_HOSTS: TableDefinition<&str, Sen<StoredHost>> =

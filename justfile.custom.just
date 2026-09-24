@@ -24,7 +24,7 @@ check-split:
   set -euo pipefail
   gui='^(gpui|rho-gui|rho-window|rho-slack|rho-transcript|rho-agents-view|rho-journal|rho-browser|rho-browser-wayland) |^rho-[a-z-]+ feature "client"'
   status=0
-  for manifest in agent-host/*/Cargo.toml agent-host/rho-git/*/Cargo.toml; do
+  for manifest in agent-host/*/Cargo.toml; do
     package=$(sed -n 's/^name = "\(.*\)"$/\1/p' "$manifest" | head -n1)
     leaks=$(cargo tree -p "$package" -e normal,features --prefix none \
       --config 'resolver.feature-unification="package"' -Zfeature-unification \

@@ -2,8 +2,7 @@
 //!
 //! One log per agent (`agent_log`), dense positions from zero; one journal
 //! (`journal`) naming every append in the order it landed. Nothing derived
-//! is stored: what an agent is now is folded from its log on read
-//! (`AGENT-LOG-DESIGN.md`, "the mirror is a pure function of the raw log").
+//! is stored: what an agent is now is folded from its log on read.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

@@ -10,7 +10,7 @@
 //! real remote URL, so `git remote -v`, `git push` and any tooling see
 //! exactly what a plain clone would. What differs is only where the bytes
 //! come from: objects are borrowed from the mirror through
-//! `objects/info/alternates` (`CLONES.md`).
+//! `objects/info/alternates`.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context as _;
-pub use rho_git_proto as proto;
 
 /// The real git executable.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -19,8 +19,6 @@ plus the plumbing around the host.
 - A change to any protocol's messages changes the wire; bump the epoch
   in `rho_rpc::protocol`. Packed structs carry a hash of their field
   names and types, so a rename changes the wire too.
-- Stored types record their Rust path in rho-db. A type that moves or
-  whose crate is renamed needs an entry in rho-db's `MOVED`.
 
 ## Security
 

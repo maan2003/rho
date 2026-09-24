@@ -187,149 +187,42 @@ where
         bytes
     }
 
+    /// `T`'s name without module paths, so a type can move between
+    /// modules and crates without its tables refusing to open.
     fn type_name() -> TypeName {
-        TypeName::new(&format!("rho-db::Sen<{}>", recorded_path::<T>()))
+        TypeName::new(&format!(
+            "rho-db::Sen<{}>",
+            short_type_name(std::any::type_name::<T>())
+        ))
     }
 }
 
-/// Stored types that moved, by their path now and the path their tables
-/// recorded. redb refuses a table whose recorded type differs from the one
-/// it is opened with, so a type keeps answering to its old name.
-const MOVED: &[(&str, &str)] = &[
-    (
-        "rho_desk_client::protocol::cells::Cell",
-        "rho_desk::cells::Cell",
-    ),
-    (
-        "rho_desk_client::protocol::cells::VerdictEvent",
-        "rho_desk::cells::VerdictEvent",
-    ),
-    (
-        "rho_desk_client::protocol::cells::Id",
-        "rho_desk::cells::Id",
-    ),
-    (
-        "rho_desk_client::protocol::cells::BodySnapshot",
-        "rho_desk::cells::BodySnapshot",
-    ),
-    (
-        "rho_desk_client::protocol::cells::Stamp",
-        "rho_desk::cells::Stamp",
-    ),
-    (
-        "rho_desk_client::protocol::cells::CellMutation",
-        "rho_desk::cells::CellMutation",
-    ),
-    (
-        "rho_desk_client::protocol::cells::DeviceId",
-        "rho_desk::cells::DeviceId",
-    ),
-    (
-        "rho_agents_client::protocol::transcript::TranscriptEvent",
-        "rho_ui_proto::mirror::MirrorEvent",
-    ),
-    (
-        "rho_desk_client::cache::StoredDeskHost",
-        "rho_mirror::desk::StoredDeskHost",
-    ),
-    (
-        "rho_desk_client::cache::CellKey",
-        "rho_mirror::desk::CellKey",
-    ),
-    (
-        "rho_desk_client::cache::VerdictKey",
-        "rho_mirror::desk::VerdictKey",
-    ),
-    (
-        "rho_desk_client::cache::BodyKey",
-        "rho_mirror::desk::BodyKey",
-    ),
-    (
-        "rho_agents_client::cache::StoredHost",
-        "rho_mirror::mirror::StoredHost",
-    ),
-    (
-        "rho_agents_client::cache::AgentSnapshot",
-        "rho_mirror::mirror::AgentSnapshot",
-    ),
-    (
-        "rho_agent_hosts::saved::SavedHosts",
-        "rho_hosts::saved::SavedHosts",
-    ),
-];
-
-fn recorded_path<T>() -> &'static str {
-    let path = std::any::type_name::<T>();
-    MOVED
-        .iter()
-        .find(|(now, _)| *now == path)
-        .map_or(path, |(_, then)| then)
+/// `path` with every module path dropped: `alloc::vec::Vec<a::b::C>`
+/// becomes `Vec<C>`.
+fn short_type_name(path: &str) -> String {
+    let mut short = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(start) = rest.find(|c: char| c.is_alphanumeric() || c == '_') {
+        short.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        match rest[end..].strip_prefix("::") {
+            Some(after) => rest = after,
+            None => {
+                short.push_str(&rest[..end]);
+                rest = &rest[end..];
+            }
+        }
+    }
+    short.push_str(rest);
+    short
 }
 
 impl<T> redb::Key for Sen<T>
 where
     T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
-{
-    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
-        data1.cmp(data2)
-    }
-}
-
-/// The name redb recorded for a table's key or value type. A migration
-/// reads rows the old code wrote, and redb checks the name the table was
-/// created with, so the reader has to answer to a name its own types no
-/// longer have.
-pub trait RecordedTypeName {
-    const NAME: &'static str;
-}
-
-/// A [`Sen`] that answers to a recorded name rather than to `T`'s own. It
-/// encodes and decodes exactly as `Sen<T>` does; only the name differs.
-#[derive(Debug)]
-pub struct SenAs<T, N>(std::marker::PhantomData<(T, N)>);
-
-impl<T, N> redb::Value for SenAs<T, N>
-where
-    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
-    N: RecordedTypeName + Debug,
-{
-    type SelfType<'a>
-        = SenValue<'a, T>
-    where
-        Self: 'a;
-
-    type AsBytes<'a>
-        = BytesMut
-    where
-        Self: 'a;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-    where
-        Self: 'a,
-    {
-        <Sen<T> as redb::Value>::from_bytes(data)
-    }
-
-    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-    where
-        Self: 'b,
-    {
-        <Sen<T> as redb::Value>::as_bytes(value)
-    }
-
-    fn type_name() -> TypeName {
-        TypeName::new(N::NAME)
-    }
-}
-
-impl<T, N> redb::Key for SenAs<T, N>
-where
-    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
-    N: RecordedTypeName + Debug,
 {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
         data1.cmp(data2)
@@ -639,10 +532,8 @@ impl WriteTxn {
     }
 
     /// Opens a table, or `None` if the file records it under other
-    /// key/value types. redb writes the Rust path of a value type into
-    /// the table, so a type that moves between crates makes every
-    /// database written before the move unopenable; a caller that can
-    /// rebuild the table would rather be told than panicked at.
+    /// key/value types; a caller that can rebuild the table would rather
+    /// be told than panicked at.
     pub fn try_open_table<K, V>(
         &mut self,
         definition: TableDefinition<K, V>,
@@ -801,6 +692,22 @@ mod tests {
         name: String,
         #[senax(default)]
         tags: Vec<String>,
+    }
+
+    #[test]
+    fn sen_records_names_without_module_paths() {
+        assert_eq!(
+            <Sen<TestRecord> as redb::Value>::type_name().name(),
+            "rho-db::Sen<TestRecord>"
+        );
+        assert_eq!(
+            <Sen<Vec<Option<TestKey>>> as redb::Value>::type_name().name(),
+            "rho-db::Sen<Vec<Option<TestKey>>>"
+        );
+        assert_eq!(
+            short_type_name("(a::B, alloc::vec::Vec<c_d::e::F<u8>>, [x::Y; 2])"),
+            "(B, Vec<F<u8>>, [Y; 2])"
+        );
     }
 
     #[tokio::test]

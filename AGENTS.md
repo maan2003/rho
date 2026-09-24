@@ -35,8 +35,6 @@ inbound world, like Slack. The GUI is the product.
 
 - Docs say why; the code says what. Rules that must hold are Linked
   Specs next to the code they govern (`linked-specs` skill).
-- `ARCHITECTURE.md` and `SECURITY.md` are being broken down into specs
-  and crate docs. Treat them as history, not as rules.
 - Vendored subtrees (`vendor/*`, `crates/senax-encoder`) are first-class
   code: fix things where they belong (`git-subtree` skill). Plain `rg`
   skips `vendor/`; name the path to search it.

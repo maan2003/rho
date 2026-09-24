@@ -1,8 +1,8 @@
 //! The mirror keeper: one bare git mirror per remote URL under a root,
-//! fetched on request, served over a unix socket. The agent host runs it in-process
-//! and is the root's only writer; everything else — the agent host's own
-//! clones and the `git` wrapper agents run — is a client that reads a
-//! mirror and never touches the network (`CLONES.md`).
+//! fetched on request, served over a unix socket. The agent host runs it
+//! in-process and is the root's only writer; everything else — the agent host's
+//! own clones and the `git` wrapper agents run — is a client that reads a
+//! mirror and never touches the network.
 //!
 //! Layout under the root, one directory per remote URL (`store_key`):
 //!
@@ -28,9 +28,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use rho_git_proto::{Request, Response, store_key};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixListener;
+
+use crate::protocol::{Request, Response, store_key};
 
 /// How the keeper serves a mirror: one fetched within `debounce` is
 /// served as is, so concurrent and back-to-back requests share a fetch.

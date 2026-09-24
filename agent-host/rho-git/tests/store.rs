@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{git, push_commit, setup_remote};
-use rho_git_proto::{Request, Response};
-use rho_git_server::{MirrorStore, Refresh};
+use rho_git::protocol::{Request, Response};
+use rho_git::server::{MirrorStore, Refresh};
 
 fn store(root: &std::path::Path, debounce: Duration) -> Arc<MirrorStore> {
     MirrorStore::new(root, "git", Vec::new(), Refresh { debounce })

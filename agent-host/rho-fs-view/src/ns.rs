@@ -393,8 +393,8 @@ impl Namespace {
         command.env_clear();
         match &self.mode {
             Mode::View { .. } => {
-                // The agent's own nix profile first, then the base userland
-                // (VIEW.md). Nothing of the host's PATH.
+                // The agent's own nix profile first, then the base userland.
+                // Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
                 // Passed through from the user: the terminal and the timezone.
                 for name in ["TERM", "TZ"] {
@@ -402,7 +402,7 @@ impl Namespace {
                         command.env(name, value);
                     }
                 }
-                // Ahead of a flake dev shell's own PATH (VIEW.md 3): the
+                // Ahead of a flake dev shell's own PATH: the
                 // find fork, then cargo-installed binaries.
                 let cargo_bin = format!("{home}/.cache/cargo/bin");
                 command.env(
@@ -412,8 +412,8 @@ impl Namespace {
                         None => cargo_bin,
                     },
                 );
-                // For the base's `nix develop` (VIEW.md 3): the builder,
-                // and the daemon's shell cache it asks first.
+                // For the base's `nix develop`: the builder,
+                // and the agent host's shell cache it asks first.
                 command.env("RHO_DEVSHELL_BUILDER", crate::devshell_builder());
                 command.env("RHO_DEVSHELL_DIR", &self.devshell_cache);
                 command
@@ -455,7 +455,7 @@ impl Namespace {
                 }
             }
         }
-        // The cargo ahead of a dev shell's own (VIEW.md 3).
+        // The cargo ahead of a dev shell's own.
         if let Some(cargo) = crate::SHARED_CARGO_BIN {
             command.env("RHO_DEVSHELL_CARGO", cargo);
         }

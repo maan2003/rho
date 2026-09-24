@@ -1,7 +1,7 @@
 //! The transient buffer: a menu that opens under the point, takes one key,
 //! and closes.
 //!
-//! Magit's transient, held to the ruling in `RHO-WINDOW-DESIGN.md`. A menu is
+//! Magit's transient. A menu is
 //! a title and rows of key and meaning; it is drawn at the bottom of the
 //! window, in the editor's own text style, the way Magit's sits at the bottom
 //! of the frame. The buffer above it is not reflowed and the point does not
