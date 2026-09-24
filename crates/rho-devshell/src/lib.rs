@@ -2,12 +2,14 @@
 //! how an evaluated shell is found again.
 //!
 //! One [`Resolver`] per workset process serves every agent's commands,
-//! terminals and sidecars. Shells are cached by the daemon ([`Cache`]) under
-//! a key that every valid entry for a flake shares (see [`Flake::key`]);
-//! entries record what evaluation read, and are checked here, in the
-//! workset's filesystem namespace, where those paths mean what they meant to
-//! the evaluator. A miss runs `rho-devshell-builder`, which evaluates with
-//! libnix in its own process.
+//! terminals and sidecars; `rho-devshell-builder shell` runs one for a
+//! `nix develop` in a view. Shells are cached by the daemon ([`Client`])
+//! under a key that every valid entry for a flake shares (see
+//! [`Flake::key`]); entries record what evaluation read, and are checked
+//! here, in the caller's filesystem namespace, where those paths mean what
+//! they meant to the evaluator. A miss runs `rho-devshell-builder eval`,
+//! which evaluates with libnix in its own process. With a watcher, a
+//! resolved shell is kept until something it was built from changes.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -20,9 +22,11 @@ use devenv_core::ObservedKind;
 use devenv_core::build_environment::BuildEnvironment;
 use devenv_eval_cache::eval_inputs::Uncached;
 use devenv_eval_cache::{Checkout, FlakeScheme, Input};
-use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
+
+pub mod protocol;
+pub use protocol::Client;
 
 /// Changes whenever evaluation semantics change (evaluator, Nix fork
 /// patches), so shells of an older evaluator are never found.
@@ -133,7 +137,7 @@ impl Flake {
     }
 }
 
-/// What `rho-devshell-builder shell` reports: the shell, and what its
+/// What `rho-devshell-builder eval` reports: the shell, and what its
 /// evaluation read, if that could be recorded.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Evaluated {
@@ -145,22 +149,11 @@ pub struct Evaluated {
 
 /// A cached shell as the daemon holds it: `data` is an [`Evaluated`] the
 /// daemon does not interpret.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct Candidate {
     pub id: u64,
     pub env_store_path: String,
     pub data: Vec<u8>,
-}
-
-/// The daemon's shell cache. Entries of a key come newest first; `used`
-/// marks one as in use and says whether its environment is still pinned,
-/// and the caller pins it otherwise.
-pub trait Cache: Send + Sync + 'static {
-    fn lookup(&self, key: String) -> BoxFuture<'static, Result<Vec<Candidate>>>;
-    fn used(&self, id: u64) -> BoxFuture<'static, Result<bool>>;
-    fn store(&self, key: String, env_store_path: String, data: Vec<u8>) -> BoxFuture<'static, Result<u64>>;
-    /// The entry's environment is gone.
-    fn forget(&self, id: u64) -> BoxFuture<'static, Result<()>>;
 }
 
 /// The GC root pinning `env_store_path` in the directory of roots. One per
@@ -190,9 +183,6 @@ pub struct Resolved {
     /// The cache entry, if the shell could be cached.
     pub id: Option<u64>,
     pub env_store_path: String,
-    /// Bash applying the shell to the caller's environment, `shellHook`
-    /// included, then rho's `PATH` policy.
-    pub activation: PathBuf,
     pub watch: Watch,
 }
 
@@ -209,11 +199,22 @@ pub struct Watch {
 }
 
 impl Watch {
+    fn subscribe(&self, watcher: &rho_watch::Watcher) -> io::Result<rho_watch::Subscription> {
+        watcher.watch(
+            self.contents.iter().map(PathBuf::as_path),
+            self.names.iter().map(PathBuf::as_path),
+        )
+    }
+}
+
+impl Watch {
     fn new(flake: &Flake, inputs: &[Input]) -> Self {
         let source = &flake.source;
         let mut watch = Self::default();
         watch.contents.insert(flake.dir.join("flake.nix"));
         watch.contents.insert(flake.dir.join("flake.lock"));
+        // Whether the flake is fetched from git.
+        watch.names.insert(source.root.join(".git"));
         let absolute = |rel: &Path| {
             if rel.as_os_str().is_empty() { source.root.clone() } else { source.root.join(rel) }
         };
@@ -286,17 +287,26 @@ fn valid(source: &Source, candidates: Vec<Candidate>) -> Result<Vec<(Candidate, 
             continue;
         };
         let Some(inputs) = &evaluated.inputs else { continue };
-        let holds = inputs.iter().all(|input| {
-            now.entry(input.identity())
-                .or_insert_with(|| input.recapture(&checkout, &mut Uncached).ok())
-                .as_ref()
-                == Some(input)
-        });
-        if holds {
+        if holds(&checkout, &mut now, inputs) {
             valid.push((candidate, evaluated));
         }
     }
     Ok(valid)
+}
+
+/// Whether every input observes now as it was recorded, remembering what
+/// was observed in `now`.
+fn holds(
+    checkout: &Checkout,
+    now: &mut HashMap<devenv_eval_cache::eval_inputs::InputIdentity, Option<Input>>,
+    inputs: &[Input],
+) -> bool {
+    inputs.iter().all(|input| {
+        now.entry(input.identity())
+            .or_insert_with(|| input.recapture(checkout, &mut Uncached).ok())
+            .as_ref()
+            == Some(input)
+    })
 }
 
 /// Bash applying the environment at `env_store_path` (the JSON Nix's
@@ -333,9 +343,9 @@ fi
 export PATH
 "#;
 
-/// Finds, pins or evaluates dev shells for one workset process.
+/// Finds, pins or evaluates dev shells for one process.
 pub struct Resolver {
-    cache: Option<Arc<dyn Cache>>,
+    cache: Option<Client>,
     /// The shared cache directory: GC roots and activation scripts. Bound
     /// at its host path in views, where the Nix daemon resolves the roots.
     dir: PathBuf,
@@ -344,6 +354,13 @@ pub struct Resolver {
     environment: Vec<(OsString, OsString)>,
     /// One resolution per key at a time; the rest find its result.
     keys: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    hot: Option<Hot>,
+}
+
+/// Shells resolved before, each until something it was built from changes.
+struct Hot {
+    watcher: rho_watch::Watcher,
+    shells: Mutex<HashMap<(PathBuf, String), (Resolved, rho_watch::Subscription)>>,
 }
 
 static RESOLVER: OnceLock<Arc<Resolver>> = OnceLock::new();
@@ -353,17 +370,15 @@ pub fn install(resolver: Resolver) {
     let _ = RESOLVER.set(Arc::new(resolver));
 }
 
-/// This process's resolver: the installed one, else one without a cache
-/// that evaluates every time.
+/// This process's resolver: the installed one, else one for a process in a
+/// view, with the daemon's cache at `$RHO_DEVSHELL_DIR` if that is set.
 pub fn resolver() -> Arc<Resolver> {
     RESOLVER
         .get_or_init(|| {
-            let base = std::env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
+            let dir = std::env::var_os("RHO_DEVSHELL_DIR").map(PathBuf::from);
             Arc::new(Resolver::new(
-                None,
-                base.join("rho/devshell"),
+                dir.as_deref().map(Client::new),
+                dir.unwrap_or_default(),
                 rho_fs_view::devshell_builder(),
                 std::env::vars_os().collect(),
             ))
@@ -382,13 +397,20 @@ pub async fn command(cwd: &Path, program: impl AsRef<std::ffi::OsStr>) -> tokio:
     };
     let activation = match flake {
         None => None,
-        Some(dir) => match resolver().resolve(&Flake::new(dir, "default")).await {
-            Ok((resolved, _)) => Some(resolved.activation),
-            Err(e) => {
-                eprintln!("rho: dev shell unavailable, running without it: {e:#}");
-                None
+        Some(dir) => {
+            let resolver = resolver();
+            let activation = async {
+                let (resolved, _) = resolver.resolve(&Flake::new(dir, "default")).await?;
+                resolver.activation(&resolved.env_store_path).await
+            };
+            match activation.await {
+                Ok(activation) => Some(activation),
+                Err(e) => {
+                    eprintln!("rho: dev shell unavailable, running without it: {e:#}");
+                    None
+                }
             }
-        },
+        }
     };
     match activation {
         None => tokio::process::Command::new(program),
@@ -404,24 +426,35 @@ pub async fn command(cwd: &Path, program: impl AsRef<std::ffi::OsStr>) -> tokio:
 }
 
 impl Resolver {
-    pub fn new(
-        cache: Option<Arc<dyn Cache>>,
-        dir: PathBuf,
-        builder: PathBuf,
-        environment: Vec<(OsString, OsString)>,
-    ) -> Self {
+    /// Without `cache`, every shell is evaluated, and `dir` is only where
+    /// activation scripts go.
+    pub fn new(cache: Option<Client>, dir: PathBuf, builder: PathBuf, environment: Vec<(OsString, OsString)>) -> Self {
         Self {
             cache,
             dir,
             builder,
             environment,
             keys: Mutex::default(),
+            hot: None,
         }
+    }
+
+    /// Keep resolved shells while `watcher` sees nothing they were built
+    /// from change; using one again needs no checks.
+    pub fn with_watcher(mut self, watcher: rho_watch::Watcher) -> Self {
+        self.hot = Some(Hot {
+            watcher,
+            shells: Mutex::default(),
+        });
+        self
     }
 
     /// `flake`'s shell: a valid cached one, pinned, or a new evaluation.
     /// Also returns the builder's diagnostics.
     pub async fn resolve(&self, flake: &Flake) -> Result<(Resolved, Vec<u8>)> {
+        if let Some(resolved) = self.hot(flake).await {
+            return Ok((resolved, Vec::new()));
+        }
         let key = {
             let flake = flake.clone();
             tokio::task::spawn_blocking(move || flake.key()).await??
@@ -439,11 +472,40 @@ impl Resolver {
         result
     }
 
+    /// A kept shell nothing has changed under, used as a cache hit is.
+    async fn hot(&self, flake: &Flake) -> Option<Resolved> {
+        let hot = self.hot.as_ref()?;
+        let slot = (flake.dir.clone(), flake.shell.clone());
+        let resolved = {
+            let mut shells = hot.shells.lock().unwrap();
+            let (resolved, subscription) = shells.get(&slot)?;
+            if !matches!(subscription.changed(), Ok(false)) {
+                shells.remove(&slot);
+                return None;
+            }
+            resolved.clone()
+        };
+        if let (Some(cache), Some(id)) = (&self.cache, resolved.id) {
+            // Without the daemon, the shell is as valid as before.
+            if let Ok(false) = cache.used(id).await
+                && let Ok(false) = self.pin(&resolved.env_store_path).await
+            {
+                let _ = cache.forget(id).await;
+                hot.shells.lock().unwrap().remove(&slot);
+                return None;
+            }
+        }
+        Some(resolved)
+    }
+
     async fn resolve_key(&self, flake: &Flake, key: &str) -> Result<(Resolved, Vec<u8>)> {
         let mut diagnostics = Vec::new();
         if let Some(cache) = &self.cache {
             match self.cached(cache, flake, key).await {
-                Ok(Some(resolved)) => return Ok((resolved, diagnostics)),
+                Ok(Some((resolved, evaluated))) => {
+                    self.keep(flake, &resolved, evaluated).await;
+                    return Ok((resolved, diagnostics));
+                }
                 Ok(None) => {}
                 Err(e) => diagnostics.extend(format!("rho: dev shell cache unavailable: {e:#}\n").bytes()),
             }
@@ -460,11 +522,37 @@ impl Resolver {
                 Err(e) => diagnostics.extend(format!("rho: failed to cache dev shell: {e:#}\n").bytes()),
             }
         }
-        Ok((self.resolved(flake, id, &evaluated).await?, diagnostics))
+        let resolved = Self::resolved(flake, id, &evaluated);
+        self.keep(flake, &resolved, evaluated).await;
+        Ok((resolved, diagnostics))
+    }
+
+    /// Keep `resolved` for [`Self::hot`] if its inputs, now watched, still
+    /// hold: a change after they were checked or read but before the watch
+    /// existed would otherwise go unseen.
+    async fn keep(&self, flake: &Flake, resolved: &Resolved, evaluated: Evaluated) {
+        let (Some(hot), Some(inputs)) = (&self.hot, evaluated.inputs) else {
+            return;
+        };
+        let watcher = hot.watcher.clone();
+        let watch = resolved.watch.clone();
+        let source = flake.source.clone();
+        let subscription = tokio::task::spawn_blocking(move || {
+            let subscription = watch.subscribe(&watcher).ok()?;
+            let checkout = Checkout::new(&source.root, source.scheme).ok()?;
+            holds(&checkout, &mut HashMap::new(), &inputs).then_some(subscription)
+        })
+        .await;
+        if let Ok(Some(subscription)) = subscription {
+            hot.shells
+                .lock()
+                .unwrap()
+                .insert((flake.dir.clone(), flake.shell.clone()), (resolved.clone(), subscription));
+        }
     }
 
     /// The newest valid cached shell whose environment could be pinned.
-    async fn cached(&self, cache: &Arc<dyn Cache>, flake: &Flake, key: &str) -> Result<Option<Resolved>> {
+    async fn cached(&self, cache: &Client, flake: &Flake, key: &str) -> Result<Option<(Resolved, Evaluated)>> {
         let candidates = cache.lookup(key.to_owned()).await?;
         let valid = {
             let source = flake.source.clone();
@@ -475,23 +563,23 @@ impl Resolver {
                 cache.forget(candidate.id).await?;
                 continue;
             }
-            return Ok(Some(self.resolved(flake, Some(candidate.id), &evaluated).await?));
+            return Ok(Some((Self::resolved(flake, Some(candidate.id), &evaluated), evaluated)));
         }
         Ok(None)
     }
 
-    async fn resolved(&self, flake: &Flake, id: Option<u64>, evaluated: &Evaluated) -> Result<Resolved> {
-        let activation = self.activation(&evaluated.env_store_path).await?;
-        Ok(Resolved {
+    fn resolved(flake: &Flake, id: Option<u64>, evaluated: &Evaluated) -> Resolved {
+        Resolved {
             id,
             env_store_path: evaluated.env_store_path.clone(),
-            activation,
             watch: Watch::new(flake, evaluated.inputs.as_deref().unwrap_or_default()),
-        })
+        }
     }
 
-    /// The activation script for an environment, written once and shared.
-    async fn activation(&self, env_store_path: &str) -> Result<PathBuf> {
+    /// Bash applying the shell at `env_store_path` to the caller's
+    /// environment, `shellHook` included, then rho's `PATH` policy: a
+    /// script written once per environment and shared.
+    pub async fn activation(&self, env_store_path: &str) -> Result<PathBuf> {
         let path = activation_path(&self.dir, env_store_path);
         let dir = path.parent().unwrap().to_owned();
         let env_store_path = env_store_path.to_owned();
@@ -525,7 +613,7 @@ impl Resolver {
 
     async fn evaluate(&self, flake: &Flake) -> Result<(Evaluated, Vec<u8>)> {
         let mut command = self.builder_command();
-        command.arg("shell").arg(&flake.dir).arg("--shell").arg(&flake.shell);
+        command.arg("eval").arg(&flake.dir).arg("--shell").arg(&flake.shell);
         if self.cache.is_some() {
             command.arg("--roots").arg(roots_dir(&self.dir));
         }

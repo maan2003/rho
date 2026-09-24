@@ -12509,6 +12509,7 @@ dependencies = [
  "rho-shell-view",
  "rho-terminal",
  "rho-tool-shell",
+ "rho-watch",
  "rho-web-search",
  "rustix 1.1.4",
  "rustix-openpty",
@@ -12897,11 +12898,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
  "devenv-core",
  "devenv-eval-cache",
- "futures",
  "rho-fs-view",
+ "rho-watch",
  "rustix 1.1.4",
+ "senax-encoder",
  "serde",
  "serde_json",
  "tempfile",
@@ -12917,6 +12920,7 @@ dependencies = [
  "devenv-nix-backend",
  "rho-devshell",
  "serde_json",
+ "tokio",
  "tracing-subscriber",
 ]
 
@@ -12926,11 +12930,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "futures",
  "redb",
  "rho-db",
  "rho-devshell",
+ "rho-watch",
  "senax-encoder",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -13445,6 +13450,7 @@ dependencies = [
  "rho-devshell",
  "rho-fs-view",
  "rho-inference",
+ "rho-watch",
  "rustix 1.1.4",
  "senax-encoder",
  "serde",
@@ -13496,6 +13502,14 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rho-watch"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+ "tempfile",
 ]
 
 [[package]]

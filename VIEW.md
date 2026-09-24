@@ -63,7 +63,8 @@ security boundary (see `WORKSET.md`); it is a distribution.
    evaluation read and reused across checkouts and worksets.
    - The dev shell cache directory (`cache/rho-devshell`) is shared by
      the owner's worksets and bound into the view at its host path. It
-     holds the GC roots of pinned shells and their activation scripts.
+     holds the GC roots of pinned shells, their activation scripts, and
+     the daemon's cache socket (`daemon.sock`, `RHO_DEVSHELL_DIR`).
      *Why:* the nix daemon resolves the roots on the host. At a
      view-only path the roots would dangle and every GC would delete
      the shells.
@@ -77,8 +78,9 @@ security boundary (see `WORKSET.md`); it is a distribution.
      gets the same, with the find fork alone as the prefix.
    - The base's `nix` is Rho's patched Nix. `nix develop` and
      `nix print-dev-env` of a local flake's dev shell take the shell's
-     environment from the builder (`RHO_DEVSHELL_BUILDER`), so it comes
-     from the same cache, and do everything else as Nix does; other
+     environment from the builder (`RHO_DEVSHELL_BUILDER`), which asks
+     the daemon's cache as a workset process does, and do everything else
+     as Nix does; other
      installables, `--impure` and lock-file overrides evaluate as usual.
 
 4. **Nix works, through the daemon.** The daemon socket is bound,
@@ -186,7 +188,8 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
 from the user's environment or git config, read once when the daemon
 starts; `RHO_DEVSHELL_PATH_PREFIX`,
-`RHO_DEVSHELL_CARGO` and `RHO_DEVSHELL_BUILDER` (above);
+`RHO_DEVSHELL_CARGO`, `RHO_DEVSHELL_BUILDER` and `RHO_DEVSHELL_DIR`
+(above);
 `FIND_DENY_ROOTS` for Rho's find;
 `NIX_REMOTE=daemon` when the host has a nix daemon;
 `RHO_GIT_STORE_SOCKET`. Passed through from the user: `TERM`, `TZ`. Variables the caller sets on a command

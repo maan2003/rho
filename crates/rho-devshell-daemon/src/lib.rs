@@ -8,13 +8,17 @@
 //! a GC root in the shared cache directory; older ones are unpinned and
 //! remain usable until Nix collects them, when using one pins it again.
 //! One process owns the entries, so pinning and unpinning never race.
+//! Clients reach it over [`protocol::socket_path`] ([`Store::serve`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
+pub use rho_devshell::Candidate;
+use rho_devshell::protocol::{self, Reply, Request};
 use rho_devshell::{activation_path, gc_root, roots_dir};
 use senax_encoder::{Decode, Encode};
 
@@ -38,14 +42,6 @@ struct Entry {
     used: u64,
     /// Whether the daemon keeps the environment's GC root.
     pinned: bool,
-}
-
-/// A cached shell, as [`Store::lookup`] returns it.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Candidate {
-    pub id: u64,
-    pub env_store_path: String,
-    pub data: Vec<u8>,
 }
 
 pub struct Store {
@@ -162,6 +158,44 @@ impl Store {
             }
         })
         .await
+    }
+
+    /// Listen on the socket in the shared cache directory, replacing a
+    /// previous daemon's, and return the loop answering its clients.
+    pub fn serve(self: Arc<Self>) -> Result<impl Future<Output = ()> + Send + 'static> {
+        let path = protocol::socket_path(&self.dir);
+        std::fs::create_dir_all(&self.dir)?;
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        Ok(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { continue };
+                tokio::spawn(self.clone().answer(stream));
+            }
+        })
+    }
+
+    /// Answer one client's requests in order.
+    async fn answer(self: Arc<Self>, mut stream: tokio::net::UnixStream) {
+        while let Ok(Some(request)) = protocol::read::<Request>(&mut stream).await {
+            let result = match request {
+                Request::Lookup(key) => self.lookup(&key).await.map(Reply::Candidates),
+                Request::Used(id) => self.used(id).await.map(Reply::Rooted),
+                Request::Store {
+                    key,
+                    env_store_path,
+                    data,
+                } => self.store(key, env_store_path, data).await.map(Reply::Stored),
+                Request::Forget(id) => self.forget(id).await.map(|()| Reply::Done),
+            };
+            let reply = result.unwrap_or_else(|error| Reply::Error(format!("{error:#}")));
+            if protocol::write(&mut stream, &reply).await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Run `f` on the loaded state and persist the entries it changed.

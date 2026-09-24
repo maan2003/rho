@@ -48,6 +48,7 @@ members = [
   "crates/rho-tool-shell",
   "crates/rho-devshell",
   "crates/rho-devshell-daemon",
+  "crates/rho-watch",
   "crates/rho-transcript",
   "crates/rho-touch-keyboard",
   "crates/rho-agent-host-proto",
@@ -171,6 +172,7 @@ rho-transcript = { path = "crates/rho-transcript" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-devshell = { path = "crates/rho-devshell" }
 rho-devshell-daemon = { path = "crates/rho-devshell-daemon" }
+rho-watch = { path = "crates/rho-watch" }
 rho-agent-host-proto = { path = "crates/rho-agent-host-proto" }
 rho-agent-types = { path = "crates/rho-agent-types" }
 rho-visualizations = { path = "crates/rho-visualizations" }

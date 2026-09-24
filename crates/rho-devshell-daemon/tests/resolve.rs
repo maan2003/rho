@@ -1,43 +1,10 @@
-//! A workset's resolver against the daemon's store, with the real builder.
+//! Resolvers against the daemon's store over its socket, with the real
+//! builder.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-use rho_devshell::{Candidate, Flake, Resolver};
-
-/// The store, in process instead of over the workset connection.
-struct Direct(Arc<rho_devshell_daemon::Store>);
-
-impl rho_devshell::Cache for Direct {
-    fn lookup(&self, key: String) -> BoxFuture<'static, anyhow::Result<Vec<Candidate>>> {
-        let store = self.0.clone();
-        Box::pin(async move {
-            Ok(store
-                .lookup(&key)
-                .await?
-                .into_iter()
-                .map(|c| Candidate {
-                    id: c.id,
-                    env_store_path: c.env_store_path,
-                    data: c.data,
-                })
-                .collect())
-        })
-    }
-    fn used(&self, id: u64) -> BoxFuture<'static, anyhow::Result<bool>> {
-        let store = self.0.clone();
-        Box::pin(async move { store.used(id).await })
-    }
-    fn store(&self, key: String, env: String, data: Vec<u8>) -> BoxFuture<'static, anyhow::Result<u64>> {
-        let store = self.0.clone();
-        Box::pin(async move { store.store(key, env, data).await })
-    }
-    fn forget(&self, id: u64) -> BoxFuture<'static, anyhow::Result<()>> {
-        let store = self.0.clone();
-        Box::pin(async move { store.forget(id).await })
-    }
-}
+use rho_devshell::{Client, Flake, Resolver};
 
 #[tokio::test]
 #[ignore = "manual: needs RHO_DEVSHELL_BUILDER and a flake checkout in RHO_TEST_FLAKE"]
@@ -49,9 +16,10 @@ async fn evaluates_once_then_hits_and_repins() {
     let store = Arc::new(
         rho_devshell_daemon::Store::open(rho_db::RhoDb::open(temp.path().join("db")), dir.clone()).await,
     );
+    tokio::spawn(store.serve().unwrap());
     let resolver = || {
         Resolver::new(
-            Some(Arc::new(Direct(store.clone()))),
+            Some(Client::new(&dir)),
             dir.clone(),
             builder.clone(),
             std::env::vars_os().collect(),
@@ -63,7 +31,6 @@ async fn evaluates_once_then_hits_and_repins() {
     eprintln!("miss: {:?}", start.elapsed());
     let root = rho_devshell::gc_root(&rho_devshell::roots_dir(&dir), &first.env_store_path);
     assert_eq!(std::fs::read_link(&root).unwrap(), PathBuf::from(&first.env_store_path));
-    assert!(first.activation.is_file());
 
     let start = std::time::Instant::now();
     let (hit, _) = resolver().resolve(&flake).await.unwrap();
@@ -76,9 +43,32 @@ async fn evaluates_once_then_hits_and_repins() {
     assert_eq!(repinned.id, first.id);
     assert_eq!(std::fs::read_link(&root).unwrap(), PathBuf::from(&first.env_store_path));
 
+    // A watched resolver keeps the shell until an input changes.
+    let watched = resolver().with_watcher(rho_watch::Watcher::global().unwrap());
+    watched.resolve(&flake).await.unwrap();
+    let start = std::time::Instant::now();
+    let (kept, diagnostics) = watched.resolve(&flake).await.unwrap();
+    eprintln!("kept: {:?}", start.elapsed());
+    assert_eq!(kept.id, first.id);
+    assert!(diagnostics.is_empty());
+
+    // What `nix develop` in a view runs.
+    let start = std::time::Instant::now();
+    let shell = tokio::process::Command::new(&builder)
+        .args(["shell".as_ref(), flake.dir.as_os_str()])
+        .env("RHO_DEVSHELL_DIR", &dir)
+        .output()
+        .await
+        .unwrap();
+    eprintln!("builder shell: {:?}", start.elapsed());
+    assert!(shell.status.success(), "{}", String::from_utf8_lossy(&shell.stderr));
+    let shell: serde_json::Value = serde_json::from_slice(&shell.stdout).unwrap();
+    assert_eq!(shell["env_store_path"], first.env_store_path.as_str());
+
+    let activation = watched.activation(&hit.env_store_path).await.unwrap();
     let output = std::process::Command::new("bash")
         .args(["--noprofile", "--norc", "-c", rho_devshell::EXEC_SCRIPT, "bash"])
-        .arg(&hit.activation)
+        .arg(&activation)
         .args(["bash", "-c", "command -v cargo"])
         .current_dir(&flake.dir)
         .output()

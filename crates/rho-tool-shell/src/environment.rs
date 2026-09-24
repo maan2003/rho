@@ -1,27 +1,25 @@
 //! Per-agent environment generations. A command's environment is the dev
 //! shell of the nearest flake, from the process's `rho_devshell` resolver,
 //! or the base environment outside flakes. Only cold/invalidated generations
-//! ask for the shell; command admission drains kernel watches over what the
-//! shell was built from before reusing a snapshot. Paths are absolute;
-//! resolver tasks inherit the workset process namespace.
+//! ask for the shell; command admission checks the process's watches
+//! (`rho_watch`) over what the shell was built from before reusing a
+//! snapshot. Paths are absolute; resolver tasks inherit the workset process
+//! namespace.
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::ffi::{OsStr, OsString};
-use std::mem::MaybeUninit;
-use std::os::fd::OwnedFd;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use rustix::fs::inotify::{self, ReadFlags, WatchFlags};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use futures::future::BoxFuture;
+use rho_watch::Subscription;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 pub(super) type Environment = BTreeMap<OsString, OsString>;
 const MAX_ENV_BYTES: usize = 4 * 1024 * 1024;
-const MAX_INPUTS: usize = 4096;
 const CACHE_SIZE: usize = 32;
 // A cold shell may build a toolchain.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -31,7 +29,7 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 type Shells = Arc<dyn Fn(PathBuf) -> BoxFuture<'static, Result<(Built, Vec<u8>)>> + Send + Sync>;
 
 pub(super) struct Worker {
-    sender: tokio::sync::OnceCell<mpsc::Sender<Request>>,
+    sender: tokio::sync::OnceCell<(mpsc::Sender<Request>, mpsc::UnboundedSender<Key>)>,
     permits: Arc<tokio::sync::Semaphore>,
     shells: Shells,
 }
@@ -67,7 +65,7 @@ pub(super) struct Resolved {
 
 struct Snapshot {
     environment: Arc<Environment>,
-    watches: Watches,
+    watches: Subscription,
     /// Where the environment came from, to reuse it when a change turns out
     /// not to affect the shell.
     source: Option<Source>,
@@ -92,35 +90,57 @@ impl Worker {
 
     pub async fn resolve(&self, cwd: PathBuf, base: Environment) -> Result<Resolved> {
         let permit = Arc::clone(&self.permits).acquire_owned().await?;
-        let sender = self
+        let (sender, cancelled) = self
             .sender
             .get_or_try_init(|| async {
                 let (sender, receiver) = mpsc::channel(64);
-                tokio::spawn(serve(receiver, self.shells.clone()));
-                Ok::<_, anyhow::Error>(sender)
+                let (cancelled, cancellations) = mpsc::unbounded_channel();
+                tokio::spawn(serve(receiver, cancellations, self.shells.clone()));
+                Ok::<_, anyhow::Error>((sender, cancelled))
             })
             .await?;
+        let key = Key {
+            cwd,
+            base: Arc::new(base),
+        };
+        // Declared before the reply, so that a caller going away closes
+        // the reply before this tells the worker to look.
+        let mut cancel = Cancel(Some((key.clone(), cancelled.clone())));
         let (reply, result) = oneshot::channel();
         sender
             .send(Request {
-                key: Key {
-                    cwd,
-                    base: Arc::new(base),
-                },
+                key,
                 reply,
                 _permit: permit,
             })
             .await
             .context("environment worker stopped")?;
-        result.await.context("environment worker stopped")?
+        let result = result.await.context("environment worker stopped")?;
+        cancel.0 = None;
+        result
     }
 }
 
-async fn serve(mut requests: mpsc::Receiver<Request>, shells: Shells) {
+/// Tells the worker when a caller stops waiting, so that a generation no
+/// caller waits for is cancelled.
+struct Cancel(Option<(Key, mpsc::UnboundedSender<Key>)>);
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        if let Some((key, cancelled)) = self.0.take() {
+            let _ = cancelled.send(key);
+        }
+    }
+}
+
+async fn serve(
+    mut requests: mpsc::Receiver<Request>,
+    mut cancellations: mpsc::UnboundedReceiver<Key>,
+    shells: Shells,
+) {
     let mut snapshots: VecDeque<(Key, Snapshot)> = VecDeque::new();
     let mut loading = HashMap::<Key, (tokio::task::AbortHandle, Vec<Request>)>::new();
     let mut tasks = tokio::task::JoinSet::new();
-    let mut cancellation = tokio::time::interval(Duration::from_millis(20));
     loop {
         tokio::select! {
             request = requests.recv(), if loading.len() < CACHE_SIZE => {
@@ -128,7 +148,7 @@ async fn serve(mut requests: mpsc::Receiver<Request>, shells: Shells) {
                 if request.reply.is_closed() { continue; }
                 let mut previous = None;
                 if let Some(index) = snapshots.iter().position(|(key, _)| key == &request.key) {
-                    let (key, mut snapshot) = snapshots.remove(index).unwrap();
+                    let (key, snapshot) = snapshots.remove(index).unwrap();
                     if matches!(snapshot.watches.changed(), Ok(false)) {
                         let _ = request.reply.send(Ok(Resolved {
                             environment: Arc::clone(&snapshot.environment),
@@ -195,11 +215,14 @@ async fn serve(mut requests: mpsc::Receiver<Request>, shells: Shells) {
                     }
                 }
             }
-            _ = cancellation.tick(), if !loading.is_empty() => {
-                loading.retain(|_, (task, waiters)| {
+            Some(key) = cancellations.recv() => {
+                if let Some((task, waiters)) = loading.get_mut(&key) {
                     waiters.retain(|waiter| !waiter.reply.is_closed());
-                    if waiters.is_empty() { task.abort(); false } else { true }
-                });
+                    if waiters.is_empty() {
+                        task.abort();
+                        loading.remove(&key);
+                    }
+                }
             }
         }
     }
@@ -313,12 +336,14 @@ struct Built {
 }
 
 async fn resolved_shell(flake: PathBuf) -> Result<(Built, Vec<u8>)> {
-    let (resolved, diagnostics) = rho_devshell::resolver()
+    let resolver = rho_devshell::resolver();
+    let (resolved, diagnostics) = resolver
         .resolve(&rho_devshell::Flake::new(flake, "default"))
         .await?;
-    let activation = tokio::fs::read_to_string(&resolved.activation)
+    let path = resolver.activation(&resolved.env_store_path).await?;
+    let activation = tokio::fs::read_to_string(&path)
         .await
-        .with_context(|| format!("read {}", resolved.activation.display()))?;
+        .with_context(|| format!("read {}", path.display()))?;
     Ok((
         Built {
             eval_id: resolved.id,
@@ -397,7 +422,7 @@ async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Resu
                 (environment, diagnostics, source)
             }
         };
-        let mut watches = Watches::new(&contents, &names)?;
+        let watches = watch(&contents, &names)?;
         // A change after the builder observed an input but before its watch
         // existed is visible to neither; confirm the shell still holds now.
         // An uncacheable shell cannot be confirmed and is kept as built.
@@ -433,7 +458,7 @@ async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<
         return Ok(None);
     }
     let names = source.names.union(&discovery.names).cloned().collect();
-    let mut watches = Watches::new(&source.contents, &names)?;
+    let watches = watch(&source.contents, &names)?;
     let (built, diagnostics) = build(shells, &source.flake).await?;
     if built.eval_id != Some(source.eval_id) || discover(&key.cwd)? != discovery || watches.changed()? {
         return Ok(None);
@@ -448,131 +473,13 @@ async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<
     )))
 }
 
-/// Kernel watches over a shell's inputs, drained at command admission.
-struct Watches {
-    fd: OwnedFd,
-    names: HashMap<i32, HashSet<OsString>>,
-    directories: HashSet<i32>,
-    files: HashSet<i32>,
-}
-
-impl Watches {
-    /// Watch `contents` for any change, and `names` for being replaced,
-    /// removed or created, or having their attributes changed.
-    fn new(contents: &HashSet<PathBuf>, names: &HashSet<PathBuf>) -> Result<Self> {
-        let mut watches = Self {
-            fd: inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?,
-            names: HashMap::new(),
-            directories: HashSet::new(),
-            files: HashSet::new(),
-        };
-        let mut seen = HashSet::new();
-        for path in contents {
-            watches.path(path, true, &mut seen, 0)?;
-        }
-        for path in names {
-            watches.path(path, false, &mut seen, 0)?;
-        }
-        Ok(watches)
-    }
-
-    fn path(
-        &mut self,
-        path: &Path,
-        contents: bool,
-        seen: &mut HashSet<(PathBuf, bool)>,
-        depth: usize,
-    ) -> Result<()> {
-        ensure!(depth < 64, "environment input symlink chain is too deep");
-        if !seen.insert((path.to_owned(), contents)) {
-            return Ok(());
-        }
-        ensure!(seen.len() <= MAX_INPUTS, "too many environment watch paths");
-        let mut parent = PathBuf::from("/");
-        for component in path.components().skip(1) {
-            let name = component.as_os_str();
-            match self.add(&parent) {
-                Ok(wd) => {
-                    self.names.entry(wd).or_default().insert(name.to_owned());
-                }
-                Err(error)
-                    if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::NOTDIR =>
-                {
-                    break;
-                }
-                Err(error) => return Err(error.into()),
-            }
-            parent.push(name);
-            if let Ok(target) = std::fs::read_link(&parent) {
-                let target = if target.is_absolute() {
-                    target
-                } else {
-                    parent.parent().unwrap().join(target)
-                };
-                self.path(&target, contents, seen, depth + 1)?;
-            }
-        }
-        if !contents {
-            // The parent's watch reports the entry's replacement and its
-            // attribute changes.
-        } else if path.is_dir() {
-            let wd = self.add(path)?;
-            self.directories.insert(wd);
-        } else if path.is_file() {
-            // Parent watches observe replacement; inode watches additionally
-            // observe writes through hard-link aliases in other directories.
-            let wd = self.add(path)?;
-            self.files.insert(wd);
-        }
-        Ok(())
-    }
-
-    fn add(&self, path: &Path) -> rustix::io::Result<i32> {
-        inotify::add_watch(
-            &self.fd,
-            path,
-            WatchFlags::MODIFY
-                | WatchFlags::ATTRIB
-                | WatchFlags::CLOSE_WRITE
-                | WatchFlags::CREATE
-                | WatchFlags::DELETE
-                | WatchFlags::MOVED_FROM
-                | WatchFlags::MOVED_TO
-                | WatchFlags::DELETE_SELF
-                | WatchFlags::MOVE_SELF,
-        )
-    }
-
-    fn changed(&mut self) -> Result<bool> {
-        let mut buffer = [MaybeUninit::uninit(); 4096];
-        let mut reader = inotify::Reader::new(&self.fd, &mut buffer);
-        let mut changed = false;
-        loop {
-            match reader.next() {
-                Err(error) if error == rustix::io::Errno::AGAIN => return Ok(changed),
-                Err(error) => return Err(error.into()),
-                Ok(event) => {
-                    let flags = event.events();
-                    if flags.intersects(
-                        ReadFlags::QUEUE_OVERFLOW
-                            | ReadFlags::IGNORED
-                            | ReadFlags::UNMOUNT
-                            | ReadFlags::DELETE_SELF
-                            | ReadFlags::MOVE_SELF,
-                    ) || self.files.contains(&event.wd())
-                        || self.directories.contains(&event.wd())
-                        || event.file_name().is_some_and(|name| {
-                            self.names.get(&event.wd()).is_some_and(|names| {
-                                names.contains(OsStr::from_bytes(name.to_bytes()))
-                            })
-                        })
-                    {
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
+/// Watch what an environment was derived from, with the process's shared
+/// watches; checking drains them, so a change before admission is seen.
+fn watch(contents: &HashSet<PathBuf>, names: &HashSet<PathBuf>) -> Result<Subscription> {
+    Ok(rho_watch::Watcher::global()?.watch(
+        contents.iter().map(PathBuf::as_path),
+        names.iter().map(PathBuf::as_path),
+    )?)
 }
 
 #[cfg(test)]
@@ -830,41 +737,6 @@ mod tests {
         let output = fixture.run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None).await;
         // The hook's output is a diagnostic, not the environment.
         assert!(output.contains("noise") && output.ends_with("ok"), "{output}");
-    }
-
-    #[test]
-    fn watches_symlink_targets_retargeting_and_ancestor_replacement() {
-        use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("dir")).unwrap();
-        std::fs::write(root.path().join("dir/value"), "one").unwrap();
-        symlink("dir/value", root.path().join("link")).unwrap();
-        let paths = HashSet::from([root.path().join("link")]);
-        let mut watches = Watches::new(&paths, &HashSet::new()).unwrap();
-        assert!(!watches.changed().unwrap());
-        std::fs::write(root.path().join("dir/value"), "two").unwrap();
-        assert!(watches.changed().unwrap());
-        let mut watches = Watches::new(&paths, &HashSet::new()).unwrap();
-        std::fs::rename(root.path().join("dir"), root.path().join("old")).unwrap();
-        assert!(watches.changed().unwrap());
-        let mut watches = Watches::new(&paths, &HashSet::new()).unwrap();
-        std::fs::remove_file(root.path().join("link")).unwrap();
-        symlink("old/value", root.path().join("link")).unwrap();
-        assert!(watches.changed().unwrap());
-    }
-
-    #[test]
-    fn writes_through_hard_links_invalidate() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("other")).unwrap();
-        let input = root.path().join("input");
-        let alias = root.path().join("other/alias");
-        std::fs::write(&input, "one").unwrap();
-        std::fs::hard_link(&input, &alias).unwrap();
-        let mut watches = Watches::new(&HashSet::from([input]), &HashSet::new()).unwrap();
-        assert!(!watches.changed().unwrap());
-        std::fs::write(alias, "two").unwrap();
-        assert!(watches.changed().unwrap());
     }
 
     #[tokio::test]

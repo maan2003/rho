@@ -1,0 +1,13 @@
+[package]
+name = "rho-watch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustix = { version = "1", features = ["event", "fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true

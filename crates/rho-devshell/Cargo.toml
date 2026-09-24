@@ -11,10 +11,12 @@ anyhow.workspace = true
 blake3.workspace = true
 devenv-core.workspace = true
 devenv-eval-cache.workspace = true
-futures.workspace = true
 rho-fs-view.workspace = true
+rho-watch.workspace = true
+senax-encoder.workspace = true
+bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rustix = { version = "1", features = ["process"] }
 tempfile.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }

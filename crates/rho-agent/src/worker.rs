@@ -1,7 +1,6 @@
 //! Process-local runtime connections. Shared services remain in the daemon.
 
 mod ipc;
-mod devshell;
 mod policy;
 mod process;
 mod remote;

@@ -14,7 +14,7 @@ no separate record of its contents.
   stores/              # mirror store root (CLONES.md), URL-keyed
   store.sock           # the mirror keeper's socket
   cache/               # every agent's ~/.cache (VIEW.md)
-  cache/rho-devshell/  # dev shell GC roots and activation scripts, also at its host path
+  cache/rho-devshell/  # dev shell GC roots, activation scripts and the cache socket, also at its host path
   worksets/<id>/src    # one directory per workset
   worksets/<id>/state  # its nix GC roots and shared notes
 ```

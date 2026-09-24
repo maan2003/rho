@@ -5,14 +5,19 @@
 //! what it read (see `rho-devshell`). It links libnix, so rho runs it as a
 //! separate process rather than loading Nix into its own.
 //!
-//!     rho-devshell-builder shell <flake-dir> [--shell NAME] [--roots DIR]
+//!     rho-devshell-builder shell <flake-dir> [--shell NAME]
+//!     rho-devshell-builder eval <flake-dir> [--shell NAME] [--roots DIR]
 //!     rho-devshell-builder pin <store-path> <gc-root>
 //!
-//! `shell` evaluates and builds the shell and prints it, with what its
+//! `shell` is the agent base's patched `nix develop` asking for a shell: it
+//! resolves it as a workset process would, through the daemon's cache at
+//! `$RHO_DEVSHELL_DIR` if that is set, running this program's `eval` and
+//! `pin` as needed, and prints `{"env_store_path": ...}`.
+//!
+//! `eval` evaluates and builds the shell and prints it, with what its
 //! evaluation read, as JSON (`rho_devshell::Evaluated`). With `--roots`, a
 //! shell that can be cached is pinned by a GC root in `DIR` before the
-//! process, and with it Nix's temporary root, goes away. The agent base's
-//! patched `nix develop` runs `shell` too.
+//! process, and with it Nix's temporary root, goes away.
 //!
 //! `pin` roots an existing store path, exiting with
 //! `rho_devshell::PIN_GONE` if it was already garbage collected.
@@ -24,11 +29,13 @@ use devenv_eval_cache::{Checkout, Input, RevInputDesc, record_inputs};
 use devenv_nix_backend::{DevShellRequest, NIX_STACK_SIZE, NixRuntime};
 use rho_devshell::{Evaluated, Flake};
 
-const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--roots DIR]
+const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME]
+       rho-devshell-builder eval <flake-dir> [--shell NAME] [--roots DIR]
        rho-devshell-builder pin <store-path> <gc-root>";
 
 enum Mode {
-    Shell { flake: Flake, roots: Option<PathBuf> },
+    Shell { flake: Flake },
+    Eval { flake: Flake, roots: Option<PathBuf> },
     Pin { store_path: String, gc_root: PathBuf },
 }
 
@@ -38,7 +45,8 @@ fn parse_args() -> Result<Mode> {
         .map(|arg| arg.into_string().map_err(|arg| anyhow::anyhow!("non-UTF-8 argument {arg:?}")));
     let mut next = |what: &str| -> Result<String> { args.next().with_context(|| format!("missing {what}\n{USAGE}"))? };
     match next("mode")?.as_str() {
-        "shell" => {
+        mode @ ("shell" | "eval") => {
+            let eval = mode == "eval";
             let dir = next("flake directory")?;
             let dir = std::fs::canonicalize(&dir).with_context(|| dir.clone())?;
             let mut shell = "default".to_owned();
@@ -46,14 +54,12 @@ fn parse_args() -> Result<Mode> {
             while let Ok(arg) = next("") {
                 match arg.as_str() {
                     "--shell" => shell = next("--shell value")?,
-                    "--roots" => roots = Some(next("--roots value")?.into()),
+                    "--roots" if eval => roots = Some(next("--roots value")?.into()),
                     other => bail!("unknown argument {other}\n{USAGE}"),
                 }
             }
-            Ok(Mode::Shell {
-                flake: Flake::new(dir, shell),
-                roots,
-            })
+            let flake = Flake::new(dir, shell);
+            Ok(if eval { Mode::Eval { flake, roots } } else { Mode::Shell { flake } })
         }
         "pin" => Ok(Mode::Pin {
             store_path: next("store path")?,
@@ -65,6 +71,9 @@ fn parse_args() -> Result<Mode> {
 
 fn main() -> Result<()> {
     let mode = parse_args()?;
+    if let Mode::Shell { flake } = mode {
+        return resolve(&flake);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -79,8 +88,9 @@ fn main() -> Result<()> {
     std::thread::Builder::new()
         .stack_size(NIX_STACK_SIZE)
         .spawn(move || match mode {
-            Mode::Shell { flake, roots } => {
-                println!("{}", serde_json::to_string(&shell(&flake, roots.as_deref())?)?);
+            Mode::Shell { .. } => unreachable!(),
+            Mode::Eval { flake, roots } => {
+                println!("{}", serde_json::to_string(&eval(&flake, roots.as_deref())?)?);
                 Ok(())
             }
             Mode::Pin { store_path, gc_root } => {
@@ -98,9 +108,28 @@ fn main() -> Result<()> {
         .expect("evaluator thread panicked")
 }
 
+/// Resolve `flake`'s shell as a workset process would, running this
+/// program to evaluate and pin.
+fn resolve(flake: &Flake) -> Result<()> {
+    let dir = std::env::var_os("RHO_DEVSHELL_DIR").map(PathBuf::from);
+    let resolver = rho_devshell::Resolver::new(
+        dir.as_deref().map(rho_devshell::Client::new),
+        dir.unwrap_or_default(),
+        std::env::current_exe()?,
+        std::env::vars_os().collect(),
+    );
+    let (resolved, diagnostics) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(resolver.resolve(flake))?;
+    std::io::Write::write_all(&mut std::io::stderr(), &diagnostics)?;
+    println!("{}", serde_json::json!({ "env_store_path": resolved.env_store_path }));
+    Ok(())
+}
+
 /// Evaluate and build `flake`'s shell, recording what evaluation read; with
 /// `roots`, pin a shell that can be cached.
-fn shell(flake: &Flake, roots: Option<&Path>) -> Result<Evaluated> {
+fn eval(flake: &Flake, roots: Option<&Path>) -> Result<Evaluated> {
     let source = &flake.source;
     let mut nix = NixRuntime::new().map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let request = DevShellRequest {

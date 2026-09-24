@@ -412,8 +412,10 @@ impl Namespace {
                         None => cargo_bin,
                     },
                 );
-                // For the base's `nix develop` (VIEW.md 3).
+                // For the base's `nix develop` (VIEW.md 3): the builder,
+                // and the daemon's shell cache it asks first.
                 command.env("RHO_DEVSHELL_BUILDER", crate::devshell_builder());
+                command.env("RHO_DEVSHELL_DIR", &self.devshell_cache);
                 command
                     .env(
                         "PATH",

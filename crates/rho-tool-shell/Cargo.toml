@@ -12,6 +12,7 @@ anyhow.workspace = true
 camino.workspace = true
 rho-agent-types.workspace = true
 rho-devshell.workspace = true
+rho-watch.workspace = true
 rho-fs-view.workspace = true
 futures.workspace = true
 rustix = { version = "1", features = ["process", "thread", "fs", "net"] }

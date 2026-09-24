@@ -180,6 +180,7 @@ test "$XDG_STATE_HOME" = /home/agent/.local/state
 test "$GIT_CONFIG_SYSTEM" = /etc/gitconfig
 test "$(git config --get core.pager)" = cat
 test -n "$RHO_DEVSHELL_BUILDER"
+test -n "$RHO_DEVSHELL_DIR"
 case "$RHO_DEVSHELL_PATH_PREFIX" in *:/home/agent/.cache/cargo/bin|/home/agent/.cache/cargo/bin) ;; *) exit 1 ;; esac
 test "$INSIDE_AGENT" = 1
 test "$CARGO_HOME" = /home/agent/.cache/cargo

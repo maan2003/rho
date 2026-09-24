@@ -13,8 +13,9 @@ redb.workspace = true
 rho-db.workspace = true
 rho-devshell.workspace = true
 senax-encoder.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
-futures.workspace = true
+serde_json.workspace = true
+rho-watch.workspace = true
 tempfile.workspace = true

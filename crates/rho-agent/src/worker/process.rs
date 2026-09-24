@@ -258,7 +258,6 @@ impl Process {
         let routing_commands = commands.clone();
         let routes = agents.clone();
         let inference = pool.inference().clone();
-        let devshell_store = pool.devshell().clone();
         // The supervisor owns the child before any cancellable bootstrap I/O.
         let (connected, connection) = oneshot::channel();
         tokio::spawn(async move {
@@ -273,12 +272,8 @@ impl Process {
                 let (policy_incoming, policy_messages) = mpsc::channel(super::policy::MAX_REQUESTS);
                 let policy = super::policy::serve(inference, sender.clone(), policy_messages);
                 tokio::pin!(policy);
-                let (devshell_incoming, devshell_messages) = mpsc::channel(64);
-                let devshell = super::devshell::serve(devshell_store, sender.clone(), devshell_messages);
-                tokio::pin!(devshell);
                 let result = tokio::select! {
                     result = &mut policy => result,
-                    result = &mut devshell => result,
                     result = &mut writer => result.context("workset writer failed")?.map_err(anyhow::Error::from),
                     result = async {
                         while let Some(message) = command_rx.recv().await {
@@ -307,9 +302,6 @@ impl Process {
                                         }
                                         super::workset::Message::Policy(message) => {
                                             policy_incoming.try_send(message).map_err(|_| anyhow::anyhow!("workset policy route closed or overloaded"))?;
-                                        }
-                                        super::workset::Message::Devshell(message) => {
-                                            devshell_incoming.try_send(message).map_err(|_| anyhow::anyhow!("workset dev shell route closed or overloaded"))?;
                                         }
                                         _ => anyhow::bail!("unexpected workset reply"),
                                     }

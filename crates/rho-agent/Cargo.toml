@@ -37,6 +37,7 @@ rho-devshell-daemon.workspace = true
 rho-inference.workspace = true
 rho-image.workspace = true
 rho-tool-shell.workspace = true
+rho-watch.workspace = true
 rho-fs-view.workspace = true
 rho-web-search.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }

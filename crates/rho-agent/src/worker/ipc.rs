@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 8;
+pub(super) const VERSION: u32 = 7;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {

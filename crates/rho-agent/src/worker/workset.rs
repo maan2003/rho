@@ -60,7 +60,6 @@ pub(super) enum Message {
     Attach { id: u64, port: Port, attach: Attach },
     Reply { id: u64, body: Reply },
     Detach(Port),
-    Devshell(super::devshell::Message),
 }
 
 pub(super) fn encode<T: senax_encoder::Encoder>(value: &T) -> anyhow::Result<bytes::Bytes> {
