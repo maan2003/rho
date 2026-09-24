@@ -62,7 +62,7 @@
             ./nix/patches/git-rho-store.patch
           ];
           # git's own test suite is long and does not exercise the patches;
-          # rho's rho-git-client tests do.
+          # rho-git's tests do.
           doInstallCheck = false;
         });
 

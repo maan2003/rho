@@ -7,15 +7,15 @@ freedom to fetch, push, gc without asking anyone. Naively that is a
 round trip per clone. The mirror store is the primitive that removes
 both costs without changing what a clone *is*.
 
-It is three small crates under `agent-host/rho-git/` and one patch to git:
+It is one small crate, `agent-host/rho-git`, and one patch to git:
 
-- `rho-git-proto`: the one-line socket protocol, URL normalization and
-  the store key.
-- `rho-git-server`: the **keeper**, `MirrorStore`. The agent host runs it
-  in-process; it is the only writer of the store root.
-- `rho-git-client`: how the agent host births its own clones from a mirror
-  (`clone_from_mirror`, `ensure_alternate`; the keeper is called
-  in-process) and the end-to-end tests of the patched git against a live
+- `rho_git::protocol`: the one-line socket protocol, URL normalization
+  and the store key.
+- `rho_git::server`: the **keeper**, `MirrorStore`. The agent host runs
+  it in-process; it is the only writer of the store root.
+- `rho_git::client`: how the agent host births its own clones from a
+  mirror (`clone_from_mirror`, `ensure_alternate`; the keeper is called
+  in-process). The crate's tests drive the patched git against a live
   keeper.
 - `nix/patches/git-rho-store.patch`: Rho's git. Its `clone` and `fetch`
   ask the keeper for the mirror themselves, so every path into a fetch
@@ -61,7 +61,7 @@ If the keeper cannot be reached git says so on stderr (`rho git store:
 socket variable it is plain git.
 
 The agent host's own clones (`Workset::clone_repo`, for a new agent's
-starting repository) use `rho-git-client` to ask the keeper and birth
+starting repository) use `rho_git::client` to ask the keeper and birth
 the clone from the mirror the same way, so an agent's `git clone` and
 the agent host's are the same thing.
 

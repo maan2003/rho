@@ -5,7 +5,7 @@
 //! interpret its contents: the agent clones what it needs with ordinary
 //! `git clone`, which is instant because every clone is born from the
 //! agent host's mirror store (`CLONES.md`). The store root is owned by the
-//! keeper (`rho-git-server`) running inside the agent host; the `git` agents
+//! keeper (`rho_git::server`) running inside the agent host; the `git` agents
 //! see is Rho's patched git, which asks the keeper itself on every fetch
 //! and clone, and the agent host's own clones go through the same keeper
 //! in-process. Nothing but the keeper writes a mirror.
@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use rho_git_server::MirrorStore;
+use rho_git::server::MirrorStore;
 use tokio::sync::Mutex;
 
 mod ns;
@@ -26,7 +26,7 @@ pub mod layout;
 
 pub use layout::*;
 pub use ns::{MAX_BOUNDED_READ, Mode, Namespace, WorksetLayout};
-pub use rho_git_proto::{SOCKET_ENV, repo_name};
+pub use rho_git::protocol::{SOCKET_ENV, repo_name};
 
 /// The agent's base userland (`VIEW.md`): a nix `buildEnv` fixed at build
 /// time whose `bin/` is the agent's PATH, after the agent's own nix
@@ -53,7 +53,7 @@ pub fn git_dir() -> PathBuf {
         .and_then(|git| git.parent().map(Path::to_owned))
         .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
 }
-pub use rho_git_server::Refresh as StoreRefresh;
+pub use rho_git::server::Refresh as StoreRefresh;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct PathOverrides {
@@ -589,7 +589,7 @@ impl Workset {
     ) -> anyhow::Result<Utf8PathBuf> {
         let name = match name {
             Some(name) => name.to_owned(),
-            None => rho_git_proto::repo_name(remote_url)
+            None => rho_git::protocol::repo_name(remote_url)
                 .with_context(|| format!("remote URL has no repository name: {remote_url:?}"))?,
         };
         validate_name(&name)?;
@@ -606,11 +606,11 @@ impl Workset {
         let cloned = match owner.store.as_ref().and_then(|store| store.keeper.as_ref()) {
             Some(keeper) => {
                 let mirror = keeper.ensure(remote_url).await?;
-                let git = rho_git_client::Git::new(GIT);
+                let git = rho_git::client::Git::new(GIT);
                 let url = remote_url.to_owned();
                 let dest = target.clone();
                 tokio::task::spawn_blocking(move || {
-                    rho_git_client::clone_from_mirror(&git, &mirror, &url, dest.as_std_path())
+                    rho_git::client::clone_from_mirror(&git, &mirror, &url, dest.as_std_path())
                 })
                 .await
                 .context("clone worker panicked")?

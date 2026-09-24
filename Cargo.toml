@@ -22,9 +22,7 @@ members = [
   "agent-host/rho-fake-model",
   "crates/rho-fake-slack",
   "crates/rho-files",
-  "agent-host/rho-git/client",
-  "agent-host/rho-git/proto",
-  "agent-host/rho-git/server",
+  "agent-host/rho-git",
   "crates/rho-gui",
   "crates/rho-agent-hosts",
   "agent-host/rho-image",
@@ -130,9 +128,7 @@ rho-db = { path = "crates/rho-db" }
 rho-fake-model = { path = "agent-host/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
-rho-git-client = { path = "agent-host/rho-git/client" }
-rho-git-proto = { path = "agent-host/rho-git/proto" }
-rho-git-server = { path = "agent-host/rho-git/server" }
+rho-git = { path = "agent-host/rho-git" }
 rho-image = { path = "agent-host/rho-image" }
 rho-inference = { path = "agent-host/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }

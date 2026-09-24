@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context as _;
-pub use rho_git_proto as proto;
 
 /// The real git executable.
 #[derive(Clone, Debug, PartialEq, Eq)]

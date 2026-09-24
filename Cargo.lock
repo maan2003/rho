@@ -12706,9 +12706,7 @@ dependencies = [
  "dirs",
  "libc",
  "rho-agent-types",
- "rho-git-client",
- "rho-git-proto",
- "rho-git-server",
+ "rho-git",
  "senax-encoder",
  "serde_json",
  "tempfile",
@@ -12716,26 +12714,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-git-client"
+name = "rho-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "rho-git-proto",
- "rho-git-server",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "rho-git-proto"
-version = "0.1.0"
-
-[[package]]
-name = "rho-git-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rho-git-proto",
  "tempfile",
  "tokio",
 ]
