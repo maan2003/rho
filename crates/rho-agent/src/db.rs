@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-use rho_agent_host_proto::UnixMs;
 pub use rho_agent_host_proto::transcript::{
     AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome,
 };
+use rho_agent_types::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_fs_view::{Place, WorksetMode};
 use rho_inference::PromptCacheKey;
@@ -257,7 +257,7 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
         }
 }
 
-pub use rho_agent_host_proto::{
+pub use rho_agent_types::{
     AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
 };
 

@@ -5,7 +5,7 @@ mod search;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent_host_proto::ContentPart;
+use rho_agent_types::ContentPart;
 use rho_inference::Inference;
 use rho_inference::types::{ContextBlock, InferenceResponseItem, ToolExecutionContext};
 
@@ -131,10 +131,10 @@ fn recent_input(blocks: &[Arc<ContextBlock>]) -> Option<Vec<ResponseItem>> {
                             "assistant",
                             content,
                             phase.map(|phase| match phase {
-                                rho_agent_host_proto::MessagePhase::Commentary => {
+                                rho_agent_types::MessagePhase::Commentary => {
                                     MessagePhase::Commentary
                                 }
-                                rho_agent_host_proto::MessagePhase::FinalAnswer => {
+                                rho_agent_types::MessagePhase::FinalAnswer => {
                                     MessagePhase::FinalAnswer
                                 }
                             }),

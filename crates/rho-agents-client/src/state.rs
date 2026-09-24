@@ -2,7 +2,7 @@
 //! the mirror and the live tail. Nothing here crosses the wire.
 
 use rho_agent_host_proto::transcript::{ArgumentsFormat, TextPhase};
-use rho_agent_host_proto::{MessageDelivery, MessagePhase, ToolOutputStatus, UnixMs};
+use rho_agent_types::{MessageDelivery, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 /// One agent's transcript as a client draws it: a flat block list plus a
@@ -22,7 +22,7 @@ pub struct UiAgentState {
     pub usage: UiAgentUsage,
     #[senax(default)]
     pub exec_timings:
-        std::sync::Arc<std::collections::BTreeMap<String, rho_agent_host_proto::ExecTiming>>,
+        std::sync::Arc<std::collections::BTreeMap<String, rho_agent_types::ExecTiming>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -53,12 +53,12 @@ pub enum UiBlock {
         text: String,
         delivery: MessageDelivery,
         /// The sending agent; `None` for the user.
-        sender: Option<rho_agent_host_proto::AgentId>,
+        sender: Option<rho_agent_types::AgentId>,
     },
     /// A delivered message from another agent.
     AgentMessage {
         /// The sending agent.
-        sender: rho_agent_host_proto::AgentId,
+        sender: rho_agent_types::AgentId,
         text: String,
     },
 }
@@ -126,7 +126,7 @@ pub struct UiTool {
     pub finished_at: Option<UnixMs>,
     pub metadata: Option<UiToolMetadata>,
     #[senax(default)]
-    pub timing: rho_agent_host_proto::ExecTiming,
+    pub timing: rho_agent_types::ExecTiming,
     /// Whether `arguments` is JSON or the raw text the model wrote. A text
     /// tool's arguments are shown as they are and never parsed.
     pub format: ArgumentsFormat,

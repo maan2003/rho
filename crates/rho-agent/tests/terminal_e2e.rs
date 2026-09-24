@@ -7,8 +7,8 @@ use std::sync::Arc;
 mod common;
 
 use rho_agent::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::term::{ScrollbackItem, TermRow, TermServerFrame, WireScreen};
+use rho_agent_types::AgentId;
 
 fn main() {
     let unshare = std::process::Command::new("unshare")

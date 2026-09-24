@@ -42,7 +42,7 @@ fn main() {
         cell.acknowledge_output();
         assert_eq!(
             output.status,
-            rho_agent_host_proto::ToolOutputStatus::Success,
+            rho_agent_types::ToolOutputStatus::Success,
             "{output:?}"
         );
         assert!(output.output.contains("/src/project"), "{output:?}");

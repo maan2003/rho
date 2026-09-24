@@ -18,8 +18,9 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent, Capability};
 use rho_agent_host_proto::{
-    FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceInfo, WorkspaceServerFrame,
+    FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame,
 };
+use rho_agent_types::WorkspaceInfo;
 use rho_agents_client::remote::{AgentsLink, WorkspaceChannel};
 use theme::ActiveTheme as _;
 

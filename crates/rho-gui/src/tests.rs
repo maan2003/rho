@@ -12,7 +12,7 @@ use gpui::{
 };
 use language::InlayId;
 use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
-use rho_agent_host_proto::{AgentId, UnixMs};
+use rho_agent_types::{AgentId, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
@@ -1289,7 +1289,7 @@ fn modal_overlays_preserve_surface_mode(cx: &mut TestAppContext) {
 }
 
 fn agent(id: u64) -> AgentId {
-    AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).unwrap()
+    AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).unwrap()
 }
 
 /// The transcript the workspace holds for this agent, to edit and feed back.
@@ -4180,7 +4180,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_agent_host_proto::Place;
+    use rho_agent_types::Place;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
@@ -6082,8 +6082,8 @@ fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
         status: UiToolStatus::Success,
         output: None,
         error: None,
-        started_at: Some(rho_agent_host_proto::UnixMs(10)),
-        finished_at: Some(rho_agent_host_proto::UnixMs(20)),
+        started_at: Some(rho_agent_types::UnixMs(10)),
+        finished_at: Some(rho_agent_types::UnixMs(20)),
         metadata: None,
     });
     feed_frame(
@@ -7768,9 +7768,9 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
     story::UiAgentHead {
         agent_id,
         story_pos: story::UiStoryPos(0),
-        role: rho_agent_host_proto::AgentRole::default(),
+        role: rho_agent_types::AgentRole::default(),
         runtime_kind: story::UiRuntimeKind::Rho,
-        place: rho_agent_host_proto::Place {
+        place: rho_agent_types::Place {
             workset: "0123456789ab".into(),
             cwd: "/src/tmp".into(),
             mode: Default::default(),

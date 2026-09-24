@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::{TableDefinition, TableHandle as _};
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{Mutex, watch};

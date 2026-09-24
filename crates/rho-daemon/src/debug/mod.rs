@@ -591,8 +591,7 @@ async fn delete_agents(db_path: Option<PathBuf>, agents: &[String]) -> anyhow::R
     let agents = agents
         .iter()
         .map(|id| {
-            rho_agent_host_proto::AgentId::from_encoded(id)
-                .with_context(|| format!("agent id {id}"))
+            rho_agent_types::AgentId::from_encoded(id).with_context(|| format!("agent id {id}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let path = db_path

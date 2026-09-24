@@ -6,7 +6,7 @@
 //! agent ended up with: they remember the label, or the thing they last
 //! asked for. Every one of those names finds it.
 
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 
 use crate::map::AgentMap;
 
@@ -58,7 +58,7 @@ mod tests {
     use rho_agent_host_proto::transcript::{
         AgentPos, RuntimeKind, SpawnedBy, TranscriptEvent, TurnEdge, TurnOutcome,
     };
-    use rho_agent_host_proto::{AgentIdDomain, MessageDelivery, UnixMs};
+    use rho_agent_types::{AgentIdDomain, MessageDelivery, UnixMs};
     use rho_hosts::HostId;
 
     use super::*;
@@ -70,9 +70,9 @@ mod tests {
 
     fn created(at: u64) -> TranscriptEvent {
         TranscriptEvent::Created {
-            role: rho_agent_host_proto::AgentRole::default(),
+            role: rho_agent_types::AgentRole::default(),
             runtime: RuntimeKind::Rho,
-            place: rho_agent_host_proto::Place {
+            place: rho_agent_types::Place {
                 workset: "0123456789ab".into(),
                 cwd: "/src/repo".into(),
                 mode: Default::default(),

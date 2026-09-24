@@ -266,12 +266,12 @@ pub(super) fn estimate(block: &ContextBlock) -> u64 {
 }
 
 fn estimate_visible(block: &ContextBlock, removed: &std::collections::BTreeSet<ToolCallId>) -> u64 {
-    fn parts(parts: &[rho_agent_host_proto::ContentPart]) -> u64 {
+    fn parts(parts: &[rho_agent_types::ContentPart]) -> u64 {
         parts
             .iter()
             .map(|part| match part {
-                rho_agent_host_proto::ContentPart::Text { text } => text_tokens(text),
-                rho_agent_host_proto::ContentPart::Image { .. } => 10000,
+                rho_agent_types::ContentPart::Text { text } => text_tokens(text),
+                rho_agent_types::ContentPart::Image { .. } => 10000,
             })
             .sum()
     }

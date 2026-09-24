@@ -12,7 +12,8 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_host_proto::agents::{self, ClientFrame, ServerFrame};
 use rho_agent_host_proto::transcript::{Live, LogEntry, Seq};
-use rho_agent_host_proto::{AgentId, AuthState, Open, QuotaSummary, read_frame, write_frame};
+use rho_agent_host_proto::{AuthState, Open, QuotaSummary, read_frame, write_frame};
+use rho_agent_types::AgentId;
 use rho_hosts::{Dialer, HostStream};
 
 use crate::HostId;

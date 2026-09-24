@@ -209,9 +209,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                                     content, phase, ..
                                 } => {
                                     let text: String = rho_inference::types::text_content(content);
-                                    if *phase
-                                        != Some(rho_agent_host_proto::MessagePhase::Commentary)
-                                    {
+                                    if *phase != Some(rho_agent_types::MessagePhase::Commentary) {
                                         if !final_answer.is_empty() {
                                             final_answer.push('\n');
                                         }

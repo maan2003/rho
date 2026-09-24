@@ -6,7 +6,7 @@ use rho_agent_host_proto::transcript::{
     AgentPos, Item, Live, LogEntry, RuntimeKind, Seq, SpawnedBy, ToolOutcome, ToolStatus,
     TranscriptEvent, Usage,
 };
-use rho_agent_host_proto::{AgentId, UnixMs};
+use rho_agent_types::{AgentId, UnixMs};
 use rho_db::RhoDb;
 #[cfg(test)]
 use rho_inference::types::ContextBlock;
@@ -191,7 +191,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
         };
     }
     let message =
-        |sender: &MessageSender, content: &[rho_agent_host_proto::ContentPart], delivery, at| {
+        |sender: &MessageSender, content: &[rho_agent_types::ContentPart], delivery, at| {
             TranscriptEvent::Message {
                 from: match sender {
                     MessageSender::User => None,
@@ -353,9 +353,9 @@ fn tool_outcome(result: &rho_inference::types::ToolResult) -> ToolOutcome {
     ToolOutcome {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_agent_host_proto::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_agent_host_proto::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_types::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_types::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         started_at: result.started_at,
         finished_at: result.finished_at,
@@ -452,7 +452,7 @@ fn is_compaction_summary(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use rho_agent_host_proto::{ContentPart, MessageDelivery, ToolOutputStatus};
+    use rho_agent_types::{ContentPart, MessageDelivery, ToolOutputStatus};
     use rho_inference::types::{ToolOutput, ToolResult, ToolUpdate};
 
     use super::*;
@@ -470,7 +470,7 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: "before".into(),
                 }],
-                phase: Some(rho_agent_host_proto::MessagePhase::Commentary),
+                phase: Some(rho_agent_types::MessagePhase::Commentary),
             },
             InferenceResponseItem::ToolCall {
                 provider_specific: data(),
@@ -484,7 +484,7 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: "after".into(),
                 }],
-                phase: Some(rho_agent_host_proto::MessagePhase::FinalAnswer),
+                phase: Some(rho_agent_types::MessagePhase::FinalAnswer),
             },
             InferenceResponseItem::Unknown {
                 provider_specific: data(),

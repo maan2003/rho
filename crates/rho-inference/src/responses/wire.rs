@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use rho_agent_host_proto::{ContentPart, MessagePhase};
+use rho_agent_types::{ContentPart, MessagePhase};
 use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde::Serialize;
 use serde_json::{Value, json};

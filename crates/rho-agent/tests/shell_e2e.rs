@@ -8,8 +8,8 @@ use std::sync::Arc;
 mod common;
 
 use rho_agent::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::shell::{ShellColor, ShellServerFrame};
+use rho_agent_types::AgentId;
 
 /// This binary is the sidecar when started with this argument.
 const CHILD_FLAG: &str = "--rho-shell-child";

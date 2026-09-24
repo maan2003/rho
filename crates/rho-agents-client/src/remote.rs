@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_host_proto::agents::{self, Call, VisualizationContent};
-use rho_agent_host_proto::{Open, Opened, WorkspaceInfo, read_frame, write_frame};
+use rho_agent_host_proto::{Open, Opened, read_frame, write_frame};
+use rho_agent_types::WorkspaceInfo;
 use rho_hosts::{ChannelTask, Dialer, Link};
 
 /// One host's agents, as a client reaches them. Cheap to clone; valid

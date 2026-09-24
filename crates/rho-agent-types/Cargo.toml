@@ -1,21 +1,15 @@
 [package]
 edition.workspace = true
 license.workspace = true
-name = "rho-visualizations"
+name = "rho-agent-types"
 readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 bytes.workspace = true
-redb.workspace = true
-rho-agent-types.workspace = true
-rho-db.workspace = true
+camino.workspace = true
+prefix-id = { workspace = true, default-features = false }
 senax-encoder.workspace = true
-sha2.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
-tokio.workspace = true
+serde.workspace = true

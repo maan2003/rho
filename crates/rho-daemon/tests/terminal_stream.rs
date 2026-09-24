@@ -10,9 +10,8 @@ use rho_agent_host_proto::agents::TerminalList;
 use rho_agent_host_proto::term::{
     ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, TerminalOpen, WireScreen,
 };
-use rho_agent_host_proto::{
-    AgentId, NewAgent, Open, Opened, StartMode, agents, read_frame, write_frame,
-};
+use rho_agent_host_proto::{NewAgent, Open, Opened, StartMode, agents, read_frame, write_frame};
+use rho_agent_types::AgentId;
 
 fn main() -> anyhow::Result<()> {
     let unshare = std::process::Command::new("unshare")
@@ -98,7 +97,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
                     repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
                     revset: "@".to_owned(),
                 },
-                mode: rho_agent_host_proto::WorksetMode::View,
+                mode: rho_agent_types::WorksetMode::View,
                 content: None,
             },
         ),

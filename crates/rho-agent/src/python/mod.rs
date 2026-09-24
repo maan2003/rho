@@ -40,7 +40,7 @@ use std::sync::Arc;
 pub use cell::{INTERRUPTED, PythonExec};
 pub(crate) use cells::Cells;
 pub use notebook::{Export, PythonNotebook, PythonStreamProgress, ToolCx, detached, operation};
-use rho_agent_host_proto::ToolOutputStatus;
+use rho_agent_types::ToolOutputStatus;
 use rho_inference::types::ToolOutput;
 pub use tool::{CellFacts, JobEnd, JobFacts, PythonCheckin};
 

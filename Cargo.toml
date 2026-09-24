@@ -47,6 +47,7 @@ members = [
   "crates/rho-transcript",
   "crates/rho-touch-keyboard",
   "crates/rho-agent-host-proto",
+  "crates/rho-agent-types",
   "crates/rho-window",
   "crates/rho-visualizations",
   "crates/rho-web-search",
@@ -159,6 +160,7 @@ rho-slack = { path = "crates/rho-slack", default-features = false }
 rho-transcript = { path = "crates/rho-transcript" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-agent-host-proto = { path = "crates/rho-agent-host-proto" }
+rho-agent-types = { path = "crates/rho-agent-types" }
 rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-fs-view = { path = "crates/rho-fs-view" }

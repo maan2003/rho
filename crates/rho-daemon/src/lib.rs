@@ -12,9 +12,9 @@ use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
-    AuthState, ContentPart, JoinTarget, Open, Opened, Place, StartMode, WorksetMode, WorkspaceInfo,
-    read_frame, write_frame,
+    AuthState, JoinTarget, Open, Opened, StartMode, read_frame, write_frame,
 };
+use rho_agent_types::{ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
@@ -1236,8 +1236,8 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
-    use rho_agent_host_proto::ContentPart;
     use rho_agent_host_proto::control::ServerFrame as ControlFrame;
+    use rho_agent_types::ContentPart;
 
     use super::{
         GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,

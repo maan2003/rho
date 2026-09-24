@@ -37,8 +37,8 @@ pub(crate) fn quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSum
 }
 
 fn claude_quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
-    let now = rho_agent_host_proto::UnixMs::now().0;
-    let since = rho_agent_host_proto::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
+    let now = rho_agent_types::UnixMs::now().0;
+    let since = rho_agent_types::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
         .into_iter()
         .filter_map(|((model, auth_namespace), observations)| {
@@ -132,7 +132,7 @@ fn hourly_global_usage_series(
 
 fn hourly_agent_cost_series(
     db: &RhoDb,
-    since: rho_agent_host_proto::UnixMs,
+    since: rho_agent_types::UnixMs,
 ) -> anyhow::Result<Vec<AgentCostSeries>> {
     const MAX_HOURLY_AGENT_COST_BUCKETS: usize = 500_000;
 
@@ -202,8 +202,8 @@ fn merge_hourly_agent_cost_bucket(
 
 pub(crate) fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
     let mut series = claude_quota_history(db);
-    let since = rho_agent_host_proto::UnixMs(
-        rho_agent_host_proto::UnixMs::now()
+    let since = rho_agent_types::UnixMs(
+        rho_agent_types::UnixMs::now()
             .0
             .saturating_sub(30 * 24 * 60 * 60 * 1_000),
     );
@@ -226,8 +226,8 @@ pub(crate) fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSerie
 }
 
 fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
-    let now = rho_agent_host_proto::UnixMs::now().0;
-    let since = rho_agent_host_proto::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
+    let now = rho_agent_types::UnixMs::now().0;
+    let since = rho_agent_types::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
         .into_iter()
         .filter_map(|((model, auth_namespace), observations)| {
@@ -250,7 +250,7 @@ fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
 
 fn quota_observation_groups(
     db: &RhoDb,
-    since: rho_agent_host_proto::UnixMs,
+    since: rho_agent_types::UnixMs,
 ) -> BTreeMap<(QuotaModel, Option<String>), Vec<QuotaObservationRecord>> {
     let read = db.read();
     let mut groups = BTreeMap::new();
@@ -305,7 +305,7 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
 pub(crate) fn global_usage(db: &RhoDb, since_ms: u64) -> Vec<AgentUsageSeries> {
     let usage = db
         .read()
-        .global_agent_usage(rho_agent_host_proto::UnixMs(since_ms));
+        .global_agent_usage(rho_agent_types::UnixMs(since_ms));
     hourly_global_usage_series(usage)
 }
 
@@ -315,11 +315,11 @@ pub(crate) fn agent_costs(db: &RhoDb, since_ms: u64) -> anyhow::Result<Vec<Agent
     const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
     const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_agent_host_proto::AGENT_COST_WINDOW_DAYS;
 
-    let now = rho_agent_host_proto::UnixMs::now().0;
+    let now = rho_agent_types::UnixMs::now().0;
     let earliest = since_ms
         .saturating_sub(rho_agent_host_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
         .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
-    hourly_agent_cost_series(db, rho_agent_host_proto::UnixMs(earliest))
+    hourly_agent_cost_series(db, rho_agent_types::UnixMs(earliest))
 }
 
 pub(crate) fn spawn_claude_quota_recorder(
@@ -337,7 +337,7 @@ pub(crate) fn spawn_claude_quota_recorder(
                     continue;
                 }
             };
-            let observed_at = rho_agent_host_proto::UnixMs::now();
+            let observed_at = rho_agent_types::UnixMs::now();
             let mut write = db.write().await;
             let mut changed = write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
@@ -416,8 +416,7 @@ mod tests {
     #[test]
     fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
         let agent_id =
-            rho_agent::db::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
-                .unwrap();
+            rho_agent::db::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
             bucket_start_ms,
             model: AgentUsageModel::GPT,
@@ -438,7 +437,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_agent_host_proto::UnixMs(at),
+            observed_at: rho_agent_types::UnixMs(at),
             used_percent,
             reset_at_unix,
         };
@@ -460,7 +459,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_agent_host_proto::UnixMs(at),
+            observed_at: rho_agent_types::UnixMs(at),
             used_percent,
             reset_at_unix: Some(100),
         };
@@ -482,7 +481,7 @@ mod tests {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
             auth_namespace: None,
-            observed_at: rho_agent_host_proto::UnixMs(at),
+            observed_at: rho_agent_types::UnixMs(at),
             used_percent,
             reset_at_unix: Some(reset_at_unix),
         };
@@ -502,14 +501,14 @@ mod tests {
     async fn claude_quota_history_includes_every_stored_point() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_agent_host_proto::UnixMs::now().0;
+        let now = rho_agent_types::UnixMs::now().0;
         let mut write = db.write().await;
         for index in 0..5 {
             assert!(write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,
                 auth_namespace: Some("default".to_owned()),
-                observed_at: rho_agent_host_proto::UnixMs(now - (4 - index) * 1_000),
+                observed_at: rho_agent_types::UnixMs(now - (4 - index) * 1_000),
                 used_percent: index as u8,
                 reset_at_unix: Some(123),
             }));
@@ -518,7 +517,7 @@ mod tests {
             provider: QuotaProvider::Claude,
             model: QuotaModel::FABLE,
             auth_namespace: None,
-            observed_at: rho_agent_host_proto::UnixMs(now),
+            observed_at: rho_agent_types::UnixMs(now),
             used_percent: 25,
             reset_at_unix: Some(456),
         }));
@@ -548,7 +547,7 @@ mod tests {
     async fn quota_summary_expires_stale_provider_window() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
-        let now = rho_agent_host_proto::UnixMs::now();
+        let now = rho_agent_types::UnixMs::now();
         let mut write = db.write().await;
         assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,

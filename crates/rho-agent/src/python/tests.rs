@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::prelude::*;
-use rho_agent_host_proto::{ContentPart, ToolOutputStatus, UnixMs};
+use rho_agent_types::{ContentPart, ToolOutputStatus, UnixMs};
 use rho_fs_view::PathOverrides;
 use rho_inference::types::{
     ContextBlock, ExecCall, ImageContent, ImageDetail, InferenceResponseItem, ToolCallId, ToolName,

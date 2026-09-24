@@ -12,6 +12,7 @@ rho-rpc.workspace = true
 alacritty_terminal.workspace = true
 rustix-openpty.workspace = true
 libc.workspace = true
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true

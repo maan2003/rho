@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use rho_agent_host_proto::ToolOutputStatus;
+use rho_agent_types::ToolOutputStatus;
 use rho_inference::types::{ExecId, ToolName, ToolOutput, ToolSpec, ToolType};
 use serde_json::{Value, json};
 

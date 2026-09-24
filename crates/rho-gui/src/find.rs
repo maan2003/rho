@@ -26,7 +26,7 @@
 //! scorer noticing.
 
 use gpui::{App, Context, Window};
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 use rho_agents_client::HostId;
 
 use crate::minibuffer::Candidate;
@@ -830,7 +830,7 @@ mod tests {
             path: path.to_owned(),
             kind: "agent",
             target: FindTarget::Agent(
-                AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).unwrap(),
+                AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).unwrap(),
             ),
             labels: Vec::new(),
             aka: Vec::new(),

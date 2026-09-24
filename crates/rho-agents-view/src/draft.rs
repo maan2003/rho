@@ -23,7 +23,7 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, Subscription, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
-use rho_agent_host_proto::ContentPart;
+use rho_agent_types::ContentPart;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;

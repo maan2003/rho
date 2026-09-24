@@ -6,7 +6,7 @@
 
 use std::borrow::Borrow;
 
-use rho_agent_host_proto::MessageDelivery;
+use rho_agent_types::MessageDelivery;
 
 use crate::state::{UiBlock, UiMessagePhase};
 

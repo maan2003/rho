@@ -519,7 +519,7 @@ fn agent_cost_percentile_points(
     let end_bucket = (now / HOUR_MS * HOUR_MS).saturating_sub(HOUR_MS);
     let half_life_hours = if days <= 7 { 12.0 } else { 48.0 };
     let decay = 0.5_f64.powf(1.0 / half_life_hours);
-    let mut hourly = HashMap::<u64, Vec<((usize, rho_agent_host_proto::AgentId), f64)>>::new();
+    let mut hourly = HashMap::<u64, Vec<((usize, rho_agent_types::AgentId), f64)>>::new();
     let mut first_bucket = end_bucket;
 
     for (host_index, series_set) in hosts.iter().enumerate() {
@@ -541,7 +541,7 @@ fn agent_cost_percentile_points(
         }
     }
 
-    let mut rolling = HashMap::<(usize, rho_agent_host_proto::AgentId), f64>::new();
+    let mut rolling = HashMap::<(usize, rho_agent_types::AgentId), f64>::new();
     let mut smoothed_histogram = [0.0; HISTOGRAM_BINS];
     let mut points = Vec::new();
     let mut bucket_start = first_bucket;
@@ -817,8 +817,7 @@ mod tests {
         );
 
         let agent_id =
-            rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
-                .unwrap();
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let points = agent_cost_percentile_points(
             &[vec![rho_agent_host_proto::AgentCostSeries {
                 agent_id,
@@ -834,8 +833,7 @@ mod tests {
     #[test]
     fn agent_cost_percentiles_keep_same_counter_agents_separate_across_hosts() {
         let agent_id =
-            rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
-                .unwrap();
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let series = |output_tokens| {
             vec![rho_agent_host_proto::AgentCostSeries {
                 agent_id,
@@ -862,8 +860,7 @@ mod tests {
     #[test]
     fn agent_cost_percentiles_ignore_the_current_partial_hour() {
         let agent_id =
-            rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
-                .unwrap();
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let now = 40 * HOUR_MS + HOUR_MS / 2;
         let points = agent_cost_percentile_points(
             &[vec![rho_agent_host_proto::AgentCostSeries {

@@ -17,9 +17,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::agents::ClientFrame;
 use rho_agent_host_proto::transcript::{AgentPos, Live, LogEntry, Seq, TranscriptEvent};
+use rho_agent_types::AgentId;
 use rho_hosts::HostStream;
 
 use crate::stream::{AgentCommands, AgentEvent, AgentFrame, AgentStream};
@@ -539,15 +539,15 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::AgentRole;
     use rho_agent_host_proto::transcript::{PresentationField, RuntimeKind, SpawnedBy};
+    use rho_agent_types::AgentRole;
 
     use super::*;
 
     const HOST: HostId = HostId(0);
 
     fn agent(id: u64) -> AgentId {
-        AgentId::from_counter(id, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent id")
+        AgentId::from_counter(id, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
     fn created(seq: u64, agent_id: AgentId) -> LogEntry {
@@ -558,7 +558,7 @@ mod tests {
             event: TranscriptEvent::Created {
                 role: AgentRole::default(),
                 runtime: RuntimeKind::Claude,
-                place: rho_agent_host_proto::Place {
+                place: rho_agent_types::Place {
                     workset: "0123456789ab".into(),
                     cwd: "/src/repo".into(),
                     mode: Default::default(),
@@ -568,7 +568,7 @@ mod tests {
                 spawn_name: None,
                 parent: None,
                 model: "test-model".to_owned(),
-                at: rho_agent_host_proto::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
             },
         }
     }
@@ -581,7 +581,7 @@ mod tests {
             event: TranscriptEvent::Presented {
                 title: PresentationField::Set(title.to_owned()),
                 activity: PresentationField::Unchanged,
-                at: rho_agent_host_proto::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
             },
         }
     }

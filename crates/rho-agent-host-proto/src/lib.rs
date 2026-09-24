@@ -1,6 +1,5 @@
-//! What a client and an agent host say to each other, and the words both
-//! sides share. The GUI depends on this crate and nothing else from the
-//! agent host.
+//! What a client and an agent host say to each other. The words they share
+//! about agents live in `rho-agent-types`.
 //!
 //! Transport, authentication, compression, and generic Senax framing live in
 //! `rho-rpc`; this crate owns message types, their limits, logical traffic
@@ -8,6 +7,9 @@
 
 use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
+use rho_agent_types::{
+    AgentId, AgentRole, ContentPart, MessageDelivery, WorksetMode, WorkspaceInfo,
+};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 /// Declares a part's one-shot calls. Each is a type of its own that names
@@ -62,7 +64,6 @@ pub mod client;
 pub mod control;
 pub mod desk;
 pub mod host;
-mod place;
 pub mod realtime;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
@@ -70,11 +71,8 @@ pub mod shell;
 pub mod shell_kernel;
 pub mod term;
 pub mod transcript;
-mod vocab;
 pub mod workspace;
-pub use place::*;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-pub use vocab::*;
 pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceServerFrame};
 
 /// Maximum accepted frame payload size.
@@ -733,6 +731,8 @@ fn read_protocol_log_record(
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::AgentIdDomain;
+
     use super::*;
 
     #[test]

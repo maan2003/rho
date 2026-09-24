@@ -27,13 +27,11 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
-#[cfg(test)]
-use rho_agent_host_proto::AdvisorIntelligence;
 use rho_agent_host_proto::desk::stream::ClientFrame as DeskClientFrame;
-use rho_agent_host_proto::{
-    AgentCommand, AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, NewAgent,
-    agents,
-};
+use rho_agent_host_proto::{AgentCommand, NewAgent, agents};
+#[cfg(test)]
+use rho_agent_types::AdvisorIntelligence;
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
 use rho_agents_client::create::{
     StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
     parse_workset_mode,
@@ -394,7 +392,7 @@ pub struct Workspace {
     /// Artifact surfaces hold the strong references; when the last file
     /// closes, the remote channel and cache entry naturally expire.
     remote_projects: HashMap<
-        (HostId, rho_agent_host_proto::WorkspaceInfo),
+        (HostId, rho_agent_types::WorkspaceInfo),
         gpui::WeakEntity<rho_files::RemoteProjectState>,
     >,
     /// Accumulated change summaries for materialized but hidden views; they
@@ -2935,7 +2933,7 @@ impl Workspace {
                 agent_id,
                 AgentCommand::Compact {
                     agent_id,
-                    delivery: rho_agent_host_proto::MessageDelivery::NextRequest,
+                    delivery: rho_agent_types::MessageDelivery::NextRequest,
                 },
                 cx,
             );
@@ -2992,7 +2990,7 @@ impl Workspace {
 
     pub(crate) fn cmd_change_agent_mode(
         &mut self,
-        mode: rho_agent_host_proto::WorksetMode,
+        mode: rho_agent_types::WorksetMode,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -4788,7 +4786,7 @@ impl Workspace {
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
-        workspace: rho_agent_host_proto::WorkspaceInfo,
+        workspace: rho_agent_types::WorkspaceInfo,
         path: Utf8PathBuf,
         cx: &mut Context<Self>,
     ) {
@@ -4907,7 +4905,7 @@ impl Workspace {
     fn cached_remote_project(
         &mut self,
         host: HostId,
-        workspace: &rho_agent_host_proto::WorkspaceInfo,
+        workspace: &rho_agent_types::WorkspaceInfo,
     ) -> Option<RemoteProject> {
         let key = (host, workspace.clone());
         let state = self.remote_projects.get(&key)?.clone();
@@ -4923,7 +4921,7 @@ impl Workspace {
     fn cache_remote_project(
         &mut self,
         host: HostId,
-        workspace: rho_agent_host_proto::WorkspaceInfo,
+        workspace: rho_agent_types::WorkspaceInfo,
         opened: RemoteProject,
     ) -> RemoteProject {
         if let Some(existing) = self.cached_remote_project(host, &workspace) {
@@ -9134,10 +9132,10 @@ pub(crate) fn resolve_filing_destination(
 }
 
 /// How a filesystem mode reads in a prompt: the draft field's words.
-fn mode_label(mode: rho_agent_host_proto::WorksetMode) -> &'static str {
+fn mode_label(mode: rho_agent_types::WorksetMode) -> &'static str {
     match mode {
-        rho_agent_host_proto::WorksetMode::View => "view",
-        rho_agent_host_proto::WorksetMode::Exposed => "exposed",
+        rho_agent_types::WorksetMode::View => "view",
+        rho_agent_types::WorksetMode::Exposed => "exposed",
     }
 }
 

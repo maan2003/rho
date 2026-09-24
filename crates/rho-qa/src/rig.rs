@@ -24,7 +24,8 @@ use rho_agent_host_proto::agents::{
 };
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::TranscriptEvent;
-use rho_agent_host_proto::{AgentRole, ContentPart, JoinTarget, NewAgent, StartMode};
+use rho_agent_host_proto::{JoinTarget, NewAgent, StartMode};
+use rho_agent_types::{AgentRole, ContentPart};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1157,7 +1158,7 @@ async fn probe_async(name: &str) -> Result<()> {
         start: StartMode::Join(JoinTarget::User {
             repo: workspace.try_into().context("rig workspace is not UTF-8")?,
         }),
-        mode: rho_agent_host_proto::WorksetMode::View,
+        mode: rho_agent_types::WorksetMode::View,
         content: Some(vec![ContentPart::Text {
             text: "Complete one deterministic rig probe turn.".to_owned(),
         }]),

@@ -163,14 +163,14 @@ impl From<rho_agent_host_proto::desk::cells::Id> for NodeIdentity {
 )]
 pub struct AgentIdentity(pub String);
 
-impl From<rho_agent_host_proto::AgentId> for AgentIdentity {
-    fn from(id: rho_agent_host_proto::AgentId) -> Self {
+impl From<rho_agent_types::AgentId> for AgentIdentity {
+    fn from(id: rho_agent_types::AgentId) -> Self {
         Self(id.encoded())
     }
 }
 
-impl From<&rho_agent_host_proto::AgentId> for AgentIdentity {
-    fn from(id: &rho_agent_host_proto::AgentId) -> Self {
+impl From<&rho_agent_types::AgentId> for AgentIdentity {
+    fn from(id: &rho_agent_types::AgentId) -> Self {
         Self(id.encoded())
     }
 }

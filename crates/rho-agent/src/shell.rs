@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alacritty_terminal::vte::{self, Params, Perform};
 use anyhow::Context as _;
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::shell::{
     MAX_STYLE_SPANS, ShellColor, ShellServerFrame, ShellStyleSpan, ShellTextStyle,
 };
@@ -25,6 +24,7 @@ use rho_agent_host_proto::shell_kernel::{
     MAX_ACTIVE_PAGERS, MAX_PAGER_BYTES, MAX_PAGER_LINES, MAX_PROMPT_BYTES, PROTOCOL_VERSION,
     PagerAction, Request, Response,
 };
+use rho_agent_types::AgentId;
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 

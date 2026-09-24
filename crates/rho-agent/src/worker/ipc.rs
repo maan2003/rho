@@ -5,7 +5,7 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_inference::types::ExecId;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -26,14 +26,14 @@ pub(super) struct Bootstrap {
 pub(super) enum Control {
     Retire,
     User {
-        content: Vec<rho_agent_host_proto::ContentPart>,
-        delivery: rho_agent_host_proto::MessageDelivery,
+        content: Vec<rho_agent_types::ContentPart>,
+        delivery: rho_agent_types::MessageDelivery,
     },
     Mail {
-        sender: rho_agent_host_proto::AgentId,
+        sender: rho_agent_types::AgentId,
         label: String,
         body: String,
-        delivery: rho_agent_host_proto::MessageDelivery,
+        delivery: rho_agent_types::MessageDelivery,
     },
     NoticeCarried,
     TellTail,
@@ -757,13 +757,13 @@ mod tests {
                         crate::native::NativeEvent::RequestStarted {
                             input: vec![rho_inference::types::ContextBlock::UserMessage {
                                 sender: crate::MessageSender::User,
-                                content: vec![rho_agent_host_proto::ContentPart::Text {
+                                content: vec![rho_agent_types::ContentPart::Text {
                                     text: "a".repeat(count),
                                 }],
                             }],
                             context: None,
                             wake: None,
-                            at: rho_agent_host_proto::UnixMs(1),
+                            at: rho_agent_types::UnixMs(1),
                         },
                     )),
                 })
@@ -785,7 +785,7 @@ mod tests {
         let rho_inference::types::ContextBlock::UserMessage { content, .. } = &input[0] else {
             panic!()
         };
-        let rho_agent_host_proto::ContentPart::Text { text } = &content[0] else {
+        let rho_agent_types::ContentPart::Text { text } = &content[0] else {
             panic!()
         };
         assert_eq!(text.len(), count);

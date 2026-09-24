@@ -7,12 +7,13 @@
 //! a [`ServerFrame`]. Whatever else is asked of the agents is a stream of
 //! its own: one [`Call`], or a terminal, shell or workspace channel.
 
+use rho_agent_types::{AgentId, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 use crate::transcript::{AgentPos, DetailBody, Live, LogEntry, Seq};
 use crate::{
-    AgentCommand, AgentCostSeries, AgentId, AgentUsageSeries, AuthState, NewAgent, QuotaSeries,
-    QuotaSummary, WorkspaceInfo, shell, term,
+    AgentCommand, AgentCostSeries, AgentUsageSeries, AuthState, NewAgent, QuotaSeries,
+    QuotaSummary, shell, term,
 };
 
 /// What an agents stream is for.
@@ -261,8 +262,9 @@ pub enum ServerFrame {
 
 #[cfg(test)]
 mod tests {
+    use rho_agent_types::AgentIdDomain;
+
     use super::*;
-    use crate::AgentIdDomain;
     use crate::transcript::{Item, TextPhase};
 
     fn round_trips<
@@ -303,7 +305,7 @@ mod tests {
                 text: "lo".to_owned(),
             },
             Live::Waiting {
-                until: Some(crate::UnixMs(5)),
+                until: Some(rho_agent_types::UnixMs(5)),
             },
             Live::Idle,
         ] {

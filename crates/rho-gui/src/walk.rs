@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use editor::Editor;
 use gpui::{App, Entity, TestAppContext, TestDispatcher, WindowHandle, point, px, size};
-use rho_agent_host_proto::{AgentId, AgentIdDomain, UnixMs};
+use rho_agent_types::{AgentId, AgentIdDomain, UnixMs};
 use rho_agents_client::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };

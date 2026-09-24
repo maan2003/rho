@@ -58,6 +58,7 @@ redb-derive = { workspace = true }
 prefix-id = { workspace = true, features = ["redb"] }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-browser = { workspace = true }
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
 rho-files = { workspace = true }

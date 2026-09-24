@@ -31,11 +31,11 @@ use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb, StdSyncHandler,
 };
 use anyhow::Context as _;
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::term::{
     TermCell, TermCellFlags, TermColor, TermCursor, TermCursorShape, TermRow, TermScreen,
     TermServerFrame,
 };
+use rho_agent_types::AgentId;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Mutex, mpsc, oneshot};
 

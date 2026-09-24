@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
         let agent=rho_agent_host_proto::client::agents(&socket,NewAgent {
             role:Default::default(), start:rho_agent_host_proto::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
-            mode:rho_agent_host_proto::WorksetMode::Exposed,content:None,
+            mode:rho_agent_types::WorksetMode::Exposed,content:None,
         }).await.context("agent creation failed")?;
         let desktop_name = "preview".to_owned();
         let desktop_directory = runtime.join("rho-desktop/agents").join(agent.encoded());

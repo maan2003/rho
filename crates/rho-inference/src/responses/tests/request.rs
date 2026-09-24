@@ -160,8 +160,7 @@ fn renders_text_and_image_user_content() {
 fn renders_agent_mail_with_supplied_short_label() {
     let session = test_inference_service("gpt-test");
     let agent_id =
-        rho_agent_host_proto::AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0))
-            .unwrap();
+        rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
     let mut agent_id_labels = std::collections::BTreeMap::new();
     agent_id_labels.insert(agent_id, Arc::from("eng-h6u7"));
     let request = InferenceRequest {
@@ -603,10 +602,10 @@ fn serializes_custom_tool_calls_and_results() {
                 detail: crate::types::ImageDetail::Original,
             }]),
             output: Arc::from("custom output".to_owned()),
-            status: rho_agent_host_proto::ToolOutputStatus::Success,
+            status: rho_agent_types::ToolOutputStatus::Success,
         },
-        started_at: rho_agent_host_proto::UnixMs(1),
-        finished_at: rho_agent_host_proto::UnixMs(2),
+        started_at: rho_agent_types::UnixMs(1),
+        finished_at: rho_agent_types::UnixMs(2),
         metadata: None,
     };
     let request = inference_request(vec![
@@ -683,10 +682,10 @@ fn exec_updates_are_named_and_unpaired_across_compaction_and_incremental_replay(
                 full_output: None,
                 images: Arc::new(Vec::new()),
                 output: Arc::new("Running".to_owned()),
-                status: rho_agent_host_proto::ToolOutputStatus::Success,
+                status: rho_agent_types::ToolOutputStatus::Success,
             },
-            started_at: rho_agent_host_proto::UnixMs(1),
-            finished_at: rho_agent_host_proto::UnixMs(2),
+            started_at: rho_agent_types::UnixMs(1),
+            finished_at: rho_agent_types::UnixMs(2),
             metadata: None,
         }],
     });
@@ -701,7 +700,7 @@ fn exec_updates_are_named_and_unpaired_across_compaction_and_incremental_replay(
         tool_type: ToolType::Custom,
         output: Arc::new("Command completed".to_owned()),
         full_output: None,
-        at: rho_agent_host_proto::UnixMs(3),
+        at: rho_agent_types::UnixMs(3),
     }));
     let compact = inference_response(
         Some("resp-compact"),
@@ -857,10 +856,10 @@ fn current_exec_reply_precedes_background_updates_and_is_only_paired_once() {
                     full_output: None,
                     images: Arc::new(Vec::new()),
                     output: Arc::new(text.to_owned()),
-                    status: rho_agent_host_proto::ToolOutputStatus::Success,
+                    status: rho_agent_types::ToolOutputStatus::Success,
                 },
-                started_at: rho_agent_host_proto::UnixMs(1),
-                finished_at: rho_agent_host_proto::UnixMs(2),
+                started_at: rho_agent_types::UnixMs(1),
+                finished_at: rho_agent_types::UnixMs(2),
                 metadata: None,
             }],
         })
@@ -873,7 +872,7 @@ fn current_exec_reply_precedes_background_updates_and_is_only_paired_once() {
             tool_type: ToolType::Custom,
             output: Arc::new(text.to_owned()),
             full_output: None,
-            at: rho_agent_host_proto::UnixMs(3),
+            at: rho_agent_types::UnixMs(3),
         }))
     };
     let blocks = vec![
@@ -1181,8 +1180,8 @@ fn eviction_removes_only_selected_tool_exchanges_and_invalidates_old_continuatio
             tool_type: ToolType::Function,
             output: Arc::new("old-late-output".into()),
             full_output: None,
-            status: Some(rho_agent_host_proto::ToolOutputStatus::Success),
-            at: rho_agent_host_proto::UnixMs(1),
+            status: Some(rho_agent_types::ToolOutputStatus::Success),
+            at: rho_agent_types::UnixMs(1),
             images: Default::default(),
         })),
         Arc::new(ContextBlock::ToolHistoryEvicted {

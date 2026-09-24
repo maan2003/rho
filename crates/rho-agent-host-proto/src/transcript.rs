@@ -9,9 +9,8 @@
 //! This vocabulary is shared with the daemon's raw log: the runtimes write
 //! these very types, so there are no twins to keep in step.
 
+use rho_agent_types::{AgentId, AgentRole, MessageDelivery, Place, UnixMs, WorksetMode};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
-
-use crate::{AgentId, AgentRole, MessageDelivery, Place, UnixMs, WorksetMode};
 
 /// A position in one agent's log: dense, starting at zero with the
 /// agent's creation, never reused. A rewind is told at a new position
@@ -242,7 +241,7 @@ pub enum TranscriptEvent {
     },
     ExecObserved {
         id: String,
-        milestone: crate::ExecMilestone,
+        milestone: rho_agent_types::ExecMilestone,
         at: UnixMs,
     },
 }

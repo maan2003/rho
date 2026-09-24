@@ -17,8 +17,8 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
-use rho_agent_host_proto::AgentId;
 pub use rho_agent_host_proto::desk::cells::SlackUnit;
+use rho_agent_types::AgentId;
 use rho_agents_client::{AgentMap, HostId};
 
 use crate::workspace::Workspace;
@@ -1896,7 +1896,7 @@ fn outcome_label(facts: &rho_agents_client::AgentFacts, wait_days: f64) -> Strin
 }
 
 fn reply_wait_days(
-    ended: rho_agent_host_proto::UnixMs,
+    ended: rho_agent_types::UnixMs,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> f64 {
     (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0

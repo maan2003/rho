@@ -1,4 +1,4 @@
-use rho_agent_host_proto::{ContentPart, UnixMs};
+use rho_agent_types::{ContentPart, UnixMs};
 use rho_db::RhoDb;
 use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
@@ -908,7 +908,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
                 output: std::sync::Arc::new("already ran".into()),
                 full_output: None,
                 images: Default::default(),
-                status: rho_agent_host_proto::ToolOutputStatus::Success,
+                status: rho_agent_types::ToolOutputStatus::Success,
             },
         )],
         wake: crate::WakeFacts::interrupt(),
@@ -971,7 +971,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
 
 #[tokio::test]
 async fn native_later_image_survives_reopen_and_provider_projection() {
-    use rho_agent_host_proto::ToolOutputStatus;
+    use rho_agent_types::ToolOutputStatus;
     use rho_inference::types::{ContextBlock, ExecOutput, ToolOutput};
 
     use crate::native::NativeEvent;

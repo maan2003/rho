@@ -10,8 +10,9 @@ use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 use rho_agent_host_proto::transcript::Seq;
 use rho_agent_host_proto::{
-    AgentCommand, AgentId, Answer, NewAgent, Open, agents, host, read_frame, write_frame,
+    AgentCommand, Answer, NewAgent, Open, agents, host, read_frame, write_frame,
 };
+use rho_agent_types::AgentId;
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 

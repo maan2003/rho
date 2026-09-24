@@ -22,6 +22,7 @@ dirs.workspace = true
 flate2 = "1"
 redb.workspace = true
 reqwest.workspace = true
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 rho-fake-model.workspace = true
 rustls.workspace = true

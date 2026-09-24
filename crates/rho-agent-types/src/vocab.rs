@@ -1,5 +1,4 @@
-//! The words both sides of the agent host protocol use: who an agent is,
-//! what a message holds, and when things happened.
+//! Who an agent is, what a message holds, and when things happened.
 
 use prefix_id::{PrefixId, PrefixIdDomain};
 use senax_encoder::{Decode, Encode, Pack, Unpack};

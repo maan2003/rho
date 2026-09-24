@@ -17,9 +17,8 @@ use rho_agent_host_proto::agents::{
 };
 use rho_agent_host_proto::client::Client;
 use rho_agent_host_proto::transcript::{AgentPos, DetailBody, Seq, TranscriptEvent, TurnEdge};
-use rho_agent_host_proto::{
-    AgentCommand, AgentId, AgentRole, ContentPart, MessageDelivery, NewAgent, StartMode,
-};
+use rho_agent_host_proto::{AgentCommand, NewAgent, StartMode};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, MessageDelivery};
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
 use serde::Deserialize;
 use serde_json::json;
@@ -211,7 +210,7 @@ async fn run_async(args: Args) -> Result<()> {
                 repo: repo.clone(),
                 revset: "HEAD".into(),
             },
-            mode: rho_agent_host_proto::WorksetMode::View,
+            mode: rho_agent_types::WorksetMode::View,
             content: Some(prompt(index, 0)),
         });
     }

@@ -15,6 +15,7 @@ collections = { path = "../../vendor/zed/crates/collections" }
 futures.workspace = true
 prefix-id = { workspace = true, default-features = false, features = ["redb"] }
 redb = { workspace = true }
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 rho-db = { workspace = true }
 rho-hosts = { workspace = true }

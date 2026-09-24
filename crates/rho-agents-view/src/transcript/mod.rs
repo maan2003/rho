@@ -44,7 +44,7 @@ use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, Weak
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
-use rho_agent_host_proto::AgentId;
+use rho_agent_types::AgentId;
 use rho_agents_client::elision::ElisionPlan;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::state::{UiAgentState, UiBlock};
@@ -436,7 +436,7 @@ impl TranscriptModel {
         state: &UiAgentState,
         summary: FrameSummary,
         now_ms: u64,
-        agent_label: &impl Fn(rho_agent_host_proto::AgentId) -> String,
+        agent_label: &impl Fn(rho_agent_types::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
         self.turn_open = rho_agents_client::store::turn_open(state.status);

@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::transcript::{Item, Live, QueuedItem};
+use rho_agent_types::AgentId;
 
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
@@ -159,7 +159,7 @@ enum Phase {
     #[default]
     Unknown,
     Requesting,
-    Waiting(Option<rho_agent_host_proto::UnixMs>),
+    Waiting(Option<rho_agent_types::UnixMs>),
     Idle,
 }
 
@@ -402,7 +402,7 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::{AgentIdDomain, MessageDelivery};
+    use rho_agent_types::{AgentIdDomain, MessageDelivery};
 
     use super::*;
 
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn durable_provider_timing_reaches_the_live_tail_before_response_commit() {
         use rho_agent_host_proto::transcript::{AgentPos, TranscriptEvent};
-        use rho_agent_host_proto::{ExecMilestone, UnixMs};
+        use rho_agent_types::{ExecMilestone, UnixMs};
 
         use crate::fold::TranscriptFold;
         let mut store = AgentStore::default();

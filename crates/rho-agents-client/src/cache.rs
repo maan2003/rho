@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::{TableDefinition, TableHandle};
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::transcript::{AgentPos, LogEntry, Seq, TranscriptEvent};
+use rho_agent_types::AgentId;
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 
 use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
@@ -656,7 +656,7 @@ mod tests {
     use super::*;
 
     fn agent_id(counter: u64) -> AgentId {
-        AgentId::from_counter(counter, &rho_agent_host_proto::AgentIdDomain(7)).expect("agent id")
+        AgentId::from_counter(counter, &rho_agent_types::AgentIdDomain(7)).expect("agent id")
     }
 
     fn told(agent: AgentId, from_seq: u64) -> Vec<LogEntry> {
@@ -664,7 +664,7 @@ mod tests {
             TranscriptEvent::Created {
                 role: Default::default(),
                 runtime: RuntimeKind::Rho,
-                place: rho_agent_host_proto::Place {
+                place: rho_agent_types::Place {
                     workset: "0123456789ab".into(),
                     cwd: "/src/repo".into(),
                     mode: Default::default(),
@@ -674,17 +674,17 @@ mod tests {
                 spawn_name: Some("the deploy".to_owned()),
                 parent: None,
                 model: "sol".to_owned(),
-                at: rho_agent_host_proto::UnixMs(1_000),
+                at: rho_agent_types::UnixMs(1_000),
             },
             TranscriptEvent::Message {
                 from: None,
                 text: "have a look".to_owned(),
-                delivery: rho_agent_host_proto::MessageDelivery::Immediate,
-                at: rho_agent_host_proto::UnixMs(1_000),
+                delivery: rho_agent_types::MessageDelivery::Immediate,
+                at: rho_agent_types::UnixMs(1_000),
             },
             TranscriptEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Completed),
-                at: rho_agent_host_proto::UnixMs(2_000),
+                at: rho_agent_types::UnixMs(2_000),
             },
         ]
         .into_iter()

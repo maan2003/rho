@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_agent_host_proto::ContentPart;
+use rho_agent_types::ContentPart;
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use rho_inference::Inference;
 use rho_inference::types::{ContextItemEvent, PendingInferenceResponse};
@@ -286,7 +286,7 @@ pub(crate) struct ClaudeLoop {
     /// arrives to carry it.
     python_wake: Option<crate::WakeFacts>,
     /// When the boundary said to ask it again, if it can change by itself.
-    python_recheck: Option<rho_agent_host_proto::UnixMs>,
+    python_recheck: Option<rho_agent_types::UnixMs>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
     response_execs: BTreeMap<usize, rho_inference::types::ExecId>,
@@ -649,7 +649,7 @@ impl ClaudeLoop {
                         content: (*content).clone(),
                     },
                     delivery,
-                    at: rho_agent_host_proto::UnixMs::now(),
+                    at: rho_agent_types::UnixMs::now(),
                 };
                 // The queue is Claude Code's, in its process: no row says
                 // a message waits (nothing would persist it across a
@@ -1286,7 +1286,7 @@ impl ClaudeLoop {
             rho_claude::ClaudeEvent::Result(message) => {
                 let successful = !message.is_error;
                 if let Some(host) = &mut self.python {
-                    host.turn_ended(rho_agent_host_proto::UnixMs::now());
+                    host.turn_ended(rho_agent_types::UnixMs::now());
                     // A turn that ends with a call still open is the CLI
                     // having given up on it (its timeout, or an abort);
                     // answer it anyway so the notebook takes the next one.
@@ -1423,7 +1423,7 @@ impl ClaudeLoop {
                                     .into(),
                             )
                         } else {
-                            let now = rho_agent_host_proto::UnixMs::now();
+                            let now = rho_agent_types::UnixMs::now();
                             self.host
                                 .append(AgentEvent::ClaudeExecAdmitted {
                                     call: rho_inference::types::ExecCall {
@@ -1484,7 +1484,7 @@ impl ClaudeLoop {
     /// waiting, or an idle model is woken with it as a message. A working
     /// model with no call open hears it at its next call or turn end.
     async fn python_tick(&mut self) -> anyhow::Result<()> {
-        let now = rho_agent_host_proto::UnixMs::now();
+        let now = rho_agent_types::UnixMs::now();
         let idle = matches!(self.state.kind, AgentStateKind::Idle)
             && self.process.is_some()
             && self.queued_turns.is_empty()
@@ -1512,7 +1512,7 @@ impl ClaudeLoop {
                     });
                     self.observe_exec(
                         pending.exec_id.clone(),
-                        rho_agent_host_proto::ExecMilestone::Boundary,
+                        rho_agent_types::ExecMilestone::Boundary,
                         now,
                     )
                     .await?;
@@ -1520,8 +1520,8 @@ impl ClaudeLoop {
                         self.output_handed_off(batch).await?;
                         self.observe_exec(
                             pending.exec_id,
-                            rho_agent_host_proto::ExecMilestone::HandedOff,
-                            rho_agent_host_proto::UnixMs::now(),
+                            rho_agent_types::ExecMilestone::HandedOff,
+                            rho_agent_types::UnixMs::now(),
                         )
                         .await?;
                     } else {
@@ -1555,7 +1555,7 @@ impl ClaudeLoop {
         &mut self,
         drained: &mut python_host::Drained,
         wake: crate::WakeFacts,
-        at: rho_agent_host_proto::UnixMs,
+        at: rho_agent_types::UnixMs,
     ) -> anyhow::Result<Uuid> {
         if let Some(retained) = &self.pending_output {
             drained
@@ -1592,7 +1592,7 @@ impl ClaudeLoop {
         self.host
             .append(AgentEvent::ClaudeOutputHandedOff {
                 id,
-                at: rho_agent_host_proto::UnixMs::now(),
+                at: rho_agent_types::UnixMs::now(),
             })
             .await?;
         self.pending_output = None;
@@ -1605,7 +1605,7 @@ impl ClaudeLoop {
         let Some(host) = self.python.as_mut() else {
             return Ok(());
         };
-        if let Some(pending) = host.cancel(rho_agent_host_proto::UnixMs::now()) {
+        if let Some(pending) = host.cancel(rho_agent_types::UnixMs::now()) {
             let reply = serde_json::json!({
                 "mcp_response": {
                     "jsonrpc": "2.0",
@@ -1685,7 +1685,7 @@ impl ClaudeLoop {
         &mut self,
         uuid: Uuid,
         line: TranscriptLine,
-        at: rho_agent_host_proto::UnixMs,
+        at: rho_agent_types::UnixMs,
     ) -> anyhow::Result<()> {
         // The notebook's reason for speaking rides on the row it produced:
         // an exec call's results, or the message of output an idle model
@@ -1899,10 +1899,7 @@ impl ClaudeLoop {
         }
 
         if let Some(host) = &mut self.python {
-            host.failed(
-                rho_agent_host_proto::UnixMs::now(),
-                Arc::from(error.to_string()),
-            );
+            host.failed(rho_agent_types::UnixMs::now(), Arc::from(error.to_string()));
         }
         // The row first, so what Claude had said is kept and the tail
         // the loop tells next follows it.
@@ -1929,8 +1926,8 @@ impl ClaudeLoop {
     async fn observe_exec(
         &self,
         id: rho_inference::types::ExecId,
-        milestone: rho_agent_host_proto::ExecMilestone,
-        at: rho_agent_host_proto::UnixMs,
+        milestone: rho_agent_types::ExecMilestone,
+        at: rho_agent_types::UnixMs,
     ) -> anyhow::Result<()> {
         self.host
             .append(AgentEvent::ExecObserved { id, milestone, at })
@@ -1942,7 +1939,7 @@ impl ClaudeLoop {
         &mut self,
         event: rho_claude::protocol::MessageStreamEvent,
     ) -> anyhow::Result<()> {
-        let now = rho_agent_host_proto::UnixMs::now();
+        let now = rho_agent_types::UnixMs::now();
         match &event {
             rho_claude::protocol::MessageStreamEvent::MessageStart { .. } => {
                 self.response_execs.clear()
@@ -1953,27 +1950,19 @@ impl ClaudeLoop {
             } if name == "mcp__py__exec" => {
                 let id = rho_inference::types::ExecId::try_from(id.as_str())?;
                 self.response_execs.insert(*index, id.clone());
-                self.observe_exec(id, rho_agent_host_proto::ExecMilestone::FirstBlock, now)
+                self.observe_exec(id, rho_agent_types::ExecMilestone::FirstBlock, now)
                     .await?;
             }
             rho_claude::protocol::MessageStreamEvent::ContentBlockStop { index } => {
                 if let Some(id) = self.response_execs.get(index).cloned() {
-                    self.observe_exec(
-                        id,
-                        rho_agent_host_proto::ExecMilestone::ArgumentsFinished,
-                        now,
-                    )
-                    .await?;
+                    self.observe_exec(id, rho_agent_types::ExecMilestone::ArgumentsFinished, now)
+                        .await?;
                 }
             }
             rho_claude::protocol::MessageStreamEvent::MessageStop => {
                 for id in self.response_execs.values().cloned().collect::<Vec<_>>() {
-                    self.observe_exec(
-                        id,
-                        rho_agent_host_proto::ExecMilestone::ResponseFinished,
-                        now,
-                    )
-                    .await?;
+                    self.observe_exec(id, rho_agent_types::ExecMilestone::ResponseFinished, now)
+                        .await?;
                 }
             }
             _ => {}
@@ -2065,7 +2054,7 @@ impl crate::ClaudeOutputBatch {
 /// to ask it again. Never, for an agent without a notebook.
 async fn python_wake(
     notify: Option<&tokio::sync::Notify>,
-    recheck: Option<rho_agent_host_proto::UnixMs>,
+    recheck: Option<rho_agent_types::UnixMs>,
 ) {
     let Some(notify) = notify else {
         return std::future::pending().await;
@@ -2073,7 +2062,7 @@ async fn python_wake(
     let timer = async move {
         match recheck {
             Some(at) => {
-                let wait = at.0.saturating_sub(rho_agent_host_proto::UnixMs::now().0);
+                let wait = at.0.saturating_sub(rho_agent_types::UnixMs::now().0);
                 tokio::time::sleep(Duration::from_millis(wait)).await;
             }
             None => std::future::pending().await,
@@ -2225,7 +2214,7 @@ mod tests {
                 content: (*text("claude-normalized text")).clone(),
             },
             delivery: MessageDelivery::Immediate,
-            at: rho_agent_host_proto::UnixMs(0),
+            at: rho_agent_types::UnixMs(0),
         });
         assert!(promote_queued_user_message(&mut state));
 

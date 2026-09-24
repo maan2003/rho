@@ -17,6 +17,7 @@ futures.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 redb = { workspace = true }
 rho-db = { workspace = true }
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 senax-encoder = { workspace = true }
 serde.workspace = true

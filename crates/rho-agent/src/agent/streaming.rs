@@ -82,7 +82,7 @@ impl Agent {
         set_source(&mut identity, String::new());
         self.persist(AgentEvent::ExecObserved {
             id: incoming.id.clone(),
-            milestone: rho_agent_host_proto::ExecMilestone::FirstBlock,
+            milestone: rho_agent_types::ExecMilestone::FirstBlock,
             at: now,
         })
         .await?;

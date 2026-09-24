@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_agent_host_proto::AgentId;
 use rho_agent_host_proto::transcript::{AgentPos, TranscriptEvent};
+use rho_agent_types::AgentId;
 use rho_agents_client::TranscriptFold;
 use rho_agents_client::state::UiAgentState;
 use rho_agents_client::store::{AgentStore, FrameSummary};
@@ -133,12 +133,12 @@ impl Transcripts {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_host_proto::{MessageDelivery, UnixMs};
+    use rho_agent_types::{MessageDelivery, UnixMs};
 
     use super::*;
 
     fn agent() -> AgentId {
-        AgentId::from_counter(1, &rho_agent_host_proto::AgentIdDomain(0)).expect("an agent id")
+        AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).expect("an agent id")
     }
 
     fn said(text: &str, at: u64) -> TranscriptEvent {

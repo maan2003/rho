@@ -5,7 +5,7 @@
 //! showed how long ago the user talked, and an agent the user never
 //! messaged showed a turn running since the epoch, "20704.2d".
 
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_agents_client::AgentFacts;
 
 use crate::home::running_elapsed_label;

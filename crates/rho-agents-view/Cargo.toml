@@ -18,6 +18,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+rho-agent-types.workspace = true
 rho-agent-host-proto.workspace = true
 rho-agents-client = { workspace = true }
 rho-window = { workspace = true }

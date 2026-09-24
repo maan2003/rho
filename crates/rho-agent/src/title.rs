@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rho_agent_host_proto::UnixMs;
+use rho_agent_types::UnixMs;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::Semaphore;
@@ -157,9 +157,9 @@ mod tests {
         AgentEvent::Accepted(QueuedInput {
             source,
             kind: InputKind::Message {
-                content: vec![rho_agent_host_proto::ContentPart::Text { text: text.into() }],
+                content: vec![rho_agent_types::ContentPart::Text { text: text.into() }],
             },
-            delivery: rho_agent_host_proto::MessageDelivery::Immediate,
+            delivery: rho_agent_types::MessageDelivery::Immediate,
             at: UnixMs(1),
         })
     }

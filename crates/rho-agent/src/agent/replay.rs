@@ -198,7 +198,7 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_inference::ty
 #[cfg(test)]
 mod tests {
 
-    use rho_agent_host_proto::{ContentPart, MessageDelivery, UnixMs};
+    use rho_agent_types::{ContentPart, MessageDelivery, UnixMs};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
@@ -299,7 +299,7 @@ mod tests {
                     sender: MessageSender::User,
                     content: text_parts("go"),
                 }]),
-                at: rho_agent_host_proto::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
                 wake: None,
                 context: None,
             }),
@@ -310,7 +310,7 @@ mod tests {
                 }]),
                 context_used: Some(40),
                 usage: None,
-                at: rho_agent_host_proto::UnixMs(0),
+                at: rho_agent_types::UnixMs(0),
             }),
         ]);
         assert!(replayed.user.is_empty());
@@ -339,13 +339,13 @@ mod tests {
             crate::native::NativeEvent::RequestStarted {
                 input: vec![ContextBlock::UserMessage {
                     sender: MessageSender::User,
-                    content: vec![rho_agent_host_proto::ContentPart::Text {
+                    content: vec![rho_agent_types::ContentPart::Text {
                         text: "saved conversation".into(),
                     }],
                 }],
                 context: None,
                 wake: None,
-                at: rho_agent_host_proto::UnixMs(1),
+                at: rho_agent_types::UnixMs(1),
             },
         )];
         assert!(replay(events.clone()).recovery_notes.is_empty());
@@ -371,7 +371,7 @@ mod tests {
             }],
             context_used: None,
             usage: None,
-            at: rho_agent_host_proto::UnixMs(1),
+            at: rho_agent_types::UnixMs(1),
         }));
         let recovered = replay(events.clone());
         assert_eq!(recovered.history.len(), 1);
@@ -385,15 +385,15 @@ mod tests {
                         output: Arc::new(String::new()),
                         full_output: None,
                         images: Default::default(),
-                        status: rho_agent_host_proto::ToolOutputStatus::Cancelled,
+                        status: rho_agent_types::ToolOutputStatus::Cancelled,
                     },
-                    first_block_at: rho_agent_host_proto::UnixMs(2),
-                    at: rho_agent_host_proto::UnixMs(2),
+                    first_block_at: rho_agent_types::UnixMs(2),
+                    at: rho_agent_types::UnixMs(2),
                 },
             )],
             context: None,
             wake: None,
-            at: rho_agent_host_proto::UnixMs(2),
+            at: rho_agent_types::UnixMs(2),
         }));
         let recovered = replay(events);
         assert!(recovered.owed.is_empty());

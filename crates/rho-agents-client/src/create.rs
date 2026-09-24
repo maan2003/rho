@@ -7,9 +7,8 @@
 //! `NewAgent`, and on which host.
 
 use camino::Utf8PathBuf;
-use rho_agent_host_proto::{
-    AgentRole, EngineerIntelligence, JoinTarget, StartMode, WorksetMode, WorkspaceInfo,
-};
+use rho_agent_host_proto::{JoinTarget, StartMode};
+use rho_agent_types::{AgentRole, EngineerIntelligence, WorksetMode, WorkspaceInfo};
 use rho_hosts::{HostId, HostPath, Hosts};
 
 /// The user-facing name for selecting the first available conventional base.

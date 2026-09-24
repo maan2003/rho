@@ -7,10 +7,8 @@ use std::collections::HashMap;
 use rho_agent_host_proto::transcript::{
     AgentPos, LogEntry, PresentationField, Seq, TranscriptEvent, TurnEdge,
 };
-use rho_agent_host_proto::{
-    AgentId, AgentRole, Answer, MessageDelivery, Open, Place, UnixMs, agents, read_frame,
-    write_frame,
-};
+use rho_agent_host_proto::{Answer, Open, agents, read_frame, write_frame};
+use rho_agent_types::{AgentId, AgentRole, MessageDelivery, Place, UnixMs};
 use rho_agents_client::stream::AgentFrame;
 use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::ConnEvent;

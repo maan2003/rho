@@ -16,7 +16,8 @@ use rho_agent_host_proto::agents::{
     SetClaudeAccount, ShellClose, ShellList, ShellStart, TerminalList, Visualization,
     VisualizationContent,
 };
-use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Opened, WorkspaceInfo, write_frame};
+use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Opened, write_frame};
+use rho_agent_types::WorkspaceInfo;
 use rho_db::RhoDb;
 use tokio::sync::{broadcast, mpsc};
 
@@ -543,7 +544,7 @@ async fn handle_agent_command(
             // message is accepted, the log when the message's row lands.
             let notice = agent.head().pending_notice;
             if let Some(text) = notice.clone() {
-                content.insert(0, rho_agent_host_proto::ContentPart::Text { text });
+                content.insert(0, rho_agent_types::ContentPart::Text { text });
             }
             agent.send_user_content_accepted(content, delivery).await?;
             if notice.is_some() {
@@ -1098,9 +1099,9 @@ fn detail_result(
     rho_agent_host_proto::transcript::DetailResult {
         id: result.call_id.as_str().to_owned(),
         status: match result.body.status {
-            rho_agent_host_proto::ToolOutputStatus::Success => ToolStatus::Success,
-            rho_agent_host_proto::ToolOutputStatus::Error => ToolStatus::Error,
-            rho_agent_host_proto::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+            rho_agent_types::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_agent_types::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_agent_types::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
         output: result.body.recorded_output().to_owned(),
         error: None,
@@ -1133,10 +1134,10 @@ mod tests {
                 output: Arc::new("bounded model view".to_owned()),
                 full_output: Some(Arc::new("complete host record".to_owned())),
                 images: Arc::new(Vec::new()),
-                status: rho_agent_host_proto::ToolOutputStatus::Success,
+                status: rho_agent_types::ToolOutputStatus::Success,
             },
-            started_at: rho_agent_host_proto::UnixMs(1),
-            finished_at: rho_agent_host_proto::UnixMs(2),
+            started_at: rho_agent_types::UnixMs(1),
+            finished_at: rho_agent_types::UnixMs(2),
             metadata: None,
         };
 
@@ -1149,7 +1150,7 @@ mod tests {
             tool_type: rho_inference::types::ToolType::Custom,
             output: Arc::new("bounded update".to_owned()),
             full_output: Some(Arc::new("complete update".to_owned())),
-            at: rho_agent_host_proto::UnixMs(3),
+            at: rho_agent_types::UnixMs(3),
         };
         assert_eq!(detail_update(&update).output, "complete update");
     }

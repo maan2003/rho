@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rho_agent_host_proto::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
+use rho_agent_types::{AgentId, ContentPart, MessagePhase, ToolOutputStatus, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

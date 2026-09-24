@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-pub use rho_agent_host_proto::MessageDelivery;
-use rho_agent_host_proto::{ContentPart, UnixMs};
+pub use rho_agent_types::MessageDelivery;
+use rho_agent_types::{ContentPart, UnixMs};
 pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
 pub use rho_inference::types::MessageSender;
 use rho_inference::types::{
@@ -138,7 +138,7 @@ pub enum AgentEvent<'a> {
         place: Place,
         spawned_by: AgentSpawnedBy,
         spawn_name: Option<String>,
-        created_at: rho_agent_host_proto::UnixMs,
+        created_at: rho_agent_types::UnixMs,
         /// The agent that spawned this one.
         #[senax(default)]
         parent: Option<AgentId>,
@@ -177,7 +177,7 @@ pub enum AgentEvent<'a> {
     /// history.
     ExecObserved {
         id: rho_inference::types::ExecId,
-        milestone: rho_agent_host_proto::ExecMilestone,
+        milestone: rho_agent_types::ExecMilestone,
         at: UnixMs,
     },
     /// Claude owns its conversation; this records only Rho's permission to
@@ -610,7 +610,7 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
             .filter_map(|item| match item {
                 InferenceResponseItem::AssistantMessage { content, phase, .. }
                     if !want_final
-                        || *phase == Some(rho_agent_host_proto::MessagePhase::FinalAnswer) =>
+                        || *phase == Some(rho_agent_types::MessagePhase::FinalAnswer) =>
                 {
                     Some(content.iter().filter_map(|part| match part {
                         ContentPart::Text { text } => Some(text.as_str()),
