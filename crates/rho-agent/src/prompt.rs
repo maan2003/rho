@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::db::{AgentRole, AgentSpawnedBy};
+use rho_agent_types::AgentRole;
+
+use crate::db::AgentSpawnedBy;
 use crate::multi_agent_tools::Team;
 
 /// Render the complete Engineer instructions in the order an agent uses them.

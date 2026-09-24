@@ -12,20 +12,17 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_agent_types::ContentPart;
+use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use rho_inference::Inference;
 use rho_inference::types::{ContextItemEvent, PendingInferenceResponse};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::db::{
-    AgentId, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind,
-    EngineerIntelligence, UnixMillis,
-};
+use crate::db::{AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind, UnixMillis};
 use crate::{
     AgentEvent, AgentState, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind,
-    InputQueues, MessageDelivery, QueuedInput, TranscriptLine, prompt,
+    InputQueues, QueuedInput, TranscriptLine, prompt,
 };
 
 pub(crate) mod projection;
@@ -57,7 +54,7 @@ impl ClaudeAgent {
         start_mode: ClaudeStartMode,
         pending_rewind: bool,
         pending_output: Option<crate::ClaudeOutputBatch>,
-        role: crate::db::AgentRole,
+        role: rho_agent_types::AgentRole,
         head: crate::db::AgentHead,
     ) -> (Self, ClaudeLoop) {
         let status = Arc::new(RwLock::new(AgentStatus {
@@ -310,7 +307,7 @@ pub(crate) struct ClaudeLoop {
     /// file watch).
     host: Arc<crate::worker::Host>,
     name_updates: tokio::sync::watch::Receiver<Option<crate::db::AgentHead>>,
-    role: crate::db::AgentRole,
+    role: rho_agent_types::AgentRole,
     /// What the projection of Claude's log keeps from one line to the
     /// next: usage already told, calls awaiting their result's times.
     projection: Projection,
@@ -644,7 +641,7 @@ impl ClaudeLoop {
                 };
                 let content = Arc::new(content);
                 let input = QueuedInput {
-                    source: crate::MessageSender::User,
+                    source: rho_inference::types::MessageSender::User,
                     kind: InputKind::Message {
                         content: (*content).clone(),
                     },
@@ -2186,7 +2183,7 @@ mod tests {
             usage_provider: crate::db::AgentUsageModel::FABLE,
         };
         state.queued_inputs.push(QueuedInput {
-            source: crate::MessageSender::User,
+            source: rho_inference::types::MessageSender::User,
             kind: InputKind::Message {
                 content: (*text("claude-normalized text")).clone(),
             },

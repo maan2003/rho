@@ -67,7 +67,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     assert!(std::path::Path::new(&format!("/proc/{terminal_pid}")).exists());
 
     let error = pool
-        .change_mode(first, rho_fs_view::WorksetMode::Exposed)
+        .change_mode(first, rho_agent_types::WorksetMode::Exposed)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("terminal"));
@@ -94,7 +94,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     .await
     .unwrap();
     let changed = pool
-        .change_mode(first, rho_fs_view::WorksetMode::Exposed)
+        .change_mode(first, rho_agent_types::WorksetMode::Exposed)
         .await
         .unwrap();
     assert!(changed.contains(&first) && changed.contains(&second));
@@ -105,7 +105,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     let (_, reloaded, _) = pool.load(first).await.unwrap();
     assert_eq!(
         reloaded.view().await.unwrap().workset_mode(),
-        rho_fs_view::WorksetMode::Exposed
+        rho_agent_types::WorksetMode::Exposed
     );
     // Development integration checks require both companions built first:
     // cargo build -p rho-agent -p rho-shell --bins

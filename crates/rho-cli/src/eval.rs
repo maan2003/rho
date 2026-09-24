@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use rho_agent::db::{AgentReadTxnExt as _, AgentRole, EngineerIntelligence};
-use rho_agent::{AgentEvent, MessageDelivery, StartPlace};
-use rho_agent_types::{TurnEdge, TurnOutcome};
+use rho_agent::db::AgentReadTxnExt as _;
+use rho_agent::{AgentEvent, StartPlace};
+use rho_agent_types::{AgentRole, EngineerIntelligence, MessageDelivery, TurnEdge, TurnOutcome};
 use rho_fs_view::{UserEnvironment, Worksets};
 use rho_inference::types::{ContextBlock, InferenceResponseItem};
 use serde_json::{Value, json};

@@ -443,11 +443,11 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::UnixMs;
+    use rho_agent_types::{AgentRole, UnixMs};
 
     use super::*;
     use crate::AgentEvent;
-    use crate::db::{AgentRole, AgentRoleSessionProfile as _, AgentRuntime};
+    use crate::db::{AgentRoleSessionProfile as _, AgentRuntime};
 
     #[tokio::test]
     async fn blocked_append_does_not_block_reads_and_history_crosses_multiple_frames() {

@@ -15,9 +15,9 @@ use client::OctoClient;
 use db::{FeedbackRecord, PrMonitorReadTxnExt as _, PrMonitorWriteTxnExt as _, PrWatch};
 use futures_util::stream::{self, StreamExt as _};
 use octo_types::{PrFeedback, PrSnapshot};
-use rho_agent::MessageDelivery;
-use rho_agent::db::{AgentId, AgentReadTxnExt as _};
+use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::AgentPool;
+use rho_agent_types::{AgentId, MessageDelivery};
 use rho_db::RhoDb;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
@@ -845,7 +845,7 @@ mod tests {
             review_state: None,
         };
         let bots = default_review_bots();
-        let subscriber = AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(0)).unwrap();
+        let subscriber = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let watch = PrWatch {
             generation: 1,
             repository_id: 1,

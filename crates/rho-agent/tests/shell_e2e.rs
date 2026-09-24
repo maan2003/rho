@@ -46,7 +46,7 @@ async fn shell_end_to_end_over_registry(
     let work = std::path::Path::new("/src");
     let registry = Arc::new(ShellRegistry::default());
     let agent_id =
-        AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter encodes");
+        AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(42)).expect("counter encodes");
 
     let spawn = || ShellSpawn {
         view: Arc::clone(&view),

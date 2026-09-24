@@ -5,15 +5,13 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rho_agent_types::{TurnEdge, UnixMs};
+use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
 use rho_inference::types::ExecId;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::AgentEvent;
-use crate::db::{
-    AgentEventPos, AgentHead, AgentRole, AgentUsageBucket, ClaudeRewind, SessionBinding,
-};
+use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
 pub(super) const VERSION: u32 = 7;
 
@@ -41,7 +39,7 @@ pub(super) enum Control {
     Cancel,
     Retry,
     Effort(rho_claude::Effort),
-    Role(crate::db::AgentRole),
+    Role(rho_agent_types::AgentRole),
     CacheKey,
     Rewind(u32),
 }
@@ -756,7 +754,7 @@ mod tests {
                     body: Request::Append(AgentEvent::Native(
                         crate::native::NativeEvent::RequestStarted {
                             input: vec![rho_inference::types::ContextBlock::UserMessage {
-                                sender: crate::MessageSender::User,
+                                sender: rho_inference::types::MessageSender::User,
                                 content: vec![rho_agent_types::ContentPart::Text {
                                     text: "a".repeat(count),
                                 }],

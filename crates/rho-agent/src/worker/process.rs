@@ -28,7 +28,7 @@ pub struct Process {
         Arc<Mutex<HashMap<rho_agent_types::AgentId, mpsc::UnboundedSender<transport::Packet>>>>,
     pub(super) next: Arc<AtomicU64>,
     pub(crate) closed: watch::Receiver<bool>,
-    pub(crate) mode: rho_fs_view::WorksetMode,
+    pub(crate) mode: rho_agent_types::WorksetMode,
     stop: Mutex<Option<oneshot::Sender<()>>>,
 }
 

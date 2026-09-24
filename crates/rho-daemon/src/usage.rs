@@ -5,13 +5,14 @@
 use std::collections::BTreeMap;
 
 use rho_agent::db::{
-    AgentId, AgentReadTxnExt as _, AgentUsageModel, AgentWriteTxnExt as _, QuotaModel,
+    AgentReadTxnExt as _, AgentUsageModel, AgentWriteTxnExt as _, QuotaModel,
     QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent_host_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, QuotaPoint,
     QuotaSeries, QuotaSummary,
 };
+use rho_agent_types::AgentId;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 
@@ -416,7 +417,7 @@ mod tests {
     #[test]
     fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
         let agent_id =
-            rho_agent::db::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
             bucket_start_ms,
             model: AgentUsageModel::GPT,

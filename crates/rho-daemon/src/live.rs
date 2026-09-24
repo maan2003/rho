@@ -292,8 +292,8 @@ pub fn queued_item(input: &QueuedInput) -> QueuedItem {
     match &input.kind {
         InputKind::Message { content } => QueuedItem::Message {
             from: match input.source {
-                rho_agent::MessageSender::User => None,
-                rho_agent::MessageSender::Agent { id } => Some(id),
+                rho_inference::types::MessageSender::User => None,
+                rho_inference::types::MessageSender::Agent { id } => Some(id),
             },
             text: content
                 .iter()

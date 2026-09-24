@@ -9,9 +9,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
-use rho_agent_types::{AgentWant, Seq, TurnEdge, UnixMs};
+use rho_agent_types::{
+    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, AgentWant, EngineerIntelligence, Place,
+    Seq, TurnEdge, UnixMs, WorksetMode,
+};
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
-use rho_fs_view::{Place, WorksetMode};
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -253,10 +255,6 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
             _ => false,
         }
 }
-
-pub use rho_agent_types::{
-    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-};
 
 /// A position in one agent's log: dense from zero, never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]

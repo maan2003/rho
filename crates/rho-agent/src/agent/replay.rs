@@ -198,11 +198,10 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<rho_inference::ty
 #[cfg(test)]
 mod tests {
 
-    use rho_agent_types::{ContentPart, MessageDelivery, UnixMs};
+    use rho_agent_types::{AgentId, AgentIdDomain, ContentPart, MessageDelivery, UnixMs};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
-    use crate::db::{AgentId, AgentIdDomain};
 
     #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
     struct TestProviderData {

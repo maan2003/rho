@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context as _;
-use rho_agent::MessageDelivery;
-use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentWriteTxnExt as _};
+use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent_host_proto::agents::{
     AgentCostDistribution, Call, ClaudeAccountList, ClaudeAccounts, ClientFrame, GlobalUsage, Open,
     QuotaHistory, QuotaUsage, RecordVisualization, Request, ServerFrame, SetAuthAccountEnabled,
@@ -17,7 +16,7 @@ use rho_agent_host_proto::agents::{
     VisualizationContent,
 };
 use rho_agent_host_proto::{AgentCommand, Answer, NewAgent, Opened, write_frame};
-use rho_agent_types::{Seq, WorkspaceInfo};
+use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
 use rho_db::RhoDb;
 use tokio::sync::{broadcast, mpsc};
 

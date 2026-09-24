@@ -7,14 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use rho_agent::db::{AgentId, AgentReadTxnExt as _, AgentRole};
+use rho_agent::db::AgentReadTxnExt as _;
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent_host_proto::control::ServerFrame as ControlFrame;
 use rho_agent_host_proto::server::{Server, ServerConnection};
 use rho_agent_host_proto::{
     AuthState, JoinTarget, Open, Opened, StartMode, read_frame, write_frame,
 };
-use rho_agent_types::{ContentPart, Place, WorksetMode, WorkspaceInfo};
+use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};

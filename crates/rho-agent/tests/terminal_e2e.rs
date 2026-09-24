@@ -33,7 +33,7 @@ fn main() {
 async fn terminal_end_to_end_over_registry(view: Arc<rho_fs_view::Namespace>) {
     let registry = Arc::new(TerminalRegistry::default());
     let agent_id =
-        AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter 1 encodes");
+        AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(42)).expect("counter 1 encodes");
     let mut client = registry
         .create(
             agent_id,

@@ -4,9 +4,8 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use rho_agent::db::{
-    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, EngineerIntelligence,
-};
+use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime};
+use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
 use rho_inference::Inference;
 
@@ -641,8 +640,8 @@ async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn config_name(config: rho_agent::db::AgentRole) -> String {
-    use rho_agent::db::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
+fn config_name(config: rho_agent_types::AgentRole) -> String {
+    use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
     match config {
         AgentRole::Advisor { intelligence } => match intelligence {
             AdvisorIntelligence::Low => "low-adv",
@@ -660,7 +659,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
     .to_owned()
 }
 
-fn place_name(place: &rho_fs_view::Place) -> String {
+fn place_name(place: &rho_agent_types::Place) -> String {
     format!("{} in workset {}", place.cwd, place.workset)
 }
 

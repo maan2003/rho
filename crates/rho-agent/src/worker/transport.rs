@@ -18,7 +18,7 @@ const AGENT_WINDOW: usize = 16;
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Encode, Decode)]
 pub(super) enum Port {
     Workset,
-    Agent(crate::db::AgentId),
+    Agent(rho_agent_types::AgentId),
     Terminal(u64),
     Shell(u64),
 }
@@ -371,8 +371,9 @@ mod tests {
         let (sender, mut replies, writing) = connect(left);
         let (_peer, mut receiver, peer_writing) = connect(right);
         let acknowledgments = tokio::spawn(async move { while replies.next().await.is_ok() {} });
-        let port =
-            Port::Agent(crate::db::AgentId::from_counter(1, &crate::db::AgentIdDomain(7)).unwrap());
+        let port = Port::Agent(
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(7)).unwrap(),
+        );
         let mut held = Vec::new();
         for index in 0..AGENT_WINDOW {
             sender

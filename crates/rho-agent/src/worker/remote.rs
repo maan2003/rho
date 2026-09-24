@@ -5,13 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use rho_agent_types::{AgentId, AgentRole, MessageDelivery};
 use tokio::sync::{oneshot, watch};
 
 use super::ipc::{self, Bootstrap, Control, Message};
 use super::services::Services;
-use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
+use crate::db::AgentReadTxnExt as _;
 use crate::lazy::Lazy;
-use crate::{AgentStatus, MessageDelivery, View};
+use crate::{AgentStatus, View};
 
 #[derive(Clone)]
 pub struct Remote(Arc<Inner>);

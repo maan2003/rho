@@ -11,19 +11,17 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-pub use rho_agent_types::MessageDelivery;
-use rho_agent_types::{AgentWant, ContentPart, TurnEdge, TurnOutcome, UnixMs};
-pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
-pub use rho_inference::types::MessageSender;
+use rho_agent_types::{
+    AgentId, AgentRole, AgentWant, ContentPart, MessageDelivery, Place, TurnEdge, TurnOutcome,
+    UnixMs, WorksetMode,
+};
 use rho_inference::types::{
-    ApplyPatchMetadata, ContextBlock, InferenceResponseItem, PendingInferenceResponse, ToolCall,
-    ToolCallId, ToolResult, ToolSpec,
+    ApplyPatchMetadata, ContextBlock, InferenceResponseItem, MessageSender,
+    PendingInferenceResponse, ToolCall, ToolCallId, ToolResult, ToolSpec,
 };
 use senax_encoder::{Decode, Encode};
 
-use crate::db::{
-    AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, ClaudeRewind, SessionBinding,
-};
+use crate::db::{AgentEventPos, AgentRuntime, AgentSpawnedBy, ClaudeRewind, SessionBinding};
 
 pub mod agent;
 mod boundary;
@@ -631,10 +629,10 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
 
 #[cfg(test)]
 mod encoding_tests {
+    use rho_agent_types::AgentIdDomain;
     use senax_encoder::{Decoder as _, Encoder as _};
 
     use super::*;
-    use crate::db::AgentIdDomain;
 
     #[test]
     fn log_events_roundtrip_through_senax() {

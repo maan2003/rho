@@ -53,7 +53,6 @@ pub fn git_dir() -> PathBuf {
         .and_then(|git| git.parent().map(Path::to_owned))
         .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
 }
-pub use rho_agent_types::{Place, WorksetMode, WorkspaceInfo};
 pub use rho_git_server::Refresh as StoreRefresh;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]

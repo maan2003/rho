@@ -1,6 +1,5 @@
-use rho_agent_types::{ContentPart, TurnOutcome, UnixMs};
+use rho_agent_types::{ContentPart, MessageDelivery, Place, TurnOutcome, UnixMs};
 use rho_db::RhoDb;
-use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
 
 use super::*;
@@ -373,7 +372,9 @@ fn agent_roles_resolve_the_current_model_matrix() {
     );
 }
 
-use crate::{InputKind, MessageDelivery, MessageSender, QueuedInput};
+use rho_inference::types::MessageSender;
+
+use crate::{InputKind, QueuedInput};
 
 pub(crate) fn user_event(text: &str) -> AgentEvent<'static> {
     AgentEvent::Accepted(QueuedInput {

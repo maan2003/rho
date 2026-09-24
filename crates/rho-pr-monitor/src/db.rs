@@ -1,5 +1,5 @@
 use redb::TableDefinition;
-use rho_agent::db::AgentId;
+use rho_agent_types::AgentId;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use senax_encoder::{Decode, Encode};
 
@@ -188,7 +188,7 @@ impl PrMonitorWriteTxnExt for WriteTxn {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent::db::{AgentId, AgentIdDomain};
+    use rho_agent_types::{AgentId, AgentIdDomain};
     use rho_db::RhoDb;
 
     use super::*;
