@@ -13134,18 +13134,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-touch-keyboard"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "js-sys",
- "serde",
- "serde_json",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
 name = "rho-transcript"
 version = "0.1.0"
 dependencies = [

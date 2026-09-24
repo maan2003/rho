@@ -46,7 +46,6 @@ members = [
   "crates/rho-slack",
   "agent-host/rho-tool-shell",
   "crates/rho-transcript",
-  "crates/rho-touch-keyboard",
   "crates/rho-agent-types",
   "crates/rho-window",
   "agent-host/rho-visualizations",
