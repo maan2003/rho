@@ -2,7 +2,7 @@
 //!
 //! Each session owns a PTY whose child runs inside an agent's view, plus the
 //! only terminal emulator in the system (an alacritty [`Term`]). Clients are
-//! dumb: they receive display state ([`rho_agent_host_proto::term`]
+//! dumb: they receive display state ([`rho_terminal::protocol`]
 //! rows/cursor) and send input bytes; the workset answers all terminal queries
 //! itself, so an unattached terminal behaves exactly like an attached one.
 //! Sessions survive client detach and die with their child process or the

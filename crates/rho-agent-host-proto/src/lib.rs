@@ -78,8 +78,6 @@ pub mod host;
 pub mod realtime;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
-pub mod shell;
-pub mod shell_kernel;
 pub mod transcript;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -978,38 +976,18 @@ mod tests {
     /// A reply reads as its call's own type in a protocol log.
     #[test]
     fn protocol_log_prints_answers_by_their_call() {
-        let request: shell::Request = shell::ShellList { agent: None }.into();
-        let answer = senax_encoder::pack(&Answer::Done(Vec::<shell::ShellInfo>::new())).unwrap();
+        let request: agents::Request = agents::Visualization { id: "v".to_owned() }.into();
+        let answer = senax_encoder::pack(&Answer::Done(agents::VisualizationContent {
+            mime_type: "image/svg+xml".to_owned(),
+            content: Vec::new(),
+        }))
+        .unwrap();
         assert!(request.debug_answer(&answer).starts_with("Done("));
     }
 
     #[test]
     fn git_provider_frames_round_trip() {
         round_trips(host::GitProviderFrame::Done { request_id: 9 });
-    }
-
-    #[test]
-    fn shell_frames_round_trip() {
-        round_trips(shell::ShellServerFrame::ExecutionOutput {
-            execution: 3,
-            start: 0,
-            end: 0,
-            text: "λ".to_owned(),
-            styles: vec![shell::ShellStyleSpan {
-                start: 0,
-                end: 2,
-                style: shell::ShellTextStyle {
-                    foreground: Some(shell::ShellColor::Indexed(1)),
-                    bold: true,
-                    ..Default::default()
-                },
-            }],
-        });
-
-        assert!(shell::command_fits(&"x".repeat(shell::MAX_COMMAND_BYTES)));
-        assert!(!shell::command_fits(
-            &"x".repeat(shell::MAX_COMMAND_BYTES + 1)
-        ));
     }
 
     /// A part's opening survives the envelope, and reads as no other part.
@@ -1044,12 +1022,6 @@ mod tests {
         });
         opens_as(agents::Open::Session);
         opens_as(desk::Open);
-        opens_as(shell::Open::Request(
-            shell::ShellStart {
-                agent: "eng-test".to_owned(),
-            }
-            .into(),
-        ));
         round_trips(Opened::Refused {
             reason: "not running".to_owned(),
         });

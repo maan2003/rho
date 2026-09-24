@@ -109,7 +109,7 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
     );
     // Development integration checks require both companions built first:
     // cargo build -p rho-agent -p rho-shell --bins
-    use rho_agent_host_proto::shell::{ShellClientFrame, ShellServerFrame};
+    use rho_shell_view::protocol::{ShellClientFrame, ShellServerFrame};
     let shell = std::path::Path::new(env!("CARGO_BIN_EXE_rho-agent-worker"))
         .ancestors()
         .map(|path| path.join("rho-shell"))

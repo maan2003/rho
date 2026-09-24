@@ -44,10 +44,11 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 uuid.workspace = true
 
+rho-shell.workspace = true
+rho-shell-view.workspace = true
 rho-terminal.workspace = true
 
 [dev-dependencies]
-rho-shell.workspace = true
 tokio-tungstenite.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 

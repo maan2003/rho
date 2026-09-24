@@ -14,9 +14,10 @@ use rho_agent_host_proto::agents::{
     QuotaHistory, QuotaUsage, RecordVisualization, Request, ServerFrame, SetAuthAccountEnabled,
     SetClaudeAccount, Visualization, VisualizationContent,
 };
-use rho_agent_host_proto::{AgentCommand, Answer, Call, NewAgent, Opened, shell, write_frame};
+use rho_agent_host_proto::{AgentCommand, Answer, Call, NewAgent, Opened, write_frame};
 use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
 use rho_db::RhoDb;
+use rho_shell_view::protocol as shell;
 use rho_terminal::protocol as term;
 use tokio::sync::{broadcast, mpsc};
 
@@ -660,7 +661,7 @@ where
         }
     };
     write_frame(&mut writer, &Opened::Ready).await?;
-    client.relay::<_, _, rho_agent_host_proto::shell::ShellClientFrame, rho_agent_host_proto::shell::ShellServerFrame>(reader, writer).await
+    client.relay::<_, _, rho_shell_view::protocol::ShellClientFrame, rho_shell_view::protocol::ShellServerFrame>(reader, writer).await
 }
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
@@ -694,7 +695,7 @@ async fn shell_attach(
 async fn shell_list(
     services: &Arc<Services>,
     agent: Option<&str>,
-) -> anyhow::Result<Vec<rho_agent_host_proto::shell::ShellInfo>> {
+) -> anyhow::Result<Vec<rho_shell_view::protocol::ShellInfo>> {
     let filter = match agent {
         Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,
@@ -758,7 +759,7 @@ fn rho_pager_program() -> std::ffi::OsString {
 /// Serves a stream dedicated to one daemon-owned terminal: spawns or attaches
 /// (per [`TerminalOpen`](rho_terminal::protocol::TerminalOpen)), replies
 /// `Opened::Ready`, then pumps
-/// [`rho_agent_host_proto::term`] frames until either side closes. Closing only
+/// [`rho_terminal::protocol`] frames until either side closes. Closing only
 /// detaches; the terminal keeps running. A headless create replies and
 /// returns without attaching.
 #[expect(clippy::too_many_arguments)]

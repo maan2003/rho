@@ -42,6 +42,7 @@ rho-rpc = { workspace = true, features = ["server"] }
 rho-visualizations.workspace = true
 rho-fs-view.workspace = true
 rho-files.workspace = true
+rho-shell-view.workspace = true
 rho-terminal.workspace = true
 rustix-openpty.workspace = true
 serde.workspace = true

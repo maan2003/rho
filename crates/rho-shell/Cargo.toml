@@ -12,10 +12,11 @@ version.workspace = true
 anyhow.workspace = true
 brush-builtins.workspace = true
 brush-core.workspace = true
+bytes.workspace = true
 libc.workspace = true
 rand.workspace = true
-rho-agent-host-proto.workspace = true
 rustix-openpty.workspace = true
+senax-encoder.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

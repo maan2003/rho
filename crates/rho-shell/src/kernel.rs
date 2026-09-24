@@ -1,7 +1,8 @@
-//! Neutral, bounded sideband protocol between rho-daemon and a shell kernel.
+//! The bounded sideband protocol between the workset runtime and this kernel.
 //!
-//! The protocol is intentionally independent of the kernel implementation. The
-//! daemon only knows these bounded execution, output, and lifecycle messages.
+//! The runtime knows only these execution, output, and lifecycle messages,
+//! never the kernel's internals. What a client sees of a shell is
+//! `rho_shell_view::protocol`, which the runtime translates to.
 
 use std::io;
 

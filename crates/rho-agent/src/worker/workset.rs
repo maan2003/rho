@@ -47,7 +47,7 @@ pub enum Attach {
 pub enum Reply {
     Done,
     Terminals(Vec<rho_terminal::protocol::TerminalInfo>),
-    Shells(Vec<rho_agent_host_proto::shell::ShellInfo>),
+    Shells(Vec<rho_shell_view::protocol::ShellInfo>),
     Error(String),
     Desktop { socket: String },
     DesktopSessions(Vec<rho_agent_host_proto::DesktopSession>),
@@ -193,7 +193,7 @@ impl Execution {
                     .list()
                     .await
                     .into_iter()
-                    .map(|entry| rho_agent_host_proto::shell::ShellInfo {
+                    .map(|entry| rho_shell_view::protocol::ShellInfo {
                         agent: entry.agent_id.encoded(),
                         clients: entry.clients as u32,
                     })
@@ -336,7 +336,7 @@ async fn serve_shell(
     sender: Sender,
     port: Port,
 ) -> anyhow::Result<()> {
-    use rho_agent_host_proto::shell::{ShellClientFrame as C, ShellServerFrame as S};
+    use rho_shell_view::protocol::{ShellClientFrame as C, ShellServerFrame as S};
 
     use crate::shell::{ShellControl, ShellSubmitError};
     let crate::shell::ShellClient {

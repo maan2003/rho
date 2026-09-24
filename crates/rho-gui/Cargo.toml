@@ -74,7 +74,7 @@ rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
 rho-slack = { workspace = true, features = ["ui"] }
-rho-shell-view = { workspace = true }
+rho-shell-view = { workspace = true, features = ["client"] }
 rho-terminal = { workspace = true, features = ["client"] }
 rho-transcript.workspace = true
 image = { version = "0.25", default-features = false }

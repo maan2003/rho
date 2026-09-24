@@ -2559,7 +2559,7 @@ impl Workspace {
 
     fn shell_pager_action(
         &mut self,
-        action: rho_agent_host_proto::shell::PagerAction,
+        action: rho_shell_view::protocol::PagerAction,
         cx: &mut Context<Self>,
     ) {
         if let SurfaceView::Shell { model, .. } = &self.active_surface().view {
@@ -3504,10 +3504,10 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(agents) = self.agents_for(agent_id) else {
+        let Some(link) = self.link_for(agent_id) else {
             return;
         };
-        let task = agents.close_shell(agent_id.encoded());
+        let task = rho_shell_view::channel::close(&link, agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
@@ -4888,10 +4888,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let Some(agents) = self.agents_for(agent_id) else {
+        let Some(link) = self.link_for(agent_id) else {
             return;
         };
-        let task = agents.open_shell(agent_id.encoded());
+        let task = rho_shell_view::channel::open(&link, agent_id.encoded());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             match result {
@@ -9436,13 +9436,13 @@ impl Render for Workspace {
                 this.open_find(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
-                this.shell_pager_action(rho_agent_host_proto::shell::PagerAction::Continue, cx);
+                this.shell_pager_action(rho_shell_view::protocol::PagerAction::Continue, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerAll, _, cx| {
-                this.shell_pager_action(rho_agent_host_proto::shell::PagerAction::Drain, cx);
+                this.shell_pager_action(rho_shell_view::protocol::PagerAction::Drain, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerQuit, _, cx| {
-                this.shell_pager_action(rho_agent_host_proto::shell::PagerAction::Quit, cx);
+                this.shell_pager_action(rho_shell_view::protocol::PagerAction::Quit, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentPrevious, window, cx| {
                 this.switch_agent_by_delta(-1, window, cx);
