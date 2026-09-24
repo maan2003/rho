@@ -21,7 +21,8 @@ plus the plumbing around the host.
   names and types, so a rename changes the wire too.
 - A table records its stored types by name, without module paths
   (`rho-db::Sen<CellMeta>`), so they can move between modules and
-  crates freely. Renaming one needs a migration that retypes its tables.
+  crates freely. Renaming one changes what its tables recorded, and
+  needs a migration.
 
 ## Security
 

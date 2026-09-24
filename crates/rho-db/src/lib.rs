@@ -292,47 +292,6 @@ where
     }
 }
 
-// TEMPORARY MIGRATION: remove once the GUI has opened its database with
-// it; agent hosts have. Tables recorded `Sen<T>` under `T`'s full path;
-// they now record its short name, see `Sen::type_name`.
-impl RhoDb {
-    fn shorten_recorded_names(&self) {
-        let write = self.database.begin_write().expect("begin rho-db write txn");
-        if shorten_recorded_names(&write) {
-            write.commit().expect("commit rho-db type names");
-        } else {
-            write.abort().expect("abort rho-db write txn");
-        }
-    }
-}
-
-fn shorten_recorded_names(write: &redb::WriteTransaction) -> bool {
-    const SEN: &str = "rho-db::Sen<";
-    let tables = write
-        .list_tables()
-        .expect("list rho-db tables")
-        .collect::<Vec<_>>();
-    let mut changed = false;
-    for table in tables {
-        changed |= write
-            .retype_table(table, |name| {
-                if !name.contains(SEN) {
-                    return None;
-                }
-                let short = name
-                    .split(SEN)
-                    .map(short_type_name)
-                    .collect::<Vec<_>>()
-                    .join(SEN)
-                    // Renamed when it moved, under the old name recorded.
-                    .replace("rho-db::Sen<MirrorEvent>", "rho-db::Sen<TranscriptEvent>");
-                Some(short)
-            })
-            .expect("shorten rho-db type names");
-    }
-    changed
-}
-
 impl RhoDb {
     pub fn open(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
@@ -749,69 +708,6 @@ mod tests {
             short_type_name("(a::B, alloc::vec::Vec<c_d::e::F<u8>>, [x::Y; 2])"),
             "(B, Vec<F<u8>>, [Y; 2])"
         );
-    }
-
-    /// `Sen<TestRecord>` as databases recorded it before names were short.
-    #[derive(Debug)]
-    struct FullPath;
-
-    impl redb::Value for FullPath {
-        type SelfType<'a> = SenValue<'a, TestRecord>;
-        type AsBytes<'a> = BytesMut;
-
-        fn fixed_width() -> Option<usize> {
-            None
-        }
-
-        fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-        where
-            Self: 'a,
-        {
-            <Sen<TestRecord> as redb::Value>::from_bytes(data)
-        }
-
-        fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> BytesMut
-        where
-            Self: 'b,
-        {
-            <Sen<TestRecord> as redb::Value>::as_bytes(value)
-        }
-
-        fn type_name() -> TypeName {
-            TypeName::new("rho-db::Sen<rho_gui::journal::TestRecord>")
-        }
-    }
-
-    #[tokio::test]
-    async fn the_client_database_shortens_the_names_its_tables_recorded() {
-        const FULL: TableDefinition<u64, FullPath> = TableDefinition::new("items");
-        const SHORT: TableDefinition<u64, Sen<TestRecord>> = TableDefinition::new("items");
-        let temp = tempfile::tempdir().unwrap();
-        let path = client::path(temp.path());
-        {
-            let database = Database::create(&path).unwrap();
-            let write = database.begin_write().unwrap();
-            write
-                .open_table(FULL)
-                .unwrap()
-                .insert(
-                    7,
-                    SenValue::owned(TestRecord {
-                        name: "moved".to_owned(),
-                        tags: Vec::new(),
-                    }),
-                )
-                .unwrap();
-            write.commit().unwrap();
-        }
-
-        // Twice: the second open finds nothing left to rename.
-        for _ in 0..2 {
-            let db = client::open(temp.path()).unwrap();
-            let read = db.read();
-            let record = read.open_table(SHORT).get(7).unwrap().value().into_owned();
-            assert_eq!(record.name, "moved");
-        }
     }
 
     #[tokio::test]

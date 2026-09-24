@@ -738,22 +738,6 @@ impl TableNamespace {
         self.inner_rename(name, new_name, TableType::Normal)
     }
 
-    // Rho fork: see `WriteTransaction::retype_table`
-    #[track_caller]
-    fn retype_table(
-        &mut self,
-        transaction: &WriteTransaction,
-        name: &str,
-        retype: &mut dyn FnMut(&str) -> Option<String>,
-    ) -> Result<bool, TableError> {
-        if let Some(location) = self.open_tables.get(name) {
-            return Err(TableError::TableAlreadyOpen(name.to_string(), location));
-        }
-        self.set_dirty(transaction);
-        self.table_tree
-            .retype_table(name, TableType::Normal, retype)
-    }
-
     #[track_caller]
     fn rename_multimap_table(
         &mut self,
@@ -1574,25 +1558,6 @@ impl WriteTransaction {
             .lock()
             .unwrap()
             .rename_table(self, &name, new_name.name())
-    }
-
-    /// Rewrite the key and value type names the given table recorded when it was created.
-    /// `retype` sees each name and returns its replacement, or `None` to keep it; the
-    /// classification is kept either way. Nothing checks the new names against the stored
-    /// data, so this is for a type that moved or was renamed without changing its encoding.
-    ///
-    /// Returns whether a name changed. Added by rho's fork.
-    pub fn retype_table(
-        &self,
-        definition: impl TableHandle,
-        mut retype: impl FnMut(&str) -> Option<String>,
-    ) -> Result<bool, TableError> {
-        let name = definition.name().to_string();
-        drop(definition);
-        self.tables
-            .lock()
-            .unwrap()
-            .retype_table(self, &name, &mut retype)
     }
 
     /// Rename the given multimap table

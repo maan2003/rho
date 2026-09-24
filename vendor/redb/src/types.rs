@@ -110,15 +110,6 @@ impl TypeName {
         }
     }
 
-    // Rho fork: see `WriteTransaction::retype_table`. Keeps the classification.
-    pub(crate) fn rename(&mut self, name: String) -> bool {
-        if self.name == name {
-            return false;
-        }
-        self.name = name;
-        true
-    }
-
     pub fn name(&self) -> &str {
         &self.name
     }
