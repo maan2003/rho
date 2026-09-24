@@ -1,7 +1,7 @@
 //! The desk stream: one GUI's replica of the desk, kept in step with a
 //! host's copy.
 //!
-//! A stream of its own, opened by [`rho_rpc::parts::Part::Desk`], so the
+//! A stream of its own, opened by [`rho_rpc::protocol::Protocol::Desk`], so the
 //! desk's handshake and its writes belong to the desk client alone and a
 //! whole-store answer never queues ahead of anything else the host says.
 //! Every frame after the opening one is a [`ClientFrame`] or a

@@ -1,5 +1,5 @@
-//! The machine itself, [`rho_rpc::parts::Part::Host`]: Git transport and
-//! one-shot administration ([`rho_rpc::parts::Call`]).
+//! The machine itself, [`rho_rpc::protocol::Protocol::Host`]: Git transport and
+//! one-shot administration ([`rho_rpc::protocol::Call`]).
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -10,11 +10,12 @@ pub enum Open {
     /// host's Git remote helpers. The host pushes [`GitProviderFrame`]s for
     /// as long as the stream is open.
     GitProvider,
-    /// One [`rho_rpc::parts::Call`], answered with one
-    /// [`rho_rpc::parts::Answer`]; then the stream closes.
+    /// One [`rho_rpc::protocol::Call`], answered with one
+    /// [`rho_rpc::protocol::Answer`]; then the stream closes.
     Request(Request),
     /// A Git remote helper's transport, paired with a GUI that provides
-    /// it. After [`rho_rpc::parts::Opened::Ready`] the stream is raw Git data.
+    /// it. After [`rho_rpc::protocol::Opened::Ready`] the stream is raw Git
+    /// data.
     GitTransport { request: GitTransportRequest },
     /// A GUI's answer to [`GitProviderFrame::Requested`].
     /// Answered with [`GitProvided`]; after `Ready` the stream is raw
@@ -63,8 +64,8 @@ rho_rpc::calls! {
     }
 }
 
-impl rho_rpc::parts::PartOpen for Open {
-    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Host;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Host;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {
@@ -221,7 +222,7 @@ pub enum PrCommand {
 
 #[cfg(test)]
 mod tests {
-    use rho_rpc::parts::{self, Part, PartOpen};
+    use rho_rpc::protocol::{self, Protocol, ProtocolOpen};
 
     use super::*;
 
@@ -268,12 +269,13 @@ mod tests {
         round_trips(GitProvided::Done);
     }
 
-    /// A part's opening survives the envelope, and reads as no other part.
-    fn opens_as<T: PartOpen + PartialEq>(open: T) {
-        let envelope = parts::Open::of(&open).unwrap();
+    /// A protocol's opening survives the envelope, and reads as no other
+    /// protocol.
+    fn opens_as<T: ProtocolOpen + PartialEq>(open: T) {
+        let envelope = protocol::Open::of(&open).unwrap();
         assert_eq!(envelope.unpack::<T>().unwrap(), open);
-        let other = parts::Open {
-            part: Part::Desk,
+        let other = protocol::Open {
+            protocol: Protocol::Desk,
             open: envelope.open.clone(),
         };
         assert!(other.unpack::<T>().is_err());

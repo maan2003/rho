@@ -1,4 +1,4 @@
-//! The machine part of the daemon, [`rho_rpc::parts::Part::Host`]: Git
+//! The machine part of the daemon, [`rho_rpc::protocol::Protocol::Host`]: Git
 //! transport and administration.
 
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use rho_hosts::protocol::{
     GitProvided, GitProviderFrame, GitTransportPolicy, GuiTelemetryUpload, IrohApprove, IrohRevoke,
     IrohTrustInMemory, Open, PlatformSecretsSet, PlatformStatus, Pr, PrOutput, Request, Snapshot,
 };
-use rho_rpc::parts::{Answer, Call, Opened, write_frame};
+use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use tokio::sync::mpsc;
 
 use crate::{GitProviderClaim, Services, debug};
@@ -60,7 +60,7 @@ where
     services.git_transport.register(frames_tx).await;
     loop {
         tokio::select! {
-            closed = rho_rpc::parts::read_frame_optional::<_, ()>(&mut reader) => {
+            closed = rho_rpc::protocol::read_frame_optional::<_, ()>(&mut reader) => {
                 return closed.map(|_| ());
             }
             Some(frame) = frames_rx.recv() => write_frame(&mut writer, &frame).await?,

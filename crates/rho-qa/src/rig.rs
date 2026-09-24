@@ -25,7 +25,7 @@ use rho_agents_client::protocol::{
     ClientFrame as AgentsClientFrame, JoinTarget, NewAgent, ServerFrame as AgentsServerFrame,
     StartMode,
 };
-use rho_rpc::parts::client::Client;
+use rho_rpc::protocol::client::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 

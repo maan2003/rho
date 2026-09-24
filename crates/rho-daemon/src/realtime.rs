@@ -12,7 +12,7 @@ use rho_inference::ResolvedOAuth;
 use rho_openai_realtime::{
     ContextChannel, ProviderEvent, Sideband, SidebandConfig, call_id_from_location,
 };
-use rho_rpc::parts::{read_frame, write_frame};
+use rho_rpc::protocol::{read_frame, write_frame};
 use rho_rtc::protocol::{Opened, RealtimeClientFrame, RealtimeServerFrame};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};

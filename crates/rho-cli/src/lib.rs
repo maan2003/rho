@@ -14,8 +14,8 @@ use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
 use rho_hosts::protocol as host;
 use rho_inference::{AuthArgs, run_auth_cli};
-use rho_rpc::parts::client::Client as UiClient;
-use rho_rpc::parts::{Answer, Call, client};
+use rho_rpc::protocol::client::Client as UiClient;
+use rho_rpc::protocol::{Answer, Call, client};
 
 mod eval;
 mod pr;
@@ -80,31 +80,31 @@ async fn run(command: Command) -> Result<()> {
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
-            rho_rpc::parts::print_protocol_log(&args.path, &mut stdout, describe_frame)?;
+            rho_rpc::protocol::print_protocol_log(&args.path, &mut stdout, describe_frame)?;
             Ok(())
         }
     }
 }
 
-/// A protocol log frame, read as the part it belongs to.
-fn describe_frame(open: &rho_rpc::parts::Open, reply: Option<&[u8]>) -> String {
-    use rho_rpc::parts::{Part, describe_as};
-    match open.part {
-        Part::Agents => describe_as::<agents::Open>(open, reply),
-        Part::Desk => describe_as::<rho_desk_client::protocol::Open>(open, reply),
-        Part::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
-        Part::Host => describe_as::<host::Open>(open, reply),
-        Part::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
-        Part::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
-        Part::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),
-        Part::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
+/// A protocol log frame, read as the protocol it belongs to.
+fn describe_frame(open: &rho_rpc::protocol::Open, reply: Option<&[u8]>) -> String {
+    use rho_rpc::protocol::{Protocol, describe_as};
+    match open.protocol {
+        Protocol::Agents => describe_as::<agents::Open>(open, reply),
+        Protocol::Desk => describe_as::<rho_desk_client::protocol::Open>(open, reply),
+        Protocol::Desktop => describe_as::<rho_desktop_client::protocol::Open>(open, reply),
+        Protocol::Host => describe_as::<host::Open>(open, reply),
+        Protocol::Shell => describe_as::<rho_shell_view::protocol::Open>(open, reply),
+        Protocol::Terminal => describe_as::<rho_terminal::protocol::Open>(open, reply),
+        Protocol::Voice => describe_as::<rho_rtc::protocol::Open>(open, reply),
+        Protocol::Workspace => describe_as::<rho_files::protocol::Open>(open, reply),
     }
 }
 
 /// Approves a pending iroh enrollment over the daemon's Unix socket, so
 /// trust decisions always come from a local user on the daemon host.
 async fn run_iroh(args: IrohArgs) -> Result<()> {
-    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let socket = &socket_path;
@@ -239,7 +239,7 @@ pub(crate) enum ClaudeAccountCommand {
 /// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
 /// view namespace outside an agent; agents get the same directory by mount.
 async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
-    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let list = match &args.command {

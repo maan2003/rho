@@ -1,4 +1,4 @@
-//! The voice part of a host, [`rho_rpc::parts::Part::Voice`].
+//! The voice protocol of a host, [`rho_rpc::protocol::Protocol::Voice`].
 //!
 //! The stream performs OAuth signaling and publishes client-local semantic
 //! context. Provider control events stay on the daemon's OpenAI sideband.
@@ -13,8 +13,8 @@ pub struct Open {
     pub offer_sdp: String,
 }
 
-impl rho_rpc::parts::PartOpen for Open {
-    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Voice;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Voice;
 }
 
 /// The answer to [`Open`].

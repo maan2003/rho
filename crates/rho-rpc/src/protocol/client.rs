@@ -6,7 +6,7 @@ use senax_encoder::{Packer, Unpacker};
 use tokio::io::AsyncWriteExt as _;
 
 use super::{
-    Answer, Call, Open, PartOpen, ProtocolLogDirection, append_protocol_log_record,
+    Answer, Call, Open, ProtocolLogDirection, ProtocolOpen, append_protocol_log_record,
     protocol_frame_bytes, read_frame, write_frame,
 };
 
@@ -38,8 +38,8 @@ impl Client {
         }
     }
 
-    /// Opens the stream for a part: the first frame sent.
-    pub async fn open<T: PartOpen>(&mut self, open: &T) -> anyhow::Result<()> {
+    /// Opens the stream for a protocol: the first frame sent.
+    pub async fn open<T: ProtocolOpen>(&mut self, open: &T) -> anyhow::Result<()> {
         self.send(&Open::of(open)?).await
     }
 

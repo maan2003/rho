@@ -317,8 +317,8 @@ fn run() -> Result<()> {
         AttachTarget::Iroh { .. } => None,
     });
     let browser_socket = match local_socket {
-        Some(socket) => rho_rpc::parts::RuntimePaths::new(Some(socket.clone()))?,
-        None => rho_rpc::parts::RuntimePaths::new(None::<PathBuf>)?,
+        Some(socket) => rho_rpc::protocol::RuntimePaths::new(Some(socket.clone()))?,
+        None => rho_rpc::protocol::RuntimePaths::new(None::<PathBuf>)?,
     }
     .browser_socket();
     rho_gui::telemetry::enable();

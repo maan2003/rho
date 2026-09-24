@@ -1,15 +1,15 @@
 //! How a client and an agent host talk over [`Stream`](crate::Stream)s:
 //! the opening every stream starts with ([`Open`]), one-shot calls
 //! ([`Call`]), bounded frames, the daemon's Unix socket ([`client`],
-//! [`server`]), and protocol logs. Each part's own words live with the
-//! crate that speaks them ([`Part`]).
+//! [`server`]), and protocol logs. Each protocol's own words live with the
+//! crate that speaks them ([`Protocol`]).
 
 use anyhow::{Context as _, bail};
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
-/// Declares a part's one-shot calls. Each is a type of its own that names
+/// Declares a protocol's one-shot calls. Each is a type of its own that names
 /// its answer ([`Call::Reply`]); `Request` is what goes on the wire, one
-/// variant per call, and the part's own `Open` in scope carries it as
+/// variant per call, and the protocol's own `Open` in scope carries it as
 /// `Open::Request`. A call is answered with one [`Answer`] of its reply
 /// type, on a stream of its own.
 #[macro_export]
@@ -41,7 +41,7 @@ macro_rules! calls {
             /// Its answer, read from `frame`, as a protocol log prints it.
             pub fn debug_answer(&self, frame: &[u8]) -> String {
                 match self {
-                    $(Self::$variant(_) => $crate::parts::debug_frame::<$crate::parts::Answer<$reply>>(frame),)*
+                    $(Self::$variant(_) => $crate::protocol::debug_frame::<$crate::protocol::Answer<$reply>>(frame),)*
                 }
             }
         }
@@ -53,7 +53,7 @@ macro_rules! calls {
                 }
             }
 
-            impl $crate::parts::Call for $call {
+            impl $crate::protocol::Call for $call {
                 type Open = Open;
                 type Reply = $reply;
                 $(const PRIORITY: Option<i32> = $priority;)?
@@ -160,10 +160,10 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
         .to_owned())
 }
 
-/// Which part of the host a stream is for. Each part's messages belong to
-/// the crate that speaks it, so this names the parts and nothing more.
+/// Which protocol a stream speaks. Each protocol's messages belong to the
+/// crate that speaks it, so this names the protocols and nothing more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum Part {
+pub enum Protocol {
     /// The agents: their journal and what is asked of them
     /// (`rho-agents-client`).
     Agents,
@@ -185,18 +185,18 @@ pub enum Part {
     Workspace,
 }
 
-/// The first frame on every stream: which part it is for, and that part's
-/// own opening, packed. Everything after it is the part's own, so neither
-/// side ever reads a frame meant for another part.
+/// The first frame on every stream: which protocol it speaks, and that
+/// protocol's own opening, packed. Everything after it is the protocol's
+/// own, so neither side ever reads a frame meant for another protocol.
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Open {
-    pub part: Part,
+    pub protocol: Protocol,
     pub open: Vec<u8>,
 }
 
-/// A part's own opening frame.
-pub trait PartOpen: Packer + Unpacker + std::fmt::Debug + Send + Sync {
-    const PART: Part;
+/// A protocol's own opening frame.
+pub trait ProtocolOpen: Packer + Unpacker + std::fmt::Debug + Send + Sync {
+    const PROTOCOL: Protocol;
 
     /// A reply on a stream this opened, as a protocol log prints it; `None`
     /// for a stream frame, which the log does not read.
@@ -206,41 +206,41 @@ pub trait PartOpen: Packer + Unpacker + std::fmt::Debug + Send + Sync {
 }
 
 impl Open {
-    pub fn of<T: PartOpen>(open: &T) -> anyhow::Result<Self> {
+    pub fn of<T: ProtocolOpen>(open: &T) -> anyhow::Result<Self> {
         Ok(Self {
-            part: T::PART,
+            protocol: T::PROTOCOL,
             open: senax_encoder::pack(open)
-                .context("pack part opening")?
+                .context("pack protocol opening")?
                 .to_vec(),
         })
     }
 
-    /// The part's own opening. Fails if the stream is for another part.
-    pub fn unpack<T: PartOpen>(&self) -> anyhow::Result<T> {
+    /// The protocol's own opening. Fails if the stream is for another protocol.
+    pub fn unpack<T: ProtocolOpen>(&self) -> anyhow::Result<T> {
         anyhow::ensure!(
-            self.part == T::PART,
+            self.protocol == T::PROTOCOL,
             "{:?} stream opened as {:?}",
-            T::PART,
-            self.part
+            T::PROTOCOL,
+            self.protocol
         );
-        senax_encoder::unpack(&mut self.open.as_slice()).context("unpack part opening")
+        senax_encoder::unpack(&mut self.open.as_slice()).context("unpack protocol opening")
     }
 }
 
-/// Opens a stream for a part: the first frame on it.
+/// Opens a stream for a protocol: the first frame on it.
 pub async fn write_open<W, T>(writer: &mut W, open: &T) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
-    T: PartOpen,
+    T: ProtocolOpen,
 {
     write_frame(writer, &Open::of(open)?).await
 }
 
-/// A one-shot call: a stream of its own, opened with the part's
+/// A one-shot call: a stream of its own, opened with the protocol's
 /// `Open::Request` ([`calls!`]) and answered with one [`Answer`] of its
 /// reply.
 pub trait Call: Send + 'static {
-    type Open: PartOpen;
+    type Open: ProtocolOpen;
     type Reply: Packer + Unpacker + std::fmt::Debug + Send + 'static;
     /// The stream's priority: above the sessions unless the answer is bulk.
     const PRIORITY: Option<i32> = Some(1);
@@ -261,15 +261,15 @@ where
         .into_result()
 }
 
-/// A stream's opening as a protocol log prints it, read as part `T`, or
+/// A stream's opening as a protocol log prints it, read as protocol `T`, or
 /// with `reply` a reply on it.
-pub fn describe_as<T: PartOpen>(open: &Open, reply: Option<&[u8]>) -> String {
+pub fn describe_as<T: ProtocolOpen>(open: &Open, reply: Option<&[u8]>) -> String {
     let opened = match open.unpack::<T>() {
         Ok(opened) => opened,
         Err(error) => return format!("(undecodable: {error:#})"),
     };
     match reply {
-        None => format!("{:?} {opened:#?}", open.part),
+        None => format!("{:?} {opened:#?}", open.protocol),
         Some(frame) => opened
             .debug_reply(frame)
             .unwrap_or_else(|| "(stream frame)".to_owned()),
@@ -499,7 +499,7 @@ pub fn append_protocol_log_record(
     Ok(())
 }
 
-/// Prints a protocol log. `describe` reads a part's frames, which this
+/// Prints a protocol log. `describe` reads a protocol's frames, which this
 /// crate does not know: a stream's opening with `None`, a reply on it with
 /// the reply's frame ([`describe_as`]).
 #[cfg(not(target_family = "wasm"))]
@@ -530,7 +530,7 @@ pub fn print_protocol_log(
                 opened = Some(open);
                 message
             }
-            // What the host answers is the opened part's own; only a
+            // What the host answers is the opened protocol's own; only a
             // request's reply is read.
             ProtocolLogDirection::ServerToClient => match &opened {
                 Some(open) => describe(open, Some(payload)),
@@ -585,7 +585,7 @@ fn read_protocol_log_record(
 mod tests {
     use super::*;
 
-    /// A part's opening, for these tests alone.
+    /// A protocol's opening, for these tests alone.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
     pub enum Open {
         Session,
@@ -601,8 +601,8 @@ mod tests {
         }
     }
 
-    impl PartOpen for Open {
-        const PART: Part = Part::Host;
+    impl ProtocolOpen for Open {
+        const PROTOCOL: Protocol = Protocol::Host;
 
         fn debug_reply(&self, frame: &[u8]) -> Option<String> {
             match self {
@@ -688,14 +688,15 @@ mod tests {
         assert!(request.debug_answer(&answer).starts_with("Done("));
     }
 
-    /// A part's opening survives the envelope, and reads as no other part.
+    /// A protocol's opening survives the envelope, and reads as no other
+    /// protocol.
     #[test]
     fn openings_read_only_as_their_part() {
         let envelope = super::Open::of(&Open::Session).unwrap();
         round_trips(envelope.clone());
         assert_eq!(envelope.unpack::<Open>().unwrap(), Open::Session);
         let other = super::Open {
-            part: Part::Desk,
+            protocol: Protocol::Desk,
             open: envelope.open.clone(),
         };
         assert!(other.unpack::<Open>().is_err());

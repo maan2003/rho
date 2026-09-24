@@ -14,8 +14,8 @@ use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
 use rho_hosts::protocol::GitProviderFrame;
 use rho_inference::Inference;
-use rho_rpc::parts::server::{Server, ServerConnection};
-use rho_rpc::parts::{Open, Opened, Part, read_frame, write_frame};
+use rho_rpc::protocol::server::{Server, ServerConnection};
+use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
@@ -32,7 +32,7 @@ pub mod workspace_channel;
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
-    rho_rpc::parts::socket_path()
+    rho_rpc::protocol::socket_path()
 }
 
 pub fn default_db_path() -> anyhow::Result<PathBuf> {
@@ -234,7 +234,9 @@ fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
     }
 }
 
-fn lock_runtime_directory(paths: &rho_rpc::parts::RuntimePaths) -> anyhow::Result<std::fs::File> {
+fn lock_runtime_directory(
+    paths: &rho_rpc::protocol::RuntimePaths,
+) -> anyhow::Result<std::fs::File> {
     let path = paths.daemon_lock();
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -254,7 +256,7 @@ fn lock_runtime_directory(paths: &rho_rpc::parts::RuntimePaths) -> anyhow::Resul
 }
 
 struct RuntimeSockets {
-    paths: rho_rpc::parts::RuntimePaths,
+    paths: rho_rpc::protocol::RuntimePaths,
     server: Server,
     _lock: std::fs::File,
 }
@@ -279,7 +281,7 @@ fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
 ) -> anyhow::Result<RuntimeSockets> {
-    let paths = rho_rpc::parts::RuntimePaths::new(socket_path)?;
+    let paths = rho_rpc::protocol::RuntimePaths::new(socket_path)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
     let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
@@ -413,7 +415,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
-        rho_rpc::parts::RuntimePaths::SOCKET_ENV.into(),
+        rho_rpc::protocol::RuntimePaths::SOCKET_ENV.into(),
         runtime.paths.socket().as_os_str().to_owned(),
     ));
     configure_octo_git_transport(&mut user_environment)?;
@@ -481,7 +483,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
     let iroh = if args.iroh {
         let (listener, auth) =
-            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::parts::IROH_ALPN).await?;
+            rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
+                .await?;
         eprintln!("rho daemon iroh endpoint: {}", listener.endpoint_id());
         Some((listener, auth))
     } else {
@@ -618,7 +621,7 @@ async fn run_iroh_listener(
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("iroh stream first frame timed out"))??;
-                        let desktop_open = (open.part == Part::Desktop)
+                        let desktop_open = (open.protocol == Protocol::Desktop)
                             .then(|| open.unpack::<rho_desktop_client::protocol::Open>())
                             .transpose()?;
                         if let Some(rho_desktop_client::protocol::Open::Wayland {
@@ -636,7 +639,10 @@ async fn run_iroh_listener(
                             )
                             .await;
                         }
-                        if matches!(open.part, Part::Terminal | Part::Shell | Part::Voice) {
+                        if matches!(
+                            open.protocol,
+                            Protocol::Terminal | Protocol::Shell | Protocol::Voice
+                        ) {
                             send.set_priority(50)
                                 .context("set iroh interactive stream priority")?;
                         }
@@ -1029,18 +1035,20 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match open.part {
-        Part::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
-        Part::Desk => services.desk.serve(reader, writer).await,
-        Part::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
-        Part::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,
-        Part::Shell => agents::serve_shells(services, open.unpack()?, reader, writer).await,
-        Part::Terminal => agents::serve_terminals(services, open.unpack()?, reader, writer).await,
-        Part::Voice => {
+    match open.protocol {
+        Protocol::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
+        Protocol::Desk => services.desk.serve(reader, writer).await,
+        Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,
+        Protocol::Host => host::serve(services, iroh_auth, open.unpack()?, reader, writer).await,
+        Protocol::Shell => agents::serve_shells(services, open.unpack()?, reader, writer).await,
+        Protocol::Terminal => {
+            agents::serve_terminals(services, open.unpack()?, reader, writer).await
+        }
+        Protocol::Voice => {
             let rho_rtc::protocol::Open { offer_sdp } = open.unpack()?;
             realtime::serve(services, reader, writer, offer_sdp).await
         }
-        Part::Workspace => {
+        Protocol::Workspace => {
             let rho_files::protocol::Open { workspace } = open.unpack()?;
             agents::serve_workspace_channel(services, reader, writer, workspace).await
         }
@@ -1101,7 +1109,7 @@ fn validate_image_content(content: &[ContentPart]) -> anyhow::Result<()> {
         }
         encoded_total = encoded_total.saturating_add(encoded);
     }
-    if encoded_total > rho_rpc::parts::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
+    if encoded_total > rho_rpc::protocol::MAX_FRAME_LEN.saturating_sub(1024 * 1024) {
         anyhow::bail!("image attachments exceed the protocol aggregate size limit");
     }
     Ok(())
@@ -1256,7 +1264,7 @@ mod tests {
     async fn second_daemon_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
-            rho_rpc::parts::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+            rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let first =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();
@@ -1285,7 +1293,7 @@ mod tests {
     async fn stale_socket_files_are_removed_and_rebound() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
-            rho_rpc::parts::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+            rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         drop(std::os::unix::net::UnixListener::bind(paths.socket()).unwrap());
         drop(std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap());
 
@@ -1302,7 +1310,7 @@ mod tests {
     async fn runtime_lock_remains_held_after_socket_setup_returns() {
         let runtime = tempfile::tempdir().unwrap();
         let paths =
-            rho_rpc::parts::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+            rho_rpc::protocol::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
         let sockets =
             start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
                 .unwrap();

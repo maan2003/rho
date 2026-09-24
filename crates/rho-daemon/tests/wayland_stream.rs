@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::NewAgent;
 use rho_hosts::protocol as host;
-use rho_rpc::parts::{Opened, read_frame, write_open};
+use rho_rpc::protocol::{Opened, read_frame, write_open};
 
 struct Child(std::process::Child);
 impl Drop for Child {
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
         std::fs::create_dir(&repo)?;
         ensure!(Command::new("git").args(["init","-q","-b","main"]).arg(&repo).status()?.success(),"git init failed");
         ensure!(Command::new("git").args(["-c","user.name=Test","-c","user.email=test@localhost","commit","-q","--allow-empty","-m","init"]).current_dir(&repo).status()?.success(),"git commit failed");
-        let agent=rho_rpc::parts::client::call(&socket,NewAgent {
+        let agent=rho_rpc::protocol::client::call(&socket,NewAgent {
             role:Default::default(), start:rho_agents_client::protocol::StartMode::NewOn { repo:camino::Utf8PathBuf::from_path_buf(repo).unwrap(),revset:"@".into() },
             mode:rho_agent_types::WorksetMode::Exposed,content:None,
         }).await.context("agent creation failed")?;
@@ -117,8 +117,8 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==(false,0,0),"video work exists without subscriber");
         let endpoint:iroh::EndpointId=endpoint.parse()?;
         let client=rho_rpc::bind_ephemeral_iroh_client().await?;
-        rho_rpc::parts::client::call(&socket,host::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await.context("trust")?;
-        let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_rpc::parts::IROH_ALPN)).await??;
+        rho_rpc::protocol::client::call(&socket,host::IrohTrustInMemory {endpoint_id:client.id().to_string()}).await.context("trust")?;
+        let connection=tokio::time::timeout(Duration::from_secs(40),client.connect(endpoint,rho_rpc::protocol::IROH_ALPN)).await??;
         ensure!(rho_rpc::authenticate_iroh_client(&connection,client.id()).await?==rho_iroh_auth::ClientAuthResult::Approved,"auth failed");
         let mux=rho_rpc::media::Mux::new(connection.clone());
         let m=mux.clone(); let uni=tokio::spawn(async move {m.receive_uni().await});
@@ -195,7 +195,7 @@ layout { background-color "#315b97"; }
         ensure!(desktop_status(&mut status).await?==stopped,"video work survived unsubscribe");
         let (send,recv)=connection.open_bi().await?;
         let mut rpc=rho_rpc::Stream::new(recv,send);
-        rho_rpc::parts::call(&mut rpc,agents::QuotaUsage).await.context("RPC failed after detach")?;
+        rho_rpc::protocol::call(&mut rpc,agents::QuotaUsage).await.context("RPC failed after detach")?;
         uni.abort(); bi.abort();
         client.close().await;
         // A second named desktop is advertised, then excluded after a crash

@@ -4,7 +4,7 @@ use std::future::Future;
 
 use futures::channel::mpsc as futures_mpsc;
 use rho_agent_types::WorkspaceInfo;
-use rho_rpc::parts::{Opened, read_frame, write_open};
+use rho_rpc::protocol::{Opened, read_frame, write_open};
 
 use crate::protocol::{MAX_WORKSPACE_FRAME_LEN, Open, WorkspaceClientFrame, WorkspaceServerFrame};
 

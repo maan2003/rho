@@ -12,7 +12,7 @@ use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
 use rho_agents_client::stream::AgentFrame;
 use rho_desk_client::stream::DeskFrame;
 use rho_hosts::connection::ConnEvent;
-use rho_rpc::parts::{Answer, Open, read_frame, write_frame};
+use rho_rpc::protocol::{Answer, Open, read_frame, write_frame};
 use senax_encoder::{Packer, Unpacker};
 
 pub type UiRuntimeKind = rho_agents_client::protocol::transcript::RuntimeKind;

@@ -19,7 +19,7 @@ use rho_agents_client::protocol::{
     StartMode,
 };
 use rho_fake_model::{REAL_TOOL_ROUNDS, Scenario};
-use rho_rpc::parts::client::Client;
+use rho_rpc::protocol::client::Client;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};

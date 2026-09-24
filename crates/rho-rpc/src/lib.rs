@@ -5,7 +5,7 @@
 //! callers can switch to raw bytes after a typed handshake without changing
 //! compression layers.
 //!
-//! [`parts`] is what goes on those streams between a client and an agent
+//! [`protocol`] is what goes on those streams between a client and an agent
 //! host.
 
 use std::future::Future;
@@ -21,7 +21,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use senax_encoder::{Packer, Unpacker};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader};
 
-pub mod parts;
+pub mod protocol;
 
 /// Zstd's maximum history window in each direction (128 KiB).
 ///

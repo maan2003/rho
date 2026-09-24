@@ -12,7 +12,7 @@ use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_agent_types::{AgentId, Seq};
 use rho_hosts::{Dialer, HostStream};
-use rho_rpc::parts::{read_frame, write_frame, write_open};
+use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::HostId;
 use crate::model::ToModel;

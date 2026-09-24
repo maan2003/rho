@@ -1,8 +1,8 @@
 //! Wire vocabulary for workset-owned terminals.
 //!
-//! The terminals part of a host, [`rho_rpc::parts::Part::Terminal`]. A
-//! terminal stream is opened by [`Open::Terminal`]; after
-//! [`rho_rpc::parts::Opened::Ready`] an attached stream carries senax
+//! The terminal protocol of a host, [`rho_rpc::protocol::Protocol::Terminal`].
+//! A terminal stream is opened by [`Open::Terminal`]; after
+//! [`rho_rpc::protocol::Opened::Ready`] an attached stream carries senax
 //! frames of [`TermClientFrame`] and [`TermServerFrame`].
 //!
 //! The protocol is deliberately dumb on the client side: the workset owns the
@@ -18,7 +18,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum Open {
     /// A daemon-owned terminal for an agent. Answered with
-    /// [`rho_rpc::parts::Opened`]; an attached stream then carries
+    /// [`rho_rpc::protocol::Opened`]; an attached stream then carries
     /// [`TermClientFrame`] and [`TermServerFrame`], the first of them a
     /// snapshot of the screen preceded by history. Otherwise the terminal
     /// runs headless and the stream closes.
@@ -33,7 +33,7 @@ pub enum Open {
         cols: u16,
         rows: u16,
     },
-    /// One call, answered with one [`rho_rpc::parts::Answer`]; then the
+    /// One call, answered with one [`rho_rpc::protocol::Answer`]; then the
     /// stream closes.
     Request(Request),
 }
@@ -45,8 +45,8 @@ rho_rpc::calls! {
     }
 }
 
-impl rho_rpc::parts::PartOpen for Open {
-    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Terminal;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Terminal;
 
     fn debug_reply(&self, frame: &[u8]) -> Option<String> {
         match self {

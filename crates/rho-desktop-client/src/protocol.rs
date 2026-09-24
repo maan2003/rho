@@ -1,5 +1,5 @@
-//! The desktops part of a host, [`rho_rpc::parts::Part::Desktop`]: which
-//! desktops the host's worksets run, and a live view of one.
+//! The desktop protocol of a host, [`rho_rpc::protocol::Protocol::Desktop`]:
+//! which desktops the host's worksets run, and a live view of one.
 
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
@@ -10,7 +10,7 @@ pub enum Open {
     /// `Vec<`[`DesktopSession`]`>`, pushed whenever it changes.
     Sessions,
     /// One live application over MoQ streams on this connection, so only
-    /// over iroh. Answered with [`rho_rpc::parts::Opened`].
+    /// over iroh. Answered with [`rho_rpc::protocol::Opened`].
     Wayland {
         media_id: u64,
         agent: String,
@@ -18,8 +18,8 @@ pub enum Open {
     },
 }
 
-impl rho_rpc::parts::PartOpen for Open {
-    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Desktop;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Desktop;
 }
 
 /// One desktop an agent's workset runs.
@@ -43,7 +43,7 @@ mod tests {
                 session: "desk".to_owned(),
             },
         ] {
-            let envelope = rho_rpc::parts::Open::of(&open).unwrap();
+            let envelope = rho_rpc::protocol::Open::of(&open).unwrap();
             assert_eq!(envelope.unpack::<Open>().unwrap(), open);
         }
     }

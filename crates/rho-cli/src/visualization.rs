@@ -15,7 +15,7 @@ pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
         bail!("visualization is too large (maximum {MAX_VISUALIZATION_BYTES} bytes)");
     }
 
-    let socket_path = rho_rpc::parts::RuntimePaths::resolve(args.socket_path)?
+    let socket_path = rho_rpc::protocol::RuntimePaths::resolve(args.socket_path)?
         .socket()
         .to_owned();
     let call = RecordVisualization {

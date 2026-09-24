@@ -12,7 +12,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
 use rho_hosts::{Dialer, HostId, HostStream};
-use rho_rpc::parts::{read_frame, write_frame, write_open};
+use rho_rpc::protocol::{read_frame, write_frame, write_open};
 
 use crate::protocol::stream::{ClientFrame, ServerFrame};
 

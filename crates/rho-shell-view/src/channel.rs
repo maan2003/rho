@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::SinkExt as _;
 use futures::channel::mpsc as futures_mpsc;
-use rho_rpc::parts::{Call, Opened, read_frame, write_frame, write_open};
+use rho_rpc::protocol::{Call, Opened, read_frame, write_frame, write_open};
 
 use crate::protocol::{
     Open, ShellClientFrame, ShellClose, ShellList, ShellServerFrame, ShellStart,
@@ -32,7 +32,7 @@ pub fn close(
 /// One call on a stream of its own. A refusal is an error.
 async fn call<C: Call>(dialer: &rho_hosts::Dialer, call: C) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    rho_rpc::parts::call(&mut stream, call).await
+    rho_rpc::protocol::call(&mut stream, call).await
 }
 
 /// One attachment to an agent's daemon-owned Comint-style shell. Dropping

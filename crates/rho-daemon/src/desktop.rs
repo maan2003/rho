@@ -1,11 +1,11 @@
-//! The desktops part of the daemon, [`rho_rpc::parts::Part::Desktop`]:
+//! The desktops part of the daemon, [`rho_rpc::protocol::Protocol::Desktop`]:
 //! which desktops the worksets run. A live view of one is served where the
 //! iroh connection's media are; see `run_iroh_listener`.
 
 use std::sync::Arc;
 
 use rho_desktop_client::protocol::Open;
-use rho_rpc::parts::{Opened, write_frame};
+use rho_rpc::protocol::{Opened, write_frame};
 
 use crate::Services;
 
@@ -50,7 +50,7 @@ where
     loop {
         tokio::select! {
             // The client says nothing; its end of the stream is the end.
-            closed = rho_rpc::parts::read_frame_optional::<_, ()>(&mut reader) => {
+            closed = rho_rpc::protocol::read_frame_optional::<_, ()>(&mut reader) => {
                 return closed.map(|_| ());
             }
             _ = timer.tick() => {}

@@ -1,6 +1,6 @@
-//! The desk part of a host, [`rho_rpc::parts::Part::Desk`]: the words of a
-//! note, as a text CRDT, the ids the store leans on ([`cells`]), and the
-//! stream that syncs them ([`stream`]).
+//! The desk protocol of a host, [`rho_rpc::protocol::Protocol::Desk`]: the
+//! words of a note, as a text CRDT, the ids the store leans on ([`cells`]), and
+//! the stream that syncs them ([`stream`]).
 //!
 //! The convergent movable tree that used to live here is gone: the store
 //! holds facts about typed ids (`cells`), and a note's body is the only
@@ -17,8 +17,8 @@ pub mod stream;
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub struct Open;
 
-impl rho_rpc::parts::PartOpen for Open {
-    const PART: rho_rpc::parts::Part = rho_rpc::parts::Part::Desk;
+impl rho_rpc::protocol::ProtocolOpen for Open {
+    const PROTOCOL: rho_rpc::protocol::Protocol = rho_rpc::protocol::Protocol::Desk;
 }
 
 /// Lamport timestamp used by structural operations.

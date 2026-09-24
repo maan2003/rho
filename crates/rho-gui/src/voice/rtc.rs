@@ -4,7 +4,7 @@
 use std::future::Future;
 
 use futures::StreamExt as _;
-use rho_rpc::parts::{read_frame, write_open};
+use rho_rpc::protocol::{read_frame, write_open};
 use rho_rtc::protocol::{RealtimeClientFrame, RealtimeServerFrame};
 use rho_rtc::{RtcEvent, RtcSession, SdpAnswer};
 
@@ -33,8 +33,8 @@ async fn dial(dialer: rho_hosts::Dialer, offer_sdp: String) -> anyhow::Result<Re
         rho_rtc::protocol::Opened::Refused { reason } => anyhow::bail!("{reason}"),
     };
     let channel = stream.into_channel(rho_rpc::ChannelConfig {
-        tx_limit: rho_rpc::parts::MAX_FRAME_LEN,
-        rx_limit: rho_rpc::parts::MAX_FRAME_LEN,
+        tx_limit: rho_rpc::protocol::MAX_FRAME_LEN,
+        rx_limit: rho_rpc::protocol::MAX_FRAME_LEN,
         tx_capacity: 32,
         rx_capacity: 32,
     });

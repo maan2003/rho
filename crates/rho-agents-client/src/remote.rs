@@ -5,7 +5,7 @@
 use std::future::Future;
 
 use rho_hosts::{Dialer, Link};
-use rho_rpc::parts::Call;
+use rho_rpc::protocol::Call;
 
 use crate::protocol::{self, VisualizationContent};
 
@@ -49,5 +49,5 @@ impl AgentsLink {
 /// One call on a stream of its own. A refusal is an error.
 async fn dial_call<C: Call>(dialer: Dialer, call: C) -> anyhow::Result<C::Reply> {
     let mut stream = dialer.open(C::PRIORITY).await?;
-    rho_rpc::parts::call(&mut stream, call).await
+    rho_rpc::protocol::call(&mut stream, call).await
 }
