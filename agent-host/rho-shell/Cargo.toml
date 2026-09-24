@@ -3,7 +3,6 @@ edition.workspace = true
 license.workspace = true
 name = "rho-shell"
 publish = false
-readme.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
