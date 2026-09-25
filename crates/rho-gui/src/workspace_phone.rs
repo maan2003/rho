@@ -653,7 +653,7 @@ impl Workspace {
                 Some(PhoneTransition::Flick(card)) => {
                     // Flicking back is taking the skip back: the card is the
                     // one to look at again, so it opens as it was.
-                    self.attention.dealer.clear_skip(&card.node);
+                    self.attention.skips.clear(&card.node);
                     self.open_card(*card, window, cx);
                     self.invalidate_dealer_signals(cx);
                 }

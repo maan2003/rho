@@ -394,7 +394,7 @@ impl Workspace {
             if node_marks.deleted {
                 continue;
             }
-            let title = self.node_title(node);
+            let title = self.node_title(node, cx);
             candidates.push(FindCandidate {
                 labels: labelled(node, &title),
                 aka: Vec::new(),
@@ -418,7 +418,7 @@ impl Workspace {
         // found; a muted one is gone for good.
         for agent_id in self.registry.known_agents().copied() {
             let node = NodeId::Agent(agent_id);
-            if marks.get(&node).muted || !self.registry.created_by_user(agent_id) {
+            if marks.get(&node).facts().muted() || !self.registry.created_by_user(agent_id) {
                 continue;
             }
             let hit = rho_agents_client::find::hit(

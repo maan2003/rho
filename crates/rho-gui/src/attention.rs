@@ -1,12 +1,12 @@
 //! What wants the user, and what they said about it.
 //!
-//! The user's marks live in the ledger, which syncs them sealed between
-//! their devices through the hosts. Every source — the agents, Slack, the
-//! notes — says what it wants from the user, folding in the marks that
-//! concern it, and the dealer ranks those wants into the hand Home shows
-//! and a pull deals from. A verdict is a source's own action: most write
-//! marks, and a Slack one moves Slack's cursor or mutes the unit in Slack.
+//! The user's marks and facts live in the ledger, which syncs them sealed
+//! between their devices through the hosts. The dealer reads them with
+//! the agents map and Slack into the hand Home shows and a pull deals
+//! from. A verdict is a fact the user said, and a Slack one also moves
+//! Slack's cursor or mutes the unit in Slack.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -14,13 +14,14 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{Context, Window};
 use rho_agent_types::AgentId;
-use rho_dealer::marks::{self, Cursor, Todo, Write};
-use rho_dealer::{Card, CardKind, Curve, DateMark, Dealer, Marks, NodeId, SlackUnit, Want};
+use rho_dealer::facts::{self, Cursor, Fact, Said};
+use rho_dealer::marks::{self, Write, legacy};
+use rho_dealer::rank::{self, Cache, Sources};
+use rho_dealer::{Card, CardKind, Hand, Marks, NodeId, Skips, SlackUnit, Until};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Ledger, Secret};
 use rho_window::style::StyleClass;
 
-use crate::sources::{AgentsSource, NotesSource, SlackSource};
 use crate::workspace::Workspace;
 
 /// What `shift-u` takes back: the marks a verdict wrote, as they were,
@@ -41,32 +42,33 @@ pub(crate) struct Undo {
     pub(crate) slack_muted: Option<SlackUnit>,
 }
 
-/// The verdicts a card can take. Each source decides what one means for
-/// its nodes.
+/// The verdicts a card can take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Dealt with: everything the source has said so far is handled.
     Done,
     /// Nothing from this node reaches the user again.
     Mute,
-    /// Out of the way until then, and back then.
-    Snooze(DateMark),
-    /// Handled here, and owed again: back after `pace_days`.
-    Todo { pace_days: u32 },
+    /// Out of the way until then.
+    Snooze(Until),
+    /// Handled here, and on the user's plate until done: from `start`, or
+    /// from now.
+    Todo { start: Option<Until> },
 }
 
 pub(crate) struct Attention {
     streams: Arc<LedgerStreams>,
     pub(crate) marks: Marks,
-    pub(crate) dealer: Dealer,
+    pub(crate) skips: Skips,
+    cache: RefCell<Cache>,
     undo: Vec<Undo>,
     next_undo: u64,
-    pub(crate) slack: SlackSource,
 }
 
 impl Attention {
     /// The ledger in `db`, with its marks read out. A device's first start
-    /// on the ledger carries over what the desk held.
+    /// on the ledger carries over what the desk held, and every start
+    /// carries an older build's marks over into facts.
     pub(crate) fn open(db: rho_db::RhoDb) -> (Self, UnboundedReceiver<LedgerEvent>) {
         let ledger = futures::executor::block_on(async {
             let ledger = Ledger::open(db.clone()).await;
@@ -80,17 +82,38 @@ impl Attention {
             ledger
                 .scan(b"n/")
                 .into_iter()
+                .chain(ledger.scan(b"f/"))
                 .map(|(key, value)| (key, Some(value))),
         );
+        let stamps = ledger
+            .stamps(b"n/")
+            .into_iter()
+            .map(|(key, ms)| {
+                let at = jiff::Timestamp::from_millisecond(ms as i64)
+                    .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+                (key, at)
+            })
+            .collect();
+        let carried = marks.carry_legacy(&stamps, &jiff::Zoned::now().time_zone().clone());
+        if !carried.is_empty() {
+            let count = carried.len();
+            let keys: Vec<Vec<u8>> = carried.iter().map(|(key, _)| key.clone()).collect();
+            futures::executor::block_on(ledger.write(carried));
+            marks.apply(keys.into_iter().map(|key| {
+                let value = ledger.get(&key);
+                (key, value)
+            }));
+            tracing::info!(writes = count, "carried older marks over into facts");
+        }
         let (streams, events) = LedgerStreams::new(ledger);
         (
             Self {
                 streams,
                 marks,
-                dealer: Dealer::default(),
+                skips: Skips::default(),
+                cache: RefCell::default(),
                 undo: Vec::new(),
                 next_undo: 0,
-                slack: SlackSource::default(),
             },
             events,
         )
@@ -176,10 +199,28 @@ fn migrated_node(id: &rho_desk_client::protocol::cells::Id) -> Option<NodeId> {
     })
 }
 
-fn date_mark(at: rho_desk_client::protocol::cells::Timestamp) -> DateMark {
-    DateMark {
-        unix_ms: at.unix_ms,
-        day: at.precision == rho_desk_client::protocol::cells::TimestampPrecision::Day,
+/// A desk date as an instant. The desk kept a day as midnight UTC of that
+/// date; the day now starts at the user's own midnight.
+fn date_mark(at: rho_desk_client::protocol::cells::Timestamp) -> legacy::DateMark {
+    match at.precision {
+        rho_desk_client::protocol::cells::TimestampPrecision::Day => {
+            let now = jiff::Zoned::now();
+            let date = jiff::Timestamp::from_millisecond(at.unix_ms)
+                .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .date();
+            let start = date
+                .to_zoned(now.time_zone().clone())
+                .map_or(at.unix_ms, |start| start.timestamp().as_millisecond());
+            legacy::DateMark {
+                unix_ms: start,
+                day: true,
+            }
+        }
+        _ => legacy::DateMark {
+            unix_ms: at.unix_ms,
+            day: false,
+        },
     }
 }
 
@@ -234,13 +275,13 @@ pub(crate) fn desk_marks(
                     writes.push(marks::repository(&target, Some(repository.url.clone())));
                 }
                 Property::State(State::Muted) if !matches!(target, NodeId::Slack(_)) => {
-                    writes.push(marks::muted(&target, true));
+                    writes.push(legacy::muted(&target));
                 }
                 Property::State(State::Done) if matches!(target, NodeId::Note(_)) => {
-                    writes.push(marks::handled(&target, Some(Cursor::Done)));
+                    writes.push(legacy::handled(&target, &Cursor::Done));
                 }
                 Property::AgentHandledThrough(pos) if matches!(target, NodeId::Agent(_)) => {
-                    writes.push(marks::handled(&target, Some(Cursor::Story(pos.0))));
+                    writes.push(legacy::handled(&target, &Cursor::Story(pos.0)));
                 }
                 Property::DeferUntil(Some(at)) => wakes = Some(date_mark(*at)),
                 Property::Deadline(Some(at)) => deadline = Some(date_mark(*at)),
@@ -253,15 +294,15 @@ pub(crate) fn desk_marks(
         match (wakes, deadline, pace_days) {
             (None, None, _) => {}
             (Some(until), None, 0) if !matches!(target, NodeId::Note(_)) => {
-                writes.push(marks::snooze(&target, Some(until)));
+                writes.push(legacy::snooze(&target, &until));
             }
-            (wakes, deadline, pace_days) => writes.push(marks::todo(
+            (wakes, deadline, pace_days) => writes.push(legacy::todo(
                 &target,
-                Some(Todo {
+                &legacy::Todo {
                     wakes,
                     deadline,
                     pace_days,
-                }),
+                },
             )),
         }
         if let (NodeId::Note(_), Some(body)) = (&target, &node.body) {
@@ -269,49 +310,6 @@ pub(crate) fn desk_marks(
         }
     }
     writes
-}
-
-/// What an agent's last turn says, in the words a card uses.
-/// The wants a node's own dates make: a todo coming due or a deadline, and
-/// a snooze that has come back.
-fn dated_wants(marks: &rho_dealer::marks::NodeMarks, title: &str, context: &str) -> Vec<Want> {
-    let want = |curve: Curve, cursor: String| Want {
-        kind: CardKind::Dated,
-        title: title.to_owned(),
-        context: context.to_owned(),
-        reason: String::new(),
-        curve,
-        touched_ms: None,
-        cursor,
-    };
-    let mut wants = Vec::new();
-    if let Some(todo) = marks.todo {
-        if let Some(at) = todo.wakes {
-            wants.push(want(
-                Curve::Wakes {
-                    at,
-                    pace_days: todo.pace_days,
-                },
-                format!("wakes {}", at.unix_ms),
-            ));
-        }
-        if let Some(at) = todo.deadline {
-            wants.push(want(
-                Curve::Deadline {
-                    at,
-                    pace_days: todo.pace_days,
-                },
-                format!("deadline {}", at.unix_ms),
-            ));
-        }
-    }
-    if let Some(at) = marks.snoozed {
-        wants.push(want(
-            Curve::Wakes { at, pace_days: 0 },
-            format!("snooze {}", at.unix_ms),
-        ));
-    }
-    wants
 }
 
 /// A label path split into its names, with empty ones dropped.
@@ -411,10 +409,6 @@ impl Workspace {
             self.refresh_workdirs();
         }
         self.push_agent_marks(&agents);
-        let now = chrono::Local::now().fixed_offset();
-        for node in &touched {
-            self.refresh_node_wants(node, now);
-        }
         self.sync_note_views(&touched, cx);
         self.invalidate_dealer_signals(cx);
     }
@@ -426,11 +420,19 @@ impl Workspace {
         for agent_id in agents {
             let node = NodeId::Agent(*agent_id);
             let marks = self.attention.marks.get(&node);
-            let verdict = AgentsSource::map_verdict(marks);
+            let said = marks.facts();
+            let handled = match said.handled() {
+                Some(Cursor::Story(pos)) => *pos,
+                _ => 0,
+            };
+            let verdict = rho_agents_client::Verdict {
+                handled_through: rho_agent_types::AgentPos(handled),
+                muted: said.muted(),
+            };
             filings.push((
                 *agent_id,
                 rho_agents_client::AgentFiling {
-                    muted: marks.muted,
+                    muted: said.muted(),
                     labels: marks
                         .labels
                         .iter()
@@ -447,134 +449,49 @@ impl Workspace {
         self.registry.set_agent_filings(filings);
     }
 
-    /// What a node is called on a card, in Find, and on its own surface.
-    pub(crate) fn node_title(&self, node: &NodeId) -> String {
-        match node {
-            NodeId::Note(_) => self.notes_source().note_title(node),
-            NodeId::Label(id) => self.notes_source().label_title(*id),
-            NodeId::Agent(agent_id) => self.agents_source().title(*agent_id),
-            NodeId::Slack(unit) => self.attention.slack.title(unit),
-            NodeId::PullRequest { repo, number } => format!("{repo}#{number}"),
-        }
-    }
-
-    pub(crate) fn agents_source(&self) -> AgentsSource<'_> {
-        AgentsSource {
-            map: &self.registry,
-            touched: &self.agent_last_interaction,
-        }
-    }
-
-    pub(crate) fn notes_source(&self) -> NotesSource<'_> {
-        NotesSource {
+    /// Everything the dealer reads, as it stands.
+    fn with_sources<R>(&self, cx: &gpui::App, read: impl FnOnce(&Sources<'_>) -> R) -> R {
+        let session = self.slack.session().map(|session| session.read(cx));
+        let sources = Sources {
+            agents: &self.registry,
+            slack: session.map(|session| rank::Slack {
+                model: session.model(),
+                mirror: session.mirror(),
+            }),
             marks: &self.attention.marks,
-        }
+            skips: &self.attention.skips,
+        };
+        read(&sources)
+    }
+
+    /// What a node is called on a card, in Find, and on its own surface.
+    pub(crate) fn node_title(&self, node: &NodeId, cx: &gpui::App) -> String {
+        self.with_sources(cx, |sources| {
+            rank::title(sources, node, &mut self.attention.cache.borrow_mut())
+        })
     }
 
     /// Where a node is: a conversation for a Slack unit, the labels it
     /// carries for anything else.
-    pub(crate) fn node_context(&self, node: &NodeId) -> String {
-        if let NodeId::Slack(unit) = node
-            && let Some(conversation) = self.attention.slack.context(unit)
-        {
-            return conversation;
-        }
-        let marks = self.attention.marks.get(node);
-        marks
-            .labels
-            .iter()
-            .filter(|label| !self.attention.marks.get(&NodeId::Label(**label)).deleted)
-            .map(|label| self.attention.marks.label_path(*label))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// Everything `node` wants of the user right now.
-    fn wants_for(&self, node: &NodeId, now: chrono::DateTime<chrono::FixedOffset>) -> Vec<Want> {
-        let marks = self.attention.marks.get(node);
-        if marks.muted || marks.deleted {
-            return Vec::new();
-        }
-        if marks.snoozed.is_some_and(|until| until.is_ahead(now)) {
-            return Vec::new();
-        }
-        let title = self.node_title(node);
-        let context = self.node_context(node);
-        let mut wants = dated_wants(marks, &title, &context);
-        match node {
-            NodeId::Agent(agent_id) => {
-                wants.extend(self.agents_source().want(*agent_id, marks, &context))
-            }
-            NodeId::Slack(unit) => {
-                wants.extend(self.attention.slack.want(unit, now.timestamp_millis()))
-            }
-            _ => {}
-        }
-        wants
-    }
-
-    fn refresh_node_wants(&mut self, node: &NodeId, now: chrono::DateTime<chrono::FixedOffset>) {
-        let wants = self.wants_for(node, now);
-        self.attention.dealer.set(node.clone(), wants);
-    }
-
-    /// Makes the named agents' wants again, after their stories moved.
-    pub(crate) fn refresh_agent_wants(&mut self, agents: impl IntoIterator<Item = AgentId>) {
-        let now = chrono::Local::now().fixed_offset();
-        for agent_id in agents {
-            self.refresh_node_wants(&NodeId::Agent(agent_id), now);
-        }
-    }
-
-    /// Reads Slack's units again and makes their wants.
-    pub(crate) fn refresh_slack_wants(&mut self, cx: &gpui::App) {
-        let facts = self.slack_thread_facts(cx);
-        let now = chrono::Local::now().fixed_offset();
-        let units = self.attention.slack.read(facts);
-        for unit in units {
-            self.refresh_node_wants(&NodeId::Slack(unit), now);
-        }
-    }
-
-    /// Every want made again: every agent, every Slack unit and every
-    /// marked node.
-    pub(crate) fn rebuild_wants(&mut self, cx: &gpui::App) {
-        let now = chrono::Local::now().fixed_offset();
-        let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
-        self.push_agent_marks(&agents);
-        self.attention.dealer.retain(|_| false);
-        let facts = self.slack_thread_facts(cx);
-        self.attention.slack.read(facts);
-        let mut nodes: BTreeSet<NodeId> = agents.into_iter().map(NodeId::Agent).collect();
-        nodes.extend(self.attention.slack.units().cloned().map(NodeId::Slack));
-        nodes.extend(
-            self.attention
-                .marks
-                .nodes()
-                .filter(|(_, marks)| marks.todo.is_some() || marks.snoozed.is_some())
-                .map(|(node, _)| node.clone()),
-        );
-        for node in nodes {
-            self.refresh_node_wants(&node, now);
-        }
+    pub(crate) fn node_context(&self, node: &NodeId, cx: &gpui::App) -> String {
+        self.with_sources(cx, |sources| rank::context(sources, node))
     }
 
     /// The ranking as it stands.
-    pub(crate) fn hand(&self) -> Vec<Card> {
-        self.attention
-            .dealer
-            .hand(chrono::Local::now().fixed_offset())
+    pub(crate) fn hand(&self, cx: &gpui::App) -> Hand {
+        let now = jiff::Zoned::now();
+        self.with_sources(cx, |sources| {
+            rank::rank(sources, &now, &mut self.attention.cache.borrow_mut())
+        })
     }
 
     /// The card for a node the reader is on: its card in the hand, or the
     /// node itself when the hand holds none, because reading a thing can
     /// be what quiets it and a verdict on what is on screen still lands.
-    pub(crate) fn card_for(&self, node: &NodeId) -> Card {
-        let now = chrono::Local::now().fixed_offset();
+    pub(crate) fn card_for(&self, node: &NodeId, cx: &gpui::App) -> Card {
         if let Some(card) = self
-            .attention
-            .dealer
-            .hand(now)
+            .hand(cx)
+            .cards
             .into_iter()
             .find(|card| &card.node == node)
         {
@@ -588,8 +505,8 @@ impl Workspace {
         Card {
             node: node.clone(),
             kind,
-            title: self.node_title(node),
-            context: self.node_context(node),
+            title: self.node_title(node, cx),
+            context: self.node_context(node, cx),
             label: String::new(),
             priority: f64::NEG_INFINITY,
             cursor: String::new(),
@@ -605,63 +522,38 @@ impl Workspace {
         verdict: Verdict,
         cx: &mut Context<Self>,
     ) -> Option<Undo> {
-        let mut writes = Vec::new();
+        let now = jiff::Zoned::now();
+        tracing::debug!(node = %node.key(), ?verdict, "verdict");
         let mut slack_cursors = Vec::new();
         let mut slack_muted = None;
-        let marks = self.attention.marks.get(node).clone();
-        // Whatever says "dealt with" also takes back the dates that would
-        // bring the node back.
-        let clear_dates = |writes: &mut Vec<Write>| {
-            if marks.todo.is_some() {
-                writes.push(marks::todo(node, None));
-            }
-            if marks.snoozed.is_some() {
-                writes.push(marks::snooze(node, None));
-            }
+        // How far the verdict deals with the node: an agent through its
+        // newest story. Slack keeps its own cursor, moved here.
+        let through = match node {
+            NodeId::Agent(agent_id) => Cursor::Story(
+                self.registry
+                    .agent_digest(*agent_id)
+                    .map_or(0, |digest| digest.newest.0),
+            ),
+            _ => Cursor::Done,
         };
-        match node {
-            NodeId::Agent(agent_id) => {
-                writes.extend(self.agents_source().verdict(*agent_id, verdict))
-            }
-            // Slack's verdicts are Slack's own, through its session.
-            NodeId::Slack(unit) => match verdict {
-                Verdict::Done | Verdict::Todo { .. } | Verdict::Mute => {
-                    slack_cursors.extend(self.advance_slack_cursor(unit, None, cx));
-                    if verdict == Verdict::Mute {
-                        self.slack_set_unit_muted(unit, true, cx);
-                        slack_muted = Some(unit.clone());
-                    }
-                }
-                Verdict::Snooze(_) => {}
-            },
-            _ => writes.extend(self.notes_source().verdict(node, verdict)),
-        }
-
-        match verdict {
-            Verdict::Done | Verdict::Mute => clear_dates(&mut writes),
-            Verdict::Snooze(until) => writes.push(marks::snooze(node, Some(until))),
-            Verdict::Todo { pace_days } => {
-                if marks.snoozed.is_some() {
-                    writes.push(marks::snooze(node, None));
-                }
-                writes.push(marks::todo(
-                    node,
-                    Some(Todo {
-                        wakes: Some(DateMark::day(chrono::Local::now().date_naive())),
-                        deadline: marks.todo.and_then(|todo| todo.deadline),
-                        pace_days,
-                    }),
-                ));
+        if let NodeId::Slack(unit) = node
+            && !matches!(verdict, Verdict::Snooze(_))
+        {
+            slack_cursors.extend(self.advance_slack_cursor(unit, None, cx));
+            if verdict == Verdict::Mute {
+                self.slack_set_unit_muted(unit, true, cx);
+                slack_muted = Some(unit.clone());
             }
         }
-        if writes.is_empty() && slack_cursors.is_empty() && slack_muted.is_none() {
-            return None;
-        }
-        let writes = self.write_marks(writes, cx);
-        if !slack_cursors.is_empty() || slack_muted.is_some() {
-            self.refresh_slack_wants(cx);
-            self.invalidate_dealer_signals(cx);
-        }
+        let said = match verdict {
+            Verdict::Done => Said::Done { through },
+            // Slack mutes the unit itself; here it is only dealt with.
+            Verdict::Mute if matches!(node, NodeId::Slack(_)) => Said::Done { through },
+            Verdict::Mute => Said::Mute,
+            Verdict::Snooze(until) => Said::Snooze { until },
+            Verdict::Todo { start } => Said::Todo { through, start },
+        };
+        let writes = self.write_marks(vec![facts::record(node, &Fact { at: now, said })], cx);
         Some(Undo {
             sequence: 0,
             verb: String::new(),
@@ -686,7 +578,6 @@ impl Workspace {
             self.slack_set_unit_muted(unit, false, cx);
         }
         self.write_marks(undo.writes, cx);
-        self.refresh_slack_wants(cx);
         let Some((node, verdict)) = undo.card else {
             if undo.slack_cursors.is_empty() {
                 self.echo(&format!("undid {}", undo.verb), StyleClass::SystemInfo, cx);
@@ -704,8 +595,8 @@ impl Workspace {
             self.invalidate_dealer_signals(cx);
             return;
         };
-        self.attention.dealer.clear_skip(&node);
-        let card = self.card_for(&node);
+        self.attention.skips.clear(&node);
+        let card = self.card_for(&node, cx);
         rho_journal::record(rho_journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.node),
             verdict,
@@ -745,7 +636,7 @@ impl Workspace {
                     writes.push(marks::parent(&node, parent));
                     writes.push(marks::created(
                         &node,
-                        chrono::Local::now().timestamp_millis(),
+                        jiff::Timestamp::now().as_millisecond(),
                     ));
                     minted.insert(prefix, id);
                     id
@@ -772,7 +663,7 @@ impl Workspace {
             );
             return;
         };
-        let title = self.node_title(&node);
+        let title = self.node_title(&node, cx);
         let mut doomed = vec![node.clone()];
         if let NodeId::Label(label) = node {
             let mut under = vec![label];
@@ -925,7 +816,7 @@ impl Workspace {
         let node = NodeId::Note(uuid::Uuid::new_v4());
         let mut writes = vec![marks::created(
             &node,
-            chrono::Local::now().timestamp_millis(),
+            jiff::Timestamp::now().as_millisecond(),
         )];
         writes.extend(self.new_thing_marks(&node, area));
         self.write_marks(writes, cx);
@@ -1150,22 +1041,17 @@ mod tests {
         );
         let mut marks = Marks::default();
         marks.apply(desk_marks(&held));
+        let carried = marks.carry_legacy(&HashMap::new(), &jiff::tz::TimeZone::UTC);
+        marks.apply(carried);
 
         let gui = uuid::Uuid::from_bytes([2; 16]);
         assert_eq!(marks.label_path(gui), "rho/gui");
         let note = marks.get(&NodeId::Note(uuid::Uuid::from_bytes([3; 16])));
         assert_eq!(note.title(), "buy milk");
         assert!(note.labels.contains(&gui));
-        assert_eq!(
-            note.todo,
-            Some(Todo {
-                wakes: Some(DateMark {
-                    unix_ms: 86_400_000,
-                    day: true
-                }),
-                deadline: None,
-                pace_days: 3,
-            })
+        assert!(
+            note.facts().todo().is_some(),
+            "a date with a pace is a todo"
         );
         assert_eq!(
             marks.notes().count(),
@@ -1173,17 +1059,14 @@ mod tests {
             "a deleted note is not carried over"
         );
         let agent = marks.get(&NodeId::Agent(agent_id));
-        assert!(agent.muted);
-        assert_eq!(agent.handled, Some(Cursor::Story(9)));
+        assert!(agent.facts().muted());
+        assert_eq!(agent.facts().handled(), Some(&Cursor::Story(9)));
         assert_eq!(agent.name.as_deref(), Some("fixer"));
         assert_eq!(
-            agent.snoozed,
-            Some(DateMark {
-                unix_ms: 0,
-                day: true
-            }),
+            agent.facts().snoozes(),
+            1,
             "a date with no pace is a snooze"
         );
-        assert_eq!(agent.todo, None);
+        assert_eq!(agent.facts().todo(), None);
     }
 }

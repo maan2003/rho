@@ -74,6 +74,16 @@ pub const TAG_JSON_NUMBER: u8 = 204;
 pub const TAG_JSON_STRING: u8 = 205; // Uses existing string encoding
 pub const TAG_JSON_ARRAY: u8 = 206;
 pub const TAG_JSON_OBJECT: u8 = 207;
+///< jiff::Timestamp
+pub const TAG_JIFF_TIMESTAMP: u8 = 209;
+///< jiff::civil::Date
+pub const TAG_JIFF_DATE: u8 = 210;
+///< jiff::civil::DateTime
+pub const TAG_JIFF_DATETIME: u8 = 211;
+///< jiff::SignedDuration
+pub const TAG_JIFF_SIGNED_DURATION: u8 = 212;
+///< jiff::Zoned
+pub const TAG_JIFF_ZONED: u8 = 213;
 
 // --- bool ---
 /// Encodes a `bool` as a single tag byte: `TAG_ZERO` for `false`, `TAG_ONE` for
@@ -1997,6 +2007,32 @@ pub fn skip_value(reader: &mut impl Buf) -> Result<()> {
             } // Approximation for i64 + u32
             let _timestamp_seconds = i64::decode(reader)?;
             let _timestamp_nanos = u32::decode(reader)?;
+            Ok(())
+        }
+        TAG_JIFF_TIMESTAMP | TAG_JIFF_SIGNED_DURATION => {
+            let _seconds = i64::decode(reader)?;
+            let _nanos = i32::decode(reader)?;
+            Ok(())
+        }
+        TAG_JIFF_DATE => {
+            let _year = i16::decode(reader)?;
+            let _month = i8::decode(reader)?;
+            let _day = i8::decode(reader)?;
+            Ok(())
+        }
+        TAG_JIFF_DATETIME => {
+            let _year = i16::decode(reader)?;
+            for _ in 0..5 {
+                let _month_day_hour_minute_second = i8::decode(reader)?;
+            }
+            let _nanos = i32::decode(reader)?;
+            Ok(())
+        }
+        TAG_JIFF_ZONED => {
+            let _seconds = i64::decode(reader)?;
+            let _nanos = i32::decode(reader)?;
+            let _offset_seconds = i32::decode(reader)?;
+            let _zone = String::decode(reader)?;
             Ok(())
         }
         TAG_DECIMAL => {

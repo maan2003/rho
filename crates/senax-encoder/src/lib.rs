@@ -44,6 +44,8 @@
 //! ### External Crate Support
 //! - `chrono` — Enables encoding/decoding of `chrono::DateTime`, `NaiveDate`,
 //!   and `NaiveTime` types.
+//! - `jiff` — Enables encoding/decoding of `jiff::Timestamp`, `Zoned`,
+//!   `SignedDuration`, `civil::Date` and `civil::DateTime`.
 //! - `uuid` — Enables encoding/decoding of `uuid::Uuid`.
 //! - `ulid` — Enables encoding/decoding of `ulid::Ulid` (shares the same tag as
 //!   UUID for binary compatibility).

@@ -25,7 +25,7 @@ use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
-use crate::model::{Unit, UnitFacts};
+use crate::model::{Model, Unit, UnitFacts};
 use crate::types::{
     Attachment, ChannelId, Conversation, ConversationKind, FileSummary, Message, Reaction, Reason,
     Ts, User, UserId,
@@ -1267,6 +1267,10 @@ struct StoredUnit {
     newest_from_other: Option<String>,
     newest_from_you: bool,
     first_seen_ms: i64,
+    #[senax(default)]
+    people: Vec<String>,
+    #[senax(default)]
+    from_others: Vec<String>,
 }
 
 impl StoredUnit {
@@ -1284,6 +1288,8 @@ impl StoredUnit {
             newest_from_other: facts.newest_from_other.as_ref().map(|ts| ts.0.clone()),
             newest_from_you: facts.newest_from_you,
             first_seen_ms: facts.first_seen_ms,
+            people: facts.people.iter().map(|user| user.0.clone()).collect(),
+            from_others: facts.from_others.iter().map(|ts| ts.0.clone()).collect(),
         }
     }
 
@@ -1310,6 +1316,12 @@ impl StoredUnit {
                 // so a restart starts it again rather than storing it.
                 others_replied: false,
                 first_seen_ms: self.first_seen_ms,
+                people: self
+                    .people
+                    .iter()
+                    .map(|user| UserId(user.clone()))
+                    .collect(),
+                from_others: self.from_others.iter().map(|ts| Ts(ts.clone())).collect(),
             },
         ))
     }
@@ -1658,6 +1670,36 @@ impl From<&StoredMessage> for Message {
     }
 }
 
+/// Where a unit's messages are kept.
+pub fn unit_scope(model: &Model, unit: &Unit) -> Scope {
+    let workspace = &model.workspace().0;
+    match &unit.thread {
+        Some(root) => Scope::thread(workspace, &unit.channel, root),
+        None => Scope::conversation(workspace, &unit.channel),
+    }
+}
+
+/// The words a unit is known by: the first line of its newest message, as
+/// the mirror holds it now. Public because it is what a card's title is,
+/// and a host measuring what a desk rebuild costs has to be able to reach
+/// the half of it that reads the mirror.
+pub fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
+    let scope = unit_scope(model, unit);
+    let message = model
+        .unit(unit)
+        .map(|facts| facts.newest.clone())
+        .and_then(|ts| mirror.message(&scope, &ts));
+    message
+        .map(|message| model.render(&message))
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
@@ -1696,6 +1738,8 @@ mod compatibility_tests {
             newest_from_you: false,
             others_replied: false,
             first_seen_ms: 42,
+            people: Default::default(),
+            from_others: Vec::new(),
         };
         let saved = Saved {
             channel: ChannelId::from("C1"),

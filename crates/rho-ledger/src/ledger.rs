@@ -245,6 +245,19 @@ impl Ledger {
             .collect()
     }
 
+    /// When each merged key starting with `prefix` was written, as the wall
+    /// clock of the device that wrote it read, in milliseconds.
+    pub fn stamps(&self, prefix: &[u8]) -> Vec<(Vec<u8>, u64)> {
+        let read = self.db.read();
+        let table = read.open_table(MERGED);
+        table
+            .range::<&[u8]>(prefix..)
+            .map(|(key, stored)| (key.value().to_vec(), stored.value().into_owned()))
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, stored)| (key, stored.stamp.millis))
+            .collect()
+    }
+
     /// Writes `changes` as this device, and returns what moved and the
     /// segment to publish. Without a key the writes still land here; the
     /// base published once a key is set carries them.

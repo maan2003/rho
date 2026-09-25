@@ -2901,14 +2901,9 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
     for _ in 0..100 {
         cx.run_until_parked();
         facts = workspace
-            .update(cx, |workspace, _, cx| workspace.slack_thread_facts(cx))
+            .update(cx, |workspace, _, cx| workspace.slack_asking(cx))
             .unwrap();
-        if facts
-            .values()
-            .filter(|facts| facts.reason.is_some())
-            .count()
-            >= 4
-        {
+        if facts.len() >= 4 {
             break;
         }
         cx.executor()
@@ -2917,12 +2912,7 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
     }
 
     let asking = facts
-        .values()
-        .filter_map(|facts| {
-            facts
-                .reason
-                .map(|reason| (facts.conversation.clone(), reason))
-        })
+        .into_values()
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
         asking.get("#design"),
@@ -2938,7 +2928,7 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
     );
 
     let hand = workspace
-        .update(cx, |workspace, _, _| workspace.hand())
+        .update(cx, |workspace, _, cx| workspace.hand(cx).cards)
         .unwrap();
     assert!(
         hand.iter()
@@ -3071,13 +3061,10 @@ async fn wait_for_reasons(
 ) {
     for _ in 0..300 {
         cx.run_until_parked();
-        let facts = workspace
-            .update(cx, |workspace, _, cx| workspace.slack_thread_facts(cx))
+        let asking = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_asking(cx))
             .unwrap();
-        if wanted
-            .iter()
-            .all(|unit| facts.get(unit).is_some_and(|facts| facts.reason.is_some()))
-        {
+        if wanted.iter().all(|unit| asking.contains_key(unit)) {
             return;
         }
         cx.executor()
@@ -3103,9 +3090,9 @@ fn reason_of(
     workspace
         .update(cx, |workspace, _, cx| {
             workspace
-                .slack_thread_facts(cx)
+                .slack_asking(cx)
                 .get(unit)
-                .and_then(|facts| facts.reason)
+                .map(|(_, attention)| *attention)
         })
         .unwrap()
 }
@@ -4615,7 +4602,8 @@ async fn quoted_previews_expand_without_rewriting_source_or_losing_their_inset(
 
 #[gpui::test]
 async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAppContext) {
-    use rho_dealer::{DateMark, NodeId, marks};
+    use rho_dealer::facts::{Fact, Said, record};
+    use rho_dealer::{NodeId, Until};
     use rho_slack::fake::Fake;
 
     let workspace = test_workspace(cx);
@@ -4637,14 +4625,51 @@ async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAp
     let node = NodeId::Slack(unit);
     workspace
         .update(cx, |workspace, _, cx| {
-            assert!(workspace.hand().iter().any(|card| card.node == node));
+            assert!(
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == node)
+            );
             workspace.write_marks(
-                vec![marks::snooze(&node, Some(DateMark::at(4_000_000_000_000)))],
+                vec![record(
+                    &node,
+                    &Fact {
+                        at: jiff::Zoned::now(),
+                        said: Said::Snooze {
+                            until: Until::In(jiff::SignedDuration::from_hours(1)),
+                        },
+                    },
+                )],
                 cx,
             );
-            assert!(!workspace.hand().iter().any(|card| card.node == node));
-            workspace.write_marks(vec![marks::snooze(&node, Some(DateMark::at(1_000)))], cx);
-            assert!(workspace.hand().iter().any(|card| card.node == node));
+            assert!(
+                !workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == node)
+            );
+            workspace.write_marks(
+                vec![record(
+                    &node,
+                    &Fact {
+                        at: jiff::Zoned::now(),
+                        said: Said::Snooze {
+                            until: Until::In(jiff::SignedDuration::from_hours(-1)),
+                        },
+                    },
+                )],
+                cx,
+            );
+            assert!(
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == node)
+            );
         })
         .unwrap();
 }

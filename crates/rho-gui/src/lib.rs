@@ -19,7 +19,6 @@ pub(crate) mod search;
 mod selection;
 pub mod slack;
 mod slack_navigation;
-pub(crate) mod sources;
 pub mod telemetry;
 #[doc(hidden)]
 pub mod transient;
@@ -27,6 +26,7 @@ pub(crate) mod usage;
 pub(crate) mod voice;
 #[cfg(feature = "walk-support")]
 pub mod walk;
+pub(crate) mod when;
 pub mod workspace;
 
 use gpui::{App, KeyBinding, actions};
@@ -580,17 +580,17 @@ pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
     use rho_dealer::curve::*;
     rho_journal::DealerPolicySnapshot {
         queue_floor: DEAL_QUEUE_FLOOR,
-        skip_cooldown_minutes: SKIP_COOLDOWN.num_minutes(),
-        blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
-        blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
-        fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
-        thread_reply_head_start: THREAD_REPLY_HEAD_START,
+        skip_cooldown_minutes: SKIP_FADE.as_mins(),
+        blocked_reply_head_start: AGENT_BLOCKED_HEAD_START,
+        blocked_reply_slope_per_day: WAITING_SLOPE_PER_DAY,
+        fyi_reply_pace_days: AGENT_FINISHED_GONE_DAYS,
+        thread_reply_head_start: SLACK_THREAD_HEAD_START,
         channel_traffic_head_start: CHANNEL_TRAFFIC_HEAD_START,
-        channel_answered_drop: CHANNEL_ANSWERED_DROP,
+        channel_answered_drop: 0.0,
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,
-        agent_recency_window_ms: AGENT_RECENCY_WINDOW_MS,
+        agent_recency_window_ms: AGENT_RECENCY_WINDOW.as_millis() as i64,
     }
 }
 

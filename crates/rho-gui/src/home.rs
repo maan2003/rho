@@ -19,7 +19,7 @@ use gpui::{App, Context, Entity, HighlightStyle, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_agent_types::AgentId;
-use rho_dealer::curve::{LAMP_THRESHOLD, age_label};
+use rho_dealer::curve::age_label;
 use rho_dealer::{Card, CardKind, NodeId};
 use rho_transcript::{Item, Transcript};
 use theme::ActiveTheme as _;
@@ -61,19 +61,15 @@ pub(crate) struct HomeRows {
     /// The top of the queue above the cutoff: a preview, not the queue.
     pub next: Vec<HomeRow>,
     pub running: Vec<RunningRow>,
-    /// The rows just under the cutoff. Peripheral vision.
-    pub later: Vec<HomeRow>,
 }
 
 impl HomeRows {
     pub fn is_empty(&self) -> bool {
-        self.next.is_empty() && self.running.is_empty() && self.later.is_empty()
+        self.next.is_empty() && self.running.is_empty()
     }
 }
 
-/// Splits the dealer's hand at the lamp threshold. Above it something is
-/// asking; below it the card is merely around, which is exactly the line
-/// the lamp already draws, so Home cannot disagree with the lamp.
+/// The top of the dealer's hand, in its order.
 pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> HomeRows {
     let row = |card: &Card| HomeRow {
         title: title(card),
@@ -82,19 +78,8 @@ pub(crate) fn split_hand(cards: &[Card], title: impl Fn(&Card) -> String) -> Hom
         skipped: card.skipped,
     };
     HomeRows {
-        next: cards
-            .iter()
-            .filter(|card| card.priority >= LAMP_THRESHOLD)
-            .take(HOME_CAP)
-            .map(&row)
-            .collect(),
+        next: cards.iter().take(HOME_CAP).map(row).collect(),
         running: Vec::new(),
-        later: cards
-            .iter()
-            .filter(|card| card.priority < LAMP_THRESHOLD)
-            .take(HOME_CAP)
-            .map(&row)
-            .collect(),
     }
 }
 
@@ -330,13 +315,6 @@ impl HomeView {
                 items.push(running_line(row, column, topics));
             }
         }
-        if !self.rows.later.is_empty() {
-            items.push(section("later"));
-            let column = column_of(self.rows.later.iter().map(|row| row.title.as_str()));
-            for row in &self.rows.later {
-                items.push(card_line(row, column, HomeClass::Muted));
-            }
-        }
         items
     }
 
@@ -475,26 +453,13 @@ mod tests {
     }
 
     #[test]
-    fn the_line_is_the_lamps_line_and_both_sides_are_capped() {
-        let mut cards = Vec::new();
-        for above in 0..7 {
-            cards.push(card(&format!("asking {above}"), 2.0 - above as f64 * 0.1));
-        }
-        for below in 0..7 {
-            cards.push(card(&format!("around {below}"), 0.4 - below as f64 * 0.1));
-        }
+    fn next_is_the_top_of_the_hand_capped() {
+        let cards: Vec<Card> = (0..14)
+            .map(|rank| card(&format!("card {rank}"), 2.0 - rank as f64 * 0.2))
+            .collect();
         let rows = split_hand(&cards, |card| card.title.clone());
         assert_eq!(rows.next.len(), HOME_CAP);
-        assert_eq!(rows.later.len(), HOME_CAP);
-        assert_eq!(rows.next[0].title, "asking 0", "the dealer's order stands");
-        assert_eq!(rows.later[0].title, "around 0");
-
-        // Exactly at the threshold the lamp is on, so the row is asking.
-        let rows = split_hand(&[card("on the line", LAMP_THRESHOLD)], |card| {
-            card.title.clone()
-        });
-        assert_eq!(rows.next.len(), 1);
-        assert!(rows.later.is_empty());
+        assert_eq!(rows.next[0].title, "card 0", "the dealer's order stands");
     }
 
     #[test]

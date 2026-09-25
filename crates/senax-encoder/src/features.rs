@@ -1343,3 +1343,187 @@ impl Unpacker for camino::Utf8PathBuf {
         Ok(Self::from(String::unpack(reader)?))
     }
 }
+
+// --- jiff ---
+// Each type keeps its own fields rather than a string, so a value is read
+// back without parsing. A zoned time keeps its offset as well as its zone's
+// name, so a reader without that zone in its database still lands on the
+// same instant and wall clock.
+
+#[cfg(feature = "jiff")]
+fn expect_jiff_tag(reader: &mut impl Buf, expected: u8, name: &str) -> Result<()> {
+    if reader.remaining() == 0 {
+        return Err(EncoderError::InsufficientData);
+    }
+    match reader.get_u8() {
+        tag if tag == expected => Ok(()),
+        tag => Err(EncoderError::Decode(format!(
+            "Expected {name} tag ({expected}), got {tag}"
+        ))),
+    }
+}
+
+#[cfg(feature = "jiff")]
+fn jiff_error(error: jiff::Error) -> EncoderError {
+    EncoderError::Decode(error.to_string())
+}
+
+/// Encodes a `jiff::Timestamp` as seconds and nanoseconds since the Unix
+/// epoch.
+#[cfg(feature = "jiff")]
+impl Encoder for jiff::Timestamp {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        writer.put_u8(TAG_JIFF_TIMESTAMP);
+        self.as_second().encode(writer)?;
+        self.subsec_nanosecond().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        *self == jiff::Timestamp::default()
+    }
+}
+
+#[cfg(feature = "jiff")]
+impl Decoder for jiff::Timestamp {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        expect_jiff_tag(reader, TAG_JIFF_TIMESTAMP, "jiff::Timestamp")?;
+        let seconds = i64::decode(reader)?;
+        let nanos = i32::decode(reader)?;
+        jiff::Timestamp::new(seconds, nanos).map_err(jiff_error)
+    }
+}
+
+/// Encodes a `jiff::SignedDuration` as seconds and nanoseconds.
+#[cfg(feature = "jiff")]
+impl Encoder for jiff::SignedDuration {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        writer.put_u8(TAG_JIFF_SIGNED_DURATION);
+        self.as_secs().encode(writer)?;
+        self.subsec_nanos().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        self.is_zero()
+    }
+}
+
+#[cfg(feature = "jiff")]
+impl Decoder for jiff::SignedDuration {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        expect_jiff_tag(reader, TAG_JIFF_SIGNED_DURATION, "jiff::SignedDuration")?;
+        let seconds = i64::decode(reader)?;
+        let nanos = i32::decode(reader)?;
+        if nanos.abs() >= 1_000_000_000
+            || (seconds != 0 && nanos != 0 && seconds.signum() != i64::from(nanos.signum()))
+        {
+            return Err(EncoderError::Decode(format!(
+                "Invalid duration: {seconds} seconds, {nanos} nanos"
+            )));
+        }
+        Ok(jiff::SignedDuration::new(seconds, nanos))
+    }
+}
+
+/// Encodes a `jiff::civil::Date` as its year, month and day.
+#[cfg(feature = "jiff")]
+impl Encoder for jiff::civil::Date {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        writer.put_u8(TAG_JIFF_DATE);
+        self.year().encode(writer)?;
+        self.month().encode(writer)?;
+        self.day().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        *self == jiff::civil::Date::default()
+    }
+}
+
+#[cfg(feature = "jiff")]
+impl Decoder for jiff::civil::Date {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        expect_jiff_tag(reader, TAG_JIFF_DATE, "jiff::civil::Date")?;
+        let year = i16::decode(reader)?;
+        let month = i8::decode(reader)?;
+        let day = i8::decode(reader)?;
+        jiff::civil::Date::new(year, month, day).map_err(jiff_error)
+    }
+}
+
+/// Encodes a `jiff::civil::DateTime` as its date and wall-clock fields.
+#[cfg(feature = "jiff")]
+impl Encoder for jiff::civil::DateTime {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        writer.put_u8(TAG_JIFF_DATETIME);
+        self.year().encode(writer)?;
+        self.month().encode(writer)?;
+        self.day().encode(writer)?;
+        self.hour().encode(writer)?;
+        self.minute().encode(writer)?;
+        self.second().encode(writer)?;
+        self.subsec_nanosecond().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        *self == jiff::civil::DateTime::default()
+    }
+}
+
+#[cfg(feature = "jiff")]
+impl Decoder for jiff::civil::DateTime {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        expect_jiff_tag(reader, TAG_JIFF_DATETIME, "jiff::civil::DateTime")?;
+        let year = i16::decode(reader)?;
+        let month = i8::decode(reader)?;
+        let day = i8::decode(reader)?;
+        let hour = i8::decode(reader)?;
+        let minute = i8::decode(reader)?;
+        let second = i8::decode(reader)?;
+        let nanos = i32::decode(reader)?;
+        jiff::civil::DateTime::new(year, month, day, hour, minute, second, nanos)
+            .map_err(jiff_error)
+    }
+}
+
+/// Encodes a `jiff::Zoned` as its instant, its offset there, and its zone's
+/// IANA name, empty for a zone without one.
+#[cfg(feature = "jiff")]
+impl Encoder for jiff::Zoned {
+    fn encode(&self, writer: &mut BytesMut) -> Result<()> {
+        writer.put_u8(TAG_JIFF_ZONED);
+        let at = self.timestamp();
+        at.as_second().encode(writer)?;
+        at.subsec_nanosecond().encode(writer)?;
+        self.offset().seconds().encode(writer)?;
+        self.time_zone()
+            .iana_name()
+            .unwrap_or("")
+            .to_owned()
+            .encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        *self == jiff::Zoned::default()
+    }
+}
+
+/// Decodes a `jiff::Zoned` in its named zone, or in its fixed offset when
+/// the zone has no name or is not in this machine's database.
+#[cfg(feature = "jiff")]
+impl Decoder for jiff::Zoned {
+    fn decode(reader: &mut impl Buf) -> Result<Self> {
+        expect_jiff_tag(reader, TAG_JIFF_ZONED, "jiff::Zoned")?;
+        let seconds = i64::decode(reader)?;
+        let nanos = i32::decode(reader)?;
+        let offset = i32::decode(reader)?;
+        let zone = String::decode(reader)?;
+        let at = jiff::Timestamp::new(seconds, nanos).map_err(jiff_error)?;
+        let zone = match jiff::tz::TimeZone::get(&zone) {
+            Ok(zone) => zone,
+            Err(_) => jiff::tz::TimeZone::fixed(
+                jiff::tz::Offset::from_seconds(offset).map_err(jiff_error)?,
+            ),
+        };
+        Ok(at.to_zoned(zone))
+    }
+}

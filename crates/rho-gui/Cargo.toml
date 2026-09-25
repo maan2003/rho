@@ -30,6 +30,7 @@ chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
 ] }
+jiff.workspace = true
 clap = { workspace = true }
 clock = { path = "../../vendor/zed/crates/clock" }
 collections = { path = "../../vendor/zed/crates/collections" }

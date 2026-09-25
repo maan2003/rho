@@ -16,6 +16,7 @@ bigdecimal = ["dep:bigdecimal"]
 chrono = ["dep:chrono"]
 fxhash = ["dep:fxhash"]
 indexmap = ["dep:indexmap"]
+jiff = ["dep:jiff"]
 raw_value = ["serde_json", "serde_json/raw_value"]
 rust_decimal = ["dep:rust_decimal"]
 serde_json = ["dep:serde_json"]
@@ -32,6 +33,7 @@ chrono = { version = "0.4", optional = true }
 fxhash = { version = "0.2", optional = true }
 indexmap = { version = "2.2", optional = true }
 inventory = "0.3"
+jiff = { version = "0.2", optional = true }
 paste = "1"
 rust_decimal = { version = "1.35", optional = true }
 senax-encoder-derive = { path = "./derive", version = "0.2.1" }

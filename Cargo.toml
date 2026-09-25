@@ -102,6 +102,7 @@ futures = "0.3"
 futures-util = "0.3"
 imara-diff = "0.2.0"
 iroh = { version = "1.0.2", default-features = false }
+jiff = "0.2"
 json-stream = { path = "crates/json-stream" }
 libc = "0.2"
 libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }
@@ -210,7 +211,7 @@ tracing = { version = "0.1", default-features = false, features = [
   "std",
 ] }
 url = { version = "2", default-features = false }
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
 worktree = { path = "vendor/zed/crates/worktree" }
 zip = { version = "2", default-features = false, features = [
   "deflate",

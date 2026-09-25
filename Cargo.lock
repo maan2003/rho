@@ -12852,8 +12852,11 @@ name = "rho-dealer"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "chrono",
+ "jiff",
+ "proptest",
  "rho-agent-types",
+ "rho-agents-client",
+ "rho-slack",
  "senax-encoder",
  "uuid",
 ]
@@ -13080,6 +13083,7 @@ dependencies = [
  "gpui_wgpu",
  "image",
  "iroh",
+ "jiff",
  "language",
  "libc",
  "multi_buffer",
@@ -14261,6 +14265,7 @@ dependencies = [
  "fxhash",
  "indexmap 2.14.0",
  "inventory",
+ "jiff",
  "paste",
  "rust_decimal",
  "senax-encoder-derive",

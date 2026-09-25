@@ -1,5 +1,5 @@
-# The dealer: what wants the user, how much, and in what order; and the
-# user's own marks on things, as the ledger holds them.
+# The dealer: what wants the user, how much, and in what order, read off
+# the sources themselves and the user's own facts and marks in the ledger.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
@@ -10,7 +10,12 @@ version.workspace = true
 
 [dependencies]
 bytes.workspace = true
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jiff.workspace = true
 rho-agent-types.workspace = true
-senax-encoder.workspace = true
+rho-agents-client = { workspace = true, features = ["client"] }
+rho-slack.workspace = true
+senax-encoder = { workspace = true, features = ["jiff"] }
 uuid.workspace = true
+
+[dev-dependencies]
+proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b" }

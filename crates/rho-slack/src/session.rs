@@ -19,7 +19,7 @@ use crate::api::{Client, FileSearchPage, SearchPage};
 use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
-use crate::mirror::{Draft, Mirror, Saved, Scope};
+use crate::mirror::{Draft, Mirror, Saved, Scope, unit_scope, unit_summary};
 use crate::model::{Change, ConversationRow, Model, Unit, UnitCard};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
 use crate::types::{ChannelId, Message, Reaction, Reason, ThreadKey, Ts, UserId};
@@ -1603,6 +1603,11 @@ impl Session {
 
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// The mirror the session reads Slack's words from, when it has one.
+    pub fn mirror(&self) -> Option<&Mirror> {
+        self.mirror.as_deref()
     }
 
     /// Whether there is a listing to draw at all, as against a status line.
@@ -3933,14 +3938,6 @@ pub fn derive_units(model: &mut Model, mirror: &Mirror) {
     }
 }
 
-fn unit_scope(model: &Model, unit: &Unit) -> Scope {
-    let workspace = &model.workspace().0;
-    match &unit.thread {
-        Some(root) => Scope::thread(workspace, &unit.channel, root),
-        None => Scope::conversation(workspace, &unit.channel),
-    }
-}
-
 fn oldest_from_other_after(
     model: &Model,
     mirror: &Mirror,
@@ -3961,27 +3958,6 @@ fn oldest_from_other_after(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .or_else(|| model.unit(unit).map(|facts| facts.newest.clone()))
-}
-
-/// The words a unit is known by: the first line of its newest message, as
-/// the mirror holds it now. Public because it is what a card's title is,
-/// and a host measuring what a desk rebuild costs has to be able to reach
-/// the half of it that reads the mirror.
-pub fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
-    let scope = unit_scope(model, unit);
-    let message = model
-        .unit(unit)
-        .map(|facts| facts.newest.clone())
-        .and_then(|ts| mirror.message(&scope, &ts));
-    message
-        .map(|message| model.render(&message))
-        .as_deref()
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 /// The mirror lives beside rho's other state. A machine without a state
@@ -4116,6 +4092,8 @@ mod tests {
                 newest_from_you: false,
                 others_replied: false,
                 first_seen_ms: 1_000,
+                people: Default::default(),
+                from_others: Vec::new(),
             },
         );
         assert!(

@@ -128,7 +128,16 @@ pub struct UnitFacts {
     /// When rho first saw this unit, so a card's age is rho's own clock and
     /// cannot be moved by a doctored message timestamp.
     pub first_seen_ms: i64,
+    /// Everyone rho has seen write in the unit, the user included: how many
+    /// people a thread is a conversation between.
+    pub people: BTreeSet<UserId>,
+    /// When somebody else last wrote in it, newest last, at most
+    /// [`FROM_OTHERS_KEPT`] of them.
+    pub from_others: Vec<Ts>,
 }
+
+/// How many of somebody else's messages a unit remembers the time of.
+pub const FROM_OTHERS_KEPT: usize = 32;
 
 impl UnitFacts {
     pub fn waiting(&self) -> Waiting {
@@ -2276,7 +2285,14 @@ impl Model {
         {
             return None;
         }
-        self.record(unit, reason, &message.ts, from_you, now_ms)
+        self.record(
+            unit,
+            reason,
+            &message.ts,
+            from_you,
+            message.user.as_ref(),
+            now_ms,
+        )
     }
 
     /// Takes one activity-feed entry. The feed says *that* something
@@ -2293,7 +2309,7 @@ impl Model {
             return None;
         }
         let unit = self.unit_for(&item.channel, item.thread_ts.as_ref());
-        self.record(unit, reason, &item.ts, false, now_ms)
+        self.record(unit, reason, &item.ts, false, None, now_ms)
     }
 
     /// Why this message obliges the user, or `None` when it is nothing to
@@ -2393,6 +2409,7 @@ impl Model {
         reason: Reason,
         ts: &Ts,
         from_you: bool,
+        author: Option<&UserId>,
         now_ms: i64,
     ) -> Option<Change> {
         let existing = self.units.get(&unit);
@@ -2424,6 +2441,18 @@ impl Model {
             true => existing.and_then(|facts| facts.newest_from_other.clone()),
             false => Some(ts.clone()),
         };
+        let mut people = existing
+            .map(|facts| facts.people.clone())
+            .unwrap_or_default();
+        people.extend(author.cloned());
+        let mut from_others = existing
+            .map(|facts| facts.from_others.clone())
+            .unwrap_or_default();
+        if !from_you {
+            from_others.push(ts.clone());
+            let over = from_others.len().saturating_sub(FROM_OTHERS_KEPT);
+            from_others.drain(..over);
+        }
         // The reader's own message is them saying they are done here,
         // wherever they wrote it: the phone, another client, or rho.
         if from_you {
@@ -2439,6 +2468,8 @@ impl Model {
                 newest_from_you: from_you,
                 others_replied,
                 first_seen_ms,
+                people,
+                from_others,
             },
         );
         self.refresh_attention(&unit);
@@ -2551,6 +2582,13 @@ impl Model {
                 }
             }
         }
+    }
+
+    /// Every unit asking for the reader, and what for, in unit order.
+    pub fn asking(&self) -> impl Iterator<Item = (&Unit, Attention)> {
+        self.asking
+            .iter()
+            .map(|(unit, attention)| (unit, *attention))
     }
 
     /// Every unit asking for the reader, longest wait first. The dealer's

@@ -29,7 +29,6 @@ const REWRITE_LOST: &str = "slack: that message was deleted; your rewrite is in 
 
 use crate::minibuffer::Candidate;
 use crate::pane::{SlackInventoryKind, SurfaceKey};
-use crate::sources::SlackFacts;
 use crate::workspace::{ContextId, SurfaceView, Workspace};
 
 pub(crate) fn slack_filter_candidates(typed: &str) -> Vec<crate::minibuffer::Candidate> {
@@ -1873,7 +1872,7 @@ impl Workspace {
         };
         let key = &key;
         let node = rho_dealer::NodeId::Slack(unit.clone());
-        if !self.hand().iter().any(|card| card.node == node) {
+        if !self.hand(cx).cards.iter().any(|card| card.node == node) {
             return;
         }
         let thread = self
@@ -1981,7 +1980,7 @@ impl Workspace {
         // A card older than the cutoff whose unit Slack has nothing unread
         // for is backlog just the same, closed at its own newest.
         let model = session.read(cx).model();
-        for (unit, cursor) in cards_before(&self.hand(), model, before) {
+        for (unit, cursor) in cards_before(&self.hand(cx).cards, model, before) {
             if !units.iter().any(|(known, _)| known == &unit) {
                 units.push((unit, cursor));
             }
@@ -3026,10 +3025,8 @@ impl Workspace {
                         Change::Replied(_) => {}
                     }
                 }
-                // The mirror moved, so the join every Slack card is derived
-                // from has to be rebuilt: a unit that started to matter is a
-                // row the moment the message lands, with nothing written.
-                self.refresh_slack_wants(cx);
+                // The mirror moved: a unit that started to matter is a row
+                // the moment the message lands, with nothing written.
                 self.invalidate_dealer_signals(cx);
             }
             SessionEvent::Notice(text) => {
@@ -3087,46 +3084,32 @@ impl Workspace {
     /// what is on screen, whether or not the hand has a card for it. Only
     /// the workspace's name comes from the session, so this is `None`
     /// exactly when there is no session at all.
+    /// What Slack is asking the reader about, by unit, with the
+    /// conversation each is in.
+    #[cfg(test)]
+    pub(crate) fn slack_asking(
+        &self,
+        cx: &gpui::App,
+    ) -> std::collections::HashMap<SlackUnit, (String, rho_slack::model::Attention)> {
+        let Some(session) = self.slack.session() else {
+            return std::collections::HashMap::new();
+        };
+        let model = session.read(cx).model();
+        model
+            .asking()
+            .map(|(unit, attention)| {
+                (
+                    store_unit(model.workspace(), unit),
+                    (model.label(&unit.channel), attention),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn slack_surface_unit(&self, source: &Source, cx: &gpui::App) -> Option<SlackUnit> {
         let session = self.slack.session()?;
         let workspace = session.read(cx).model().workspace().clone();
         Some(unit_of_source(&workspace, source))
-    }
-
-    /// What every tracked unit is currently about, read live from the
-    /// mirror. The crate answers what it is asking about and in what words;
-    /// this is the map from its cards onto the dealer's units, and it
-    /// decides nothing. Each carries `reason`, the crate's answer to whether
-    /// Slack itself would be badging it, and a unit with none makes no
-    /// want: a mention read on the phone this morning is not handed to
-    /// anybody.
-    pub(crate) fn slack_thread_facts(
-        &self,
-        cx: &gpui::App,
-    ) -> std::collections::HashMap<SlackUnit, SlackFacts> {
-        let Some(session) = self.slack.session() else {
-            return std::collections::HashMap::new();
-        };
-        let now = chrono::Local::now();
-        let session = session.read(cx);
-        let workspace = session.model().workspace();
-        session
-            .tracked_cards(now.timestamp_millis())
-            .into_iter()
-            .map(|card| {
-                (
-                    store_unit(workspace, &card.unit),
-                    SlackFacts {
-                        title: card.title,
-                        conversation: card.conversation.clone(),
-                        reason: card.attention,
-                        wait_days: card.wait_days,
-                        latest: card.newest.0,
-                        others_replied: card.others_replied,
-                    },
-                )
-            })
-            .collect()
     }
 }
 

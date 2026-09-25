@@ -216,18 +216,18 @@ impl NoteView {
 impl Workspace {
     /// A node's text as its surface shows it: a note's body, a label's
     /// name, and anything else's title.
-    fn note_text(&self, node: &NodeId) -> String {
+    fn note_text(&self, node: &NodeId, cx: &gpui::App) -> String {
         let marks = self.attention.marks.get(node);
         match node {
             NodeId::Note(_) => marks.body.clone().unwrap_or_default(),
             NodeId::Label(_) => marks.name.clone().unwrap_or_default(),
-            _ => self.node_title(node),
+            _ => self.node_title(node, cx),
         }
     }
 
     /// What is listed under a node: under a label, the labels inside it
     /// and then everything carrying it.
-    fn note_rows(&self, node: &NodeId) -> Vec<(NodeId, String)> {
+    fn note_rows(&self, node: &NodeId, cx: &gpui::App) -> Vec<(NodeId, String)> {
         let NodeId::Label(label) = node else {
             return Vec::new();
         };
@@ -253,7 +253,7 @@ impl Workspace {
                     NodeId::Note(_) => "*",
                     _ => "◦",
                 };
-                let line = format!("  {bullet} {}", self.node_title(&node));
+                let line = format!("  {bullet} {}", self.node_title(&node, cx));
                 (node, line)
             })
             .collect();
@@ -272,7 +272,7 @@ impl Workspace {
     ) -> &NoteView {
         if !self.note_views.contains_key(node) {
             let editable = node.is_minted();
-            let view = NoteView::new(node.clone(), self.note_text(node), editable, window, cx);
+            let view = NoteView::new(node.clone(), self.note_text(node, cx), editable, window, cx);
             self.note_views.insert(node.clone(), view);
             self.sync_note_view(node, cx);
         }
@@ -280,8 +280,8 @@ impl Workspace {
     }
 
     fn sync_note_view(&mut self, node: &NodeId, cx: &mut Context<Self>) {
-        let text = self.note_text(node);
-        let rows = self.note_rows(node);
+        let text = self.note_text(node, cx);
+        let rows = self.note_rows(node, cx);
         let Some(view) = self.note_views.get_mut(node) else {
             return;
         };

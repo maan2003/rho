@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
@@ -230,69 +230,6 @@ pub(crate) enum SnoozeUnit {
     Weeks,
 }
 
-/// A named hour of the day, for the phone's `tonight` and `tomorrow`.
-/// `tonight` is this evening while it is still ahead and the next one after
-/// that; `tomorrow` is always the next day, even when read before nine.
-fn named_hour(hour: u32, tomorrow: bool) -> chrono::DateTime<chrono::Local> {
-    use chrono::TimeZone as _;
-    let now = chrono::Local::now();
-    let mut day = now.date_naive();
-    let time = chrono::NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default();
-    if tomorrow || day.and_time(time) <= now.naive_local() {
-        day += chrono::Duration::days(1);
-    }
-    chrono::Local
-        .from_local_datetime(&day.and_time(time))
-        .earliest()
-        .unwrap_or(now)
-}
-
-/// Where a snooze lands and how the bar says it. Minutes and hours keep the
-/// clock, so a card can come back this afternoon; days and weeks land on a
-/// date, which is what a defer has always been.
-pub(crate) fn snooze_target(
-    unit: SnoozeUnit,
-    count: i64,
-    now: chrono::DateTime<chrono::Local>,
-) -> (rho_dealer::DateMark, String) {
-    match unit {
-        SnoozeUnit::Minutes | SnoozeUnit::Hours => {
-            let ahead = match unit {
-                SnoozeUnit::Minutes => chrono::Duration::minutes(count),
-                _ => chrono::Duration::hours(count),
-            };
-            let at = now + ahead;
-            (
-                rho_dealer::DateMark::at(at.timestamp_millis()),
-                snooze_said(at, now),
-            )
-        }
-        SnoozeUnit::Days | SnoozeUnit::Weeks => {
-            let days = match unit {
-                SnoozeUnit::Days => count,
-                _ => count * 7,
-            };
-            let date = now.date_naive() + chrono::Duration::days(days);
-            (
-                rho_dealer::DateMark::day(date),
-                format!("snooze until {}", date.format("%a %-d %b")),
-            )
-        }
-    }
-}
-
-/// The bar's words for a snooze with a clock time: the hour alone when it
-/// is still today, the day in front of it when it is not.
-fn snooze_said(
-    at: chrono::DateTime<chrono::Local>,
-    now: chrono::DateTime<chrono::Local>,
-) -> String {
-    match at.date_naive() == now.date_naive() {
-        true => format!("snooze until {}", at.format("%H:%M")),
-        false => format!("snooze until {}", at.format("%a %-d %b %H:%M")),
-    }
-}
-
 pub struct Workspace {
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
@@ -382,11 +319,9 @@ pub struct Workspace {
     shell_touch_committed: bool,
     deal_gesture_active: bool,
     deal_controls_visible: bool,
-    pub(crate) agent_last_interaction: HashMap<AgentId, i64>,
     dealer_signal_eval_scheduled: bool,
-    /// Agents whose wants are made again on the next frame: rows arrive
-    /// one `Log` at a time. `Some(None)` makes every want again.
-    wants_pending: Option<Option<BTreeSet<AgentId>>>,
+    /// When the hand next moves on its own, as the last ranking said.
+    dealer_next_change: Option<jiff::Timestamp>,
     _dealer_signal_task: Task<()>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
@@ -831,10 +766,9 @@ impl Workspace {
             loop {
                 let wait = this
                     .read_with(cx, |this, _| {
-                        this.attention
-                            .dealer
-                            .next_change(chrono::Local::now().fixed_offset())
-                            .and_then(|until| until.to_std().ok())
+                        this.dealer_next_change
+                            .map(|at| at.duration_since(jiff::Timestamp::now()))
+                            .and_then(|until| std::time::Duration::try_from(until).ok())
                             .unwrap_or(DEALER_SIGNAL_CEILING)
                             .clamp(DEALER_SIGNAL_FLOOR, DEALER_SIGNAL_CEILING)
                     })
@@ -939,9 +873,8 @@ impl Workspace {
             shell_touch_committed: false,
             deal_gesture_active: false,
             deal_controls_visible: false,
-            agent_last_interaction: HashMap::new(),
             dealer_signal_eval_scheduled: false,
-            wants_pending: None,
+            dealer_next_change: None,
             _dealer_signal_task: dealer_signal_task,
             lamp_on: false,
             dealer_signals_initialized: false,
@@ -990,7 +923,8 @@ impl Workspace {
         // The marks are on this disk, so Home's first draw already shows
         // the user's own verdicts.
         this.refresh_workdirs();
-        this.rebuild_wants(cx);
+        let agents: Vec<AgentId> = this.registry.known_agents().copied().collect();
+        this.push_agent_marks(&agents);
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
         let home = this.make_surface(SurfaceKey::Home, window, cx);
@@ -1114,7 +1048,6 @@ impl Workspace {
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         let gone = self.registry.detach_host(host);
         self.selection.forget(|agent_id| gone.contains(&agent_id));
-        self.refresh_agent_wants(departed.clone());
         self.invalidate_dealer_signals(cx);
         for agent_id in departed {
             // The agent is gone with its agent host, so its transcript is a
@@ -1376,13 +1309,13 @@ impl Workspace {
         let Some(view) = self.home_view() else {
             return;
         };
-        let rows = self.home_rows();
+        let rows = self.home_rows(cx);
         view.update(cx, |view, cx| view.set_rows(rows, cx));
     }
 
-    fn home_rows(&mut self) -> crate::home::HomeRows {
-        let now = chrono::Local::now().fixed_offset();
-        let hand = self.hand();
+    fn home_rows(&mut self, cx: &gpui::App) -> crate::home::HomeRows {
+        let now = jiff::Timestamp::now();
+        let hand = self.hand(cx).cards;
         let registry = &self.registry;
         // The name the user gave it, with the handle beside it to tell two
         // of the same name apart — the same label a transcript tab carries,
@@ -1393,7 +1326,7 @@ impl Workspace {
                 registry.agent_name_with_labels(agent_id, registry.agent_display_label(agent_id))
             })
         });
-        let now_ms = now.timestamp_millis();
+        let now_ms = now.as_millisecond();
         // An agent created by an agent belongs to its creator and is not
         // the reader's to watch; only the ones the reader made are listed.
         // Nor one the user put away. A running turn decides how loudly an
@@ -1412,6 +1345,7 @@ impl Workspace {
                         .attention
                         .marks
                         .get(&rho_dealer::NodeId::Agent(*agent_id))
+                        .facts()
                         .put_away(now)
                     && self.registry.agent_facts(*agent_id).turn_running
             })
@@ -1435,7 +1369,7 @@ impl Workspace {
                     // Where it is filed, not the whole path: the row is
                     // about the agent, and the leaf is what names the work.
                     topic: self
-                        .node_context(&rho_dealer::NodeId::Agent(agent_id))
+                        .node_context(&rho_dealer::NodeId::Agent(agent_id), cx)
                         .split(", ")
                         .next()
                         .and_then(|path| path.rsplit('/').next())
@@ -1469,7 +1403,7 @@ impl Workspace {
             }
             crate::home::HomeTarget::None => return,
         };
-        let card = self.card_for(&wanted);
+        let card = self.card_for(&wanted, cx);
         self.open_card(card, window, cx);
         self.invalidate_dealer_signals(cx);
     }
@@ -1618,37 +1552,6 @@ impl Workspace {
         }
     }
 
-    /// Makes the wants of the agents that moved again on the next frame,
-    /// once for everything a batch of rows moved. `None` makes every want
-    /// again.
-    fn schedule_wants(
-        &mut self,
-        moved: Option<Vec<AgentId>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let scheduled = self.wants_pending.is_some();
-        let pending = self
-            .wants_pending
-            .get_or_insert_with(|| Some(BTreeSet::new()));
-        match (pending.as_mut(), moved) {
-            (Some(pending), Some(moved)) => pending.extend(moved),
-            (Some(_), None) => *pending = None,
-            (None, _) => {}
-        }
-        if scheduled {
-            return;
-        }
-        cx.on_next_frame(window, move |this, _window, cx| {
-            match this.wants_pending.take().flatten() {
-                Some(moved) => this.refresh_agent_wants(moved),
-                None => this.rebuild_wants(cx),
-            }
-            this.invalidate_dealer_signals(cx);
-            cx.notify();
-        });
-    }
-
     pub(crate) fn invalidate_dealer_signals(&mut self, cx: &mut Context<Self>) {
         if self.dealer_signal_eval_scheduled {
             return;
@@ -1664,7 +1567,9 @@ impl Workspace {
     }
 
     fn evaluate_dealer_signals(&mut self, cx: &mut Context<Self>) {
-        let mut candidates = self.hand();
+        let hand = self.hand(cx);
+        self.dealer_next_change = hand.next_change;
+        let mut candidates = hand.cards;
         // What the lamp is about is what is *not* in front of the reader:
         // the card they are already reading is not news.
         let in_view = self.surface_node(cx);
@@ -1718,15 +1623,6 @@ impl Workspace {
             });
         }
         self.chime_above_threshold = chime_above;
-    }
-
-    fn mark_agent_prompt_sent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let sent_at = now_ms();
-        // The story's own `UserMessage` arrives on the round trip; until
-        // then this is what keeps the user's own reply from chiming back
-        // at them.
-        self.agent_last_interaction.insert(agent_id, sent_at as i64);
-        self.invalidate_dealer_signals(cx);
     }
 
     fn context_for_agent(&self, agent_id: AgentId) -> ContextId {
@@ -1806,7 +1702,8 @@ impl Workspace {
         match msg {
             rho_agents_client::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
-                self.rebuild_wants(cx);
+                let agents: Vec<AgentId> = self.registry.known_agents().copied().collect();
+                self.push_agent_marks(&agents);
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
@@ -1815,14 +1712,10 @@ impl Workspace {
                 if changed.is_empty() {
                     return;
                 }
-                // The wants these agents own are made again here, not when
-                // the frame comes round: a fact that has moved is exactly
-                // when a want is made, and everything that reads the
-                // ranking in between must see it. Their marks go with them:
-                // an agent that just arrived may already have a name.
+                // Their marks go with them: an agent that just arrived may
+                // already have a name.
                 self.push_agent_marks(&changed);
-                self.refresh_agent_wants(changed.iter().copied());
-                self.schedule_wants(Some(changed), window, cx);
+                self.invalidate_dealer_signals(cx);
             }
             rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
@@ -2272,7 +2165,7 @@ impl Workspace {
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the agent host persists the same timestamp).
         self.registry.touch_agent(agent_id);
-        self.mark_agent_prompt_sent(agent_id, cx);
+        self.invalidate_dealer_signals(cx);
         cx.notify();
     }
 
@@ -2904,25 +2797,32 @@ impl Workspace {
         }
     }
 
-    /// `t`: handled for now, and owed again: the card comes back on a
-    /// pace, in days, defaulting to a week.
+    /// `t`: handled for now, and on the user's plate until done. With a
+    /// count, it comes onto the plate that many days from now.
     pub(crate) fn verdict_todo(
         &mut self,
         count: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let days = count.unwrap_or(7).max(1) as u32;
         if !self.deal_card_is_target(cx) {
             self.echo("todo: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         }
+        let (start, said) = match count {
+            None => (None, "todo".to_owned()),
+            Some(days) => {
+                let (start, said) =
+                    crate::when::snooze_target(SnoozeUnit::Days, days as i64, &jiff::Zoned::now());
+                (Some(start), said.replace("snooze until", "todo from"))
+            }
+        };
         if !self.submit_verdict(
             None,
-            crate::attention::Verdict::Todo { pace_days: days },
+            crate::attention::Verdict::Todo { start },
             rho_journal::DealerVerdict::Done,
             rho_journal::PhoneVerdict::Todo,
-            "todo".to_owned(),
+            said,
             window,
             cx,
         ) {
@@ -2939,7 +2839,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let days = count.unwrap_or(1).max(1) as i64;
-        let today = chrono::Local::now().date_naive();
         let Some(card) = self.card_in_view(cx) else {
             self.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
@@ -2956,7 +2855,7 @@ impl Workspace {
             thread: None,
             ..unit.clone()
         });
-        let until = rho_dealer::DateMark::day(today + chrono::Duration::days(days));
+        let (until, _) = crate::when::snooze_target(SnoozeUnit::Days, days, &jiff::Zoned::now());
         if !self.submit_verdict(
             Some(room),
             crate::attention::Verdict::Snooze(until),
@@ -2982,7 +2881,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let count = count.unwrap_or(1).max(1) as i64;
-        let (until, said) = snooze_target(unit, count, chrono::Local::now());
+        let (until, said) = crate::when::snooze_target(unit, count, &jiff::Zoned::now());
         self.deal_snooze_until(until, said, window, cx);
     }
 
@@ -2990,17 +2889,18 @@ impl Workspace {
     /// an hour of the day rather than a distance from now.
     pub(crate) fn deal_snooze_at(
         &mut self,
-        at: chrono::DateTime<chrono::Local>,
+        at: jiff::Zoned,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let until = rho_dealer::DateMark::at(at.timestamp_millis());
-        self.deal_snooze_until(until, snooze_said(at, chrono::Local::now()), window, cx);
+        let until = rho_dealer::Until::At(at.datetime());
+        let said = crate::when::snooze_said(&at, &jiff::Zoned::now());
+        self.deal_snooze_until(until, said, window, cx);
     }
 
     fn deal_snooze_until(
         &mut self,
-        until: rho_dealer::DateMark,
+        until: rho_dealer::Until,
         said: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -4947,9 +4847,7 @@ impl Workspace {
             SurfaceKey::Image { .. } => None,
             SurfaceKey::Browser(_) => None,
         };
-        if let Some(agent_id) = agent_id {
-            self.agent_last_interaction
-                .insert(agent_id, now_ms() as i64);
+        if agent_id.is_some() {
             self.invalidate_dealer_signals(cx);
         }
         let handle = self.active_surface_focus(cx);
@@ -5667,10 +5565,10 @@ impl Workspace {
                 );
             }
             Command::PhoneSnoozeAt { hour, tomorrow } => {
-                let at = named_hour(hour, tomorrow);
+                let at = crate::when::named_hour(hour, tomorrow, &jiff::Zoned::now());
                 self.phone_verdict_with(
                     rho_journal::PhoneVerdict::Defer,
-                    move |workspace, window, cx| workspace.deal_snooze_at(at, window, cx),
+                    move |workspace, window, cx| workspace.deal_snooze_at(at.clone(), window, cx),
                     window,
                     cx,
                 );
@@ -5983,27 +5881,31 @@ impl Workspace {
         if self.phone.enabled && self.phone_snap_in_progress() {
             return;
         }
-        let now = chrono::Local::now().fixed_offset();
+        let now = jiff::Timestamp::now();
         let in_view = self.open_card_in_view(cx);
         // Reading a card and pulling again is what a skip is: the card is
         // still owed, it is just not what to look at next.
         if let Some(card) = &in_view
-            && let Some(held) = self.hand().into_iter().find(|held| held.node == card.node)
+            && let Some(held) = self
+                .hand(cx)
+                .cards
+                .into_iter()
+                .find(|held| held.node == card.node)
         {
             self.attention
-                .dealer
+                .skips
                 .skip(held.node.clone(), held.cursor.clone(), now);
             Self::record_dealer_verdict(
                 &held,
                 rho_journal::DealerVerdict::Skip,
                 now,
-                Some(now + rho_dealer::curve::SKIP_COOLDOWN),
+                Some(now + rho_dealer::curve::SKIP_FADE),
             );
         }
         let Some(card) = self
-            .attention
-            .dealer
-            .top(now, in_view.as_ref().map(|card| &card.node))
+            .hand(cx)
+            .top(in_view.as_ref().map(|card| &card.node))
+            .cloned()
         else {
             // Empty lands on Home rather than on whatever was last open:
             // there is nothing to deal, so the glance is the answer. Home
@@ -6025,8 +5927,8 @@ impl Workspace {
     fn record_dealer_verdict(
         card: &rho_dealer::Card,
         verdict: rho_journal::DealerVerdict,
-        at: chrono::DateTime<chrono::FixedOffset>,
-        skip_until: Option<chrono::DateTime<chrono::FixedOffset>>,
+        at: jiff::Timestamp,
+        skip_until: Option<jiff::Timestamp>,
     ) {
         let kind = match card.kind {
             rho_dealer::CardKind::Agent => rho_journal::DealerCardKind::Agent,
@@ -6037,8 +5939,8 @@ impl Workspace {
             card: Self::journal_card_identity(&card.node),
             kind,
             verdict,
-            occurred_at: at.to_rfc3339(),
-            skip_until: skip_until.map(|until| until.to_rfc3339()),
+            occurred_at: at.to_string(),
+            skip_until: skip_until.map(|until| until.to_string()),
         });
     }
 
@@ -6067,7 +5969,7 @@ impl Workspace {
     /// what quiets it and it is still what is on screen.
     pub(crate) fn card_in_view(&mut self, cx: &mut Context<Self>) -> Option<rho_dealer::Card> {
         let node = self.card_target(cx)?;
-        Some(self.card_for(&node))
+        Some(self.card_for(&node, cx))
     }
 
     /// Whether Home itself is what the reader has open. Its cursor row is a
@@ -6247,7 +6149,6 @@ impl Workspace {
                 slack_cursors: cursors,
                 slack_muted: None,
             });
-            self.refresh_slack_wants(cx);
             self.invalidate_dealer_signals(cx);
         }
         count
@@ -6272,8 +6173,8 @@ impl Workspace {
         if phone_verdict.is_some() && current {
             self.phone_completed_verdict(sequence);
         }
-        self.attention.dealer.clear_skip(&card.node);
-        Self::record_dealer_verdict(&card, verdict, chrono::Local::now().fixed_offset(), None);
+        self.attention.skips.clear(&card.node);
+        Self::record_dealer_verdict(&card, verdict, jiff::Timestamp::now(), None);
         if let Some(phone_verdict) = phone_verdict {
             self.record_phone_verdict(phone_verdict, cx);
         }
@@ -7085,7 +6986,7 @@ impl Workspace {
             match &self.active_surface().key {
                 SurfaceKey::Transcript(agent_id) => {
                     let leaf = self.registry.agent_display_label(*agent_id);
-                    match self.node_context(&rho_dealer::NodeId::Agent(*agent_id)) {
+                    match self.node_context(&rho_dealer::NodeId::Agent(*agent_id), cx) {
                         context if context.is_empty() => leaf,
                         context => format!("{context} / {leaf}"),
                     }
@@ -7742,7 +7643,7 @@ impl Render for Workspace {
                 Self::record_dealer_verdict(
                     &card,
                     rho_journal::DealerVerdict::Open,
-                    chrono::Local::now().fixed_offset(),
+                    jiff::Timestamp::now(),
                     None,
                 );
                 match &card.node {
