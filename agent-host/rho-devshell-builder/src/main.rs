@@ -130,7 +130,7 @@ fn main() -> Result<()> {
 fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -> Result<Result<Shell, Failure>> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = dir.filter(|_| cache).map(Client::new);
-    let key = flake.key()?;
+    let mut key = flake.key()?;
     let mut found = None;
     if let (Some(client), Some(dir)) = (&client, dir) {
         match runtime.block_on(cached(nix, client, flake, &key, dir)) {
@@ -141,16 +141,24 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
     let (id, evaluated) = match found {
         Some(hit) => hit,
         None => {
-            let evaluation = match evaluate(nix, flake) {
+            let mut evaluation = match evaluate(nix, flake) {
                 Ok(evaluation) => evaluation,
                 Err(failure) => return Ok(Err(failure)),
             };
             // Locking that wrote `flake.lock` changed what evaluation had
-            // observed of it; the next resolution evaluates the locked flake,
-            // and caches that.
-            let locked = flake.key()? == key;
+            // observed of it: evaluate the locked flake again, to cache that.
+            let mut stable = true;
+            let locked = flake.key()?;
+            if locked != key {
+                evaluation = match evaluate(nix, flake) {
+                    Ok(evaluation) => evaluation,
+                    Err(failure) => return Ok(Err(failure)),
+                };
+                stable = flake.key()? == locked;
+                key = locked;
+            }
             let mut id = None;
-            if let (Some(client), Some(dir), Some(evaluated), true) = (&client, dir, evaluation.cacheable(), locked) {
+            if let (Some(client), Some(dir), Some(evaluated), true) = (&client, dir, evaluation.cacheable(), stable) {
                 match runtime.block_on(store(nix, client, &key, dir, &evaluated)) {
                     Ok(stored) => id = Some(stored),
                     Err(e) => eprintln!("rho: failed to cache dev shell: {e:#}"),

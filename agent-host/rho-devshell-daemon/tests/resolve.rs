@@ -136,15 +136,14 @@ async fn observations_decide_hits() {
         async move { resolver.resolve(&flake).await.unwrap().0.id.unwrap() }
     };
     let flake = Flake::new(repo.canonicalize().unwrap(), "default");
-    // Locked as `nix develop` locks; not cached across writing the lock.
-    assert_eq!(resolver().resolve(&flake).await.unwrap().0.id, None);
+    // Locked as `nix develop` locks, and cached as locked.
+    let first = id(&flake).await;
     let tracked = std::process::Command::new("git")
         .args(["ls-files", "--error-unmatch", "flake.lock"])
         .current_dir(&repo)
         .output()
         .unwrap();
     assert!(tracked.status.success(), "flake.lock written and added");
-    let first = id(&flake).await;
     assert_eq!(id(&flake).await, first, "hit");
 
     std::fs::write(repo.join("other.txt"), "y").unwrap();
