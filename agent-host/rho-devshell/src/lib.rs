@@ -26,6 +26,7 @@ use tokio::io::AsyncReadExt as _;
 
 pub mod protocol;
 pub use protocol::Client;
+pub use rho_fs_view::devshell_dir;
 
 /// Changes whenever evaluation semantics change (evaluator, Nix fork
 /// patches), so shells of an older evaluator are never found.
@@ -514,11 +515,11 @@ pub fn install(resolver: Resolver) {
 }
 
 /// This process's resolver: the installed one, else one for a process in a
-/// view, with the daemon's cache at `$RHO_DEVSHELL_DIR` if that is set.
+/// view, with the daemon's cache at [`devshell_dir`].
 pub fn resolver() -> Arc<Resolver> {
     RESOLVER
         .get_or_init(|| {
-            let dir = std::env::var_os("RHO_DEVSHELL_DIR").map(PathBuf::from);
+            let dir = devshell_dir().ok();
             Arc::new(Resolver::new(
                 dir.as_deref().map(Client::new),
                 dir.unwrap_or_else(|| std::env::temp_dir().join("rho-devshell")),

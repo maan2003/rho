@@ -12535,7 +12535,6 @@ dependencies = [
  "rho-db",
  "rho-desktop-client",
  "rho-devshell",
- "rho-devshell-daemon",
  "rho-fs-view",
  "rho-image",
  "rho-inference",

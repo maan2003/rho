@@ -13,7 +13,7 @@ redb.workspace = true
 rho-db.workspace = true
 rho-devshell.workspace = true
 senax-encoder.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "rt"] }
 
 [dev-dependencies]
 serde_json.workspace = true

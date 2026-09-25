@@ -11,7 +11,7 @@
 //!     rho-devshell-builder pin <store-path> <gc-root>
 //!
 //! `shell` finds the shell in the daemon's cache in `DIR` (by default
-//! `$RHO_DEVSHELL_DIR`) unless `--no-cache`, pinning it, or evaluates and
+//! `rho_devshell::devshell_dir`) unless `--no-cache`, pinning it, or evaluates and
 //! caches it; writes its activation script into `DIR`; and prints it as
 //! JSON (`rho_devshell::Shell`). The agent base's patched `nix develop`
 //! runs it too, and reads `env_store_path`. A flake without a shell exits
@@ -51,7 +51,7 @@ fn parse_args() -> Result<Mode> {
             let dir = next("flake directory")?;
             let flake_dir = std::fs::canonicalize(&dir).with_context(|| dir.clone())?;
             let mut shell = "default".to_owned();
-            let mut dir = std::env::var_os("RHO_DEVSHELL_DIR").map(PathBuf::from);
+            let mut dir = rho_devshell::devshell_dir().ok();
             let mut cache = true;
             while let Ok(arg) = next("") {
                 match arg.as_str() {

@@ -97,6 +97,43 @@ pub struct AgentTurnCompleted {
     pub final_answer: String,
 }
 
+/// Run the cache of flake dev shells, shared by every workset process and
+/// every `nix develop` in a view over the shared cache directory, as a child
+/// that dies with the host. It is started again if it exits; without it,
+/// shells are evaluated uncached.
+fn run_devshell_daemon(worksets: &Worksets) {
+    let program = rho_fs_view::devshell_daemon();
+    // A host over another root than the default tells the daemon where.
+    let dir = worksets.devshell_cache_dir().into_std_path_buf();
+    let other = rho_fs_view::devshell_dir().ok() != Some(dir.clone());
+    tokio::spawn(async move {
+        loop {
+            let mut command = tokio::process::Command::new(&program);
+            if other {
+                command.env("RHO_DEVSHELL_DIR", &dir);
+            }
+            command.kill_on_drop(true);
+            unsafe {
+                command.pre_exec(|| {
+                    rustix::process::set_parent_process_death_signal(Some(
+                        rustix::process::Signal::TERM,
+                    ))?;
+                    Ok(())
+                });
+            }
+            let status = match command.spawn() {
+                Ok(mut child) => child.wait().await,
+                Err(error) => {
+                    eprintln!("dev shell cache unavailable: {} failed: {error}", program.display());
+                    return;
+                }
+            };
+            eprintln!("dev shell cache daemon exited ({status:?}), restarting");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
 impl AgentPool {
     /// Opens the pool over `db`, initializing the agent tables.
     pub async fn new(
@@ -111,21 +148,7 @@ impl AgentPool {
         if let Err(error) = claude.bootstrap(&account) {
             panic!("Claude account {account} could not be prepared: {error:#}");
         }
-        // Cached flake dev shells, shared by every workset process and
-        // every `nix develop` in a view, over the shared cache directory.
-        let devshell = Arc::new(
-            rho_devshell_daemon::Store::open(
-                db.clone(),
-                worksets.devshell_cache_dir().into_std_path_buf(),
-            )
-            .await,
-        );
-        match devshell.serve() {
-            Ok(serve) => {
-                tokio::spawn(serve);
-            }
-            Err(error) => eprintln!("dev shell cache unavailable: {error:#}"),
-        }
+        run_devshell_daemon(&worksets);
         let (responses, mut notifications) =
             tokio::sync::mpsc::channel::<ResponseNotification>(256);
         let pool = Arc::new(Self {

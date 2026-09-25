@@ -67,20 +67,40 @@ pub fn git_dir() -> PathBuf {
 /// cargo test binary, next to its `deps` directory), else from `PATH`. A view
 /// binds a development executable's directory, so the path holds there too.
 pub fn devshell_builder() -> PathBuf {
-    const NAME: &str = "rho-devshell-builder";
-    if let Some(program) = std::env::var_os("RHO_DEVSHELL_BUILDER") {
-        return program.into();
+    match std::env::var_os("RHO_DEVSHELL_BUILDER") {
+        Some(program) => program.into(),
+        None => installed("rho-devshell-builder"),
     }
+}
+
+/// `rho-devshell-daemon`, which keeps the dev shell cache, found as
+/// [`devshell_builder`] is but without an override.
+pub fn devshell_daemon() -> PathBuf {
+    installed("rho-devshell-daemon")
+}
+
+/// The dev shell cache: `$RHO_DEVSHELL_DIR`, else the default root's
+/// ([`Worksets::devshell_cache_dir`]). A view sets the variable, because the
+/// agent's home there is not the owner's.
+pub fn devshell_dir() -> anyhow::Result<PathBuf> {
+    match std::env::var_os("RHO_DEVSHELL_DIR") {
+        Some(dir) => Ok(dir.into()),
+        None => Ok(ns::devshell_cache(&Utf8PathBuf::try_from(Worksets::default_root()?.join("cache"))?)
+            .into_std_path_buf()),
+    }
+}
+
+fn installed(name: &str) -> PathBuf {
     let Ok(exe) = std::env::current_exe() else {
-        return NAME.into();
+        return name.into();
     };
     let dir = exe.parent().unwrap_or(Path::new("/"));
     [Some(dir), dir.parent().filter(|_| dir.ends_with("deps"))]
         .into_iter()
         .flatten()
-        .map(|dir| dir.join(NAME))
+        .map(|dir| dir.join(name))
         .find(|path| path.is_file())
-        .unwrap_or_else(|| NAME.into())
+        .unwrap_or_else(|| name.into())
 }
 pub use rho_git::server::Refresh as StoreRefresh;
 

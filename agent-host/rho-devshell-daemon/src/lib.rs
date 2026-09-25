@@ -8,8 +8,10 @@
 //! in the Nix store. The [`PIN_BUDGET`] most recently used environments keep
 //! a GC root in the shared cache directory; older ones are unpinned and
 //! remain usable until Nix collects them, when using one pins it again.
-//! One process owns the entries, so pinning and unpinning never race.
-//! Clients reach it over [`protocol::socket_path`] ([`Store::serve`]).
+//! One process owns the entries, so pinning and unpinning never race:
+//! `rho-agent-host` runs this crate's binary, which keeps them in its own
+//! database in the cache directory. Clients reach it over [`protocol::socket_path`]
+//! ([`Store::serve`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};

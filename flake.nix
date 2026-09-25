@@ -360,7 +360,7 @@
             craneLib = craneLibBase.overrideArgs {
               cargoVendorDir = craneLibBase.vendorCargoDeps { };
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-agent-host -p rho-agent -p rho-shell -p rho-devshell-builder -p git-remote-octo";
+            packageCargoExtraArgs = "-p rho-cli -p rho-agent-host -p rho-agent -p rho-shell -p rho-devshell-builder -p rho-devshell-daemon -p git-remote-octo";
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. Registry dependencies need the real APIs of
