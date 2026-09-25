@@ -74,6 +74,45 @@ enum DebugCommand {
         /// low-adv, med-adv, or med1-adv.
         role: String,
     },
+    /// Snapshot the database and print one agent's persisted events, each
+    /// cut to `--max-chars`.
+    Transcript {
+        /// Full agent id.
+        agent: String,
+        #[arg(long = "max-chars", default_value_t = 3000)]
+        max_chars: usize,
+    },
+    /// Start an agent on a running agent host and print its id.
+    NewAgent {
+        /// Role text, as for `render-prompt`.
+        #[arg(long, default_value = "high-eng")]
+        role: String,
+        /// The repository its workset is cloned from.
+        #[arg(long)]
+        repo: camino::Utf8PathBuf,
+        #[arg(long, default_value = "@")]
+        revset: String,
+        /// See the host filesystem rather than a generated root.
+        #[arg(long)]
+        exposed: bool,
+        /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
+        /// user's agent host.
+        #[arg(long = "socket-path")]
+        socket_path: Option<PathBuf>,
+        /// The first message.
+        text: String,
+    },
+    /// Send an agent a message, as the user would, on a running agent host.
+    /// Never starts one: the message is for an agent that already lives there.
+    SendMessage {
+        /// Full agent id, as in `$RHO_AGENT_ID`.
+        agent: String,
+        /// The agent host's socket; defaults to `$RHO_SOCKET_PATH`, then the
+        /// user's agent host.
+        #[arg(long = "socket-path")]
+        socket_path: Option<PathBuf>,
+        text: String,
+    },
 }
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
@@ -94,7 +133,53 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::DeleteAgents { agents } => delete_agents(args.db_path, &agents).await,
         DebugCommand::Context => print_context(args.db_path, &claude).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
+        DebugCommand::Transcript { agent, max_chars } => {
+            print_transcript(args.db_path, &agent, max_chars).await
+        }
+        DebugCommand::NewAgent {
+            role,
+            repo,
+            revset,
+            exposed,
+            socket_path,
+            text,
+        } => {
+            let call = rho_agents_client::protocol::NewAgent {
+                role: parse_role(&role)?,
+                start: rho_agents_client::protocol::StartMode::NewOn { repo, revset },
+                mode: if exposed {
+                    rho_agent_types::WorksetMode::Exposed
+                } else {
+                    rho_agent_types::WorksetMode::View
+                },
+                content: Some(vec![rho_agent_types::ContentPart::Text { text }]),
+            };
+            let agent_id = rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            println!("{}", agent_id.encoded());
+            Ok(())
+        }
+        DebugCommand::SendMessage {
+            agent,
+            socket_path,
+            text,
+        } => {
+            let agent_id = rho_agent_types::AgentId::from_encoded(&agent)
+                .with_context(|| format!("agent id {agent}"))?;
+            let call = rho_agents_client::protocol::AgentCommand::Send {
+                agent_id,
+                content: vec![rho_agent_types::ContentPart::Text { text }],
+                delivery: rho_agent_types::MessageDelivery::Immediate,
+            };
+            rho_rpc::protocol::client::call(host_socket(socket_path)?, call).await?;
+            Ok(())
+        }
     }
+}
+
+fn host_socket(socket_path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    Ok(rho_rpc::protocol::RuntimePaths::resolve(socket_path)?
+        .socket()
+        .to_owned())
 }
 
 /// The agent host's lock, held for as long as the file lives, or `None` while
@@ -405,6 +490,33 @@ async fn print_agents(
                     None => writeln!(output, "  transcript: <missing>")?,
                 }
             }
+        }
+    }
+    io::stdout().lock().write_all(output.as_bytes())?;
+    Ok(())
+}
+
+async fn print_transcript(
+    db_path: Option<PathBuf>,
+    agent: &str,
+    max_chars: usize,
+) -> anyhow::Result<()> {
+    let agent_id = rho_agent_types::AgentId::from_encoded(agent)
+        .with_context(|| format!("agent id {agent}"))?;
+    let snapshot = copy_snapshot(db_path).await?;
+    let db = RhoDb::open(&snapshot.path);
+    migrate_snapshot(&db).await?;
+    let read = db.read();
+    let mut output = String::new();
+    for (index, event) in read.agent_events(agent_id).1.iter().enumerate() {
+        let text = format!("{event:?}");
+        let cut = text
+            .char_indices()
+            .nth(max_chars)
+            .map_or(text.len(), |(at, _)| at);
+        writeln!(output, "#{index} {}", &text[..cut])?;
+        if cut < text.len() {
+            writeln!(output, "   … {} more bytes", text.len() - cut)?;
         }
     }
     io::stdout().lock().write_all(output.as_bytes())?;
