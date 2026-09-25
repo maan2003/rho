@@ -68,7 +68,6 @@ rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-journal = { workspace = true }
 rho-dealer = { workspace = true }
-rho-desk-client = { workspace = true }
 rho-ledger = { workspace = true, features = ["client"] }
 rho-desktop-client = { workspace = true, features = ["client"] }
 rho-profiling = { workspace = true }

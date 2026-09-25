@@ -16,7 +16,6 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{Context, Window};
 use rho_agent_types::AgentId;
 use rho_dealer::facts::{Device, Entry, EntryId, Fact, Seen};
-use rho_dealer::marks::legacy;
 use rho_dealer::notes::NoteRev;
 use rho_dealer::rank::{self, Cache, Sources};
 use rho_dealer::{Card, CardKind, Hand, Marks, NodeId, Skips, SlackUnit, Until};
@@ -108,43 +107,14 @@ pub(crate) struct Attention {
 }
 
 impl Attention {
-    /// The ledger in `db`, read out. A device that holds nothing yet
-    /// carries over what an older build's ledger held, or else what the
-    /// desk held.
+    /// The ledger in `db`, read out.
     pub(crate) fn open(db: rho_db::RhoDb) -> (Self, UnboundedReceiver<LedgerEvent>) {
+        futures::executor::block_on(drop_the_desk(&db));
         let ledger = futures::executor::block_on(Ledger::open(db.clone()));
         let device = Device(ledger.device().0);
         let mut marks = Marks::default();
         marks.apply(read_entries(&ledger.items(Channel::Facts)));
         marks.apply_notes(read_notes(&ledger.items(Channel::Notes)));
-        if marks.is_empty() {
-            let mut old = ledger.legacy_merged();
-            if old.is_empty() {
-                old = desk_marks(&rho_desk_client::export::held(&db))
-                    .into_iter()
-                    .map(|(key, value)| (key, value, 1))
-                    .collect();
-            }
-            let zone = jiff::Zoned::now().time_zone().clone();
-            let (entries, notes) = legacy::convert(&old, device, &zone);
-            if !entries.is_empty() || !notes.is_empty() {
-                tracing::info!(
-                    facts = entries.len(),
-                    notes = notes.len(),
-                    "carried older marks over into facts"
-                );
-                futures::executor::block_on(async {
-                    ledger
-                        .append(Channel::Facts, entries.iter().map(Entry::encode).collect())
-                        .await;
-                    ledger
-                        .append(Channel::Notes, notes.iter().map(NoteRev::encode).collect())
-                        .await;
-                });
-                marks.apply(entries);
-                marks.apply_notes(notes);
-            }
-        }
         let (streams, events) = LedgerStreams::new(ledger);
         (
             Self {
@@ -254,6 +224,15 @@ impl Attention {
     }
 }
 
+/// Every device has carried the desk over into the ledger; its cache goes.
+async fn drop_the_desk(db: &rho_db::RhoDb) {
+    let mut write = db.write().await;
+    for table in ["gui_desk_cells_v1", "gui_desk_bodies_v1"] {
+        write.delete_table(table);
+    }
+    write.commit();
+}
+
 fn read_entries(items: &[Item]) -> Vec<Entry> {
     items
         .iter()
@@ -266,135 +245,6 @@ fn read_notes(items: &[Item]) -> Vec<NoteRev> {
         .iter()
         .filter_map(|item| NoteRev::decode(&item.bytes))
         .collect()
-}
-
-fn migrated_node(id: &rho_desk_client::protocol::cells::Id) -> Option<NodeId> {
-    use rho_desk_client::protocol::cells::Id;
-    Some(match id {
-        Id::Note(uuid) => NodeId::Note(uuid::Uuid::from_bytes(uuid.0)),
-        Id::Label(uuid) => NodeId::Label(uuid::Uuid::from_bytes(uuid.0)),
-        Id::Agent(agent) => NodeId::Agent(*agent),
-        Id::Slack(unit) => NodeId::Slack(SlackUnit {
-            workspace: unit.workspace.clone(),
-            channel: unit.channel.clone(),
-            thread: unit.thread.clone(),
-        }),
-        Id::PullRequest { repo, number } => NodeId::PullRequest {
-            repo: repo.clone(),
-            number: *number,
-        },
-        Id::Host(_) | Id::Page(_) | Id::File { .. } => return None,
-    })
-}
-
-/// A desk date as an instant. The desk kept a day as midnight UTC of that
-/// date; the day now starts at the user's own midnight.
-fn date_mark(at: rho_desk_client::protocol::cells::Timestamp) -> legacy::DateMark {
-    match at.precision {
-        rho_desk_client::protocol::cells::TimestampPrecision::Day => {
-            let now = jiff::Zoned::now();
-            let date = jiff::Timestamp::from_millisecond(at.unix_ms)
-                .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
-                .to_zoned(jiff::tz::TimeZone::UTC)
-                .date();
-            let start = date
-                .to_zoned(now.time_zone().clone())
-                .map_or(at.unix_ms, |start| start.timestamp().as_millisecond());
-            legacy::DateMark {
-                unix_ms: start,
-                day: true,
-            }
-        }
-        _ => legacy::DateMark {
-            unix_ms: at.unix_ms,
-            day: false,
-        },
-    }
-}
-
-/// The marks that say what the desk said. Labels keep their names,
-/// nesting and repositories; notes that are not deleted keep their text,
-/// labels, state and dates; agents keep their labels, names, mutes, dates
-/// and how far they were handled; Slack units keep their labels and
-/// dates. A date with no pace is a snooze, one with a pace a todo.
-pub(crate) fn desk_marks(
-    held: &std::collections::BTreeMap<
-        rho_desk_client::protocol::cells::Id,
-        rho_desk_client::export::HeldNode,
-    >,
-) -> Vec<legacy::Mark> {
-    use rho_desk_client::protocol::cells::{Id, Property, State};
-    let mut writes = Vec::new();
-    for (id, node) in held {
-        let Some(target) = migrated_node(id) else {
-            continue;
-        };
-        let deleted = node
-            .properties
-            .iter()
-            .any(|property| matches!(property, Property::Deleted(true)));
-        if deleted && matches!(target, NodeId::Note(_)) {
-            continue;
-        }
-        let mut wakes = None;
-        let mut deadline = None;
-        let mut pace_days = 0;
-        for property in &node.properties {
-            match property {
-                Property::Parent(Some(Id::Label(parent))) if matches!(target, NodeId::Label(_)) => {
-                    writes.push(legacy::parent(&target, uuid::Uuid::from_bytes(parent.0)));
-                }
-                Property::About(about) => {
-                    if let Some(about) = migrated_node(about) {
-                        writes.push(legacy::about(&target, &about));
-                    }
-                }
-                Property::Labeled {
-                    label: Id::Label(label),
-                    present: true,
-                } => writes.push(legacy::label(&target, uuid::Uuid::from_bytes(label.0))),
-                Property::Name(name) if !name.trim().is_empty() => {
-                    writes.push(legacy::name(&target, name));
-                }
-                Property::Repository(Some(repository)) => {
-                    writes.push(legacy::repository(&target, &repository.url));
-                }
-                Property::State(State::Muted) if !matches!(target, NodeId::Slack(_)) => {
-                    writes.push(legacy::muted(&target));
-                }
-                Property::State(State::Done) if matches!(target, NodeId::Note(_)) => {
-                    writes.push(legacy::handled(&target, &legacy::Cursor::Done));
-                }
-                Property::AgentHandledThrough(pos) if matches!(target, NodeId::Agent(_)) => {
-                    writes.push(legacy::handled(&target, &legacy::Cursor::Story(pos.0)));
-                }
-                Property::DeferUntil(Some(at)) => wakes = Some(date_mark(*at)),
-                Property::Deadline(Some(at)) => deadline = Some(date_mark(*at)),
-                Property::PaceDays(pace) => pace_days = *pace,
-                Property::Deleted(true) => writes.push(legacy::deleted(&target)),
-                Property::CreatedAt(at) => writes.push(legacy::created(&target, at.unix_ms)),
-                _ => {}
-            }
-        }
-        match (wakes, deadline, pace_days) {
-            (None, None, _) => {}
-            (Some(until), None, 0) if !matches!(target, NodeId::Note(_)) => {
-                writes.push(legacy::snooze(&target, &until));
-            }
-            (wakes, deadline, pace_days) => writes.push(legacy::todo(
-                &target,
-                &legacy::Todo {
-                    wakes,
-                    deadline,
-                    pace_days,
-                },
-            )),
-        }
-        if let (NodeId::Note(_), Some(body)) = (&target, &node.body) {
-            writes.push(legacy::body(&target, body));
-        }
-    }
-    writes
 }
 
 /// A label path split into its names, with empty ones dropped.
@@ -1080,122 +930,4 @@ pub(crate) fn agent_state_label(
     } else {
         format!("finished · {age} ago")
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use rho_desk_client::export::HeldNode;
-    use rho_desk_client::protocol::cells::{
-        Id, Property, State, StoryPos, Timestamp, TimestampPrecision, Uuid,
-    };
-
-    use super::*;
-
-    fn day(unix_ms: i64) -> Timestamp {
-        Timestamp {
-            unix_ms,
-            precision: TimestampPrecision::Day,
-        }
-    }
-
-    #[test]
-    fn the_desk_carries_over_as_marks() {
-        let label = Id::Label(Uuid([1; 16]));
-        let child = Id::Label(Uuid([2; 16]));
-        let note = Id::Note(Uuid([3; 16]));
-        let gone = Id::Note(Uuid([4; 16]));
-        let agent_id = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let agent = Id::Agent(agent_id);
-        let mut held = std::collections::BTreeMap::new();
-        held.insert(
-            label.clone(),
-            HeldNode {
-                properties: vec![Property::Name("rho".into())],
-                body: None,
-            },
-        );
-        held.insert(
-            child.clone(),
-            HeldNode {
-                properties: vec![
-                    Property::Name("gui".into()),
-                    Property::Parent(Some(label.clone())),
-                ],
-                body: None,
-            },
-        );
-        held.insert(
-            note.clone(),
-            HeldNode {
-                properties: vec![
-                    Property::Labeled {
-                        label: child.clone(),
-                        present: true,
-                    },
-                    Property::DeferUntil(Some(day(86_400_000))),
-                    Property::PaceDays(3),
-                ],
-                body: Some("buy milk\nsoon".into()),
-            },
-        );
-        held.insert(
-            gone,
-            HeldNode {
-                properties: vec![Property::Deleted(true)],
-                body: Some("old".into()),
-            },
-        );
-        held.insert(
-            agent,
-            HeldNode {
-                properties: vec![
-                    Property::State(State::Muted),
-                    Property::AgentHandledThrough(StoryPos(9)),
-                    Property::DeferUntil(Some(day(0))),
-                    Property::Name("fixer".into()),
-                ],
-                body: None,
-            },
-        );
-        held.insert(
-            Id::Host(7),
-            HeldNode {
-                properties: vec![Property::Name("host".into())],
-                body: None,
-            },
-        );
-        let old: Vec<_> = desk_marks(&held)
-            .into_iter()
-            .map(|(key, value)| (key, value, 1))
-            .collect();
-        let (entries, notes) = legacy::convert(&old, Device([0; 16]), &jiff::tz::TimeZone::UTC);
-        let mut marks = Marks::default();
-        marks.apply(entries);
-        marks.apply_notes(notes);
-
-        let gui = uuid::Uuid::from_bytes([2; 16]);
-        assert_eq!(marks.label_path(gui), "rho/gui");
-        let note = marks.get(&NodeId::Note(uuid::Uuid::from_bytes([3; 16])));
-        assert_eq!(note.title(), "buy milk");
-        assert!(note.labels.contains(&gui));
-        assert!(
-            note.facts().todo().is_some(),
-            "a date with a pace is a todo"
-        );
-        assert_eq!(
-            marks.notes().count(),
-            1,
-            "a deleted note is not carried over"
-        );
-        let agent = marks.get(&NodeId::Agent(agent_id));
-        assert!(agent.facts().muted());
-        assert_eq!(agent.facts().seen_agent(), Some(9));
-        assert_eq!(agent.name.as_deref(), Some("fixer"));
-        assert_eq!(
-            agent.facts().snoozes(),
-            1,
-            "a date with no pace is a snooze"
-        );
-        assert_eq!(agent.facts().todo(), None);
-    }
 }

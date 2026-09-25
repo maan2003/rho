@@ -8,6 +8,17 @@ use rho_rpc::protocol::{read_frame, write_frame};
 use tokio::sync::broadcast;
 
 const LOGS: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("ledger_logs_v2");
+// What the desk and the older ledger kept here. Every device has carried
+// it over; drop it once.
+const RETIRED: [&str; 7] = [
+    "ledger_segments_v1",
+    "rho_desk_facts_v1",
+    "rho_desk_fact_verdicts_v1",
+    "rho_desk_fact_mutations_v1",
+    "rho_desk_note_body_v1",
+    "rho_desk_cell_meta_v2",
+    "rho_desk_parent_labels_v1",
+];
 pub struct LedgerServer {
     db: RhoDb,
     appends: broadcast::Sender<(LogId, u64, Vec<u8>)>,
@@ -15,6 +26,9 @@ pub struct LedgerServer {
 impl LedgerServer {
     pub async fn open(db: RhoDb) -> Self {
         let mut write = db.write().await;
+        for table in RETIRED {
+            write.delete_table(table);
+        }
         write.open_table(LOGS);
         write.commit();
         Self {

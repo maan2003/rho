@@ -3,8 +3,6 @@
 //! conditionally append.
 
 #[cfg(feature = "client")]
-mod entry;
-#[cfg(feature = "client")]
 mod ledger;
 pub mod protocol;
 #[cfg(feature = "client")]

@@ -5,16 +5,22 @@ use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
-use crate::entry::Stamp;
 use crate::protocol::{DeviceId, LogId};
 use crate::seal;
 use crate::secret::Secret;
 
 const SELF: TableDefinition<(), Sen<SelfRecord>> = TableDefinition::new("ledger_self_v1");
-const MERGED: TableDefinition<&[u8], Sen<Stored>> = TableDefinition::new("ledger_merged_v1");
 const LOGS: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("ledger_logs_v2");
 const READ: TableDefinition<[u8; 16], u64> = TableDefinition::new("ledger_read_v2");
 const UNSENT: TableDefinition<u64, Sen<Envelope>> = TableDefinition::new("ledger_unsent_v2");
+// What older builds kept. Every device has converted it; drop it once.
+const RETIRED: [&str; 5] = [
+    "ledger_merged_v1",
+    "ledger_own_v1",
+    "ledger_seen_v1",
+    "ledger_pending_v1",
+    "ledger_segments_v1",
+];
 const KEY_CONTEXT: &str = "rho 2026-09-24 ledger";
 
 // Keep the old row's exact serialized shape so existing identities and secrets
@@ -27,12 +33,6 @@ struct SelfRecord {
     seq: u64,
     since_base: u32,
 }
-#[derive(Clone, Debug, Encode, Decode)]
-struct Stored {
-    stamp: Stamp,
-    value: Option<Vec<u8>>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Channel {
     Facts,
@@ -96,7 +96,9 @@ pub fn log_id(device: DeviceId, channel: Channel) -> LogId {
 impl Ledger {
     pub async fn open(db: RhoDb) -> Self {
         let mut write = db.write().await;
-        write.open_table(MERGED);
+        for table in RETIRED {
+            write.delete_table(table);
+        }
         write.open_table(LOGS);
         write.open_table(READ);
         write.open_table(UNSENT);
@@ -133,17 +135,6 @@ impl Ledger {
     }
     pub fn secret(&self) -> Option<Secret> {
         self.me().secret.map(Secret)
-    }
-    pub fn legacy_merged(&self) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
-        self.db
-            .read()
-            .open_table(MERGED)
-            .iter()
-            .filter_map(|(key, value)| {
-                let stored = value.value().into_owned();
-                Some((key.value().to_vec(), stored.value?, stored.stamp.millis))
-            })
-            .collect()
     }
     pub fn items(&self, channel: Channel) -> Vec<Item> {
         let read = self.db.read();
@@ -356,41 +347,6 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn preserves_legacy_identity_secret_and_dated_merged_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(dir.path().join("ledger.redb"));
-        let ledger = Ledger::open(db.clone()).await;
-        let device = ledger.device();
-        let secret = Secret::generate();
-        ledger.set_secret(secret).await.unwrap();
-        let mut write = db.write().await;
-        let stamp = Stamp {
-            millis: 137,
-            counter: 2,
-            device,
-        };
-        write.open_table(MERGED).insert(
-            b"f/a".as_slice(),
-            SenValue::borrowed(&Stored {
-                stamp,
-                value: Some(b"old".to_vec()),
-            }),
-        );
-        write.open_table(MERGED).insert(
-            b"f/deleted".as_slice(),
-            SenValue::borrowed(&Stored { stamp, value: None }),
-        );
-        write.commit();
-        let reopened = Ledger::open(db).await;
-        assert_eq!(reopened.device(), device);
-        assert_eq!(reopened.secret(), Some(secret));
-        assert_eq!(
-            reopened.legacy_merged(),
-            vec![(b"f/a".to_vec(), b"old".to_vec(), 137)]
-        );
-    }
 
     #[tokio::test]
     async fn local_writes_before_key_are_readable_and_sealed_on_key_arrival() {

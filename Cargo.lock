@@ -12862,20 +12862,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-desk-client"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "camino",
- "clock",
- "redb",
- "rho-agent-types",
- "rho-db",
- "senax-encoder",
- "text",
-]
-
-[[package]]
 name = "rho-desktop-client"
 version = "0.1.0"
 dependencies = [
@@ -13102,7 +13088,6 @@ dependencies = [
  "rho-browser",
  "rho-db",
  "rho-dealer",
- "rho-desk-client",
  "rho-desktop-client",
  "rho-desktop-proto",
  "rho-fake-slack",
