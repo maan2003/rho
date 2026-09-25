@@ -23,6 +23,7 @@ pub(super) struct Bootstrap {
 #[derive(Encode, Decode)]
 pub(super) enum Control {
     Retire,
+    Drain,
     User {
         content: Vec<rho_agent_types::ContentPart>,
         delivery: rho_agent_types::MessageDelivery,

@@ -67,6 +67,11 @@ impl Services {
     pub(super) async fn worker_failed(&self, error: String) {
         use rho_agent_types::{TurnEdge, TurnOutcome};
 
+        // A stopping agent host lets its workers go; that is no failure.
+        if self.pool.upgrade().is_some_and(|pool| pool.is_draining()) {
+            return;
+        }
+
         use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
             kind: crate::AgentStateKind::Error(crate::FailedInferenceResponse {

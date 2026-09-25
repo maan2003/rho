@@ -8,6 +8,9 @@ use super::ipc::{self, Control, Host, Message};
 use crate::agent::{Agent, AgentHandle};
 use crate::claude::{ClaudeAgent, ClaudeLoop};
 
+/// How long one agent may take to finish the request in flight when drained.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(50);
+
 enum Controller {
     Rho(AgentHandle),
     Claude(ClaudeAgent),
@@ -19,6 +22,21 @@ impl Controller {
             Control::Retire => match self {
                 Self::Rho(agent) => agent.retire().await?,
                 Self::Claude(agent) => agent.retire().await?,
+            },
+            // Bounded here, inside the workset, so the agent host always hears
+            // back before its own stop deadline (`DRAIN_TIMEOUT` there).
+            Control::Drain => match self {
+                Self::Rho(agent) => {
+                    if tokio::time::timeout(DRAIN_TIMEOUT, agent.drain())
+                        .await
+                        .is_err()
+                    {
+                        anyhow::bail!("request still in flight after {DRAIN_TIMEOUT:?}");
+                    }
+                }
+                // Claude Code keeps its own conversation; there is no tail
+                // of ours to flush.
+                Self::Claude(_) => {}
             },
             Control::User { content, delivery } => match self {
                 Self::Rho(agent) => agent.send_user_content_accepted(content, delivery).await?,
@@ -85,6 +103,7 @@ impl Controller {
         let mut controls = host.controls();
         while let Some((id, body)) = controls.recv().await {
             let retiring = matches!(body, Control::Retire);
+            let draining = matches!(body, Control::Drain);
             let error = self
                 .apply(body)
                 .await
@@ -92,7 +111,9 @@ impl Controller {
                 .map(|error| format!("{error:#}"));
             let retired = retiring && error.is_none();
             host.send(Message::Controlled { id, error }).await?;
-            if retired {
+            // A drained agent takes no more input, whether or not its request
+            // ended in time: the agent host is on its way down.
+            if retired || draining {
                 std::future::pending::<()>().await;
             }
         }

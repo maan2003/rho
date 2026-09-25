@@ -295,6 +295,7 @@ pub(in crate::agent) mod tests {
                 mail: Vec::new(),
                 cells: Cells::new(Arc::clone(&wake)),
                 observations: Observations::default(),
+                draining: None,
                 recovery_notes: Vec::new(),
                 context_used: None,
                 turn: None,

@@ -207,6 +207,7 @@ impl AgentHandle {
             mail: replayed.mail,
             cells: Cells::new(Arc::clone(&wake)),
             observations: Observations::default(),
+            draining: None,
             recovery_notes: replayed.recovery_notes,
             context_used: replayed.context_used,
             turn: None,
@@ -353,6 +354,19 @@ impl AgentHandle {
             .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?
     }
 
+    /// Waits for the request in flight, if any, to end, then freezes the
+    /// loop with its log flushed. Calls still running are left to die with
+    /// the process.
+    pub(crate) async fn drain(&self) -> anyhow::Result<()> {
+        let (reply, drained) = oneshot::channel();
+        self.control
+            .send(Control::Drain(reply))
+            .map_err(|_| anyhow::anyhow!("agent loop is closed"))?;
+        drained
+            .await
+            .map_err(|_| anyhow::anyhow!("agent loop is closed"))
+    }
+
     pub(crate) async fn retire(&self) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -404,6 +418,7 @@ impl AgentHandle {
 /// waits for a boundary the caller does not control.
 enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
+    Drain(oneshot::Sender<()>),
     User(QueuedInput, Option<oneshot::Sender<()>>),
     Mail {
         sender: AgentId,
@@ -503,6 +518,10 @@ pub(crate) struct Agent {
     /// When each pending event was first seen: the clocks the boundary's
     /// patiences run on.
     observations: Observations,
+    /// A drain waiting for the request in flight to end: no new request
+    /// starts, and once none is in flight the log is flushed and this is
+    /// answered.
+    draining: Option<oneshot::Sender<()>>,
     recovery_notes: Vec<String>,
 
     context_used: Option<u64>,
@@ -593,11 +612,26 @@ impl Agent {
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         loop {
             self.writer.check()?;
+            if self.draining.is_some() && matches!(self.phase, Phase::Idle { .. }) {
+                // The last status says whether the agent is still at work
+                // (calls running) or done, which is what decides resuming it.
+                self.publish(None).await?;
+                self.flush_events().await?;
+                let _ = self.draining.take().expect("checked above").send(());
+                // Frozen like a retired loop; the driver cancels this future
+                // when the agent host lets go.
+                std::future::pending::<()>().await;
+            }
             // One question per event. Either it says to wait and hands over the
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
             let now = UnixMs::now();
-            let decision = self.decide(now);
+            // A draining loop only waits for the request in flight to end.
+            let decision = if self.draining.is_some() {
+                Boundary::No { recheck: None }
+            } else {
+                self.decide(now)
+            };
             // Admission waits on the decision: a statement is not admitted
             // into a request about to be thrown away.
             if decision != Boundary::AbortAndResend {
@@ -861,6 +895,7 @@ impl Agent {
                 }
             }
 
+            Control::Drain(reply) => self.draining = Some(reply),
             Control::TellTail => self.host.tell_tail(),
             Control::User(input, done) => {
                 self.persist(AgentEvent::Accepted(input.clone())).await?;
