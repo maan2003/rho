@@ -80,18 +80,26 @@
 
         # The agent's base userland: one store path whose bin/ is the
         # agent's PATH. Agents add to it with `nix profile`.
-        agentRegistry = pkgs.writeTextDir "etc/nix/registry.json" (builtins.toJSON {
-          version = 2;
-          flakes = [{
-            from = { type = "indirect"; id = "nixpkgs"; };
-            to = {
-              type = "path";
-              path = nixpkgs.outPath;
-              inherit (nixpkgs) narHash lastModified;
-            } // (if nixpkgs ? rev then { inherit (nixpkgs) rev; } else { });
-            exact = true;
-          }];
-        });
+        agentRegistry = pkgs.writeTextDir "etc/nix/registry.json" (
+          builtins.toJSON {
+            version = 2;
+            flakes = [
+              {
+                from = {
+                  type = "indirect";
+                  id = "nixpkgs";
+                };
+                to = {
+                  type = "path";
+                  path = nixpkgs.outPath;
+                  inherit (nixpkgs) narHash lastModified;
+                }
+                // (if nixpkgs ? rev then { inherit (nixpkgs) rev; } else { });
+                exact = true;
+              }
+            ];
+          }
+        );
         rhoBash = pkgs.bash.overrideAttrs (old: {
           pname = "rho-bash";
           # Pinned one-shot Bash spare pool, maintained in its own fork.
@@ -109,50 +117,95 @@
             ln -s bash "$out/bin/rho-bash"
           '';
         });
-        rhoAgentDesktop = (agent-desktop.packages.${system}.niri.override {
-          libdisplay-info = pkgs.libdisplay-info_0_3;
-          withDbus = false;
-          withSystemd = false;
-          withScreencastSupport = false;
-        }).overrideAttrs (old: {
-          pname = "rho-agent-desktop";
-          cargoBuildFlags = [ "--bin" "rho-agent-desktop" ];
-          nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.makeWrapper ];
-          # A headless agent may have no system EGL vendor configuration.
-          # Bundle Mesa rather than requiring the user to configure a driver path.
-          postInstall = ''
-            wrapProgram $out/bin/rho-agent-desktop \
-              --set-default __EGL_VENDOR_LIBRARY_FILENAMES "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json" \
-              --set-default FONTCONFIG_FILE "${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts pkgs.noto-fonts-color-emoji ]; }}" \
-              --prefix XCURSOR_PATH : "${pkgs.adwaita-icon-theme}/share/icons" \
-              --set-default XCURSOR_THEME Adwaita
-          '';
-          passthru = old.passthru // { providedSessions = [ ]; };
-          meta = old.meta // {
-            description = "Rho agent desktop companion";
-            mainProgram = "rho-agent-desktop";
-          };
-        });
+        rhoAgentDesktop =
+          (agent-desktop.packages.${system}.niri.override {
+            libdisplay-info = pkgs.libdisplay-info_0_3;
+            withDbus = false;
+            withSystemd = false;
+            withScreencastSupport = false;
+          }).overrideAttrs
+            (old: {
+              pname = "rho-agent-desktop";
+              cargoBuildFlags = [
+                "--bin"
+                "rho-agent-desktop"
+              ];
+              nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+              # A headless agent may have no system EGL vendor configuration.
+              # Bundle Mesa rather than requiring the user to configure a driver path.
+              postInstall = ''
+                wrapProgram $out/bin/rho-agent-desktop \
+                  --set-default __EGL_VENDOR_LIBRARY_FILENAMES "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json" \
+                  --set-default FONTCONFIG_FILE "${
+                    pkgs.makeFontsConf {
+                      fontDirectories = [
+                        pkgs.dejavu_fonts
+                        pkgs.noto-fonts-color-emoji
+                      ];
+                    }
+                  }" \
+                  --prefix XCURSOR_PATH : "${pkgs.adwaita-icon-theme}/share/icons" \
+                  --set-default XCURSOR_THEME Adwaita
+              '';
+              passthru = old.passthru // {
+                providedSessions = [ ];
+              };
+              meta = old.meta // {
+                description = "Rho agent desktop companion";
+                mainProgram = "rho-agent-desktop";
+              };
+            });
         agentBase = pkgs.buildEnv {
           name = "rho-agent-base";
           # NixOS's core and default system packages (nixos/modules/config/
           # system-path.nix), minus what has no meaning in a view (acl,
           # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
           # Rho's fork (find with deny roots); then Rho's own list.
-          paths = [ rhoGit findutils (pkgs.lib.lowPrio rhoBash) nixFork ]
-            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
-            ++ (with pkgs; [
-            bashInteractive bzip2
+          paths = [
+            rhoGit
+            findutils
+            (pkgs.lib.lowPrio rhoBash)
+            nixFork
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ rhoAgentDesktop ]
+          ++ (with pkgs; [
+            bashInteractive
+            bzip2
             # Keep small commands from loading the multicall binary's unrelated
             # libraries (notably OpenSSL) on every exec.
             (coreutils-full.override { singleBinary = false; })
-            cpio curl diffutils gawk
-            getent getconf gnugrep gnupatch gnused gnutar gzip xz less
-            ncurses netcat procps time util-linux which zstd
-            perl rsync strace
+            cpio
+            curl
+            diffutils
+            gawk
+            getent
+            getconf
+            gnugrep
+            gnupatch
+            gnused
+            gnutar
+            gzip
+            xz
+            less
+            ncurses
+            netcat
+            procps
+            time
+            util-linux
+            which
+            zstd
+            perl
+            rsync
+            strace
             openssh
-            ripgrep fd just python3 uv nodejs
-            cacert agentRegistry
+            ripgrep
+            fd
+            just
+            python3
+            uv
+            nodejs
+            cacert
+            agentRegistry
           ]);
         };
         # Cargo with a shared, fine-grained build cache: agents' dev shells use
@@ -167,9 +220,21 @@
             hash = "sha256-PUyv2mfLDH7NJh+LkfoI/ZS03E7yHYqPv+EkuLGaOZ0=";
           };
           cargoHash = "sha256-KY2pDD8wNJQvtJtv/Xx0PGvA1cymaBYPkx2BXb1KF8A=";
-          cargoBuildFlags = [ "--package" "cargo" "--bin" "cargo" ];
-          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ];
-          buildInputs = [ pkgs.curl pkgs.openssl pkgs.zlib ];
+          cargoBuildFlags = [
+            "--package"
+            "cargo"
+            "--bin"
+            "cargo"
+          ];
+          nativeBuildInputs = [
+            pkgs.cmake
+            pkgs.pkg-config
+          ];
+          buildInputs = [
+            pkgs.curl
+            pkgs.openssl
+            pkgs.zlib
+          ];
           doCheck = false;
           meta.mainProgram = "cargo";
         };
@@ -282,7 +347,10 @@
           paths = buildPaths;
         };
 
-        pythonPackages = pkgs.python3.withPackages (ps: [ ps.pyyaml ps.httpx ]);
+        pythonPackages = pkgs.python3.withPackages (ps: [
+          ps.pyyaml
+          ps.httpx
+        ]);
         pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
         # Evaluation in rho-devshell-builder records what the evaluator
@@ -324,7 +392,10 @@
               src = buildSrc;
               nativeBuildInputs = guiNativeBuildInputs ++ [ pkgs.rustPlatform.bindgenHook ];
               # The notebook embeds this CPython; PyO3 links its libpython.
-              buildInputs = guiBuildInputs ++ [ pkgs.python3 nixFork.dev ];
+              buildInputs = guiBuildInputs ++ [
+                pkgs.python3
+                nixFork.dev
+              ];
               env.RUSTDOCFLAGS = "-D warnings";
               env.PYO3_PYTHON = "${pythonPackages}/bin/python3";
               env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
@@ -344,9 +415,7 @@
               # Elsewhere 4 KiB is jemalloc's own default; it is spelled out
               # because env refuses a null.
               env.JEMALLOC_SYS_WITH_LG_PAGE =
-                if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
-                then "14"
-                else "12";
+                if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64 then "14" else "12";
               postPatch = ''
                 # Brush denies warnings, but the root lockfile can select a
                 # newer Clap which deprecates attributes used by Brush.
@@ -357,22 +426,39 @@
               CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
               CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
             };
+            cargoVendorDir = craneLibBase.vendorCargoDeps { };
+            # Panic locations and line tables name vendored sources by their
+            # path. Remapping it at compile time keeps the vendor directory out
+            # of the binaries, so crane need not scrub it out afterwards (a
+            # regex pass over every binary that took about a minute).
+            rustflags = "--cfg tokio_unstable -Cforce-frame-pointers=yes --remap-path-prefix=${cargoVendorDir}=/cargo-vendor";
             craneLib = craneLibBase.overrideArgs {
-              cargoVendorDir = craneLibBase.vendorCargoDeps { };
+              inherit cargoVendorDir;
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = rustflags;
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = rustflags;
             };
             packageCargoExtraArgs = "-p rho-cli -p rho-agent-host -p rho-agent -p rho-shell -p rho-devshell-builder -p rho-devshell-daemon -p git-remote-octo";
+            # Each copied tree is its own store path: `${buildSrc}/vendor/…`
+            # would make the dependency cache depend on every source file,
+            # rebuilding all dependencies on any commit.
+            vendored =
+              dir:
+              builtins.path {
+                name = "rho-" + builtins.replaceStrings [ "/" ] [ "-" ] dir;
+                path = ./. + "/${dir}";
+              };
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. Registry dependencies need the real APIs of
               # local patches (including iroh and kio for web-transport-iroh),
               # along with their local transitive dependencies.
               rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/tree-sitter-language
-              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/brush $out/vendor/brush
-              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
+              cp -r --no-preserve=mode,ownership ${vendored "vendor/brush"} $out/vendor/brush
+              cp -r --no-preserve=mode,ownership ${vendored "vendor/noq"} $out/vendor/noq
               rm -rf $out/vendor/iroh $out/vendor/moq/rs/kio
-              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/iroh $out/vendor/iroh
-              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/moq/rs/kio $out/vendor/moq/rs/kio
-              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/tree-sitter-language \
+              cp -r --no-preserve=mode,ownership ${vendored "vendor/iroh"} $out/vendor/iroh
+              cp -r --no-preserve=mode,ownership ${vendored "vendor/moq/rs/kio"} $out/vendor/moq/rs/kio
+              cp -r --no-preserve=mode,ownership ${vendored "vendor/tree-sitter-language"} \
                 $out/vendor/tree-sitter-language
             '';
           in
@@ -397,6 +483,7 @@
               cargoArtifacts = packageDeps;
               cargoExtraArgs = packageCargoExtraArgs;
               doCheck = false;
+              doNotRemoveReferencesToVendorDir = true;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               env.RHO_FIND_BIN = "${findutils}/bin";
               env.RHO_SHARED_CARGO_BIN = "${cargoSharedCache}/bin";
@@ -406,7 +493,8 @@
                 cp -r ${./.agents/skills/rho-wayland} $out/share/rho/skills/rho-wayland
                 cp -r ${./.agents/skills/rho-workstreams} $out/share/rho/skills/rho-workstreams
                 chmod -R u+w $out/share/rho/skills
-              '' + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              ''
+              + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
                 ln -s ${rhoAgentDesktop}/bin/rho-agent-desktop $out/bin/rho-agent-desktop
               '';
             };
@@ -479,7 +567,8 @@
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
           inherit findutils cargoSharedCache;
-        } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           rho-agent-desktop = rhoAgentDesktop;
         };
 
@@ -493,7 +582,14 @@
             ;
         };
 
-        legacyPackages = multiBuild // { inherit rhoGit agentBase rhoBash nixFork; };
+        legacyPackages = multiBuild // {
+          inherit
+            rhoGit
+            agentBase
+            rhoBash
+            nixFork
+            ;
+        };
 
         devShells = flakeboxLib.mkShells {
           channel = "latest";
@@ -510,9 +606,7 @@
           RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
           RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
           JEMALLOC_SYS_WITH_LG_PAGE =
-            if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
-            then "14"
-            else null;
+            if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64 then "14" else null;
           packages = [
             selfciMq
             pkgs.cargo-nextest
