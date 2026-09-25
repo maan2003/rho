@@ -247,7 +247,7 @@ impl Workspace {
         let mut carrying: Vec<(NodeId, String)> = marks
             .labeled(*label)
             .into_iter()
-            .filter(|node| !matches!(node, NodeId::Agent(agent) if !self.registry.created_by_user(*agent)))
+            .filter(|node| !matches!(node, NodeId::Agent(agent) if !self.registry.owned_by_user(*agent)))
             .map(|node| {
                 let bullet = match node {
                     NodeId::Note(_) => "*",

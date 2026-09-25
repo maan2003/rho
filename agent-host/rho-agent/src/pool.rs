@@ -18,7 +18,7 @@ use rho_inference::Inference;
 use tokio::sync::{Mutex, broadcast};
 
 use crate::db::{
-    AGENT_USAGE_BUCKET_MS, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _,
+    AGENT_USAGE_BUCKET_MS, AgentOrigin, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _,
     AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
     SessionBinding,
 };
@@ -114,7 +114,11 @@ impl AgentPool {
         // Cached flake dev shells, shared by every workset process and
         // every `nix develop` in a view, over the shared cache directory.
         let devshell = Arc::new(
-            rho_devshell_daemon::Store::open(db.clone(), worksets.devshell_cache_dir().into_std_path_buf()).await,
+            rho_devshell_daemon::Store::open(
+                db.clone(),
+                worksets.devshell_cache_dir().into_std_path_buf(),
+            )
+            .await,
         );
         match devshell.serve() {
             Ok(serve) => {
@@ -524,16 +528,16 @@ impl AgentPool {
         display_name: Option<String>,
         start: StartPlace,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(config, display_name, start, None)
+        self.create_with_origin(config, display_name, start, AgentOrigin::User)
             .await
     }
 
-    async fn create_with_parent(
+    async fn create_with_origin(
         self: &Arc<Self>,
         config: AgentRole,
         display_name: Option<String>,
         start: StartPlace,
-        parent: Option<AgentId>,
+        origin: AgentOrigin,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let pool = self.clone();
         // Admission and its per-ID ownership lock outlive cancellation of
@@ -580,7 +584,7 @@ impl AgentPool {
                 config,
                 mode,
                 runtime,
-                parent,
+                origin,
             );
             write.commit();
             // Once its record commits, the workset belongs to that record,
@@ -595,7 +599,10 @@ impl AgentPool {
             drop(loading);
             drop(admission);
             pool.trim(MAX_LOADED).await;
-            let _ = pool.created.send(AgentCreated { agent_id, parent });
+            let _ = pool.created.send(AgentCreated {
+                agent_id,
+                parent: origin.parent(),
+            });
             Ok((agent_id, agent))
         })
         .await?
@@ -613,39 +620,94 @@ impl AgentPool {
         workdir: Option<camino::Utf8PathBuf>,
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
-        let (parent_place, parent_role) = {
-            let record = self.db.read().get_agent(parent);
+        self.spawn(
+            AgentOrigin::Child { parent },
+            task_name,
+            prompt,
+            config,
+            workdir,
+        )
+        .await
+    }
+
+    /// Create an Engineer the user manages, briefed by `by` in its workset.
+    /// It has no parent: nothing it says is mailed to `by`, and it counts
+    /// against none of `by`'s limits.
+    pub async fn spawn_user_owned(
+        self: &Arc<Self>,
+        by: AgentId,
+        task_name: String,
+        prompt: String,
+        workdir: Option<camino::Utf8PathBuf>,
+    ) -> anyhow::Result<AgentId> {
+        self.spawn(
+            AgentOrigin::UserOwned { by },
+            task_name,
+            prompt,
+            AgentRole::default(),
+            workdir,
+        )
+        .await
+    }
+
+    /// Create an agent in its spawner's workset and mail it its task from
+    /// the spawner. Returns once the agent has accepted its task.
+    async fn spawn(
+        self: &Arc<Self>,
+        origin: AgentOrigin,
+        task_name: String,
+        prompt: String,
+        config: AgentRole,
+        workdir: Option<camino::Utf8PathBuf>,
+    ) -> anyhow::Result<AgentId> {
+        let spawner = match origin {
+            AgentOrigin::Child { parent: spawner } | AgentOrigin::UserOwned { by: spawner } => {
+                spawner
+            }
+            AgentOrigin::User => anyhow::bail!("only an agent can spawn an agent"),
+        };
+        let (spawner_place, spawner_role) = {
+            let record = self.db.read().get_agent(spawner);
             (record.place().clone(), record.config.role)
         };
         let Place {
             workset,
             cwd,
             mode,
-            origin,
-        } = parent_place;
+            origin: place_origin,
+        } = spawner_place;
         let cwd = workdir.unwrap_or(cwd);
         anyhow::ensure!(cwd.is_absolute(), "workdir must be an absolute path");
         let workset = self.worksets.open_workset(&workset).await?;
         let mode = Mode::from_workset_mode(mode);
         let view = workset.enter(mode, &cwd)?;
-        let start = StartPlace::new(view, origin);
-        let config = child_role(parent_role, config);
-        let (child_id, child) = self
-            .create_with_parent(config, Some(task_name), start, Some(parent))
+        let start = StartPlace::new(view, place_origin);
+        let config = child_role(spawner_role, config);
+        let (agent_id, agent) = self
+            .create_with_origin(config, Some(task_name), start, origin)
             .await?;
-        self.set_response_subscription(parent, child_id, true)
-            .await?;
-        let parent_label = self.agent_handle(parent);
-        child
-            .send_agent_message_accepted(parent, parent_label, prompt, MessageDelivery::NextRequest)
+        // Subscribe before the task goes out, or a quick first turn ends
+        // with no one to tell.
+        if let AgentOrigin::Child { parent } = origin {
+            self.set_response_subscription(parent, agent_id, true)
+                .await?;
+        }
+        let spawner_label = self.agent_handle(spawner);
+        agent
+            .send_agent_message_accepted(
+                spawner,
+                spawner_label,
+                prompt,
+                MessageDelivery::NextRequest,
+            )
             .await
             .with_context(|| {
                 format!(
-                    "created child {} but it did not accept its initial task",
-                    self.agent_handle(child_id)
+                    "created {} but it did not accept its initial task",
+                    self.agent_handle(agent_id)
                 )
             })?;
-        Ok(child_id)
+        Ok(agent_id)
     }
 
     async fn enforce_spawn_limits(&self, parent: AgentId) -> anyhow::Result<()> {
@@ -1164,6 +1226,109 @@ mod tests {
         }
         pool.execution(parent_id).await.unwrap().shutdown().await;
         drop(parent);
+    }
+
+    #[tokio::test]
+    async fn user_owned_engineers_answer_to_the_user() {
+        use crate::multi_agent_tools::{
+            AgentCall, InterruptArgs, MultiAgentTools, SendArgs, SpawnArgs, call_agent_tool,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, view) = test_pool(directory.path()).await;
+        let (creator_id, creator) = pool
+            .create(
+                AgentRole::default(),
+                Some("creator".into()),
+                StartPlace::new(view, None),
+            )
+            .await
+            .unwrap();
+        let tools_of =
+            |agent_id, parent| MultiAgentTools::new(Arc::downgrade(&pool), agent_id, parent);
+        let spawn_args = |task_name: &str| SpawnArgs {
+            task_name: task_name.into(),
+            prompt: "No work is required.".into(),
+            workdir: None,
+        };
+        let new_agent = |before: Vec<AgentId>| {
+            pool.db
+                .read()
+                .list_agent_ids()
+                .into_iter()
+                .find(|id| !before.contains(id))
+                .unwrap()
+        };
+
+        let before = pool.db.read().list_agent_ids();
+        let output = call_agent_tool(
+            tools_of(creator_id, None),
+            AgentCall::SpawnUserOwnedEngineer(spawn_args("side")),
+        )
+        .await
+        .unwrap();
+        let owned = new_agent(before);
+        let owned_handle = pool.agent_handle(owned);
+        assert!(output.contains(&owned_handle), "{output}");
+        {
+            let read = pool.db.read();
+            assert_eq!(read.agent_parent(owned), None);
+            assert_eq!(
+                read.get_agent(owned).config.spawned_by,
+                crate::db::AgentSpawnedBy::UserOwned { by: creator_id }
+            );
+            assert!(read.agent_response_subscribers(owned).is_empty());
+        }
+
+        // The creator no longer manages it.
+        for call in [
+            AgentCall::Message(SendArgs {
+                agent_id: owned_handle.clone(),
+                message: "one more thing".into(),
+            }),
+            AgentCall::Cancel(InterruptArgs {
+                agent_id: owned_handle.clone(),
+            }),
+        ] {
+            let error = call_agent_tool(tools_of(creator_id, None), call)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("managed by the user"), "{error}");
+        }
+
+        // Its own children still reach it, but one working for an agent
+        // cannot open a thread for the user.
+        let before = pool.db.read().list_agent_ids();
+        call_agent_tool(
+            tools_of(owned, None),
+            AgentCall::SpawnEngineer(spawn_args("helper")),
+        )
+        .await
+        .unwrap();
+        let helper = new_agent(before);
+        call_agent_tool(
+            tools_of(helper, Some(owned)),
+            AgentCall::Message(SendArgs {
+                agent_id: owned_handle,
+                message: "question".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let count = pool.db.read().list_agent_ids().len();
+        let error = call_agent_tool(
+            tools_of(helper, Some(owned)),
+            AgentCall::SpawnUserOwnedEngineer(spawn_args("nested")),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("only an agent the user manages"),
+            "{error}"
+        );
+        assert_eq!(pool.db.read().list_agent_ids().len(), count);
+
+        pool.execution(creator_id).await.unwrap().shutdown().await;
+        drop(creator);
     }
 
     #[tokio::test]

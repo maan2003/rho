@@ -101,7 +101,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
         },
-        None,
+        crate::db::AgentOrigin::User,
     );
     let first = AgentUsageBucket {
         bucket_start_ms: AGENT_USAGE_BUCKET_MS,
@@ -129,7 +129,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         AgentRuntime::Claude {
             session_id: uuid::Uuid::new_v4(),
         },
-        None,
+        crate::db::AgentOrigin::User,
     );
     write.add_agent_usage(
         claude_id,
@@ -151,7 +151,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         AgentRuntime::Claude {
             session_id: uuid::Uuid::new_v4(),
         },
-        None,
+        crate::db::AgentOrigin::User,
     );
     write.add_agent_usage(
         opus_id,
@@ -171,7 +171,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
         },
-        None,
+        crate::db::AgentOrigin::User,
     );
     write.add_agent_usage(
         astra_id,
@@ -191,7 +191,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
         },
-        None,
+        crate::db::AgentOrigin::User,
     );
     write.add_agent_usage(
         luna_id,
@@ -441,7 +441,7 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
         AgentRuntime::Claude {
             session_id: source_session_id,
         },
-        None,
+        crate::db::AgentOrigin::User,
     );
     let rewind = ClaudeRewind {
         source_session_id,
@@ -479,7 +479,7 @@ async fn a_mode_change_folds_into_the_agents_place() {
         AgentRole::default(),
         AgentRole::default().session_profile(),
         test_agent_runtime(),
-        None,
+        crate::db::AgentOrigin::User,
     );
     write.commit();
     let before = db.read().get_agent(agent_id).config.place.clone();
@@ -515,7 +515,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         AgentRole::default(),
         AgentRole::default().session_profile(),
         test_agent_runtime(),
-        None,
+        crate::db::AgentOrigin::User,
     );
     let engineer = write.alloc_agent_id();
     write.create_agent(
@@ -526,7 +526,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         AgentRole::default(),
         AgentRole::default().session_profile(),
         test_agent_runtime(),
-        Some(pm),
+        crate::db::AgentOrigin::Child { parent: pm },
     );
     write.commit();
 
@@ -592,7 +592,7 @@ async fn agent_ids_allocate_before_records_exist() {
         AgentRole::default(),
         SessionBinding::ResponsesSol(InferenceProfile::default()),
         test_agent_runtime(),
-        None,
+        crate::db::AgentOrigin::User,
     );
     write.commit();
 
@@ -637,7 +637,9 @@ pub(super) fn create(
         AgentRole::default(),
         SessionBinding::ResponsesSol(InferenceProfile::default()),
         test_agent_runtime(),
-        parent,
+        parent.map_or(crate::db::AgentOrigin::User, |parent| {
+            crate::db::AgentOrigin::Child { parent }
+        }),
     );
     agent_id
 }

@@ -661,12 +661,13 @@ impl AgentMap {
         self.agent_identity(agent_id)
             .and_then(|identity| identity.parent)
     }
-    /// The user made this agent themself. An agent created by an agent
-    /// belongs to its creator: it is not dealt, not on Home, not in the
-    /// running list, and not in Find, and its waiting reaches the user
-    /// through its creator's card. The fact is who created it, which never
-    /// changes; filing is placement and says nothing about it.
-    pub fn created_by_user(&self, agent_id: AgentId) -> bool {
+    /// The user manages this agent: they made it, or an Engineer started
+    /// it for them. An agent working for another agent belongs to that
+    /// agent: it is not dealt, not on Home, not in the running list, and
+    /// not in Find, and its waiting reaches the user through its parent's
+    /// card. The fact is fixed at creation; filing is placement and says
+    /// nothing about it.
+    pub fn owned_by_user(&self, agent_id: AgentId) -> bool {
         self.agent_parent(agent_id).is_none()
     }
     /// The user muted this agent: they said "not this one", and nothing
@@ -887,16 +888,23 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_created_by_an_agent_belongs_to_its_creator() {
+    fn an_agent_working_for_an_agent_belongs_to_it() {
         let mut registry = AgentMap::default();
         let host = HostId::default();
-        registry.set_host_data(host, 0, 2);
+        registry.set_host_data(host, 0, 3);
         let mut entries = log(agent(1), 0, vec![created(1)]);
         entries.extend(log(agent(2), 1, vec![child_of(Some(agent(1)), 2)]));
+        // Started by agent 1 for the user: no parent, so the user's.
+        let mut user_owned = created(3);
+        if let TranscriptEvent::Created { spawned_by, .. } = &mut user_owned {
+            *spawned_by = SpawnedBy::UserOwned { by: agent(1) };
+        }
+        entries.extend(log(agent(3), 2, vec![user_owned]));
         registry.tell(host, &entries);
 
-        assert!(registry.created_by_user(agent(1)));
-        assert!(!registry.created_by_user(agent(2)));
+        assert!(registry.owned_by_user(agent(1)));
+        assert!(!registry.owned_by_user(agent(2)));
+        assert!(registry.owned_by_user(agent(3)));
     }
 
     /// The desk files every agent in one go, so the registry rebuilds once.

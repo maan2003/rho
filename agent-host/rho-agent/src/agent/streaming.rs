@@ -247,7 +247,7 @@ pub(in crate::agent) mod tests {
             AgentRuntime::Rho {
                 prompt_cache_key: key,
             },
-            None,
+            crate::db::AgentOrigin::User,
         );
         write.commit();
         let head = db.read().get_agent(id);

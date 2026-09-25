@@ -1327,8 +1327,8 @@ impl Workspace {
             })
         });
         let now_ms = now.as_millisecond();
-        // An agent created by an agent belongs to its creator and is not
-        // the reader's to watch; only the ones the reader made are listed.
+        // An agent working for another agent belongs to it and is not the
+        // reader's to watch; only the ones the reader manages are listed.
         // Nor one the user put away. A running turn decides how loudly an
         // agent may ask; a mute and a snooze decide whether it may ask at
         // all, and neither is a cursor, so a turn starting does not take
@@ -1340,7 +1340,7 @@ impl Workspace {
             .known_agents()
             .copied()
             .filter(|agent_id| {
-                self.registry.created_by_user(*agent_id)
+                self.registry.owned_by_user(*agent_id)
                     && !self
                         .attention
                         .marks

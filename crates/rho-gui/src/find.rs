@@ -414,11 +414,11 @@ impl Workspace {
                 recency: 0,
             });
         }
-        // An agent created by an agent belongs to its creator and is not
+        // An agent working for another agent belongs to it and is not
         // found; a muted one is gone for good.
         for agent_id in self.registry.known_agents().copied() {
             let node = NodeId::Agent(agent_id);
-            if marks.get(&node).facts().muted() || !self.registry.created_by_user(agent_id) {
+            if marks.get(&node).facts().muted() || !self.registry.owned_by_user(agent_id) {
                 continue;
             }
             let hit = rho_agents_client::find::hit(

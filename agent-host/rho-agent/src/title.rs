@@ -227,7 +227,7 @@ mod tests {
                 AgentRole::default(),
                 SessionBinding::ResponsesSol(Default::default()),
                 crate::db::tests::test_agent_runtime(),
-                None,
+                crate::db::AgentOrigin::User,
             );
             let first = write.append_agent_event(
                 agent,

@@ -152,6 +152,29 @@ impl EngineerAgents {
         )
     }
 
+    /// Start an Engineer the user manages as its own thread; it reports to
+    /// the user, not to the caller.
+    #[pyo3(signature = (*, task_name, prompt, workdir = None))]
+    fn spawn_user_owned_engineer(
+        this: PyRef<'_, Self>,
+        py: Python<'_>,
+        task_name: String,
+        prompt: String,
+        workdir: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let call = AgentCall::SpawnUserOwnedEngineer(SpawnArgs {
+            task_name,
+            prompt,
+            workdir,
+        });
+        ask(
+            py,
+            &this.as_super().agent_host,
+            "agents.spawn_user_owned_engineer",
+            SharedCall::Agent(call),
+        )
+    }
+
     /// Interrupt an Engineer's current turn.
     #[pyo3(signature = (*, agent_id))]
     fn cancel(this: PyRef<'_, Self>, py: Python<'_>, agent_id: String) -> PyResult<Py<PyAny>> {
@@ -345,6 +368,8 @@ for name in ["tools", "spawn_engineer", "ask_advisor", "message_agent", "interru
 assert agents.spawn_new_engineer.__doc__
 result = await agents.spawn_new_engineer(task_name="test", prompt="work", workdir="/src/checkout")
 assert 'workdir: Some("/src/checkout")' in result, result
+result = await agents.spawn_user_owned_engineer(task_name="side", prompt="work")
+assert "SpawnUserOwnedEngineer" in result, result
 assert "SendArgs" in await agents.message(agent_id="eng-test", message="hello")
 from agents import cancel
 await cancel(agent_id="eng-test")
@@ -366,9 +391,9 @@ papercut(description="friction")
             "{output:?}"
         );
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 5, "{calls:?}");
+        assert_eq!(calls.len(), 6, "{calls:?}");
         assert!(
-            calls[2].contains("Cancel(InterruptArgs { agent_id: \"eng-test\" })"),
+            calls[3].contains("Cancel(InterruptArgs { agent_id: \"eng-test\" })"),
             "{calls:?}"
         );
     }
@@ -383,6 +408,7 @@ papercut(description="friction")
             vec![agents(role, echo_host(calls))],
             r#"
 assert not hasattr(agents, "spawn_new_engineer")
+assert not hasattr(agents, "spawn_user_owned_engineer")
 assert not hasattr(agents, "spawn_new_advisor")
 await agents.message(agent_id="eng-test", message="hello")
 "#,

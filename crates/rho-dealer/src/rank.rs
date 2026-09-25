@@ -177,7 +177,7 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
     let agents = sources.agents;
     for agent_id in agents.known_agents().copied() {
         let node = NodeId::Agent(agent_id);
-        if !agents.created_by_user(agent_id) || agents.host_of_agent(agent_id).is_none() {
+        if !agents.owned_by_user(agent_id) || agents.host_of_agent(agent_id).is_none() {
             continue;
         }
         let Some(digest) = agents.agent_digest(agent_id) else {

@@ -397,6 +397,39 @@ pub enum AgentSpawnedBy {
     #[default]
     Direct,
     Engineer,
+    /// An Engineer started it for the user, who manages it from then on.
+    UserOwned {
+        by: AgentId,
+    },
+}
+
+impl AgentSpawnedBy {
+    /// The user manages the agent: it has no parent to answer to.
+    pub fn user_owned(self) -> bool {
+        !matches!(self, Self::Engineer)
+    }
+}
+
+/// How an agent comes to exist. The `parent` of its `Created` event is
+/// the agent it answers to, so only a child has one: a user-owned
+/// Engineer answers to the user and only remembers who started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentOrigin {
+    /// The user started it.
+    User,
+    /// An agent spawned it to work for that agent.
+    Child { parent: AgentId },
+    /// An Engineer started it for the user.
+    UserOwned { by: AgentId },
+}
+
+impl AgentOrigin {
+    pub fn parent(self) -> Option<AgentId> {
+        match self {
+            Self::Child { parent } => Some(parent),
+            Self::User | Self::UserOwned { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -693,7 +726,7 @@ pub(crate) trait AgentProfileWriteTxnExt {
         role: AgentRole,
         mode: SessionBinding,
         runtime: AgentRuntime,
-        parent_agent: Option<AgentId>,
+        origin: AgentOrigin,
     );
 
     fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding);
@@ -711,18 +744,30 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         role: AgentRole,
         mode: SessionBinding,
         runtime: AgentRuntime,
-        parent_agent: Option<AgentId>,
+        origin: AgentOrigin,
     ) {
-        let spawned_by = parent_agent.map_or(AgentSpawnedBy::Direct, |parent| {
-            match agent_head_write(self, parent)
-                .expect("parent agent must exist")
+        let spawner = match origin {
+            AgentOrigin::User => None,
+            AgentOrigin::Child { parent: spawner } | AgentOrigin::UserOwned { by: spawner } => {
+                Some(spawner)
+            }
+        };
+        if let Some(spawner) = spawner {
+            match agent_head_write(self, spawner)
+                .expect("spawning agent must exist")
                 .config
                 .role
             {
-                AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
+                AgentRole::Engineer { .. } => {}
                 AgentRole::Advisor { .. } => panic!("Advisors cannot spawn agents"),
             }
-        });
+        }
+        let spawned_by = match origin {
+            AgentOrigin::User => AgentSpawnedBy::Direct,
+            AgentOrigin::Child { .. } => AgentSpawnedBy::Engineer,
+            AgentOrigin::UserOwned { by } => AgentSpawnedBy::UserOwned { by },
+        };
+        let parent_agent = origin.parent();
         let created = AgentEvent::Created {
             role,
             binding: mode,

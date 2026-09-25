@@ -25,6 +25,8 @@ pub struct Team {
     pub agent: String,
     pub parent: Option<String>,
     pub spawned_by: crate::db::AgentSpawnedBy,
+    /// The Engineer that started a user-owned agent for the user.
+    pub started_by: Option<String>,
 }
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
@@ -54,10 +56,16 @@ impl MultiAgentTools {
 
     pub(crate) fn team(&self) -> anyhow::Result<Team> {
         let pool = self.pool()?;
+        let spawned_by = pool.db().read().get_agent(self.self_id).config.spawned_by;
+        let started_by = match spawned_by {
+            crate::db::AgentSpawnedBy::UserOwned { by } => Some(pool.agent_handle(by)),
+            _ => None,
+        };
         Ok(Team {
             agent: pool.agent_handle(self.self_id),
             parent: self.parent.map(|parent| pool.agent_handle(parent)),
-            spawned_by: pool.db().read().get_agent(self.self_id).config.spawned_by,
+            spawned_by,
+            started_by,
         })
     }
 
@@ -73,6 +81,7 @@ impl MultiAgentTools {
 #[derive(Debug, Encode, Decode)]
 pub(crate) enum AgentCall {
     SpawnEngineer(SpawnArgs),
+    SpawnUserOwnedEngineer(SpawnArgs),
     Message(SendArgs),
     Cancel(InterruptArgs),
     SpawnAdvisor(AdvisorArgs),
@@ -95,6 +104,7 @@ pub(crate) async fn call_agent_tool(
 ) -> anyhow::Result<String> {
     match call {
         AgentCall::SpawnEngineer(args) => spawn_engineer(&tools, args).await,
+        AgentCall::SpawnUserOwnedEngineer(args) => spawn_user_owned_engineer(&tools, args).await,
         AgentCall::Message(args) => message_agent(&tools, args).await,
         AgentCall::Cancel(args) => interrupt_engineer(&tools, args).await,
         AgentCall::SpawnAdvisor(args) => ask_advisor(&tools, args).await,
@@ -179,6 +189,59 @@ async fn spawn_engineer(tools: &MultiAgentTools, args: SpawnArgs) -> anyhow::Res
     ))
 }
 
+async fn spawn_user_owned_engineer(
+    tools: &MultiAgentTools,
+    args: SpawnArgs,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(!args.prompt.trim().is_empty(), "prompt must not be empty");
+    let pool = tools.pool()?;
+    // An agent working for another agent must not open threads the user
+    // never asked for.
+    anyhow::ensure!(
+        pool.db()
+            .read()
+            .get_agent(tools.self_id)
+            .config
+            .spawned_by
+            .user_owned(),
+        "only an agent the user manages can spawn a user-owned Engineer"
+    );
+    let task_name = args.task_name.clone();
+    let agent_id = pool
+        .spawn_user_owned(
+            tools.self_id,
+            args.task_name,
+            args.prompt,
+            args.workdir.map(Into::into),
+        )
+        .await?;
+    let cwd = pool.db().read().get_agent(agent_id).place().cwd.clone();
+    Ok(format!(
+        "Spawned user-owned Engineer {} for task \"{}\". It works in {}. It appears in the \
+         user's agent list and reports to the user, not to you; you cannot message or interrupt it.",
+        pool.agent_handle(agent_id),
+        task_name,
+        cwd,
+    ))
+}
+
+/// An agent spawned as user-owned hears only from the user and from the
+/// agents it spawned itself: the Engineer that started it no longer
+/// manages it.
+fn ensure_may_reach(pool: &AgentPool, sender: AgentId, target: AgentId) -> anyhow::Result<()> {
+    let read = pool.db().read();
+    let user_owned = matches!(
+        read.get_agent(target).config.spawned_by,
+        crate::db::AgentSpawnedBy::UserOwned { .. }
+    );
+    anyhow::ensure!(
+        !user_owned || read.agent_parent(sender) == Some(target),
+        "{} is managed by the user; tell the user instead",
+        pool.agent_handle(target)
+    );
+    Ok(())
+}
+
 #[derive(Debug, Encode, Decode)]
 pub(crate) struct SendArgs {
     pub(crate) agent_id: String,
@@ -220,6 +283,7 @@ async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Resul
     if recipient == tools.self_id {
         anyhow::bail!("cannot send a message to yourself");
     }
+    ensure_may_reach(&pool, tools.self_id, recipient)?;
     pool.deliver_mail(
         tools.self_id,
         recipient,
@@ -264,6 +328,7 @@ async fn interrupt_engineer(
     if target == tools.self_id {
         anyhow::bail!("cannot interrupt yourself");
     }
+    ensure_may_reach(&pool, tools.self_id, target)?;
     let (_, agent, _) = pool.load(target).await?;
     agent.cancel();
     Ok(format!(

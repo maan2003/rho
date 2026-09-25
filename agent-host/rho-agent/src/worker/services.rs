@@ -467,7 +467,7 @@ mod tests {
             AgentRuntime::Rho {
                 prompt_cache_key: rho_inference::PromptCacheKey::generate(),
             },
-            None,
+            crate::db::AgentOrigin::User,
         );
         for _ in 0..3 {
             write.append_agent_event(

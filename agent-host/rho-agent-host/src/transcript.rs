@@ -25,6 +25,7 @@ pub fn spawned_by(spawned_by: AgentSpawnedBy) -> SpawnedBy {
     match spawned_by {
         AgentSpawnedBy::Direct => SpawnedBy::Direct,
         AgentSpawnedBy::Engineer => SpawnedBy::Engineer,
+        AgentSpawnedBy::UserOwned { by } => SpawnedBy::UserOwned { by },
     }
 }
 

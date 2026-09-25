@@ -30,6 +30,11 @@ pub enum SpawnedBy {
     #[default]
     Direct,
     Engineer,
+    /// An Engineer started it for the user, who manages it: it has no
+    /// parent.
+    UserOwned {
+        by: AgentId,
+    },
 }
 
 /// Who said a mirrored Claude message.

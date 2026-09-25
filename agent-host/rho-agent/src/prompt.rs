@@ -5,8 +5,37 @@ use rho_agent_types::AgentRole;
 use crate::db::AgentSpawnedBy;
 use crate::multi_agent_tools::Team;
 
+/// Offered only to an agent the user manages: one working for another
+/// agent must not open threads the user never asked for.
+const USER_OWNED_ENGINEERS: &str = r#"### Engineers the user manages
+
+```python
+agents.spawn_user_owned_engineer(*, task_name: str, prompt: str, workdir: str) → Awaitable[str]
+```
+
+Start an Engineer that the user manages as its own thread. It appears in the user's agent list, and
+the user reads and directs it from then on. Its responses go to the user, not to you, and you
+cannot message or interrupt it. Returns its identity.
+
+Use it only when the user asks for a separate agent or thread, or agrees when you propose one;
+every thread competes for the user's attention. Never use it to get around spawn limits or to
+offload work you were asked to do. The prompt is its whole brief, and you cannot add to it later.
+Afterwards, tell the user its handle and what it is for.
+
+"#;
+
+/// What a user-owned agent is told about the Engineer that started it.
+fn user_owned_ownership(by: &str) -> String {
+    format!(
+        "Engineer {by} started you for the user. The user manages you: they read your \
+         responses and direct you from here on. {by}'s first message is your starting brief; \
+         after it, the user's messages take priority. Your final response is not mailed to \
+         {by}, and {by} cannot message or interrupt you. You own the user's technical outcome."
+    )
+}
+
 /// Render the complete Engineer instructions in the order an agent uses them.
-fn main_agent_prompt(team: &str, context: &str) -> Arc<str> {
+fn main_agent_prompt(team: &str, user_owned: &str, context: &str) -> Arc<str> {
     let mut out = String::new();
     out.push_str(
         r#"You are Rho, an autonomous coding agent. You and the user share one workspace.
@@ -438,7 +467,11 @@ Interrupt an agent's current turn with `agents.cancel`; the agent remains availa
 agents.cancel(*, agent_id: str) -> Awaitable[str]
 ```
 
-### Briefing and integrating work
+"#,
+    );
+    out.push_str(user_owned);
+    out.push_str(
+        r#"### Briefing and integrating work
 
 Brief another agent as a capable colleague who has not seen this discussion. Explain the goal and
 why it matters, what you have learned or ruled out, and where to look first. Write outcome-first
@@ -1163,13 +1196,15 @@ agent and the idle mechanism described above when blocked on a reply.
 "
             );
         }
-        let ownership = match tools.spawned_by {
-            AgentSpawnedBy::Direct => {
-                "You were started directly and own the user's technical outcome."
-            }
-            AgentSpawnedBy::Engineer => {
+        let ownership = match (tools.spawned_by, tools.started_by.as_deref()) {
+            (AgentSpawnedBy::Engineer, _) => {
                 "You were spawned by another Engineer. Own the bounded assignment in the \
                  parent message; your final response is mailed to that Engineer."
+                    .to_owned()
+            }
+            (AgentSpawnedBy::UserOwned { .. }, Some(by)) => user_owned_ownership(by),
+            (AgentSpawnedBy::Direct | AgentSpawnedBy::UserOwned { .. }, _) => {
+                "You were started directly and own the user's technical outcome.".to_owned()
             }
         };
         let message_tool = "agents.message";
@@ -1193,8 +1228,11 @@ Use `{message_tool}` for bidirectional communication with any known agent.
     });
     let workspace = render_workspace_prompt(&place);
     let context = format!("{workspace}{agents_md}{skills}");
+    let user_owned = multi_agent
+        .filter(|tools| tools.spawned_by.user_owned())
+        .map_or("", |_| USER_OWNED_ENGINEERS);
     match role {
-        AgentRole::Engineer { .. } => main_agent_prompt(&team_context, &context),
+        AgentRole::Engineer { .. } => main_agent_prompt(&team_context, user_owned, &context),
         AgentRole::Advisor { .. } => advisor_prompt(&team_context, &context),
     }
 }
@@ -1218,7 +1256,10 @@ pub fn claude_prompt(
                 &tools.agent
             ),
         };
-        format!("{identity}\n\n")
+        match tools.started_by.as_deref() {
+            Some(by) => format!("{identity} {}\n\n", user_owned_ownership(by)),
+            None => format!("{identity}\n\n"),
+        }
     });
     let workspace = view
         .map(|view| render_workspace_prompt(&WorksetPrompt::of(view)))
@@ -1437,6 +1478,9 @@ push, or modify shared infrastructure. You cannot spawn or interrupt agents.
 
 "#,
         ),
+    }
+    if role.is_engineer() && multi_agent.is_some_and(|tools| tools.spawned_by.user_owned()) {
+        out.push_str(USER_OWNED_ENGINEERS);
     }
     out.push_str(
         r#"Use agents.message to send findings, questions, or a scoped next action to an existing agent.
@@ -1714,7 +1758,7 @@ mod tests {
 
     #[test]
     fn engineer_prompt_integrates_capabilities_in_story_order() {
-        let prompt = main_agent_prompt("TEAM_SENTINEL\n\n", "WORKSPACE_SENTINEL");
+        let prompt = main_agent_prompt("TEAM_SENTINEL\n\n", "", "WORKSPACE_SENTINEL");
         let headings = prompt
             .lines()
             .filter(|line| line.starts_with("## "))
@@ -1872,7 +1916,7 @@ mod tests {
     #[test]
     fn engineer_delegation_requires_concrete_benefit_in_both_runtimes() {
         for prompt in [
-            main_agent_prompt("", ""),
+            main_agent_prompt("", "", ""),
             claude_prompt(None, None, AgentRole::default()),
         ] {
             assert!(prompt.contains("### Engineers\n\n```python\nagents.spawn_new_engineer("));
@@ -1927,7 +1971,7 @@ mod tests {
     #[test]
     fn agent_messaging_scopes_replies_and_avoids_duplicate_completion_reports() {
         for prompt in [
-            main_agent_prompt("", ""),
+            main_agent_prompt("", "", ""),
             advisor_prompt("", ""),
             claude_prompt(None, None, AgentRole::default()),
             claude_prompt(
@@ -1955,7 +1999,7 @@ mod tests {
     #[test]
     fn execution_examples_cover_commands_and_live_cells_for_each_role() {
         for prompt in [
-            main_agent_prompt("", ""),
+            main_agent_prompt("", "", ""),
             advisor_prompt("", ""),
             claude_prompt(None, None, AgentRole::default()),
             claude_prompt(
@@ -2006,6 +2050,7 @@ mod tests {
                 .into(),
                 parent: Some("eng-parent".into()),
                 spawned_by: AgentSpawnedBy::Engineer,
+                started_by: None,
             };
             let prompt = claude_prompt(None, Some(&team), role);
             let collaboration = prompt
@@ -2046,5 +2091,50 @@ mod tests {
                 role.is_engineer()
             );
         }
+    }
+
+    #[test]
+    fn only_agents_the_user_manages_may_start_engineers_for_the_user() {
+        let team = |spawned_by, parent: Option<&str>, started_by: Option<&str>| Team {
+            agent: "eng-self".into(),
+            parent: parent.map(Into::into),
+            spawned_by,
+            started_by: started_by.map(Into::into),
+        };
+        let by =
+            rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let direct = team(AgentSpawnedBy::Direct, None, None);
+        let user_owned = team(AgentSpawnedBy::UserOwned { by }, None, Some("eng-starter"));
+        let child = team(AgentSpawnedBy::Engineer, Some("eng-parent"), None);
+        let signature = "agents.spawn_user_owned_engineer(*, task_name:";
+        for team in [&direct, &user_owned] {
+            let prompt = claude_prompt(None, Some(team), AgentRole::default());
+            assert!(prompt.contains(signature));
+            assert!(prompt.find("### Engineers\n").unwrap() < prompt.find(signature).unwrap());
+        }
+        for prompt in [
+            claude_prompt(None, Some(&child), AgentRole::default()),
+            claude_prompt(
+                None,
+                Some(&direct),
+                AgentRole::Advisor {
+                    intelligence: rho_agent_types::AdvisorIntelligence::Medium,
+                },
+            ),
+        ] {
+            assert!(!prompt.contains(signature));
+        }
+        let prompt = claude_prompt(None, Some(&user_owned), AgentRole::default());
+        assert!(prompt.contains("You are the primary Rho agent"));
+        assert!(prompt.contains("Engineer eng-starter started you for the user."));
+        assert!(!claude_prompt(None, Some(&direct), AgentRole::default()).contains("started you"));
+
+        // The native prompt offers it after the Engineers it manages and
+        // before briefing, which applies to both.
+        let native = main_agent_prompt("", USER_OWNED_ENGINEERS, "");
+        let engineers = native.find("### Engineers\n").unwrap();
+        let owned = native.find("### Engineers the user manages").unwrap();
+        let briefing = native.find("### Briefing and integrating work").unwrap();
+        assert!(engineers < owned && owned < briefing);
     }
 }
