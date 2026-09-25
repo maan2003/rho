@@ -693,7 +693,6 @@ mod tests {
                     agent: "eng-once".into(),
                     parent: Some("eng-parent".into()),
                     spawned_by: crate::db::AgentSpawnedBy::Engineer,
-                    started_by: None,
                 })),
             })
             .await
