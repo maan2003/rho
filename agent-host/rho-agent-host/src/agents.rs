@@ -555,7 +555,7 @@ async fn new_agent(services: &Arc<Services>, new: NewAgent) -> anyhow::Result<Ag
     Ok(agent_id)
 }
 
-async fn handle_agent_command(
+pub(crate) async fn handle_agent_command(
     services: &Arc<Services>,
     command: AgentCommand,
 ) -> anyhow::Result<()> {

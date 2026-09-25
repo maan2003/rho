@@ -536,6 +536,8 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             iroh_auth.clone(),
         ));
     }
+    let resume_path = state_dir.join(RESUME_AFTER_RESTART);
+    tokio::spawn(resume_after_restart(services.clone(), resume_path.clone()));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -543,6 +545,8 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
+                record_resume_after_restart(&services, &resume_path).await;
+                stop_executions(&services).await;
                 services.pool.flush_agent_usage(None).await;
                 return Ok(());
             }
@@ -556,6 +560,77 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                     }
                 });
             }
+        }
+    }
+}
+
+/// Agents that were working when this agent host was told to stop, one id
+/// per line, for the next one to wake.
+const RESUME_AFTER_RESTART: &str = "resume-after-restart";
+
+/// A stop someone asked for (a deploy, say) is a chosen restart: the agents
+/// it interrupted carry on after it. A crash writes nothing, so a crash is
+/// still never a reason to send
+/// (`DECISION-a-restart-does-not-resume-by-itself`).
+async fn record_resume_after_restart(services: &Services, path: &Utf8Path) {
+    let agents = services.pool.unsettled().await;
+    let text: String = agents.iter().map(|id| id.encoded() + "\n").collect();
+    if let Err(error) = std::fs::write(path, text) {
+        eprintln!("rho-agent-host: could not record agents to resume in {path}: {error}");
+    }
+}
+
+/// Stops every workset process before this agent host exits, as idle
+/// eviction does, rather than leaving them to die with it. Under
+/// `KillMode=mixed` only this process is signalled, so the statuses read by
+/// [`record_resume_after_restart`] are still the workers' own.
+async fn stop_executions(services: &Services) {
+    let stops = services
+        .pool
+        .executions()
+        .await
+        .into_iter()
+        .map(|process| async move {
+            process.shutdown().await;
+        });
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures::future::join_all(stops),
+    )
+    .await
+    .is_err()
+    {
+        eprintln!("rho-agent-host: workset processes still stopping after 20s; exiting anyway");
+    }
+}
+
+/// Wakes the agents the last agent host recorded on its way down. The record
+/// is removed first, so an agent host that dies waking them does not wake
+/// them again.
+async fn resume_after_restart(services: Arc<Services>, path: Utf8PathBuf) {
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&path) {
+        eprintln!("rho-agent-host: not resuming agents, {path} stays: {error}");
+        return;
+    }
+    for id in text.lines().filter(|line| !line.is_empty()) {
+        let Ok(agent_id) = AgentId::from_encoded(id) else {
+            eprintln!("rho-agent-host: not resuming unknown agent id {id}");
+            continue;
+        };
+        let command = rho_agents_client::protocol::AgentCommand::Send {
+            agent_id,
+            content: vec![ContentPart::Text {
+                text: "The agent host was stopped on purpose (for example to deploy a new rho) \
+                       while you were working, and has started again. Continue your task."
+                    .to_owned(),
+            }],
+            delivery: rho_agent_types::MessageDelivery::Immediate,
+        };
+        if let Err(error) = agents::handle_agent_command(&services, command).await {
+            eprintln!("rho-agent-host: could not resume {id}: {error:#}");
         }
     }
 }

@@ -124,7 +124,10 @@ fn run_devshell_daemon(worksets: &Worksets) {
             let status = match command.spawn() {
                 Ok(mut child) => child.wait().await,
                 Err(error) => {
-                    eprintln!("dev shell cache unavailable: {} failed: {error}", program.display());
+                    eprintln!(
+                        "dev shell cache unavailable: {} failed: {error}",
+                        program.display()
+                    );
                     return;
                 }
             };
@@ -411,6 +414,17 @@ impl AgentPool {
             self.touch(agent_id);
         }
         agent
+    }
+
+    /// Loaded agents mid-turn or with input waiting.
+    pub async fn unsettled(&self) -> Vec<AgentId> {
+        self.agents
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, agent)| !agent.settled())
+            .map(|(agent_id, _)| *agent_id)
+            .collect()
     }
 
     /// Whether any client is looking at this agent right now. Read by the
