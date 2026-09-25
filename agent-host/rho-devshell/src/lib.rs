@@ -332,10 +332,16 @@ pub fn roots_dir(dir: &Path) -> PathBuf {
     dir.join("roots")
 }
 
+/// The directory of every environment's activation scripts below the
+/// shared cache directory.
+pub fn activations_root(dir: &Path) -> PathBuf {
+    dir.join("activations")
+}
+
 /// The directory of `env_store_path`'s activation scripts below the shared
 /// cache directory, removed with the environment.
 pub fn activations_dir(dir: &Path, env_store_path: &str) -> PathBuf {
-    dir.join("activations").join(store_basename(env_store_path))
+    activations_root(dir).join(store_basename(env_store_path))
 }
 
 /// Where the activation script of `env_store_path` is written: one per

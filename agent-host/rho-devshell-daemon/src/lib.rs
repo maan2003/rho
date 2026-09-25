@@ -14,6 +14,7 @@
 //! ([`Store::serve`]).
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 pub use rho_devshell::Candidate;
 use rho_devshell::protocol::{self, Reply, Request};
-use rho_devshell::{activations_dir, gc_root, roots_dir};
+use rho_devshell::{activations_dir, activations_root, gc_root, roots_dir};
 use senax_encoder::{Decode, Encode};
 
 /// How many environments stay pinned, most recently used first.
@@ -31,6 +32,9 @@ pub const PIN_BUDGET: usize = 50;
 /// Unpinned entries beyond this many are dropped, least recently used
 /// first. Entries are small; this only bounds a store never collected.
 pub const MAX_ENTRIES: usize = 1000;
+
+/// Where the environments are, for activation scripts no entry names.
+const NIX_STORE: &str = "/nix/store";
 
 const SHELLS_TABLE: &str = "devshell_shells";
 const SHELLS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new(SHELLS_TABLE);
@@ -254,6 +258,22 @@ async fn load(db: &RhoDb, dir: &Path) -> State {
             }
         }
     }
+    // Activation scripts no entry uses, of uncached shells or left by a
+    // crash, go once Nix has collected their environment: until then a
+    // workset may still run an uncached shell's.
+    let used: HashSet<&OsStr> = state
+        .entries
+        .values()
+        .filter_map(|entry| Path::new(&entry.env_store_path).file_name())
+        .collect();
+    if let Ok(activations) = std::fs::read_dir(activations_root(dir)) {
+        for activation in activations.flatten() {
+            let name = activation.file_name();
+            if !used.contains(name.as_os_str()) && !Path::new(NIX_STORE).join(&name).exists() {
+                let _ = std::fs::remove_dir_all(activation.path());
+            }
+        }
+    }
     let mut changes = HashSet::new();
     for (id, entry) in &mut state.entries {
         if entry.pinned && !is_rooted(dir, &entry.env_store_path) {
@@ -470,5 +490,26 @@ mod tests {
         store.lookup("k").await.unwrap();
         assert!(root_b.symlink_metadata().is_err());
         assert!(!store.used(id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn loading_removes_activations_of_collected_environments_without_entries() {
+        let f = Fixture::new().await;
+        let a = f.env("a");
+        f.store.store("k".into(), a.clone(), vec![]).await.unwrap();
+        let cache = f.temp.path().join("cache");
+        // In use by an entry, of an environment still in the store, and of
+        // one Nix collected.
+        let store_path = std::fs::read_dir(NIX_STORE).unwrap().flatten().next().unwrap().path();
+        let kept = [activations_dir(&cache, &a), activations_dir(&cache, store_path.to_str().unwrap())];
+        let collected = activations_dir(&cache, "/nix/store/00000000000000000000000000000000-gone");
+        for dir in kept.iter().chain([&collected]) {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let Fixture { temp, store } = f;
+        drop(store);
+        Fixture::open(&temp).await;
+        assert!(kept.iter().all(|dir| dir.is_dir()));
+        assert!(!collected.exists());
     }
 }

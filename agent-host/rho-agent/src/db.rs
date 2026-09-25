@@ -63,14 +63,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "b906d137",
-    to: "6bcd407c",
-    // The dev shell cache moved to its daemon's own database.
-    migrate: |write| {
-        write.delete_table("devshell_shells");
-    },
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
