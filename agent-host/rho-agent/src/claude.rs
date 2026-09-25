@@ -1409,12 +1409,9 @@ impl ClaudeLoop {
                         exec_id,
                         source,
                     } => {
-                        let already_admitted = self.host.exec_was_admitted(exec_id.clone()).await?;
-                        if self.cancelling
-                            || self.response_execs.values().next() != Some(&exec_id)
-                            || already_admitted
+                        if self.cancelling || self.response_execs.values().next() != Some(&exec_id)
                         {
-                            Err("Only the first exec in a provider response may run, once. This call was not executed; earlier side effects are not undone.".into())
+                            Err("Only the first exec in a provider response may run. This call was not executed; earlier side effects are not undone.".into())
                         } else if self.python.as_ref().is_none_or(|host| !host.can_admit()) {
                             Err(
                                 "The notebook is unavailable or already has an open exec reply."

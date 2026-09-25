@@ -626,7 +626,16 @@ impl Workset {
         let mut command = owner.command("git");
         command
             .current_dir(checkout)
-            .args(["checkout", "--quiet", "--detach"]);
+            // Git's default is one checkout worker. Parallel writes substantially
+            // shorten large workset checkouts; its default 100-file threshold
+            // keeps small checkouts sequential.
+            .args([
+                "-c",
+                "checkout.workers=8",
+                "checkout",
+                "--quiet",
+                "--detach",
+            ]);
         if !rev.is_empty() {
             command.arg(rev);
         }

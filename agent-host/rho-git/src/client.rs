@@ -151,6 +151,8 @@ pub fn clone_from_mirror(git: &Git, mirror: &Path, url: &str, dest: &Path) -> an
         git.output(
             Some(dest),
             [
+                "-c",
+                "checkout.workers=8",
                 "checkout",
                 "--quiet",
                 "-b",

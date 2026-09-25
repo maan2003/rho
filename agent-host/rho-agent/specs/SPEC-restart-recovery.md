@@ -155,8 +155,7 @@ execution journal.
 
 Claude Code restores its own conversation; Rho does not replay it as native
 provider input. Notebook admission and output ownership remain Rho's durable
-facts. An admitted provider identity must never execute again, even after rewind.
-A restart does not restore the Python namespace or its jobs.
+facts. A restart does not restore the Python namespace or its jobs.
 
 Before releasing notebook output, Rho commits its attributed contributions.
 A transport failure leaves that batch pending across restart. The next eligible

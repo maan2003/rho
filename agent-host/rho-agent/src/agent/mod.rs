@@ -572,9 +572,9 @@ impl Agent {
             .deep_model()
             .expect("deep profile has a model");
         host.team().await?;
-        let admitted = host.admitted_ids().await?.into_iter().collect();
         let total_usage = host.usage_total().await?;
-        let (_, rows) = host.history().await?;
+        let (_, rows, admitted) = host.recovery_history().await?;
+        let admitted = admitted.into_iter().collect();
         let replayed = replay::recover(rows.into_iter().map(|(_, event)| event).collect());
         Ok(AgentHandle::start(
             host,

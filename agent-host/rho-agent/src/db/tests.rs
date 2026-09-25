@@ -528,8 +528,23 @@ async fn agent_spawned_by_is_stored_at_creation() {
         test_agent_runtime(),
         crate::db::AgentOrigin::Child { parent: pm },
     );
+    let owned = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(3),
+        owned,
+        None,
+        test_workspace(),
+        AgentRole::default(),
+        AgentRole::default().session_profile(),
+        test_agent_runtime(),
+        crate::db::AgentOrigin::UserOwned { by: pm },
+    );
     write.commit();
 
+    let read = db.read();
+    assert_eq!(read.agent_spawner(pm), None);
+    assert_eq!(read.agent_spawner(engineer), Some(pm));
+    assert_eq!(read.agent_spawner(owned), Some(pm));
     assert_eq!(
         db.read().get_agent(pm).config.spawned_by,
         AgentSpawnedBy::Direct
@@ -559,6 +574,57 @@ async fn init_agent_tables_stamps_current_db_format() {
 
     let format = db.read().open_table(FORMAT).get(&()).unwrap().value();
     assert_eq!(format, CURRENT_AGENT_DB_FORMAT);
+}
+
+#[tokio::test]
+async fn migration_backfills_heads_from_all_log_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let first = create(&mut write, None, None);
+    let second = create(&mut write, None, None);
+    write.set_agent_mode(first, WorksetMode::Exposed);
+    write.append_agent_event(first, &user_event("hidden"));
+    write.rewind_agent(UnixMs(2), first, AgentEventPos::new(1));
+    write.append_agent_event(first, &user_event("visible"));
+    write.set_agent_role(second, AgentRole::default());
+    write.commit();
+    let expected = [first, second]
+        .into_iter()
+        .map(|id| {
+            let read = db.read();
+            let log = read.open_table(AGENT_LOG);
+            (id, fold_head(rows(log.range(agent_range(id)))).unwrap())
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected;
+    expected.sort_by_key(|(id, _)| *id);
+
+    // Recreate a pre-projection store: only the event log survives.
+    let mut write = db.write().await;
+    write.delete_table("agent_heads");
+    write.open_table(FORMAT).insert(&(), &"6bcd407c".to_owned());
+    write.commit();
+
+    prepare(&db).await;
+    assert_eq!(db.read().list_agents(), expected);
+    assert_eq!(
+        db.read().list_agent_ids(),
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    );
+
+    let mut write = db.write().await;
+    write.set_agent_mode(first, WorksetMode::View);
+    write.commit();
+    let read = db.read();
+    assert_eq!(read.get_agent(first).config.place.mode, WorksetMode::View);
+    assert_eq!(read.get_agent(first).next, AgentEventPos::new(6));
+    assert_eq!(
+        read.get_agent(second),
+        expected.iter().find(|(id, _)| *id == second).unwrap().1
+    );
 }
 
 #[tokio::test]
@@ -608,19 +674,51 @@ async fn response_subscriptions_are_persistent_edges() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let subscriber = write.alloc_agent_id();
-    let target = write.alloc_agent_id();
-    write.set_agent_response_subscription(subscriber, target, true);
+    let mut ids = (0..5).map(|_| write.alloc_agent_id()).collect::<Vec<_>>();
+    ids.sort();
+    let [
+        lower_target,
+        lower_subscriber,
+        target,
+        upper_subscriber,
+        upper_target,
+    ] = ids.as_slice()
+    else {
+        unreachable!()
+    };
+    write.set_agent_response_subscription(*lower_subscriber, *lower_target, true);
+    write.set_agent_response_subscription(*lower_subscriber, *target, true);
+    write.set_agent_response_subscription(*upper_subscriber, *target, true);
+    write.set_agent_response_subscription(*upper_subscriber, *upper_target, true);
     write.commit();
 
-    assert!(db.read().is_agent_response_subscribed(subscriber, target));
-    assert_eq!(db.read().agent_response_subscribers(target), [subscriber]);
+    let read = db.read();
+    assert!(read.is_agent_response_subscribed(*lower_subscriber, *target));
+    assert_eq!(
+        read.agent_response_subscribers(*target),
+        [*lower_subscriber, *upper_subscriber]
+    );
+    assert_eq!(
+        read.agent_response_subscribers(*lower_target),
+        [*lower_subscriber]
+    );
+    assert_eq!(
+        read.agent_response_subscribers(*upper_target),
+        [*upper_subscriber]
+    );
+    drop(read);
 
     let mut write = db.write().await;
-    write.set_agent_response_subscription(subscriber, target, false);
+    write.set_agent_response_subscription(*lower_subscriber, *target, false);
     write.commit();
-    assert!(!db.read().is_agent_response_subscribed(subscriber, target));
-    assert!(db.read().agent_response_subscribers(target).is_empty());
+    assert!(
+        !db.read()
+            .is_agent_response_subscribed(*lower_subscriber, *target)
+    );
+    assert_eq!(
+        db.read().agent_response_subscribers(*target),
+        [*upper_subscriber]
+    );
 }
 
 pub(super) fn create(
@@ -730,6 +828,26 @@ async fn a_rewind_hides_rows_and_is_itself_visible() {
         Some(user_event("old branch"))
     );
     // The tail walk backward skips it too.
+    drop(read);
+
+    let mut write = db.write().await;
+    write.rewind_agent(UnixMs(3), agent_id, AgentEventPos::new(3));
+    write.append_agent_event(agent_id, &user_event("latest branch"));
+    write.commit();
+    let (next, records) = db.read().agent_event_records(agent_id);
+    assert_eq!(next, AgentEventPos::new(7));
+    assert_eq!(
+        records
+            .iter()
+            .map(|(pos, event)| (pos.pos, event_text(event)))
+            .collect::<Vec<_>>(),
+        [
+            (0, "created".to_owned()),
+            (1, "parent".to_owned()),
+            (5, "rewound".to_owned()),
+            (6, "latest branch".to_owned()),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -869,7 +987,7 @@ async fn the_journal_names_every_row_in_write_order() {
 }
 
 #[tokio::test]
-async fn rewind_cannot_erase_exec_admission() {
+async fn rewind_keeps_old_claude_admission_and_allows_the_same_id_again() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
@@ -887,16 +1005,26 @@ async fn rewind_cannot_erase_exec_admission() {
         },
     );
     write.rewind_agent(UnixMs(2), agent_id, AgentEventPos::new(1));
-    write.commit();
-    assert!(db.read().agent_exec_was_admitted(agent_id, &exec.id));
-    assert!(db.read().agent_admitted_ids(agent_id).contains(&exec.id));
-    assert!(
-        !db.read()
-            .agent_events(agent_id)
-            .1
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ClaudeExecAdmitted { .. }))
+    write.append_agent_event(
+        agent_id,
+        &AgentEvent::ClaudeExecAdmitted {
+            call: exec.clone(),
+            at: UnixMs(3),
+        },
     );
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(
+        read.agent_recovery_records(agent_id).2,
+        [exec.id.clone(), exec.id.clone()]
+    );
+    let (_, visible) = read.agent_events(agent_id);
+    assert!(matches!(
+        visible.as_slice(),
+        [AgentEvent::Created { .. }, AgentEvent::Rewound { .. }, AgentEvent::ClaudeExecAdmitted { call, .. }]
+            if call.id == exec.id
+    ));
 }
 
 #[tokio::test]
@@ -917,6 +1045,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
         wake: crate::WakeFacts::interrupt(),
         at: UnixMs(2),
     };
+    let first_batch_id = batch.id;
     let agent_id = {
         let db = RhoDb::open(&path);
         let mut write = db.write().await;
@@ -945,6 +1074,13 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
             },
         );
         write.rewind_agent(UnixMs(3), id, AgentEventPos::new(1));
+        write.append_agent_event(
+            id,
+            &AgentEvent::ClaudeOutputHandedOff {
+                id: first_batch_id,
+                at: UnixMs(3),
+            },
+        );
         write.commit();
         id
     };

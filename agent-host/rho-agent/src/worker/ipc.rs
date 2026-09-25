@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 7;
+pub(super) const VERSION: u32 = 9;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -69,11 +69,11 @@ pub(super) enum Request<'a> {
     Failed(String),
     Settled,
     Head,
-    History,
+    History {
+        recovery: bool,
+    },
     Append(AgentEvent<'a>),
     AppendBatch(Vec<AgentEvent<'static>>),
-    AdmittedIds,
-    ExecAdmitted(ExecId),
     Profile {
         role: AgentRole,
         binding: SessionBinding,
@@ -106,10 +106,9 @@ pub(super) enum Reply {
     History {
         next: AgentEventPos,
         rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
+        admitted: Vec<ExecId>,
     },
     Position(AgentEventPos),
-    Admitted(bool),
-    AdmittedIds(Vec<ExecId>),
     ClaudeAccount(String),
     ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
     Usage(AgentUsageBucket),
@@ -272,12 +271,17 @@ impl Host {
                             if let Some(waiter) = pending.lock().expect("poison").calls.remove(&id)
                             {
                                 let body = match body {
-                                    Reply::History { next, mut rows } => {
+                                    Reply::History {
+                                        next,
+                                        mut rows,
+                                        admitted,
+                                    } => {
                                         let mut history = waiter.history;
                                         history.append(&mut rows);
                                         Reply::History {
                                             next,
                                             rows: history,
+                                            admitted,
                                         }
                                     }
                                     reply => reply,
@@ -485,8 +489,44 @@ impl Host {
     pub(crate) async fn history(
         &self,
     ) -> Result<(AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>), StoreError> {
-        match self.request(Request::History).await.map_err(StoreError)? {
-            Reply::History { next, rows } => Ok((next, rows)),
+        let (next, rows, _) = self.request_history(false).await?;
+        Ok((next, rows))
+    }
+
+    pub(crate) async fn recovery_history(
+        &self,
+    ) -> Result<
+        (
+            AgentEventPos,
+            Vec<(AgentEventPos, AgentEvent<'static>)>,
+            Vec<ExecId>,
+        ),
+        StoreError,
+    > {
+        self.request_history(true).await
+    }
+
+    async fn request_history(
+        &self,
+        recovery: bool,
+    ) -> Result<
+        (
+            AgentEventPos,
+            Vec<(AgentEventPos, AgentEvent<'static>)>,
+            Vec<ExecId>,
+        ),
+        StoreError,
+    > {
+        match self
+            .request(Request::History { recovery })
+            .await
+            .map_err(StoreError)?
+        {
+            Reply::History {
+                next,
+                rows,
+                admitted,
+            } => Ok((next, rows, admitted)),
             _ => Err(StoreError(anyhow::anyhow!("unexpected history reply"))),
         }
     }
@@ -505,28 +545,6 @@ impl Host {
         events: Vec<AgentEvent<'static>>,
     ) -> Result<(), StoreError> {
         self.change(Request::AppendBatch(events)).await
-    }
-
-    pub(crate) async fn admitted_ids(&self) -> Result<Vec<ExecId>, StoreError> {
-        match self
-            .request(Request::AdmittedIds)
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::AdmittedIds(ids) => Ok(ids),
-            _ => Err(StoreError(anyhow::anyhow!("unexpected admission reply"))),
-        }
-    }
-
-    pub(crate) async fn exec_was_admitted(&self, id: ExecId) -> Result<bool, StoreError> {
-        match self
-            .request(Request::ExecAdmitted(id))
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::Admitted(admitted) => Ok(admitted),
-            _ => Err(StoreError(anyhow::anyhow!("unexpected admission reply"))),
-        }
     }
 
     pub(crate) async fn record_usage(&self, usage: AgentUsageBucket) -> Result<(), StoreError> {

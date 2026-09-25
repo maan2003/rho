@@ -735,24 +735,29 @@ impl AgentPool {
     }
 
     async fn enforce_spawn_limits(&self, spawner: AgentId) -> anyhow::Result<()> {
-        let child_ids = {
-            let read = self.db.read();
-            let mut depth = 0;
-            let mut cursor = Some(spawner);
-            while let Some(id) = cursor {
-                depth += 1;
-                if depth > MAX_SPAWN_DEPTH {
-                    anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
-                }
-                cursor = read.agent_spawner(id);
+        let read = self.db.read();
+        let mut depth = 0;
+        let mut cursor = Some(spawner);
+        while let Some(id) = cursor {
+            depth += 1;
+            if depth > MAX_SPAWN_DEPTH {
+                anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
             }
-            read.list_agent_ids()
-                .into_iter()
-                .filter(|id| read.agent_spawner(*id) == Some(spawner))
-                .collect::<Vec<_>>()
-        };
+            cursor = read.agent_spawner(id);
+        }
+        drop(read);
+        // Only loaded agents have a working runtime; settled agents can be
+        // evicted. Identify loaded children without visiting every persisted
+        // agent, then inspect their statuses under the pool lock.
+        let loaded = self.agents.lock().await.keys().copied().collect::<Vec<_>>();
+        let read = self.db.read();
+        let children = loaded
+            .into_iter()
+            .filter(|id| read.agent_spawner(*id) == Some(spawner))
+            .collect::<Vec<_>>();
+        drop(read);
         let agents = self.agents.lock().await;
-        let working_children = child_ids
+        let working_children = children
             .into_iter()
             .filter_map(|id| agents.get(&id))
             .filter(|agent| agent.status().kind.is_working())

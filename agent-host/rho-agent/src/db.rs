@@ -1,8 +1,8 @@
 //! Raw redb schema for persisted agents.
 //!
 //! One log per agent (`agent_log`), dense positions from zero; one journal
-//! (`journal`) naming every append in the order it landed. Nothing derived
-//! is stored: what an agent is now is folded from its log on read.
+//! (`journal`) naming every append in the order it landed. The log remains
+//! authoritative; `agent_heads` is its transactionally updated read projection.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -35,6 +35,8 @@ const RECOVERY: TableDefinition<String, u64> = TableDefinition::new("recovery_sa
 /// rewritten; a rewind is a row like any other.
 const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_log");
+/// Current heads, derived from the log in the same transaction as every append.
+const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> = TableDefinition::new("agent_heads");
 /// The order every append landed in, across agents: `seq -> (agent, pos)`,
 /// written in the same transaction as the row it names. What a client
 /// follows to stay current.
@@ -54,7 +56,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "6bcd407c";
+const CURRENT_AGENT_DB_FORMAT: &str = "a7e43d91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -63,7 +65,21 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "b906d137",
+        to: "6bcd407c",
+        // The dev shell cache moved to its daemon's own database.
+        migrate: |write| {
+            write.delete_table("devshell_shells");
+        },
+    },
+    AgentDbMigration {
+        from: "6bcd407c",
+        to: "a7e43d91",
+        migrate: rebuild_agent_heads,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -327,8 +343,8 @@ pub struct AgentConfig {
 }
 
 /// What an agent is now: the fold of its whole log, hidden rows included
-/// (a rewind takes back history, not configuration). Made on read, never
-/// stored.
+/// (a rewind takes back history, not configuration). Stored as a read
+/// projection, updated atomically with the log.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentHead {
     pub config: AgentConfig,
@@ -620,14 +636,14 @@ pub trait AgentReadTxnExt {
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch>;
-    /// Admission is an external-effects fact, never undone by transcript
-    /// rewind.
-    fn agent_exec_was_admitted(
+    fn agent_recovery_records(
         &self,
         agent_id: AgentId,
-        exec: &rho_inference::types::ExecId,
-    ) -> bool;
-    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_inference::types::ExecId>;
+    ) -> (
+        AgentEventPos,
+        Vec<(AgentEventPos, AgentEvent<'static>)>,
+        Vec<rho_inference::types::ExecId>,
+    );
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
     /// Newest text-bearing visible rows, read backward and bounded before
@@ -828,8 +844,9 @@ impl AgentReadTxnExt for ReadTxn {
     }
 
     fn try_get_agent(&self, agent_id: AgentId) -> Option<AgentHead> {
-        let log = self.open_table(AGENT_LOG);
-        fold_head(rows(log.range(agent_range(agent_id))))
+        self.open_table(AGENT_HEADS)
+            .get(&agent_id)
+            .map(|value| value.value().into_owned())
     }
 
     fn agent_exists(&self, agent_id: AgentId) -> bool {
@@ -837,26 +854,16 @@ impl AgentReadTxnExt for ReadTxn {
     }
 
     fn list_agent_ids(&self) -> Vec<AgentId> {
-        let log = self.open_table(AGENT_LOG);
-        let mut ids = Vec::new();
-        let mut cursor = log.iter().next().map(|(key, _)| key.value().0);
-        while let Some(agent_id) = cursor {
-            ids.push(agent_id);
-            // Jump past this agent's last possible key straight to the
-            // next agent's first: one descent per agent, not one per row.
-            cursor = log
-                .range((agent_id, u64::MAX)..)
-                .next()
-                .map(|(key, _)| key.value().0)
-                .filter(|next| *next != agent_id);
-        }
-        ids
+        self.open_table(AGENT_HEADS)
+            .iter()
+            .map(|(id, _)| id.value())
+            .collect()
     }
 
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)> {
-        self.list_agent_ids()
-            .into_iter()
-            .filter_map(|agent_id| Some((agent_id, self.try_get_agent(agent_id)?)))
+        self.open_table(AGENT_HEADS)
+            .iter()
+            .map(|(id, head)| (id.value(), head.value().into_owned()))
             .collect()
     }
 
@@ -867,22 +874,24 @@ impl AgentReadTxnExt for ReadTxn {
         }
     }
     fn agent_spawner(&self, agent_id: AgentId) -> Option<AgentId> {
-        match self.agent_event(agent_id, AgentEventPos::ZERO)? {
-            AgentEvent::Created {
-                spawned_by: AgentSpawnedBy::UserOwned { by },
-                ..
-            } => Some(by),
-            AgentEvent::Created { parent, .. } => parent,
-            _ => None,
+        let head = self.try_get_agent(agent_id)?;
+        match head.config.spawned_by {
+            AgentSpawnedBy::UserOwned { by } => Some(by),
+            _ => head.parent,
         }
     }
     fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId> {
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS)
-            .iter()
-            .filter_map(|(key, _)| {
-                let key = key.value();
-                (key.target == target).then_some(key.subscriber)
-            })
+            .range(
+                AgentResponseSubscription {
+                    target,
+                    subscriber: AgentId::MIN,
+                }..=AgentResponseSubscription {
+                    target,
+                    subscriber: AgentId::MAX,
+                },
+            )
+            .map(|(key, _)| key.value().subscriber)
             .collect()
     }
 
@@ -906,29 +915,38 @@ impl AgentReadTxnExt for ReadTxn {
     }
 
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch> {
-        let mut pending: Option<crate::ClaudeOutputBatch> = None;
         let log = self.open_table(AGENT_LOG);
-        for (_, event) in rows(log.range(agent_range(agent_id))) {
+        let mut handed_off = BTreeSet::new();
+        // Only the newest batch can still be pending. Handoffs to older
+        // batches do not retire it, including across a rewind.
+        for (_, event) in rows(log.range(agent_range(agent_id)).rev()) {
             match event {
-                AgentEvent::ClaudeOutput { batch } => pending = Some(batch),
-                AgentEvent::ClaudeOutputHandedOff { id, .. }
-                    if pending.as_ref().is_some_and(|batch| batch.id == id) =>
-                {
-                    pending = None
+                AgentEvent::ClaudeOutputHandedOff { id, .. } => {
+                    handed_off.insert(id);
+                }
+                AgentEvent::ClaudeOutput { batch } => {
+                    return (!handed_off.contains(&batch.id)).then_some(batch);
                 }
                 _ => {}
             }
         }
-        pending
+        None
     }
 
-    fn agent_admitted_ids(&self, agent_id: AgentId) -> Vec<rho_inference::types::ExecId> {
+    fn agent_recovery_records(
+        &self,
+        agent_id: AgentId,
+    ) -> (
+        AgentEventPos,
+        Vec<(AgentEventPos, AgentEvent<'static>)>,
+        Vec<rho_inference::types::ExecId>,
+    ) {
         let log = self.open_table(AGENT_LOG);
-        let mut ids = Vec::new();
-        // All branches, not only visible history: rewind must not reuse identities.
-        for (_, event) in rows(log.range(agent_range(agent_id))) {
-            if let AgentEvent::ClaudeExecAdmitted { call, .. } = &event {
-                ids.push(call.id.clone());
+        let mut admitted = Vec::new();
+        // Include identities from hidden branches: rewinds never reauthorize them.
+        let events = rows(log.range(agent_range(agent_id))).inspect(|(_, event)| {
+            if let AgentEvent::ClaudeExecAdmitted { call, .. } = event {
+                admitted.push(call.id.clone());
             }
             if let Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =
                 event.native_event()
@@ -937,7 +955,7 @@ impl AgentReadTxnExt for ReadTxn {
                     if let rho_inference::types::ContextBlock::InferenceResponse { items, .. } =
                         block
                     {
-                        ids.extend(items.iter().filter_map(|item| match item {
+                        admitted.extend(items.iter().filter_map(|item| match item {
                             rho_inference::types::InferenceResponseItem::ToolCall {
                                 id, ..
                             } => Some(id.clone()),
@@ -946,26 +964,9 @@ impl AgentReadTxnExt for ReadTxn {
                     }
                 }
             }
-        }
-        ids
-    }
-
-    fn agent_exec_was_admitted(
-        &self,
-        agent_id: AgentId,
-        exec: &rho_inference::types::ExecId,
-    ) -> bool {
-        let log = self.open_table(AGENT_LOG);
-        rows(log.range(agent_range(agent_id))).any(|(_, event)| {
-            if let AgentEvent::ClaudeExecAdmitted { call, .. } = &event {
-                return &call.id == exec;
-            }
-            match event.native_event() {
-                Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =>
-                    output.iter().filter_map(|entry| match entry { rho_inference::types::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None }).flatten().any(|item| matches!(item, rho_inference::types::InferenceResponseItem::ToolCall { id, .. } if id == exec)),
-                _ => false,
-            }
-        })
+        });
+        let (next, visible) = visible_rows(events);
+        (next, visible, admitted)
     }
 
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>> {
@@ -1088,6 +1089,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(COUNTERS);
         self.open_table(FORMAT);
         self.open_table(AGENT_LOG);
+        self.open_table(AGENT_HEADS);
         self.open_table(JOURNAL);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(QUOTA_OBSERVATIONS);
@@ -1114,6 +1116,21 @@ impl AgentWriteTxnExt for WriteTxn {
         );
         self.open_table(AGENT_LOG)
             .insert(&(agent_id, pos.pos), SenValue::borrowed(event));
+        let head = if pos == AgentEventPos::ZERO {
+            created_head(event, pos)
+        } else {
+            let mut head = self
+                .open_table(AGENT_HEADS)
+                .get(&agent_id)
+                .expect("agent head missing for existing log")
+                .value()
+                .into_owned();
+            fold_agent_head(&mut head, event);
+            head.next = pos.next();
+            head
+        };
+        self.open_table(AGENT_HEADS)
+            .insert(&agent_id, SenValue::borrowed(&head));
         let seq = {
             let mut journal = self.open_table(JOURNAL);
             let seq = journal
@@ -1386,8 +1403,10 @@ fn visible_rows(
     for (pos, event) in all {
         next = pos.next();
         if let AgentEvent::Rewound { to, .. } = &event {
-            let to = *to;
-            visible.retain(|(kept, _)| *kept < to);
+            // Visible positions stay sorted even after earlier branches were
+            // removed; a rewind cuts one suffix, not a scattered set.
+            let keep = visible.partition_point(|(kept, _)| kept < to);
+            visible.truncate(keep);
         }
         visible.push((pos, event));
     }
@@ -1437,21 +1456,10 @@ fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) ->
     for (pos, event) in all {
         match &mut head {
             None => {
-                let AgentEvent::Created { parent, .. } = &event else {
+                if !matches!(event, AgentEvent::Created { .. }) {
                     return None;
-                };
-                head = Some(AgentHead {
-                    config: created_config(&event),
-                    title_attempted: false,
-                    generated_title: None,
-                    activity: None,
-                    turn_running: false,
-                    parent: *parent,
-                    user_interacted: false,
-                    pending_notice: None,
-                    last_turn_ended: None,
-                    next: pos.next(),
-                });
+                }
+                head = Some(created_head(&event, pos));
             }
             Some(head) => {
                 fold_agent_head(head, &event);
@@ -1462,9 +1470,29 @@ fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) ->
     head
 }
 
+fn created_head(event: &AgentEvent<'_>, pos: AgentEventPos) -> AgentHead {
+    let AgentEvent::Created { parent, .. } = event else {
+        panic!("an agent head starts at creation");
+    };
+    AgentHead {
+        config: created_config(event),
+        title_attempted: false,
+        generated_title: None,
+        activity: None,
+        turn_running: false,
+        parent: *parent,
+        user_interacted: false,
+        pending_notice: None,
+        last_turn_ended: None,
+        next: pos.next(),
+    }
+}
+
 pub(crate) fn agent_head_write(write: &mut WriteTxn, agent_id: AgentId) -> Option<AgentHead> {
-    let log = write.open_table(AGENT_LOG);
-    fold_head(rows(log.range(agent_range(agent_id))))
+    write
+        .open_table(AGENT_HEADS)
+        .get(&agent_id)
+        .map(|value| value.value().into_owned())
 }
 
 /// Whether a rewind destination is still in the visible history.
@@ -1678,6 +1706,7 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
             log.remove(key);
         }
         drop(log);
+        write.open_table(AGENT_HEADS).remove(&agent_id);
         deleted.push((agent_id, keys.len()));
 
         let mut usage = write.open_table(AGENT_USAGE_BUCKETS);
@@ -1769,6 +1798,43 @@ pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
     write.delete_persistent_savepoint(id);
     write.commit();
     Ok(hop)
+}
+
+/// Backfill the cheap read projection once. The log is still the source of
+/// truth, including branches hidden by rewinds when folding the head.
+fn rebuild_agent_heads(write: &mut WriteTxn) {
+    let heads = {
+        let log = write.open_table(AGENT_LOG);
+        let mut heads = Vec::new();
+        let mut current: Option<(AgentId, AgentHead)> = None;
+        for (key, value) in log.iter() {
+            let (id, position) = key.value();
+            let pos = AgentEventPos::new(position);
+            let event = value.value().into_owned();
+            if current.as_ref().is_none_or(|(previous, _)| *previous != id) {
+                if let Some(previous) = current.take() {
+                    heads.push(previous);
+                }
+                current = Some((
+                    id,
+                    fold_head(std::iter::once((pos, event)))
+                        .expect("agent log must start with creation"),
+                ));
+            } else {
+                let head = &mut current.as_mut().expect("current agent").1;
+                fold_agent_head(head, &event);
+                head.next = pos.next();
+            }
+        }
+        if let Some(last) = current {
+            heads.push(last);
+        }
+        heads
+    };
+    let mut table = write.open_table(AGENT_HEADS);
+    for (id, head) in heads {
+        table.insert(&id, SenValue::borrowed(&head));
+    }
 }
 
 fn migrate_agent_db_format(write: &mut WriteTxn) {
