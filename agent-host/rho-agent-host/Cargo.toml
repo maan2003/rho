@@ -46,6 +46,7 @@ rho-fs-view.workspace = true
 rho-files.workspace = true
 rho-shell-view.workspace = true
 rho-terminal.workspace = true
+rustix = { version = "1", features = ["process"] }
 rustix-openpty.workspace = true
 serde.workspace = true
 serde_json.workspace = true

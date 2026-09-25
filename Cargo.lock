@@ -12606,6 +12606,7 @@ dependencies = [
  "rho-shell-view",
  "rho-terminal",
  "rho-visualizations",
+ "rustix 1.1.4",
  "rustix-openpty",
  "senax-encoder",
  "serde",

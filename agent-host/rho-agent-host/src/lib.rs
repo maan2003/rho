@@ -40,6 +40,51 @@ pub fn default_db_path() -> anyhow::Result<PathBuf> {
     Ok(base.join("rho").join("rho.redb"))
 }
 
+/// Run the cache of flake dev shells, shared by every workset process and
+/// every `nix develop` in a view over the shared cache directory, as a child
+/// that dies with the host and is started again if it exits; without it,
+/// shells are evaluated uncached. Only the host runs it, not every
+/// `AgentPool`, and it gets no stdin or stdout: a daemon outliving a test
+/// would otherwise hold the test's output open.
+fn run_devshell_daemon(worksets: &rho_fs_view::Worksets) {
+    let program = rho_fs_view::devshell_daemon();
+    // A host over another root than the default tells the daemon where.
+    let dir = worksets.devshell_cache_dir().into_std_path_buf();
+    let other = rho_fs_view::devshell_dir().ok() != Some(dir.clone());
+    tokio::spawn(async move {
+        loop {
+            let mut command = tokio::process::Command::new(&program);
+            if other {
+                command.env("RHO_DEVSHELL_DIR", &dir);
+            }
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .kill_on_drop(true);
+            unsafe {
+                command.pre_exec(|| {
+                    rustix::process::set_parent_process_death_signal(Some(
+                        rustix::process::Signal::TERM,
+                    ))?;
+                    Ok(())
+                });
+            }
+            let status = match command.spawn() {
+                Ok(mut child) => child.wait().await,
+                Err(error) => {
+                    eprintln!(
+                        "dev shell cache unavailable: {} failed: {error}",
+                        program.display()
+                    );
+                    return;
+                }
+            };
+            eprintln!("dev shell cache daemon exited ({status:?}), restarting");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
 #[cfg(unix)]
 fn login_environment() -> anyhow::Result<Vec<(OsString, OsString)>> {
     use std::os::unix::ffi::OsStringExt as _;
@@ -475,6 +520,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             .await?
         }
     };
+    run_devshell_daemon(&worksets);
     let iroh = if args.iroh {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_rpc::protocol::IROH_ALPN)
