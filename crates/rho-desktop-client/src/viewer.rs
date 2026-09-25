@@ -2,7 +2,7 @@
 //! transport, input back on a stream of its own. Only decoded images are
 //! coalesced.
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,7 @@ impl Image {
 struct Progress {
     floor: AtomicU64,
     feedback: Mutex<Feedback>,
+    recovery_pending: AtomicBool,
 }
 impl Progress {
     fn accepts(&self, id: FrameId) -> bool {
@@ -52,6 +53,17 @@ impl Progress {
         let mut feedback = self.feedback.lock().unwrap();
         self.floor.fetch_max(floor, Ordering::Release);
         feedback.recover = true;
+        self.recovery_pending.store(true, Ordering::Release);
+    }
+    fn report(&self) -> Feedback {
+        let state = self.feedback.lock().unwrap();
+        let mut feedback = *state;
+        // Control is reliable: request once per failure, not once per tick
+        // until a network-delayed keyframe arrives. Repeated requests would
+        // keep superseding that keyframe and add more traffic to the backlog.
+        // Retain feedback.recover internally until reception for lag rebasing.
+        feedback.recover &= self.recovery_pending.swap(false, Ordering::AcqRel);
+        feedback
     }
     fn presented(&self, id: FrameId, lag_us: u64) {
         let mut feedback = self.feedback.lock().unwrap();
@@ -452,7 +464,7 @@ async fn subscribe(
                         let Some(input)=quality_updates.borrow_and_update().clone() else {continue};
                         input
                     },
-                    _=ticks.tick()=> Input::Feedback(*progress.feedback.lock().unwrap()),
+                    _=ticks.tick()=> Input::Feedback(progress.report()),
                 };
                 rho_rpc::write_frame(&mut writer, &input, 64 * 1024).await?;
             }
@@ -495,6 +507,39 @@ mod tests {
             group,
             timestamp_us,
         }
+    }
+
+    #[test]
+    fn slow_recovery_requests_one_keyframe_not_one_per_report() {
+        let progress = Progress::default();
+        assert!(!progress.report().recover);
+        progress.recover(5);
+        assert!(progress.report().recover);
+        // Three seconds of feedback while the requested keyframe is in flight.
+        // Group announcements alone do not mean that it arrived or failed.
+        progress.floor.fetch_max(6, Ordering::Release);
+        progress.presented(id(6, 900), 220_000);
+        for _ in 0..30 {
+            let report = progress.report();
+            assert!(!report.recover);
+            assert_eq!(report.presented, Some(id(6, 900)));
+            assert_eq!(report.lag_us, 220_000);
+        }
+        // Keep recovery state until reception, for the lag rebase. Reporting
+        // must consume only the request, not pretend reception succeeded.
+        assert!(progress.feedback.lock().unwrap().recover);
+        progress.feedback.lock().unwrap().recover = false;
+        // A subsequent failure still requests a new keyframe even if no
+        // periodic report observed the intervening successful reception.
+        progress.recover(7);
+        assert!(progress.report().recover);
+        assert!(!progress.report().recover);
+        // If a periodic keyframe beats the next report, no request is needed.
+        progress.recover(8);
+        progress.feedback.lock().unwrap().recover = false;
+        assert!(!progress.report().recover);
+        progress.recover(9);
+        assert!(progress.report().recover);
     }
 
     #[test]
