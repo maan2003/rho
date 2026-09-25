@@ -8,9 +8,8 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-redb.workspace = true
 rho-db.workspace = true
-rho-ledger.workspace = true
+rho-ledger = { workspace = true, features = ["store"] }
 rho-rpc.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 

@@ -1,13 +1,11 @@
 //! Blind append-only byte storage for device logs.
 use std::collections::BTreeMap;
 
-use redb::TableDefinition;
 use rho_db::RhoDb;
 use rho_ledger::protocol::{ClientFrame, LogId, ServerFrame};
 use rho_rpc::protocol::{read_frame, write_frame};
 use tokio::sync::broadcast;
 
-const LOGS: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("ledger_logs_v2");
 // What the desk and the older ledger kept here. Every device has carried
 // it over; drop it once.
 const RETIRED: [&str; 7] = [
@@ -19,6 +17,7 @@ const RETIRED: [&str; 7] = [
     "rho_desk_cell_meta_v2",
     "rho_desk_parent_labels_v1",
 ];
+const CHUNK: usize = 64 * 1024;
 pub struct LedgerServer {
     db: RhoDb,
     appends: broadcast::Sender<(LogId, u64, Vec<u8>)>,
@@ -29,7 +28,7 @@ impl LedgerServer {
         for table in RETIRED {
             write.delete_table(table);
         }
-        write.open_table(LOGS);
+        rho_ledger::store::open(&mut write);
         write.commit();
         Self {
             db,
@@ -37,50 +36,16 @@ impl LedgerServer {
         }
     }
     fn lengths(&self) -> BTreeMap<LogId, u64> {
-        self.db
-            .read()
-            .open_table(LOGS)
-            .iter()
-            .map(|(log, bytes)| (LogId(log.value()), bytes.value().len() as u64))
-            .collect()
-    }
-    fn after(&self, have: &BTreeMap<LogId, u64>) -> Vec<(LogId, u64, Vec<u8>)> {
-        self.db
-            .read()
-            .open_table(LOGS)
-            .iter()
-            .filter_map(|(log, bytes)| {
-                let log = LogId(log.value());
-                let at = have.get(&log).copied().unwrap_or(0);
-                let bytes = bytes.value().get(usize::try_from(at).ok()?..)?.to_vec();
-                Some((log, at, bytes))
-            })
-            .flat_map(|(log, at, bytes)| {
-                bytes
-                    .chunks(64 * 1024)
-                    .enumerate()
-                    .map(move |(index, chunk)| {
-                        (log, at + (index * 64 * 1024) as u64, chunk.to_vec())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        rho_ledger::store::lengths(&self.db.read())
     }
     async fn append(&self, log: LogId, at: u64, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
         let mut write = self.db.write().await;
-        let mut table = write.open_table(LOGS);
-        let mut held = table
-            .get(log.0)
-            .map_or_else(Vec::new, |value| value.value().to_vec());
-        if held.len() as u64 != at {
+        if !rho_ledger::store::append(&mut write, log, at, &bytes) {
             return;
         }
-        held.extend_from_slice(&bytes);
-        table.insert(log.0, held.as_slice());
-        drop(table);
         write.commit();
         let _ = self.appends.send((log, at, bytes));
     }
@@ -100,15 +65,32 @@ impl LedgerServer {
             },
         )
         .await?;
-        let mut catchup = self.after(&have).into_iter();
+        // What the device lacks, read a chunk at a time as the stream has
+        // room for it.
+        let mut catchup: Vec<(LogId, u64, u64)> = self
+            .lengths()
+            .into_iter()
+            .filter_map(|(log, length)| {
+                let at = have.get(&log).copied().unwrap_or(0);
+                (at < length).then_some((log, at, length))
+            })
+            .collect();
         loop {
             tokio::select! {
                 frame = read_frame::<_, ClientFrame>(&mut reader) => match frame? {
                     ClientFrame::Append { log, at, bytes } => self.append(log, at, bytes).await,
                     ClientFrame::Hello { .. } => anyhow::bail!("ledger stream says hello once"),
                 },
-                _ = std::future::ready(()), if catchup.len() > 0 => {
-                    if let Some((log, at, bytes)) = catchup.next() {
+                _ = std::future::ready(()), if !catchup.is_empty() => {
+                    let (log, at, length) = catchup[0];
+                    let bytes = rho_ledger::store::read(&self.db.read(), log, at, CHUNK);
+                    let end = at + bytes.len() as u64;
+                    if bytes.is_empty() || end >= length {
+                        catchup.remove(0);
+                    } else {
+                        catchup[0].1 = end;
+                    }
+                    if !bytes.is_empty() {
                         write_frame(&mut writer, &ServerFrame::Bytes { log, at, bytes }).await?;
                     }
                 }

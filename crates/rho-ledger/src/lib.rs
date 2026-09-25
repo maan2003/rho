@@ -9,6 +9,8 @@ pub mod protocol;
 mod seal;
 #[cfg(feature = "client")]
 mod secret;
+#[cfg(feature = "store")]
+pub mod store;
 #[cfg(feature = "client")]
 pub mod stream;
 #[cfg(feature = "client")]

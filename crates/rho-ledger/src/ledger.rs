@@ -6,11 +6,10 @@ use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
 use crate::protocol::{DeviceId, LogId};
-use crate::seal;
 use crate::secret::Secret;
+use crate::{seal, store};
 
 const SELF: TableDefinition<(), Sen<SelfRecord>> = TableDefinition::new("ledger_self_v1");
-const LOGS: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("ledger_logs_v2");
 const READ: TableDefinition<[u8; 16], u64> = TableDefinition::new("ledger_read_v2");
 const UNSENT: TableDefinition<u64, Sen<Envelope>> = TableDefinition::new("ledger_unsent_v2");
 // What older builds kept. Every device has converted it; drop it once.
@@ -61,20 +60,16 @@ pub struct Received {
 
 fn append_sealed(write: &mut rho_db::WriteTxn, secret: Secret, envelope: &Envelope) {
     let log = log_id(envelope.device, envelope.channel);
-    let mut table = write.open_table(LOGS);
-    let mut bytes = table
-        .get(log.0)
-        .map_or_else(Vec::new, |value| value.value().to_vec());
+    let at = store::length_in(write, log);
     let plain = senax_encoder::encode(envelope).expect("encode ledger payloads");
-    bytes.extend(seal::seal(
-        &secret.derive(KEY_CONTEXT),
-        log,
-        bytes.len() as u64,
-        &plain,
-    ));
-    table.insert(log.0, bytes.as_slice());
-    drop(table);
-    write.open_table(READ).insert(log.0, bytes.len() as u64);
+    let record = seal::seal(&secret.derive(KEY_CONTEXT), log, at, &plain);
+    assert!(
+        store::append(write, log, at, &record),
+        "own log appends at its end"
+    );
+    write
+        .open_table(READ)
+        .insert(log.0, at + record.len() as u64);
 }
 
 #[derive(Clone, Debug)]
@@ -99,7 +94,7 @@ impl Ledger {
         for table in RETIRED {
             write.delete_table(table);
         }
-        write.open_table(LOGS);
+        store::open(&mut write);
         write.open_table(READ);
         write.open_table(UNSENT);
         let mut table = write.open_table(SELF);
@@ -163,9 +158,8 @@ impl Ledger {
         };
         let key = secret.derive(KEY_CONTEXT);
         let mut items = Vec::new();
-        for (log, bytes) in read.open_table(LOGS).iter() {
-            let log = LogId(log.value());
-            let bytes = bytes.value();
+        for log in store::lengths(&read).into_keys() {
+            let bytes = store::read(&read, log, 0, usize::MAX);
             let mut at = 0;
             while let Some((size, plain)) = seal::open(&key, log, at as u64, &bytes[at..]) {
                 let Ok(envelope) = senax_encoder::decode::<Envelope>(&mut plain.as_slice()) else {
@@ -253,18 +247,11 @@ impl Ledger {
         Ok(received)
     }
     pub fn lengths(&self) -> BTreeMap<LogId, u64> {
-        self.db
-            .read()
-            .open_table(LOGS)
-            .iter()
-            .map(|(log, bytes)| (LogId(log.value()), bytes.value().len() as u64))
-            .collect()
+        store::lengths(&self.db.read())
     }
-    pub fn bytes_after(&self, log: LogId, at: u64) -> Option<Vec<u8>> {
-        let read = self.db.read();
-        let bytes = read.open_table(LOGS).get(log.0)?.value().to_vec();
-        let at = usize::try_from(at).ok()?;
-        bytes.get(at..).map(Vec::from)
+    /// Up to `max` held bytes of `log` from `at`.
+    pub fn bytes_after(&self, log: LogId, at: u64, max: usize) -> Vec<u8> {
+        store::read(&self.db.read(), log, at, max)
     }
     /// Appends only at the held length. A divergent or retried append changes
     /// nothing.
@@ -273,16 +260,9 @@ impl Ledger {
             return Received::default();
         }
         let mut write = self.db.write().await;
-        let mut table = write.open_table(LOGS);
-        let mut held = table
-            .get(log.0)
-            .map_or_else(Vec::new, |value| value.value().to_vec());
-        if held.len() as u64 != at {
+        if !store::append(&mut write, log, at, &bytes) {
             return Received::default();
         }
-        held.extend(bytes);
-        table.insert(log.0, held.as_slice());
-        drop(table);
         write.commit();
         self.read_new(log).await
     }
@@ -294,16 +274,12 @@ impl Ledger {
         };
         let key = secret.derive(KEY_CONTEXT);
         let mut write = self.db.write().await;
-        let bytes = write
-            .open_table(LOGS)
-            .get(log.0)
-            .expect("held log")
-            .value()
-            .to_vec();
-        let mut at = write
+        let from = write
             .open_table(READ)
             .get(log.0)
-            .map_or(0, |offset| offset.value()) as usize;
+            .map_or(0, |offset| offset.value());
+        let bytes = store::read_in(&mut write, log, from, usize::MAX);
+        let mut at = 0;
         while at < bytes.len() {
             let Some(length_bytes) = bytes[at..].get(..4) else {
                 break;
@@ -315,7 +291,7 @@ impl Ledger {
             {
                 break;
             }
-            let Some((size, plain)) = seal::open(&key, log, at as u64, &bytes[at..]) else {
+            let Some((size, plain)) = seal::open(&key, log, from + at as u64, &bytes[at..]) else {
                 received.unreadable = true;
                 break;
             };
@@ -338,7 +314,7 @@ impl Ledger {
                 }));
             at += size;
         }
-        write.open_table(READ).insert(log.0, at as u64);
+        write.open_table(READ).insert(log.0, from + at as u64);
         write.commit();
         received
     }

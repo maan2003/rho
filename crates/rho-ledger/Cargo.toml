@@ -10,16 +10,17 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
+# The rows hosts and devices keep logs in.
+store = ["dep:redb", "dep:rho-db"]
 client = [
+  "store",
   "dep:anyhow",
   "dep:bip39",
   "dep:blake3",
   "dep:chacha20poly1305",
   "dep:futures",
   "dep:rand",
-  "dep:redb",
   "dep:rho-agent-hosts",
-  "dep:rho-db",
   "dep:tokio",
 ]
 

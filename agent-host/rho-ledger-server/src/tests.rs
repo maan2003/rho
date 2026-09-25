@@ -91,8 +91,7 @@ async fn two_devices_sync_and_host_stores_only_ciphertext() {
     assert!(phone.streams.ledger().items(Channel::Notes).is_empty());
     let log = *server.lengths().keys().next().unwrap();
     assert!(
-        !server.after(&BTreeMap::new())[0]
-            .2
+        !rho_ledger::store::read(&server.db.read(), log, 0, usize::MAX)
             .windows(5)
             .any(|window| window == b"plans")
     );
@@ -149,8 +148,8 @@ async fn conditional_append_ignores_retry_and_wrong_offset() {
     server.append(log, 4, vec![9]).await;
     server.append(log, 2, vec![3]).await;
     assert_eq!(
-        server.after(&BTreeMap::new()),
-        vec![(log, 0, vec![1, 2, 3])]
+        rho_ledger::store::read(&server.db.read(), log, 0, usize::MAX),
+        vec![1, 2, 3]
     );
 }
 #[tokio::test]

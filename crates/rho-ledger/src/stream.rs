@@ -121,8 +121,8 @@ impl LedgerStreams {
                     if at > held { anyhow::bail!("ledger gap at {at} after {held}"); }
                     let overlap = usize::try_from(held - at).unwrap_or(usize::MAX).min(bytes.len());
                     if overlap > 0 {
-                        let local = self.ledger.bytes_after(log, at).unwrap_or_default();
-                        if local.get(..overlap) != Some(&bytes[..overlap]) { anyhow::bail!("divergent ledger bytes"); }
+                        let local = self.ledger.bytes_after(log, at, overlap);
+                        if local[..] != bytes[..overlap] { anyhow::bail!("divergent ledger bytes"); }
                     }
                     let end = at + bytes.len() as u64;
                     host_lengths.entry(log).and_modify(|length| *length = (*length).max(end)).or_insert(end);
@@ -148,18 +148,18 @@ impl LedgerStreams {
         for (log, len) in self.ledger.lengths() {
             let at = host.get(&log).copied().unwrap_or(0);
             if len > at {
-                let bytes = self.ledger.bytes_after(log, at).expect("held suffix");
-                let chunk = &bytes[..bytes.len().min(64 * 1024)];
+                let chunk = self.ledger.bytes_after(log, at, 64 * 1024);
+                let end = at + chunk.len() as u64;
                 write_frame(
                     writer,
                     &ClientFrame::Append {
                         log,
                         at,
-                        bytes: chunk.to_vec(),
+                        bytes: chunk,
                     },
                 )
                 .await?;
-                host.insert(log, at + chunk.len() as u64);
+                host.insert(log, end);
                 break;
             }
         }
