@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const MAX_HEADER: u64 = 65536;
 pub const MAX_DIMENSION: u32 = 4096;
 pub const SOCKET_ENV: &str = "RHO_DESKTOP_SOCKET";
@@ -77,10 +77,43 @@ mod tests {
             r#"{"type":"capture","output":"headless-1"}"#
         );
         assert_eq!(
-            serde_json::from_str::<Request>(r#"{"type":"hello","version":3}"#).unwrap(),
+            serde_json::from_str::<Request>(r#"{"type":"hello","version":4}"#).unwrap(),
             Request::Hello { version: VERSION }
         );
     }
+    #[test]
+    fn progress_round_trips_without_conflating_pipeline_stages() {
+        let input = Input::Feedback(Feedback {
+            received: Some(FrameId {
+                group: 9,
+                timestamp_us: 81_000,
+            }),
+            decoded: Some(FrameId {
+                group: 8,
+                timestamp_us: 72_000,
+            }),
+            presented: Some(FrameId {
+                group: 8,
+                timestamp_us: 63_000,
+            }),
+            decode_us: 19_000,
+            lag_us: 47_000,
+            recover: true,
+        });
+        assert_eq!(
+            serde_json::from_slice::<Input>(&serde_json::to_vec(&input).unwrap()).unwrap(),
+            input
+        );
+        #[cfg(feature = "senax")]
+        {
+            let bytes = senax_encoder::pack(&input).unwrap();
+            assert_eq!(
+                senax_encoder::unpack::<Input>(&mut &bytes[..]).unwrap(),
+                input
+            );
+        }
+    }
+
     #[test]
     fn validates_both_dimensions_before_allocation() {
         assert_eq!(frame_len(65, 47), Some(12220));
@@ -119,6 +152,45 @@ pub enum Input {
     Physical { code: u32, pressed: bool },
     ReleaseAll,
     Quality { bitrate: u32, keyframe: bool },
+    Feedback(Feedback),
+}
+
+/// Identity survives capture, transport, decode, and presentation. Timestamps
+/// use the source's monotonic capture clock, not either machine's wall clock.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "senax",
+    derive(
+        senax_encoder::Encode,
+        senax_encoder::Decode,
+        senax_encoder::Pack,
+        senax_encoder::Unpack
+    )
+)]
+pub struct FrameId {
+    pub group: u64,
+    pub timestamp_us: u64,
+}
+
+/// Coalesced receiver progress. `presented` marks a GUI frame callback after
+/// paint, not a hardware scanout fence. Durations are measured on the receiver.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(
+    feature = "senax",
+    derive(
+        senax_encoder::Encode,
+        senax_encoder::Decode,
+        senax_encoder::Pack,
+        senax_encoder::Unpack
+    )
+)]
+pub struct Feedback {
+    pub received: Option<FrameId>,
+    pub decoded: Option<FrameId>,
+    pub presented: Option<FrameId>,
+    pub decode_us: u64,
+    pub lag_us: u64,
+    pub recover: bool,
 }
 
 /// Asynchronous viewer control errors. Media travels on separate MoQ streams.

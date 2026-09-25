@@ -60,22 +60,47 @@ fn fixed_publish<S: moq_net::web_transport_trait::Session + Send + Sync + Unpin 
 ) -> Result<Session> {
     let origin = origin.clone();
     Ok(fixed_session(async move {
-        use moq_net::web_transport_trait::RecvStream as _;
+        use moq_net::web_transport_trait::{RecvStream as _, SendStream as _};
         let _close = CloseTransport(transport.clone());
-        // This stream only signals lifetime. No request or response gates video.
-        let (_send, mut recv) = transport.open_bi().await?;
-        let mut byte = [0];
+        // The reverse stream carries asynchronous group floors, never a startup gate.
+        let (mut send, mut recv) = transport.open_bi().await?;
         let video = async {
             let broadcast = origin.consume().request_broadcast("app").await?;
             let track = broadcast.track("video")?.subscribe(None).await?;
-            moq_net::publish_fixed(moq_tokio::transport::Session::new(transport.clone()), track)
-                .await?;
+            let control = track.control();
+            let floors = async {
+                loop {
+                    let mut floor = [0; 8];
+                    let mut read = 0;
+                    while read < floor.len() {
+                        match recv.read(&mut floor[read..]).await? {
+                            Some(0) | None => return Ok::<(), anyhow::Error>(()),
+                            Some(n) => read += n,
+                        }
+                    }
+                    control.update(
+                        control
+                            .subscription()
+                            .with_start(track::Position::group(u64::from_be_bytes(floor))),
+                    )?;
+                }
+            };
+            tokio::select! {
+                result = moq_net::publish_fixed(moq_tokio::transport::Session::new(transport.clone()), track) => Ok::<(), anyhow::Error>(result?),
+                result = floors => result,
+            }
+        };
+        // QMux opens bidirectional streams lazily: write a one-byte preface to
+        // make the reverse floor stream visible without waiting for its receiver.
+        let lifetime = async {
+            send.write_chunk(Bytes::from_static(&[0])).await?;
+            let _ = send.closed().await;
             Ok::<(), anyhow::Error>(())
         };
         tokio::select! {
             result = video => result,
+            result = lifetime => result,
             _ = transport.closed() => Ok(()),
-            _ = recv.read(&mut byte) => Ok(()),
         }
     }))
 }
@@ -97,13 +122,30 @@ fn fixed_subscribe<S: moq_net::web_transport_trait::Session + Send + Sync + Unpi
     broadcast.announce(Default::default())?;
     Ok(fixed_session(async move {
         use moq_net::transport::poll::Session as _;
-        use moq_net::web_transport_trait::RecvStream as _;
+        use moq_net::web_transport_trait::{RecvStream as _, SendStream as _};
         let _close = CloseTransport(transport.clone());
         let lifetime = async {
-            let (_send, mut recv) = transport.accept_bi().await?;
+            let (mut send, mut recv) = transport.accept_bi().await?;
+            let mut preface = [0];
+            if recv.read(&mut preface).await?.is_none() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            let mut track = video.track.clone();
+            let floors = async {
+                loop {
+                    let subscription = track.subscription_changed().await?;
+                    let floor = subscription
+                        .and_then(|subscription| subscription.start)
+                        .map_or(0, |position| position.group);
+                    send.write_chunk(Bytes::copy_from_slice(&floor.to_be_bytes()))
+                        .await?;
+                }
+            };
             let mut byte = [0];
-            let _ = recv.read(&mut byte).await;
-            Ok::<(), anyhow::Error>(())
+            tokio::select! {
+                result = floors => result,
+                _ = recv.read(&mut byte) => Ok(()),
+            }
         };
         let receive = async {
             let mut receiver = moq_tokio::transport::Session::new(transport.clone());
@@ -229,6 +271,102 @@ mod tests {
             // their accidental destruction, must release compositor demand.
             video.track.unused().await?;
             sending.closed().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn detach_while_waiting_for_broadcast_closes_publisher() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let source = origin();
+            let (server, client) = tokio::io::duplex(4096);
+            let (sending, receiving) = tokio::try_join!(
+                local_server(server, &source),
+                local_client(client, origin()),
+            )?;
+            drop(receiving);
+            sending.closed().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+
+    #[tokio::test]
+    async fn floor_crosses_relay_and_cancels_unfinished_group() -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let source = origin();
+            let relay = origin();
+            let viewer = origin();
+            let broadcast = source.create_broadcast("app")?;
+            broadcast.announce(Default::default())?;
+            let mut video = Video::new(&broadcast)?;
+
+            let (up_a, up_b) = tokio::io::duplex(4096);
+            let (down_a, down_b) = tokio::io::duplex(4096);
+            let (upstream, relay_input, relay_output, downstream) = tokio::try_join!(
+                local_server(up_a, &source),
+                local_client(up_b, relay.clone()),
+                local_server(down_a, &relay),
+                local_client(down_b, viewer.clone()),
+            )?;
+            let mut upstream_prefs = video.track.clone();
+            // Consume the original viewer demand before looking for the changed floor.
+            let _ = upstream_prefs.subscription_changed().await?;
+            let remote = viewer.consume().request_broadcast("app").await?;
+            let mut subscribed = remote.track("video")?.subscribe(None).await?.ordered();
+            video.write(true, 17_000, Bytes::from_static(b"old"))?;
+            let mut old = subscribed.next_group().await?.unwrap();
+            assert_eq!(&old.read_frame().await?.unwrap().payload[..], b"old");
+
+            subscribed.control().update(
+                subscribed
+                    .control()
+                    .subscription()
+                    .with_start(track::Position::group(1)),
+            )?;
+            // A spliced cursor forwards changed preferences to its active
+            // segment when polled, independently of the previously handed group.
+            let mut next = Box::pin(subscribed.next_group());
+            loop {
+                tokio::select! {
+                    changed = upstream_prefs.subscription_changed() => {
+                        if changed?.unwrap().start == Some(track::Position::group(1)) { break; }
+                    }
+                    _ = &mut next => anyhow::bail!("unexpected next group"),
+                }
+            }
+            drop(next);
+            // A less restrictive second viewer holds the aggregate floor down.
+            let mut second = remote.track("video")?.subscribe(None).await?.ordered();
+            let second_old = second.next_group().await?.unwrap();
+            drop(second_old);
+            loop {
+                if upstream_prefs.subscription_changed().await?.unwrap().start
+                    == Some(track::Position::group(0))
+                {
+                    break;
+                }
+            }
+            drop(second);
+            loop {
+                if upstream_prefs.subscription_changed().await?.unwrap().start
+                    == Some(track::Position::group(1))
+                {
+                    break;
+                }
+            }
+            // The old group is still open at the source; the reader must not
+            // wait for its next frame or its source-side finish.
+            // Expiry at the consumed end reports EOF, even though the source
+            // has not finished this group; there is no truncated unread frame.
+            assert!(old.read_frame().await?.is_none());
+            video.write(false, 17_500, Bytes::from_static(b"superseded"))?;
+            assert!(old.read_frame().await?.is_none());
+            video.write(true, 18_000, Bytes::from_static(b"new"))?;
+            let mut fresh = subscribed.next_group().await?.unwrap();
+            assert_eq!(&fresh.read_frame().await?.unwrap().payload[..], b"new");
+            drop((downstream, relay_output, relay_input, upstream));
             Ok::<(), anyhow::Error>(())
         })
         .await?

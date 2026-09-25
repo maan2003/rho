@@ -39,3 +39,5 @@ tracing = { workspace = true, optional = true }
 [dev-dependencies]
 # The tests exercise the client too.
 rho-desktop-client = { path = ".", features = ["client"] }
+
+rho-desktop-media = { workspace = true, features = ["encoder"] }
