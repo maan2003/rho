@@ -527,15 +527,16 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         );
     }
 
-    let iroh_listener = iroh.map(|(listener, _)| listener);
-
-    if let Some(listener) = iroh_listener {
-        tokio::spawn(run_iroh_listener(
+    let mut iroh_listener = iroh.map(|(listener, _)| {
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_iroh_listener(
             services.clone(),
             listener,
             iroh_auth.clone(),
+            stopped,
         ));
-    }
+        (shutdown, task)
+    });
     let resume_path = state_dir.join(RESUME_AFTER_RESTART);
     tokio::spawn(resume_after_restart(services.clone(), resume_path.clone()));
     let shutdown = shutdown_signal();
@@ -547,6 +548,10 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
                 result?;
                 services.stopping.store(true, Ordering::Relaxed);
                 stop_executions(&services, &resume_path).await;
+                if let Some((shutdown, listener)) = iroh_listener.take() {
+                    let _ = shutdown.send(());
+                    listener.await.context("close iroh listener")?;
+                }
                 services.pool.flush_agent_usage(None).await;
                 return Ok(());
             }
@@ -662,8 +667,12 @@ async fn run_iroh_listener(
     services: Arc<Services>,
     mut listener: rho_rpc::AuthenticatedIrohListener,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
-    while let Some(approved) = listener.accept().await {
+    while let Some(approved) = tokio::select! {
+        approved = listener.accept() => approved,
+        _ = &mut shutdown => None,
+    } {
         let connection = match approved {
             Ok(connection) => connection,
             Err(error) => {
