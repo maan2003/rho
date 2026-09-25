@@ -59,6 +59,35 @@ impl Hand {
     }
 }
 
+/// Everything one deal weighed, for the journal: every node that came up,
+/// what became of it, and what it was weighed from. Free-form text, for
+/// reading back a bad deal, never for deciding anything.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Trace {
+    pub nodes: BTreeMap<NodeId, Weighed>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Weighed {
+    pub outcome: String,
+    pub inputs: Vec<(&'static str, String)>,
+    pub parts: Vec<String>,
+}
+
+impl Trace {
+    fn input(&mut self, node: &NodeId, key: &'static str, value: String) {
+        self.nodes
+            .entry(node.clone())
+            .or_default()
+            .inputs
+            .push((key, value));
+    }
+
+    fn outcome(&mut self, node: &NodeId, outcome: String) {
+        self.nodes.entry(node.clone()).or_default().outcome = outcome;
+    }
+}
+
 /// Slack, as the session holds it: the model, and the mirror the words
 /// of a card come from.
 #[derive(Clone, Copy)]
@@ -167,6 +196,22 @@ fn unix(ms: impl Into<i64>) -> Timestamp {
 
 /// The hand, as everything stands at `now`.
 pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
+    rank_into(sources, now, cache, None)
+}
+
+/// [`rank`], with everything it weighed.
+pub fn rank_traced(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> (Hand, Trace) {
+    let mut trace = Trace::default();
+    let hand = rank_into(sources, now, cache, Some(&mut trace));
+    (hand, trace)
+}
+
+fn rank_into(
+    sources: &Sources<'_>,
+    now: &Zoned,
+    cache: &mut Cache,
+    mut trace: Option<&mut Trace>,
+) -> Hand {
     let at = now.timestamp();
     let marks = sources.marks;
     let mut parts: BTreeMap<NodeId, Vec<Part>> = BTreeMap::new();
@@ -188,12 +233,29 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
             running.insert(node.clone());
         }
         let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
-        let Some(ended) = facts.last_turn_ended else {
-            continue;
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.input(&node, "agent facts", format!("{facts:?}"));
+            trace.input(&node, "digest newest", digest.newest.0.to_string());
+            trace.input(&node, "seen through", seen.to_string());
+        }
+        let quiet = if facts.turn_running {
+            Some("running")
+        } else if facts.last_turn_ended.is_none() {
+            Some("no turn has ended")
+        } else if facts.last_turn_ended <= Some(facts.last_user_message_at) {
+            Some("the user wrote after its turn ended")
+        } else if digest.newest.0 <= seen {
+            Some("seen through its newest")
+        } else {
+            None
         };
-        if facts.turn_running || ended <= facts.last_user_message_at || digest.newest.0 <= seen {
+        if let Some(quiet) = quiet {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.outcome(&node, format!("no card: {quiet}"));
+            }
             continue;
         }
+        let ended = facts.last_turn_ended.expect("checked above");
         let ended = unix(ended.0 as i64);
         let (curve, reason) = if facts.errored || facts.needs_you_hint {
             (
@@ -237,12 +299,19 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
             };
             // Done on another device, having seen this far.
             let node = NodeId::Slack(slack_unit(workspace, unit));
-            if marks
-                .get(&node)
-                .facts()
-                .seen_slack()
+            let seen = marks.get(&node).facts().seen_slack().map(str::to_owned);
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.input(&node, "attention", format!("{attention:?}"));
+                trace.input(&node, "unit facts", format!("{facts:?}"));
+                trace.input(&node, "seen through", format!("{seen:?}"));
+            }
+            if seen
+                .as_deref()
                 .is_some_and(|seen| slack_ts_order(&facts.newest.0, seen).is_le())
             {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.outcome(&node, "no card: done through its newest".to_owned());
+                }
                 continue;
             }
             let since = unix(
@@ -332,7 +401,35 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
     let mut cards = Vec::new();
     for (node, mut node_parts) in parts {
         let held = marks.get(&node);
+        if let Some(trace) = trace.as_deref_mut() {
+            let facts = &held.facts;
+            let recent = facts.len().saturating_sub(12);
+            for entry in &facts[recent..] {
+                trace.input(&node, "fact", format!("{} {:?}", entry.at, entry.fact));
+            }
+            let weighed = trace.nodes.entry(node.clone()).or_default();
+            weighed.parts = node_parts
+                .iter()
+                .map(|part| {
+                    format!(
+                        "{:?} {:?} priority {:.3} bonus {:.3} cursor {} from_source {} others {} breaks_snooze_set_by {:?}",
+                        part.reason,
+                        part.curve,
+                        part.curve.priority(at),
+                        part.bonus,
+                        part.cursor,
+                        part.from_source,
+                        part.others.len(),
+                        part.breaks_snooze_set_by,
+                    )
+                })
+                .collect();
+        }
         if held.deleted || held.facts().muted() {
+            if let Some(trace) = trace.as_deref_mut() {
+                let why = if held.deleted { "deleted" } else { "muted" };
+                trace.outcome(&node, format!("no card: {why}"));
+            }
             continue;
         }
         // A snooze on a Slack room holds every thread in it too.
@@ -357,6 +454,15 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
             let set = snooze.set.timestamp();
             node_parts.retain(|part| part.breaks_snooze_set_by.is_some_and(|spoke| set <= spoke));
             if node_parts.is_empty() {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.outcome(
+                        &node,
+                        format!(
+                            "no card: snoozed until {} (said {})",
+                            snooze.until, snooze.set
+                        ),
+                    );
+                }
                 continue;
             }
         }
@@ -395,9 +501,33 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
             .filter(|(_, priority)| *priority > DEAL_QUEUE_FLOOR)
             .max_by(|a, b| a.1.total_cmp(&b.1))
         else {
+            if let Some(trace) = trace.as_deref_mut() {
+                let best = node_parts
+                    .iter()
+                    .map(|part| part.curve.priority(at) + part.bonus)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                trace.outcome(&node, format!("no card: below the floor at {best:.3}"));
+            }
             continue;
         };
         let penalty = sources.skips.penalty(&node, &part.cursor, at);
+        if let Some(trace) = trace.as_deref_mut() {
+            let snoozes: Vec<String> = snoozes
+                .iter()
+                .map(|snooze| format!("until {} (said {})", snooze.until, snooze.set))
+                .collect();
+            trace.input(&node, "snoozes", format!("{snoozes:?}"));
+            trace.outcome(
+                &node,
+                format!(
+                    "card at {:.3}{}",
+                    priority,
+                    penalty.map_or(String::new(), |(penalty, gone)| format!(
+                        ", less {penalty:.3} for a skip until {gone}"
+                    ))
+                ),
+            );
+        }
         if let Some((_, gone)) = penalty {
             steps.push(gone);
         }

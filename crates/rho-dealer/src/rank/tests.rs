@@ -392,6 +392,19 @@ impl World {
     }
 
     /// The hand as lines of `name · label`, top first.
+    fn traced(&mut self) -> (Hand, Trace) {
+        let sources = Sources {
+            agents: &self.agents,
+            slack: Some(Slack {
+                model: &self.slack,
+                mirror: None,
+            }),
+            marks: &self.marks,
+            skips: &self.skips,
+        };
+        rank_traced(&sources, &self.now, &mut self.cache)
+    }
+
     fn hand(&mut self) -> String {
         let hand = self.deal();
         hand.cards
@@ -1022,4 +1035,28 @@ proptest::proptest! {
             }
         }
     }
+}
+
+#[test]
+fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
+    let mut w = world();
+    let asking = w.dm("D1", "U1");
+    let snoozed = w.dm("D2", "U2");
+    w.snooze(&snoozed, hours(1));
+    let quiet = w.agent("a");
+    w.finishes(&quiet);
+    w.done(&quiet);
+    let (hand, trace) = w.traced();
+    assert_eq!(hand, w.deal());
+    let outcome = |node: &NodeId| trace.nodes[node].outcome.clone();
+    assert!(outcome(&asking).starts_with("card at "), "{}", outcome(&asking));
+    assert!(outcome(&snoozed).starts_with("no card: snoozed until"));
+    assert_eq!(outcome(&quiet), "no card: seen through its newest");
+    assert!(
+        trace.nodes[&asking]
+            .inputs
+            .iter()
+            .any(|(key, _)| *key == "unit facts")
+    );
+    assert!(!trace.nodes[&asking].parts.is_empty());
 }

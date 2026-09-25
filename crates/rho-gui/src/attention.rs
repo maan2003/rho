@@ -480,6 +480,58 @@ impl Workspace {
         self.with_sources(cx, |sources| rank::context(sources, node))
     }
 
+    /// The ranking as it stands, with everything it weighed, into the
+    /// journal: `dealt` is the card the user is shown, if any.
+    pub(crate) fn journal_deal(
+        &self,
+        trigger: rho_journal::DealTrigger,
+        dealt: Option<&NodeId>,
+        cx: &gpui::App,
+    ) {
+        let now = jiff::Zoned::now();
+        let (hand, trace) = self.with_sources(cx, |sources| {
+            rank::rank_traced(sources, &now, &mut self.attention.cache.borrow_mut())
+        });
+        rho_journal::record(rho_journal::Event::Deal {
+            trigger,
+            occurred_at: now.timestamp().to_string(),
+            zone: now.time_zone().iana_name().unwrap_or("unnamed").to_owned(),
+            dealt: dealt.map(Self::journal_card_identity),
+            hand: hand
+                .cards
+                .iter()
+                .map(|card| rho_journal::DealtCard {
+                    card: Self::journal_card_identity(&card.node),
+                    kind: Self::journal_card_kind(card.kind),
+                    priority: card.priority,
+                    label: card.label.clone(),
+                    title: card.title.clone(),
+                    context: card.context.clone(),
+                    cursor: card.cursor.clone(),
+                    skipped: card.skipped,
+                })
+                .collect(),
+            weighed: trace
+                .nodes
+                .into_iter()
+                .map(|(node, weighed)| rho_journal::WeighedNode {
+                    card: Self::journal_card_identity(&node),
+                    outcome: weighed.outcome,
+                    inputs: weighed
+                        .inputs
+                        .into_iter()
+                        .map(|(key, value)| rho_journal::Input {
+                            key: key.to_owned(),
+                            value,
+                        })
+                        .collect(),
+                    parts: weighed.parts,
+                })
+                .collect(),
+            next_change: hand.next_change.map(|at| at.to_string()),
+        });
+    }
+
     /// The ranking as it stands.
     pub(crate) fn hand(&self, cx: &gpui::App) -> Hand {
         let now = jiff::Zoned::now();

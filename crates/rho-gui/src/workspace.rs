@@ -5474,6 +5474,7 @@ impl Workspace {
             VerdictAction::File => self.prompt_file_deal_card(window, cx),
             VerdictAction::Undo => self.undo_verdict(window, cx),
             VerdictAction::Pull => self.pull_card(window, cx),
+            VerdictAction::WrongCard => self.verdict_wrong_card(window, cx),
             VerdictAction::Snooze(None) => {
                 self.deal_snooze(SnoozeUnit::Days, None, window, cx);
             }
@@ -5928,8 +5929,52 @@ impl Workspace {
             self.open_home(window, cx);
             return;
         };
+        self.journal_deal(rho_journal::DealTrigger::Pull, Some(&card.node), cx);
         self.open_card(card, window, cx);
         self.invalidate_dealer_signals(cx);
+    }
+
+    /// `w`: the card in front of the user should not have been dealt, or
+    /// not there. Changes nothing in the hand; the journal keeps the hand
+    /// as it stood and the user's line about it, to replay and fix.
+    pub(crate) fn verdict_wrong_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.card_in_view(cx) else {
+            self.echo(
+                "wrong card: nothing under the deal",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                workspace.journal_deal(rho_journal::DealTrigger::WrongCard, Some(&card.node), cx);
+                rho_journal::record(rho_journal::Event::WrongCard {
+                    card: Self::journal_card_identity(&card.node),
+                    kind: Self::journal_card_kind(card.kind),
+                    reason: input.trim().to_owned(),
+                    occurred_at: jiff::Timestamp::now().to_string(),
+                });
+                workspace.echo(
+                    &format!("wrong card noted: {}", card.title),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            },
+        );
+        self.open_prompt("why is this card wrong:", complete, on_submit, window, cx);
+    }
+
+    pub(crate) fn journal_card_kind(kind: rho_dealer::CardKind) -> rho_journal::DealerCardKind {
+        match kind {
+            rho_dealer::CardKind::Agent => rho_journal::DealerCardKind::Agent,
+            rho_dealer::CardKind::Slack => rho_journal::DealerCardKind::Thread,
+            rho_dealer::CardKind::Dated => rho_journal::DealerCardKind::Note,
+        }
     }
 
     /// What the timeline records about a verdict on a card.
@@ -5939,14 +5984,9 @@ impl Workspace {
         at: jiff::Timestamp,
         skip_until: Option<jiff::Timestamp>,
     ) {
-        let kind = match card.kind {
-            rho_dealer::CardKind::Agent => rho_journal::DealerCardKind::Agent,
-            rho_dealer::CardKind::Slack => rho_journal::DealerCardKind::Thread,
-            rho_dealer::CardKind::Dated => rho_journal::DealerCardKind::Note,
-        };
         rho_journal::record(rho_journal::Event::Dealer {
             card: Self::journal_card_identity(&card.node),
-            kind,
+            kind: Self::journal_card_kind(card.kind),
             verdict,
             occurred_at: at.to_string(),
             skip_until: skip_until.map(|until| until.to_string()),

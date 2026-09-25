@@ -656,6 +656,70 @@ pub enum Event {
     PhoneVerdict {
         verdict: PhoneVerdict,
     },
+    /// Everything a deal weighed, when a card is dealt or called wrong: the
+    /// hand in order, and every node the dealer looked at with what became
+    /// of it and what it was weighed from, so a bad deal can be replayed.
+    Deal {
+        trigger: DealTrigger,
+        occurred_at: String,
+        /// The user's time zone then: "tomorrow" is their own midnight.
+        zone: String,
+        dealt: Option<DealerCardIdentity>,
+        hand: Vec<DealtCard>,
+        weighed: Vec<WeighedNode>,
+        next_change: Option<String>,
+    },
+    /// The user said the card in front of them should not have been dealt,
+    /// or not there. A [`Event::Deal`] with the same moment holds the hand.
+    WrongCard {
+        card: DealerCardIdentity,
+        kind: DealerCardKind,
+        reason: String,
+        occurred_at: String,
+    },
+}
+
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DealTrigger {
+    Pull,
+    WrongCard,
+}
+
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
+)]
+pub struct DealtCard {
+    pub card: DealerCardIdentity,
+    pub kind: DealerCardKind,
+    pub priority: f64,
+    pub label: String,
+    pub title: String,
+    pub context: String,
+    pub cursor: String,
+    pub skipped: bool,
+}
+
+/// One node the dealer looked at. Free-form on purpose: what is worth
+/// knowing about a node changes faster than a schema would.
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
+)]
+pub struct WeighedNode {
+    pub card: DealerCardIdentity,
+    pub outcome: String,
+    pub inputs: Vec<Input>,
+    pub parts: Vec<String>,
+}
+
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
+)]
+pub struct Input {
+    pub key: String,
+    pub value: String,
 }
 
 impl Event {
@@ -697,6 +761,8 @@ impl Event {
             Self::VerdictUndone { .. } => "verdict_undone",
             Self::PhoneFlick { .. } => "phone_flick",
             Self::PhoneVerdict { .. } => "phone_verdict",
+            Self::Deal { .. } => "deal",
+            Self::WrongCard { .. } => "wrong_card",
         }
     }
 }
@@ -1139,6 +1205,62 @@ mod tests {
         };
         let encoded = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+    }
+
+    #[test]
+    fn a_deal_and_a_wrong_card_are_kept_and_dumped() {
+        let card = DealerCardIdentity {
+            host: 0,
+            node_id: NodeIdentity::Note { uuid: [7; 16] },
+        };
+        let deal = Event::Deal {
+            trigger: DealTrigger::WrongCard,
+            occurred_at: "2026-09-25T20:00:00Z".into(),
+            zone: "Asia/Kolkata".into(),
+            dealt: Some(card.clone()),
+            hand: vec![DealtCard {
+                card: card.clone(),
+                kind: DealerCardKind::Note,
+                priority: 0.4,
+                label: "todo".into(),
+                title: "buy milk".into(),
+                context: String::new(),
+                cursor: "todo 1".into(),
+                skipped: false,
+            }],
+            weighed: vec![WeighedNode {
+                card: card.clone(),
+                outcome: "card at 0.400".into(),
+                inputs: vec![Input {
+                    key: "fact".into(),
+                    value: "Todo".into(),
+                }],
+                parts: vec!["Plate".into()],
+            }],
+            next_change: None,
+        };
+        let wrong = Event::WrongCard {
+            card,
+            kind: DealerCardKind::Note,
+            reason: "done yesterday".into(),
+            occurred_at: "2026-09-25T20:00:00Z".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+        journal.record(deal.clone());
+        journal.record(wrong.clone());
+        journal.flush().unwrap();
+        let mut output = Vec::new();
+        journal.dump(None, &mut output).unwrap();
+        let events: Vec<Event> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                serde_json::from_value(value["event"].clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(events, vec![deal, wrong]);
     }
 
     #[test]
