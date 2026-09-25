@@ -118,6 +118,7 @@ impl AuthenticatedIrohListener {
             ));
         }
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .keylog(std::env::var_os("SSLKEYLOGFILE").is_some())
             .secret_key(secret)
             .transport_config(transport.build())
             .alpns(vec![alpn.into()])
