@@ -204,7 +204,12 @@ fn receive_slot(
         .get(theirs.note)
         .map(|held| held.value().into_owned());
     match mine {
-        Some(mut mine) if mine.blob.as_deref() == Some(blob.as_slice()) => {
+        // The same note sealed apart: take the host's sealing, so every
+        // device puts the same bytes and none puts again.
+        Some(mut mine)
+            if mine.blob.as_deref() == Some(blob.as_slice()) || mine.plain == theirs.plain =>
+        {
+            mine.blob = Some(blob);
             mine.unsent = false;
             write
                 .open_table(NOTES)

@@ -355,3 +355,26 @@ async fn a_device_putting_many_notes_while_catching_up_keeps_its_stream() {
     a.abort();
     b.abort();
 }
+
+#[tokio::test]
+async fn devices_holding_the_same_note_settle_on_one_blob() {
+    let secret = Secret::generate();
+    let (server, _dir) = host().await;
+    let laptop = device(Some(secret)).await;
+    let phone = device(Some(secret)).await;
+    // Both carried the same revision over, each sealing it on its own.
+    laptop.streams.put_note([1; 16], b"same".to_vec()).await;
+    phone.streams.put_note([1; 16], b"same".to_vec()).await;
+    let links = [connect(&server, &laptop), connect(&server, &phone)];
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let version = |server: &LedgerServer| {
+        slots::next_after(&server.db.read(), 0).map(|(_, version, _)| version)
+    };
+    let settled = version(&server);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(version(&server), settled, "no put after settling");
+    assert!(settled.is_some_and(|version| version <= 2));
+    for link in links {
+        link.abort();
+    }
+}
