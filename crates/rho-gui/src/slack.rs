@@ -122,6 +122,9 @@ impl Workspace {
             window,
             cx,
         );
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_secret();
+        }
     }
 
     fn prompt_slack_cookie(
@@ -140,6 +143,9 @@ impl Workspace {
             window,
             cx,
         );
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_secret();
+        }
     }
 
     pub(crate) fn register_slack_workspace(
@@ -3010,6 +3016,9 @@ impl Workspace {
             }
             SessionEvent::Changed(changes) => {
                 for change in changes {
+                    rho_journal::record(rho_journal::Event::SlackChanged {
+                        change: format!("{change:?}"),
+                    });
                     // A thread that starts to matter needs nothing written:
                     // it is addressable as its unit, and the view shows it
                     // because the mirror says it is open.

@@ -2,7 +2,8 @@
 //!
 //! Call [`record`] with an [`Event`] at the interaction site. Each call is
 //! timestamped immediately and queued to a dedicated writer thread, which
-//! commits one event per transaction under the GUI state directory.
+//! commits whatever is queued in one transaction under the GUI state
+//! directory.
 //! The journal is deliberately generous and inert: it is for offline replay
 //! and measurement, and is never uploaded or used to adapt GUI behavior.
 //! The native GUI is already single-instance because it exclusively owns the
@@ -677,6 +678,56 @@ pub enum Event {
         reason: String,
         occurred_at: String,
     },
+    /// One key the user pressed while talking to an agent or on Slack, as
+    /// GPUI resolved it: what it was bound to and where it landed.
+    Key {
+        key: String,
+        text: Option<String>,
+        action: Option<String>,
+        surface: Option<SurfaceIdentity>,
+    },
+    /// A message the user sent an agent, whole.
+    AgentMessageSent {
+        agent: String,
+        text: String,
+        images: u32,
+    },
+    /// A line the GUI told the user, in the echo area and the messages
+    /// buffer: notices, host connections, errors.
+    Told {
+        text: String,
+        class: String,
+    },
+    /// What the GUI believes about an agent, each time the host changes it.
+    /// Times are the host's, in unix milliseconds.
+    AgentChanged {
+        agent: String,
+        title: String,
+        turn_running: bool,
+        turn_started_at: Option<u64>,
+        last_turn_ended: Option<u64>,
+        last_user_message_at: u64,
+        needs_you: bool,
+        errored: bool,
+    },
+    /// A menu item run, by its key or by a tap.
+    MenuRan {
+        action: String,
+        count: Option<u32>,
+    },
+    /// A mouse button pressed anywhere in the workspace, in window pixels.
+    Click {
+        button: String,
+        x: f32,
+        y: f32,
+        clicks: usize,
+        surface: Option<SurfaceIdentity>,
+    },
+    /// What Slack changed about a unit that wants the user: raised, a newer
+    /// message, answered, or let go in another client.
+    SlackChanged {
+        change: String,
+    },
 }
 
 #[derive(
@@ -763,6 +814,13 @@ impl Event {
             Self::PhoneVerdict { .. } => "phone_verdict",
             Self::Deal { .. } => "deal",
             Self::WrongCard { .. } => "wrong_card",
+            Self::Key { .. } => "key",
+            Self::AgentMessageSent { .. } => "agent_message_sent",
+            Self::Told { .. } => "told",
+            Self::AgentChanged { .. } => "agent_changed",
+            Self::MenuRan { .. } => "menu_ran",
+            Self::Click { .. } => "click",
+            Self::SlackChanged { .. } => "slack_changed",
         }
     }
 }
@@ -789,11 +847,15 @@ impl Journal {
     /// holds every other kind of client state too, under its own names;
     /// this touches the journal's and nothing else.
     pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
+        let scrubbed = db.read().has_table(SCRUBBED.name());
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
             write.delete_table("gui_action_journal_v1");
             write.open_table(EVENTS);
+            if !scrubbed {
+                scrub_secret_inputs(&mut write);
+            }
             write.commit();
         });
         let sequence = next_sequence(&db);
@@ -848,28 +910,83 @@ fn next_sequence(db: &RhoDb) -> u64 {
         })
 }
 
+/// Temporary: builds before secret prompts journaled what was typed into
+/// them: the Slack token and cookie, and the ledger's secret phrase. The
+/// scrub blanks those inputs once; this table says it ran. Remove both once
+/// every device has opened its journal with this build.
+const SCRUBBED: TableDefinition<(), ()> = TableDefinition::new("gui_action_journal_scrubbed_v1");
+
+fn secret_prompt(prompt: &str) -> bool {
+    prompt.ends_with(" xoxc token:")
+        || prompt.ends_with(" d cookie:")
+        || prompt.starts_with("secret phrase")
+}
+
+fn scrub_secret_inputs(write: &mut rho_db::WriteTxn) {
+    let leaked: Vec<(u64, Entry)> = write
+        .open_table(STORED_EVENTS)
+        .iter()
+        .filter_map(|(sequence, value)| {
+            let mut bytes = value.value();
+            let mut entry = <Entry as senax_encoder::Decoder>::decode(&mut bytes).ok()?;
+            let (Event::MinibufferSubmitted { prompt, input }
+            | Event::MinibufferCancelled { prompt, input }) = &mut entry.event
+            else {
+                return None;
+            };
+            if !secret_prompt(prompt) || input.is_empty() {
+                return None;
+            }
+            input.clear();
+            Some((sequence.value(), entry))
+        })
+        .collect();
+    let mut events = write.open_table(EVENTS);
+    for (sequence, entry) in &leaked {
+        events.insert(sequence, SenValue::borrowed(entry));
+    }
+    drop(events);
+    write.open_table(SCRUBBED).insert((), ());
+}
+
+/// Entries taken into one commit at most. A commit syncs the file, so a
+/// burst of keys is written together rather than one sync a key.
+const BATCH: usize = 1024;
+
 fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build action journal runtime");
 
-    for message in receiver {
-        match message {
-            Message::Entry(entry) => {
-                runtime.block_on(async {
-                    let mut write = db.write().await;
-                    write
-                        .open_table(EVENTS)
-                        .insert(&sequence, SenValue::borrowed(&entry));
-                    write.commit();
-                });
-                sequence = sequence
-                    .checked_add(1)
-                    .expect("action journal sequence overflow");
+    while let Ok(first) = receiver.recv() {
+        let mut entries = Vec::new();
+        let mut flushes = Vec::new();
+        let mut next = Some(first);
+        while let Some(message) = next {
+            match message {
+                Message::Entry(entry) => entries.push(entry),
+                Message::Flush(done) => flushes.push(done),
             }
-            Message::Flush(done) => {
-                let _ = done.send(());
-            }
+            next = (entries.len() < BATCH)
+                .then(|| receiver.try_recv().ok())
+                .flatten();
+        }
+        if !entries.is_empty() {
+            runtime.block_on(async {
+                let mut write = db.write().await;
+                let mut table = write.open_table(EVENTS);
+                for entry in &entries {
+                    table.insert(&sequence, SenValue::borrowed(entry));
+                    sequence = sequence
+                        .checked_add(1)
+                        .expect("action journal sequence overflow");
+                }
+                drop(table);
+                write.commit();
+            });
+        }
+        for done in flushes {
+            let _ = done.send(());
         }
     }
 }
@@ -1261,6 +1378,100 @@ mod tests {
             })
             .collect();
         assert_eq!(events, vec![deal, wrong]);
+    }
+
+    #[test]
+    fn a_journal_from_before_secret_prompts_loses_what_was_typed_into_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let typed = |prompt: &str, input: &str| Event::MinibufferSubmitted {
+            prompt: prompt.into(),
+            input: input.into(),
+        };
+        {
+            let db = rho_db::client::open(dir.path()).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut write = db.write().await;
+                let mut events = write.open_table(EVENTS);
+                for (sequence, event) in [
+                    typed("acme xoxc token:", "xoxc-1"),
+                    Event::MinibufferCancelled {
+                        prompt: "acme d cookie:".into(),
+                        input: "cookie".into(),
+                    },
+                    typed(
+                        "secret phrase from another device (empty makes a new one):",
+                        "abandon",
+                    ),
+                    typed("find:", "abandon"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let entry = Entry {
+                        timestamp: "2026-09-01T00:00:00Z".into(),
+                        event,
+                    };
+                    events.insert(&(sequence as u64), SenValue::borrowed(&entry));
+                }
+                drop(events);
+                write.commit();
+            });
+        }
+        let journal = Journal::open(dir.path()).unwrap();
+        let mut output = Vec::new();
+        journal.dump(None, &mut output).unwrap();
+        let dumped = String::from_utf8(output).unwrap();
+        assert!(!dumped.contains("xoxc-1"), "{dumped}");
+        assert!(!dumped.contains("cookie\""), "{dumped}");
+        assert_eq!(dumped.matches("abandon").count(), 1, "{dumped}");
+        assert!(
+            dumped.contains(r#""prompt":"find:","input":"abandon""#),
+            "{dumped}"
+        );
+    }
+
+    #[test]
+    fn a_burst_of_keys_is_kept_whole_and_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+        let keys: Vec<Event> = (0..3000)
+            .map(|at| Event::Key {
+                key: format!("k{at}"),
+                text: Some("k".into()),
+                action: None,
+                surface: Some(SurfaceIdentity::Transcript {
+                    agent_id: AgentIdentity("a".into()),
+                }),
+            })
+            .collect();
+        for key in keys.clone() {
+            journal.record(key);
+        }
+        journal.record(Event::Told {
+            text: "[devbox connected]".into(),
+            class: "SystemInfo".into(),
+        });
+        journal.flush().unwrap();
+        let mut output = Vec::new();
+        journal.dump(None, &mut output).unwrap();
+        let entries: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 3001);
+        for (at, entry) in entries.iter().enumerate() {
+            assert_eq!(entry["sequence"], at as u64);
+        }
+        let dumped: Vec<Event> = entries[..3000]
+            .iter()
+            .map(|entry| serde_json::from_value(entry["event"].clone()).unwrap())
+            .collect();
+        assert_eq!(dumped, keys);
+        assert_eq!(entries[3000]["event"]["type"], "told");
     }
 
     #[test]

@@ -820,7 +820,7 @@ impl Workspace {
                 }
             });
         let transient_keystroke_interceptor = cx.intercept_keystrokes(transient_keystroke_listener);
-        let keystroke_subscription = cx.observe_keystrokes(|_this, event, _window, _cx| {
+        let keystroke_subscription = cx.observe_keystrokes(|this, event, _window, _cx| {
             tracing::debug!(
                 key = %event.keystroke.key,
                 shift = event.keystroke.modifiers.shift,
@@ -829,6 +829,7 @@ impl Workspace {
                 platform = event.keystroke.modifiers.platform,
                 "keystroke"
             );
+            this.journal_key(event);
         });
         let mut last_window_active = None;
         let window_activation_subscription =
@@ -1712,6 +1713,19 @@ impl Workspace {
                 if changed.is_empty() {
                     return;
                 }
+                for agent_id in &changed {
+                    let facts = self.registry.agent_facts(*agent_id);
+                    rho_journal::record(rho_journal::Event::AgentChanged {
+                        agent: agent_id.encoded(),
+                        title: self.registry.agent_display_label(*agent_id),
+                        turn_running: facts.turn_running,
+                        turn_started_at: facts.turn_started_at.map(|at| at.0),
+                        last_turn_ended: facts.last_turn_ended.map(|at| at.0),
+                        last_user_message_at: facts.last_user_message_at.0,
+                        needs_you: facts.needs_you_hint,
+                        errored: facts.errored,
+                    });
+                }
                 // Their marks go with them: an agent that just arrived may
                 // already have a name.
                 self.push_agent_marks(&changed);
@@ -2153,6 +2167,21 @@ impl Workspace {
             );
             return;
         }
+        rho_journal::record(rho_journal::Event::AgentMessageSent {
+            agent: agent_id.encoded(),
+            text: content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            images: content
+                .iter()
+                .filter(|part| !matches!(part, ContentPart::Text { .. }))
+                .count() as u32,
+        });
         self.send_to_agent(
             agent_id,
             AgentCommand::Send {
@@ -3694,6 +3723,21 @@ impl Workspace {
         class: StyleClass,
         cx: &mut Context<Self>,
     ) {
+        rho_journal::record(rho_journal::Event::Told {
+            text: text.clone(),
+            class: format!("{class:?}"),
+        });
+        self.append_secret_message(text, class, cx);
+    }
+
+    /// [`Self::append_message`] for a line holding a credential: shown in
+    /// the message log, and kept out of the journal.
+    pub(crate) fn append_secret_message(
+        &mut self,
+        text: String,
+        class: StyleClass,
+        cx: &mut Context<Self>,
+    ) {
         self.messages
             .update(cx, |messages, cx| messages.append(text, class, cx));
         cx.notify();
@@ -3982,6 +4026,40 @@ impl Workspace {
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
+    }
+
+    /// A key pressed while talking to an agent or on Slack, into the
+    /// journal. Keys anywhere else stay out: notes are the user's own words,
+    /// shells take passwords, and prompts are journaled whole on submit.
+    fn journal_key(&self, event: &gpui::KeystrokeEvent) {
+        use rho_journal::SurfaceIdentity;
+        if self.minibuffer.is_some() || self.menu_buffer.is_some() {
+            return;
+        }
+        let Some(surface) = self
+            .history
+            .as_ref()
+            .map(|history| Self::journal_surface(&history.current().surface.key))
+        else {
+            return;
+        };
+        if !matches!(
+            surface,
+            SurfaceIdentity::Draft
+                | SurfaceIdentity::Transcript { .. }
+                | SurfaceIdentity::SlackList
+                | SurfaceIdentity::SlackConversation { .. }
+                | SurfaceIdentity::SlackSearch { .. }
+                | SurfaceIdentity::SlackInventory { .. }
+        ) {
+            return;
+        }
+        rho_journal::record(rho_journal::Event::Key {
+            key: event.keystroke.unparse(),
+            text: event.keystroke.key_char.clone(),
+            action: event.action.as_ref().map(|action| action.name().to_owned()),
+            surface: Some(surface),
+        });
     }
 
     fn journal_surface(key: &SurfaceKey) -> rho_journal::SurfaceIdentity {
@@ -5027,10 +5105,11 @@ impl Workspace {
         } else {
             minibuffer.accept_selected(window, cx);
         }
+        let secret = minibuffer.is_secret();
         let (input, on_submit) = minibuffer.into_submission(cx);
         rho_journal::record(rho_journal::Event::MinibufferSubmitted {
             prompt,
-            input: input.clone(),
+            input: if secret { String::new() } else { input.clone() },
         });
         self.finish_overlay_focus(window, cx);
         // Submitting keeps the narrowing, so there is nothing to put back.
@@ -5055,7 +5134,11 @@ impl Workspace {
         if let Some(minibuffer) = self.minibuffer.take() {
             rho_journal::record(rho_journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
-                input: minibuffer.input(cx),
+                input: if minibuffer.is_secret() {
+                    String::new()
+                } else {
+                    minibuffer.input(cx)
+                },
             });
             // What there was to find goes with the prompt that asked. A
             // snapshot is only honest for as long as the reader is looking
@@ -5414,6 +5497,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use crate::transient::MenuAction;
+        rho_journal::record(rho_journal::Event::MenuRan {
+            action: format!("{action:?}"),
+            count,
+        });
         match action {
             MenuAction::Open(id) => self.open_menu_by_id(id, count, window, cx),
             MenuAction::Verdict(verdict) => {
@@ -7137,6 +7224,18 @@ impl Workspace {
             .w_full()
             .flex_grow(1.0)
             .min_h_0()
+            .capture_any_mouse_down(cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
+                rho_journal::record(rho_journal::Event::Click {
+                    button: format!("{:?}", event.button),
+                    x: event.position.x.into(),
+                    y: event.position.y.into(),
+                    clicks: event.click_count,
+                    surface: this
+                        .history
+                        .as_ref()
+                        .map(|history| Self::journal_surface(&history.current().surface.key)),
+                });
+            }))
             .children(sidebar)
             .child(
                 div()

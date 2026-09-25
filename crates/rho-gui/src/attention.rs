@@ -940,7 +940,7 @@ impl Workspace {
     /// it, or taken from the user when this device has none yet.
     pub(crate) fn prompt_secret_phrase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(secret) = self.attention.secret() {
-            self.append_message(
+            self.append_secret_message(
                 format!(
                     "secret phrase (enter it on your other devices): {}",
                     secret.to_words()
@@ -996,7 +996,7 @@ impl Workspace {
                     return;
                 }
                 if made {
-                    workspace.append_message(
+                    workspace.append_secret_message(
                         format!(
                             "secret phrase (save it, and enter it on your other devices): {}",
                             secret.to_words()
@@ -1016,6 +1016,9 @@ impl Workspace {
             window,
             cx,
         );
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_secret();
+        }
     }
 }
 

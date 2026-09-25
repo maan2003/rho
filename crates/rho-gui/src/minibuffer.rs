@@ -156,6 +156,8 @@ pub struct Minibuffer {
     selection_moved: bool,
     complete_whole_input: bool,
     completed_selection: Option<(Candidate, usize)>,
+    /// What is typed here is a credential: the journal keeps none of it.
+    secret: bool,
     _edits: Subscription,
 }
 
@@ -166,6 +168,14 @@ const VISIBLE_CANDIDATES: usize = 8;
 impl Minibuffer {
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn set_secret(&mut self) {
+        self.secret = true;
+    }
+
+    pub fn is_secret(&self) -> bool {
+        self.secret
     }
 
     pub fn open(
@@ -215,6 +225,7 @@ impl Minibuffer {
             selection_moved: false,
             complete_whole_input: false,
             completed_selection: None,
+            secret: false,
             _edits: edits,
         }
     }
