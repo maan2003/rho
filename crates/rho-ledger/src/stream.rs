@@ -1,5 +1,5 @@
 //! Connections exchange log suffixes and forward bytes held from other hosts.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use futures::channel::mpsc as futures_mpsc;
@@ -9,27 +9,39 @@ use rho_rpc::protocol::{read_frame, write_frame, write_open};
 use tokio::sync::broadcast;
 
 use crate::ledger::{Channel, Item, Ledger, Received};
-use crate::protocol::{ClientFrame, DeviceId, LogId, Open, ServerFrame};
+use crate::notes::Arrived;
+use crate::protocol::{BlobHash, ClientFrame, DeviceId, LogId, Open, ServerFrame, SlotId, StoreId};
 use crate::secret::Secret;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LedgerEvent {
     Appended(Vec<Item>),
-    Unreadable { device: Option<DeviceId> },
+    /// A note from another device, now the one this device holds.
+    Note(Arrived),
+    Unreadable {
+        device: Option<DeviceId>,
+    },
     NeedsKey,
 }
+/// Whether their note (first) replaces the one this device holds.
+pub type KeepTheirs = Box<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
 pub struct LedgerStreams {
     ledger: Ledger,
+    keep_theirs: KeepTheirs,
     events: futures_mpsc::UnboundedSender<LedgerEvent>,
     changed: broadcast::Sender<()>,
 }
 impl LedgerStreams {
-    pub fn new(ledger: Ledger) -> (Arc<Self>, futures_mpsc::UnboundedReceiver<LedgerEvent>) {
+    pub fn new(
+        ledger: Ledger,
+        keep_theirs: KeepTheirs,
+    ) -> (Arc<Self>, futures_mpsc::UnboundedReceiver<LedgerEvent>) {
         let (events, receiver) = futures_mpsc::unbounded();
         let (changed, _) = broadcast::channel(256);
         (
             Arc::new(Self {
                 ledger,
+                keep_theirs,
                 events,
                 changed,
             }),
@@ -57,6 +69,10 @@ impl LedgerStreams {
             .collect();
         self.ledger.append(channel, payloads).await;
         let _ = self.events.unbounded_send(LedgerEvent::Appended(own));
+        let _ = self.changed.send(());
+    }
+    pub async fn put_note(&self, note: [u8; 16], plain: Vec<u8>) {
+        self.ledger.put_note(note, plain).await;
         let _ = self.changed.send(());
     }
     pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<()> {
@@ -104,18 +120,35 @@ impl LedgerStreams {
             &mut writer,
             &ClientFrame::Hello {
                 have: self.ledger.lengths(),
+                slots: self.ledger.slots_seen(),
             },
         )
         .await?;
-        let ServerFrame::Lengths { logs } = read_frame(&mut reader).await? else {
+        let ServerFrame::Lengths { store, logs } = read_frame(&mut reader).await? else {
             anyhow::bail!("host did not answer hello with lengths")
         };
         let mut host_lengths = logs;
+        // Puts said and not yet answered, so they are said once.
+        let mut putting = HashMap::new();
         self.send_missing(&mut writer, &mut host_lengths).await?;
+        self.send_notes(&mut writer, store, &mut putting).await?;
         loop {
             tokio::select! {
-                frame = read_frame::<_, ServerFrame>(&mut reader) => {
-                    let ServerFrame::Bytes { log, at, bytes } = frame? else { anyhow::bail!("host said lengths twice") };
+                frame = read_frame::<_, ServerFrame>(&mut reader) => match frame? {
+                ServerFrame::Lengths { .. } => anyhow::bail!("host said lengths twice"),
+                ServerFrame::Slot { slot, version, blob } => {
+                    putting.remove(&slot);
+                    let arrived = self
+                        .ledger
+                        .receive_slot(store, slot, version, blob, &*self.keep_theirs)
+                        .await;
+                    if let Some(arrived) = arrived {
+                        let _ = self.events.unbounded_send(LedgerEvent::Note(arrived));
+                        let _ = self.changed.send(());
+                    }
+                    self.send_notes(&mut writer, store, &mut putting).await?;
+                }
+                ServerFrame::Bytes { log, at, bytes } => {
                     // Catch-up and a subscribed live append may overlap. Only matching bytes may overlap.
                     let held = self.ledger.lengths().get(&log).copied().unwrap_or(0);
                     if at > held { anyhow::bail!("ledger gap at {at} after {held}"); }
@@ -133,9 +166,11 @@ impl LedgerStreams {
                     }
                     self.send_missing(&mut writer, &mut host_lengths).await?;
                 }
+                },
                 change = changed.recv() => {
                     if change.is_err_and(|error| matches!(error, broadcast::error::RecvError::Closed)) { return Ok(()); }
                     self.send_missing(&mut writer, &mut host_lengths).await?;
+                    self.send_notes(&mut writer, store, &mut putting).await?;
                 }
             }
         }
@@ -162,6 +197,24 @@ impl LedgerStreams {
                 host.insert(log, end);
                 break;
             }
+        }
+        Ok(())
+    }
+}
+impl LedgerStreams {
+    async fn send_notes(
+        &self,
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        store: StoreId,
+        putting: &mut HashMap<SlotId, BlobHash>,
+    ) -> anyhow::Result<()> {
+        for (slot, prev, blob) in self.ledger.note_puts(store) {
+            let hash = *blake3::hash(&blob).as_bytes();
+            if putting.get(&slot) == Some(&hash) {
+                continue;
+            }
+            putting.insert(slot, hash);
+            write_frame(writer, &ClientFrame::Put { slot, prev, blob }).await?;
         }
         Ok(())
     }

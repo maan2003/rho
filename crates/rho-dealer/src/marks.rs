@@ -205,6 +205,11 @@ impl Marks {
     }
 
     /// A note's newest revision.
+    /// Every note's newest revision, deleted ones too.
+    pub fn note_revs(&self) -> impl Iterator<Item = &NoteRev> {
+        self.notes.values()
+    }
+
     pub fn note(&self, note: uuid::Uuid) -> Option<&NoteRev> {
         self.notes.get(&note)
     }

@@ -114,8 +114,24 @@ impl Attention {
         let device = Device(ledger.device().0);
         let mut marks = Marks::default();
         marks.apply(read_entries(&ledger.items(Channel::Facts)));
-        marks.apply_notes(read_notes(&ledger.items(Channel::Notes)));
-        let (streams, events) = LedgerStreams::new(ledger);
+        if ledger.notes().is_empty() {
+            // Notes were revisions in a log; every device carries its log's
+            // newest of each into slots once. Remove with `Channel::Notes`.
+            let mut old = Marks::default();
+            old.apply_notes(read_notes(&ledger.items(Channel::Notes)));
+            futures::executor::block_on(async {
+                for rev in old.note_revs() {
+                    ledger.put_note(*rev.note.as_bytes(), rev.encode()).await;
+                }
+            });
+        }
+        marks.apply_notes(
+            ledger
+                .notes()
+                .iter()
+                .filter_map(|plain| NoteRev::decode(plain)),
+        );
+        let (streams, events) = LedgerStreams::new(ledger, Box::new(keep_theirs));
         (
             Self {
                 streams,
@@ -207,7 +223,7 @@ impl Attention {
                         ..rev.clone()
                     })));
                     touched.extend(self.marks.apply_notes([rev.clone()]));
-                    notes.push(rev.encode());
+                    notes.push(rev);
                 }
             }
         }
@@ -215,8 +231,10 @@ impl Attention {
             if !entries.is_empty() {
                 self.streams.append(Channel::Facts, entries).await;
             }
-            if !notes.is_empty() {
-                self.streams.append(Channel::Notes, notes).await;
+            for rev in notes {
+                self.streams
+                    .put_note(*rev.note.as_bytes(), rev.encode())
+                    .await;
             }
         });
         takeback.reverse();
@@ -238,6 +256,14 @@ fn read_entries(items: &[Item]) -> Vec<Entry> {
         .iter()
         .filter_map(|item| Entry::decode(&item.bytes))
         .collect()
+}
+
+/// Their revision replaces this device's only if it is newer.
+fn keep_theirs(theirs: &[u8], mine: &[u8]) -> bool {
+    match (NoteRev::decode(theirs), NoteRev::decode(mine)) {
+        (Some(theirs), Some(mine)) => theirs.id() > mine.id(),
+        (theirs, _) => theirs.is_some(),
+    }
 }
 
 fn read_notes(items: &[Item]) -> Vec<NoteRev> {
@@ -282,13 +308,51 @@ impl Workspace {
 
     fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
         match event {
-            LedgerEvent::Appended(items) => {
-                let (facts, notes): (Vec<Item>, Vec<Item>) = items
-                    .into_iter()
-                    .partition(|item| matches!(item.channel, Channel::Facts));
-                let mut touched = self.attention.marks.apply(read_entries(&facts));
-                touched.extend(self.attention.marks.apply_notes(read_notes(&notes)));
+            LedgerEvent::Appended(mut items) => {
+                items.retain(|item| matches!(item.channel, Channel::Facts));
+                let touched = self.attention.marks.apply(read_entries(&items));
                 self.marks_moved(touched, cx);
+            }
+            LedgerEvent::Note(arrived) => {
+                let Some(theirs) = NoteRev::decode(&arrived.plain) else {
+                    return;
+                };
+                let lost = arrived
+                    .replaced
+                    .as_deref()
+                    .and_then(NoteRev::decode)
+                    .filter(|mine| {
+                        arrived.replaced_unsent
+                            && !mine.deleted
+                            && mine.body != theirs.body
+                            && !mine.body.trim().is_empty()
+                    });
+                let touched = self.attention.marks.apply_notes([theirs]);
+                self.marks_moved(touched, cx);
+                if let Some(mine) = lost {
+                    // Written here while another device wrote it too: theirs
+                    // is newer, and what was written here stays, as its own
+                    // note.
+                    let title = self
+                        .attention
+                        .marks
+                        .get(&NodeId::Note(mine.note))
+                        .title()
+                        .to_owned();
+                    self.write_marks(
+                        vec![Write::Note {
+                            note: uuid::Uuid::new_v4(),
+                            body: Some(mine.body),
+                            deleted: Some(false),
+                        }],
+                        cx,
+                    );
+                    self.append_message(
+                        format!("notes: `{title}` changed on another device too; what was written here is kept as a new note"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
             }
             LedgerEvent::Unreadable { device } => self.append_message(
                 format!(

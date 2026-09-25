@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use rho_ledger::notes::Arrived;
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Channel, Ledger, Secret};
 
@@ -15,7 +16,8 @@ struct Device {
 async fn device(secret: Option<Secret>) -> Device {
     let dir = tempfile::tempdir().unwrap();
     let ledger = Ledger::open(RhoDb::open(dir.path().join("client.redb"))).await;
-    let (streams, events) = LedgerStreams::new(ledger);
+    // Here the greater note is the newer.
+    let (streams, events) = LedgerStreams::new(ledger, Box::new(|theirs, mine| theirs > mine));
     if let Some(secret) = secret {
         streams.set_secret(secret).await.unwrap();
     }
@@ -195,4 +197,119 @@ async fn a_record_larger_than_one_wire_chunk_is_read_once_complete() {
     );
     a.abort();
     b.abort();
+}
+
+async fn wait_for_note(device: &Device, plain: &[u8]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !device
+            .streams
+            .ledger()
+            .notes()
+            .iter()
+            .any(|note| note == plain)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("note synced in time");
+}
+#[tokio::test]
+async fn a_note_is_one_sealed_slot_holding_its_latest_revision() {
+    let secret = Secret::generate();
+    let (server, _dir) = host().await;
+    let laptop = device(Some(secret)).await;
+    let mut phone = device(Some(secret)).await;
+    let links = [connect(&server, &laptop), connect(&server, &phone)];
+    laptop.streams.put_note([1; 16], b"buy milk".to_vec()).await;
+    laptop
+        .streams
+        .put_note([1; 16], b"buy oat milk".to_vec())
+        .await;
+    wait_for_note(&phone, b"buy oat milk").await;
+    assert_eq!(
+        phone.streams.ledger().notes(),
+        vec![b"buy oat milk".to_vec()]
+    );
+    assert!(matches!(
+        next(&mut phone).await,
+        LedgerEvent::Note(Arrived { replaced: None, .. })
+    ));
+    let read = server.db.read();
+    let mut version = 0;
+    let mut held = Vec::new();
+    while let Some((_, next, blob)) = slots::next_after(&read, version) {
+        version = next;
+        held.push(blob);
+    }
+    assert_eq!(held.len(), 1, "the host keeps one blob per note");
+    assert!(!held[0].windows(4).any(|window| window == b"milk"));
+    for link in links {
+        link.abort();
+    }
+}
+#[tokio::test]
+async fn notes_said_apart_meet_on_the_newer_and_reach_every_host() {
+    let secret = Secret::generate();
+    let (h1, _one) = host().await;
+    let (h2, _two) = host().await;
+    let laptop = device(Some(secret)).await;
+    let mut phone = device(Some(secret)).await;
+    let both = device(Some(secret)).await;
+    // Written apart, each on its own host.
+    laptop.streams.put_note([1; 16], b"a: older".to_vec()).await;
+    phone.streams.put_note([1; 16], b"b: newer".to_vec()).await;
+    let links = [
+        connect(&h1, &laptop),
+        connect(&h2, &phone),
+        connect(&h1, &both),
+        connect(&h2, &both),
+    ];
+    wait_for_note(&laptop, b"b: newer").await;
+    wait_for_note(&both, b"b: newer").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(phone.streams.ledger().notes(), vec![b"b: newer".to_vec()]);
+    let slots = |server: &LedgerServer| {
+        let read = server.db.read();
+        std::iter::successors(slots::next_after(&read, 0), |(_, version, _)| {
+            slots::next_after(&read, *version)
+        })
+        .map(|(_, _, blob)| blob)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(slots(&h1), slots(&h2), "both hosts hold the same blob");
+    while let Ok(event) = phone.events.try_recv() {
+        assert!(
+            !matches!(event, LedgerEvent::Note(_)),
+            "the newer note stays"
+        );
+    }
+    for link in links {
+        link.abort();
+    }
+}
+#[tokio::test]
+async fn a_put_that_names_another_blob_is_refused_with_what_is_held() {
+    let (server, _dir) = host().await;
+    let slot = SlotId([7; 16]);
+    assert_eq!(server.put(slot, None, vec![1]).await, None);
+    let held = Some(ServerFrame::Slot {
+        slot,
+        version: 1,
+        blob: vec![1],
+    });
+    assert_eq!(server.put(slot, None, vec![2]).await, held);
+    assert_eq!(server.put(slot, Some([0; 32]), vec![2]).await, held);
+    assert_eq!(
+        server.put(slot, Some(slots::hash(&[1])), vec![2]).await,
+        None
+    );
+    assert_eq!(
+        server.put(SlotId([8; 16]), Some([0; 32]), vec![3]).await,
+        Some(ServerFrame::Slot {
+            slot: SlotId([8; 16]),
+            version: 0,
+            blob: Vec::new(),
+        })
+    );
 }

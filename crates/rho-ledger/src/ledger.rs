@@ -95,6 +95,7 @@ impl Ledger {
             write.delete_table(table);
         }
         store::open(&mut write);
+        crate::notes::open(&mut write);
         write.open_table(READ);
         write.open_table(UNSENT);
         let mut table = write.open_table(SELF);
@@ -115,6 +116,9 @@ impl Ledger {
         drop(table);
         write.commit();
         Self { db }
+    }
+    pub(crate) fn db(&self) -> &RhoDb {
+        &self.db
     }
     fn me(&self) -> SelfRecord {
         self.db
@@ -237,6 +241,7 @@ impl Ledger {
             append_sealed(&mut write, secret, &envelope);
             write.open_table(UNSENT).remove(index);
         }
+        crate::notes::seal_held(&mut write, secret);
         write.commit();
         let mut received = Received::default();
         for log in self.lengths().keys() {
