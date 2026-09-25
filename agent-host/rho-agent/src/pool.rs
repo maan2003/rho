@@ -1279,21 +1279,25 @@ mod tests {
             assert!(read.agent_response_subscribers(owned).is_empty());
         }
 
-        // The creator no longer manages it.
-        for call in [
+        // The creator may still answer it, but no longer manages it.
+        call_agent_tool(
+            tools_of(creator_id, None),
             AgentCall::Message(SendArgs {
                 agent_id: owned_handle.clone(),
-                message: "one more thing".into(),
+                message: "more context".into(),
             }),
+        )
+        .await
+        .unwrap();
+        let error = call_agent_tool(
+            tools_of(creator_id, None),
             AgentCall::Cancel(InterruptArgs {
                 agent_id: owned_handle.clone(),
             }),
-        ] {
-            let error = call_agent_tool(tools_of(creator_id, None), call)
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("managed by the user"), "{error}");
-        }
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("managed by the user"), "{error}");
 
         // Its own children still reach it, but one working for an agent
         // cannot open a thread for the user.

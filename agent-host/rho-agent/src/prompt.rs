@@ -14,8 +14,8 @@ agents.spawn_user_owned_engineer(*, task_name: str, prompt: str, workdir: str) â
 ```
 
 Start an Engineer that the user manages as its own thread. It appears in the user's agent list, and
-the user reads and directs it from then on. Its responses go to the user, not to you, and you
-cannot message or interrupt it. Returns its identity.
+the user reads and directs it from then on. Its responses go to the user, not to you, but it may
+ask you for more context. Returns its identity.
 
 Use it only when the user asks for a separate agent or thread, or agrees when you propose one;
 every thread competes for the user's attention. Never use it to get around spawn limits or to
@@ -29,8 +29,9 @@ fn user_owned_ownership(by: &str) -> String {
     format!(
         "Engineer {by} started you for the user. The user manages you: they read your \
          responses and direct you from here on. {by}'s first message is your starting brief; \
-         after it, the user's messages take priority. Your final response is not mailed to \
-         {by}, and {by} cannot message or interrupt you. You own the user's technical outcome."
+         after it, the user's messages take priority. Your final response goes to the user, \
+         not to {by}; ask {by} with agents.message if you need more context. You own the \
+         user's technical outcome."
     )
 }
 

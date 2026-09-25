@@ -218,17 +218,17 @@ async fn spawn_user_owned_engineer(
     let cwd = pool.db().read().get_agent(agent_id).place().cwd.clone();
     Ok(format!(
         "Spawned user-owned Engineer {} for task \"{}\". It works in {}. It appears in the \
-         user's agent list and reports to the user, not to you; you cannot message or interrupt it.",
+         user's agent list and reports to the user, not to you.",
         pool.agent_handle(agent_id),
         task_name,
         cwd,
     ))
 }
 
-/// An agent spawned as user-owned hears only from the user and from the
-/// agents it spawned itself: the Engineer that started it no longer
-/// manages it.
-fn ensure_may_reach(pool: &AgentPool, sender: AgentId, target: AgentId) -> anyhow::Result<()> {
+/// Only the user and the agents it spawned itself interrupt a user-owned
+/// agent: the Engineer that started it may still talk to it, but no
+/// longer manages it.
+fn ensure_may_interrupt(pool: &AgentPool, sender: AgentId, target: AgentId) -> anyhow::Result<()> {
     let read = pool.db().read();
     let user_owned = matches!(
         read.get_agent(target).config.spawned_by,
@@ -236,7 +236,7 @@ fn ensure_may_reach(pool: &AgentPool, sender: AgentId, target: AgentId) -> anyho
     );
     anyhow::ensure!(
         !user_owned || read.agent_parent(sender) == Some(target),
-        "{} is managed by the user; tell the user instead",
+        "{} is managed by the user; only the user can interrupt it",
         pool.agent_handle(target)
     );
     Ok(())
@@ -283,7 +283,6 @@ async fn message_agent(tools: &MultiAgentTools, args: SendArgs) -> anyhow::Resul
     if recipient == tools.self_id {
         anyhow::bail!("cannot send a message to yourself");
     }
-    ensure_may_reach(&pool, tools.self_id, recipient)?;
     pool.deliver_mail(
         tools.self_id,
         recipient,
@@ -328,7 +327,7 @@ async fn interrupt_engineer(
     if target == tools.self_id {
         anyhow::bail!("cannot interrupt yourself");
     }
-    ensure_may_reach(&pool, tools.self_id, target)?;
+    ensure_may_interrupt(&pool, tools.self_id, target)?;
     let (_, agent, _) = pool.load(target).await?;
     agent.cancel();
     Ok(format!(
