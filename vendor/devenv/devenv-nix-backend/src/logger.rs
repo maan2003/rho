@@ -34,7 +34,7 @@ fn log_message(level: i32, msg: &str) {
 
 /// Nix colours its messages whether or not anyone renders them; its CLI
 /// filters the escapes out at print time, which the C API does not.
-fn strip_ansi(msg: &str) -> String {
+pub fn strip_ansi(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut chars = msg.chars();
     while let Some(c) = chars.next() {

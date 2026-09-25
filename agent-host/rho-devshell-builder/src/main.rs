@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
+use devenv_nix_backend::logger::strip_ansi;
 use devenv_nix_backend::{DevShellRequest, LocalInput, NIX_STACK_SIZE, NixRuntime};
 use rho_devshell::{Client, Evaluated, Flake, InputUrl, Observation, SHELL_FAILED, Shell, Watch};
 
@@ -94,18 +95,20 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_target(false)
+        // Nix's messages carry their own `warning:` or `error:`.
+        .with_level(false)
         .without_time()
         .init();
     // Evaluation recurses deeply; match the Nix CLI's stack.
     std::thread::Builder::new()
         .stack_size(NIX_STACK_SIZE)
         .spawn(move || {
-            let mut nix = NixRuntime::new().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let mut nix = NixRuntime::new().map_err(|e| anyhow::anyhow!(plain(e.chain())))?;
             match mode {
                 Mode::Shell { flake, dir, cache } => match shell(&mut nix, &flake, dir.as_deref(), cache)? {
                     Ok(shell) => println!("{}", serde_json::to_string(&shell)?),
                     Err(failure) => {
-                        eprintln!("{}", strip_ansi(&failure.error));
+                        eprintln!("{}", failure.error);
                         println!("{}", serde_json::to_string(&failure.watch)?);
                         std::process::exit(SHELL_FAILED);
                     }
@@ -184,26 +187,13 @@ struct Failure {
     watch: Watch,
 }
 
-/// `text` without terminal escapes: Nix colours its errors.
-fn strip_ansi(text: &str) -> String {
-    let mut plain = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            // CSI sequences end at a byte in @..~.
-            if chars.next() == Some('[') {
-                for c in chars.by_ref() {
-                    if ('@'..='~').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        plain.push(c);
-    }
-    plain
+/// An error from Nix as plain text: each context, then what it wraps, a
+/// line each.
+fn plain<'a>(chain: impl Iterator<Item = &'a (dyn std::error::Error + 'static)>) -> String {
+    let lines: Vec<String> = chain.map(|error| error.to_string().trim_matches('\n').to_owned()).collect();
+    strip_ansi(&lines.join("\n"))
 }
+
 
 /// The newest cached shell whose observations all hold now and whose
 /// environment could be pinned.
@@ -323,10 +313,10 @@ fn evaluate(nix: &mut NixRuntime, flake: &Flake) -> Result<Evaluation, Failure> 
             watch: Watch::failed(flake, &observations),
         }
     };
-    let eval = nix.eval_dev_shell(&request).map_err(|error| failed(format!("{error:?}"), &[]))?;
+    let eval = nix.eval_dev_shell(&request).map_err(|error| failed(plain(error.chain()), &[]))?;
     let shell = match eval.shell {
         Ok(shell) => shell,
-        Err(error) => return Err(failed(format!("{error:?}"), &eval.observations)),
+        Err(error) => return Err(failed(plain(error.chain()), &eval.observations)),
     };
     let cacheable = match record(&flake.source.root, eval.observations) {
         Ok(observations) => Some(observations),
@@ -382,7 +372,7 @@ async fn store(nix: &mut NixRuntime, client: &Client, key: &str, dir: &Path, eva
     let roots = rho_devshell::roots_dir(dir);
     std::fs::create_dir_all(&roots)?;
     nix.add_gc_root(&rho_devshell::gc_root(&roots, env_store_path), env_store_path)
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(|e| anyhow::anyhow!(plain(e.chain())))?;
     client
         .store(key.to_owned(), env_store_path.clone(), serde_json::to_vec(evaluated)?)
         .await
@@ -393,7 +383,7 @@ fn pin(nix: &mut NixRuntime, gc_root: &Path, store_path: &str) -> Result<bool> {
     if let Some(dir) = gc_root.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    nix.pin(gc_root, store_path).map_err(|e| anyhow::anyhow!("{e:?}"))
+    nix.pin(gc_root, store_path).map_err(|e| anyhow::anyhow!(plain(e.chain())))
 }
 
 /// Write `env_store_path`'s activation script into the cache directory
@@ -408,7 +398,7 @@ fn write_activation(nix: &NixRuntime, dir: &Path, env_store_path: &str) -> Resul
     std::fs::create_dir_all(&data)?;
     let script = nix
         .rc_script(&json, &data, &data.join("outputs"))
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        .map_err(|e| anyhow::anyhow!(plain(e.chain())))?;
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     std::io::Write::write_all(&mut temporary, script.as_bytes())?;
     temporary.persist(&path)?;
