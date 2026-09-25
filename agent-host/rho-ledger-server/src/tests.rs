@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt as _;
 use rho_ledger::notes::Arrived;
+use rho_ledger::protocol::SlotId;
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
 use rho_ledger::{Channel, Ledger, Secret};
 
@@ -312,4 +312,46 @@ async fn a_put_that_names_another_blob_is_refused_with_what_is_held() {
             blob: Vec::new(),
         })
     );
+}
+
+#[tokio::test]
+async fn a_device_putting_many_notes_while_catching_up_keeps_its_stream() {
+    let secret = Secret::generate();
+    let (server, _dir) = host().await;
+    let laptop = device(Some(secret)).await;
+    let phone = device(Some(secret)).await;
+    for note in 0..200u8 {
+        laptop.streams.put_note([note; 16], vec![b'l'; 300]).await;
+        let mut id = [note; 16];
+        id[0] = 0xff;
+        phone.streams.put_note(id, vec![b'p'; 300]).await;
+    }
+    let a = connect(&server, &laptop);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !laptop.streams.ledger().note_puts(server.store).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("laptop's notes put");
+    // The phone puts its notes while the host streams it the laptop's.
+    let b = connect(&server, &phone);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while phone.streams.ledger().notes().len() < 400
+            || laptop.streams.ledger().notes().len() < 400
+        {
+            eprintln!(
+                "progress phone {} laptop {} puts {}",
+                phone.streams.ledger().notes().len(),
+                laptop.streams.ledger().notes().len(),
+                phone.streams.ledger().note_puts(server.store).len()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("every note reaches both");
+    assert!(!a.is_finished() && !b.is_finished(), "no stream broke");
+    a.abort();
+    b.abort();
 }

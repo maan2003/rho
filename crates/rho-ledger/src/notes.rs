@@ -154,65 +154,78 @@ impl Ledger {
             .collect()
     }
 
-    /// What `store` holds in `slot` as of `version`. `keep_theirs` says
-    /// whether their note replaces this device's; the answer is what
-    /// arrived, if it did.
-    pub async fn receive_slot(
+    /// What `store` holds in each slot, as of each version, in one write.
+    /// `keep_theirs` says whether their note replaces this device's; the
+    /// answer is what arrived.
+    pub async fn receive_slots(
         &self,
         store: StoreId,
-        slot: SlotId,
-        version: u64,
-        blob: Vec<u8>,
+        slots: Vec<(SlotId, u64, Vec<u8>)>,
         keep_theirs: &(dyn Fn(&[u8], &[u8]) -> bool + Send + Sync),
-    ) -> Option<Arrived> {
-        let secret = self.secret()?;
+    ) -> Vec<Arrived> {
+        let Some(secret) = self.secret() else {
+            return Vec::new();
+        };
         let mut write = self.db().write().await;
-        let mut seen = write.open_table(SEEN);
-        let last = seen.get(store.0).map_or(0, |seen| seen.value());
-        seen.insert(store.0, last.max(version));
-        drop(seen);
-        if blob.is_empty() {
-            write.open_table(HOSTS).remove((store.0, slot.0));
-            write.commit();
-            return None;
-        }
-        write
-            .open_table(HOSTS)
-            .insert((store.0, slot.0), hash(&blob));
-        let Some(theirs) = open_note(secret, slot, &blob) else {
-            write.commit();
-            return None;
-        };
-        let mine = write
-            .open_table(NOTES)
-            .get(theirs.note)
-            .map(|held| held.value().into_owned());
-        let arrived = match mine {
-            Some(mut mine) if mine.blob.as_deref() == Some(blob.as_slice()) => {
-                mine.unsent = false;
-                write
-                    .open_table(NOTES)
-                    .insert(theirs.note, SenValue::borrowed(&mine));
-                None
-            }
-            Some(mine) if !keep_theirs(&theirs.plain, &mine.plain) => None,
-            mine => {
-                write.open_table(NOTES).insert(
-                    theirs.note,
-                    SenValue::borrowed(&Held {
-                        plain: theirs.plain.clone(),
-                        blob: Some(blob),
-                        unsent: false,
-                    }),
-                );
-                Some(Arrived {
-                    plain: theirs.plain,
-                    replaced_unsent: mine.as_ref().is_some_and(|mine| mine.unsent),
-                    replaced: mine.map(|mine| mine.plain),
-                })
-            }
-        };
+        let arrived = slots
+            .into_iter()
+            .filter_map(|(slot, version, blob)| {
+                receive_slot(&mut write, secret, store, slot, version, blob, keep_theirs)
+            })
+            .collect();
         write.commit();
         arrived
+    }
+}
+
+fn receive_slot(
+    write: &mut WriteTxn,
+    secret: Secret,
+    store: StoreId,
+    slot: SlotId,
+    version: u64,
+    blob: Vec<u8>,
+    keep_theirs: &(dyn Fn(&[u8], &[u8]) -> bool + Send + Sync),
+) -> Option<Arrived> {
+    let mut seen = write.open_table(SEEN);
+    let last = seen.get(store.0).map_or(0, |seen| seen.value());
+    seen.insert(store.0, last.max(version));
+    drop(seen);
+    if blob.is_empty() {
+        write.open_table(HOSTS).remove((store.0, slot.0));
+        return None;
+    }
+    write
+        .open_table(HOSTS)
+        .insert((store.0, slot.0), hash(&blob));
+    let theirs = open_note(secret, slot, &blob)?;
+    let mine = write
+        .open_table(NOTES)
+        .get(theirs.note)
+        .map(|held| held.value().into_owned());
+    match mine {
+        Some(mut mine) if mine.blob.as_deref() == Some(blob.as_slice()) => {
+            mine.unsent = false;
+            write
+                .open_table(NOTES)
+                .insert(theirs.note, SenValue::borrowed(&mine));
+            None
+        }
+        Some(mine) if !keep_theirs(&theirs.plain, &mine.plain) => None,
+        mine => {
+            write.open_table(NOTES).insert(
+                theirs.note,
+                SenValue::borrowed(&Held {
+                    plain: theirs.plain.clone(),
+                    blob: Some(blob),
+                    unsent: false,
+                }),
+            );
+            Some(Arrived {
+                plain: theirs.plain,
+                replaced_unsent: mine.as_ref().is_some_and(|mine| mine.unsent),
+                replaced: mine.map(|mine| mine.plain),
+            })
+        }
     }
 }

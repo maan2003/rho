@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use futures::channel::mpsc as futures_mpsc;
 use futures::future::BoxFuture;
+use futures::{FutureExt as _, StreamExt as _};
 use rho_agent_hosts::{Dialer, HostStream};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 use tokio::sync::broadcast;
@@ -132,41 +133,52 @@ impl LedgerStreams {
         let mut putting = HashMap::new();
         self.send_missing(&mut writer, &mut host_lengths).await?;
         self.send_notes(&mut writer, store, &mut putting).await?;
+        // A frame read half-way must not be dropped when a change wakes the
+        // loop: the stream keeps the read in flight across it.
+        let mut frames = std::pin::pin!(futures::stream::unfold(reader, |mut reader| async {
+            let frame = read_frame::<_, ServerFrame>(&mut reader).await;
+            Some((frame, reader))
+        }));
         loop {
             tokio::select! {
-                frame = read_frame::<_, ServerFrame>(&mut reader) => match frame? {
-                ServerFrame::Lengths { .. } => anyhow::bail!("host said lengths twice"),
-                ServerFrame::Slot { slot, version, blob } => {
-                    putting.remove(&slot);
-                    let arrived = self
-                        .ledger
-                        .receive_slot(store, slot, version, blob, &*self.keep_theirs)
-                        .await;
-                    if let Some(arrived) = arrived {
-                        let _ = self.events.unbounded_send(LedgerEvent::Note(arrived));
-                        let _ = self.changed.send(());
+                frame = frames.next() => {
+                    // Whatever else has arrived is taken in with it: slots in
+                    // one write.
+                    let mut batch = vec![frame.expect("frames never end")?];
+                    while batch.len() < 256 {
+                        match frames.next().now_or_never() {
+                            Some(frame) => batch.push(frame.expect("frames never end")?),
+                            None => break,
+                        }
                     }
-                    self.send_notes(&mut writer, store, &mut putting).await?;
-                }
-                ServerFrame::Bytes { log, at, bytes } => {
-                    // Catch-up and a subscribed live append may overlap. Only matching bytes may overlap.
-                    let held = self.ledger.lengths().get(&log).copied().unwrap_or(0);
-                    if at > held { anyhow::bail!("ledger gap at {at} after {held}"); }
-                    let overlap = usize::try_from(held - at).unwrap_or(usize::MAX).min(bytes.len());
-                    if overlap > 0 {
-                        let local = self.ledger.bytes_after(log, at, overlap);
-                        if local[..] != bytes[..overlap] { anyhow::bail!("divergent ledger bytes"); }
+                    let mut slots = Vec::new();
+                    for frame in batch {
+                        match frame {
+                            ServerFrame::Lengths { .. } => anyhow::bail!("host said lengths twice"),
+                            ServerFrame::Slot { slot, version, blob } => {
+                                putting.remove(&slot);
+                                slots.push((slot, version, blob));
+                            }
+                            ServerFrame::Bytes { log, at, bytes } => {
+                                self.receive_bytes(log, at, bytes, &mut host_lengths).await?;
+                            }
+                        }
                     }
-                    let end = at + bytes.len() as u64;
-                    host_lengths.entry(log).and_modify(|length| *length = (*length).max(end)).or_insert(end);
-                    if overlap < bytes.len() {
-                        let result = self.ledger.receive(log, held, bytes[overlap..].to_vec()).await;
-                        self.report(result, Some(log));
-                        let _ = self.changed.send(());
+                    if !slots.is_empty() {
+                        let arrived = self
+                            .ledger
+                            .receive_slots(store, slots, &*self.keep_theirs)
+                            .await;
+                        if !arrived.is_empty() {
+                            let _ = self.changed.send(());
+                        }
+                        for arrived in arrived {
+                            let _ = self.events.unbounded_send(LedgerEvent::Note(arrived));
+                        }
                     }
                     self.send_missing(&mut writer, &mut host_lengths).await?;
+                    self.send_notes(&mut writer, store, &mut putting).await?;
                 }
-                },
                 change = changed.recv() => {
                     if change.is_err_and(|error| matches!(error, broadcast::error::RecvError::Closed)) { return Ok(()); }
                     self.send_missing(&mut writer, &mut host_lengths).await?;
@@ -202,6 +214,42 @@ impl LedgerStreams {
     }
 }
 impl LedgerStreams {
+    async fn receive_bytes(
+        &self,
+        log: LogId,
+        at: u64,
+        bytes: Vec<u8>,
+        host: &mut BTreeMap<LogId, u64>,
+    ) -> anyhow::Result<()> {
+        // Catch-up and a subscribed live append may overlap. Only matching
+        // bytes may overlap.
+        let held = self.ledger.lengths().get(&log).copied().unwrap_or(0);
+        if at > held {
+            anyhow::bail!("ledger gap at {at} after {held}");
+        }
+        let overlap = usize::try_from(held - at)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        if overlap > 0 {
+            let local = self.ledger.bytes_after(log, at, overlap);
+            if local[..] != bytes[..overlap] {
+                anyhow::bail!("divergent ledger bytes");
+            }
+        }
+        let end = at + bytes.len() as u64;
+        host.entry(log)
+            .and_modify(|length| *length = (*length).max(end))
+            .or_insert(end);
+        if overlap < bytes.len() {
+            let result = self
+                .ledger
+                .receive(log, held, bytes[overlap..].to_vec())
+                .await;
+            self.report(result, Some(log));
+            let _ = self.changed.send(());
+        }
+        Ok(())
+    }
     async fn send_notes(
         &self,
         writer: &mut (impl tokio::io::AsyncWrite + Unpin),

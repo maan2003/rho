@@ -2,8 +2,9 @@
 //! per note slot.
 use std::collections::BTreeMap;
 
+use futures::{FutureExt as _, StreamExt as _};
 use rho_db::RhoDb;
-use rho_ledger::protocol::{BlobHash, ClientFrame, LogId, ServerFrame, SlotId, StoreId};
+use rho_ledger::protocol::{ClientFrame, LogId, ServerFrame, StoreId};
 use rho_rpc::protocol::{read_frame, write_frame};
 use tokio::sync::broadcast;
 
@@ -19,6 +20,8 @@ const RETIRED: [&str; 7] = [
     "rho_desk_parent_labels_v1",
 ];
 const CHUNK: usize = 64 * 1024;
+/// The most frames applied in one write.
+const BATCH: usize = 256;
 mod slots;
 
 pub struct LedgerServer {
@@ -45,41 +48,59 @@ impl LedgerServer {
     fn lengths(&self) -> BTreeMap<LogId, u64> {
         rho_ledger::store::lengths(&self.db.read())
     }
-    async fn append(&self, log: LogId, at: u64, bytes: Vec<u8>) {
-        if bytes.is_empty() {
-            return;
-        }
+    /// Applies what a device sent, in one write. Returns, for each refused
+    /// put, what the slot still holds, for that device.
+    async fn apply(&self, frames: Vec<ClientFrame>) -> anyhow::Result<Vec<ServerFrame>> {
         let mut write = self.db.write().await;
-        if !rho_ledger::store::append(&mut write, log, at, &bytes) {
-            return;
+        let mut accepted = Vec::new();
+        let mut refused = Vec::new();
+        for frame in frames {
+            match frame {
+                ClientFrame::Append { log, at, bytes } => {
+                    if !bytes.is_empty() && rho_ledger::store::append(&mut write, log, at, &bytes) {
+                        accepted.push(ServerFrame::Bytes { log, at, bytes });
+                    }
+                }
+                ClientFrame::Put { slot, prev, blob } => {
+                    match slots::put(&mut write, slot, prev, &blob) {
+                        Ok(version) => accepted.push(ServerFrame::Slot {
+                            slot,
+                            version,
+                            blob,
+                        }),
+                        Err((version, blob)) => refused.push(ServerFrame::Slot {
+                            slot,
+                            version,
+                            blob,
+                        }),
+                    }
+                }
+                ClientFrame::Hello { .. } => anyhow::bail!("ledger stream says hello once"),
+            }
         }
         write.commit();
-        let _ = self.updates.send(ServerFrame::Bytes { log, at, bytes });
+        for frame in accepted {
+            let _ = self.updates.send(frame);
+        }
+        Ok(refused)
     }
-    /// Refused, what the slot still holds, for the device that put.
+    #[cfg(test)]
+    async fn append(&self, log: LogId, at: u64, bytes: Vec<u8>) {
+        self.apply(vec![ClientFrame::Append { log, at, bytes }])
+            .await
+            .unwrap();
+    }
+    #[cfg(test)]
     async fn put(
         &self,
-        slot: SlotId,
-        prev: Option<BlobHash>,
+        slot: rho_ledger::protocol::SlotId,
+        prev: Option<rho_ledger::protocol::BlobHash>,
         blob: Vec<u8>,
     ) -> Option<ServerFrame> {
-        let mut write = self.db.write().await;
-        match slots::put(&mut write, slot, prev, &blob) {
-            Ok(version) => {
-                write.commit();
-                let _ = self.updates.send(ServerFrame::Slot {
-                    slot,
-                    version,
-                    blob,
-                });
-                None
-            }
-            Err((version, blob)) => Some(ServerFrame::Slot {
-                slot,
-                version,
-                blob,
-            }),
-        }
+        self.apply(vec![ClientFrame::Put { slot, prev, blob }])
+            .await
+            .unwrap()
+            .pop()
     }
     pub async fn serve<R, W>(&self, mut reader: R, mut writer: W) -> anyhow::Result<()>
     where
@@ -109,17 +130,27 @@ impl LedgerServer {
             })
             .collect();
         let mut slots_since = Some(slots.get(&self.store).copied().unwrap_or(0));
+        // A frame read half-way must not be dropped when another branch is
+        // ready: the stream keeps the read in flight across the loop.
+        let mut frames = std::pin::pin!(futures::stream::unfold(reader, |mut reader| async {
+            let frame = read_frame::<_, ClientFrame>(&mut reader).await;
+            Some((frame, reader))
+        }));
         loop {
             tokio::select! {
-                frame = read_frame::<_, ClientFrame>(&mut reader) => match frame? {
-                    ClientFrame::Append { log, at, bytes } => self.append(log, at, bytes).await,
-                    ClientFrame::Put { slot, prev, blob } => {
-                        if let Some(held) = self.put(slot, prev, blob).await {
-                            write_frame(&mut writer, &held).await?;
+                frame = frames.next() => {
+                    // Whatever else has arrived goes in the same write.
+                    let mut batch = vec![frame.expect("frames never end")?];
+                    while batch.len() < BATCH {
+                        match frames.next().now_or_never() {
+                            Some(frame) => batch.push(frame.expect("frames never end")?),
+                            None => break,
                         }
                     }
-                    ClientFrame::Hello { .. } => anyhow::bail!("ledger stream says hello once"),
-                },
+                    for held in self.apply(batch).await? {
+                        write_frame(&mut writer, &held).await?;
+                    }
+                }
                 _ = std::future::ready(()), if !catchup.is_empty() => {
                     let (log, at, length) = catchup[0];
                     let bytes = rho_ledger::store::read(&self.db.read(), log, at, CHUNK);
