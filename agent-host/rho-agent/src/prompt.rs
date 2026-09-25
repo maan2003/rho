@@ -21,11 +21,18 @@ Give it its own checkout: create a git worktree in the workset with `git worktre
 as workdir, so its edits do not collide with yours or other Engineers'.
 
 Use it only when the user asks for a separate agent or thread, or agrees when you propose one;
-every thread competes for the user's attention. Never use it to get around spawn limits or to
-offload work you were asked to do. The prompt is its whole brief, and you cannot add to it later.
-Afterwards, tell the user its handle and what it is for.
+every thread competes for the user's attention. The prompt is its whole brief. Afterwards, tell the
+user its handle and what it is for.
 
 "#;
+
+/// Who a user-owned agent can ask for the context behind its brief.
+fn started_by_note(by: &str) -> String {
+    format!(
+        "Engineer {by} started you for the user; ask it with agents.message if you need more \
+         context."
+    )
+}
 
 /// Render the complete Engineer instructions in the order an agent uses them.
 fn main_agent_prompt(team: &str, user_owned: &str, context: &str) -> Arc<str> {
@@ -1189,14 +1196,20 @@ agent and the idle mechanism described above when blocked on a reply.
 "
             );
         }
-        // An Engineer started for the user is the user's like any other.
-        let ownership = match tools.spawned_by {
-            AgentSpawnedBy::Direct | AgentSpawnedBy::UserOwned { .. } => {
-                "You were started directly and own the user's technical outcome."
-            }
-            AgentSpawnedBy::Engineer => {
+        let ownership = match (tools.spawned_by, tools.started_by.as_deref()) {
+            (AgentSpawnedBy::Engineer, _) => {
                 "You were spawned by another Engineer. Own the bounded assignment in the \
                  parent message; your final response is mailed to that Engineer."
+                    .to_owned()
+            }
+            // An Engineer started for the user is the user's like any other;
+            // it only learns who holds the context behind its brief.
+            (AgentSpawnedBy::UserOwned { .. }, Some(by)) => format!(
+                "{} You own the user's technical outcome.",
+                started_by_note(by)
+            ),
+            (AgentSpawnedBy::Direct | AgentSpawnedBy::UserOwned { .. }, _) => {
+                "You were started directly and own the user's technical outcome.".to_owned()
             }
         };
         let message_tool = "agents.message";
@@ -1248,7 +1261,10 @@ pub fn claude_prompt(
                 &tools.agent
             ),
         };
-        format!("{identity}\n\n")
+        match tools.started_by.as_deref() {
+            Some(by) => format!("{identity} {}\n\n", started_by_note(by)),
+            None => format!("{identity}\n\n"),
+        }
     });
     let workspace = view
         .map(|view| render_workspace_prompt(&WorksetPrompt::of(view)))
@@ -2039,6 +2055,7 @@ mod tests {
                 .into(),
                 parent: Some("eng-parent".into()),
                 spawned_by: AgentSpawnedBy::Engineer,
+                started_by: None,
             };
             let prompt = claude_prompt(None, Some(&team), role);
             let collaboration = prompt
@@ -2083,16 +2100,17 @@ mod tests {
 
     #[test]
     fn only_agents_the_user_manages_may_start_engineers_for_the_user() {
-        let team = |spawned_by, parent: Option<&str>| Team {
+        let team = |spawned_by, parent: Option<&str>, started_by: Option<&str>| Team {
             agent: "eng-self".into(),
             parent: parent.map(Into::into),
             spawned_by,
+            started_by: started_by.map(Into::into),
         };
         let by =
             rho_agent_types::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(0)).unwrap();
-        let direct = team(AgentSpawnedBy::Direct, None);
-        let user_owned = team(AgentSpawnedBy::UserOwned { by }, None);
-        let child = team(AgentSpawnedBy::Engineer, Some("eng-parent"));
+        let direct = team(AgentSpawnedBy::Direct, None, None);
+        let user_owned = team(AgentSpawnedBy::UserOwned { by }, None, Some("eng-starter"));
+        let child = team(AgentSpawnedBy::Engineer, Some("eng-parent"), None);
         let signature = "agents.spawn_user_owned_engineer(*, task_name:";
         for team in [&direct, &user_owned] {
             let prompt = claude_prompt(None, Some(team), AgentRole::default());
@@ -2111,10 +2129,13 @@ mod tests {
         ] {
             assert!(!prompt.contains(signature));
         }
-        // One started for the user is told nothing a direct one is not.
+        // One started for the user is told nothing a direct one is not,
+        // but who can give it the context behind its brief.
+        let note = " Engineer eng-starter started you for the user; ask it with agents.message \
+                    if you need more context.";
         assert_eq!(
-            claude_prompt(None, Some(&user_owned), AgentRole::default()),
-            claude_prompt(None, Some(&direct), AgentRole::default())
+            claude_prompt(None, Some(&user_owned), AgentRole::default()).replacen(note, "", 1),
+            *claude_prompt(None, Some(&direct), AgentRole::default())
         );
 
         // The native prompt offers it after the Engineers it manages and

@@ -25,6 +25,8 @@ pub struct Team {
     pub agent: String,
     pub parent: Option<String>,
     pub spawned_by: crate::db::AgentSpawnedBy,
+    /// The Engineer that started a user-owned agent for the user.
+    pub started_by: Option<String>,
 }
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
@@ -54,10 +56,16 @@ impl MultiAgentTools {
 
     pub(crate) fn team(&self) -> anyhow::Result<Team> {
         let pool = self.pool()?;
+        let spawned_by = pool.db().read().get_agent(self.self_id).config.spawned_by;
+        let started_by = match spawned_by {
+            crate::db::AgentSpawnedBy::UserOwned { by } => Some(pool.agent_handle(by)),
+            _ => None,
+        };
         Ok(Team {
             agent: pool.agent_handle(self.self_id),
             parent: self.parent.map(|parent| pool.agent_handle(parent)),
-            spawned_by: pool.db().read().get_agent(self.self_id).config.spawned_by,
+            spawned_by,
+            started_by,
         })
     }
 

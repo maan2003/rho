@@ -607,6 +607,9 @@ pub trait AgentReadTxnExt {
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
     /// Who spawned an agent, read from its creation alone.
     fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId>;
+    /// The agent that spawned this one: its parent, or the Engineer that
+    /// started it for the user. Spawn limits follow this edge.
+    fn agent_spawner(&self, agent_id: AgentId) -> Option<AgentId>;
     fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId>;
     fn is_agent_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool;
     /// The agent's history as it stands: every row a later `Rewound` did
@@ -859,6 +862,16 @@ impl AgentReadTxnExt for ReadTxn {
 
     fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId> {
         match self.agent_event(agent_id, AgentEventPos::ZERO)? {
+            AgentEvent::Created { parent, .. } => parent,
+            _ => None,
+        }
+    }
+    fn agent_spawner(&self, agent_id: AgentId) -> Option<AgentId> {
+        match self.agent_event(agent_id, AgentEventPos::ZERO)? {
+            AgentEvent::Created {
+                spawned_by: AgentSpawnedBy::UserOwned { by },
+                ..
+            } => Some(by),
             AgentEvent::Created { parent, .. } => parent,
             _ => None,
         }

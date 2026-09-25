@@ -631,8 +631,8 @@ impl AgentPool {
     }
 
     /// Create an Engineer the user manages, briefed by `by` in its workset.
-    /// It has no parent: nothing it says is mailed to `by`, and it counts
-    /// against none of `by`'s limits.
+    /// It has no parent, so nothing it says is mailed to `by`, but it
+    /// counts against `by`'s spawn limits like a child.
     pub async fn spawn_user_owned(
         self: &Arc<Self>,
         by: AgentId,
@@ -640,6 +640,7 @@ impl AgentPool {
         prompt: String,
         workdir: Option<camino::Utf8PathBuf>,
     ) -> anyhow::Result<AgentId> {
+        self.enforce_spawn_limits(by).await?;
         self.spawn(
             AgentOrigin::UserOwned { by },
             task_name,
@@ -710,21 +711,21 @@ impl AgentPool {
         Ok(agent_id)
     }
 
-    async fn enforce_spawn_limits(&self, parent: AgentId) -> anyhow::Result<()> {
+    async fn enforce_spawn_limits(&self, spawner: AgentId) -> anyhow::Result<()> {
         let child_ids = {
             let read = self.db.read();
             let mut depth = 0;
-            let mut cursor = Some(parent);
+            let mut cursor = Some(spawner);
             while let Some(id) = cursor {
                 depth += 1;
                 if depth > MAX_SPAWN_DEPTH {
                     anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
                 }
-                cursor = read.agent_parent(id);
+                cursor = read.agent_spawner(id);
             }
             read.list_agent_ids()
                 .into_iter()
-                .filter(|id| read.agent_parent(*id) == Some(parent))
+                .filter(|id| read.agent_spawner(*id) == Some(spawner))
                 .collect::<Vec<_>>()
         };
         let agents = self.agents.lock().await;
@@ -1330,6 +1331,27 @@ mod tests {
             "{error}"
         );
         assert_eq!(pool.db.read().list_agent_ids().len(), count);
+
+        // Spawn limits follow the starter: a chain of user-owned Engineers
+        // stops at the depth limit like a chain of children.
+        let mut starter = owned;
+        for _ in 2..=MAX_SPAWN_DEPTH {
+            let before = pool.db.read().list_agent_ids();
+            call_agent_tool(
+                tools_of(starter, None),
+                AgentCall::SpawnUserOwnedEngineer(spawn_args("deeper")),
+            )
+            .await
+            .unwrap();
+            starter = new_agent(before);
+        }
+        let error = call_agent_tool(
+            tools_of(starter, None),
+            AgentCall::SpawnUserOwnedEngineer(spawn_args("too-deep")),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("spawn depth limit"), "{error}");
 
         pool.execution(creator_id).await.unwrap().shutdown().await;
         drop(creator);
