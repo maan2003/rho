@@ -126,13 +126,6 @@ async fn observations_decide_hits() {
     std::fs::write(repo.join("other.txt"), "x").unwrap();
     git(&repo, &["init", "-q"]);
     git(&repo, &["add", "."]);
-    let status = std::process::Command::new("nix")
-        .args(["flake", "lock", "--extra-experimental-features", "nix-command flakes"])
-        .current_dir(&repo)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    git(&repo, &["add", "flake.lock"]);
 
     let resolver = || {
         Resolver::new(Some(Client::new(&dir)), dir.clone(), builder.clone(), std::env::vars_os().collect())
@@ -143,6 +136,14 @@ async fn observations_decide_hits() {
         async move { resolver.resolve(&flake).await.unwrap().0.id.unwrap() }
     };
     let flake = Flake::new(repo.canonicalize().unwrap(), "default");
+    // Locked as `nix develop` locks; not cached across writing the lock.
+    assert_eq!(resolver().resolve(&flake).await.unwrap().0.id, None);
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "flake.lock"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(tracked.status.success(), "flake.lock written and added");
     let first = id(&flake).await;
     assert_eq!(id(&flake).await, first, "hit");
 
@@ -174,4 +175,14 @@ async fn observations_decide_hits() {
     std::fs::write(repo.join("data.txt"), "two").unwrap();
     let changed = watched.resolve(&flake).await.unwrap().0.id.unwrap();
     assert!(![first, tracked, edited].contains(&changed), "a watched read changed");
+
+    // A flake that does not evaluate fails with what to watch.
+    let good = std::fs::read_to_string(repo.join("flake.nix")).unwrap();
+    std::fs::write(repo.join("flake.nix"), "{ outputs = ").unwrap();
+    let error = resolver().resolve(&flake).await.unwrap_err();
+    let failed = error.downcast_ref::<rho_devshell::Failed>().expect("a shell failure");
+    assert!(failed.message.contains("syntax error") && !failed.message.contains('\u{1b}'), "{}", failed.message);
+    assert!(failed.watch.contents.contains(&flake.dir.join("flake.nix")));
+    std::fs::write(repo.join("flake.nix"), good).unwrap();
+    assert_eq!(resolver().resolve(&flake).await.unwrap().0.id, Some(changed), "fixed");
 }

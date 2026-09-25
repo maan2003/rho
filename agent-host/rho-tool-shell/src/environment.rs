@@ -3,8 +3,10 @@
 //! or the base environment outside flakes. Only cold/invalidated generations
 //! ask for the shell; command admission checks the process's watches
 //! (`rho_watch`) over what the shell was built from before reusing a
-//! snapshot. Paths are absolute; resolver tasks inherit the workset process
-//! namespace.
+//! snapshot. A shell that fails leaves the directory's last environment
+//! from it in place, else the base environment, saying why once, until what
+//! the failure depended on changes. Paths are absolute; resolver tasks
+//! inherit the workset process namespace.
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -69,6 +71,54 @@ struct Snapshot {
     /// Where the environment came from, to reuse it when a change turns out
     /// not to affect the shell.
     source: Option<Source>,
+    /// The directory's last environment from its flake's shell, to fall
+    /// back to while the shell fails.
+    good: Option<Arc<Environment>>,
+    /// Why the shell failed, if `environment` is a fallback.
+    failure: Option<Failure>,
+}
+
+impl Snapshot {
+    /// Whether the next command may use this without resolving again.
+    fn current(&self) -> bool {
+        !self.failure.as_ref().is_some_and(|failure| failure.retry) && matches!(self.watches.changed(), Ok(false))
+    }
+}
+
+/// A shell failure a fallback environment stands in for.
+struct Failure {
+    message: String,
+    /// Nothing tells when the failure may be over: try again every command.
+    retry: bool,
+}
+
+/// A flake's shell could not be had: why, and what to watch to know when
+/// trying again may succeed.
+struct ShellFailed {
+    message: String,
+    watch: Vec<PathBuf>,
+    watch_names: Vec<PathBuf>,
+    /// If the shell built but failed to activate: [`Built::shell`].
+    activating: Option<Option<String>>,
+}
+
+impl ShellFailed {
+    fn from_error(error: anyhow::Error) -> Self {
+        match error.downcast::<rho_devshell::Failed>() {
+            Ok(failed) => Self {
+                message: failed.message,
+                watch: failed.watch.contents.into_iter().collect(),
+                watch_names: failed.watch.names.into_iter().collect(),
+                activating: None,
+            },
+            Err(error) => Self {
+                message: format!("{error:#}"),
+                watch: Vec::new(),
+                watch_names: Vec::new(),
+                activating: None,
+            },
+        }
+    }
 }
 
 /// A cached shell an environment was activated from.
@@ -160,7 +210,7 @@ async fn serve(
                 let mut previous = None;
                 if let Some(index) = snapshots.iter().position(|(key, _)| key == &request.key) {
                     let (key, snapshot) = snapshots.remove(index).unwrap();
-                    if matches!(snapshot.watches.changed(), Ok(false)) {
+                    if snapshot.current() {
                         let _ = request.reply.send(Ok(Resolved {
                             environment: Arc::clone(&snapshot.environment),
                             diagnostics: Vec::new(),
@@ -368,13 +418,28 @@ async fn resolved_shell(flake: PathBuf) -> Result<(Built, Vec<u8>)> {
     ))
 }
 
-async fn build(shells: &Shells, flake: &Path) -> Result<(Built, Vec<u8>)> {
-    let (built, diagnostics) = shells(flake.to_owned()).await?;
-    ensure!(
-        built.watch.iter().chain(&built.watch_names).all(|path| path.is_absolute()),
-        "relative shell watch path"
-    );
+async fn build(shells: &Shells, flake: &Path) -> Result<(Built, Vec<u8>), ShellFailed> {
+    let (built, diagnostics) = shells(flake.to_owned()).await.map_err(ShellFailed::from_error)?;
+    if !built.watch.iter().chain(&built.watch_names).all(|path| path.is_absolute()) {
+        return Err(ShellFailed::from_error(anyhow!("relative shell watch path")));
+    }
     Ok((built, diagnostics))
+}
+
+/// `flake`'s shell applied to `key`'s base environment, with the builder's
+/// and the shell hook's output.
+async fn shell(key: &Key, shells: &Shells, flake: &Path) -> Result<(Environment, Vec<u8>, Built), ShellFailed> {
+    let (built, mut diagnostics) = build(shells, flake).await?;
+    let (environment, hook_output) = activate(key, &built.activation)
+        .await
+        .map_err(|error| ShellFailed {
+            message: format!("{error:#}"),
+            watch: built.watch.clone(),
+            watch_names: built.watch_names.clone(),
+            activating: Some(built.shell.clone()),
+        })?;
+    diagnostics.extend(hook_output);
+    Ok((environment, diagnostics, built))
 }
 
 /// Apply `activation` to the base environment as `nix develop` would, in Bash.
@@ -409,6 +474,11 @@ async fn activate(key: &Key, activation: &str) -> Result<(Environment, Vec<u8>)>
 }
 
 async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Result<(Snapshot, Vec<u8>)> {
+    let good = previous.as_ref().and_then(|previous| previous.good.clone());
+    let shown = previous
+        .as_ref()
+        .and_then(|previous| previous.failure.as_ref())
+        .map(|failure| failure.message.clone());
     if let Some(previous) = previous
         && let Some(reused) = reuse(key, previous, shells).await?
     {
@@ -418,38 +488,84 @@ async fn resolve(key: &Key, previous: Option<Snapshot>, shells: &Shells) -> Resu
         let discovery = discover(&key.cwd)?;
         let mut contents = HashSet::new();
         let mut names = discovery.names.clone();
-        let (environment, diagnostics, source) = match &discovery.flake {
-            None => ((*key.base).clone(), Vec::new(), None),
-            Some(flake) => {
-                let (built, mut diagnostics) = build(shells, flake).await?;
-                let (environment, hook_output) = activate(key, &built.activation).await?;
-                diagnostics.extend(hook_output);
-                contents.extend(built.watch.iter().cloned());
-                names.extend(built.watch_names.iter().cloned());
-                let source = built.shell.map(|shell| Source {
-                    flake: flake.clone(),
-                    shell,
-                    contents: built.watch.into_iter().collect(),
-                    names: built.watch_names.into_iter().collect(),
-                });
-                (environment, diagnostics, source)
-            }
+        let (environment, diagnostics, source, failure) = match &discovery.flake {
+            None => ((*key.base).clone(), Vec::new(), None, None),
+            Some(flake) => match shell(key, shells, flake).await {
+                Ok((environment, diagnostics, built)) => {
+                    contents.extend(built.watch.iter().cloned());
+                    names.extend(built.watch_names.iter().cloned());
+                    let source = built.shell.map(|shell| Source {
+                        flake: flake.clone(),
+                        shell,
+                        contents: built.watch.into_iter().collect(),
+                        names: built.watch_names.into_iter().collect(),
+                    });
+                    (environment, diagnostics, source, None)
+                }
+                Err(failed) => {
+                    contents.extend(failed.watch.iter().cloned());
+                    names.extend(failed.watch_names.iter().cloned());
+                    let environment = match &good {
+                        Some(good) => (**good).clone(),
+                        None => (*key.base).clone(),
+                    };
+                    let diagnostics = if shown.as_ref() == Some(&failed.message) {
+                        Vec::new()
+                    } else {
+                        let fallback = match &good {
+                            Some(_) => "its last environment",
+                            None => "the base environment",
+                        };
+                        format!(
+                            "rho: the dev shell of {} failed; commands run in {fallback} until it builds:\n{}\n",
+                            flake.display(),
+                            failed.message
+                        )
+                        .into_bytes()
+                    };
+                    (environment, diagnostics, None, Some(failed))
+                }
+            },
         };
         let watches = watch(&contents, &names)?;
         // A change after the builder observed an input but before its watch
-        // existed is visible to neither; confirm the shell still holds now.
-        // An uncacheable shell cannot be confirmed and is kept as built.
+        // existed is visible to neither; confirm the shell still holds now,
+        // or still fails as it did. An uncacheable shell cannot be confirmed
+        // and is kept as built.
         let still_valid = discover(&key.cwd)? == discovery
-            && match &source {
-                Some(source) => source.holds(&build(shells, &source.flake).await?.0),
-                None => true,
+            && match (&source, &failure) {
+                (Some(source), _) => build(shells, &source.flake)
+                    .await
+                    .is_ok_and(|(built, _)| source.holds(&built)),
+                (None, Some(failed)) if !failed.watch.is_empty() => {
+                    let flake = discovery.flake.as_deref().unwrap();
+                    match (build(shells, flake).await, &failed.activating) {
+                        (Err(again), None) => again.message == failed.message,
+                        // An uncacheable shell cannot be confirmed.
+                        (Ok(_), Some(None)) => true,
+                        (Ok((built, _)), Some(shell)) => &built.shell == shell,
+                        _ => false,
+                    }
+                }
+                _ => true,
             };
         if still_valid && !watches.changed()? {
+            let environment = Arc::new(environment);
+            let good = match &failure {
+                None if discovery.flake.is_some() => Some(Arc::clone(&environment)),
+                None => None,
+                Some(_) => good,
+            };
             return Ok((
                 Snapshot {
-                    environment: Arc::new(environment),
+                    environment,
                     watches,
                     source,
+                    good,
+                    failure: failure.map(|failed| Failure {
+                        retry: failed.watch.is_empty(),
+                        message: failed.message,
+                    }),
                 },
                 diagnostics,
             ));
@@ -472,7 +588,9 @@ async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<
     }
     let names = source.names.union(&discovery.names).cloned().collect();
     let watches = watch(&source.contents, &names)?;
-    let (built, diagnostics) = build(shells, &source.flake).await?;
+    let Ok((built, diagnostics)) = build(shells, &source.flake).await else {
+        return Ok(None);
+    };
     if !source.holds(&built) || discover(&key.cwd)? != discovery || watches.changed()? {
         return Ok(None);
     }
@@ -481,6 +599,8 @@ async fn reuse(key: &Key, previous: Snapshot, shells: &Shells) -> Result<Option<
             environment: previous.environment,
             watches,
             source: Some(source),
+            good: previous.good,
+            failure: None,
         },
         diagnostics,
     )))
@@ -510,10 +630,23 @@ mod tests {
 
     /// A stand-in for the dev shell resolver: the shell sources the flake's
     /// `env.sh` and depends on `env.sh` and an optional `extra`, and is
-    /// cached by their contents.
+    /// cached by their contents. It fails to build while `env.sh` says
+    /// `BROKEN`, and fails with nothing to watch while `down` exists.
     fn shells() -> Shells {
         Arc::new(|flake: PathBuf| {
             Box::pin(async move {
+                anyhow::ensure!(!flake.join("down").exists(), "builder down");
+                let script = std::fs::read_to_string(flake.join("env.sh")).unwrap_or_default();
+                if script.contains("BROKEN") {
+                    return Err(rho_devshell::Failed {
+                        message: format!("broken: {}", script.trim()),
+                        watch: rho_devshell::Watch {
+                            contents: [flake.join("env.sh"), flake.join("extra")].into(),
+                            ..Default::default()
+                        },
+                    }
+                    .into());
+                }
                 let mut hasher = std::hash::DefaultHasher::new();
                 for name in ["env.sh", "extra"] {
                     std::hash::Hash::hash(&std::fs::read(flake.join(name)).ok(), &mut hasher);
@@ -728,19 +861,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_failure_does_not_serve_the_previous_generation() {
+    async fn failed_activation_serves_the_previous_generation_with_the_error() {
         let fixture = Fixture::new();
         fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=old\n");
         fixture.run("true", None).await;
         fixture.write("env.sh", "echo expected-failure >&2\nexit 1\n");
-        let error = fixture
-            .tools
-            .spawn("touch must-not-run", None)
-            .await
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("expected-failure"), "{error:#}");
-        assert!(!fixture.root.path().join("must-not-run").exists());
+        let output = fixture.run(r#"printf '%s' "$RHO_CACHE_TEST_VALUE""#, None).await;
+        assert!(output.contains("expected-failure") && output.ends_with("old"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn a_broken_shell_falls_back_to_the_last_environment_saying_so_once() {
+        let fixture = Fixture::new();
+        let command = r#"printf '%s' "${RHO_CACHE_TEST_VALUE-unset}""#;
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=good\n");
+        assert_eq!(fixture.run(command, None).await, "good");
+        fixture.write("env.sh", "BROKEN one\n");
+        let output = fixture.run(command, None).await;
+        assert!(
+            output.contains("its last environment") && output.contains("broken: BROKEN one") && output.ends_with("good"),
+            "{output}"
+        );
+        assert_eq!(fixture.run(command, None).await, "good");
+        // Broken again, the same way: nothing new to say.
+        fixture.write("extra", "x");
+        assert_eq!(fixture.run(command, None).await, "good");
+        fixture.write("env.sh", "BROKEN two\n");
+        assert!(fixture.run(command, None).await.contains("broken: BROKEN two"));
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=fixed\n");
+        assert_eq!(fixture.run(command, None).await, "fixed");
+    }
+
+    #[tokio::test]
+    async fn a_shell_broken_from_the_start_falls_back_to_the_base_environment() {
+        let fixture = Fixture::new();
+        fixture.write("env.sh", "BROKEN\n");
+        let command = r#"printf '%s %s' "${RHO_CACHE_TEST_VALUE-unset}" "$RHO_CACHE_TEST_BASE""#;
+        let output = fixture.run(command, None).await;
+        assert!(output.contains("the base environment") && output.ends_with("unset base"), "{output}");
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=fixed\n");
+        assert_eq!(fixture.run(command, None).await, "fixed base");
+    }
+
+    #[tokio::test]
+    async fn a_shell_failing_with_nothing_to_watch_is_tried_again_every_command() {
+        let fixture = Fixture::new();
+        fixture.write("env.sh", "export RHO_CACHE_TEST_VALUE=up\n");
+        fixture.write("down", "");
+        let command = r#"printf '%s' "${RHO_CACHE_TEST_VALUE-unset}""#;
+        let output = fixture.run(command, None).await;
+        assert!(output.contains("builder down") && output.ends_with("unset"), "{output}");
+        assert_eq!(fixture.run(command, None).await, "unset");
+        std::fs::remove_file(fixture.root.path().join("down")).unwrap();
+        assert_eq!(fixture.run(command, None).await, "up");
     }
 
     #[tokio::test]

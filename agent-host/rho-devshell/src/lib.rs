@@ -417,6 +417,20 @@ impl Watch {
         watch
     }
 
+    /// What to watch for a shell of `flake` whose evaluation failed after
+    /// `observations`. Git deciding which files the flake has can fix it
+    /// before evaluation reads anything, e.g. adding an untracked
+    /// `flake.nix`.
+    pub fn failed(flake: &Flake, observations: &[Observation]) -> Self {
+        let mut watch = Self::new(flake, observations);
+        if flake.source.scheme == Scheme::Git
+            && let Some(git) = GitDirs::find(&flake.source.root)
+        {
+            watch.contents.insert(git.dir.join("index"));
+        }
+        watch
+    }
+
     fn subscribe(&self, watcher: &rho_watch::Watcher) -> io::Result<rho_watch::Subscription> {
         watcher.watch(
             self.contents.iter().map(PathBuf::as_path),
@@ -580,7 +594,8 @@ impl Resolver {
     }
 
     /// `flake`'s shell: a valid cached one, pinned, or a new evaluation.
-    /// Also returns the builder's diagnostics.
+    /// Also returns the builder's diagnostics. A shell that failed to build
+    /// is a [`Failed`] error.
     pub async fn resolve(&self, flake: &Flake) -> Result<(Resolved, Vec<u8>)> {
         if let Some(resolved) = self.hot(flake).await {
             return Ok((resolved, Vec::new()));
@@ -757,6 +772,11 @@ impl Resolver {
         }
         command.current_dir(&flake.dir);
         let output = run(command).await?;
+        if output.status.code() == Some(SHELL_FAILED) {
+            let watch = serde_json::from_slice(&output.stdout).context("parse rho-devshell-builder output")?;
+            let message = String::from_utf8_lossy(&output.stderr).trim_end().to_owned();
+            return Err(Failed { message, watch }.into());
+        }
         ensure!(
             output.status.success(),
             "rho-devshell-builder failed: {}",
@@ -779,6 +799,26 @@ fn slot(flake: &Flake) -> Slot {
 
 /// `rho-devshell-builder pin`'s exit status for a path already collected.
 pub const PIN_GONE: i32 = 3;
+
+/// `rho-devshell-builder shell`'s exit status for a flake without a shell:
+/// it prints the error, and the [`Watch`] for [`Failed`] as its output.
+pub const SHELL_FAILED: i32 = 4;
+
+/// A flake's shell failed to build. Nothing it could depend on has changed
+/// while `watch` sees no change.
+#[derive(Debug)]
+pub struct Failed {
+    pub message: String,
+    pub watch: Watch,
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failed {}
 
 /// Run a [`Resolver::pin_command`]: whether the environment is pinned,
 /// `false` if it is gone.

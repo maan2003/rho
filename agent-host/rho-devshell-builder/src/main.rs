@@ -14,7 +14,9 @@
 //! `$RHO_DEVSHELL_DIR`) unless `--no-cache`, pinning it, or evaluates and
 //! caches it; writes its activation script into `DIR`; and prints it as
 //! JSON (`rho_devshell::Shell`). The agent base's patched `nix develop`
-//! runs it too, and reads `env_store_path`.
+//! runs it too, and reads `env_store_path`. A flake without a shell exits
+//! with `rho_devshell::SHELL_FAILED`, the error on stderr and what to watch
+//! (`rho_devshell::Watch`) as JSON.
 //!
 //! `activate` writes an environment's activation script into `DIR`.
 //!
@@ -26,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use devenv_nix_backend::{DevShellRequest, LocalInput, NIX_STACK_SIZE, NixRuntime};
-use rho_devshell::{Client, Evaluated, Flake, InputUrl, Observation, Shell, Watch};
+use rho_devshell::{Client, Evaluated, Flake, InputUrl, Observation, SHELL_FAILED, Shell, Watch};
 
 const USAGE: &str = "usage: rho-devshell-builder shell <flake-dir> [--shell NAME] [--dir DIR] [--no-cache]
        rho-devshell-builder activate <env-store-path> --dir DIR
@@ -100,10 +102,14 @@ fn main() -> Result<()> {
         .spawn(move || {
             let mut nix = NixRuntime::new().map_err(|e| anyhow::anyhow!("{e:?}"))?;
             match mode {
-                Mode::Shell { flake, dir, cache } => {
-                    let shell = shell(&mut nix, &flake, dir.as_deref(), cache)?;
-                    println!("{}", serde_json::to_string(&shell)?);
-                }
+                Mode::Shell { flake, dir, cache } => match shell(&mut nix, &flake, dir.as_deref(), cache)? {
+                    Ok(shell) => println!("{}", serde_json::to_string(&shell)?),
+                    Err(failure) => {
+                        eprintln!("{}", strip_ansi(&failure.error));
+                        println!("{}", serde_json::to_string(&failure.watch)?);
+                        std::process::exit(SHELL_FAILED);
+                    }
+                },
                 Mode::Activate { env_store_path, dir } => {
                     println!("{}", write_activation(&nix, &dir, &env_store_path)?.display());
                 }
@@ -121,7 +127,7 @@ fn main() -> Result<()> {
 
 /// `flake`'s shell: a valid cached one, pinned, or a new evaluation, cached
 /// if it can be. Cache failures are reported and otherwise ignored.
-fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -> Result<Shell> {
+fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -> Result<Result<Shell, Failure>> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let client = dir.filter(|_| cache).map(Client::new);
     let key = flake.key()?;
@@ -135,9 +141,16 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
     let (id, evaluated) = match found {
         Some(hit) => hit,
         None => {
-            let evaluation = evaluate(nix, flake)?;
+            let evaluation = match evaluate(nix, flake) {
+                Ok(evaluation) => evaluation,
+                Err(failure) => return Ok(Err(failure)),
+            };
+            // Locking that wrote `flake.lock` changed what evaluation had
+            // observed of it; the next resolution evaluates the locked flake,
+            // and caches that.
+            let locked = flake.key()? == key;
             let mut id = None;
-            if let (Some(client), Some(dir), Some(evaluated)) = (&client, dir, evaluation.cacheable()) {
+            if let (Some(client), Some(dir), Some(evaluated), true) = (&client, dir, evaluation.cacheable(), locked) {
                 match runtime.block_on(store(nix, client, &key, dir, &evaluated)) {
                     Ok(stored) => id = Some(stored),
                     Err(e) => eprintln!("rho: failed to cache dev shell: {e:#}"),
@@ -149,12 +162,39 @@ fn shell(nix: &mut NixRuntime, flake: &Flake, dir: Option<&Path>, cache: bool) -
     let activation = dir
         .map(|dir| write_activation(nix, dir, &evaluated.env_store_path))
         .transpose()?;
-    Ok(Shell {
+    Ok(Ok(Shell {
         id,
         watch: Watch::new(flake, &evaluated.observations),
         env_store_path: evaluated.env_store_path,
         activation,
-    })
+    }))
+}
+
+/// A flake without a shell: why, and what to watch for that to change.
+struct Failure {
+    error: String,
+    watch: Watch,
+}
+
+/// `text` without terminal escapes: Nix colours its errors.
+fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI sequences end at a byte in @..~.
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        plain.push(c);
+    }
+    plain
 }
 
 /// The newest cached shell whose observations all hold now and whose
@@ -251,13 +291,35 @@ impl Evaluation {
     }
 }
 
-fn evaluate(nix: &mut NixRuntime, flake: &Flake) -> Result<Evaluation> {
+fn evaluate(nix: &mut NixRuntime, flake: &Flake) -> Result<Evaluation, Failure> {
     let request = DevShellRequest {
         flake_dir: flake.dir.clone(),
         system: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
         shell: flake.shell.clone(),
     };
-    let eval = nix.eval_dev_shell(&request).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let failed = |error: String, observed: &[devenv_nix_backend::Observation]| {
+        let root = &flake.source.root;
+        let observations: Vec<Observation> = observed
+            .iter()
+            .filter_map(|observation| {
+                Some(Observation {
+                    kind: observation.kind.clone(),
+                    input: InputUrl::parse(&observation.input, root)?,
+                    path: observation.path.clone(),
+                    value: observation.value.clone(),
+                })
+            })
+            .collect();
+        Failure {
+            error,
+            watch: Watch::failed(flake, &observations),
+        }
+    };
+    let eval = nix.eval_dev_shell(&request).map_err(|error| failed(format!("{error:?}"), &[]))?;
+    let shell = match eval.shell {
+        Ok(shell) => shell,
+        Err(error) => return Err(failed(format!("{error:?}"), &eval.observations)),
+    };
     let cacheable = match record(&flake.source.root, eval.observations) {
         Ok(observations) => Some(observations),
         Err(e) => {
@@ -266,8 +328,8 @@ fn evaluate(nix: &mut NixRuntime, flake: &Flake) -> Result<Evaluation> {
         }
     };
     Ok(Evaluation {
-        drv_path: eval.shell.drv_path,
-        env_store_path: eval.shell.env_store_path,
+        drv_path: shell.drv_path,
+        env_store_path: shell.env_store_path,
         cacheable,
     })
 }

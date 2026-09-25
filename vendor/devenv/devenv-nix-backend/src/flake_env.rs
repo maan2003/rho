@@ -3,15 +3,15 @@
 //! One [`NixRuntime`] owns the process-global Nix state: GC registration,
 //! settings, the store connection and the logger. Each
 //! [`NixRuntime::eval_dev_shell`] call builds a fresh `EvalState`, locks the
-//! flake in check mode (a stale or missing lock is an error, never a write),
-//! builds the shell's environment, and returns it together with everything
-//! evaluation observed of local inputs while producing it. Callers decide
-//! what those observations mean for caching.
+//! flake as `nix develop` does (writing `flake.lock` when it is missing or
+//! stale), builds the shell's environment, and returns it, or its failure,
+//! together with everything evaluation observed of local inputs meanwhile.
+//! Callers decide what those observations mean for caching.
 
 use std::path::{Path, PathBuf};
 
 use miette::{Result, WrapErr, miette};
-use nix_bindings_expr::eval_state::{EvalStateBuilder, ThreadRegistrationGuard, gc_register_my_thread};
+use nix_bindings_expr::eval_state::{EvalState, EvalStateBuilder, ThreadRegistrationGuard, gc_register_my_thread};
 use nix_bindings_fetchers::FetchersSettings;
 use nix_bindings_flake::{
     EvalStateBuilderExt, FlakeLockFlags, FlakeReference, FlakeReferenceParseFlags, FlakeSettings,
@@ -52,9 +52,10 @@ pub struct DevShell {
     pub env_store_path: String,
 }
 
-/// A development shell plus what its evaluation observed.
+/// A development shell, or why there is none, plus what its evaluation
+/// observed: up to the failure if it failed.
 pub struct DevShellEval {
-    pub shell: DevShell,
+    pub shell: Result<DevShell>,
     pub observations: Vec<Observation>,
 }
 
@@ -118,7 +119,14 @@ impl NixRuntime {
             .build()
             .to_miette()
             .wrap_err("Failed to build eval state")?;
+        let shell = self.dev_shell(request, flake_dir, &mut state);
+        Ok(DevShellEval {
+            shell,
+            observations: observations(&state)?,
+        })
+    }
 
+    fn dev_shell(&mut self, request: &DevShellRequest, flake_dir: &str, state: &mut EvalState) -> Result<DevShell> {
         let mut parse = FlakeReferenceParseFlags::new(&self.flake_settings).to_miette()?;
         parse.set_base_directory(flake_dir).to_miette()?;
         let (flake_ref, _) = FlakeReference::parse_with_fragment(
@@ -130,19 +138,20 @@ impl NixRuntime {
         .to_miette()
         .wrap_err_with(|| format!("Failed to parse flake reference for {flake_dir}"))?;
         let mut lock = FlakeLockFlags::new(&self.flake_settings).to_miette()?;
-        lock.set_mode_check().to_miette()?;
+        // As `nix develop`: lock what is unlocked, and write the lock file.
+        lock.set_mode_write_as_needed().to_miette()?;
         let locked = LockedFlake::lock(
             &self.fetchers_settings,
             &self.flake_settings,
-            &state,
+            state,
             &lock,
             &flake_ref,
         )
         .to_miette()
-        .wrap_err("Failed to lock flake (is flake.lock up to date?)")?;
+        .wrap_err("Failed to lock flake")?;
 
         let outputs = locked
-            .outputs(&self.flake_settings, &mut state)
+            .outputs(&self.flake_settings, state)
             .to_miette()
             .wrap_err("Failed to evaluate flake outputs")?;
         let mut drv = outputs;
@@ -164,12 +173,9 @@ impl NixRuntime {
                 .wrap_err("Failed to get dev environment")?
         };
         let env_store_path = self.store.real_path(&env_store_path).to_miette()?;
-        Ok(DevShellEval {
-            shell: DevShell {
-                drv_path,
-                env_store_path,
-            },
-            observations: observations(&state)?,
+        Ok(DevShell {
+            drv_path,
+            env_store_path,
         })
     }
 
