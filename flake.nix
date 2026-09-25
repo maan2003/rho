@@ -414,6 +414,10 @@
             tests = craneLib.cargoNextest {
               cargoArtifacts = workspace;
               cargoNextestExtraArgs = "--workspace --show-progress none";
+              preBuild = ''
+                export NEXTEST_TEST_THREADS=$(nproc)
+                if [ "$NEXTEST_TEST_THREADS" -gt 16 ]; then NEXTEST_TEST_THREADS=16; fi
+              '';
               nativeBuildInputs = [ pkgs.ripgrep ];
             };
 
@@ -450,6 +454,8 @@
               cargoArtifacts = workspaceCcov;
               buildPhaseCargoCommand = ''
                 source <(cargo llvm-cov show-env --export-prefix)
+                export NEXTEST_TEST_THREADS=$(nproc)
+                if [ "$NEXTEST_TEST_THREADS" -gt 16 ]; then NEXTEST_TEST_THREADS=16; fi
                 cargo nextest run --locked --workspace --all-targets --cargo-profile $CARGO_PROFILE --show-progress none
                 mkdir -p $out
                 cargo llvm-cov report --profile $CARGO_PROFILE --lcov --output-path $out/lcov.info
@@ -542,6 +548,8 @@
             # dial9-tokio-telemetry and CPU stack capture need.
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--ld-path=${moldLinker}/bin/mold -C link-arg=-Wl,--compress-debug-sections=zstd --cfg tokio_unstable -Cforce-frame-pointers=yes"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -Cforce-frame-pointers=yes"
+            export NEXTEST_TEST_THREADS=$(nproc)
+            if [ "$NEXTEST_TEST_THREADS" -gt 16 ]; then NEXTEST_TEST_THREADS=16; fi
           '';
         };
       }

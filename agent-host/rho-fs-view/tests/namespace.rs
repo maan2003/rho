@@ -14,6 +14,14 @@ mod common;
 use common::{GitDaemon, only_store, open_worksets, setup_remote};
 
 fn main() {
+    // These namespace-first binaries cannot use libtest, but nextest still
+    // needs a libtest-compatible listing to run and time each binary.
+    if std::env::args().any(|arg| arg == "--list") {
+        if !std::env::args().any(|arg| arg == "--ignored") {
+            println!("e2e: test");
+        }
+        return;
+    }
     let args = std::env::args_os().collect::<Vec<_>>();
     if args.get(1).is_some_and(|arg| arg == "--inside") {
         let bytes = std::fs::read(&args[2]).unwrap();

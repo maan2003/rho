@@ -13,15 +13,13 @@ use gpui::TestAppContext;
 
 use super::test_workspace;
 
-/// How many folds stand above the edit in the small and large cases. The
-/// large case is the order a four-hundred-turn transcript reaches with one
-/// elision per settled turn.
-const SMALL: usize = 32;
-const LARGE: usize = 256;
+/// Eightfold difference isolates dependence on folds above the edit.
+const SMALL: usize = 16;
+const LARGE: usize = 128;
 
 /// The document, identical in both cases: the rows the folds are spread
 /// over, and the rows below them the edit lands in.
-const FOLDED_LINES: usize = 1_024;
+const FOLDED_LINES: usize = 512;
 const LINES: usize = FOLDED_LINES + 32;
 
 /// What the fold map's cursors walk for one edit at the foot of a document

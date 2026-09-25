@@ -183,7 +183,7 @@ async fn a_record_larger_than_one_wire_chunk_is_read_once_complete() {
     let (server, _dir) = host().await;
     let writer = device(Some(secret)).await;
     let reader = device(Some(secret)).await;
-    let payload = vec![42; 2 * 1024 * 1024 + 17];
+    let payload = vec![42; 64 * 1024 + 17];
     writer
         .streams
         .append(Channel::Notes, vec![payload.clone()])

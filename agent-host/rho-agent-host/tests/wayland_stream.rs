@@ -32,6 +32,14 @@ async fn desktop_status(
     Ok((streaming, composed, encoded))
 }
 fn main() -> Result<()> {
+    // These namespace-first binaries cannot use libtest, but nextest still
+    // needs a libtest-compatible listing to run and time each binary.
+    if std::env::args().any(|arg| arg == "--list") {
+        if !std::env::args().any(|arg| arg == "--ignored") {
+            println!("e2e: test");
+        }
+        return Ok(());
+    }
     let temp = tempfile::tempdir()?;
     let runtime = temp.path().join("runtime");
     std::fs::create_dir(&runtime)?;

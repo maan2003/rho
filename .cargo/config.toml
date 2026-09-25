@@ -10,6 +10,11 @@ codegen-backend = "cranelift"
 [profile.dev.package."*"]
 codegen-backend = "llvm"
 
+# Test binaries are large; keep location-bearing panic messages, but omit
+# DWARF so compiling and linking the full workspace is affordable.
+[profile.test]
+debug = 0
+
 [build]
 rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]
 

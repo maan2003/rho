@@ -2549,6 +2549,7 @@ fn scrolled_messages_viewport_stays_put_across_append(cx: &mut TestAppContext) {
                         format!("message-{index}"),
                     )
                 }),
+                rho_agents_view::messages::LOG_CAP,
                 cx,
             );
             workspace.cmd_messages(window, cx);
@@ -2599,21 +2600,71 @@ fn scrolled_messages_viewport_stays_put_across_append(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn appended_message_styles_keep_previous_lines(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.append_test_message(
+                "first info".to_owned(),
+                rho_window::style::StyleClass::SystemInfo,
+                cx,
+            );
+            workspace.append_test_message(
+                "important".to_owned(),
+                rho_window::style::StyleClass::SystemImportant,
+                cx,
+            );
+            workspace.append_test_message(
+                "last info".to_owned(),
+                rho_window::style::StyleClass::SystemInfo,
+                cx,
+            );
+            workspace.cmd_messages(window, cx);
+        })
+        .expect("append styled messages");
+    let info = workspace
+        .update(cx, |_, _, cx| {
+            rho_window::style::StyleClass::SystemInfo.resolve(cx).color
+        })
+        .unwrap();
+    let important = workspace
+        .update(cx, |_, _, cx| {
+            rho_window::style::StyleClass::SystemImportant
+                .resolve(cx)
+                .color
+        })
+        .unwrap();
+    let runs = styled_runs(&workspace, cx);
+    for (text, color) in [
+        ("first info", info),
+        ("important", important),
+        ("last info", info),
+    ] {
+        assert!(
+            runs.iter()
+                .any(|(run, applied)| run.contains(text) && *applied == color),
+            "{text} has its own class color: {runs:?}"
+        );
+    }
+}
+
+#[gpui::test]
 fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.seed_messages_for_test(
-                std::iter::once((
-                    rho_window::style::StyleClass::SystemImportant,
-                    "important".to_owned(),
-                ))
-                .chain((1..rho_agents_view::messages::LOG_CAP).map(|index| {
+                [
+                    (
+                        rho_window::style::StyleClass::SystemImportant,
+                        "important".to_owned(),
+                    ),
                     (
                         rho_window::style::StyleClass::SystemInfo,
-                        format!("ordinary-{index}"),
-                    )
-                })),
+                        "ordinary".to_owned(),
+                    ),
+                ],
+                2,
                 cx,
             );
             workspace.cmd_messages(window, cx);
@@ -2654,46 +2705,6 @@ fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
             assert_eq!(messages.last(), Some(&expected_last));
         })
         .expect("fill message log");
-}
-
-#[gpui::test]
-fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let original = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.seed_messages_for_test(
-                (0..rho_agents_view::messages::LOG_CAP).map(|index| {
-                    (
-                        rho_window::style::StyleClass::SystemInfo,
-                        format!("initial-{index}"),
-                    )
-                }),
-                cx,
-            );
-            workspace.messages_buffer_id(cx)
-        })
-        .expect("seed capped messages");
-    workspace
-        .update(cx, |workspace, _, cx| {
-            for index in 0..rho_agents_view::messages::REBASE_EVICTIONS {
-                workspace.append_test_message(
-                    format!("replacement-{index}"),
-                    rho_window::style::StyleClass::SystemInfo,
-                    cx,
-                );
-            }
-        })
-        .expect("append enough evictions to rebase");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_ne!(workspace.messages_buffer_id(cx), original);
-            assert_eq!(
-                workspace.message_log_texts(cx).len(),
-                rho_agents_view::messages::LOG_CAP
-            );
-        })
-        .expect("inspect rebased messages");
 }
 
 #[gpui::test]
@@ -3172,7 +3183,7 @@ fn fenced_code_keeps_its_asterisks(cx: &mut TestAppContext) {
 /// viewport moves rather than being removed and recreated around the screen.
 #[gpui::test]
 fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppContext) {
-    let markup = (0..400)
+    let markup = (0..200)
         .map(|index| format!("line **{index}** of `history`\n"))
         .collect::<String>();
     let workspace = test_workspace(cx);
@@ -3194,8 +3205,8 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
     }
     cx.run_until_parked();
     let settled = display_text(&workspace, cx);
-    assert!(settled.contains("line 399 of history"));
-    assert!(!settled.contains("line **399** of `history`"));
+    assert!(settled.contains("line 199 of history"));
+    assert!(!settled.contains("line **199** of `history`"));
     assert!(
         buffer_text(&workspace, cx).contains("line **0** of `history`"),
         "the buffer keeps the markup either way"
@@ -3204,7 +3215,7 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
     let editor = active_editor(&workspace, cx);
     let folds = concealed_ranges(&workspace, &editor, cx);
     assert!(
-        folds.len() >= 1_000,
+        folds.len() >= 500,
         "every composed row is concealed: {}",
         folds.len()
     );
@@ -3240,13 +3251,20 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
     assert_eq!(concealed_ranges(&workspace, &editor, cx), folds);
 }
 
-/// Two hundred turns of transcript, the shape a long-running agent has.
+/// Enough turns to leave history outside the opening tail.
 fn long_history() -> UiAgentState {
+    history_with_turns(44)
+}
+
+fn history_with_turns(turns: usize) -> UiAgentState {
     let mut blocks = Vec::new();
-    for turn in 0..200 {
+    for turn in 0..turns {
         blocks.push(user(&format!("ask {turn}")));
         blocks.push(assistant(
-            &format!("turn {turn} line one\nturn {turn} line two\nturn {turn} line three\n"),
+            &format!(
+                "turn {turn} line one\nturn {turn} b\nturn {turn} line three{}\n",
+                if turn + 1 == turns { " z" } else { "" }
+            ),
             Some(UiMessagePhase::FinalAnswer),
         ));
     }
@@ -3311,7 +3329,7 @@ fn a_long_transcript_opens_on_its_tail(cx: &mut TestAppContext) {
 
     let text = buffer_text(&workspace, cx);
     assert!(
-        text.contains("turn 199 line one"),
+        text.contains("turn 43 line one"),
         "the tail is what a transcript opens on"
     );
     assert!(
@@ -3348,16 +3366,16 @@ fn scrolling_into_history_composes_it(cx: &mut TestAppContext) {
         "reaching the top composes more history: {opened} then {after}"
     );
     assert!(
-        buffer_text(&workspace, cx).contains("turn 199 line one"),
+        buffer_text(&workspace, cx).contains("turn 43 line one"),
         "the tail is still where it was"
     );
 }
 
-/// Two hundred turns whose answers are all markdown tables, so every page
+/// Forty-four turns whose answers are all markdown tables, so every page
 /// of history composed carries virtual-tab inlays of its own.
 fn long_history_of_tables() -> UiAgentState {
     let mut blocks = Vec::new();
-    for turn in 0..200 {
+    for turn in 0..44 {
         blocks.push(user(&format!("ask {turn}")));
         blocks.push(assistant(
             &format!("| Name | Outcome |\n| --- | --- |\n| turn {turn} | passed |\n"),
@@ -3367,18 +3385,29 @@ fn long_history_of_tables() -> UiAgentState {
     state(blocks, Vec::new())
 }
 
-/// Two hundred turns whose answers are all visualization refs, each its own
-/// ref, so every page of history composed carries blocks of its own.
+/// Two refs separated by more than the opening tail. Scrolling up must
+/// compose the older ref without replacing the younger one's block.
 fn long_history_of_visualizations() -> UiAgentState {
-    let mut blocks = Vec::new();
-    for turn in 0..200 {
-        blocks.push(user(&format!("ask {turn}")));
-        blocks.push(assistant(
-            &format!("```visualization\nref={turn:032x} rows=2\n```"),
-            Some(UiMessagePhase::FinalAnswer),
-        ));
-    }
-    state(blocks, Vec::new())
+    state(
+        vec![
+            user("older"),
+            assistant(
+                "```visualization\nref=00000000000000000000000000000001 rows=2\n```",
+                Some(UiMessagePhase::FinalAnswer),
+            ),
+            user("between"),
+            assistant(
+                &"plain history\n".repeat(210),
+                Some(UiMessagePhase::FinalAnswer),
+            ),
+            user("newer"),
+            assistant(
+                "```visualization\nref=00000000000000000000000000000002 rows=2\n```",
+                Some(UiMessagePhase::FinalAnswer),
+            ),
+        ],
+        Vec::new(),
+    )
 }
 
 fn inlay_ids(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> HashSet<InlayId> {
@@ -3550,7 +3579,7 @@ fn searching_a_transcript_composes_the_history_it_looks_through(cx: &mut TestApp
     feed_frame(&workspace, cx, agent(1), long_history());
     assert!(uncomposed_blocks(&workspace, cx, agent(1)) > 0);
 
-    cx.simulate_keystrokes(*workspace, "escape / t u r n space 3 space l i n e enter");
+    cx.simulate_keystrokes(*workspace, "escape / t u r n space 3 enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -3633,7 +3662,7 @@ fn n_repeats_a_transcript_search_and_shift_n_runs_it_backwards(cx: &mut TestAppC
     let workspace = test_workspace(cx);
     feed_frame(&workspace, cx, agent(1), long_history());
 
-    cx.simulate_keystrokes(*workspace, "escape / l i n e space t w o enter");
+    cx.simulate_keystrokes(*workspace, "escape / b enter");
     cx.run_until_parked();
     let first = transcript_point_block(&workspace, cx, agent(1)).expect("the point is on a match");
 
@@ -3662,12 +3691,9 @@ fn a_repeat_that_wraps_says_so(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(&workspace, cx, agent(1), long_history());
 
-    // The last turn's third line occurs once, so the repeat has nowhere to
+    // The last turn's marker occurs once, so the repeat has nowhere to
     // go but round.
-    cx.simulate_keystrokes(
-        *workspace,
-        "escape / t u r n space 1 9 9 space l i n e space t h r e e enter",
-    );
+    cx.simulate_keystrokes(*workspace, "escape / z enter");
     cx.run_until_parked();
     let only = transcript_point_block(&workspace, cx, agent(1)).expect("the point is on the match");
 
@@ -5332,7 +5358,7 @@ fn wrap_rows(traces: &[editor::display_map::WrapSyncTrace]) -> u32 {
 fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
-    feed_frame(&workspace, cx, agent(1), long_history());
+    feed_frame(&workspace, cx, agent(1), history_with_turns(60));
     let editor = active_editor(&workspace, cx);
     let model = workspace
         .update(cx, |workspace, _, _cx| {

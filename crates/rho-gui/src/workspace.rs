@@ -3740,10 +3740,11 @@ impl Workspace {
     pub(crate) fn seed_messages_for_test(
         &mut self,
         entries: impl IntoIterator<Item = (StyleClass, String)>,
+        capacity: usize,
         cx: &mut Context<Self>,
     ) {
         self.messages
-            .update(cx, |messages, cx| messages.seed(entries, cx));
+            .update(cx, |messages, cx| messages.seed(entries, capacity, cx));
     }
 
     #[cfg(test)]
@@ -3754,11 +3755,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.append_message(text, class, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn messages_buffer_id(&self, cx: &App) -> gpui::EntityId {
-        self.messages.read(cx).buffer_id()
     }
 
     #[cfg(test)]

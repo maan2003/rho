@@ -1,2 +1,4 @@
 [profile.default]
+# CI caps concurrent tests here; the dev shell lowers this to the local CPU count.
+test-threads = 16
 slow-timeout = { period = "5s", terminate-after = 1 }

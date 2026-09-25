@@ -9,6 +9,14 @@ mod common;
 use rho_tool_shell::ShellTools;
 
 fn main() {
+    // These namespace-first binaries cannot use libtest, but nextest still
+    // needs a libtest-compatible listing to run and time each binary.
+    if std::env::args().any(|arg| arg == "--list") {
+        if !std::env::args().any(|arg| arg == "--ignored") {
+            println!("e2e: test");
+        }
+        return;
+    }
     let unshare = std::process::Command::new("unshare")
         .args(["-U", "true"])
         .status();

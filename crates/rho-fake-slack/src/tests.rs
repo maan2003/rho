@@ -363,8 +363,20 @@ async fn what_the_schedule_does_arrives_on_the_socket() {
         })
         .count();
     assert!(said > 0, "forty happenings include somebody talking");
+    let self_id = slack.store().self_id.clone();
+    let frames = happenings
+        .iter()
+        .filter(|happening| match happening {
+            crate::Happening::Posted { .. }
+            | crate::Happening::Replied { .. }
+            | crate::Happening::Reacted { .. }
+            | crate::Happening::Edited { .. } => true,
+            crate::Happening::Read { user, .. } => user == &self_id,
+            crate::Happening::Nothing => false,
+        })
+        .count();
     let mut messages = 0;
-    for _ in 0..happenings.len() {
+    for _ in 0..frames {
         let Some(frame) = frame(&mut socket).await else {
             break;
         };

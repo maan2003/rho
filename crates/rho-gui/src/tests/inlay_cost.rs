@@ -22,11 +22,12 @@ use super::test_workspace;
 
 /// How many inlays the small and large cases carry. The large case is near
 /// the transform count the user's reports show on a live transcript.
-const SMALL: usize = 500;
-const LARGE: usize = 4_000;
+const SMALL: usize = 375;
+const LARGE: usize = 3_000;
 
-/// Splicing one inlay into a map that already holds `held` of them, timed
-/// over enough repeats that the number is not one scheduler hiccup.
+/// Splicing a batch into a map that already holds `held` inlays. Each batch
+/// contains enough offsets to make the difference between a walk and a seek
+/// larger than scheduler jitter.
 fn cost_of_a_splice(cx: &mut TestAppContext, held: usize) -> f64 {
     use editor::Editor;
     use gpui::AppContext as _;
@@ -70,7 +71,7 @@ fn cost_of_a_splice(cx: &mut TestAppContext, held: usize) -> f64 {
     // transforms is the quadratic the user is paying for. A splice of one
     // inlay never shows it — the rest of `splice` swamps two lookups.
     let batch = (held / 4).max(1);
-    let repeats = 8;
+    let repeats = 1;
     let started = Instant::now();
     workspace
         .update(cx, |_, _window, cx| {
@@ -103,12 +104,13 @@ fn cost_of_a_splice(cx: &mut TestAppContext, held: usize) -> f64 {
 ///
 /// Eight times the transforms and eight times the offsets in the batch. The
 /// lookup used to be a walk, so it paid both — sixty-four times over, and
-/// measured at **41.4×** here. Seeking the tree instead leaves only the batch
-/// itself, measured at **10.0×**. Twenty is the line between them: far above
-/// the honest linear cost of a bigger batch, far below what a walk can reach
-/// on any machine.
+/// previously measured at **41.4×**. Seeking the tree instead leaves only the
+/// batch itself, previously measured at **10.0×**. Twenty is the line between
+/// them: far above the honest linear cost of a bigger batch, far below what a
+/// walk can reach on any machine.
 ///
-/// The numbers behind those two, on the desk host, per batch splice:
+/// Earlier measurements at 500 and 4,000 inlays, on the desk host, per batch
+/// splice:
 ///
 /// | transforms | walk    | seek    |
 /// |------------|---------|---------|

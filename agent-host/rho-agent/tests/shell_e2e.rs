@@ -15,6 +15,14 @@ use rho_shell_view::protocol::{ShellColor, ShellServerFrame};
 const CHILD_FLAG: &str = "--rho-shell-child";
 
 fn main() {
+    // These namespace-first binaries cannot use libtest, but nextest still
+    // needs a libtest-compatible listing to run and time each binary.
+    if std::env::args().any(|arg| arg == "--list") {
+        if !std::env::args().any(|arg| arg == "--ignored") {
+            println!("e2e: test");
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some(CHILD_FLAG) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

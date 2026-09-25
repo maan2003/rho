@@ -3,6 +3,14 @@ use std::path::Path;
 use tokio::process::Command;
 
 fn main() {
+    // These namespace-first binaries cannot use libtest, but nextest still
+    // needs a libtest-compatible listing to run and time each binary.
+    if std::env::args().any(|arg| arg == "--list") {
+        if !std::env::args().any(|arg| arg == "--ignored") {
+            println!("e2e: test");
+        }
+        return;
+    }
     if !std::process::Command::new("unshare")
         .args(["-U", "true"])
         .status()

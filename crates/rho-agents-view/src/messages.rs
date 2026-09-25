@@ -34,14 +34,19 @@ struct Entry {
     text: String,
 }
 
-#[derive(Default)]
-struct Log(VecDeque<Entry>);
+struct Log(VecDeque<Entry>, usize);
+
+impl Default for Log {
+    fn default() -> Self {
+        Self(VecDeque::new(), LOG_CAP)
+    }
+}
 
 impl Log {
     /// Records an entry, and says whether one was dropped to make room.
     fn push(&mut self, entry: Entry) -> bool {
         self.0.push_back(entry);
-        if self.0.len() > LOG_CAP {
+        if self.0.len() > self.1 {
             self.0.pop_front();
             true
         } else {
@@ -144,8 +149,44 @@ impl MessageLog {
             self.styles.remove(0);
             self.evictions_since_rebase += 1;
         }
-        self.styles.push((class, range));
-        self.apply_styles(cx);
+        self.styles.push((class, range.clone()));
+        // The editor already has the old ranges. Splice just this line instead
+        // of remapping and replacing all LOG_CAP highlights on every append.
+        let multi_buffer = self.editor.read(cx).buffer().clone();
+        let snapshot = multi_buffer.read(cx).snapshot(cx);
+        if let Some(range) = rho_window::highlights::excerpt_range(&snapshot, &range) {
+            self.editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.highlight_text_in_range(
+                        class.highlight_key(rho_window::style::Region::System),
+                        range.clone(),
+                        vec![range],
+                        class.resolve(cx),
+                        cx,
+                    );
+                });
+                cx.notify();
+            });
+        }
+        // Clearing a departed class also removes its dead ranges. For a class
+        // still in use, evicted ranges collapse with the front edit and the
+        // periodic rebase discards them outright.
+        if evicted {
+            for departed in self.applied_classes.iter().copied().collect::<Vec<_>>() {
+                if !self.styles.iter().any(|(present, _)| *present == departed) {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.highlight_text(
+                            departed.highlight_key(rho_window::style::Region::System),
+                            Vec::new(),
+                            departed.resolve(cx),
+                            cx,
+                        );
+                    });
+                    self.applied_classes.remove(&departed);
+                }
+            }
+        }
+        self.applied_classes.insert(class);
         if self.evictions_since_rebase >= REBASE_EVICTIONS && !self.rebase_scheduled {
             self.rebase_scheduled = true;
             cx.spawn(async move |this, cx| {
@@ -246,12 +287,6 @@ impl MessageLog {
         self.log.0.iter().map(|entry| entry.text.as_str()).collect()
     }
 
-    /// Which buffer the surface is showing, so a host's test can see that a
-    /// rebase replaced it.
-    pub fn buffer_id(&self) -> gpui::EntityId {
-        self.buffer.entity_id()
-    }
-
     /// Records an entry without touching the buffer, for a host's test that
     /// only cares about what the log keeps.
     pub fn append_unrendered(&mut self, text: String) {
@@ -264,13 +299,14 @@ impl MessageLog {
 
     /// Replaces the log with these entries, rendered in one edit. For a
     /// host's test that needs a full log without paying for it an entry at
-    /// a time.
+    /// a time. The test can choose a small cap to exercise eviction.
     pub fn seed(
         &mut self,
         entries: impl IntoIterator<Item = (StyleClass, String)>,
+        capacity: usize,
         cx: &mut Context<Self>,
     ) {
-        self.log = Log::default();
+        self.log = Log(VecDeque::new(), capacity);
         self.line_lengths.clear();
         let mut rendered = String::new();
         let mut spans = Vec::new();

@@ -715,6 +715,23 @@ async fn removing_our_reaction_preserves_other_reactors_after_socket_echo(cx: &m
     });
     for _ in 0..100 {
         cx.run_until_parked();
+        if rig.fake.calls("reactions.remove") == 1
+            && rig.session.read_with(cx, |session, _| {
+                session
+                    .loaded(&design())
+                    .unwrap()
+                    .held(&ts)
+                    .unwrap()
+                    .reactions
+                    == [rho_slack::types::Reaction {
+                        name: "thumbsup".into(),
+                        count: 1,
+                        users: vec![UserId("UA".into())],
+                    }]
+            })
+        {
+            break;
+        }
         cx.executor()
             .timer(std::time::Duration::from_millis(10))
             .await;

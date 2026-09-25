@@ -258,15 +258,25 @@ mod tests {
 
     #[test]
     fn writers_enforce_frame_limit() {
-        let exact = (MAX_FRAME_LEN - 64..=MAX_FRAME_LEN)
-            .find_map(|len| {
-                let frame = Response::Output {
-                    execution: 1,
-                    data: vec![0; len],
-                };
-                (senax_encoder::pack(&frame).unwrap().len() == MAX_FRAME_LEN).then_some(frame)
-            })
-            .expect("senax vector overhead fits search window");
+        // Encode once at the boundary to account for senax's length prefix,
+        // rather than packing 65 separate two-megabyte candidate frames.
+        let oversized = Response::Output {
+            execution: 1,
+            data: vec![0; MAX_FRAME_LEN],
+        };
+        let overhead = senax_encoder::pack(&oversized).unwrap().len() - MAX_FRAME_LEN;
+        let mut exact = Response::Output {
+            execution: 1,
+            data: vec![0; MAX_FRAME_LEN - overhead],
+        };
+        // The vector-length prefix can shrink by one byte below the limit.
+        if senax_encoder::pack(&exact).unwrap().len() == MAX_FRAME_LEN - 1 {
+            let Response::Output { data, .. } = &mut exact else {
+                unreachable!()
+            };
+            data.push(0);
+        }
+        assert_eq!(senax_encoder::pack(&exact).unwrap().len(), MAX_FRAME_LEN);
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &exact).unwrap();
 
