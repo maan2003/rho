@@ -75,9 +75,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/23";
+pub const IROH_ALPN: &[u8] = b"rho/ui/24";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP23";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP24";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +184,8 @@ pub enum Protocol {
     Voice,
     /// An agent's workspace files (`rho-files`).
     Workspace,
+    /// Append-only sealed byte logs; the old Ledger protocol is retired.
+    LedgerLog,
 }
 
 /// The first frame on every stream: which protocol it speaks, and that
@@ -664,7 +666,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP21\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP23\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 

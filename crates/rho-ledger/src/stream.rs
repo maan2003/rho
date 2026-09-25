@@ -1,11 +1,5 @@
-//! The ledger's stream to each host: this device's segments out to every
-//! host, every other device's segments in.
-//!
-//! On every connection the device says what it has read, hears the host's
-//! heads and what it missed, and hands the host a base of its own if the
-//! host is behind on it. After that it puts each segment it writes and
-//! reads each one another device puts.
-
+//! Connections exchange log suffixes and forward bytes held from other hosts.
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::channel::mpsc as futures_mpsc;
@@ -14,94 +8,169 @@ use rho_agent_hosts::{Dialer, HostStream};
 use rho_rpc::protocol::{read_frame, write_frame, write_open};
 use tokio::sync::broadcast;
 
-use crate::ledger::{Change, Ledger};
-use crate::protocol::{ClientFrame, DeviceId, Open, Segment, ServerFrame};
+use crate::ledger::{Channel, Item, Ledger, Received};
+use crate::protocol::{ClientFrame, DeviceId, LogId, Open, ServerFrame};
 use crate::secret::Secret;
 
-/// What the ledger's streams hear.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LedgerEvent {
-    /// Another device's writes moved these keys.
-    Changed(Vec<Change>),
-    /// A device's segments do not open with this device's key.
-    Unreadable { device: DeviceId },
-    /// Other devices wrote, and this device has no key to read them with.
+    Appended(Vec<Item>),
+    Unreadable { device: Option<DeviceId> },
     NeedsKey,
 }
-
-/// The ledger and its stream to every host. Writes go through here so
-/// that every host hears them.
 pub struct LedgerStreams {
     ledger: Ledger,
     events: futures_mpsc::UnboundedSender<LedgerEvent>,
-    puts: broadcast::Sender<Segment>,
+    changed: broadcast::Sender<()>,
 }
-
 impl LedgerStreams {
-    /// The receiver hears what every host's stream reads.
     pub fn new(ledger: Ledger) -> (Arc<Self>, futures_mpsc::UnboundedReceiver<LedgerEvent>) {
-        let (events, events_rx) = futures_mpsc::unbounded();
-        let (puts, _) = broadcast::channel(256);
-        let streams = Arc::new(Self {
-            ledger,
-            events,
-            puts,
-        });
-        (streams, events_rx)
+        let (events, receiver) = futures_mpsc::unbounded();
+        let (changed, _) = broadcast::channel(256);
+        (
+            Arc::new(Self {
+                ledger,
+                events,
+                changed,
+            }),
+            receiver,
+        )
     }
-
     pub fn ledger(&self) -> &Ledger {
         &self.ledger
     }
-
-    /// Writes `changes` and puts them to every host, returning what moved.
-    pub async fn write(&self, changes: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Vec<Change> {
-        let (moved, segment) = self.ledger.write(changes).await;
-        if let Some(segment) = segment {
-            let _ = self.puts.send(segment);
+    pub async fn append(&self, channel: Channel, payloads: Vec<Vec<u8>>) {
+        if payloads.is_empty() {
+            return;
         }
-        moved
+        let device = self.ledger.device();
+        let log = crate::ledger::log_id(device, channel);
+        let own = payloads
+            .iter()
+            .cloned()
+            .map(|bytes| Item {
+                log,
+                device,
+                channel,
+                bytes,
+            })
+            .collect();
+        self.ledger.append(channel, payloads).await;
+        let _ = self.events.unbounded_send(LedgerEvent::Appended(own));
+        let _ = self.changed.send(());
     }
-
-    /// Takes the secret the user's devices share, puts everything this
-    /// device wrote before it to every host, and reads what other devices
-    /// wrote while it had none.
     pub async fn set_secret(&self, secret: Secret) -> anyhow::Result<()> {
-        let (base, received) = self.ledger.set_secret(secret).await?;
-        if let Some(base) = base {
-            let _ = self.puts.send(base);
-        }
-        self.report(received);
+        let received = self.ledger.set_secret(secret).await?;
+        self.report(received, None);
+        let _ = self.changed.send(());
         Ok(())
     }
-
-    /// The ledger's stream for a host, for the host to open on every
-    /// connection.
+    fn report(&self, result: Received, log: Option<LogId>) {
+        if result.needs_key {
+            let _ = self.events.unbounded_send(LedgerEvent::NeedsKey);
+        }
+        if result.unreadable {
+            // A first unreadable record has no authenticated device identity.
+            let device = result.device.or_else(|| {
+                log.and_then(|log| {
+                    self.ledger
+                        .items(Channel::Facts)
+                        .into_iter()
+                        .chain(self.ledger.items(Channel::Notes))
+                        .find(|item| item.log == log)
+                        .map(|item| item.device)
+                })
+            });
+            let _ = self
+                .events
+                .unbounded_send(LedgerEvent::Unreadable { device });
+        }
+        if !result.items.is_empty() {
+            let _ = self
+                .events
+                .unbounded_send(LedgerEvent::Appended(result.items));
+        }
+    }
     pub fn stream(self: &Arc<Self>) -> Arc<dyn HostStream> {
         Arc::new(LedgerStream(Arc::clone(self)))
     }
-}
-
-impl LedgerStreams {
-    fn report(&self, received: crate::Received) {
-        if received.needs_key {
-            let _ = self.events.unbounded_send(LedgerEvent::NeedsKey);
-        }
-        if !received.changes.is_empty() {
-            let _ = self
-                .events
-                .unbounded_send(LedgerEvent::Changed(received.changes));
+    pub async fn speak(
+        &self,
+        mut reader: impl tokio::io::AsyncRead + Unpin,
+        mut writer: impl tokio::io::AsyncWrite + Unpin,
+    ) -> anyhow::Result<()> {
+        let mut changed = self.changed.subscribe();
+        write_frame(
+            &mut writer,
+            &ClientFrame::Hello {
+                have: self.ledger.lengths(),
+            },
+        )
+        .await?;
+        let ServerFrame::Lengths { logs } = read_frame(&mut reader).await? else {
+            anyhow::bail!("host did not answer hello with lengths")
+        };
+        let mut host_lengths = logs;
+        self.send_missing(&mut writer, &mut host_lengths).await?;
+        loop {
+            tokio::select! {
+                frame = read_frame::<_, ServerFrame>(&mut reader) => {
+                    let ServerFrame::Bytes { log, at, bytes } = frame? else { anyhow::bail!("host said lengths twice") };
+                    // Catch-up and a subscribed live append may overlap. Only matching bytes may overlap.
+                    let held = self.ledger.lengths().get(&log).copied().unwrap_or(0);
+                    if at > held { anyhow::bail!("ledger gap at {at} after {held}"); }
+                    let overlap = usize::try_from(held - at).unwrap_or(usize::MAX).min(bytes.len());
+                    if overlap > 0 {
+                        let local = self.ledger.bytes_after(log, at).unwrap_or_default();
+                        if local.get(..overlap) != Some(&bytes[..overlap]) { anyhow::bail!("divergent ledger bytes"); }
+                    }
+                    let end = at + bytes.len() as u64;
+                    host_lengths.entry(log).and_modify(|length| *length = (*length).max(end)).or_insert(end);
+                    if overlap < bytes.len() {
+                        let result = self.ledger.receive(log, held, bytes[overlap..].to_vec()).await;
+                        self.report(result, Some(log));
+                        let _ = self.changed.send(());
+                    }
+                    self.send_missing(&mut writer, &mut host_lengths).await?;
+                }
+                change = changed.recv() => {
+                    if change.is_err_and(|error| matches!(error, broadcast::error::RecvError::Closed)) { return Ok(()); }
+                    self.send_missing(&mut writer, &mut host_lengths).await?;
+                }
+            }
         }
     }
+    async fn send_missing(
+        &self,
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        host: &mut BTreeMap<LogId, u64>,
+    ) -> anyhow::Result<()> {
+        for (log, len) in self.ledger.lengths() {
+            let at = host.get(&log).copied().unwrap_or(0);
+            if len > at {
+                let bytes = self.ledger.bytes_after(log, at).expect("held suffix");
+                let chunk = &bytes[..bytes.len().min(64 * 1024)];
+                write_frame(
+                    writer,
+                    &ClientFrame::Append {
+                        log,
+                        at,
+                        bytes: chunk.to_vec(),
+                    },
+                )
+                .await?;
+                host.insert(log, at + chunk.len() as u64);
+                break;
+            }
+        }
+        Ok(())
+    }
 }
-
 struct LedgerStream(Arc<LedgerStreams>);
-
 impl HostStream for LedgerStream {
     fn name(&self) -> &'static str {
         "ledger"
     }
-
     fn run(&self, dialer: Dialer) -> BoxFuture<'static, anyhow::Result<()>> {
         let streams = Arc::clone(&self.0);
         Box::pin(async move {
@@ -110,73 +179,5 @@ impl HostStream for LedgerStream {
             let (reader, writer) = tokio::io::split(socket);
             streams.speak(reader, writer).await
         })
-    }
-}
-
-impl LedgerStreams {
-    /// One connection's stream, for as long as it lasts.
-    pub async fn speak(
-        &self,
-        mut reader: impl tokio::io::AsyncRead + Unpin,
-        mut writer: impl tokio::io::AsyncWrite + Unpin,
-    ) -> anyhow::Result<()> {
-        // Before saying hello, so no write falls between the host's heads
-        // and the first put.
-        let mut puts = self.puts.subscribe();
-        let device = self.ledger.device();
-        write_frame(
-            &mut writer,
-            &ClientFrame::Hello {
-                known: self.ledger.known(),
-            },
-        )
-        .await?;
-        let ServerFrame::Heads { heads } = read_frame(&mut reader).await? else {
-            anyhow::bail!("the host did not answer the ledger's hello with its heads");
-        };
-        let head = heads.get(&device).copied().unwrap_or(0);
-        if let Some(base) = self.ledger.base_for(head) {
-            write_frame(
-                &mut writer,
-                &ClientFrame::Put {
-                    device,
-                    segment: base,
-                },
-            )
-            .await?;
-        }
-        let read = async {
-            loop {
-                let ServerFrame::Segments { device, segments } = read_frame(&mut reader).await?
-                else {
-                    anyhow::bail!("the host said its heads twice");
-                };
-                let received = self.ledger.receive(device, segments).await;
-                if received.unreadable {
-                    let _ = self
-                        .events
-                        .unbounded_send(LedgerEvent::Unreadable { device });
-                }
-                self.report(received);
-            }
-        };
-        let write = async {
-            loop {
-                let segment = match puts.recv().await {
-                    Ok(segment) => Some(segment),
-                    // A base at the newest segment covers whatever was
-                    // missed.
-                    Err(broadcast::error::RecvError::Lagged(_)) => self.ledger.base_for(0),
-                    Err(broadcast::error::RecvError::Closed) => return anyhow::Ok(()),
-                };
-                if let Some(segment) = segment {
-                    write_frame(&mut writer, &ClientFrame::Put { device, segment }).await?;
-                }
-            }
-        };
-        tokio::select! {
-            result = read => result,
-            result = write => result,
-        }
     }
 }

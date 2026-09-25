@@ -1,115 +1,81 @@
-//! Sealing segments with the key the user's devices share.
-//!
-//! XChaCha20-Poly1305 with a random nonce per segment. The device, the
-//! segment's number and whether it is a base are bound in as associated
-//! data, so a host cannot pass one device's segment off as another's, or
-//! an old segment off as a newer one.
-
+//! Record framing and authenticated encryption; only devices use this module.
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore as _;
 
-use crate::entry::Entry;
-use crate::protocol::DeviceId;
+use crate::protocol::LogId;
 
 const NONCE_LEN: usize = 24;
-
-fn associated(device: DeviceId, seq: u64, base: bool) -> Vec<u8> {
-    let mut data = b"rho-ledger/1".to_vec();
-    data.extend_from_slice(&device.0);
-    data.extend_from_slice(&seq.to_le_bytes());
-    data.push(u8::from(base));
-    data
+const TAG_LEN: usize = 16;
+fn associated(log: LogId, at: u64) -> Vec<u8> {
+    let mut aad = b"rho-ledger/log/1".to_vec();
+    aad.extend_from_slice(&log.0);
+    aad.extend_from_slice(&at.to_le_bytes());
+    aad
 }
 
-pub(crate) fn seal(
-    key: &[u8; 32],
-    device: DeviceId,
-    seq: u64,
-    base: bool,
-    entries: &[Entry],
-) -> Vec<u8> {
-    let plain = senax_encoder::encode(&entries.to_vec()).expect("encode ledger entries");
+pub(crate) fn seal(key: &[u8; 32], log: LogId, at: u64, payload: &[u8]) -> Vec<u8> {
+    let real_len = u32::try_from(payload.len()).expect("ledger payload fits u32");
+    let padded = (payload.len() + 4).max(256).next_power_of_two();
+    let mut plain = vec![0; padded];
+    plain[..4].copy_from_slice(&real_len.to_le_bytes());
+    plain[4..4 + payload.len()].copy_from_slice(payload);
     let mut nonce = [0; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let aad = associated(device, seq, base);
-    let sealed = XChaCha20Poly1305::new(key.into())
+    let body = XChaCha20Poly1305::new(key.into())
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
                 msg: &plain,
-                aad: &aad,
+                aad: &associated(log, at),
             },
         )
-        .expect("seal a ledger segment");
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&sealed);
-    out
+        .expect("seal ledger record");
+    let len = u32::try_from(NONCE_LEN + body.len()).expect("ledger record fits u32");
+    let mut record = Vec::with_capacity(4 + len as usize);
+    record.extend_from_slice(&len.to_le_bytes());
+    record.extend_from_slice(&nonce);
+    record.extend_from_slice(&body);
+    record
 }
 
-/// The entries in a segment, or `None` when it does not open with this
-/// key as this device's segment `seq`: the wrong key, or a segment that
-/// was tampered with or moved.
-pub(crate) fn open(
-    key: &[u8; 32],
-    device: DeviceId,
-    seq: u64,
-    base: bool,
-    sealed: &[u8],
-) -> Option<Vec<Entry>> {
-    if sealed.len() < NONCE_LEN {
+/// Returns (record length, plaintext), or None if incomplete or invalid.
+pub(crate) fn open(key: &[u8; 32], log: LogId, at: u64, record: &[u8]) -> Option<(usize, Vec<u8>)> {
+    let len = usize::try_from(u32::from_le_bytes(record.get(..4)?.try_into().ok()?)).ok()?;
+    if len < NONCE_LEN + TAG_LEN + 256 || len.checked_add(4)? > record.len() {
         return None;
     }
-    let (nonce, body) = sealed.split_at(NONCE_LEN);
-    let aad = associated(device, seq, base);
+    let (nonce, body) = record[4..4 + len].split_at(NONCE_LEN);
     let plain = XChaCha20Poly1305::new(key.into())
         .decrypt(
             XNonce::from_slice(nonce),
             Payload {
                 msg: body,
-                aad: &aad,
+                aad: &associated(log, at),
             },
         )
         .ok()?;
-    let mut plain: &[u8] = &plain;
-    senax_encoder::decode(&mut plain).ok()
+    let real = u32::from_le_bytes(plain.get(..4)?.try_into().ok()?) as usize;
+    if real > plain.len() - 4 || !plain[4 + real..].iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some((4 + len, plain[4..4 + real].to_vec()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::Stamp;
-
-    const DEVICE: DeviceId = DeviceId([5; 16]);
-    const KEY: [u8; 32] = [9; 32];
-
-    fn entries() -> Vec<Entry> {
-        vec![Entry {
-            key: b"k".to_vec(),
-            value: Some(b"v".to_vec()),
-            stamp: Stamp {
-                millis: 1,
-                counter: 0,
-                device: DEVICE,
-            },
-        }]
-    }
-
     #[test]
-    fn a_sealed_segment_opens_with_its_key_where_it_was_put() {
-        let sealed = seal(&KEY, DEVICE, 3, false, &entries());
-        assert_eq!(open(&KEY, DEVICE, 3, false, &sealed), Some(entries()));
-    }
-
-    #[test]
-    fn a_segment_does_not_open_with_another_key_or_somewhere_else() {
-        let sealed = seal(&KEY, DEVICE, 3, false, &entries());
-        assert_eq!(open(&[8; 32], DEVICE, 3, false, &sealed), None);
-        assert_eq!(open(&KEY, DeviceId([6; 16]), 3, false, &sealed), None);
-        assert_eq!(open(&KEY, DEVICE, 4, false, &sealed), None);
-        assert_eq!(open(&KEY, DEVICE, 3, true, &sealed), None);
-        let mut tampered = sealed.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert_eq!(open(&KEY, DEVICE, 3, false, &tampered), None);
+    fn padding_and_binding() {
+        let key = [1; 32];
+        let log = LogId([2; 16]);
+        for (size, padded) in [(0, 256), (252, 256), (253, 512), (600, 1024)] {
+            let bytes = vec![7; size];
+            let record = seal(&key, log, 37, &bytes);
+            assert_eq!(record.len(), 4 + 24 + padded + 16);
+            assert_eq!(open(&key, log, 37, &record), Some((record.len(), bytes)));
+            assert!(open(&key, log, 38, &record).is_none());
+            assert!(open(&key, LogId([3; 16]), 37, &record).is_none());
+        }
     }
 }
