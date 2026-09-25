@@ -50,6 +50,7 @@ pub struct WaylandView {
     focus: FocusHandle,
     error: Option<String>,
     first_paint: Rc<Cell<bool>>,
+    painted: Rc<Cell<Option<rho_desktop_proto::FrameId>>>,
     _updates: Task<()>,
     _activation: Subscription,
 }
@@ -123,6 +124,7 @@ impl WaylandView {
         });
         Self {
             first_paint: Rc::new(Cell::new(true)),
+            painted: Rc::new(Cell::new(None)),
             _activation: activation,
             viewer,
             image: None,
@@ -233,6 +235,7 @@ impl Render for WaylandView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let image = self.frozen.clone().or_else(|| self.image.clone());
         let first_paint = self.first_paint.clone();
+        let painted = self.painted.clone();
         let started = self.viewer.started_at;
         let desktop_id = self.viewer.desktop_id;
         let strokes = self.strokes.clone();
@@ -258,6 +261,10 @@ impl Render for WaylandView {
                 if let Some(image) = image {
                     #[cfg(target_os = "linux")]
                     window.paint_video(bounds, image.render.clone());
+                    let presented = image.image.clone();
+                    on_presented(image.image.id, &painted, window, move || {
+                        presented.presented()
+                    });
                     if first_paint.replace(false) {
                         tracing::info!(
                             desktop_id,
@@ -538,6 +545,21 @@ impl Render for WaylandView {
     }
 }
 
+/// A repeated paint (including annotation on a frozen frame) must not refresh
+/// the source's progress clock. Report only after the following GUI frame.
+fn on_presented(
+    id: rho_desktop_proto::FrameId,
+    painted: &Cell<Option<rho_desktop_proto::FrameId>>,
+    window: &Window,
+    report: impl FnOnce() + 'static,
+) {
+    if painted.get().is_none_or(|previous| id > previous) {
+        painted.set(Some(id));
+        // Renderer progress, not a hardware scanout fence.
+        window.on_next_frame(move |_, _| report());
+    }
+}
+
 /// Burn the same output-pixel strokes into the frozen frame, not a later frame.
 fn draw_line(pixels: &mut [u8], size: (usize, usize), from: (u32, u32), to: (u32, u32)) {
     let (mut x, mut y) = (from.0 as i32, from.1 as i32);
@@ -576,7 +598,43 @@ fn draw_line(pixels: &mut [u8], size: (usize, usize), from: (u32, u32), to: (u32
 }
 #[cfg(test)]
 mod tests {
-    use super::draw_line;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{EmptyView, TestAppContext};
+
+    use super::{draw_line, on_presented};
+
+    #[gpui::test]
+    fn presentation_feedback_waits_for_frame_and_ignores_repaints(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let painted = Cell::new(None);
+        let reported = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, _| {
+                for (group, timestamp_us) in [(2, 50), (2, 50), (1, 90), (2, 60)] {
+                    let reported = reported.clone();
+                    on_presented(
+                        rho_desktop_proto::FrameId {
+                            group,
+                            timestamp_us,
+                        },
+                        &painted,
+                        window,
+                        move || reported.set(reported.get() + 1),
+                    );
+                }
+                assert_eq!(reported.get(), 0, "paint is not presentation");
+            })
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                assert_eq!(window.simulate_next_frame(cx), 2);
+            })
+            .unwrap();
+        assert_eq!(reported.get(), 2, "one callback per advancing frame");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn planar_video_gpu_rendering() -> anyhow::Result<()> {

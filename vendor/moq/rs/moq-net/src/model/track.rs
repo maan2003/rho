@@ -2956,10 +2956,15 @@ struct GroupExpiry {
 impl group::Expiry for GroupExpiry {
 	fn is_expired(&self, waiter: &kio::Waiter) -> bool {
 		let mut max_age = Duration::default();
+		let mut below_floor = false;
 		let _ = self.subscription.poll(waiter, |subscription| {
 			max_age = subscription.max_age;
+			below_floor = subscription.start.is_some_and(|start| self.sequence < start.group);
 			Poll::<()>::Pending
 		});
+		if below_floor {
+			return true;
+		}
 
 		let mut cap = None;
 		let _ = self.cap.poll(waiter, |current| {
@@ -6757,6 +6762,28 @@ mod test {
 			consumer.recv_group().now_or_never().unwrap().unwrap().unwrap().sequence,
 			2
 		);
+	}
+
+	#[tokio::test]
+	async fn advancing_start_expires_handed_out_unfinished_group() {
+		let producer = track_producer("test", None);
+		let mut source_old = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		source_old.write_frame(Timestamp::ZERO, b"old".to_vec()).unwrap();
+		let mut reader = producer.subscribe(None);
+		let mut old = reader.recv_group().await.unwrap().unwrap();
+		assert!(!old.poll_expired(&kio::Waiter::noop()));
+
+		reader.control().update(Subscription::default().with_start(Position::group(1))).unwrap();
+		assert!(old.poll_expired(&kio::Waiter::noop()), "the source has not finished group 0");
+		assert!(matches!(old.read_frame().await, Err(Error::Old)), "unread data was cancelled");
+		source_old.write_frame(Timestamp::ZERO, b"still open".to_vec()).unwrap();
+
+		let mut source_new = producer.create_group(group::Info { sequence: 1 }).unwrap();
+		source_new.write_frame(Timestamp::ZERO, b"new".to_vec()).unwrap();
+		let mut fresh = reader.recv_group().await.unwrap().unwrap();
+		assert_eq!(fresh.sequence, 1);
+		assert!(!fresh.poll_expired(&kio::Waiter::noop()));
+		assert_eq!(&fresh.read_frame().await.unwrap().unwrap().payload[..], b"new");
 	}
 
 	#[tokio::test]
