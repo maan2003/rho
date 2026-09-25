@@ -14,7 +14,7 @@ jiff.workspace = true
 rho-agent-types.workspace = true
 rho-agents-client = { workspace = true, features = ["client"] }
 rho-slack.workspace = true
-senax-encoder = { workspace = true, features = ["jiff"] }
+senax-encoder = { workspace = true, features = ["jiff", "uuid"] }
 uuid.workspace = true
 
 [dev-dependencies]

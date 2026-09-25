@@ -15,8 +15,18 @@ use rho_slack::types::{ChannelId, Conversation, ConversationKind, Message, Ts, U
 
 use super::*;
 use crate::curve::*;
-use crate::facts::{Fact, Said};
+use crate::facts::{Device, Entry, Fact, Seen};
+use crate::notes::NoteRev;
 use crate::until::Until;
+
+/// What the user says in these scenarios, about the node it is said to.
+enum Said {
+    Done,
+    Mute,
+    Unmute,
+    Snooze { until: Until },
+    Deadline { by: Until, lead_days: u32 },
+}
 
 /// Everything `rank` reads, and a clock to move.
 struct World {
@@ -212,12 +222,46 @@ impl World {
         self.agents.agent_digest(Self::id(node)).unwrap().newest.0
     }
 
+    fn tell(&mut self, fact: Fact) {
+        // Said now, or just after the last thing said.
+        let at = self.marks.next_at(&self.now);
+        self.now = at.clone();
+        self.marks.apply([Entry {
+            device: Device([0; 16]),
+            at,
+            fact,
+        }]);
+    }
+
+    /// How far the user has seen `node`: everything its source has.
+    fn seen(&self, node: &NodeId) -> Seen {
+        match node {
+            NodeId::Agent(_) => Seen::Agent(self.newest(node)),
+            NodeId::Slack(unit) => self
+                .slack
+                .unit(&model_unit(unit))
+                .map_or(Seen::Whole, |facts| Seen::Slack(facts.newest.0.clone())),
+            _ => Seen::Whole,
+        }
+    }
+
     fn say(&mut self, node: &NodeId, said: Said) {
-        let fact = Fact {
-            at: self.now.clone(),
-            said,
+        let node = node.clone();
+        let fact = match said {
+            Said::Done => Fact::Settled {
+                seen: self.seen(&node),
+                node,
+            },
+            Said::Mute => Fact::Mute { node },
+            Said::Unmute => Fact::Unmute { node },
+            Said::Snooze { until } => Fact::Snooze { node, until },
+            Said::Deadline { by, lead_days } => Fact::Deadline {
+                node,
+                by,
+                lead_days,
+            },
         };
-        self.marks.apply([crate::facts::record(node, &fact)]);
+        self.tell(fact);
     }
 
     fn snooze(&mut self, node: &NodeId, until: SignedDuration) {
@@ -230,19 +274,31 @@ impl World {
     }
 
     fn done(&mut self, node: &NodeId) {
-        let through = match node {
-            NodeId::Agent(_) => Cursor::Story(self.newest(node)),
-            _ => Cursor::Done,
-        };
-        self.say(node, Said::Done { through });
+        self.say(node, Said::Done);
     }
 
     fn todo(&mut self, node: &NodeId, start: Option<Until>) {
-        let through = match node {
-            NodeId::Agent(_) => Cursor::Story(self.newest(node)),
-            _ => Cursor::Done,
+        self.tell(Fact::Todo {
+            node: node.clone(),
+            start,
+            seen: self.seen(node),
+        });
+    }
+
+    fn write_note(&mut self, node: &NodeId, body: &str, deleted: bool) {
+        let NodeId::Note(note) = node else {
+            panic!("not a note")
         };
-        self.say(node, Said::Todo { through, start });
+        let at = self.marks.next_at(&self.now);
+        self.now = at.clone();
+        self.marks.apply_notes([NoteRev {
+            note: *note,
+            device: Device([0; 16]),
+            created: at.timestamp(),
+            at,
+            body: body.into(),
+            deleted,
+        }]);
     }
 
     fn next_ts(&mut self) -> Ts {
@@ -571,7 +627,7 @@ fn z6_every_snooze_is_kept() {
 
 fn note(w: &mut World, name: &str) -> NodeId {
     let node = NodeId::Note(uuid::Uuid::new_v4());
-    w.marks.apply([crate::marks::body(&node, name)]);
+    w.write_note(&node, name, false);
     w.names.insert(node.clone(), name.into());
     node
 }
@@ -650,12 +706,7 @@ fn t5_writing_to_an_agent_keeps_its_todo() {
 
 #[test]
 fn t6_done_or_mute_takes_back_the_todo_the_deadline_and_the_snooze() {
-    for take_back in [
-        Said::Done {
-            through: Cursor::Done,
-        },
-        Said::Mute,
-    ] {
+    for take_back in [Said::Done, Said::Mute] {
         let mut w = world();
         let n = note(&mut w, "n");
         w.todo(&n, None);
@@ -733,6 +784,17 @@ fn s3_s4_read_or_replied_is_nothing_until_a_new_message() {
 }
 
 #[test]
+fn s3_s4_done_on_another_device_holds_until_a_newer_message() {
+    let mut w = world();
+    let d = w.dm("D1", "U1");
+    // Said on the phone: this device's Slack still has it unread.
+    w.done(&d);
+    assert_eq!(w.hand(), "");
+    w.post("D1", None, "U1", "one more thing");
+    assert_eq!(w.hand(), "D1 · unread in @u1 · needs reply · 0m");
+}
+
+#[test]
 fn s5_a_todo_on_a_thread_outlasts_reading_it() {
     let mut w = world();
     let (thread, _) = w.thread(&["U1", "U2", "U3"]);
@@ -768,7 +830,7 @@ fn n1_n3_a_plain_or_deleted_note_has_no_card() {
     note(&mut w, "plain");
     let gone = note(&mut w, "gone");
     w.todo(&gone, None);
-    w.marks.apply([crate::marks::deleted(&gone, true)]);
+    w.write_note(&gone, "gone", true);
     assert_eq!(w.hand(), "");
 }
 

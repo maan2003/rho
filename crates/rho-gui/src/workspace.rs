@@ -2751,7 +2751,16 @@ impl Workspace {
         let node = rho_dealer::NodeId::Agent(agent_id);
         let name = name.trim().to_owned();
         let written = (!name.is_empty()).then(|| name.clone());
-        self.write_marks(vec![rho_dealer::marks::name(&node, written)], cx);
+        self.write_marks(
+            vec![
+                rho_dealer::facts::Fact::Named {
+                    node,
+                    name: written,
+                }
+                .into(),
+            ],
+            cx,
+        );
         let said = match name.is_empty() {
             true => "name removed".to_owned(),
             false => format!("name: {name}"),
@@ -2961,12 +2970,14 @@ impl Workspace {
         let Some(label) = self.mint_label(&path_name, cx) else {
             return;
         };
-        let node = rho_dealer::NodeId::Label(label);
         self.write_marks(
-            vec![rho_dealer::marks::repository(
-                &node,
-                Some(workdir.path.to_string()),
-            )],
+            vec![
+                rho_dealer::facts::Fact::Repository {
+                    label,
+                    url: Some(workdir.path.to_string()),
+                }
+                .into(),
+            ],
             cx,
         );
     }
@@ -2991,8 +3002,10 @@ impl Workspace {
                 let Some(label) = self.attention.marks.label_at(&name) else {
                     return;
                 };
-                let node = rho_dealer::NodeId::Label(label);
-                self.write_marks(vec![rho_dealer::marks::repository(&node, None)], cx);
+                self.write_marks(
+                    vec![rho_dealer::facts::Fact::Repository { label, url: None }.into()],
+                    cx,
+                );
             }
             None => {
                 let message = format!("no registered project `{path}`");
@@ -6023,7 +6036,7 @@ impl Workspace {
             );
             return;
         }
-        let Some((present, writes)) = self.toggle_label(&node, path, cx) else {
+        let Some((present, takeback)) = self.toggle_label(&node, path, cx) else {
             self.echo("label: nothing to label", StyleClass::SystemInfo, cx);
             return;
         };
@@ -6037,7 +6050,7 @@ impl Workspace {
             let sequence = self.attention.push_undo(crate::attention::Undo {
                 sequence: 0,
                 verb: said.clone(),
-                writes,
+                takeback,
                 card: Some((card.node.clone(), rho_journal::DealerVerdict::File)),
                 slack_cursors: Vec::new(),
                 slack_muted: None,
@@ -6134,17 +6147,28 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> usize {
         let mut cursors = Vec::new();
+        let mut settled = Vec::new();
         for (unit, at) in units {
             // A unit is done at the cutoff and no further: anything newer
             // is still the reader's.
-            cursors.extend(self.advance_slack_cursor(&unit, Some(at), cx));
+            if let Some(cursor) = self.advance_slack_cursor(&unit, Some(at.clone()), cx) {
+                cursors.push(cursor);
+                settled.push(
+                    rho_dealer::facts::Fact::Settled {
+                        node: rho_dealer::NodeId::Slack(unit),
+                        seen: rho_dealer::facts::Seen::Slack(at.0),
+                    }
+                    .into(),
+                );
+            }
         }
         let count = cursors.len();
         if count > 0 {
+            let takeback = self.write_marks(settled, cx);
             self.attention.push_undo(crate::attention::Undo {
                 sequence: 0,
                 verb,
-                writes: Vec::new(),
+                takeback,
                 card: None,
                 slack_cursors: cursors,
                 slack_muted: None,

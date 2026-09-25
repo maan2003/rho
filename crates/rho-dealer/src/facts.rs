@@ -1,11 +1,17 @@
-//! What the user did about a node, as the ledger holds it.
+//! What the user said, as the ledger holds it.
 //!
-//! A fact is one thing the user said, with when and where they said it:
-//! done, mute, snooze, todo, a deadline. Facts are never edited. Each is
-//! its own ledger key, `f/<node>|<id>`, so two devices never write over
-//! each other, and taking one back (undo) removes its key. What a node's
-//! facts come to right now is read off them in time order; nothing
-//! summarises them in storage.
+//! An [`Entry`] is one thing the user said: which device said it, when
+//! and where, and the [`Fact`]. Entries are never edited or removed; an
+//! undo is a [`Fact::Retract`] of its own. Every device holds every
+//! device's entries, and what they come to is read off them in time
+//! order, so merging two devices is only putting their entries together.
+//!
+//! A fact is kept as the user said it: a snooze "until tomorrow" is
+//! `Until::Day`, read against the zone it was said in. How far the user
+//! had seen when they were done is in the source's own terms ([`Seen`]),
+//! never a time, so it means the same on every device.
+
+use std::cmp::Ordering;
 
 use jiff::{Timestamp, Zoned};
 use senax_encoder::{Decode, Encode};
@@ -13,52 +19,165 @@ use senax_encoder::{Decode, Encode};
 use crate::node::NodeId;
 use crate::until::Until;
 
-/// How far the user has dealt with a node: its source's position when
-/// they said so.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Cursor {
-    /// For a node whose source has no position: a note, a Slack unit
-    /// (Slack keeps its own cursor).
-    Done,
-    /// An agent's story, through this position.
-    Story(u64),
+/// A device that writes entries. The ledger names it; here it only tells
+/// entries said in the same instant apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct Device(pub [u8; 16]);
+
+/// An entry, by who said it and when: what a retract names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct EntryId {
+    pub at: Timestamp,
+    pub device: Device,
 }
 
-/// One thing the user said about a node.
+/// One thing the user said.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Fact {
-    /// When and where they said it.
+pub struct Entry {
+    pub device: Device,
+    /// When and where it was said. A device never writes an instant at or
+    /// before one it has already seen, so what it says after reading
+    /// another device's entry sorts after it.
     pub at: Zoned,
-    pub said: Said,
+    pub fact: Fact,
+}
+
+impl Entry {
+    pub fn id(&self) -> EntryId {
+        EntryId {
+            at: self.at.timestamp(),
+            device: self.device,
+        }
+    }
+
+    /// The payload the ledger carries.
+    pub fn encode(&self) -> Vec<u8> {
+        senax_encoder::encode(self)
+            .expect("encode an entry")
+            .to_vec()
+    }
+
+    /// An entry read back; `None` for one this build cannot read, which a
+    /// newer build may have written.
+    pub fn decode(mut bytes: &[u8]) -> Option<Self> {
+        senax_encoder::decode(&mut bytes).ok()
+    }
+}
+
+impl PartialOrd for Entry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Entry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.id().cmp(&other.id())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum Said {
-    /// Dealt with through `through`. Takes back any snooze, todo and
-    /// deadline said before it.
-    Done {
-        through: Cursor,
-    },
-    /// Nothing from the node reaches the user, until [`Said::Unmute`].
-    /// Takes back what [`Said::Done`] does.
-    Mute,
-    Unmute,
+pub enum Fact {
     /// Out of the way until then.
     Snooze {
+        node: NodeId,
         until: Until,
     },
-    /// Handled through `through`, and kept on the user's plate until done:
-    /// from `start` when they named one, from now otherwise. Takes back an
-    /// earlier snooze.
+    /// On the user's plate until settled: from `start`, or from when it was
+    /// said. Handles what the user had seen, and takes back a snooze.
     Todo {
-        through: Cursor,
+        node: NodeId,
         start: Option<Until>,
+        seen: Seen,
     },
     /// Due by `by`, pressing from `lead_days` before.
     Deadline {
+        node: NodeId,
         by: Until,
         lead_days: u32,
     },
+    /// Done, having seen this far: takes back the node's todo, deadline
+    /// and snooze.
+    Settled {
+        node: NodeId,
+        seen: Seen,
+    },
+    /// Nothing from the node reaches the user, until unmuted. For every
+    /// node but a Slack one, which Slack mutes itself.
+    Mute {
+        node: NodeId,
+    },
+    Unmute {
+        node: NodeId,
+    },
+
+    /// Makes a label, or renames or moves it.
+    Label {
+        label: uuid::Uuid,
+        name: String,
+        parent: Option<uuid::Uuid>,
+    },
+    /// Deletes a label.
+    Unlabel {
+        label: uuid::Uuid,
+    },
+    /// Where work under a label happens.
+    Repository {
+        label: uuid::Uuid,
+        url: Option<String>,
+    },
+    Labeled {
+        node: NodeId,
+        label: uuid::Uuid,
+        present: bool,
+    },
+    /// What the user calls a node, over what its source calls it.
+    Named {
+        node: NodeId,
+        name: Option<String>,
+    },
+    /// What a node is about.
+    About {
+        node: NodeId,
+        about: Option<NodeId>,
+    },
+
+    /// Takes back an entry: undo.
+    Retract {
+        of: EntryId,
+    },
+}
+
+impl Fact {
+    /// The node the fact is about; `None` for a retract.
+    pub fn node(&self) -> Option<NodeId> {
+        match self {
+            Self::Snooze { node, .. }
+            | Self::Todo { node, .. }
+            | Self::Deadline { node, .. }
+            | Self::Settled { node, .. }
+            | Self::Mute { node }
+            | Self::Unmute { node }
+            | Self::Labeled { node, .. }
+            | Self::Named { node, .. }
+            | Self::About { node, .. } => Some(node.clone()),
+            Self::Label { label, .. }
+            | Self::Unlabel { label }
+            | Self::Repository { label, .. } => Some(NodeId::Label(*label)),
+            Self::Retract { .. } => None,
+        }
+    }
+}
+
+/// How far the user had seen, in the source's own terms.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Seen {
+    /// An agent's story, through this position.
+    Agent(u64),
+    /// A Slack unit, through this message.
+    Slack(String),
+    /// A note or a label: there is nothing more to see.
+    Whole,
 }
 
 /// A snooze in force or past: when it was said and when it ends.
@@ -82,59 +201,56 @@ pub struct Deadline {
     pub lead_days: u32,
 }
 
-fn prefix(node: &NodeId) -> String {
-    format!("f/{}|", node.key())
-}
-
-/// The ledger key a fact on `node` is kept under.
-pub fn key(node: &NodeId, id: uuid::Uuid) -> Vec<u8> {
-    format!("{}{}", prefix(node), id.simple()).into_bytes()
-}
-
-/// The ledger write that records `fact` on `node`, under a new key. Keys
-/// sort in the order this process made them, which is what orders two
-/// facts said in the same instant.
-pub fn record(node: &NodeId, fact: &Fact) -> crate::marks::Write {
-    record_as(node, uuid::Uuid::now_v7(), fact)
-}
-
-pub(crate) fn record_as(node: &NodeId, id: uuid::Uuid, fact: &Fact) -> crate::marks::Write {
-    (
-        key(node, id),
-        Some(senax_encoder::encode(fact).expect("encode a fact").to_vec()),
-    )
-}
-
-/// A node's facts, oldest first, and what they come to.
+/// A node's attention entries, oldest first and none of them retracted,
+/// and what they come to.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Facts<'a>(pub &'a [Fact]);
+pub struct Facts<'a>(pub &'a [Entry]);
 
 impl<'a> Facts<'a> {
-    /// The facts since the last one that takes everything back.
-    fn since_cleared(self) -> &'a [Fact] {
+    /// The entries since the last one that takes everything back.
+    fn since_cleared(self) -> &'a [Entry] {
         let from = self
             .0
             .iter()
-            .rposition(|fact| matches!(fact.said, Said::Done { .. } | Said::Mute))
+            .rposition(|entry| matches!(entry.fact, Fact::Settled { .. } | Fact::Mute { .. }))
             .map_or(0, |at| at + 1);
         &self.0[from..]
     }
 
-    /// How far the user has dealt with the node: the last done or todo.
-    pub fn handled(self) -> Option<&'a Cursor> {
-        self.0.iter().rev().find_map(|fact| match &fact.said {
-            Said::Done { through } | Said::Todo { through, .. } => Some(through),
+    fn seen(self) -> impl Iterator<Item = &'a Seen> {
+        self.0.iter().filter_map(|entry| match &entry.fact {
+            Fact::Settled { seen, .. } | Fact::Todo { seen, .. } => Some(seen),
             _ => None,
         })
+    }
+
+    /// How far into an agent's story the user has seen when done with it.
+    pub fn seen_agent(self) -> Option<u64> {
+        self.seen()
+            .filter_map(|seen| match seen {
+                Seen::Agent(pos) => Some(*pos),
+                _ => None,
+            })
+            .max()
+    }
+
+    /// The newest Slack message the user had seen when done with a unit.
+    pub fn seen_slack(self) -> Option<&'a str> {
+        self.seen()
+            .filter_map(|seen| match seen {
+                Seen::Slack(ts) => Some(ts.as_str()),
+                _ => None,
+            })
+            .max_by(|a, b| slack_ts_order(a, b))
     }
 
     pub fn muted(self) -> bool {
         self.0
             .iter()
             .rev()
-            .find_map(|fact| match fact.said {
-                Said::Mute => Some(true),
-                Said::Unmute => Some(false),
+            .find_map(|entry| match entry.fact {
+                Fact::Mute { .. } => Some(true),
+                Fact::Unmute { .. } => Some(false),
                 _ => None,
             })
             .unwrap_or(false)
@@ -147,25 +263,28 @@ impl<'a> Facts<'a> {
         let live = self.since_cleared();
         let from = live
             .iter()
-            .rposition(|fact| matches!(fact.said, Said::Todo { .. }))
+            .rposition(|entry| matches!(entry.fact, Fact::Todo { .. }))
             .map_or(0, |at| at + 1);
-        live[from..].iter().rev().find_map(|fact| match fact.said {
-            Said::Snooze { until } => Some(Snooze {
-                set: fact.at.clone(),
-                until: until.resolve(&fact.at),
-            }),
-            _ => None,
-        })
+        live[from..]
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.fact {
+                Fact::Snooze { until, .. } => Some(Snooze {
+                    set: entry.at.clone(),
+                    until: until.resolve(&entry.at),
+                }),
+                _ => None,
+            })
     }
 
     pub fn todo(self) -> Option<Todo> {
         self.since_cleared()
             .iter()
             .rev()
-            .find_map(|fact| match &fact.said {
-                Said::Todo { start, .. } => Some(Todo {
-                    set: fact.at.clone(),
-                    start: start.map_or(fact.at.timestamp(), |start| start.resolve(&fact.at)),
+            .find_map(|entry| match &entry.fact {
+                Fact::Todo { start, .. } => Some(Todo {
+                    set: entry.at.clone(),
+                    start: start.map_or(entry.at.timestamp(), |start| start.resolve(&entry.at)),
                 }),
                 _ => None,
             })
@@ -175,100 +294,139 @@ impl<'a> Facts<'a> {
         self.since_cleared()
             .iter()
             .rev()
-            .find_map(|fact| match fact.said {
-                Said::Deadline { by, lead_days } => Some(Deadline {
-                    set: fact.at.clone(),
-                    by: by.resolve(&fact.at),
-                    lead_days,
+            .find_map(|entry| match &entry.fact {
+                Fact::Deadline { by, lead_days, .. } => Some(Deadline {
+                    set: entry.at.clone(),
+                    by: by.resolve(&entry.at),
+                    lead_days: *lead_days,
                 }),
                 _ => None,
             })
     }
 
-    /// How many times the user has snoozed the node, ever.
     /// Muted, or snoozed past `now`: the user put it away.
     pub fn put_away(self, now: Timestamp) -> bool {
         self.muted() || self.snooze().is_some_and(|snooze| snooze.until > now)
     }
 
+    /// How many times the user has snoozed the node, ever.
     pub fn snoozes(self) -> usize {
         self.0
             .iter()
-            .filter(|fact| matches!(fact.said, Said::Snooze { .. }))
+            .filter(|entry| matches!(entry.fact, Fact::Snooze { .. }))
             .count()
     }
 }
 
+/// Slack timestamps in time order: seconds, then the sequence after the
+/// dot.
+pub fn slack_ts_order(a: &str, b: &str) -> Ordering {
+    let parts = |ts: &str| {
+        let (seconds, sequence) = ts.split_once('.').unwrap_or((ts, "0"));
+        (
+            seconds.parse::<u64>().unwrap_or(0),
+            sequence.parse::<u64>().unwrap_or(0),
+        )
+    };
+    parts(a).cmp(&parts(b))
+}
+
 #[cfg(test)]
 mod tests {
-    use jiff::SignedDuration;
+    use jiff::tz::TimeZone;
 
     use super::*;
 
-    fn at(minutes: i64, said: Said) -> Fact {
-        let noon: Timestamp = "2026-08-23T12:00:00Z".parse().unwrap();
-        Fact {
-            at: (noon + SignedDuration::from_mins(minutes)).to_zoned(jiff::tz::TimeZone::UTC),
-            said,
+    fn at(minute: i64) -> Zoned {
+        Timestamp::from_second(1_800_000_000 + minute * 60)
+            .unwrap()
+            .to_zoned(TimeZone::get("Europe/Berlin").unwrap())
+    }
+
+    fn entry(minute: i64, fact: Fact) -> Entry {
+        Entry {
+            device: Device([1; 16]),
+            at: at(minute),
+            fact,
         }
     }
 
-    fn snooze(minutes: i64, hours: i64) -> Fact {
-        at(
-            minutes,
-            Said::Snooze {
-                until: Until::In(SignedDuration::from_hours(hours)),
+    fn agent() -> NodeId {
+        NodeId::Agent(rho_agent_types::AgentId::from_encoded("00jvj4xuk96p").unwrap())
+    }
+
+    #[test]
+    fn an_entry_reads_back_as_it_was_said() {
+        let said = entry(
+            0,
+            Fact::Snooze {
+                node: agent(),
+                until: Until::Day(jiff::civil::date(2027, 1, 16)),
             },
-        )
-    }
-
-    #[test]
-    fn done_takes_back_what_came_before_it_and_not_after() {
-        let facts = [
-            snooze(0, 1),
-            at(
-                1,
-                Said::Todo {
-                    through: Cursor::Story(3),
-                    start: None,
-                },
-            ),
-            at(
-                2,
-                Said::Done {
-                    through: Cursor::Story(5),
-                },
-            ),
-            snooze(3, 2),
-        ];
-        let facts = Facts(&facts);
-        assert_eq!(facts.handled(), Some(&Cursor::Story(5)));
-        assert_eq!(facts.todo(), None);
-        let snoozed = facts.snooze().unwrap();
-        assert_eq!(
-            snoozed.until,
-            snoozed.set.timestamp() + SignedDuration::from_hours(2)
         );
-        assert_eq!(facts.snoozes(), 2);
+        let back = Entry::decode(&said.encode()).unwrap();
+        assert_eq!(back, said);
+        assert_eq!(back.at.time_zone().iana_name(), Some("Europe/Berlin"));
     }
 
     #[test]
-    fn a_todo_takes_back_an_earlier_snooze_and_mute_is_the_latest_word() {
-        let facts = [
-            snooze(0, 1),
-            at(
-                1,
-                Said::Todo {
-                    through: Cursor::Done,
+    fn seen_only_grows_whatever_order_it_was_said_in() {
+        let settled = |minute, pos| {
+            entry(
+                minute,
+                Fact::Settled {
+                    node: agent(),
+                    seen: Seen::Agent(pos),
+                },
+            )
+        };
+        let entries = [settled(0, 812), settled(1, 800)];
+        assert_eq!(Facts(&entries).seen_agent(), Some(812));
+    }
+
+    #[test]
+    fn settled_takes_back_the_todo_and_the_snooze_before_it() {
+        let node = agent();
+        let entries = [
+            entry(
+                0,
+                Fact::Todo {
+                    node: node.clone(),
                     start: None,
+                    seen: Seen::Agent(3),
                 },
             ),
-            at(2, Said::Mute),
-            at(3, Said::Unmute),
+            entry(
+                1,
+                Fact::Snooze {
+                    node: node.clone(),
+                    until: Until::In(jiff::SignedDuration::from_hours(1)),
+                },
+            ),
+            entry(
+                2,
+                Fact::Settled {
+                    node,
+                    seen: Seen::Agent(4),
+                },
+            ),
         ];
-        let facts = Facts(&facts);
+        let facts = Facts(&entries);
+        assert_eq!(facts.todo(), None);
         assert_eq!(facts.snooze(), None);
-        assert!(!facts.muted());
-        assert_eq!(facts.todo(), None, "the mute took the todo back");
+        assert_eq!(facts.snoozes(), 1, "every snooze is kept");
+        assert_eq!(facts.seen_agent(), Some(4));
+    }
+
+    #[test]
+    fn slack_messages_order_by_time_not_by_text() {
+        assert_eq!(
+            slack_ts_order("1800000100.000010", "1800000100.000009"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            slack_ts_order("999999999.000000", "1800000000.000000"),
+            Ordering::Less
+        );
     }
 }

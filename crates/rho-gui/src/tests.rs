@@ -48,26 +48,45 @@ mod wrap_under_tab;
 use jiff::SignedDuration;
 use rho_agents_client::HostId;
 use rho_dealer::Until;
-use rho_dealer::facts::Said;
+use rho_dealer::facts::{Fact, Seen};
 
+use crate::attention::Write;
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
-/// The write that says `said` about `node`, now.
-fn said(node: &rho_dealer::NodeId, said: Said) -> rho_dealer::marks::Write {
-    rho_dealer::facts::record(
-        node,
-        &rho_dealer::facts::Fact {
-            at: jiff::Zoned::now(),
-            said,
+/// What the tests say about a node.
+enum Said {
+    Snooze { until: Until },
+    Todo,
+}
+
+/// The write that says `said` about `node`.
+fn said(node: &rho_dealer::NodeId, said: Said) -> Write {
+    let node = node.clone();
+    match said {
+        Said::Snooze { until } => Fact::Snooze { node, until },
+        Said::Todo => Fact::Todo {
+            node,
+            start: None,
+            seen: Seen::Whole,
         },
-    )
+    }
+    .into()
 }
 
 /// A todo on the plate from now.
 fn todo_now() -> Said {
-    Said::Todo {
-        through: rho_dealer::facts::Cursor::Done,
-        start: None,
+    Said::Todo
+}
+
+/// A note's text, written.
+fn body(note: &rho_dealer::NodeId, text: &str) -> Write {
+    let rho_dealer::NodeId::Note(note) = note else {
+        panic!("not a note")
+    };
+    Write::Note {
+        note: *note,
+        body: Some(text.to_owned()),
+        deleted: None,
     }
 }
 
@@ -5686,18 +5705,57 @@ fn agent_done_writes_its_story_cursor_and_undo_restores_the_hand(cx: &mut TestAp
                 workspace,
                 HostId::default(),
                 ready_with(vec![ui_head(agent_id)], 702),
-                window, cx,
+                window,
+                cx,
             );
-            story::feed(workspace, HostId::default(), story_wanting(agent_id, UnixMs(100)), window, cx);
-            assert!(workspace.hand(cx).cards.iter().any(|card| card.node == node));
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(agent_id, UnixMs(100)),
+                window,
+                cx,
+            );
+            assert!(
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == node)
+            );
             workspace.pull_card(window, cx);
-            assert_eq!(workspace.current_deal_card_for_test(cx).map(|card| card.0), Some(node.clone()));
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(node.clone())
+            );
             workspace.verdict_done(window, cx);
-            assert!(matches!(workspace.attention.marks.get(&node).facts().handled(), Some(rho_dealer::facts::Cursor::Story(pos)) if *pos > 0));
-            assert!(!workspace.hand(cx).cards.iter().any(|card| card.node == node));
+            assert!(
+                workspace
+                    .attention
+                    .marks
+                    .get(&node)
+                    .facts()
+                    .seen_agent()
+                    .is_some_and(|pos| pos > 0)
+            );
+            assert!(
+                !workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == node)
+            );
             workspace.undo_verdict(window, cx);
-            assert_eq!(workspace.attention.marks.get(&node).facts().handled(), None);
-            assert!(workspace.hand(cx).cards.iter().any(|card| card.node == node));
+            assert_eq!(
+                workspace.attention.marks.get(&node).facts().seen_agent(),
+                None
+            );
+            assert!(
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .any(|card| card.node == node)
+            );
         })
         .unwrap();
 }
@@ -5769,12 +5827,11 @@ fn a_future_snooze_hides_an_agent_until_the_mark_ripens(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn toggling_a_label_twice_restores_the_note_and_find_uses_its_path(cx: &mut TestAppContext) {
-    use rho_dealer::marks;
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             let note = workspace.create_note(None, cx);
-            workspace.write_marks(vec![marks::body(&note, "Frost report\nDetails")], cx);
+            workspace.write_marks(vec![body(&note, "Frost report\nDetails")], cx);
             let (on, _) = workspace.toggle_label(&note, "ops/weather", cx).unwrap();
             assert!(on);
             let label = workspace.attention.marks.label_at("ops/weather").unwrap();
@@ -5838,12 +5895,11 @@ fn deleting_a_label_takes_its_sublabels_and_undo_brings_them_back(cx: &mut TestA
 
 #[gpui::test]
 fn deleting_a_note_leaves_it_out_of_the_notes(cx: &mut TestAppContext) {
-    use rho_dealer::marks;
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             let note = workspace.create_note(None, cx);
-            workspace.write_marks(vec![marks::body(&note, "Frost report")], cx);
+            workspace.write_marks(vec![body(&note, "Frost report")], cx);
             workspace.open_node(&note, window, cx);
             workspace.delete_made(window, cx);
             assert!(workspace.attention.marks.get(&note).deleted);
@@ -5895,7 +5951,7 @@ fn a_moved_label_takes_its_sublabels_along(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn creating_a_note_from_a_label_files_it_and_home_reads_the_dated_card(cx: &mut TestAppContext) {
-    use rho_dealer::{NodeId, marks};
+    use rho_dealer::NodeId;
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -5905,10 +5961,7 @@ fn creating_a_note_from_a_label_files_it_and_home_reads_the_dated_card(cx: &mut 
             assert!(areas.iter().any(|(path, _)| path == "writing/reviews"));
             let note = workspace.create_note(Some(&NodeId::Label(label)), cx);
             workspace.write_marks(
-                vec![
-                    marks::body(&note, "Review the patch"),
-                    said(&note, todo_now()),
-                ],
+                vec![body(&note, "Review the patch"), said(&note, todo_now())],
                 cx,
             );
             assert!(workspace.attention.marks.get(&note).labels.contains(&label));
@@ -5928,13 +5981,12 @@ fn creating_a_note_from_a_label_files_it_and_home_reads_the_dated_card(cx: &mut 
 
 #[gpui::test]
 fn a_phone_flick_moves_from_one_dated_card_to_the_next(cx: &mut TestAppContext) {
-    use rho_dealer::marks;
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, _, cx| {
             for title in ["First phone card", "Second phone card"] {
                 let note = workspace.create_note(None, cx);
-                workspace.write_marks(vec![marks::body(&note, title), said(&note, todo_now())], cx);
+                workspace.write_marks(vec![body(&note, title), said(&note, todo_now())], cx);
             }
         })
         .unwrap();
@@ -6038,13 +6090,12 @@ fn the_new_note_and_agent_area_picker_files_at_the_label_in_view(cx: &mut TestAp
 
 #[gpui::test]
 fn a_note_todo_with_a_count_starts_later_and_undo_takes_it_back(cx: &mut TestAppContext) {
-    use rho_dealer::marks;
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             let note = workspace.create_note(None, cx);
             workspace.write_marks(
-                vec![marks::body(&note, "Pay invoice"), said(&note, todo_now())],
+                vec![body(&note, "Pay invoice"), said(&note, todo_now())],
                 cx,
             );
             let now = jiff::Timestamp::now();
@@ -6073,13 +6124,12 @@ fn a_note_todo_with_a_count_starts_later_and_undo_takes_it_back(cx: &mut TestApp
 
 #[gpui::test]
 fn muting_a_dated_note_takes_it_out_of_the_hand_until_undo(cx: &mut TestAppContext) {
-    use rho_dealer::marks;
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             let note = workspace.create_note(None, cx);
             workspace.write_marks(
-                vec![marks::body(&note, "Read contract"), said(&note, todo_now())],
+                vec![body(&note, "Read contract"), said(&note, todo_now())],
                 cx,
             );
             workspace.pull_card(window, cx);
@@ -6111,16 +6161,12 @@ fn muting_a_dated_note_takes_it_out_of_the_hand_until_undo(cx: &mut TestAppConte
 
 #[gpui::test]
 fn flicking_down_from_an_empty_phone_feed_undoes_its_last_verdict(cx: &mut TestAppContext) {
-    use rho_dealer::marks;
     let workspace = test_workspace(cx);
     let note = workspace
         .update(cx, |workspace, _, cx| {
             let note = workspace.create_note(None, cx);
             workspace.write_marks(
-                vec![
-                    marks::body(&note, "Last phone card"),
-                    said(&note, todo_now()),
-                ],
+                vec![body(&note, "Last phone card"), said(&note, todo_now())],
                 cx,
             );
             note

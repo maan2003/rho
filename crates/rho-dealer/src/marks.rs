@@ -1,37 +1,28 @@
-//! The user's marks on nodes, as the ledger holds them.
+//! What each node comes to: the user's entries ([`crate::facts`]) folded
+//! in time order, and its note ([`crate::notes`]).
 //!
-//! Every mark is one ledger key, `n/<node>|<field>`, merged
-//! last-writer-wins like everything in the ledger, so two devices marking
-//! different things never collide and two marking the same thing settle
-//! on the later. A source decides which marks it uses and what they mean
-//! for its nodes; this keeps them, typed, and says which nodes moved.
-//!
-//! What the user did about a node — done, mute, snooze, todo — is not a
-//! mark but a run of facts ([`crate::facts`]) under `f/<node>|`; they are
-//! read here too, so a node's marks are everything the user said about it.
-//!
-//! A key this build cannot read (a newer build's field, or a node kind it
-//! does not know) is kept as it is and never written over.
+//! Attention facts are kept per node for [`crate::facts::Facts`] to read.
+//! Filing facts settle on the last one said: a label's name and parent,
+//! whether a node carries a label, what it is called and what it is about.
+//! A retracted entry counts for nothing, whenever the retract arrives.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp, Zoned};
 
-use crate::facts::{Cursor, Fact, Facts, Said};
+use crate::facts::{Entry, EntryId, Fact, Facts};
 use crate::node::NodeId;
-use crate::until::Until;
-
-/// A ledger write: a key, and its new value or `None` to take it away.
-pub type Write = (Vec<u8>, Option<Vec<u8>>);
+use crate::notes::NoteRev;
 
 /// Everything the user said about one node. Which fields mean anything
 /// depends on the node: a note has a body, a label a parent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeMarks {
-    /// What the user did about it, oldest first ([`crate::facts`]).
-    pub facts: Vec<Fact>,
+    /// Its attention facts, oldest first, none retracted.
+    pub facts: Vec<Entry>,
     pub labels: BTreeSet<uuid::Uuid>,
-    /// What the user calls it, over what its source calls it.
+    /// What the user calls it, over what its source calls it; a label's
+    /// own name.
     pub name: Option<String>,
     /// A note's text; its first line is its title.
     pub body: Option<String>,
@@ -73,98 +64,64 @@ impl NodeMarks {
     }
 }
 
-fn node_prefix(node: &NodeId) -> String {
-    format!("n/{}|", node.key())
-}
-
-fn key(node: &NodeId, field: &str) -> Vec<u8> {
-    format!("{}{field}", node_prefix(node)).into_bytes()
-}
-
-fn write<T: senax_encoder::Encoder>(node: &NodeId, field: &str, value: Option<&T>) -> Write {
-    (
-        key(node, field),
-        value.map(|value| {
-            senax_encoder::encode(value)
-                .expect("encode a mark")
-                .to_vec()
-        }),
-    )
-}
-
-pub fn label(node: &NodeId, label: uuid::Uuid, present: bool) -> Write {
-    write(
-        node,
-        &format!("label:{}", label.simple()),
-        present.then_some(&true),
-    )
-}
-
-pub fn name(node: &NodeId, name: Option<String>) -> Write {
-    write(node, "name", name.as_ref())
-}
-
-pub fn body(node: &NodeId, body: &str) -> Write {
-    write(node, "body", Some(&body.to_owned()))
-}
-
-pub fn created(node: &NodeId, at_ms: i64) -> Write {
-    write(node, "created", Some(&at_ms))
-}
-
-pub fn deleted(node: &NodeId, deleted: bool) -> Write {
-    write(node, "deleted", deleted.then_some(&true))
-}
-
-pub fn about(node: &NodeId, about: Option<&NodeId>) -> Write {
-    write(node, "about", about.map(NodeId::key).as_ref())
-}
-
-pub fn parent(label: &NodeId, parent: Option<uuid::Uuid>) -> Write {
-    write(
-        label,
-        "parent",
-        parent.map(|parent| parent.simple().to_string()).as_ref(),
-    )
-}
-
-pub fn repository(label: &NodeId, url: Option<String>) -> Write {
-    write(label, "repository", url.as_ref())
-}
-
-fn decode<T: senax_encoder::Decoder>(value: &[u8]) -> Option<T> {
-    let mut value = value;
-    senax_encoder::decode(&mut value).ok()
-}
-
-/// Every mark the ledger holds, typed by node.
+/// Every entry and note revision this device holds, folded by node.
 #[derive(Default)]
 pub struct Marks {
-    /// Every mark key the ledger holds, as it holds it, including the
-    /// ones this build cannot read.
-    raw: BTreeMap<Vec<u8>, Vec<u8>>,
+    entries: BTreeMap<EntryId, Entry>,
+    retracted: HashSet<EntryId>,
+    by_node: HashMap<NodeId, BTreeSet<EntryId>>,
+    /// The newest revision of each note.
+    notes: HashMap<uuid::Uuid, NoteRev>,
     nodes: HashMap<NodeId, NodeMarks>,
+    /// The newest instant any entry or revision here was said at.
+    newest: Option<Timestamp>,
 }
 
 impl Marks {
-    /// Takes in ledger entries, and says which nodes moved. Keys that are
-    /// neither marks nor facts are ignored.
-    pub fn apply(&mut self, entries: impl IntoIterator<Item = Write>) -> BTreeSet<NodeId> {
+    /// Takes in entries from any device, in any order and any number of
+    /// times, and says which nodes moved.
+    pub fn apply(&mut self, entries: impl IntoIterator<Item = Entry>) -> BTreeSet<NodeId> {
         let mut touched = BTreeSet::new();
-        for (key, value) in entries {
-            if !key.starts_with(b"n/") && !key.starts_with(b"f/") {
+        for entry in entries {
+            let id = entry.id();
+            if self.entries.contains_key(&id) {
                 continue;
             }
-            let node = std::str::from_utf8(&key[2..])
-                .ok()
-                .and_then(|rest| rest.split_once('|'))
-                .and_then(|(node, _)| NodeId::parse(node));
-            match value {
-                Some(value) => self.raw.insert(key, value),
-                None => self.raw.remove(&key),
-            };
-            if let Some(node) = node {
-                touched.insert(node);
+            self.saw(id.at);
+            match &entry.fact {
+                Fact::Retract { of } => {
+                    self.retracted.insert(*of);
+                    if let Some(node) = self.entries.get(of).and_then(|entry| entry.fact.node()) {
+                        touched.insert(node);
+                    }
+                }
+                fact => {
+                    if let Some(node) = fact.node() {
+                        self.by_node.entry(node.clone()).or_default().insert(id);
+                        touched.insert(node);
+                    }
+                }
+            }
+            self.entries.insert(id, entry);
+        }
+        for node in &touched {
+            self.refresh(node);
+        }
+        touched
+    }
+
+    /// Takes in note revisions, and says which notes moved.
+    pub fn apply_notes(&mut self, revs: impl IntoIterator<Item = NoteRev>) -> BTreeSet<NodeId> {
+        let mut touched = BTreeSet::new();
+        for rev in revs {
+            self.saw(rev.at.timestamp());
+            let newer = self
+                .notes
+                .get(&rev.note)
+                .is_none_or(|held| held.id() < rev.id());
+            if newer {
+                touched.insert(NodeId::Note(rev.note));
+                self.notes.insert(rev.note, rev);
             }
         }
         for node in &touched {
@@ -173,59 +130,68 @@ impl Marks {
         touched
     }
 
+    fn saw(&mut self, at: Timestamp) {
+        self.newest = Some(self.newest.map_or(at, |newest| newest.max(at)));
+    }
+
+    /// When something said `now` is said: never at or before anything
+    /// already here, so it sorts after everything this device has seen.
+    pub fn next_at(&self, now: &Zoned) -> Zoned {
+        match self.newest {
+            Some(newest) if newest >= now.timestamp() => {
+                (newest + SignedDuration::from_nanos(1)).to_zoned(now.time_zone().clone())
+            }
+            _ => now.clone(),
+        }
+    }
+
     fn refresh(&mut self, node: &NodeId) {
         let mut marks = NodeMarks::default();
-        let mut any = false;
-        let prefix = node_prefix(node).into_bytes();
-        for (key, value) in self.raw.range(prefix.clone()..) {
-            let Some(field) = key.strip_prefix(prefix.as_slice()) else {
-                break;
-            };
-            any = true;
-            let Ok(field) = std::str::from_utf8(field) else {
+        let ids = self.by_node.get(node);
+        for id in ids.into_iter().flatten() {
+            if self.retracted.contains(id) {
                 continue;
-            };
-            match field {
-                "name" => marks.name = decode(value),
-                "body" => marks.body = decode(value),
-                "created" => marks.created_ms = decode(value),
-                "deleted" => marks.deleted = decode(value).unwrap_or(false),
-                "about" => {
-                    marks.about = decode::<String>(value).and_then(|key| NodeId::parse(&key))
+            }
+            let entry = &self.entries[id];
+            match &entry.fact {
+                Fact::Snooze { .. }
+                | Fact::Todo { .. }
+                | Fact::Deadline { .. }
+                | Fact::Settled { .. }
+                | Fact::Mute { .. }
+                | Fact::Unmute { .. } => marks.facts.push(entry.clone()),
+                Fact::Label { name, parent, .. } => {
+                    marks.name = Some(name.clone());
+                    marks.parent = *parent;
+                    marks.deleted = false;
+                    marks
+                        .created_ms
+                        .get_or_insert(entry.at.timestamp().as_millisecond());
                 }
-                "parent" => {
-                    marks.parent =
-                        decode::<String>(value).and_then(|id| uuid::Uuid::try_parse(&id).ok())
+                Fact::Unlabel { .. } => marks.deleted = true,
+                Fact::Repository { url, .. } => marks.repository = url.clone(),
+                Fact::Labeled { label, present, .. } => {
+                    match present {
+                        true => marks.labels.insert(*label),
+                        false => marks.labels.remove(label),
+                    };
                 }
-                "repository" => marks.repository = decode(value),
-                _ => {
-                    if let Some(label) = field
-                        .strip_prefix("label:")
-                        .and_then(|id| uuid::Uuid::try_parse(id).ok())
-                        && decode(value).unwrap_or(false)
-                    {
-                        marks.labels.insert(label);
-                    }
-                }
+                Fact::Named { name, .. } => marks.name = name.clone(),
+                Fact::About { about, .. } => marks.about = about.clone(),
+                Fact::Retract { .. } => {}
             }
         }
-        let prefix = format!("f/{}|", node.key()).into_bytes();
-        let mut facts: Vec<(&[u8], Fact)> = Vec::new();
-        for (key, value) in self.raw.range(prefix.clone()..) {
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            any = true;
-            if let Some(fact) = decode::<Fact>(value) {
-                facts.push((key, fact));
-            }
+        if let NodeId::Note(id) = node
+            && let Some(note) = self.notes.get(id)
+        {
+            marks.body = Some(note.body.clone());
+            marks.created_ms = Some(note.created.as_millisecond());
+            marks.deleted = note.deleted;
         }
-        facts.sort_by(|a, b| (a.1.at.timestamp(), a.0).cmp(&(b.1.at.timestamp(), b.0)));
-        marks.facts = facts.into_iter().map(|(_, fact)| fact).collect();
-        if any {
-            self.nodes.insert(node.clone(), marks);
-        } else {
+        if marks == NodeMarks::default() {
             self.nodes.remove(node);
+        } else {
+            self.nodes.insert(node.clone(), marks);
         }
     }
 
@@ -238,12 +204,14 @@ impl Marks {
         self.nodes.iter()
     }
 
-    /// The writes that put back what `writes` would change.
-    pub fn inverse(&self, writes: &[Write]) -> Vec<Write> {
-        writes
-            .iter()
-            .map(|(key, _)| (key.clone(), self.raw.get(key).cloned()))
-            .collect()
+    /// A note's newest revision.
+    pub fn note(&self, note: uuid::Uuid) -> Option<&NoteRev> {
+        self.notes.get(&note)
+    }
+
+    /// Whether this device holds nothing at all yet.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.notes.is_empty()
     }
 
     /// Every note that is not deleted.
@@ -259,7 +227,9 @@ impl Marks {
             .nodes
             .iter()
             .filter_map(|(node, marks)| match node {
-                NodeId::Label(id) if !marks.deleted => Some((*id, self.label_path(*id))),
+                NodeId::Label(id) if !marks.deleted && marks.name.is_some() => {
+                    Some((*id, self.label_path(*id)))
+                }
                 _ => None,
             })
             .collect();
@@ -339,14 +309,30 @@ impl Marks {
     }
 }
 
-/// The marks an older build kept where facts now go, as it kept them: what
-/// the desk's carry-over still writes, and [`Marks::carry_legacy`] reads.
+/// The ledger an older build kept: one last-writer-wins key per mark,
+/// `n/<node>|<field>`. What the desk's carry-over still writes, and what
+/// [`legacy::convert`] turns into entries and notes once.
 pub mod legacy {
+    use std::collections::BTreeMap;
+
+    use jiff::tz::TimeZone;
+    use jiff::{SignedDuration, Timestamp};
     use senax_encoder::{Decode, Encode};
 
-    use super::{Write, write};
-    use crate::facts::Cursor;
+    use crate::facts::{Device, Entry, Fact, Seen};
     use crate::node::NodeId;
+    use crate::notes::NoteRev;
+    use crate::until::Until;
+
+    /// An old key and its value.
+    pub type Mark = (Vec<u8>, Vec<u8>);
+
+    /// How far a node was handled, as an older build kept it.
+    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+    pub enum Cursor {
+        Done,
+        Story(u64),
+    }
 
     /// A day or a moment, as an instant.
     #[derive(Clone, Copy, Debug, Encode, Decode)]
@@ -362,174 +348,307 @@ pub mod legacy {
         pub pace_days: u32,
     }
 
-    pub fn handled(node: &NodeId, cursor: &Cursor) -> Write {
-        write(node, "handled", Some(cursor))
+    fn mark<T: senax_encoder::Encoder>(node: &NodeId, field: &str, value: &T) -> Mark {
+        (
+            format!("n/{}|{field}", node.key()).into_bytes(),
+            senax_encoder::encode(value)
+                .expect("encode a mark")
+                .to_vec(),
+        )
     }
 
-    pub fn muted(node: &NodeId) -> Write {
-        write(node, "muted", Some(&true))
+    pub fn label(node: &NodeId, label: uuid::Uuid) -> Mark {
+        mark(node, &format!("label:{}", label.simple()), &true)
     }
 
-    pub fn snooze(node: &NodeId, until: &DateMark) -> Write {
-        write(node, "snooze", Some(until))
+    pub fn name(node: &NodeId, name: &str) -> Mark {
+        mark(node, "name", &name.to_owned())
     }
 
-    pub fn todo(node: &NodeId, todo: &Todo) -> Write {
-        write(node, "todo", Some(todo))
+    pub fn body(node: &NodeId, body: &str) -> Mark {
+        mark(node, "body", &body.to_owned())
     }
-}
 
-/// A node's legacy marks, by field: the key and the value.
-type LegacyFields<'a> = BTreeMap<&'a str, (&'a [u8], &'a [u8])>;
-
-/// A legacy mark, as a time named on the user's clock.
-fn legacy_until(mark: legacy::DateMark, zone: &jiff::tz::TimeZone) -> Until {
-    let at = Timestamp::from_millisecond(mark.unix_ms)
-        .unwrap_or(Timestamp::UNIX_EPOCH)
-        .to_zoned(zone.clone());
-    match mark.day {
-        true => Until::Day(at.date()),
-        false => Until::At(at.datetime()),
+    pub fn created(node: &NodeId, at_ms: i64) -> Mark {
+        mark(node, "created", &at_ms)
     }
-}
 
-/// The same 128 bits for the same legacy key and value on every device,
-/// so two devices carrying the same marks over write the same facts.
-fn legacy_id(key: &[u8], value: &[u8]) -> uuid::Uuid {
-    let mut hash: u128 = 0x6c62272e07bb014262b821756295c58d;
-    for byte in key.iter().chain([0u8].iter()).chain(value) {
-        hash ^= u128::from(*byte);
-        hash = hash.wrapping_mul(0x0000000001000000000000000000013B);
+    pub fn deleted(node: &NodeId) -> Mark {
+        mark(node, "deleted", &true)
     }
-    uuid::Uuid::from_u128(hash)
-}
 
-impl Marks {
-    /// The writes that carry an older build's done, mute, snooze and todo
-    /// marks over into facts, and take the old keys away. `stamps` says
-    /// when the ledger took each key; a fact is said then, on `zone`'s
-    /// clock. Nothing, once nothing is left to carry.
-    pub fn carry_legacy(
-        &self,
-        stamps: &HashMap<Vec<u8>, Timestamp>,
-        zone: &jiff::tz::TimeZone,
-    ) -> Vec<Write> {
-        let mut writes = Vec::new();
-        let mut by_node: BTreeMap<NodeId, LegacyFields<'_>> = BTreeMap::new();
-        for (key, value) in self.raw.range(b"n/".to_vec()..) {
-            if !key.starts_with(b"n/") {
-                break;
-            }
-            let Some((node, field)) = std::str::from_utf8(&key[2..])
-                .ok()
+    pub fn about(node: &NodeId, about: &NodeId) -> Mark {
+        mark(node, "about", &about.key())
+    }
+
+    pub fn parent(label: &NodeId, parent: uuid::Uuid) -> Mark {
+        mark(label, "parent", &parent.simple().to_string())
+    }
+
+    pub fn repository(label: &NodeId, url: &str) -> Mark {
+        mark(label, "repository", &url.to_owned())
+    }
+
+    pub fn handled(node: &NodeId, cursor: &Cursor) -> Mark {
+        mark(node, "handled", cursor)
+    }
+
+    pub fn muted(node: &NodeId) -> Mark {
+        mark(node, "muted", &true)
+    }
+
+    pub fn snooze(node: &NodeId, until: &DateMark) -> Mark {
+        mark(node, "snooze", until)
+    }
+
+    pub fn todo(node: &NodeId, todo: &Todo) -> Mark {
+        mark(node, "todo", todo)
+    }
+
+    fn decode<T: senax_encoder::Decoder>(value: &[u8]) -> Option<T> {
+        let mut value = value;
+        senax_encoder::decode(&mut value).ok()
+    }
+
+    /// A legacy date, as a time named on the user's clock.
+    fn until(mark: DateMark, zone: &TimeZone) -> Until {
+        let at = Timestamp::from_millisecond(mark.unix_ms)
+            .unwrap_or(Timestamp::UNIX_EPOCH)
+            .to_zoned(zone.clone());
+        match mark.day {
+            true => Until::Day(at.date()),
+            false => Until::At(at.datetime()),
+        }
+    }
+
+    /// One node's old marks: each field's value and when it was written.
+    #[derive(Default)]
+    struct Fields<'a>(BTreeMap<&'a str, (&'a [u8], Timestamp)>);
+
+    impl<'a> Fields<'a> {
+        fn get<T: senax_encoder::Decoder>(&self, field: &str) -> Option<(T, Timestamp)> {
+            let (value, at) = self.0.get(field)?;
+            Some((decode(value)?, *at))
+        }
+
+        fn at(&self, fields: &[&str]) -> Timestamp {
+            fields
+                .iter()
+                .filter_map(|field| self.0.get(field).map(|(_, at)| *at))
+                .max()
+                .unwrap_or(Timestamp::UNIX_EPOCH)
+        }
+    }
+
+    /// Turns an old ledger into entries and notes said by `device`, each
+    /// dated when its mark was written, on `zone`'s clock. `marks` holds
+    /// each key's value and the millis it was stamped.
+    pub fn convert(
+        marks: &[(Vec<u8>, Vec<u8>, u64)],
+        device: Device,
+        zone: &TimeZone,
+    ) -> (Vec<Entry>, Vec<NoteRev>) {
+        let mut by_node: BTreeMap<NodeId, Fields> = BTreeMap::new();
+        for (key, value, stamp) in marks {
+            let Some((node, field)) = key
+                .strip_prefix(b"n/")
+                .and_then(|rest| std::str::from_utf8(rest).ok())
                 .and_then(|rest| rest.split_once('|'))
             else {
                 continue;
             };
-            if !matches!(field, "handled" | "muted" | "snooze" | "todo") {
+            let Some(node) = NodeId::parse(node) else {
                 continue;
-            }
-            writes.push((key.clone(), None));
-            if let Some(node) = NodeId::parse(node) {
-                by_node
-                    .entry(node)
-                    .or_default()
-                    .insert(field, (key.as_slice(), value.as_slice()));
-            }
+            };
+            let at = Timestamp::from_millisecond(*stamp as i64).unwrap_or(Timestamp::UNIX_EPOCH);
+            by_node
+                .entry(node)
+                .or_default()
+                .0
+                .insert(field, (value.as_slice(), at));
         }
-        for (node, fields) in by_node {
-            let at = |field: &str| {
-                let stamp = fields
-                    .get(field)
-                    .and_then(|(key, _)| stamps.get(*key))
-                    .copied()
-                    .unwrap_or(Timestamp::UNIX_EPOCH);
-                stamp.to_zoned(zone.clone())
+        // Each fact at its mark's time; in this order within a node, so a
+        // done never lands after the snooze written with it.
+        let mut said: Vec<(Timestamp, usize, Fact)> = Vec::new();
+        let mut notes = Vec::new();
+        for (node, fields) in &by_node {
+            let mut say = |at: Timestamp, fact: Fact| {
+                let order = said.len();
+                said.push((at, order, fact));
             };
-            // Marks written together carry the same stamp. A nanosecond
-            // apart, in this order, a done never lands after the snooze it
-            // came with and takes it back.
-            let mut order = 0;
-            let mut fact = |field: &str, said: Said| {
-                let (key, value) = fields[field];
-                let at = at(field);
-                let at = at
-                    .checked_add(jiff::SignedDuration::from_nanos(order))
-                    .unwrap_or(at);
-                order += 1;
-                writes.push(crate::facts::record_as(
-                    &node,
-                    legacy_id(key, value),
-                    &Fact { at, said },
-                ));
-            };
-            let handled = fields
-                .get("handled")
-                .and_then(|(_, value)| decode::<Cursor>(value));
-            let todo = fields
-                .get("todo")
-                .and_then(|(_, value)| decode::<legacy::Todo>(value));
+            match node {
+                NodeId::Label(label) => {
+                    if let Some((name, _)) = fields.get::<String>("name") {
+                        say(
+                            fields.at(&["name", "parent"]),
+                            Fact::Label {
+                                label: *label,
+                                name,
+                                parent: fields
+                                    .get::<String>("parent")
+                                    .and_then(|(id, _)| uuid::Uuid::try_parse(&id).ok()),
+                            },
+                        );
+                    }
+                    if let Some((url, at)) = fields.get::<String>("repository") {
+                        say(
+                            at,
+                            Fact::Repository {
+                                label: *label,
+                                url: Some(url),
+                            },
+                        );
+                    }
+                    if let Some((true, at)) = fields.get::<bool>("deleted") {
+                        say(at, Fact::Unlabel { label: *label });
+                    }
+                }
+                NodeId::Note(note) => {
+                    let body = fields.get::<String>("body");
+                    let created = fields.get::<i64>("created");
+                    let deleted = fields
+                        .get::<bool>("deleted")
+                        .is_some_and(|(deleted, _)| deleted);
+                    if body.is_some() || created.is_some() || deleted {
+                        let at = fields.at(&["body", "created", "deleted"]);
+                        notes.push(NoteRev {
+                            note: *note,
+                            device,
+                            at: at.to_zoned(zone.clone()),
+                            created: created
+                                .and_then(|(ms, _)| Timestamp::from_millisecond(ms).ok())
+                                .unwrap_or(at),
+                            body: body.map(|(body, _)| body).unwrap_or_default(),
+                            deleted,
+                        });
+                    }
+                }
+                _ => {
+                    if let Some((name, at)) = fields.get::<String>("name") {
+                        say(
+                            at,
+                            Fact::Named {
+                                node: node.clone(),
+                                name: Some(name),
+                            },
+                        );
+                    }
+                }
+            }
+            for (field, (value, at)) in &fields.0 {
+                if let Some(label) = field
+                    .strip_prefix("label:")
+                    .and_then(|id| uuid::Uuid::try_parse(id).ok())
+                    && decode::<bool>(value).unwrap_or(false)
+                {
+                    say(
+                        *at,
+                        Fact::Labeled {
+                            node: node.clone(),
+                            label,
+                            present: true,
+                        },
+                    );
+                }
+            }
+            if let Some((about, at)) = fields.get::<String>("about")
+                && let Some(about) = NodeId::parse(&about)
+            {
+                say(
+                    at,
+                    Fact::About {
+                        node: node.clone(),
+                        about: Some(about),
+                    },
+                );
+            }
+            let seen = fields.get::<Cursor>("handled").map(|(cursor, at)| {
+                let seen = match cursor {
+                    Cursor::Story(pos) => Seen::Agent(pos),
+                    Cursor::Done => Seen::Whole,
+                };
+                (seen, at)
+            });
+            let todo = fields.get::<Todo>("todo");
             match (
-                &handled,
-                todo.and_then(|todo| todo.wakes.map(|wakes| (todo, wakes))),
+                &seen,
+                todo.and_then(|(todo, at)| todo.wakes.map(|wakes| (todo, wakes, at))),
             ) {
-                (_, Some((todo, wakes))) => {
-                    let start = match legacy_until(wakes, zone) {
+                (_, Some((todo, wakes, at))) => {
+                    let start = match until(wakes, zone) {
                         Until::Day(date) => Until::Day(
                             date.checked_add(
                                 jiff::Span::new().days(i64::from(todo.pace_days.saturating_sub(1))),
                             )
                             .unwrap_or(date),
                         ),
-                        until => until,
+                        start => start,
                     };
-                    fact(
-                        "todo",
-                        Said::Todo {
-                            through: handled.clone().unwrap_or(Cursor::Done),
+                    say(
+                        at,
+                        Fact::Todo {
+                            node: node.clone(),
                             start: Some(start),
+                            seen: seen.clone().map_or(Seen::Whole, |(seen, _)| seen),
                         },
                     );
                 }
-                (Some(through), None) => fact(
-                    "handled",
-                    Said::Done {
-                        through: through.clone(),
+                (Some((seen, at)), None) => say(
+                    *at,
+                    Fact::Settled {
+                        node: node.clone(),
+                        seen: seen.clone(),
                     },
                 ),
                 (None, None) => {}
             }
-            if let Some(deadline) = todo.and_then(|todo| todo.deadline.map(|by| (todo, by))) {
-                fact(
-                    "todo",
-                    Said::Deadline {
-                        by: legacy_until(deadline.1, zone),
-                        lead_days: match deadline.0.pace_days {
+            if let Some((todo, at)) = todo
+                && let Some(by) = todo.deadline
+            {
+                say(
+                    at,
+                    Fact::Deadline {
+                        node: node.clone(),
+                        by: until(by, zone),
+                        lead_days: match todo.pace_days {
                             0 => crate::curve::DEADLINE_LEAD_DAYS,
                             days => days,
                         },
                     },
                 );
             }
-            if let Some(mark) = fields
-                .get("snooze")
-                .and_then(|(_, value)| decode::<legacy::DateMark>(value))
-            {
-                fact(
-                    "snooze",
-                    Said::Snooze {
-                        until: legacy_until(mark, zone),
+            if let Some((mark, at)) = fields.get::<DateMark>("snooze") {
+                say(
+                    at,
+                    Fact::Snooze {
+                        node: node.clone(),
+                        until: until(mark, zone),
                     },
                 );
             }
-            if fields
-                .get("muted")
-                .is_some_and(|(_, value)| decode::<bool>(value).unwrap_or(false))
-            {
-                fact("muted", Said::Mute);
+            if let Some((true, at)) = fields.get::<bool>("muted") {
+                say(at, Fact::Mute { node: node.clone() });
             }
         }
-        writes
+        // Every entry of one device needs an instant of its own.
+        said.sort_by_key(|(at, order, _)| (*at, *order));
+        let mut last: Option<Timestamp> = None;
+        let entries = said
+            .into_iter()
+            .map(|(at, _, fact)| {
+                let at = match last {
+                    Some(last) if last >= at => last + SignedDuration::from_nanos(1),
+                    _ => at,
+                };
+                last = Some(at);
+                Entry {
+                    device,
+                    at: at.to_zoned(zone.clone()),
+                    fact,
+                }
+            })
+            .collect();
+        (entries, notes)
     }
 }
 
@@ -538,156 +657,192 @@ mod tests {
     use jiff::tz::TimeZone;
 
     use super::*;
+    use crate::facts::{Device, Seen};
+    use crate::until::Until;
+
+    const LAPTOP: Device = Device([1; 16]);
+    const PHONE: Device = Device([2; 16]);
 
     fn agent() -> NodeId {
         NodeId::Agent(rho_agent_types::AgentId::from_encoded("00jvj4xuk96p").unwrap())
     }
 
-    fn noon() -> jiff::Zoned {
-        "2026-08-23T12:00:00Z"
-            .parse::<Timestamp>()
+    fn at(minute: i64) -> Zoned {
+        Timestamp::from_second(1_800_000_000 + minute * 60)
             .unwrap()
             .to_zoned(TimeZone::UTC)
     }
 
-    fn said(said: Said) -> Fact {
-        Fact { at: noon(), said }
+    fn said(device: Device, minute: i64, fact: Fact) -> Entry {
+        Entry {
+            device,
+            at: at(minute),
+            fact,
+        }
     }
 
     #[test]
-    fn marks_and_facts_read_back_typed_and_say_which_node_moved() {
+    fn filing_settles_on_the_last_thing_said_from_any_device() {
         let mut marks = Marks::default();
         let rho = uuid::Uuid::new_v4();
-        let touched = marks.apply([
-            crate::facts::record(
-                &agent(),
-                &said(Said::Done {
-                    through: Cursor::Story(7),
-                }),
+        let gui = uuid::Uuid::new_v4();
+        let entries = [
+            said(
+                LAPTOP,
+                0,
+                Fact::Label {
+                    label: rho,
+                    name: "rho".into(),
+                    parent: None,
+                },
             ),
-            crate::facts::record(&agent(), &said(Said::Mute)),
-            label(&agent(), rho, true),
-            name(&NodeId::Label(rho), Some("rho".into())),
-        ]);
-        assert_eq!(touched, BTreeSet::from([agent(), NodeId::Label(rho)]));
-        let held = marks.get(&agent());
-        assert_eq!(held.facts().handled(), Some(&Cursor::Story(7)));
-        assert!(held.facts().muted());
-        assert_eq!(held.labels, BTreeSet::from([rho]));
-        assert_eq!(marks.labeled(rho), [agent()]);
+            said(
+                PHONE,
+                1,
+                Fact::Label {
+                    label: gui,
+                    name: "gui".into(),
+                    parent: Some(rho),
+                },
+            ),
+            said(
+                LAPTOP,
+                2,
+                Fact::Labeled {
+                    node: agent(),
+                    label: gui,
+                    present: true,
+                },
+            ),
+            said(
+                PHONE,
+                3,
+                Fact::Named {
+                    node: agent(),
+                    name: Some("fixer".into()),
+                },
+            ),
+        ];
+        // Arriving in any order, and twice, comes to the same.
+        let mut backwards = entries.to_vec();
+        backwards.reverse();
+        marks.apply(backwards);
+        let touched = marks.apply(entries);
+        assert!(touched.is_empty(), "entries already held move nothing");
+        assert_eq!(marks.label_path(gui), "rho/gui");
+        assert_eq!(marks.labeled(gui), vec![agent()]);
+        assert_eq!(marks.get(&agent()).name.as_deref(), Some("fixer"));
     }
 
     #[test]
-    fn taking_a_fact_back_leaves_the_node_as_if_it_was_never_said() {
+    fn a_retract_takes_an_entry_back_whenever_it_arrives() {
         let mut marks = Marks::default();
-        let mute = crate::facts::record(&agent(), &said(Said::Mute));
-        let undo = marks.inverse(std::slice::from_ref(&mute));
-        marks.apply([mute]);
-        assert!(marks.get(&agent()).facts().muted());
-        marks.apply(undo);
-        assert_eq!(marks.get(&agent()), &NodeMarks::default());
-        assert_eq!(marks.nodes().count(), 0);
-    }
-
-    #[test]
-    fn a_field_this_build_does_not_know_is_kept() {
-        let mut marks = Marks::default();
-        let unknown = (
-            format!("n/{}|sparkle", agent().key()).into_bytes(),
-            Some(vec![1, 2, 3]),
+        let rename = said(
+            PHONE,
+            1,
+            Fact::Named {
+                node: agent(),
+                name: Some("new".into()),
+            },
         );
-        marks.apply([unknown.clone(), name(&agent(), Some("a".into()))]);
-        assert_eq!(marks.get(&agent()).name.as_deref(), Some("a"));
-        assert_eq!(marks.inverse(std::slice::from_ref(&unknown)), [unknown]);
+        let retract = said(PHONE, 2, Fact::Retract { of: rename.id() });
+        marks.apply([
+            said(
+                LAPTOP,
+                0,
+                Fact::Named {
+                    node: agent(),
+                    name: Some("old".into()),
+                },
+            ),
+            retract,
+        ]);
+        marks.apply([rename]);
+        assert_eq!(marks.get(&agent()).name.as_deref(), Some("old"));
     }
 
     #[test]
-    fn an_older_builds_marks_carry_over_into_facts_once() {
-        let zone = TimeZone::fixed(jiff::tz::Offset::constant(5));
-        let note = NodeId::Note(uuid::Uuid::from_u128(1));
-        let midnight = jiff::civil::date(2026, 8, 24)
-            .to_zoned(zone.clone())
-            .unwrap()
-            .timestamp();
+    fn a_note_is_its_newest_revision() {
         let mut marks = Marks::default();
-        marks.apply([
-            legacy::handled(&agent(), &Cursor::Story(4)),
+        let id = uuid::Uuid::new_v4();
+        let rev = |device, minute, body: &str| NoteRev {
+            note: id,
+            device,
+            at: at(minute),
+            created: at(0).timestamp(),
+            body: body.into(),
+            deleted: false,
+        };
+        marks.apply_notes([rev(PHONE, 2, "buy milk"), rev(LAPTOP, 1, "buy")]);
+        assert_eq!(marks.get(&NodeId::Note(id)).title(), "buy milk");
+        assert_eq!(marks.notes().count(), 1);
+    }
+
+    #[test]
+    fn what_is_said_next_sorts_after_everything_seen() {
+        let mut marks = Marks::default();
+        marks.apply([said(PHONE, 10, Fact::Mute { node: agent() })]);
+        // This device's clock is behind the phone's.
+        let next = marks.next_at(&at(5));
+        assert!(next.timestamp() > at(10).timestamp());
+        assert_eq!(marks.next_at(&at(20)), at(20));
+    }
+
+    #[test]
+    fn an_older_ledger_converts_into_entries_and_notes_dated_as_written() {
+        let rho = uuid::Uuid::new_v4();
+        let label = NodeId::Label(rho);
+        let note = NodeId::Note(uuid::Uuid::new_v4());
+        let stamp = at(0).timestamp().as_millisecond() as u64;
+        let mut old = vec![
+            legacy::name(&label, "rho"),
+            legacy::repository(&label, "https://example.com/rho"),
+            legacy::label(&agent(), rho),
+            legacy::name(&agent(), "fixer"),
+            legacy::handled(&agent(), &legacy::Cursor::Story(9)),
             legacy::snooze(
                 &agent(),
                 &legacy::DateMark {
-                    unix_ms: midnight.as_millisecond() + 3_600_000,
-                    day: false,
+                    unix_ms: at(60 * 24).timestamp().as_millisecond(),
+                    day: true,
                 },
             ),
-            legacy::todo(
-                &note,
-                &legacy::Todo {
-                    wakes: Some(legacy::DateMark {
-                        unix_ms: midnight.as_millisecond(),
-                        day: true,
-                    }),
-                    deadline: None,
-                    pace_days: 3,
-                },
-            ),
-            legacy::muted(&note),
-        ]);
-        let stamps = HashMap::new();
-        let writes = marks.carry_legacy(&stamps, &zone);
-        assert_eq!(
-            writes,
-            marks.carry_legacy(&stamps, &zone),
-            "the same facts on every device"
-        );
-        marks.apply(writes);
+            legacy::body(&note, "buy milk"),
+            legacy::created(&note, 5),
+        ];
+        old.push(legacy::muted(&NodeId::Label(uuid::Uuid::new_v4())));
+        let old: Vec<_> = old
+            .into_iter()
+            .map(|(key, value)| (key, value, stamp))
+            .collect();
+        let (entries, notes) = legacy::convert(&old, LAPTOP, &TimeZone::UTC);
+        let ids: BTreeSet<_> = entries.iter().map(Entry::id).collect();
+        assert_eq!(ids.len(), entries.len(), "every entry has its own instant");
         assert!(
-            marks.carry_legacy(&stamps, &zone).is_empty(),
-            "nothing left to carry"
+            entries
+                .iter()
+                .all(|entry| entry.at.timestamp() >= at(0).timestamp()
+                    && entry.at.timestamp() < at(0).timestamp() + SignedDuration::from_micros(1)),
+            "each is dated when its mark was written"
         );
 
-        let facts = marks.get(&agent()).facts();
-        assert_eq!(facts.handled(), Some(&Cursor::Story(4)));
-        assert_eq!(
-            facts.snooze().unwrap().until,
-            midnight + jiff::SignedDuration::from_hours(1)
-        );
-        let note = marks.get(&note).facts();
-        assert!(note.muted());
-        let todo = Facts(&marks.get(&NodeId::Note(uuid::Uuid::from_u128(1))).facts[..1]).todo();
-        assert_eq!(
-            todo.unwrap().start,
-            midnight + jiff::SignedDuration::from_hours(48),
-            "a pace of three came back on the third day"
-        );
-    }
-
-    #[test]
-    fn labels_nest_into_paths_and_lend_their_repository() {
         let mut marks = Marks::default();
-        let (rho, agents) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let note = NodeId::Note(uuid::Uuid::new_v4());
-        marks.apply([
-            name(&NodeId::Label(rho), Some("rho".into())),
-            repository(
-                &NodeId::Label(rho),
-                Some("git@github.com:maan2003/rho".into()),
-            ),
-            name(&NodeId::Label(agents), Some("agents".into())),
-            parent(&NodeId::Label(agents), Some(rho)),
-            body(&note, "fix the dealer\nsoon"),
-            label(&note, agents, true),
-        ]);
-        assert_eq!(marks.label_path(agents), "rho/agents");
-        assert_eq!(marks.label_at("rho/agents"), Some(agents));
-        assert_eq!(marks.sublabels(Some(rho)), [agents]);
-        assert_eq!(marks.sublabels(None), [rho]);
+        marks.apply(entries);
+        marks.apply_notes(notes);
         assert_eq!(
-            marks.repository_of(&note).as_deref(),
-            Some("git@github.com:maan2003/rho")
+            marks.repository_of(&agent()).as_deref(),
+            Some("https://example.com/rho")
         );
-        assert_eq!(marks.get(&note).title(), "fix the dealer");
-        marks.apply([deleted(&note, true)]);
-        assert!(marks.labeled(agents).is_empty());
-        assert_eq!(marks.notes().count(), 0);
+        let held = marks.get(&agent());
+        assert_eq!(held.name.as_deref(), Some("fixer"));
+        assert_eq!(held.facts().seen_agent(), Some(9));
+        assert_eq!(
+            held.facts().snooze().map(|snooze| snooze.until),
+            Some(Until::Day(jiff::civil::date(2027, 1, 16)).resolve(&at(0)))
+        );
+        let (_, held) = marks.notes().next().unwrap();
+        assert_eq!(held.title(), "buy milk");
+        assert_eq!(held.created_ms, Some(5));
+        let _ = Seen::Whole;
     }
 }

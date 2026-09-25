@@ -13,7 +13,7 @@ use gpui::{AppContext as _, Context, Entity, Task, Window};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec, SectionSpec};
-use rho_dealer::{NodeId, marks};
+use rho_dealer::NodeId;
 use rho_window::style::StyleClass;
 use text::{BufferId, ReplicaId};
 
@@ -333,7 +333,11 @@ impl Workspace {
         }
         view.synced = text.clone();
         let write = match node {
-            NodeId::Note(_) => marks::body(node, &text),
+            NodeId::Note(note) => crate::attention::Write::Note {
+                note: *note,
+                body: Some(text),
+                deleted: None,
+            },
             NodeId::Label(_) => {
                 let name = text.lines().next().unwrap_or_default().trim();
                 if name.is_empty() || name.contains('/') {
@@ -344,7 +348,15 @@ impl Workspace {
                     );
                     return;
                 }
-                marks::name(node, Some(name.to_owned()))
+                let NodeId::Label(label) = node else {
+                    unreachable!()
+                };
+                rho_dealer::facts::Fact::Label {
+                    label: *label,
+                    name: name.to_owned(),
+                    parent: self.attention.marks.get(node).parent,
+                }
+                .into()
             }
             _ => return,
         };
@@ -427,14 +439,22 @@ impl Workspace {
         let note = match existing {
             Some(note) => note,
             None => {
-                let note = NodeId::Note(uuid::Uuid::new_v4());
-                let mut writes = vec![
-                    marks::created(&note, chrono::Local::now().timestamp_millis()),
-                    marks::body(&note, ""),
-                ];
+                let id = uuid::Uuid::new_v4();
+                let note = NodeId::Note(id);
+                let mut writes = vec![crate::attention::Write::Note {
+                    note: id,
+                    body: Some(String::new()),
+                    deleted: None,
+                }];
                 writes.extend(self.new_thing_marks(&note, Some(&node)));
                 if !matches!(node, NodeId::Label(_)) {
-                    writes.push(marks::about(&note, Some(&node)));
+                    writes.push(
+                        rho_dealer::facts::Fact::About {
+                            node: note.clone(),
+                            about: Some(node.clone()),
+                        }
+                        .into(),
+                    );
                 }
                 self.write_marks(writes, cx);
                 note
@@ -466,21 +486,36 @@ impl Workspace {
         &self,
         thing: &NodeId,
         area: Option<&NodeId>,
-    ) -> Vec<rho_dealer::marks::Write> {
+    ) -> Vec<crate::attention::Write> {
+        use rho_dealer::facts::Fact;
         let Some(area) = area else {
             return Vec::new();
         };
+        let labeled = |label: uuid::Uuid| {
+            Fact::Labeled {
+                node: thing.clone(),
+                label,
+                present: true,
+            }
+            .into()
+        };
         if let NodeId::Label(label) = area {
-            return vec![marks::label(thing, *label, true)];
+            return vec![labeled(*label)];
         }
-        let mut writes = vec![marks::about(thing, Some(area))];
+        let mut writes = vec![
+            Fact::About {
+                node: thing.clone(),
+                about: Some(area.clone()),
+            }
+            .into(),
+        ];
         writes.extend(
             self.attention
                 .marks
                 .get(area)
                 .labels
                 .iter()
-                .map(|label| marks::label(thing, *label, true)),
+                .map(|label| labeled(*label)),
         );
         writes
     }

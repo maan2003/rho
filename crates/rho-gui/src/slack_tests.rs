@@ -4602,7 +4602,7 @@ async fn quoted_previews_expand_without_rewriting_source_or_losing_their_inset(
 
 #[gpui::test]
 async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAppContext) {
-    use rho_dealer::facts::{Fact, Said, record};
+    use rho_dealer::facts::Fact;
     use rho_dealer::{NodeId, Until};
     use rho_slack::fake::Fake;
 
@@ -4633,15 +4633,13 @@ async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAp
                     .any(|card| card.node == node)
             );
             workspace.write_marks(
-                vec![record(
-                    &node,
-                    &Fact {
-                        at: jiff::Zoned::now(),
-                        said: Said::Snooze {
-                            until: Until::In(jiff::SignedDuration::from_hours(1)),
-                        },
-                    },
-                )],
+                vec![
+                    Fact::Snooze {
+                        node: node.clone(),
+                        until: Until::In(jiff::SignedDuration::from_hours(1)),
+                    }
+                    .into(),
+                ],
                 cx,
             );
             assert!(
@@ -4652,15 +4650,13 @@ async fn snoozing_a_slack_unit_keeps_its_card_out_until_the_date(cx: &mut TestAp
                     .any(|card| card.node == node)
             );
             workspace.write_marks(
-                vec![record(
-                    &node,
-                    &Fact {
-                        at: jiff::Zoned::now(),
-                        said: Said::Snooze {
-                            until: Until::In(jiff::SignedDuration::from_hours(-1)),
-                        },
-                    },
-                )],
+                vec![
+                    Fact::Snooze {
+                        node: node.clone(),
+                        until: Until::In(jiff::SignedDuration::from_hours(-1)),
+                    }
+                    .into(),
+                ],
                 cx,
             );
             assert!(

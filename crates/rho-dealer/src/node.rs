@@ -87,6 +87,26 @@ impl NodeId {
     }
 }
 
+/// A node goes over the wire as its key, so a node kind a newer build
+/// adds fails to decode here rather than reading as something else.
+impl senax_encoder::Encoder for NodeId {
+    fn encode(&self, writer: &mut bytes::BytesMut) -> senax_encoder::Result<()> {
+        self.key().encode(writer)
+    }
+
+    fn is_default(&self) -> bool {
+        false
+    }
+}
+
+impl senax_encoder::Decoder for NodeId {
+    fn decode(reader: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        let key = String::decode(reader)?;
+        Self::parse(&key)
+            .ok_or_else(|| senax_encoder::EncoderError::Decode(format!("unknown node {key}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

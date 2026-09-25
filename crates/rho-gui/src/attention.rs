@@ -1,10 +1,11 @@
 //! What wants the user, and what they said about it.
 //!
-//! The user's marks and facts live in the ledger, which syncs them sealed
-//! between their devices through the hosts. The dealer reads them with
-//! the agents map and Slack into the hand Home shows and a pull deals
-//! from. A verdict is a fact the user said, and a Slack one also moves
-//! Slack's cursor or mutes the unit in Slack.
+//! What the user says lives in the ledger, which syncs it sealed between
+//! their devices through the hosts: facts, every one kept, and notes, a
+//! revision per save. The dealer reads them with the agents map and Slack
+//! into the hand Home shows and a pull deals from. A verdict is a fact the
+//! user said, and a Slack one also moves Slack's cursor or mutes the unit
+//! in Slack.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -14,24 +15,63 @@ use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{Context, Window};
 use rho_agent_types::AgentId;
-use rho_dealer::facts::{self, Cursor, Fact, Said};
-use rho_dealer::marks::{self, Write, legacy};
+use rho_dealer::facts::{Device, Entry, EntryId, Fact, Seen};
+use rho_dealer::marks::legacy;
+use rho_dealer::notes::NoteRev;
 use rho_dealer::rank::{self, Cache, Sources};
 use rho_dealer::{Card, CardKind, Hand, Marks, NodeId, Skips, SlackUnit, Until};
 use rho_ledger::stream::{LedgerEvent, LedgerStreams};
-use rho_ledger::{Ledger, Secret};
+use rho_ledger::{Channel, Item, Ledger, Secret};
 use rho_window::style::StyleClass;
 
 use crate::workspace::Workspace;
 
-/// What `shift-u` takes back: the marks a verdict wrote, as they were,
-/// and what it did outside the ledger.
+/// Something the user says: a fact, or a note's new text or state.
+#[derive(Clone, Debug)]
+pub(crate) enum Write {
+    Fact(Fact),
+    Note {
+        note: uuid::Uuid,
+        body: Option<String>,
+        deleted: Option<bool>,
+    },
+}
+
+impl From<Fact> for Write {
+    fn from(fact: Fact) -> Self {
+        Self::Fact(fact)
+    }
+}
+
+/// What takes one write back: a retract of the entry, or a note's
+/// revision before it, said again.
+#[derive(Clone, Debug)]
+pub(crate) enum Takeback {
+    Retract(EntryId),
+    Note(NoteRev),
+}
+
+impl Takeback {
+    fn write(self) -> Write {
+        match self {
+            Self::Retract(of) => Write::Fact(Fact::Retract { of }),
+            Self::Note(rev) => Write::Note {
+                note: rev.note,
+                body: Some(rev.body),
+                deleted: Some(rev.deleted),
+            },
+        }
+    }
+}
+
+/// What `shift-u` takes back: what a verdict said, and what it did
+/// outside the ledger.
 pub(crate) struct Undo {
     /// Which verdict this is, in the order they were taken.
     pub(crate) sequence: u64,
     pub(crate) verb: String,
-    /// The writes that put the marks back.
-    pub(crate) writes: Vec<Write>,
+    /// What takes back what it said.
+    pub(crate) takeback: Vec<Takeback>,
     /// The node the verdict was on, dealt again by the undo, and what the
     /// journal called the verdict. `None` for a batch like `mark read
     /// before`, which has no card of its own.
@@ -58,6 +98,8 @@ pub(crate) enum Verdict {
 
 pub(crate) struct Attention {
     streams: Arc<LedgerStreams>,
+    /// This device, as its entries name it.
+    device: Device,
     pub(crate) marks: Marks,
     pub(crate) skips: Skips,
     cache: RefCell<Cache>,
@@ -66,49 +108,48 @@ pub(crate) struct Attention {
 }
 
 impl Attention {
-    /// The ledger in `db`, with its marks read out. A device's first start
-    /// on the ledger carries over what the desk held, and every start
-    /// carries an older build's marks over into facts.
+    /// The ledger in `db`, read out. A device that holds nothing yet
+    /// carries over what an older build's ledger held, or else what the
+    /// desk held.
     pub(crate) fn open(db: rho_db::RhoDb) -> (Self, UnboundedReceiver<LedgerEvent>) {
-        let ledger = futures::executor::block_on(async {
-            let ledger = Ledger::open(db.clone()).await;
-            if ledger.head() == 0 {
-                migrate(&db).await;
-            }
-            ledger
-        });
+        let ledger = futures::executor::block_on(Ledger::open(db.clone()));
+        let device = Device(ledger.device().0);
         let mut marks = Marks::default();
-        marks.apply(
-            ledger
-                .scan(b"n/")
-                .into_iter()
-                .chain(ledger.scan(b"f/"))
-                .map(|(key, value)| (key, Some(value))),
-        );
-        let stamps = ledger
-            .stamps(b"n/")
-            .into_iter()
-            .map(|(key, ms)| {
-                let at = jiff::Timestamp::from_millisecond(ms as i64)
-                    .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
-                (key, at)
-            })
-            .collect();
-        let carried = marks.carry_legacy(&stamps, &jiff::Zoned::now().time_zone().clone());
-        if !carried.is_empty() {
-            let count = carried.len();
-            let keys: Vec<Vec<u8>> = carried.iter().map(|(key, _)| key.clone()).collect();
-            futures::executor::block_on(ledger.write(carried));
-            marks.apply(keys.into_iter().map(|key| {
-                let value = ledger.get(&key);
-                (key, value)
-            }));
-            tracing::info!(writes = count, "carried older marks over into facts");
+        marks.apply(read_entries(&ledger.items(Channel::Facts)));
+        marks.apply_notes(read_notes(&ledger.items(Channel::Notes)));
+        if marks.is_empty() {
+            let mut old = ledger.legacy_merged();
+            if old.is_empty() {
+                old = desk_marks(&rho_desk_client::export::held(&db))
+                    .into_iter()
+                    .map(|(key, value)| (key, value, 1))
+                    .collect();
+            }
+            let zone = jiff::Zoned::now().time_zone().clone();
+            let (entries, notes) = legacy::convert(&old, device, &zone);
+            if !entries.is_empty() || !notes.is_empty() {
+                tracing::info!(
+                    facts = entries.len(),
+                    notes = notes.len(),
+                    "carried older marks over into facts"
+                );
+                futures::executor::block_on(async {
+                    ledger
+                        .append(Channel::Facts, entries.iter().map(Entry::encode).collect())
+                        .await;
+                    ledger
+                        .append(Channel::Notes, notes.iter().map(NoteRev::encode).collect())
+                        .await;
+                });
+                marks.apply(entries);
+                marks.apply_notes(notes);
+            }
         }
         let (streams, events) = LedgerStreams::new(ledger);
         (
             Self {
                 streams,
+                device,
                 marks,
                 skips: Skips::default(),
                 cache: RefCell::default(),
@@ -150,34 +191,81 @@ impl Attention {
         self.streams.ledger().secret()
     }
 
-    /// Reads `keys` back from the ledger into the marks: the merged value
-    /// is the one that counts, whatever the write or event said.
-    fn reread(&mut self, keys: impl IntoIterator<Item = Vec<u8>>) -> BTreeSet<NodeId> {
-        let ledger = self.streams.ledger();
-        let entries: Vec<Write> = keys
-            .into_iter()
-            .map(|key| {
-                let value = ledger.get(&key);
-                (key, value)
-            })
-            .collect();
-        self.marks.apply(entries)
+    /// Says `writes` on this device, and returns what takes each back and
+    /// which nodes moved.
+    fn say(&mut self, writes: Vec<Write>) -> (Vec<Takeback>, BTreeSet<NodeId>) {
+        let now = jiff::Zoned::now();
+        let mut takeback = Vec::new();
+        let mut touched = BTreeSet::new();
+        let mut entries = Vec::new();
+        let mut notes = Vec::new();
+        for write in writes {
+            let at = self.marks.next_at(&now);
+            match write {
+                Write::Fact(fact) => {
+                    let entry = Entry {
+                        device: self.device,
+                        at,
+                        fact,
+                    };
+                    takeback.push(Takeback::Retract(entry.id()));
+                    touched.extend(self.marks.apply([entry.clone()]));
+                    entries.push(entry.encode());
+                }
+                Write::Note {
+                    note,
+                    body,
+                    deleted,
+                } => {
+                    let held = self.marks.note(note).cloned();
+                    let rev = NoteRev {
+                        note,
+                        device: self.device,
+                        created: held.as_ref().map_or(at.timestamp(), |held| held.created),
+                        body: body
+                            .or_else(|| held.as_ref().map(|held| held.body.clone()))
+                            .unwrap_or_default(),
+                        deleted: deleted
+                            .or_else(|| held.as_ref().map(|held| held.deleted))
+                            .unwrap_or(false),
+                        at,
+                    };
+                    // A note that did not exist before is taken back by
+                    // deleting it.
+                    takeback.push(Takeback::Note(held.unwrap_or_else(|| NoteRev {
+                        deleted: true,
+                        ..rev.clone()
+                    })));
+                    touched.extend(self.marks.apply_notes([rev.clone()]));
+                    notes.push(rev.encode());
+                }
+            }
+        }
+        futures::executor::block_on(async {
+            if !entries.is_empty() {
+                self.streams.append(Channel::Facts, entries).await;
+            }
+            if !notes.is_empty() {
+                self.streams.append(Channel::Notes, notes).await;
+            }
+        });
+        takeback.reverse();
+        (takeback, touched)
     }
 }
 
-/// Reads the desk this client held into marks, stamped as old as the
-/// ledger allows: a device that migrates after the user has already
-/// worked elsewhere must not win over that work.
-async fn migrate(db: &rho_db::RhoDb) {
-    let held = rho_desk_client::export::held(db);
-    let writes = desk_marks(&held);
-    if writes.is_empty() {
-        return;
-    }
-    let count = writes.len();
-    let old = Ledger::open_with_clock(db.clone(), Arc::new(|| 1)).await;
-    old.write(writes).await;
-    tracing::info!(marks = count, "carried the desk over into the ledger");
+fn read_entries(items: &[Item]) -> Vec<Entry> {
+    items
+        .iter()
+        .filter_map(|item| Entry::decode(&item.bytes))
+        .collect()
+}
+
+fn read_notes(items: &[Item]) -> Vec<NoteRev> {
+    items
+        .iter()
+        .filter_map(|item| NoteRev::decode(&item.bytes))
+        .collect()
 }
 
 fn migrated_node(id: &rho_desk_client::protocol::cells::Id) -> Option<NodeId> {
@@ -234,7 +322,7 @@ pub(crate) fn desk_marks(
         rho_desk_client::protocol::cells::Id,
         rho_desk_client::export::HeldNode,
     >,
-) -> Vec<Write> {
+) -> Vec<legacy::Mark> {
     use rho_desk_client::protocol::cells::{Id, Property, State};
     let mut writes = Vec::new();
     for (id, node) in held {
@@ -254,40 +342,37 @@ pub(crate) fn desk_marks(
         for property in &node.properties {
             match property {
                 Property::Parent(Some(Id::Label(parent))) if matches!(target, NodeId::Label(_)) => {
-                    writes.push(marks::parent(
-                        &target,
-                        Some(uuid::Uuid::from_bytes(parent.0)),
-                    ));
+                    writes.push(legacy::parent(&target, uuid::Uuid::from_bytes(parent.0)));
                 }
                 Property::About(about) => {
                     if let Some(about) = migrated_node(about) {
-                        writes.push(marks::about(&target, Some(&about)));
+                        writes.push(legacy::about(&target, &about));
                     }
                 }
                 Property::Labeled {
                     label: Id::Label(label),
                     present: true,
-                } => writes.push(marks::label(&target, uuid::Uuid::from_bytes(label.0), true)),
+                } => writes.push(legacy::label(&target, uuid::Uuid::from_bytes(label.0))),
                 Property::Name(name) if !name.trim().is_empty() => {
-                    writes.push(marks::name(&target, Some(name.clone())));
+                    writes.push(legacy::name(&target, name));
                 }
                 Property::Repository(Some(repository)) => {
-                    writes.push(marks::repository(&target, Some(repository.url.clone())));
+                    writes.push(legacy::repository(&target, &repository.url));
                 }
                 Property::State(State::Muted) if !matches!(target, NodeId::Slack(_)) => {
                     writes.push(legacy::muted(&target));
                 }
                 Property::State(State::Done) if matches!(target, NodeId::Note(_)) => {
-                    writes.push(legacy::handled(&target, &Cursor::Done));
+                    writes.push(legacy::handled(&target, &legacy::Cursor::Done));
                 }
                 Property::AgentHandledThrough(pos) if matches!(target, NodeId::Agent(_)) => {
-                    writes.push(legacy::handled(&target, &Cursor::Story(pos.0)));
+                    writes.push(legacy::handled(&target, &legacy::Cursor::Story(pos.0)));
                 }
                 Property::DeferUntil(Some(at)) => wakes = Some(date_mark(*at)),
                 Property::Deadline(Some(at)) => deadline = Some(date_mark(*at)),
                 Property::PaceDays(pace) => pace_days = *pace,
-                Property::Deleted(true) => writes.push(marks::deleted(&target, true)),
-                Property::CreatedAt(at) => writes.push(marks::created(&target, at.unix_ms)),
+                Property::Deleted(true) => writes.push(legacy::deleted(&target)),
+                Property::CreatedAt(at) => writes.push(legacy::created(&target, at.unix_ms)),
                 _ => {}
             }
         }
@@ -306,7 +391,7 @@ pub(crate) fn desk_marks(
             )),
         }
         if let (NodeId::Note(_), Some(body)) = (&target, &node.body) {
-            writes.push(marks::body(&target, body));
+            writes.push(legacy::body(&target, body));
         }
     }
     writes
@@ -347,20 +432,21 @@ impl Workspace {
 
     fn ledger_event(&mut self, event: LedgerEvent, cx: &mut Context<Self>) {
         match event {
-            LedgerEvent::Changed(changes) => {
-                let touched = self
-                    .attention
-                    .reread(changes.into_iter().map(|change| change.key));
+            LedgerEvent::Appended(items) => {
+                let (facts, notes): (Vec<Item>, Vec<Item>) = items
+                    .into_iter()
+                    .partition(|item| matches!(item.channel, Channel::Facts));
+                let mut touched = self.attention.marks.apply(read_entries(&facts));
+                touched.extend(self.attention.marks.apply_notes(read_notes(&notes)));
                 self.marks_moved(touched, cx);
             }
             LedgerEvent::Unreadable { device } => self.append_message(
                 format!(
-                    "ledger: device {} writes with another key; its marks are not read",
-                    device
-                        .0
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
+                    "ledger: device {} writes with another key; what it says is not read",
+                    device.map_or_else(
+                        || "unknown".to_owned(),
+                        |device| device.0.iter().map(|byte| format!("{byte:02x}")).collect()
+                    )
                 ),
                 StyleClass::SystemInfo,
                 cx,
@@ -374,17 +460,23 @@ impl Workspace {
         }
     }
 
-    /// Writes marks, and returns the writes that put them back.
-    pub(crate) fn write_marks(&mut self, writes: Vec<Write>, cx: &mut Context<Self>) -> Vec<Write> {
+    /// Says `writes`, and returns what takes them back.
+    pub(crate) fn write_marks(
+        &mut self,
+        writes: Vec<Write>,
+        cx: &mut Context<Self>,
+    ) -> Vec<Takeback> {
         if writes.is_empty() {
             return Vec::new();
         }
-        let inverse = self.attention.marks.inverse(&writes);
-        let keys: Vec<Vec<u8>> = writes.iter().map(|(key, _)| key.clone()).collect();
-        futures::executor::block_on(self.attention.streams.write(writes));
-        let touched = self.attention.reread(keys);
+        let (takeback, touched) = self.attention.say(writes);
         self.marks_moved(touched, cx);
-        inverse
+        takeback
+    }
+
+    /// Takes back what a verdict said.
+    pub(crate) fn take_back(&mut self, takeback: Vec<Takeback>, cx: &mut Context<Self>) {
+        self.write_marks(takeback.into_iter().map(Takeback::write).collect(), cx);
     }
 
     /// Everything that follows from marks moving: the agents' own view of
@@ -421,10 +513,7 @@ impl Workspace {
             let node = NodeId::Agent(*agent_id);
             let marks = self.attention.marks.get(&node);
             let said = marks.facts();
-            let handled = match said.handled() {
-                Some(Cursor::Story(pos)) => *pos,
-                _ => 0,
-            };
+            let handled = said.seen_agent().unwrap_or(0);
             let verdict = rho_agents_client::Verdict {
                 handled_through: rho_agent_types::AgentPos(handled),
                 muted: said.muted(),
@@ -522,20 +611,12 @@ impl Workspace {
         verdict: Verdict,
         cx: &mut Context<Self>,
     ) -> Option<Undo> {
-        let now = jiff::Zoned::now();
         tracing::debug!(node = %node.key(), ?verdict, "verdict");
         let mut slack_cursors = Vec::new();
         let mut slack_muted = None;
-        // How far the verdict deals with the node: an agent through its
-        // newest story. Slack keeps its own cursor, moved here.
-        let through = match node {
-            NodeId::Agent(agent_id) => Cursor::Story(
-                self.registry
-                    .agent_digest(*agent_id)
-                    .map_or(0, |digest| digest.newest.0),
-            ),
-            _ => Cursor::Done,
-        };
+        let seen = self.seen(node, cx);
+        // Slack keeps its own cursor too, moved here, so Slack's own apps
+        // agree.
         if let NodeId::Slack(unit) = node
             && !matches!(verdict, Verdict::Snooze(_))
         {
@@ -545,23 +626,46 @@ impl Workspace {
                 slack_muted = Some(unit.clone());
             }
         }
-        let said = match verdict {
-            Verdict::Done => Said::Done { through },
-            // Slack mutes the unit itself; here it is only dealt with.
-            Verdict::Mute if matches!(node, NodeId::Slack(_)) => Said::Done { through },
-            Verdict::Mute => Said::Mute,
-            Verdict::Snooze(until) => Said::Snooze { until },
-            Verdict::Todo { start } => Said::Todo { through, start },
+        let node = node.clone();
+        let fact = match verdict {
+            Verdict::Done => Fact::Settled { node, seen },
+            // Slack mutes the unit itself; here it is only settled.
+            Verdict::Mute if matches!(node, NodeId::Slack(_)) => Fact::Settled { node, seen },
+            Verdict::Mute => Fact::Mute { node },
+            Verdict::Snooze(until) => Fact::Snooze { node, until },
+            Verdict::Todo { start } => Fact::Todo { node, start, seen },
         };
-        let writes = self.write_marks(vec![facts::record(node, &Fact { at: now, said })], cx);
+        let takeback = self.write_marks(vec![fact.into()], cx);
         Some(Undo {
             sequence: 0,
             verb: String::new(),
-            writes,
+            takeback,
             card: None,
             slack_cursors,
             slack_muted,
         })
+    }
+
+    /// How far the user has seen `node`: everything its source has now.
+    pub(crate) fn seen(&self, node: &NodeId, cx: &gpui::App) -> Seen {
+        match node {
+            NodeId::Agent(agent_id) => Seen::Agent(
+                self.registry
+                    .agent_digest(*agent_id)
+                    .map_or(0, |digest| digest.newest.0),
+            ),
+            NodeId::Slack(unit) => self
+                .slack
+                .session()
+                .and_then(|session| {
+                    let model = session.read(cx).model();
+                    model
+                        .unit(&rank::model_unit(unit))
+                        .map(|facts| Seen::Slack(facts.newest.0.clone()))
+                })
+                .unwrap_or(Seen::Whole),
+            _ => Seen::Whole,
+        }
     }
 
     /// `shift-u`: the last verdict, taken back.
@@ -577,7 +681,7 @@ impl Workspace {
         if let Some(unit) = &undo.slack_muted {
             self.slack_set_unit_muted(unit, false, cx);
         }
-        self.write_marks(undo.writes, cx);
+        self.take_back(undo.takeback, cx);
         let Some((node, verdict)) = undo.card else {
             if undo.slack_cursors.is_empty() {
                 self.echo(&format!("undid {}", undo.verb), StyleClass::SystemInfo, cx);
@@ -631,13 +735,11 @@ impl Workspace {
                 Some(id) => id,
                 None => {
                     let id = uuid::Uuid::new_v4();
-                    let node = NodeId::Label(id);
-                    writes.push(marks::name(&node, Some(names[depth].to_owned())));
-                    writes.push(marks::parent(&node, parent));
-                    writes.push(marks::created(
-                        &node,
-                        jiff::Timestamp::now().as_millisecond(),
-                    ));
+                    writes.push(Write::from(Fact::Label {
+                        label: id,
+                        name: names[depth].to_owned(),
+                        parent,
+                    }));
                     minted.insert(prefix, id);
                     id
                 }
@@ -681,13 +783,21 @@ impl Workspace {
         };
         let writes = doomed
             .iter()
-            .map(|node| marks::deleted(node, true))
+            .map(|node| match node {
+                NodeId::Note(note) => Write::Note {
+                    note: *note,
+                    body: None,
+                    deleted: Some(true),
+                },
+                NodeId::Label(label) => Fact::Unlabel { label: *label }.into(),
+                _ => unreachable!("only notes and labels are deleted"),
+            })
             .collect();
-        let writes = self.write_marks(writes, cx);
+        let takeback = self.write_marks(writes, cx);
         self.attention.push_undo(Undo {
             sequence: 0,
             verb: said.clone(),
-            writes,
+            takeback,
             card: None,
             slack_cursors: Vec::new(),
             slack_muted: None,
@@ -771,11 +881,14 @@ impl Workspace {
             true => None,
             false => self.mint_label(&parents.join("/"), cx),
         };
-        let node = NodeId::Label(label);
-        let writes = self.write_marks(
+        let takeback = self.write_marks(
             vec![
-                marks::name(&node, Some((*name).to_owned())),
-                marks::parent(&node, parent),
+                Fact::Label {
+                    label,
+                    name: (*name).to_owned(),
+                    parent,
+                }
+                .into(),
             ],
             cx,
         );
@@ -783,7 +896,7 @@ impl Workspace {
         self.attention.push_undo(Undo {
             sequence: 0,
             verb: said.clone(),
-            writes,
+            takeback,
             card: None,
             slack_cursors: Vec::new(),
             slack_muted: None,
@@ -799,7 +912,7 @@ impl Workspace {
         node: &NodeId,
         path: &str,
         cx: &mut Context<Self>,
-    ) -> Option<(bool, Vec<Write>)> {
+    ) -> Option<(bool, Vec<Takeback>)> {
         let existing = self.attention.marks.label_at(path.trim());
         let carried =
             existing.is_some_and(|label| self.attention.marks.get(node).labels.contains(&label));
@@ -807,17 +920,29 @@ impl Workspace {
             Some(label) => label,
             None => self.mint_label(path, cx)?,
         };
-        let undo = self.write_marks(vec![marks::label(node, label, !carried)], cx);
+        let undo = self.write_marks(
+            vec![
+                Fact::Labeled {
+                    node: node.clone(),
+                    label,
+                    present: !carried,
+                }
+                .into(),
+            ],
+            cx,
+        );
         Some((!carried, undo))
     }
 
     /// A new note, made from `area` the way any new thing is.
     pub(crate) fn create_note(&mut self, area: Option<&NodeId>, cx: &mut Context<Self>) -> NodeId {
-        let node = NodeId::Note(uuid::Uuid::new_v4());
-        let mut writes = vec![marks::created(
-            &node,
-            jiff::Timestamp::now().as_millisecond(),
-        )];
+        let note = uuid::Uuid::new_v4();
+        let node = NodeId::Note(note);
+        let mut writes = vec![Write::Note {
+            note,
+            body: Some(String::new()),
+            deleted: None,
+        }];
         writes.extend(self.new_thing_marks(&node, area));
         self.write_marks(writes, cx);
         node
@@ -1039,10 +1164,14 @@ mod tests {
                 body: None,
             },
         );
+        let old: Vec<_> = desk_marks(&held)
+            .into_iter()
+            .map(|(key, value)| (key, value, 1))
+            .collect();
+        let (entries, notes) = legacy::convert(&old, Device([0; 16]), &jiff::tz::TimeZone::UTC);
         let mut marks = Marks::default();
-        marks.apply(desk_marks(&held));
-        let carried = marks.carry_legacy(&HashMap::new(), &jiff::tz::TimeZone::UTC);
-        marks.apply(carried);
+        marks.apply(entries);
+        marks.apply_notes(notes);
 
         let gui = uuid::Uuid::from_bytes([2; 16]);
         assert_eq!(marks.label_path(gui), "rho/gui");
@@ -1060,7 +1189,7 @@ mod tests {
         );
         let agent = marks.get(&NodeId::Agent(agent_id));
         assert!(agent.facts().muted());
-        assert_eq!(agent.facts().handled(), Some(&Cursor::Story(9)));
+        assert_eq!(agent.facts().seen_agent(), Some(9));
         assert_eq!(agent.name.as_deref(), Some("fixer"));
         assert_eq!(
             agent.facts().snoozes(),

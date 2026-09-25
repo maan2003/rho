@@ -3,8 +3,9 @@
 //! Everything in the user's world is a node: a Slack thread, an agent, a
 //! note, a label. Most nodes are never stored; a source (Slack, the
 //! agents) says they exist and what they have done. What the user did
-//! about them — done, mute, snooze, todo — is kept in the ledger as facts
-//! ([`facts`]), and what they called and filed them as marks ([`marks`]).
+//! about them, and how they named and filed them, is kept in the ledger
+//! as facts ([`facts`]); notes sync as revisions of their own ([`notes`]).
+//! [`marks`] reads both into what each node comes to.
 //!
 //! [`rank`] reads all of it, the sources as they are and the user's facts
 //! as they were said, and deals the hand; nothing about ranking is stored.
@@ -14,6 +15,7 @@ pub mod curve;
 pub mod facts;
 pub mod marks;
 mod node;
+pub mod notes;
 pub mod rank;
 pub mod until;
 

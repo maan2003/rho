@@ -15,7 +15,7 @@ use rho_agents_client::AgentMap;
 use rho_slack::model::{Attention, Model, Unit};
 
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
-use crate::facts::{Cursor, Snooze};
+use crate::facts::{Snooze, slack_ts_order};
 use crate::marks::Marks;
 use crate::node::{NodeId, SlackUnit};
 
@@ -187,14 +187,11 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
         if facts.turn_running {
             running.insert(node.clone());
         }
-        let handled = match marks.get(&node).facts().handled() {
-            Some(Cursor::Story(pos)) => *pos,
-            _ => 0,
-        };
+        let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
         let Some(ended) = facts.last_turn_ended else {
             continue;
         };
-        if facts.turn_running || ended <= facts.last_user_message_at || digest.newest.0 <= handled {
+        if facts.turn_running || ended <= facts.last_user_message_at || digest.newest.0 <= seen {
             continue;
         }
         let ended = unix(ended.0 as i64);
@@ -238,6 +235,16 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
             let Some(facts) = model.unit(unit) else {
                 continue;
             };
+            // Done on another device, having seen this far.
+            let node = NodeId::Slack(slack_unit(workspace, unit));
+            if marks
+                .get(&node)
+                .facts()
+                .seen_slack()
+                .is_some_and(|seen| slack_ts_order(&facts.newest.0, seen).is_le())
+            {
+                continue;
+            }
             let since = unix(
                 facts
                     .newest
@@ -293,10 +300,7 @@ pub fn rank(sources: &Sources<'_>, now: &Zoned, cache: &mut Cache) -> Hand {
                     .map(|ts| unix(ts.millis()))
                     .collect();
             }
-            parts
-                .entry(NodeId::Slack(slack_unit(workspace, unit)))
-                .or_default()
-                .push(part);
+            parts.entry(node).or_default().push(part);
         }
     }
 
