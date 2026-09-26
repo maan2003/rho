@@ -156,13 +156,15 @@ pub(crate) fn command(
             // Failure is a fact of the process, computed here and nowhere
             // else: a non-zero exit, no exit code at all (a signal), a spawn
             // failure, or a cancellation.
-            let failed = !matches!(
-                &result,
+            // An explicit cancellation is quiet even when it terminates a
+            // subprocess: it must not schedule a failure wake.
+            let failed = match &result {
                 Ok(CommandExit {
-                    exit_code: Some(0),
-                    ..
-                })
-            );
+                    exit_code: Some(0), ..
+                }) => false,
+                Err(error) if error == "Command cancelled" => false,
+                _ => true,
+            };
             let mut state = job.state.lock().unwrap();
             state.log.as_mut().expect("a command keeps a log").exit = Some(result.clone());
             state.finished = Some(UnixMs::now());

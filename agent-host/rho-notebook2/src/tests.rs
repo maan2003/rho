@@ -189,6 +189,12 @@ async fn cancelling_a_task_kills_its_command_quietly() {
             .any(|f| f.kind == crate::Kind::Command && f.finished.is_some())
     })
     .await;
+    assert!(
+        !notebook
+            .facts()
+            .iter()
+            .any(|f| f.kind == crate::Kind::Command && f.finished.unwrap().failed)
+    );
     let text = notebook.report().unwrap().text;
     assert!(text.contains("Task cancelled"), "{text}");
     assert!(!text.contains("Task failed"), "{text}");
