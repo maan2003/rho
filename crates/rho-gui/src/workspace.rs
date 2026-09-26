@@ -42,7 +42,6 @@ use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, HostId, protocol as agents};
 use rho_agents_view::agent_view::AgentModel;
-use rho_agents_view::draft::DraftModel;
 use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
@@ -59,6 +58,7 @@ use settings::Settings as _;
 use theme::ActiveTheme as _;
 
 use crate::chime::Chime;
+use crate::draft::DraftModel;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
 use crate::search;
@@ -719,7 +719,7 @@ impl Workspace {
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
             DraftModel::new(
-                rho_agents_view::draft::Hooks::new(move |editor, fields, _, _| {
+                crate::draft::Hooks::new(move |editor, fields, _, _| {
                     editor.set_completion_provider(Some(
                         crate::commands::WorkspaceCompletionProvider::new(
                             workspace.clone(),
@@ -735,7 +735,7 @@ impl Workspace {
         });
         let draft_subscription =
             cx.subscribe(&draft_model, |workspace, _, event, cx| match event {
-                rho_agents_view::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
+                crate::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
             });
         let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {

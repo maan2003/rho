@@ -6,6 +6,7 @@ pub(crate) mod browser;
 pub(crate) mod chime;
 pub(crate) mod commands;
 pub(crate) mod create;
+pub(crate) mod draft;
 pub(crate) mod find;
 pub(crate) mod git_approval;
 pub mod home;
