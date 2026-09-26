@@ -1,6 +1,6 @@
 //! Host-owned proxy and process lifetime. No agent loop or notebook runs
 //! here.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -294,6 +294,8 @@ pub enum ChatWorkerEvent {
 pub struct ChatRemote(Arc<ChatInner>);
 
 struct ChatInner {
+    next: AtomicU64,
+    rewinds: Arc<Mutex<std::collections::HashMap<u64, oneshot::Sender<anyhow::Result<()>>>>>,
     commands: tokio::sync::mpsc::UnboundedSender<ipc::Message<'static>>,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     closed: watch::Receiver<bool>,
@@ -320,6 +322,9 @@ impl ChatRemote {
         id: AgentId,
         model: String,
         effort: String,
+        role: AgentRole,
+        parent: Option<AgentId>,
+        user_owned: bool,
         on_event: Arc<dyn Fn(ChatWorkerEvent) + Send + Sync>,
     ) -> anyhow::Result<Self> {
         // Mode changes hold the write side through process replacement.
@@ -336,17 +341,22 @@ impl ChatRemote {
         let (stop, mut stopping) = oneshot::channel();
         let (closed, closed_rx) = watch::channel(false);
         let (ready, started) = oneshot::channel();
+        let rewinds: Arc<Mutex<std::collections::HashMap<_, _>>> = Arc::default();
+        let pending_rewinds = rewinds.clone();
         let handle = Self(Arc::new(ChatInner {
+            next: AtomicU64::new(1),
+            rewinds,
             commands,
             stop: Mutex::new(Some(stop)),
             closed: closed_rx,
         }));
         let cwd = place.cwd.clone();
+        let pool = Arc::downgrade(pool);
         tokio::spawn(async move {
             let port = super::transport::Port::Agent(id);
             let result = async {
                 process.sender.send(port, ipc::encode(&ipc::Message::ChatBootstrap(
-                    ipc::ChatBootstrap { cwd, model, effort },
+                    ipc::ChatBootstrap { cwd, model, effort, role, parent, user_owned },
                 ))?).await?;
                 let mut ready = Some(ready);
                 let mut stopping_requested = false;
@@ -377,6 +387,23 @@ impl ChatRemote {
                         }
                         ipc::Message::Chat { event } => on_event(ChatWorkerEvent::Chat(event)),
                         ipc::Message::ChatArchived { archived } => on_event(ChatWorkerEvent::Archived(archived)),
+                        ipc::Message::ChatTool { request, call } => {
+                            let pool = pool.clone();
+                            let sender = process.sender.clone();
+                            tokio::spawn(async move {
+                                let result = match super::services::agent2_tool(pool, id, call).await {
+                                    Ok(reply) => ipc::Agent2ToolResult::Ok(reply),
+                                    Err(error) => ipc::Agent2ToolResult::Error(error),
+                                };
+                                let _ = sender.send(port, ipc::encode(&ipc::Message::ChatToolReply { request, result })
+                                    .expect("encode agent2 tool reply")).await;
+                            });
+                        }
+                        ipc::Message::ChatRewound { request, error } => {
+                            if let Some(reply) = pending_rewinds.lock().expect("poison").remove(&request) {
+                                let _ = reply.send(error.map_or(Ok(()), |reason| Err(anyhow::anyhow!(reason))));
+                            }
+                        },
                         ipc::Message::Stopped { error } => {
                             on_event(ChatWorkerEvent::Stopped(error));
                             return Ok::<(), anyhow::Error>(());
@@ -386,6 +413,7 @@ impl ChatRemote {
                 }
             }.await;
             process.agents.lock().expect("poison").remove(&id);
+            pending_rewinds.lock().expect("poison").clear();
             if let Err(error) = result {
                 on_event(ChatWorkerEvent::Stopped(Some(format!("{error:#}"))));
                 process.stop();
@@ -419,6 +447,35 @@ impl ChatRemote {
             .commands
             .send(ipc::Message::ChatArchive)
             .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
+    }
+
+    pub fn cancel(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
+        self.0
+            .commands
+            .send(ipc::Message::ChatCancel)
+            .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
+    }
+
+    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
+        let request = self.0.next.fetch_add(1, Ordering::Relaxed);
+        let (reply, result) = oneshot::channel();
+        self.0
+            .rewinds
+            .lock()
+            .expect("poison")
+            .insert(request, reply);
+        if self
+            .0
+            .commands
+            .send(ipc::Message::ChatRewind { request, turns })
+            .is_err()
+        {
+            self.0.rewinds.lock().expect("poison").remove(&request);
+            anyhow::bail!("agent2 worker closed");
+        }
+        result.await.context("agent2 worker closed")?
     }
 
     pub async fn shutdown(&self) {

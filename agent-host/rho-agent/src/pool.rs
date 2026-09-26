@@ -25,6 +25,19 @@ use crate::db::{
 use crate::lazy::Lazy;
 use crate::{StartPlace, View};
 
+/// Host-owned agent2 policy and ownership. The callback must not retain the
+/// pool: the host installs one that upgrades a weak manager reference per
+/// request.
+pub type Agent2ToolHandler = Arc<
+    dyn Fn(
+            AgentId,
+            rho_agent2::human::Agent2Call,
+        )
+            -> futures::future::BoxFuture<'static, anyhow::Result<rho_agent2::human::Agent2Reply>>
+        + Send
+        + Sync,
+>;
+
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
 const MAX_WORKING_CHILDREN: usize = 20;
@@ -48,6 +61,7 @@ struct ExecutionSlot {
 
 pub struct AgentPool {
     processes: Mutex<HashMap<String, Arc<ExecutionSlot>>>,
+    agent2_tools: std::sync::Mutex<Option<Agent2ToolHandler>>,
 
     responses: tokio::sync::mpsc::Sender<ResponseNotification>,
     db: RhoDb,
@@ -159,6 +173,7 @@ impl AgentPool {
             tokio::sync::mpsc::channel::<ResponseNotification>(256);
         let pool = Arc::new(Self {
             processes: Mutex::new(HashMap::new()),
+            agent2_tools: std::sync::Mutex::new(None),
             responses,
             db,
             inference: inference.clone(),
@@ -215,6 +230,26 @@ impl AgentPool {
             }
         });
         pool
+    }
+
+    /// Replace the agent2 manager's checked dispatcher after manager reload.
+    pub fn install_agent2_tool_handler(&self, handler: Agent2ToolHandler) -> anyhow::Result<()> {
+        *self.agent2_tools.lock().expect("poison") = Some(handler);
+        Ok(())
+    }
+
+    pub(crate) async fn agent2_tool(
+        &self,
+        source: AgentId,
+        call: rho_agent2::human::Agent2Call,
+    ) -> anyhow::Result<rho_agent2::human::Agent2Reply> {
+        let handler = self
+            .agent2_tools
+            .lock()
+            .expect("poison")
+            .clone()
+            .context("agent2 collaboration service unavailable")?;
+        handler(source, call).await
     }
 
     /// The worksets agents work in.
@@ -1212,6 +1247,35 @@ mod tests {
             origin: None,
         };
         let id = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(7)).unwrap();
+        pool.install_agent2_tool_handler(Arc::new(|_, _| {
+            Box::pin(async {
+                Ok(rho_agent2::human::Agent2Reply {
+                    text: "stale manager".into(),
+                })
+            })
+        }))
+        .unwrap();
+        let (seen, mut called) = tokio::sync::mpsc::unbounded_channel();
+        pool.install_agent2_tool_handler(Arc::new(move |source, call| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                seen.send((source, call)).unwrap();
+                Ok(rho_agent2::human::Agent2Reply {
+                    text: "current manager".into(),
+                })
+            })
+        }))
+        .unwrap();
+        assert_eq!(
+            pool.agent2_tool(id, rho_agent2::human::Agent2Call::Team)
+                .await
+                .unwrap()
+                .text,
+            "current manager"
+        );
+        assert!(
+            matches!(called.recv().await.unwrap(), (source, rho_agent2::human::Agent2Call::Team) if source == id)
+        );
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
         let callback = Arc::new(move |event| {
             let _ = events.send(event);
@@ -1222,6 +1286,9 @@ mod tests {
             id,
             "gpt-5".into(),
             "low".into(),
+            AgentRole::default(),
+            None,
+            false,
             callback,
         )
         .await
@@ -1242,6 +1309,9 @@ mod tests {
             id,
             "gpt-5".into(),
             "low".into(),
+            AgentRole::default(),
+            None,
+            false,
             Arc::new(|_| {}),
         )
         .await;

@@ -7,15 +7,64 @@
 //! While any cell awaits it, the agent is awaiting the human: the fact the
 //! dealer reads.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use rho_notebook2::Export;
+use rho_agent_types::AgentRole;
+use rho_notebook2::{Export, operation};
+use senax_encoder::{Decode, Encode};
 use tokio::sync::mpsc;
 
 use crate::log::{AgentId, Party};
+
+/// A notebook collaboration request. The host uses the source agent ID from
+/// the worker port, never a caller-supplied identity.
+#[derive(Debug, Encode, Decode)]
+pub enum Agent2Call {
+    SpawnEngineer {
+        task_name: String,
+        prompt: String,
+        workdir: Option<String>,
+    },
+    SpawnUserOwnedEngineer {
+        task_name: String,
+        prompt: String,
+        workdir: Option<String>,
+    },
+    SpawnAdvisor {
+        message: String,
+    },
+    Message {
+        agent_id: AgentId,
+        message: String,
+    },
+    Cancel {
+        agent_id: AgentId,
+    },
+    Team,
+}
+
+impl Agent2Call {
+    /// The host checks this against persisted role metadata on every call.
+    pub fn allowed(&self, role: AgentRole) -> bool {
+        role.is_engineer() || matches!(self, Self::Message { .. } | Self::Team)
+    }
+}
+
+#[derive(Debug, Encode, Decode)]
+pub struct Agent2Reply {
+    pub text: String,
+}
+
+pub type Agent2HostCall = Arc<
+    dyn Fn(Agent2Call) -> Pin<Box<dyn Future<Output = Result<Agent2Reply, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// What the notebook hands the agent loop.
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +82,7 @@ pub enum Outbound {
 /// Shared by the notebook's `human` and the agent loop.
 pub struct Mailroom {
     outbox: mpsc::UnboundedSender<Outbound>,
+    agents: Option<Agent2HostCall>,
     waits: Mutex<Waits>,
 }
 
@@ -48,11 +98,12 @@ struct Waits {
 }
 
 impl Mailroom {
-    pub fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<Outbound>) {
+    pub fn new(agents: Option<Agent2HostCall>) -> (Arc<Self>, mpsc::UnboundedReceiver<Outbound>) {
         let (outbox, rx) = mpsc::unbounded_channel();
         (
             Arc::new(Self {
                 outbox,
+                agents,
                 waits: Mutex::default(),
             }),
             rx,
@@ -105,6 +156,22 @@ fn build(py: Python<'_>, class: &str, mailroom: Arc<Mailroom>) -> PyResult<Py<Py
 #[pyclass(frozen)]
 struct Bridge(Arc<Mailroom>);
 
+impl Bridge {
+    fn tool(&self, py: Python<'_>, call: Agent2Call, name: &'static str) -> PyResult<Py<PyAny>> {
+        let tools = self
+            .0
+            .agents
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("agent service unavailable"))?
+            .clone();
+        operation(py, name, move |cx| async move {
+            let result = tools(call).await?;
+            cx.report(&result.text);
+            Ok(result.text)
+        })
+    }
+}
+
 #[pymethods]
 impl Bridge {
     #[pyo3(signature = (to, text))]
@@ -125,6 +192,73 @@ impl Bridge {
 
     fn archive(&self) {
         self.0.archive();
+    }
+
+    #[pyo3(signature = (*, task_name, prompt, workdir = None))]
+    fn spawn_new_engineer(
+        &self,
+        py: Python<'_>,
+        task_name: String,
+        prompt: String,
+        workdir: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        self.tool(
+            py,
+            Agent2Call::SpawnEngineer {
+                task_name,
+                prompt,
+                workdir,
+            },
+            "agents.spawn_new_engineer",
+        )
+    }
+
+    #[pyo3(signature = (*, task_name, prompt, workdir = None))]
+    fn spawn_user_owned_engineer(
+        &self,
+        py: Python<'_>,
+        task_name: String,
+        prompt: String,
+        workdir: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        self.tool(
+            py,
+            Agent2Call::SpawnUserOwnedEngineer {
+                task_name,
+                prompt,
+                workdir,
+            },
+            "agents.spawn_user_owned_engineer",
+        )
+    }
+
+    fn spawn_new_advisor(&self, py: Python<'_>, message: String) -> PyResult<Py<PyAny>> {
+        self.tool(
+            py,
+            Agent2Call::SpawnAdvisor { message },
+            "agents.spawn_new_advisor",
+        )
+    }
+
+    #[pyo3(signature = (*, agent_id, message))]
+    fn message(&self, py: Python<'_>, agent_id: String, message: String) -> PyResult<Py<PyAny>> {
+        let agent_id = AgentId::from_encoded(&agent_id)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.tool(
+            py,
+            Agent2Call::Message { agent_id, message },
+            "agents.message",
+        )
+    }
+
+    fn cancel(&self, py: Python<'_>, agent_id: String) -> PyResult<Py<PyAny>> {
+        let agent_id = AgentId::from_encoded(&agent_id)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        self.tool(py, Agent2Call::Cancel { agent_id }, "agents.cancel")
+    }
+
+    fn team(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.tool(py, Agent2Call::Team, "agents.team")
     }
 
     fn status(&self, text: String) {
@@ -211,6 +345,30 @@ class Agents:
         while not self._bridge.agent_replied(since):
             await _asyncio.sleep(0.1)
 
+    def spawn_new_engineer(self, *, task_name, prompt, workdir=None):
+        """Start an Engineer; its findings arrive as mail. Returns a full ID."""
+        return self._bridge.spawn_new_engineer(task_name=str(task_name), prompt=str(prompt), workdir=workdir)
+
+    def spawn_user_owned_engineer(self, *, task_name, prompt, workdir=None):
+        """Start an Engineer managed by the human, not by this agent."""
+        return self._bridge.spawn_user_owned_engineer(task_name=str(task_name), prompt=str(prompt), workdir=workdir)
+
+    def spawn_new_advisor(self, message):
+        """Ask an independent Advisor; its answer arrives as mail."""
+        return self._bridge.spawn_new_advisor(str(message))
+
+    def message(self, *, agent_id, message):
+        """Send a confirmed message to an agent by its full ID."""
+        return self._bridge.message(agent_id=str(agent_id), message=str(message))
+
+    def cancel(self, agent_id):
+        """Interrupt an Engineer you manage, by its full ID."""
+        return self._bridge.cancel(str(agent_id))
+
+    def team(self):
+        """Describe this agent's team and parent."""
+        return self._bridge.team()
+
     def __repr__(self):
         return "<agents>"
 "#;
@@ -222,8 +380,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn advisor_can_only_message_or_read_team() {
+        let role = AgentRole::Advisor {
+            intelligence: rho_agent_types::AdvisorIntelligence::Medium,
+        };
+        let id = AgentId::from_counter(17, &AgentIdDomain(42)).unwrap();
+        for call in [
+            Agent2Call::SpawnEngineer {
+                task_name: "task".into(),
+                prompt: "work".into(),
+                workdir: None,
+            },
+            Agent2Call::SpawnUserOwnedEngineer {
+                task_name: "task".into(),
+                prompt: "work".into(),
+                workdir: None,
+            },
+            Agent2Call::SpawnAdvisor {
+                message: "ask".into(),
+            },
+            Agent2Call::Cancel { agent_id: id },
+        ] {
+            assert!(!call.allowed(role));
+            assert!(call.allowed(AgentRole::default()));
+        }
+        assert!(
+            Agent2Call::Message {
+                agent_id: id,
+                message: "reply".into()
+            }
+            .allowed(role)
+        );
+        assert!(Agent2Call::Team.allowed(role));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn python_agents_calls_are_awaitable_and_forward_typed_arguments() {
+        use std::time::Duration;
+
+        use rho_notebook2::Notebook;
+        let dir = tempfile::tempdir().unwrap();
+        let (calls, mut received) = mpsc::unbounded_channel();
+        let host: Agent2HostCall = Arc::new(move |call| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.send(call).unwrap();
+                Ok(Agent2Reply {
+                    text: "accepted".into(),
+                })
+            })
+        });
+        let (mailroom, _) = Mailroom::new(Some(host));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let notebook = Notebook::new(
+            rho_tool_shell::ShellTools::in_directory(
+                Duration::from_secs(5),
+                camino::Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap(),
+                rho_fs_view::PathOverrides::default(),
+            ),
+            mailroom.exports(),
+            wake.clone(),
+        )
+        .unwrap();
+        let id = AgentId::from_counter(17, &AgentIdDomain(42)).unwrap();
+        let cell = notebook.run(format!(
+            "await agents.spawn_new_engineer(task_name='alpha', prompt='build', workdir='/src/sub')\nawait agents.spawn_new_advisor('question')\nawait agents.spawn_user_owned_engineer(task_name='beta', prompt='inspect')\nawait agents.message(agent_id='{id}', message='details')\nawait agents.cancel('{id}')\nprint(await agents.team())",
+            id=id.encoded()
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cell.facts().finished.is_none() {
+                wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!cell.facts().finished.unwrap().failed);
+        let report = notebook.report().unwrap().text;
+        assert!(report.contains("accepted"), "{report}");
+        assert!(
+            matches!(received.recv().await.unwrap(), Agent2Call::SpawnEngineer { task_name, prompt, workdir }
+            if task_name == "alpha" && prompt == "build" && workdir.as_deref() == Some("/src/sub"))
+        );
+        assert!(
+            matches!(received.recv().await.unwrap(), Agent2Call::SpawnAdvisor { message } if message == "question")
+        );
+        assert!(
+            matches!(received.recv().await.unwrap(), Agent2Call::SpawnUserOwnedEngineer { task_name, prompt, workdir }
+            if task_name == "beta" && prompt == "inspect" && workdir.is_none())
+        );
+        assert!(
+            matches!(received.recv().await.unwrap(), Agent2Call::Message { agent_id, message }
+            if agent_id == id && message == "details")
+        );
+        assert!(
+            matches!(received.recv().await.unwrap(), Agent2Call::Cancel { agent_id } if agent_id == id)
+        );
+        assert!(matches!(received.recv().await.unwrap(), Agent2Call::Team));
+        notebook.shutdown().await.unwrap();
+    }
+
+    #[test]
     fn agents_send_parses_full_ids_and_rejects_invalid_labels() {
-        let (mailroom, mut outbox) = Mailroom::new();
+        let (mailroom, mut outbox) = Mailroom::new(None);
         let bridge = Bridge(mailroom);
         let id = AgentId::from_counter(17, &AgentIdDomain(42)).unwrap();
         bridge.send(Some(id.encoded()), "hello".into()).unwrap();

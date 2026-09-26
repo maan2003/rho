@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 8;
+pub(super) const VERSION: u32 = 10;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -25,6 +25,9 @@ pub(super) struct ChatBootstrap {
     pub cwd: camino::Utf8PathBuf,
     pub model: String,
     pub effort: String,
+    pub role: rho_agent_types::AgentRole,
+    pub parent: Option<rho_agent_types::AgentId>,
+    pub user_owned: bool,
 }
 
 #[derive(Encode, Decode)]
@@ -64,6 +67,12 @@ pub(crate) enum SharedCall {
 pub(super) enum SharedReply {
     Ok(String),
     Err(String),
+}
+
+#[derive(Encode, Decode)]
+pub(super) enum Agent2ToolResult {
+    Ok(rho_agent2::human::Agent2Reply),
+    Error(String),
 }
 
 #[derive(Encode, Decode)]
@@ -169,6 +178,23 @@ pub(super) enum Message<'a> {
         text: String,
     },
     ChatArchive,
+    ChatCancel,
+    ChatTool {
+        request: u64,
+        call: rho_agent2::human::Agent2Call,
+    },
+    ChatToolReply {
+        request: u64,
+        result: Agent2ToolResult,
+    },
+    ChatRewind {
+        request: u64,
+        turns: u32,
+    },
+    ChatRewound {
+        request: u64,
+        error: Option<String>,
+    },
     Chat {
         event: rho_agent2::chat::ChatEvent,
     },
@@ -329,6 +355,11 @@ impl Host {
                         | Message::ChatStarted { .. }
                         | Message::ChatSend { .. }
                         | Message::ChatArchive
+                        | Message::ChatCancel
+                        | Message::ChatTool { .. }
+                        | Message::ChatToolReply { .. }
+                        | Message::ChatRewind { .. }
+                        | Message::ChatRewound { .. }
                         | Message::Chat { .. }
                         | Message::ChatArchived { .. } => {
                             return Err::<(), _>(io::Error::new(
@@ -652,6 +683,66 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent2_collaboration_crosses_the_worker_channel_with_full_arguments_and_reply() {
+        use rho_agent2::human::{Agent2Call, Agent2Reply};
+
+        let (mut worker, mut host) = crate::worker::testing::pair();
+        let request = 42;
+        worker
+            .write(&Message::ChatTool {
+                request,
+                call: Agent2Call::SpawnEngineer {
+                    task_name: "probe".into(),
+                    prompt: "inspect the worker".into(),
+                    workdir: Some("/src/component".into()),
+                },
+            })
+            .await
+            .unwrap();
+        let Message::ChatTool {
+            request: received,
+            call:
+                Agent2Call::SpawnEngineer {
+                    task_name,
+                    prompt,
+                    workdir,
+                },
+        } = host.read().await.unwrap()
+        else {
+            panic!("the host did not receive the typed collaboration call");
+        };
+        assert_eq!(received, request);
+        assert_eq!(task_name, "probe");
+        assert_eq!(prompt, "inspect the worker");
+        assert_eq!(workdir.as_deref(), Some("/src/component"));
+        host.write(&Message::ChatToolReply {
+            request,
+            result: Agent2ToolResult::Ok(Agent2Reply {
+                text: "eng-fullid".into(),
+            }),
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(worker.read().await.unwrap(), Message::ChatToolReply {
+            request: 42, result: Agent2ToolResult::Ok(Agent2Reply { text })
+        } if text == "eng-fullid")
+        );
+
+        host.write(&Message::ChatToolReply {
+            request: 43,
+            result: Agent2ToolResult::Error("advisor cannot spawn".into()),
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(worker.read().await.unwrap(), Message::ChatToolReply {
+            request: 43, result: Agent2ToolResult::Error(error)
+        } if error == "advisor cannot spawn")
+        );
+    }
 
     #[tokio::test]
     async fn replies_are_routed_independently_and_eof_fails_pending_requests() {

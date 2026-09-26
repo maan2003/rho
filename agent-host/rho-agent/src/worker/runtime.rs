@@ -1,5 +1,7 @@
 //! Worker-owned runtimes and their local control dispatch. No database or pool.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use tokio::net::UnixStream;
@@ -157,6 +159,23 @@ async fn drive_claude(
     result.and(cleanup)
 }
 
+type ChatToolWaiters = Arc<
+    Mutex<
+        HashMap<u64, tokio::sync::oneshot::Sender<Result<rho_agent2::human::Agent2Reply, String>>>,
+    >,
+>;
+
+struct ChatToolPending {
+    request: u64,
+    waiters: ChatToolWaiters,
+}
+
+impl Drop for ChatToolPending {
+    fn drop(&mut self) {
+        self.waiters.lock().expect("poison").remove(&self.request);
+    }
+}
+
 /// The agent2 loop uses the same workset namespace and policy channel as the
 /// legacy loops, but its own append-only log and chat projection.
 async fn drive_chat(
@@ -166,15 +185,45 @@ async fn drive_chat(
     policy: Arc<super::policy::Host>,
     sender: super::transport::Sender,
     base_url: String,
+    next: Arc<AtomicU64>,
     mut incoming: tokio::sync::mpsc::UnboundedReceiver<super::transport::Packet>,
 ) -> anyhow::Result<()> {
     use rho_agent2::agent::{Agent as ChatAgent, Config, Inbound, Trace};
+    use rho_agent2::human::Agent2HostCall;
     use rho_agent2::log::{Block, Log};
     use rho_inference::InferenceHost as _;
     use rho_inference2::Model;
     use rho_inference2::openai::{AuthResolver, Effort, OpenAi};
 
     let port = super::transport::Port::Agent(agent);
+    let pending: ChatToolWaiters = Arc::default();
+    let agent_tools: Agent2HostCall = {
+        let pending = pending.clone();
+        let sender = sender.clone();
+        Arc::new(move |call| {
+            let sender = sender.clone();
+            let pending = pending.clone();
+            let next = next.clone();
+            Box::pin(async move {
+                let request = next.fetch_add(1, Ordering::Relaxed);
+                let bytes = ipc::encode(&Message::ChatTool { request, call })
+                    .map_err(|error| error.to_string())?;
+                let (reply, response) = tokio::sync::oneshot::channel();
+                pending.lock().expect("poison").insert(request, reply);
+                let _pending = ChatToolPending {
+                    request,
+                    waiters: pending,
+                };
+                sender
+                    .send(port, bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                response
+                    .await
+                    .map_err(|_| "agent service closed".to_owned())?
+            })
+        })
+    };
     let setup = (|| {
         let cwd = base.for_cwd(&bootstrap.cwd)?;
         let path = base
@@ -210,7 +259,28 @@ async fn drive_chat(
             log: Log::open(path.as_std_path())?,
             model,
             shell: rho_tool_shell::ShellTools::new(std::time::Duration::from_secs(20), cwd),
-            instructions: rho_agent2::prompt::INSTRUCTIONS.into(),
+            instructions: {
+                let instructions = match (bootstrap.parent, bootstrap.user_owned) {
+                    (Some(parent), false) => format!(
+                        "{}\n\nYou work for agent {}. Send your findings to that agent with `agents.send(\"{}\", text)`; they arrive as mail.",
+                        rho_agent2::prompt::INSTRUCTIONS,
+                        parent.encoded(),
+                        parent.encoded(),
+                    ),
+                    (_, true) => format!(
+                        "{}\n\nYou are managed by the human. Report your results with human.send(text), not to the Engineer who started you.",
+                        rho_agent2::prompt::INSTRUCTIONS,
+                    ),
+                    (None, false) => rho_agent2::prompt::INSTRUCTIONS.into(),
+                };
+                let role = if bootstrap.role.is_engineer() {
+                    "You are an Engineer."
+                } else {
+                    "You are an Advisor. You may message agents and inspect your team, but cannot spawn or cancel agents."
+                };
+                format!("{instructions}\n\n{role}").into()
+            },
+            agent_tools: Some(agent_tools),
         })
     })();
     let (runtime, handle) = match setup {
@@ -243,7 +313,27 @@ async fn drive_chat(
                 match ipc::decode(&packet.bytes)? {
                     Message::ChatSend { from, text } => handle.send(Inbound { from, body: vec![Block::Text(text)] })?,
                     Message::ChatArchive => handle.archive(),
+                    Message::ChatCancel => handle.cancel(),
+                    Message::ChatToolReply { request, result } => {
+                        if let Some(wait) = pending.lock().expect("poison").remove(&request) {
+                            let reply = match result {
+                                ipc::Agent2ToolResult::Ok(reply) => Ok(reply),
+                                ipc::Agent2ToolResult::Error(error) => Err(error),
+                            };
+                            let _ = wait.send(reply);
+                        }
+                    }
+                    Message::ChatRewind { request, turns } => {
+                        let handle = handle.clone();
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            let error = handle.rewind(turns).await.err().map(|error| format!("{error:#}"));
+                            let _ = sender.send(port, ipc::encode(&Message::ChatRewound { request, error })
+                                .expect("encode rewind reply")).await;
+                        });
+                    },
                     Message::Stop => {
+                        handle.stop();
                         drop(handle);
                         // The notebook can still be running an admitted cell.
                         break tokio::time::timeout(std::time::Duration::from_secs(5), &mut running).await
@@ -456,9 +546,19 @@ pub(super) async fn run(
             let base = base.clone();
             let policy = policy.clone();
             let url = startup.responses_base_url.clone();
+            let next = next.clone();
             tasks.spawn(async move {
-                let result =
-                    drive_chat(agent, chat, base, policy, sender.clone(), url, messages).await;
+                let result = drive_chat(
+                    agent,
+                    chat,
+                    base,
+                    policy,
+                    sender.clone(),
+                    url,
+                    next,
+                    messages,
+                )
+                .await;
                 agents.lock().expect("poison").remove(&agent);
                 let _ = sender
                     .send(
@@ -522,6 +622,24 @@ pub(super) async fn run(
     sender.close();
     writer.abort();
     result
+}
+
+#[cfg(test)]
+mod chat_tool_tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_an_agent2_tool_releases_its_waiter() {
+        let waiters: ChatToolWaiters = Arc::default();
+        let (reply, _response) = tokio::sync::oneshot::channel();
+        waiters.lock().unwrap().insert(79, reply);
+        let pending = ChatToolPending {
+            request: 79,
+            waiters: waiters.clone(),
+        };
+        drop(pending);
+        assert!(waiters.lock().unwrap().is_empty());
+    }
 }
 
 /// Consume the inherited channel before Python or any child can inherit fd 0.

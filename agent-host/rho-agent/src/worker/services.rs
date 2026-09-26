@@ -12,6 +12,21 @@ use tokio::task::JoinSet;
 use super::ipc::{self, Message, Reply, Request};
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
 
+/// Agent2 collaboration is answered by its host manager, never the legacy DB.
+/// The agent port supplies the source identity; notebook arguments cannot.
+pub(super) async fn agent2_tool(
+    pool: std::sync::Weak<crate::pool::AgentPool>,
+    source: AgentId,
+    call: rho_agent2::human::Agent2Call,
+) -> Result<rho_agent2::human::Agent2Reply, String> {
+    let pool = pool
+        .upgrade()
+        .ok_or_else(|| "agent pool is shutting down".to_owned())?;
+    pool.agent2_tool(source, call)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
 struct Controls {
     closed: bool,
     pending: std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<(), String>>>,
