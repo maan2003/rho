@@ -287,6 +287,11 @@ pub enum SurfaceIdentity {
     SlackInventory {
         name: String,
     },
+    /// Agent2 identities are distinct from legacy transcript identities.
+    /// Append variants to preserve the existing binary journal tags.
+    Agent2Chat {
+        agent_id: String,
+    },
 }
 
 /// Who ignored the thread: this rho, or Slack telling rho that another

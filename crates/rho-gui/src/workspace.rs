@@ -47,6 +47,13 @@ use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
 };
+use rho_agents2_client::protocol::{
+    AgentId as Agent2Id, AgentInfo as Agent2Info, ArchiveAgent as ArchiveAgent2,
+    CreateAgent as CreateAgent2, Effort as Agent2Effort, SendMessage as SendMessage2,
+    ServerFrame as Agent2Frame,
+};
+use rho_agents2_client::remote::Agents2Link;
+use rho_agents2_client::stream::{Agents2Event, Agents2Stream};
 use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
@@ -117,6 +124,7 @@ pub(crate) enum SurfaceView {
     Messages(Entity<editor::Editor>),
     Usage(Entity<crate::usage::UsageView>),
     Note(Entity<editor::Editor>),
+    Agent2(crate::agent2::ChatView),
     Transcript {
         model: Entity<AgentModel>,
         /// The editor over the model's multibuffer.
@@ -146,6 +154,7 @@ impl SurfaceView {
             Self::Messages(_) => SurfaceKind::Messages,
             Self::Usage(_) => SurfaceKind::Usage,
             Self::Note(_) => SurfaceKind::Dashboard,
+            Self::Agent2(_) => SurfaceKind::Transcript,
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
             Self::Shell { .. } => SurfaceKind::Shell,
@@ -244,6 +253,9 @@ pub struct Workspace {
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
     models: HashMap<AgentId, Entity<AgentModel>>,
+    agent2: HashMap<Agent2Id, (HostId, Agent2Info)>,
+    agent2_events: futures_mpsc::UnboundedSender<Agents2Event>,
+    pending_agent2_open: Option<Agent2Id>,
     /// Weak project cache keyed by host-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
     /// Artifact surfaces hold the strong references; when the last file
@@ -415,6 +427,7 @@ pub struct Workspace {
     _host_event_task: Task<()>,
     _ledger_event_task: Task<()>,
     _desktop_event_task: Task<()>,
+    _agent2_event_task: Task<()>,
     _keystroke_subscription: gpui::Subscription,
     _transient_keystroke_interceptor: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
@@ -689,6 +702,19 @@ impl Workspace {
         let (desktop_streams, desktop_events_rx) =
             rho_desktop_client::stream::DesktopStreams::new();
         let hosts = Hosts::new(std::sync::Arc::new(host_events));
+        let (agent2_events, mut agent2_rx) = futures_mpsc::unbounded::<Agents2Event>();
+        let agent2_event_task = cx.spawn(async move |this, cx| {
+            while let Some(event) = agent2_rx.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_agent2_event(event, window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| {
@@ -848,6 +874,9 @@ impl Workspace {
             registry: AgentMap::default(),
             selection: Selection::default(),
             models: HashMap::new(),
+            agent2: HashMap::new(),
+            agent2_events,
+            pending_agent2_open: None,
             remote_projects: HashMap::new(),
             pending_syncs: HashMap::new(),
             agents_client,
@@ -912,6 +941,7 @@ impl Workspace {
             _host_event_task: host_event_task,
             _ledger_event_task: ledger_event_task,
             _desktop_event_task: desktop_event_task,
+            _agent2_event_task: agent2_event_task,
             _keystroke_subscription: keystroke_subscription,
             _transient_keystroke_interceptor: transient_keystroke_interceptor,
             _window_activation_subscription: window_activation_subscription,
@@ -978,6 +1008,7 @@ impl Workspace {
         let agents_client = &self.agents_client;
         let ledger = self.attention.stream();
         let desktop_streams = &self.desktop_streams;
+        let agent2_events = self.agent2_events.clone();
         // The agents client is told the host exists, and gets its agents
         // stream, before any frame from it can arrive.
         let host = self.hosts.attach(
@@ -989,6 +1020,7 @@ impl Workspace {
                     agents_client.stream(host),
                     ledger.clone(),
                     desktop_streams.stream(host),
+                    std::sync::Arc::new(Agents2Stream::new(host, agent2_events)),
                 ]
             },
             &gpui_tokio::Tokio::handle(cx),
@@ -1040,6 +1072,16 @@ impl Workspace {
             self.voice.stop();
         }
         self.hosts.detach(host);
+        let gone_agent2 = self
+            .agent2
+            .iter()
+            .filter(|(_, (owner, _))| *owner == host)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in gone_agent2 {
+            self.agent2.remove(&id);
+            self.forget_surface(&SurfaceKey::Agent2(id));
+        }
         self.quotas.forget(host);
         self.save_hosts();
         self.agents_client.detach_host(host);
@@ -2022,6 +2064,28 @@ impl Workspace {
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
+        if let SurfaceView::Agent2(view) = &self.active_surface().view {
+            let view = view.clone();
+            let Some(id) = self.active_agent2() else {
+                return;
+            };
+            let text = view.composition(cx);
+            if text.trim().is_empty() {
+                return;
+            }
+            if let Some((host, _)) = self.agent2.get(&id) {
+                let sent = text.clone();
+                self.call_agent2(
+                    *host,
+                    SendMessage2 { agent_id: id, text },
+                    cx,
+                    move |_, (), _, cx| {
+                        view.clear_if_sent(&sent, cx);
+                    },
+                );
+            }
+            return;
+        }
         if let SurfaceView::Shell { model, .. } = &self.active_surface().view {
             model.clone().update(cx, |model, cx| model.submit(cx));
             return;
@@ -3217,6 +3281,424 @@ impl Workspace {
         .detach();
     }
 
+    fn agent2_link(&self, host: HostId) -> Option<Agents2Link> {
+        Some(Agents2Link::new(self.hosts.connection(host)?.link()))
+    }
+
+    fn call_agent2<C: rho_rpc::protocol::Call>(
+        &self,
+        host: HostId,
+        call: C,
+        cx: &mut Context<Self>,
+        on_reply: impl FnOnce(&mut Self, C::Reply, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let Some(link) = self.agent2_link(host) else {
+            return;
+        };
+        let reply = link.call(call);
+        cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            let _ = this.update_in(cx, |this, window, cx| match reply {
+                Ok(value) => on_reply(this, value, window, cx),
+                Err(error) => this.report_refusal(host, &format!("{error:#}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn handle_agent2_event(
+        &mut self,
+        event: Agents2Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = event.host;
+        let mut changed = Vec::new();
+        match event.frame {
+            Agent2Frame::Snapshot { agents } => {
+                let ids = agents
+                    .iter()
+                    .map(|agent| agent.id.clone())
+                    .collect::<HashSet<_>>();
+                let stale = self
+                    .agent2
+                    .iter()
+                    .filter(|(id, (owner, _))| *owner == host && !ids.contains(*id))
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                for id in stale {
+                    self.agent2.remove(&id);
+                    self.forget_surface(&SurfaceKey::Agent2(id));
+                }
+                for agent in agents {
+                    changed.push(agent.id.clone());
+                    self.agent2.insert(agent.id.clone(), (host, agent));
+                }
+            }
+            Agent2Frame::Created { agent } => {
+                changed.push(agent.id.clone());
+                self.agent2.insert(agent.id.clone(), (host, agent));
+            }
+            Agent2Frame::Chat { agent_id, event } => {
+                if let Some((owner, info)) = self.agent2.get_mut(&agent_id) {
+                    if *owner == host && !info.chat.iter().any(|existing| existing.seq == event.seq)
+                    {
+                        if let rho_agents2_client::protocol::ChatKind::Status(status) = &event.kind
+                        {
+                            info.status = Some(status.clone());
+                        }
+                        info.chat.push(event);
+                        info.chat.sort_by_key(|event| event.seq);
+                        changed.push(agent_id);
+                    }
+                }
+            }
+            Agent2Frame::Archived { agent_id, archived } => {
+                if let Some((owner, info)) = self.agent2.get_mut(&agent_id) {
+                    if *owner == host {
+                        info.archived = archived;
+                        changed.push(agent_id);
+                    }
+                }
+            }
+        }
+        for id in changed {
+            if let Some((_, info)) = self.agent2.get(&id) {
+                for surfaces in self.surfaces.values() {
+                    for surface in surfaces {
+                        if surface.key == SurfaceKey::Agent2(id.clone()) {
+                            if let SurfaceView::Agent2(view) = &surface.view {
+                                view.refresh(info, cx);
+                            }
+                        }
+                    }
+                }
+            }
+            if self.pending_agent2_open.as_ref() == Some(&id) {
+                self.pending_agent2_open = None;
+                self.open_agent2(id, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_agent2(&mut self, id: Agent2Id, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.agent2.contains_key(&id) {
+            return;
+        }
+        self.active_context = ContextId::Draft;
+        let surface = self.make_surface(SurfaceKey::Agent2(id), window, cx);
+        self.display_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+    }
+
+    fn prompt_agent2_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &App| {
+            let mut entries = workspace
+                .agent2
+                .iter()
+                .filter(|(id, (_, info))| {
+                    id.as_str().contains(input) || info.workdir.as_str().contains(input)
+                })
+                .map(|(id, (host, info))| crate::minibuffer::Candidate {
+                    value: id.as_str().to_owned(),
+                    description: format!(
+                        "{} · {} · {}{}",
+                        workspace.hosts.host_label(*host),
+                        info.workdir,
+                        info.status.as_deref().unwrap_or("idle"),
+                        if info.archived { " · archived" } else { "" }
+                    ),
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.value.cmp(&b.value));
+            entries
+        });
+        let submit = std::rc::Rc::new(
+            |this: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if let Some(id) = this
+                    .agent2
+                    .keys()
+                    .find(|id| id.as_str() == input.trim())
+                    .cloned()
+                {
+                    this.open_agent2(id, window, cx);
+                } else {
+                    this.notice_on(None, "unknown agent2 chat", StyleClass::StatusError, cx);
+                }
+            },
+        );
+        self.open_prompt("agent2 chat:", complete, submit, window, cx);
+        self.set_prompt_complete_whole_input();
+    }
+
+    fn prompt_agent2_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|this: &Workspace, input: &str, _: &App| {
+            this.hosts
+                .iter()
+                .filter(|host| host.name.contains(input))
+                .map(|host| crate::minibuffer::Candidate {
+                    value: host.name.clone(),
+                    description: host.status.label(),
+                })
+                .collect()
+        });
+        let submit = std::rc::Rc::new(
+            |this: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if let Some(host) = this.hosts.by_name(input.trim()).map(|host| host.id) {
+                    this.prompt_agent2_workdir(host, window, cx);
+                } else {
+                    this.notice_on(None, "unknown host", StyleClass::StatusError, cx);
+                }
+            },
+        );
+        self.open_prompt("agent2 host:", complete, submit, window, cx);
+    }
+
+    fn prompt_agent2_workdir(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(move |this: &Workspace, input: &str, _: &App| {
+            this.hosts
+                .workdirs()
+                .into_iter()
+                .filter(|workdir| {
+                    workdir.host == host
+                        && (workdir.name.contains(input) || workdir.path.as_str().contains(input))
+                })
+                .map(|workdir| crate::minibuffer::Candidate {
+                    value: workdir.path.to_string(),
+                    description: workdir.name.clone(),
+                })
+                .collect()
+        });
+        let submit = std::rc::Rc::new(
+            move |this: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                if !input.trim().is_empty() {
+                    this.prompt_agent2_model(host, input.trim().into(), window, cx);
+                }
+            },
+        );
+        self.open_prompt(
+            "agent2 workdir (absolute path):",
+            complete,
+            submit,
+            window,
+            cx,
+        );
+    }
+
+    fn prompt_agent2_model(
+        &mut self,
+        host: HostId,
+        workdir: camino::Utf8PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete = std::rc::Rc::new(|_: &Workspace, input: &str, _: &App| {
+            ["gpt-6-sol"]
+                .into_iter()
+                .filter(|model| model.contains(input))
+                .map(|model| crate::minibuffer::Candidate {
+                    value: model.to_owned(),
+                    description: "default model".to_owned(),
+                })
+                .collect()
+        });
+        let submit = std::rc::Rc::new(
+            move |this: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let model = if input.trim().is_empty() {
+                    "gpt-6-sol"
+                } else {
+                    input.trim()
+                }
+                .to_owned();
+                this.prompt_agent2_effort(host, workdir.clone(), model, window, cx);
+            },
+        );
+        self.open_prompt(
+            "agent2 model (default gpt-6-sol):",
+            complete,
+            submit,
+            window,
+            cx,
+        );
+    }
+
+    fn prompt_agent2_effort(
+        &mut self,
+        host: HostId,
+        workdir: camino::Utf8PathBuf,
+        model: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete = std::rc::Rc::new(|_: &Workspace, input: &str, _: &App| {
+            ["low", "medium", "high", "xhigh"]
+                .into_iter()
+                .filter(|value| value.contains(input))
+                .map(|value| crate::minibuffer::Candidate {
+                    value: value.to_owned(),
+                    description: String::new(),
+                })
+                .collect()
+        });
+        let submit = std::rc::Rc::new(
+            move |this: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let effort = match input.trim() {
+                    "" | "medium" => Agent2Effort::Medium,
+                    "low" => Agent2Effort::Low,
+                    "high" => Agent2Effort::High,
+                    "xhigh" => Agent2Effort::XHigh,
+                    _ => {
+                        this.notice_on(
+                            None,
+                            "effort must be low, medium, high, or xhigh",
+                            StyleClass::StatusError,
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                this.prompt_agent2_initial(
+                    host,
+                    workdir.clone(),
+                    model.clone(),
+                    effort,
+                    window,
+                    cx,
+                );
+            },
+        );
+        self.open_prompt(
+            "agent2 effort (default medium):",
+            complete,
+            submit,
+            window,
+            cx,
+        );
+    }
+
+    fn prompt_agent2_initial(
+        &mut self,
+        host: HostId,
+        workdir: camino::Utf8PathBuf,
+        model: String,
+        effort: Agent2Effort,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &App| Vec::new());
+        let submit = std::rc::Rc::new(
+            move |this: &mut Workspace,
+                  input: String,
+                  _window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let initial_message = (!input.trim().is_empty()).then_some(input);
+                this.call_agent2(
+                    host,
+                    CreateAgent2 {
+                        workdir: workdir.clone(),
+                        model: model.clone(),
+                        effort,
+                        initial_message,
+                    },
+                    cx,
+                    |this, id, window, cx| {
+                        if this.agent2.contains_key(&id) {
+                            this.open_agent2(id, window, cx);
+                        } else {
+                            this.pending_agent2_open = Some(id);
+                        }
+                    },
+                );
+            },
+        );
+        self.open_prompt(
+            "agent2 first message (optional):",
+            complete,
+            submit,
+            window,
+            cx,
+        );
+    }
+
+    fn active_agent2(&self) -> Option<Agent2Id> {
+        match &self.active_surface().key {
+            SurfaceKey::Agent2(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    fn prompt_agent2_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_agent2() else {
+            return self.notice_on(
+                None,
+                "open an agent2 chat first (Space h o)",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        };
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &App| Vec::new());
+        let submit = std::rc::Rc::new(
+            move |this: &mut Workspace,
+                  text: String,
+                  _: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                if text.trim().is_empty() {
+                    return;
+                }
+                if let Some((host, _)) = this.agent2.get(&id) {
+                    this.call_agent2(
+                        *host,
+                        SendMessage2 {
+                            agent_id: id.clone(),
+                            text,
+                        },
+                        cx,
+                        |_, (), _, _| {},
+                    );
+                }
+            },
+        );
+        self.open_prompt("agent2 send:", complete, submit, window, cx);
+    }
+
+    fn cmd_agent2_archive(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active_agent2() else {
+            return self.notice_on(
+                None,
+                "open an agent2 chat first (Space h o)",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        };
+        if let Some((host, info)) = self.agent2.get(&id) {
+            if info.archived {
+                return self.notice_on(
+                    None,
+                    "agent2 chat already archived",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }
+            self.call_agent2(*host, ArchiveAgent2 { agent_id: id }, cx, |_, (), _, _| {});
+        }
+    }
+
     /// The attached agent hosts and how each is doing, as one notice line.
     pub(crate) fn cmd_hosts(&mut self, cx: &mut Context<Self>) {
         let listing = self
@@ -3900,6 +4382,7 @@ impl Workspace {
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::Note(_) => "note".to_owned(),
+            SurfaceKey::Agent2(id) => format!("agent2 {}", id.as_str()),
             SurfaceKey::Transcript(agent_id) => self
                 .registry
                 .agent_name_with_labels(*agent_id, self.registry.agent_display_label(*agent_id)),
@@ -3938,6 +4421,7 @@ impl Workspace {
             SurfaceKey::Usage => "usage",
             SurfaceKey::Note(_) => "note",
             SurfaceKey::Transcript(_) => "transcript",
+            SurfaceKey::Agent2(_) => "agent2 chat",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Terminal { .. } => "terminal",
@@ -4073,6 +4557,9 @@ impl Workspace {
                 host: 0,
                 node_id: node.clone().into(),
             },
+            SurfaceKey::Agent2(id) => SurfaceIdentity::Agent2Chat {
+                agent_id: id.as_str().to_owned(),
+            },
             SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
                 agent_id: agent_id.into(),
             },
@@ -4179,6 +4666,9 @@ impl Workspace {
                 editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
             }
             SurfaceView::Image(_) => 0,
+            SurfaceView::Agent2(view) => view
+                .editor()
+                .update(cx, |editor, cx| editor.scroll_position(cx).y as i64),
         };
         let (surface, rough_position) =
             (Self::journal_surface(&pane.current().surface.key), position);
@@ -4849,6 +5339,7 @@ impl Workspace {
             SurfaceView::Messages(editor) => editor.clone(),
             SurfaceView::Usage(view) => view.read(cx).editor().clone(),
             SurfaceView::Note(editor) => editor.clone(),
+            SurfaceView::Agent2(view) => view.composer_editor().clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
@@ -4901,6 +5392,7 @@ impl Workspace {
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
             SurfaceView::Usage(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Note(editor) => editor.focus_handle(cx),
+            SurfaceView::Agent2(view) => view.composer_editor().focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
@@ -4926,7 +5418,8 @@ impl Workspace {
             | SurfaceKey::Home
             | SurfaceKey::Messages
             | SurfaceKey::Usage
-            | SurfaceKey::Note(_) => None,
+            | SurfaceKey::Note(_)
+            | SurfaceKey::Agent2(_) => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackInventory(_)
@@ -4969,6 +5462,10 @@ impl Workspace {
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
             SurfaceKey::Usage => SurfaceView::Usage(self.usage.view(window, cx)),
+            SurfaceKey::Agent2(id) => {
+                let info = &self.agent2.get(id).expect("opened agent2 is known").1;
+                SurfaceView::Agent2(crate::agent2::ChatView::new(info, window, cx))
+            }
             SurfaceKey::Note(node) => {
                 let node = node.clone();
                 SurfaceView::Note(self.note_view_for(&node, window, cx).editor().clone())
@@ -5052,7 +5549,8 @@ impl Workspace {
             | SurfaceKey::Note(_)
             | SurfaceKey::Messages
             | SurfaceKey::Usage
-            | SurfaceKey::File { .. } => None,
+            | SurfaceKey::File { .. }
+            | SurfaceKey::Agent2(_) => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackInventory(_)
@@ -5627,6 +6125,10 @@ impl Workspace {
             Command::SlackSaveForLater => self.slack_save_for_later(window, cx),
             Command::SlackRegister => self.prompt_slack_register(window, cx),
             Command::HostsList => self.cmd_hosts(cx),
+            Command::Agent2Create => self.prompt_agent2_create(window, cx),
+            Command::Agent2Open => self.prompt_agent2_open(window, cx),
+            Command::Agent2Send => self.prompt_agent2_send(window, cx),
+            Command::Agent2Archive => self.cmd_agent2_archive(cx),
             Command::HostAttach => self.prompt_host_attach(window, cx),
             Command::HostDetach => self.prompt_host_detach(window, cx),
             Command::HostAuth => self.open_host_auth_transient(window, cx),
@@ -7247,12 +7749,12 @@ impl Workspace {
                     .h_full()
                     .relative()
                     .overflow_hidden()
-                    .child(self.render_surface(self.active_surface())),
+                    .child(self.render_surface(self.active_surface(), cx)),
             )
             .into_any_element()
     }
 
-    fn render_surface(&self, surface: &Surface) -> gpui::AnyElement {
+    fn render_surface(&self, surface: &Surface, cx: &Context<Self>) -> gpui::AnyElement {
         match &surface.view {
             SurfaceView::Draft { editor, .. } => div()
                 .id("rho-surface-draft")
@@ -7278,6 +7780,36 @@ impl Workspace {
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())
+                .into_any_element(),
+            SurfaceView::Agent2(view) => div()
+                .id("rho-surface-agent2")
+                .key_context("RhoAgent2")
+                .flex()
+                .flex_col()
+                .size_full()
+                .overflow_hidden()
+                .child(div().flex_1().min_h_0().child(view.editor().clone()))
+                .child(
+                    div()
+                        .h(px(120.))
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(
+                            div()
+                                .px_2()
+                                .text_color(cx.theme().colors().text_muted)
+                                .child("you · type a message"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(view.composer_editor().clone()),
+                        ),
+                )
                 .into_any_element(),
             SurfaceView::Note(editor) => div()
                 .id("rho-surface-note")
@@ -8061,5 +8593,95 @@ mod tests {
         ] {
             assert_eq!(agent_role_label(role), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod agent2_chat_tests {
+    use gpui::{TestAppContext, WindowHandle};
+    use rho_agent_types::UnixMs;
+    use rho_agents2_client::protocol::{ChatEvent, ChatKind, MessageId, Party};
+
+    use super::*;
+
+    #[gpui::test]
+    fn stream_refreshes_chat_without_erasing_composition_or_replaying_events(
+        cx: &mut TestAppContext,
+    ) {
+        let workspace: WindowHandle<Workspace> = crate::tests::test_workspace(cx);
+        let id = Agent2Id::new("eng-stream").unwrap();
+        let info = Agent2Info {
+            id: id.clone(),
+            workdir: "/src/work".into(),
+            model: "gpt-6-sol".into(),
+            effort: Agent2Effort::Medium,
+            archived: false,
+            status: None,
+            chat: vec![],
+        };
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId(0),
+                        frame: Agent2Frame::Snapshot { agents: vec![info] },
+                    },
+                    window,
+                    cx,
+                );
+                workspace.open_agent2(id.clone(), window, cx);
+                let SurfaceView::Agent2(view) = &workspace.active_surface().view else {
+                    panic!("not a chat")
+                };
+                view.composer_editor().update(cx, |editor, cx| {
+                    editor.set_text("unsent draft", window, cx);
+                });
+            })
+            .unwrap();
+        let reply = ChatEvent {
+            seq: 7,
+            at: UnixMs(17),
+            kind: ChatKind::Message {
+                id: MessageId(8),
+                from: Party::Agent(id.clone()),
+                to: Party::Human,
+                text: "answer".into(),
+            },
+        };
+        workspace
+            .update(cx, |workspace, window, cx| {
+                for _ in 0..2 {
+                    workspace.handle_agent2_event(
+                        Agents2Event {
+                            host: HostId(0),
+                            frame: Agent2Frame::Chat {
+                                agent_id: id.clone(),
+                                event: reply.clone(),
+                            },
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                workspace.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId(0),
+                        frame: Agent2Frame::Archived {
+                            agent_id: id.clone(),
+                            archived: true,
+                        },
+                    },
+                    window,
+                    cx,
+                );
+                let SurfaceView::Agent2(view) = &workspace.active_surface().view else {
+                    panic!("not a chat")
+                };
+                let text = view.editor().update(cx, |editor, cx| editor.text(cx));
+                assert_eq!(text.matches("agent → you:\n  answer").count(), 1);
+                assert!(text.contains("archived"));
+                assert_eq!(view.composition(cx), "unsent draft");
+            })
+            .unwrap();
     }
 }

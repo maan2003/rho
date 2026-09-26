@@ -1,5 +1,6 @@
 //! The Rho GPUI client views and native application integration.
 
+pub(crate) mod agent2;
 pub(crate) mod attention;
 pub(crate) mod browser;
 pub(crate) mod chime;
@@ -233,6 +234,16 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             "ctrl-u",
             DraftFieldClear,
             Some("RhoDraft > Editor && !showing_completions"),
+        ),
+        KeyBinding::new(
+            "enter",
+            SubmitPrompt,
+            Some("RhoAgent2 > Editor && vim_mode == insert && !showing_completions"),
+        ),
+        KeyBinding::new(
+            "shift-enter",
+            editor::actions::Newline,
+            Some("RhoAgent2 > Editor && vim_mode == insert && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
         // Preserve Vim's normal-mode Ctrl-V (visual block). Clipboard paste

@@ -62,6 +62,7 @@ rho-agent-types.workspace = true
 rho-db = { workspace = true }
 rho-files = { workspace = true, features = ["client"] }
 rho-agents-client = { workspace = true, features = ["client"] }
+rho-agents2-client = { workspace = true, features = ["client"] }
 rho-agents-view = { workspace = true }
 rho-agent-hosts = { workspace = true, features = ["client"] }
 rho-window = { workspace = true }

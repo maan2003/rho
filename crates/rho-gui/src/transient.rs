@@ -110,6 +110,10 @@ pub(crate) enum Command {
     SlackMessageForward(rho_slack::types::Ts),
     // Hosts.
     HostsList,
+    Agent2Create,
+    Agent2Open,
+    Agent2Send,
+    Agent2Archive,
     HostAttach,
     HostDetach,
     HostAuth,
@@ -511,6 +515,26 @@ pub(crate) fn slack_menu() -> Menu {
 pub(crate) fn hosts_menu() -> Menu {
     Menu::new("hosts")
         .item("l", "list", MenuAction::Command(Command::HostsList))
+        .item(
+            "c",
+            "new agent2 chat…",
+            MenuAction::Command(Command::Agent2Create),
+        )
+        .item(
+            "o",
+            "open agent2 chat…",
+            MenuAction::Command(Command::Agent2Open),
+        )
+        .item(
+            "s",
+            "send to agent2…",
+            MenuAction::Command(Command::Agent2Send),
+        )
+        .item(
+            "x",
+            "archive agent2",
+            MenuAction::Command(Command::Agent2Archive),
+        )
         .item("a", "attach…", MenuAction::Command(Command::HostAttach))
         .item("d", "detach…", MenuAction::Command(Command::HostDetach))
         .item("u", "auth…", MenuAction::Command(Command::HostAuth))

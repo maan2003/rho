@@ -780,7 +780,7 @@ impl Workspace {
                         .child(breadcrumb),
                 )
                 .child(div().flex_none().ml_2().whitespace_nowrap().child(label));
-            let body = self.render_surface(&self.active_surface().clone());
+            let body = self.render_surface(&self.active_surface().clone(), cx);
             let card = div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.feed_focus)
@@ -877,7 +877,7 @@ impl Workspace {
                         .w_full()
                         .overflow_hidden()
                         .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
-                        .child(self.render_surface(&surface)),
+                        .child(self.render_surface(&surface, cx)),
                 )
                 .child(self.render_phone_bar(cx))
                 .into_any_element()
