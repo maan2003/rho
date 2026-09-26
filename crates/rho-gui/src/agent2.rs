@@ -82,7 +82,7 @@ impl ChatView {
 fn chat_text(info: &AgentInfo) -> String {
     let mut text = format!(
         "agent2 {}\n{} · {} · {:?}{}\n",
-        info.id.as_str(),
+        info.id.encoded(),
         info.workdir,
         info.model,
         info.effort,
@@ -125,14 +125,14 @@ fn party_label(party: &Party) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use rho_agent_types::UnixMs;
+    use rho_agent_types::{AgentIdDomain, UnixMs};
     use rho_agents2_client::protocol::{AgentId, ChatEvent, Effort, MessageId};
 
     use super::*;
 
     #[test]
     fn chat_keeps_direction_multiline_text_and_archived_status() {
-        let id = AgentId::new("eng-case").unwrap();
+        let id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let info = AgentInfo {
             id: id.clone(),
             workdir: "/src/project".into(),

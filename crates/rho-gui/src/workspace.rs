@@ -3398,10 +3398,10 @@ impl Workspace {
                 .agent2
                 .iter()
                 .filter(|(id, (_, info))| {
-                    id.as_str().contains(input) || info.workdir.as_str().contains(input)
+                    id.encoded().contains(input) || info.workdir.as_str().contains(input)
                 })
                 .map(|(id, (host, info))| crate::minibuffer::Candidate {
-                    value: id.as_str().to_owned(),
+                    value: id.encoded(),
                     description: format!(
                         "{} · {} · {}{}",
                         workspace.hosts.host_label(*host),
@@ -3419,11 +3419,9 @@ impl Workspace {
              input: String,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
-                if let Some(id) = this
-                    .agent2
-                    .keys()
-                    .find(|id| id.as_str() == input.trim())
-                    .cloned()
+                if let Some(id) = Agent2Id::from_encoded(input.trim())
+                    .ok()
+                    .filter(|id| this.agent2.contains_key(id))
                 {
                     this.open_agent2(id, window, cx);
                 } else {
@@ -4382,7 +4380,7 @@ impl Workspace {
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::Note(_) => "note".to_owned(),
-            SurfaceKey::Agent2(id) => format!("agent2 {}", id.as_str()),
+            SurfaceKey::Agent2(id) => format!("agent2 {}", id.encoded()),
             SurfaceKey::Transcript(agent_id) => self
                 .registry
                 .agent_name_with_labels(*agent_id, self.registry.agent_display_label(*agent_id)),
@@ -4558,7 +4556,7 @@ impl Workspace {
                 node_id: node.clone().into(),
             },
             SurfaceKey::Agent2(id) => SurfaceIdentity::Agent2Chat {
-                agent_id: id.as_str().to_owned(),
+                agent_id: id.encoded(),
             },
             SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
                 agent_id: agent_id.into(),
@@ -8609,7 +8607,7 @@ mod agent2_chat_tests {
         cx: &mut TestAppContext,
     ) {
         let workspace: WindowHandle<Workspace> = crate::tests::test_workspace(cx);
-        let id = Agent2Id::new("eng-stream").unwrap();
+        let id = Agent2Id::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let info = Agent2Info {
             id: id.clone(),
             workdir: "/src/work".into(),
