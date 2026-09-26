@@ -16,7 +16,7 @@ use tokio::sync::Notify;
 
 use crate::Image;
 use crate::runtime::{Build, Inbox, Input, Message};
-use crate::source::{Kind, Source, SourceFacts, State, StreamProgress};
+use crate::source::{Kind, SessionId, Source, SourceFacts, SourceId, State, StreamProgress};
 
 /// How much of one cell's own output a report carries.
 const CELL_TOKENS: usize = 10000;
@@ -38,10 +38,10 @@ pub(crate) struct Shared {
     tasks: Mutex<HostTasks>,
     /// Cells, commands and calls: one ID space, one table.
     pub(crate) next_id: AtomicU64,
-    pub(crate) sources: Mutex<BTreeMap<u64, Arc<Source>>>,
+    pub(crate) sources: Mutex<BTreeMap<SourceId, Arc<Source>>>,
     pub(crate) retention: Mutex<()>,
     /// Cell ids in the order they started, to tell old sources from new.
-    cells: Mutex<Vec<u64>>,
+    cells: Mutex<Vec<SourceId>>,
     checkin: Mutex<(std::time::Duration, bool)>,
     pub(crate) shell: ShellTools,
     /// Woken on any change. `notify_one` stores a permit, so a change that
@@ -106,7 +106,7 @@ impl Notebook {
 
     fn start(&self, code: Option<String>) -> CellHandle {
         let shared = &self.shared;
-        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = shared.next_source();
         let cell = Arc::new(Source::new(
             id,
             Kind::Cell,
@@ -172,11 +172,11 @@ impl Notebook {
         let mut images = Vec::new();
         for source in sources
             .values()
-            .filter(|s| s.id == cells.last().copied().unwrap_or(0))
+            .filter(|s| s.id == cells.last().copied().unwrap_or(SourceId(0)))
             .chain(
                 sources
                     .values()
-                    .filter(|s| s.id != cells.last().copied().unwrap_or(0)),
+                    .filter(|s| s.id != cells.last().copied().unwrap_or(SourceId(0))),
             )
         {
             // Named when two or more cells have started since its own.
@@ -261,8 +261,8 @@ pub struct CellHandle {
 }
 
 impl CellHandle {
-    pub fn session_id(&self) -> u32 {
-        crate::source::session_id(self.cell.id)
+    pub fn session_id(&self) -> SessionId {
+        self.cell.id.session()
     }
 
     pub fn facts(&self) -> SourceFacts {
@@ -314,9 +314,13 @@ impl CellHandle {
 }
 
 impl Shared {
+    pub(crate) fn next_source(&self) -> SourceId {
+        SourceId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Keep at most 50 MB across live retained command logs, dropping oldest
     /// first.
-    pub(crate) fn retain_space(&self, current: u64, incoming: usize) {
+    pub(crate) fn retain_space(&self, current: SourceId, incoming: usize) {
         let _guard = self.retention.lock().unwrap();
         let sources = self.sources.lock().unwrap();
         let mut total: usize = sources
@@ -455,7 +459,7 @@ impl std::ops::DerefMut for Woken<'_> {
 impl Cell {
     #[getter]
     fn id(&self) -> u64 {
-        self.source.id
+        self.source.id.0
     }
 
     fn pending_failure(&self) {
@@ -592,7 +596,7 @@ where
     let future = crate::runtime::future(py, &shared)?;
     let reply = future.clone_ref(py);
     let inbox = Arc::clone(&shared.inbox);
-    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    let id = shared.next_source();
     let source = Arc::new(Source::new(
         id,
         Kind::Call,

@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use crate::{Call, Carry, Inner, Request, Step, Stream, Usage};
+use crate::{Call, CallId, Carry, Inner, Request, Step, Stream, Usage};
 
 enum Scripting {
     Call(String),
@@ -81,7 +81,7 @@ impl Scripted {
             let mut n = self.calls.lock().unwrap();
             *n += 1;
             Call {
-                id: format!("call_{n}"),
+                id: CallId::new(format!("call_{n}")),
                 code,
             }
         });

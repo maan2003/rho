@@ -24,8 +24,59 @@ pub const EXEC: &str = "exec";
 pub struct Request {
     pub instructions: Arc<str>,
     pub items: Vec<Item>,
-    /// Stable per agent, so the provider can reuse its cache across steps.
-    pub cache_key: uuid::Uuid,
+    pub cache_key: CacheKey,
+}
+
+/// Stable per agent, so the provider can reuse its cache across steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct CacheKey(u128);
+
+impl CacheKey {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().as_u128())
+    }
+
+    fn uuid(self) -> uuid::Uuid {
+        uuid::Uuid::from_u128(self.0)
+    }
+}
+
+impl Default for CacheKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for CacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.uuid().fmt(f)
+    }
+}
+
+/// The provider's id for one `exec` call; a result names the call it answers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct CallId(String);
+
+impl CallId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CallId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for CallId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -34,7 +85,7 @@ pub enum Item {
     Step(Carry),
     /// What an earlier step's `exec` call produced.
     Result {
-        call_id: String,
+        call_id: CallId,
         text: String,
         images: Vec<Image>,
     },
@@ -62,7 +113,7 @@ pub struct Step {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Call {
-    pub id: String,
+    pub id: CallId,
     pub code: String,
 }
 
@@ -90,7 +141,7 @@ enum Inner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stream<'a> {
     /// The call has begun.
-    Call { id: &'a str },
+    Call { id: &'a CallId },
     /// More of its code.
     Code(&'a str),
 }

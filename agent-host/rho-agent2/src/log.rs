@@ -6,7 +6,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
 use rho_agent_types::UnixMs;
-use rho_inference2::{Call, Carry, Image, Usage};
+use rho_inference2::{CacheKey, Call, Carry, Image, Usage};
 use senax_encoder::{Decode, Encode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
@@ -24,11 +24,43 @@ impl Default for MessageId {
     }
 }
 
+/// An agent, as other agents name it. Never empty.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct AgentId(String);
+
+impl AgentId {
+    pub fn new(id: impl Into<String>) -> Result<Self, String> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err("an agent id cannot be empty".into());
+        }
+        Ok(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for AgentId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        Self::new(s)
+    }
+}
+
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Who a message is from or to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
 pub enum Party {
     Human,
-    Agent(String),
+    Agent(AgentId),
 }
 
 /// Part of a message body. Text is kept as written; structure lives around
@@ -74,7 +106,7 @@ pub enum Entry {
     /// The first entry.
     Created {
         at: UnixMs,
-        cache_key: u128,
+        cache_key: CacheKey,
     },
     /// One model response, and the cell it started.
     Step {
@@ -219,7 +251,7 @@ mod tests {
         let mut log = Log::open(&path).unwrap();
         log.append(Entry::Created {
             at: UnixMs(1),
-            cache_key: 7,
+            cache_key: CacheKey::new(),
         })
         .unwrap();
         log.append(Entry::Status {

@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use rho_agent2::chat::{ChatEvent, ChatKind};
-use rho_agent2::log::{Block, Log, Party};
+use rho_agent2::log::{AgentId, Block, Log, Party};
 use rho_agent2::{Agent, Config, Inbound, Trace};
 use rho_inference2::Model;
-use rho_inference2::openai::{CHATGPT_BASE_URL, OpenAi};
+use rho_inference2::openai::{CHATGPT_BASE_URL, Effort, OpenAi};
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Parser)]
@@ -28,11 +28,11 @@ struct Args {
     workdir: PathBuf,
     /// The agent's id, as other agents name it.
     #[arg(long, default_value = "agent")]
-    id: String,
+    id: AgentId,
     #[arg(long, default_value = "gpt-6-sol")]
     model: String,
     #[arg(long, default_value = "medium")]
-    effort: String,
+    effort: Effort,
     /// The OAuth credentials file in rho's auth directory.
     #[arg(long, default_value = "default")]
     auth: String,
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     running.await?
 }
 
-fn print_event(me: &str, event: &ChatEvent) {
+fn print_event(me: &AgentId, event: &ChatEvent) {
     match &event.kind {
         ChatKind::Message { from, to, body, .. } => {
             let text = body

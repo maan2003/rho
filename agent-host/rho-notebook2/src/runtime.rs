@@ -14,7 +14,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::notebook::{Cell, Export, Shared};
-use crate::source::{Kind, Source};
+use crate::source::{Kind, Source, SourceId};
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -28,21 +28,21 @@ pub(crate) enum Input {
         cell: Arc<Source>,
     },
     Feed {
-        cell: u64,
+        cell: SourceId,
         code: String,
         eof: bool,
     },
     /// Run the unit that ends at this byte.
     Permit {
-        cell: u64,
+        cell: SourceId,
         end: usize,
     },
     /// Admit no more code.
     Stop {
-        cell: u64,
+        cell: SourceId,
     },
     Cancel {
-        cell: u64,
+        cell: SourceId,
     },
     Shutdown,
 }
@@ -259,8 +259,16 @@ impl Driver {
     /// Inputs posted since the last drain, in order, as tuples. Finished
     /// host work resolves its futures here.
     fn new_task(&self, parent: u64, name: String) -> Cell {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let source = Arc::new(Source::new(id, Kind::Task, name, parent, 10000, None, None));
+        let id = self.shared.next_source();
+        let source = Arc::new(Source::new(
+            id,
+            Kind::Task,
+            name,
+            SourceId(parent),
+            10000,
+            None,
+            None,
+        ));
         self.shared
             .sources
             .lock()
@@ -283,10 +291,12 @@ impl Driver {
                     Input::Begin { cell } => {
                         ("begin", Cell::new(Arc::clone(&self.shared), cell)).into_py_any(py)?
                     }
-                    Input::Feed { cell, code, eof } => ("feed", cell, code, eof).into_py_any(py)?,
-                    Input::Permit { cell, end } => ("permit", cell, end).into_py_any(py)?,
-                    Input::Stop { cell } => ("stop", cell).into_py_any(py)?,
-                    Input::Cancel { cell } => ("cancel", cell).into_py_any(py)?,
+                    Input::Feed { cell, code, eof } => {
+                        ("feed", cell.0, code, eof).into_py_any(py)?
+                    }
+                    Input::Permit { cell, end } => ("permit", cell.0, end).into_py_any(py)?,
+                    Input::Stop { cell } => ("stop", cell.0).into_py_any(py)?,
+                    Input::Cancel { cell } => ("cancel", cell.0).into_py_any(py)?,
                     Input::Shutdown => ("shutdown",).into_py_any(py)?,
                 }),
             }

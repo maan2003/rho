@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rho_inference2::{Item, Request};
+use rho_inference2::{CacheKey, Item, Request};
 
 use crate::log::{Block, Entry, MessageId, Party};
 
-pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: u128) -> Request {
+pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: CacheKey) -> Request {
     let mut texts: HashMap<MessageId, String> = HashMap::new();
     let mut messages: HashMap<MessageId, (Party, Vec<Block>)> = HashMap::new();
     for entry in entries {
@@ -76,7 +76,7 @@ pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: u128) -> Re
     Request {
         instructions,
         items,
-        cache_key: uuid::Uuid::from_u128(cache_key),
+        cache_key,
     }
 }
 

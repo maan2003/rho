@@ -3,7 +3,7 @@
 
 use rho_agent_types::UnixMs;
 
-use crate::log::{Block, Entry, MessageId, Party};
+use crate::log::{AgentId, Block, Entry, MessageId, Party};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatEvent {
@@ -27,17 +27,17 @@ pub enum ChatKind {
 
 /// The chat event an entry makes, if any. `me` is the agent's own id, the
 /// other end of a received message.
-pub fn project(me: &str, seq: u64, entry: &Entry) -> Option<ChatEvent> {
+pub fn project(me: &AgentId, seq: u64, entry: &Entry) -> Option<ChatEvent> {
     let kind = match entry {
         Entry::Received { id, from, body, .. } => ChatKind::Message {
             id: *id,
             from: from.clone(),
-            to: Party::Agent(me.to_owned()),
+            to: Party::Agent(me.clone()),
             body: body.clone(),
         },
         Entry::Sent { id, to, text, .. } => ChatKind::Message {
             id: *id,
-            from: Party::Agent(me.to_owned()),
+            from: Party::Agent(me.clone()),
             to: to.clone(),
             body: vec![Block::Text(text.clone())],
         },
@@ -53,7 +53,7 @@ pub fn project(me: &str, seq: u64, entry: &Entry) -> Option<ChatEvent> {
 }
 
 /// The whole chat, from the start of a log.
-pub fn chat(me: &str, entries: &[Entry]) -> Vec<ChatEvent> {
+pub fn chat(me: &AgentId, entries: &[Entry]) -> Vec<ChatEvent> {
     entries
         .iter()
         .enumerate()

@@ -15,7 +15,7 @@ use pyo3::types::PyModule;
 use rho_notebook2::Export;
 use tokio::sync::mpsc;
 
-use crate::log::Party;
+use crate::log::{AgentId, Party};
 
 /// What the notebook hands the agent loop.
 #[derive(Debug, PartialEq, Eq)]
@@ -114,8 +114,7 @@ impl Bridge {
         }
         let to = match to {
             None => Party::Human,
-            Some(id) if !id.trim().is_empty() => Party::Agent(id),
-            Some(_) => return Err(PyValueError::new_err("agent_id is empty")),
+            Some(id) => Party::Agent(AgentId::new(id).map_err(PyValueError::new_err)?),
         };
         let _ = self.0.outbox.send(Outbound::Send { to, text });
         Ok(())

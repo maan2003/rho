@@ -12,7 +12,7 @@ mod source;
 mod tests;
 
 pub use notebook::{CellHandle, Export, Notebook, Report, ToolCx, operation};
-pub use source::{End, Kind, SourceFacts, StreamProgress};
+pub use source::{End, Kind, SessionId, SourceFacts, StreamProgress};
 
 /// An image a report shows.
 #[derive(Clone, Debug, PartialEq, Eq)]

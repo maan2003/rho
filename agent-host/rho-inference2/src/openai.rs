@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::{Call, Carry, EXEC, Image, Inner, Item, Request, Step, Stream, Usage};
+use crate::{Call, CallId, Carry, EXEC, Image, Inner, Item, Request, Step, Stream, Usage};
 
 pub const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_BETA: &str = "responses_websockets=2026-02-06";
@@ -24,11 +24,53 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct OpenAi {
     pub base_url: String,
     pub model: String,
-    /// `low`, `medium`, `high` or `xhigh`.
-    pub effort: String,
+    pub effort: Effort,
     /// The OAuth credentials file in rho's auth directory, read each step so
     /// a refresh between steps is picked up.
     pub auth: String,
+}
+
+/// How hard the model reasons before it answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    #[default]
+    Medium,
+    High,
+    XHigh,
+}
+
+impl Effort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::XHigh => "xhigh",
+        }
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            "xhigh" => Ok(Effort::XHigh),
+            _ => Err(format!(
+                "unknown effort {s:?}: use low, medium, high or xhigh"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Effort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl OpenAi {
@@ -94,7 +136,7 @@ impl OpenAi {
                     let item = &event["item"];
                     streaming = Some(item["id"].as_str().unwrap_or_default().to_owned());
                     stream(Stream::Call {
-                        id: item["call_id"].as_str().unwrap_or_default(),
+                        id: &CallId::new(item["call_id"].as_str().unwrap_or_default()),
                     });
                 }
                 "response.custom_tool_call_input.delta"
@@ -155,7 +197,7 @@ impl OpenAi {
                     images,
                 } => input.push(json!({
                     "type": "custom_tool_call_output",
-                    "call_id": call_id,
+                    "call_id": call_id.as_str(),
                     "output": content(text, images, true),
                 })),
                 Item::User { text, images } => input.push(json!({
@@ -173,10 +215,10 @@ impl OpenAi {
             "store": false,
             "parallel_tool_calls": false,
             "text": { "verbosity": "low" },
-            "reasoning": { "context": "all_turns", "effort": self.effort, "summary": "auto" },
+            "reasoning": { "context": "all_turns", "effort": self.effort.as_str(), "summary": "auto" },
             "service_tier": "default",
             "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": request.cache_key,
+            "prompt_cache_key": request.cache_key.to_string(),
             "client_metadata": {
                 "ws_request_header_x_openai_internal_codex_responses_lite": "true",
             },
@@ -192,7 +234,7 @@ fn call_item(call: &Call) -> Value {
     json!({
         "type": "custom_tool_call",
         "id": format!("ctc_{}", call.id),
-        "call_id": call.id,
+        "call_id": call.id.as_str(),
         "name": EXEC,
         "input": call.code,
     })
@@ -240,13 +282,13 @@ fn step(items: Vec<Value>, usage: &Value) -> Step {
                     .unwrap_or_default()
                     .to_owned();
                 let this = Call {
-                    id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                    id: CallId::new(item["call_id"].as_str().unwrap_or_default()),
                     code,
                 };
                 let replay = json!({
                     "type": "custom_tool_call",
                     "id": item["id"],
-                    "call_id": this.id,
+                    "call_id": this.id.as_str(),
                     "name": EXEC,
                     "input": this.code,
                 });
@@ -299,7 +341,7 @@ mod tests {
         let model = OpenAi {
             base_url: CHATGPT_BASE_URL.into(),
             model: "gpt-6-sol".into(),
-            effort: "low".into(),
+            effort: Effort::Low,
             auth: "default".into(),
         };
         let request = Request {
@@ -308,7 +350,7 @@ mod tests {
                 text: "Print the first five squares, one statement per line.".into(),
                 images: Vec::new(),
             }],
-            cache_key: uuid::Uuid::new_v4(),
+            cache_key: crate::CacheKey::new(),
         };
         let mut pieces = Vec::new();
         let step = model
@@ -338,7 +380,7 @@ mod tests {
         assert_eq!(
             step.call,
             Some(Call {
-                id: "c1".into(),
+                id: CallId::new("c1"),
                 code: "print(1)".into()
             })
         );

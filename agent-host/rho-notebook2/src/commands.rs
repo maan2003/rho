@@ -13,7 +13,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::notebook::{Shared, current, register};
 use crate::runtime::{Build, Inbox, Message, Reply, resolved};
-use crate::source::{CommandExit, Kind, Log, Process, Source};
+use crate::source::{CommandExit, Kind, Log, Process, Source, SourceId};
 
 const LOG_LIMIT: usize = 4 * 1024 * 1024;
 const OUTPUT_TOKEN_LIMIT: usize = 10000;
@@ -38,7 +38,7 @@ fn new_job(
     budget: usize,
 ) -> Result<Arc<Source>, String> {
     let mut jobs = shared.sources.lock().unwrap();
-    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    let id = shared.next_source();
     let (writes, queued) = tokio::sync::mpsc::unbounded_channel();
     let job = Arc::new(Source::new(
         id,
@@ -74,7 +74,7 @@ fn new_job(
     Ok(job)
 }
 
-fn job(shared: &Shared, id: u64) -> PyResult<Arc<Source>> {
+fn job(shared: &Shared, id: SourceId) -> PyResult<Arc<Source>> {
     shared
         .sources
         .lock()
@@ -87,7 +87,7 @@ fn job(shared: &Shared, id: u64) -> PyResult<Arc<Source>> {
 
 /// The command a handle names, touched by the running cell: the model is
 /// watching it again.
-fn touch(py: Python<'_>, id: u64) -> PyResult<(Arc<Shared>, Arc<Source>)> {
+fn touch(py: Python<'_>, id: SourceId) -> PyResult<(Arc<Shared>, Arc<Source>)> {
     let (shared, _) = current(py, "Commands are available")?;
     let job = job(&shared, id)?;
     Ok((shared, job))
@@ -187,9 +187,9 @@ pub(crate) fn command(
 }
 
 /// How a command ended, as awaiting its handle returns it.
-fn exit_reply(id: u64, result: Result<CommandExit, String>) -> Reply {
+fn exit_reply(id: SourceId, result: Result<CommandExit, String>) -> Reply {
     Ok(result.unwrap_or(CommandExit {
-        id: u64::from(crate::source::session_id(id)),
+        id: id.session(),
         exit_code: None,
     }))
     .map(|exit| {
@@ -248,7 +248,7 @@ impl StdinWrite {
 /// A managed command. Awaiting it waits for the command to end.
 #[pyclass(frozen, module = "__main__")]
 pub(crate) struct Command {
-    id: u64,
+    id: SourceId,
     /// Resolves when the command ends.
     result: Mutex<Option<Py<PyAny>>>,
 }
@@ -257,7 +257,7 @@ pub(crate) struct Command {
 impl Command {
     #[getter]
     fn id(&self) -> u32 {
-        crate::source::session_id(self.id)
+        self.id.session().get()
     }
 
     /// The live command a report's session ID refers to.
@@ -268,10 +268,10 @@ impl Command {
     #[staticmethod]
     fn from_session_id(py: Python<'_>, session_id: u64) -> PyResult<Self> {
         let (shared, _) = current(py, "Commands are available")?;
-        let found: Vec<u64> = (shared.sources.lock().unwrap().values())
+        let found: Vec<SourceId> = (shared.sources.lock().unwrap().values())
             .filter(|source| source.process.is_some())
             .map(|source| source.id)
-            .filter(|id| u64::from(crate::source::session_id(*id)) == session_id)
+            .filter(|id| u64::from(id.session().get()) == session_id)
             .collect();
         match found.as_slice() {
             [id] => Ok(Self {
@@ -345,7 +345,7 @@ impl Command {
     }
 
     fn __repr__(&self) -> String {
-        format!("<command {}>", crate::source::session_id(self.id))
+        format!("<command {}>", self.id.session())
     }
 }
 
@@ -419,7 +419,7 @@ pub(crate) async fn run_command(
             wake.notify_one();
         }
         Ok(CommandExit {
-            id: u64::from(crate::source::session_id(job.id)),
+            id: job.id.session(),
             exit_code,
         })
     };

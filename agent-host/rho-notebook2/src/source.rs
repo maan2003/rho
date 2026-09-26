@@ -17,16 +17,41 @@ use tokio::sync::{Notify, mpsc, watch};
 use crate::Image;
 use crate::commands::StdinWrite;
 
-/// The label a source is reported under. Scrambled so the model does not
-/// read consecutive IDs as a count; labels repeat every 9,000 sources.
-pub(crate) fn session_id(internal_id: u64) -> u32 {
-    let x = internal_id % 9_000;
-    let (mut left, mut right) = (x / 100, x % 100);
-    left = (left + right * right + 17 * right + 43) % 90;
-    right = (right + left * left + 29 * left + 71) % 100;
-    left = (left + right * right + 53 * right + 19) % 90;
-    right = (right + left * left + 11 * left + 37) % 100;
-    (1_000 + 100 * left + right) as u32
+/// A source's place in the notebook's one table: cells, tasks, commands
+/// and calls share the space, in the order they started. Never shown to the
+/// model; it sees the [`SessionId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SourceId(pub(crate) u64);
+
+impl SourceId {
+    /// The label this source is reported under. Scrambled so the model does
+    /// not read consecutive IDs as a count; labels repeat every 9,000
+    /// sources.
+    pub(crate) fn session(self) -> SessionId {
+        let x = self.0 % 9_000;
+        let (mut left, mut right) = (x / 100, x % 100);
+        left = (left + right * right + 17 * right + 43) % 90;
+        right = (right + left * left + 29 * left + 71) % 100;
+        left = (left + right * right + 53 * right + 19) % 90;
+        right = (right + left * left + 11 * left + 37) % 100;
+        SessionId((1_000 + 100 * left + right) as u32)
+    }
+}
+
+/// The label a source is reported under, and what the model names it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SessionId(u32);
+
+impl SessionId {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +65,7 @@ pub enum Kind {
 /// How a command ended, as awaiting its handle shows it.
 #[derive(Clone, Debug)]
 pub(crate) struct CommandExit {
-    pub(crate) id: u64,
+    pub(crate) id: SessionId,
     pub(crate) exit_code: Option<i32>,
 }
 
@@ -51,20 +76,20 @@ impl<'py> IntoPyObject<'py> for CommandExit {
 
     fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let exit = PyDict::new(py);
-        exit.set_item("id", self.id)?;
+        exit.set_item("id", self.id.get())?;
         exit.set_item("exit_code", self.exit_code)?;
         Ok(exit)
     }
 }
 
 pub(crate) struct Source {
-    pub(crate) id: u64,
+    pub(crate) id: SourceId,
     pub(crate) kind: Kind,
     /// A command's line, a call's name; a cell's is "Cell".
     pub(crate) name: String,
     /// The cell that started it; a cell's own id for a cell. Cancelling
     /// that cell stops it.
-    pub(crate) cell: u64,
+    pub(crate) cell: SourceId,
     /// Asks it to stop. Stores a permit, so an early request is not lost.
     pub(crate) cancel: Notify,
     pub(crate) process: Option<Process>,
@@ -152,10 +177,10 @@ impl State {
 
 impl Source {
     pub(crate) fn new(
-        id: u64,
+        id: SourceId,
         kind: Kind,
         name: String,
-        cell: u64,
+        cell: SourceId,
         budget: usize,
         process: Option<Process>,
         log: Option<Log>,
@@ -230,7 +255,7 @@ impl Source {
             state.since = None;
             return Some(format!(
                 "Session ID: {}\nOutput:\n{}",
-                session_id(self.id),
+                self.id.session(),
                 take(state)
             ));
         }
@@ -260,7 +285,7 @@ impl Source {
         let mut parts = Vec::new();
         if state.finished.is_some() {
             if state.announced || self.kind != Kind::Cell {
-                parts.push(format!("Session ID: {}", session_id(self.id)));
+                parts.push(format!("Session ID: {}", self.id.session()));
             }
             if old {
                 match self.kind {
@@ -280,7 +305,7 @@ impl Source {
             parts.push(format!(
                 "{} running in background with session ID {}",
                 self.label(),
-                session_id(self.id)
+                self.id.session()
             ));
             if old {
                 match self.kind {
@@ -337,7 +362,7 @@ impl Source {
     /// The pages `more_output` asked for, under the session ID the model
     /// asked by, with the end too if that has not been reported yet.
     fn answer_pages(&self, state: &mut State, old: bool) -> String {
-        let mut parts = vec![format!("Session ID: {}", session_id(self.id))];
+        let mut parts = vec![format!("Session ID: {}", self.id.session())];
         if old {
             parts.push(format!("Command: {}", self.name));
         }
@@ -357,9 +382,9 @@ impl Source {
     pub(crate) fn facts(&self) -> SourceFacts {
         let state = self.state.lock().unwrap();
         SourceFacts {
-            session_id: session_id(self.id),
+            session_id: self.id.session(),
             kind: self.kind,
-            cell: self.cell,
+            owner: self.cell.session(),
             output_since: state.since,
             notified_at: state.notified,
             paged_at: state.paged_at,
@@ -440,10 +465,10 @@ fn page(state: &mut State, max_tokens: usize) -> String {
 /// One source, as its reader sees it. Observations, not verdicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceFacts {
-    pub session_id: u32,
+    pub session_id: SessionId,
     pub kind: Kind,
-    /// The cell that started it.
-    pub cell: u64,
+    /// The task that started it; its own session for a task.
+    pub owner: SessionId,
     pub output_since: Option<UnixMs>,
     /// A cell's oldest unsent `notify()`.
     pub notified_at: Option<UnixMs>,
@@ -466,12 +491,12 @@ pub struct End {
 
 #[cfg(test)]
 mod tests {
-    use super::session_id;
+    use super::SourceId;
 
     #[test]
     fn labels_are_distinct_within_a_cycle_and_in_range() {
         let labels = (0..9_000)
-            .map(session_id)
+            .map(|id| SourceId(id).session().get())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(labels.len(), 9_000);
         assert!(labels.iter().all(|label| (1_000..10_000).contains(label)));

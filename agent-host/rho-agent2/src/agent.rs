@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_agent_types::UnixMs;
-use rho_inference2::{Call, Carry, Image, Model, Stream, Usage};
+use rho_inference2::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
 use rho_notebook2::{CellHandle, Notebook};
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::chat::{self, ChatEvent};
 use crate::human::{Mailroom, Outbound};
-use crate::log::{Block, Entry, Log, MessageId, Notice, Party, Wake};
+use crate::log::{AgentId, Block, Entry, Log, MessageId, Notice, Party, Wake};
 use crate::wake::{self, Decision, Facts};
 
 /// Failed model requests in a row before the agent stops until the human
@@ -69,7 +69,7 @@ impl AgentHandle {
 }
 
 pub struct Agent {
-    id: String,
+    id: AgentId,
     log: Log,
     instructions: Arc<str>,
     model: Arc<Model>,
@@ -97,17 +97,17 @@ pub struct Agent {
     prose: u32,
     restarted: bool,
     stopped: bool,
-    cache_key: u128,
+    cache_key: CacheKey,
 }
 
 /// The call of the step in progress, as its code arrives.
 struct Streaming {
-    id: String,
+    id: CallId,
     code: String,
 }
 
 pub struct Config {
-    pub id: String,
+    pub id: AgentId,
     pub log: Log,
     pub model: Arc<Model>,
     pub shell: rho_tool_shell::ShellTools,
@@ -150,7 +150,7 @@ impl Agent {
             prose: 0,
             restarted: false,
             stopped: false,
-            cache_key: 0,
+            cache_key: CacheKey::new(),
         };
         agent.resume()?;
         let handle_mailroom = Arc::clone(&agent.mailroom);
@@ -203,7 +203,7 @@ impl Agent {
             }
         }
         if self.log.entries().is_empty() {
-            self.cache_key = uuid::Uuid::new_v4().as_u128();
+            self.cache_key = CacheKey::new();
             self.append(Entry::Created {
                 at: UnixMs::now(),
                 cache_key: self.cache_key,
@@ -484,7 +484,7 @@ impl Agent {
             let result = {
                 let mut forward = move |piece: Stream<'_>| {
                     let _ = code_tx.send(match piece {
-                        Stream::Call { id } => (Some(id.to_owned()), String::new()),
+                        Stream::Call { id } => (Some(id.clone()), String::new()),
                         Stream::Code(code) => (None, code.to_owned()),
                     });
                 };
@@ -598,7 +598,7 @@ impl Agent {
 
     /// A piece of the call being written: its start opens a cell, its code
     /// feeds it.
-    fn stream(&mut self, streaming: &mut Option<Streaming>, (id, code): (Option<String>, String)) {
+    fn stream(&mut self, streaming: &mut Option<Streaming>, (id, code): (Option<CallId>, String)) {
         if let Some(id) = id {
             self.cell = Some(self.notebook.stream());
             self.told_returned = false;
