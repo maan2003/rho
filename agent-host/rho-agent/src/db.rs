@@ -21,6 +21,8 @@ use uuid::Uuid;
 use crate::AgentEvent;
 use crate::journal::{Feed, Journal, LogAppended};
 
+mod entries_migration;
+
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
 /// [`PrefixIdDomain::machine_seed`]), generated once at init.
@@ -56,7 +58,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "a7e43d91";
+const CURRENT_AGENT_DB_FORMAT: &str = "9990d22e";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -78,6 +80,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "6bcd407c",
         to: "a7e43d91",
         migrate: rebuild_agent_heads,
+    },
+    AgentDbMigration {
+        from: "a7e43d91",
+        to: "9990d22e",
+        migrate: entries_migration::migrate,
     },
 ];
 

@@ -203,6 +203,21 @@ impl Carry {
         }
     }
 
+    /// The calls this response replays; a result for any other call has
+    /// nothing to answer.
+    pub fn call_ids(&self) -> Vec<CallId> {
+        match &self.0 {
+            Inner::OpenAi { items } => items
+                .iter()
+                .filter_map(|item| serde_json::from_str::<serde_json::Value>(item).ok())
+                .filter(|item| item["type"] == "custom_tool_call")
+                .filter_map(|item| item["call_id"].as_str().map(CallId::new))
+                .collect(),
+            Inner::Scripted { call } => call.iter().map(|call| call.id.clone()).collect(),
+            Inner::ScriptedCompaction => Vec::new(),
+        }
+    }
+
     /// A call that was cut off: all that can be replayed is the code that
     /// ran.
     pub fn bare(call: Call) -> Self {
