@@ -164,23 +164,6 @@ pub(crate) mod testing {
             self.sender.send(self.port, ipc::encode(message)?).await
         }
     }
-    /// A worker host backed by the agent host's real services for `agent`.
-    pub(crate) fn served(
-        db: rho_db::RhoDb,
-        inference: rho_inference::Inference,
-        agent: rho_agent_types::AgentId,
-    ) -> std::sync::Arc<Host> {
-        let services = std::sync::Arc::new(services::Services::new(
-            db,
-            inference,
-            agent,
-            Default::default(),
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        ));
-        let (client, server) = pair();
-        tokio::spawn(services.serve(server.sender, server.port, server.incoming));
-        client.host()
-    }
     pub fn pair() -> (Endpoint, Endpoint) {
         let (left, right) = tokio::net::UnixStream::pair().unwrap();
         fn endpoint(socket: tokio::net::UnixStream) -> Endpoint {

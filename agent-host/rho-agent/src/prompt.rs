@@ -1011,14 +1011,24 @@ pub fn claude_prompt(
 ## Python execution
 
 Rho exposes its tools through mcp__py__exec, with one source string argument. Claude Code's built-in
-tools are disabled in this session. Make one call at a time. It stays open until a reporting boundary:
-output, completion, check-in, or incoming input. It then returns output so far. Cells may
-continue running afterward; later output appears in a subsequent result or message.
+tools are disabled in this session. Make one call at a time. The call returns as soon as its code
+finishes, with everything the notebook has said since you last looked. Tasks it started may keep
+running; their later output arrives in a subsequent result, or as a message once you have ended
+your turn.
 
-The notebook supports top-level await and persistent globals. Host calls start immediately, even
-without assignment or await. Start independent work in one cell; await only when later Python code
-needs completion or a returned value. Output arrives automatically; do not await or reprint it
-merely to show it.
+An open call also returns early: 2 seconds after a user message arrives or notify() is called,
+20 seconds after a task fails without being awaited, and at the check-in, 120 seconds after the
+call by default. Successful tasks finishing on their own do not return it.
+
+The notebook supports top-level await and persistent globals. Each exec is a task;
+asyncio.create_task(coro) creates another with its own session ID and output, which does not hold
+the call open. Commands belong to the task that started them and are awaited implicitly when its
+code succeeds. Host calls start immediately, even without assignment or await. Start independent
+work in one cell; await only when later Python code needs completion or a returned value. Output
+arrives automatically; do not await or reprint it merely to show it.
+
+The handle for a live exec or created task, found by the session ID in its reports.
+Task.from_session_id(session_id: int) → Task
 
 Run a shell command. Returns a persistent handle immediately; output arrives automatically.
 command(cmd: str, *, workdir: str | None = None, max_tokens: int = 2000) → Command
@@ -1082,45 +1092,42 @@ print(*values, sep=' ', end='\n', file=None, flush=False, max_tokens: int = 2000
 Emit meaningful output that can wake the model sooner, unless tool wakeups are disabled.
 notify(value: object, *, max_tokens: int = 2000) → None
 
-A monitoring cell can stay live across reporting boundaries:
+A monitoring task can keep running after the call returns:
 
     progress = {"checks": 0}
-    while not Path("results.json").exists():
-        progress["checks"] += 1
-        await asyncio.sleep(5)
-    notify("Results are ready")
+    async def watch():
+        while not Path("results.json").exists():
+            progress["checks"] += 1
+            await asyncio.sleep(5)
+        notify("Results are ready")
+    asyncio.create_task(watch())
 
 Inspect its globals from a later cell without stopping it:
 
     print(progress)
 
-Set the maximum wait before the model wakes again, even if nothing happens. Tools may wake it
-sooner. The default is 120 seconds; accepted values are 1–3600 seconds.
+Set the check-in: how long an open call may wait with nothing new. The default is 120 seconds.
 set_max_wait(seconds: int) → None
 
-Suppress early wakes from tool output, completion, errors, notify, and exec completion. The timer,
-user messages, and agent mail can still wake the model. Buffered output arrives on the next wake.
+Suppress early returns from task completion and notify, but not user messages or the check-in.
+Buffered output arrives on the next return.
 suppress_tool_wakeups() → None
 
-The controls are independent. A new exec call resets both to their defaults; older cells cannot
-change the newer call's settings. Set them before an await that may suspend the cell.
+A new exec call resets both to their defaults; the latest setting from any task wins.
 
-    command("git diff --check")
     command("cargo test")
     set_max_wait(seconds=300)
 
-To suppress tool-triggered wakes as well, call suppress_tool_wakeups(). Neither function sleeps
-or stops running work. Results report through the MCP call; do not sleep in Python merely to
-wait for reporting.
+Neither function sleeps or stops running work. Results report through the MCP call; do not sleep
+in Python merely to wait for reporting.
 
 The standard library, PyYAML, and HTTPX are available. Python runs in-process, not in a security
 sandbox; cwd is notebook-local, other process-global APIs retain their normal effects, and native
 extensions are unsupported. A runtime restart loses globals and handles; do not automatically
-replay interrupted work. The native Rho transcript API is empty in Claude sessions.
+replay interrupted work.
 
-Output budgets are capped at 10000 tokens. Each command retains its first 8 MiB, with overflow
-counts. Up to 64 command handles and 32 image references are retained; old completed, delivered
-handles may be evicted. Displayed session IDs are reusable labels, not handles.
+Output budgets are capped at 10000 tokens. Each command retains its first 4 MiB. Displayed session
+IDs are reusable labels, not handles.
 
 ## Other Rho functions
 
@@ -1777,7 +1784,7 @@ mod tests {
         }
         for prompt in &claude {
             for example in [
-                "The controls are independent. A new exec call resets both to their defaults",
+                "A new exec call resets both to their defaults",
                 "    write_stdin(job, \"hello\\n\")",
                 "    job.more_output(max_tokens=6000)",
                 "    job.cancel()\n    await job",
@@ -1822,10 +1829,10 @@ mod tests {
             assert!(!prompt.contains("## Rho Team Context"));
             assert!(prompt.contains("mcp__py__exec"));
             assert!(prompt.contains("Make one call at a time"));
-            assert!(prompt.contains("stays open until a reporting boundary"));
+            assert!(prompt.contains("returns as soon as its code\nfinishes"));
             assert!(!prompt.contains("Issue at most one exec call per response"));
             assert!(prompt.starts_with("# Rho integration\n"));
-            assert!(prompt.contains("transcript API is empty in Claude sessions"));
+            assert!(!prompt.contains("transcript"));
             for native_only in [
                 "You are Rho, an autonomous coding agent",
                 "You are the Advisor — an expert",

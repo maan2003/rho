@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rho_agent_types::{AgentRole, TurnEdge, UnixMs};
-use rho_inference::types::ExecId;
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -69,9 +68,7 @@ pub(super) enum Request<'a> {
     Failed(String),
     Settled,
     Head,
-    History {
-        recovery: bool,
-    },
+    History,
     Append(AgentEvent<'a>),
     AppendBatch(Vec<AgentEvent<'static>>),
     Profile {
@@ -106,7 +103,6 @@ pub(super) enum Reply {
     History {
         next: AgentEventPos,
         rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
-        admitted: Vec<ExecId>,
     },
     Position(AgentEventPos),
     ClaudeAccount(String),
@@ -271,17 +267,12 @@ impl Host {
                             if let Some(waiter) = pending.lock().expect("poison").calls.remove(&id)
                             {
                                 let body = match body {
-                                    Reply::History {
-                                        next,
-                                        mut rows,
-                                        admitted,
-                                    } => {
+                                    Reply::History { next, mut rows } => {
                                         let mut history = waiter.history;
                                         history.append(&mut rows);
                                         Reply::History {
                                             next,
                                             rows: history,
-                                            admitted,
                                         }
                                     }
                                     reply => reply,
@@ -489,44 +480,8 @@ impl Host {
     pub(crate) async fn history(
         &self,
     ) -> Result<(AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>), StoreError> {
-        let (next, rows, _) = self.request_history(false).await?;
-        Ok((next, rows))
-    }
-
-    pub(crate) async fn recovery_history(
-        &self,
-    ) -> Result<
-        (
-            AgentEventPos,
-            Vec<(AgentEventPos, AgentEvent<'static>)>,
-            Vec<ExecId>,
-        ),
-        StoreError,
-    > {
-        self.request_history(true).await
-    }
-
-    async fn request_history(
-        &self,
-        recovery: bool,
-    ) -> Result<
-        (
-            AgentEventPos,
-            Vec<(AgentEventPos, AgentEvent<'static>)>,
-            Vec<ExecId>,
-        ),
-        StoreError,
-    > {
-        match self
-            .request(Request::History { recovery })
-            .await
-            .map_err(StoreError)?
-        {
-            Reply::History {
-                next,
-                rows,
-                admitted,
-            } => Ok((next, rows, admitted)),
+        match self.request(Request::History).await.map_err(StoreError)? {
+            Reply::History { next, rows } => Ok((next, rows)),
             _ => Err(StoreError(anyhow::anyhow!("unexpected history reply"))),
         }
     }

@@ -124,8 +124,9 @@ impl OpenAi {
             .await?;
 
         let mut items = Vec::new();
-        // The item whose code is streamed: the first call, as only it runs.
-        let mut streaming: Option<String> = None;
+        // The item whose code is streamed, by id and output index: the
+        // first call, as only it runs.
+        let mut streaming: Option<(String, Value)> = None;
         loop {
             let message = tokio::time::timeout(EVENT_TIMEOUT, socket.next())
                 .await
@@ -144,13 +145,21 @@ impl OpenAi {
             match event["type"].as_str().unwrap_or_default() {
                 "response.output_item.added" if streaming.is_none() && is_call(&event["item"]) => {
                     let item = &event["item"];
-                    streaming = Some(item["id"].as_str().unwrap_or_default().to_owned());
+                    streaming = Some((
+                        item["id"].as_str().unwrap_or_default().to_owned(),
+                        event["output_index"].clone(),
+                    ));
                     stream(Stream::Call {
                         id: &CallId::new(item["call_id"].as_str().unwrap_or_default()),
                     });
                 }
                 "response.custom_tool_call_input.delta"
-                    if streaming.as_deref() == event["item_id"].as_str() =>
+                    if streaming.as_ref().is_some_and(|(id, index)| {
+                        match event["item_id"].as_str() {
+                            Some(item) => item == id,
+                            None => !index.is_null() && event["output_index"] == *index,
+                        }
+                    }) =>
                 {
                     stream(Stream::Code(event["delta"].as_str().unwrap_or_default()));
                 }

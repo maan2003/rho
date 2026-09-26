@@ -8,10 +8,10 @@
 //! call and speaks to the person only through `human.send`.
 
 mod context;
-mod mailroom;
+pub(crate) mod mailroom;
 mod persistence;
-mod tools;
-mod wake;
+pub(crate) mod tools;
+pub(crate) mod wake;
 
 #[cfg(test)]
 mod tests;
@@ -931,7 +931,7 @@ impl Agent {
                 Some(&self.inference),
                 team.as_ref(),
                 Some(&self.host),
-                &self.mailroom,
+                Some(&self.mailroom),
             );
             let notebook = Notebook::new(shell, exports, Arc::clone(&self.wake))
                 .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;

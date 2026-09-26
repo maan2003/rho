@@ -6,10 +6,10 @@ use rho_agent_types::UnixMs;
 
 use crate::entry::Wake;
 
-pub(super) const DEFAULT_CHECKIN: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_CHECKIN: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct Facts {
+pub(crate) struct Facts {
     pub human: Option<UnixMs>,
     pub agent: Option<UnixMs>,
     pub finished: Option<UnixMs>,
@@ -28,12 +28,12 @@ pub(super) struct Facts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Decision {
+pub(crate) enum Decision {
     Now(Wake),
     Later(Option<UnixMs>),
 }
 
-pub(super) fn decide(facts: &Facts, now: UnixMs) -> Decision {
+pub(crate) fn decide(facts: &Facts, now: UnixMs) -> Decision {
     if facts.archived {
         return Decision::Later(None);
     }

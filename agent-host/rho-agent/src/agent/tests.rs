@@ -53,7 +53,12 @@ impl Harness {
         )
         .await
         .unwrap();
-        let host = crate::worker::testing::served(db.clone(), inference.clone(), agent);
+        let host = crate::worker::local_services(
+            db.clone(),
+            inference.clone(),
+            agent,
+            std::sync::Weak::new(),
+        );
         let worksets = rho_fs_view::Worksets::open(
             directory.path().join("state"),
             rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),

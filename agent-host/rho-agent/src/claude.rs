@@ -1172,17 +1172,19 @@ impl ClaudeLoop {
             return Ok(());
         }
         let team = self.host.team().await?;
-        let (shell, others) = crate::python::host::host_tools(
+        let (shell, exports) = crate::agent::tools::host_tools(
             view,
             self.role,
             self.agent_id,
             Some(&self.inference),
             team.as_ref(),
             Some(&self.host),
+            None,
         );
-        let tool = crate::python::PythonNotebook::new(shell, others)
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notebook = rho_notebook2::Notebook::new(shell, exports, Arc::clone(&notify))
             .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
-        self.python = Some(python_host::PythonHost::new(tool));
+        self.python = Some(python_host::PythonHost::new(notebook, notify));
         Ok(())
     }
 
@@ -1490,12 +1492,8 @@ impl ClaudeLoop {
         let oldest_user = self.state.queued_inputs.iter().map(|input| input.at).min();
         let available = host.has_pending() || idle;
         match host.decide(available, oldest_user, self.pending_output.is_some(), now) {
-            crate::boundary::Boundary::No { recheck } => self.python_recheck = recheck,
-            crate::boundary::Boundary::AbortAndResend
-            | crate::boundary::Boundary::RetryExhausted => {
-                self.python_recheck = None;
-            }
-            crate::boundary::Boundary::Now { wake } => {
+            python_host::Boundary::No { recheck } => self.python_recheck = recheck,
+            python_host::Boundary::Now { wake } => {
                 self.python_recheck = None;
                 if let Some((pending, mut drained)) = host.answer_pending() {
                     let batch = self.record_output(&mut drained, wake, now).await?;

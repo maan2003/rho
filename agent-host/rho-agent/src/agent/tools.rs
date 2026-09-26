@@ -26,7 +26,7 @@ use crate::worker::{Host, SharedCall};
 
 /// The shell, and the notebook globals Rho answers itself (images,
 /// collaboration, web search, papercuts, and the mailroom's `human` and
-/// `archive`). Unavailable services export nothing.
+/// `archive` when there is one). Unavailable services export nothing.
 pub(crate) fn host_tools(
     view: &Arc<View>,
     role: AgentRole,
@@ -34,7 +34,7 @@ pub(crate) fn host_tools(
     inference: Option<&Inference>,
     multi_agent: Option<&Team>,
     host: Option<&Arc<Host>>,
-    mailroom: &Arc<Mailroom>,
+    mailroom: Option<&Arc<Mailroom>>,
 ) -> (ShellTools, Vec<Export>) {
     let shell = ShellTools::new(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -55,7 +55,7 @@ pub(crate) fn host_tools(
         },
     )];
     if let Some(agent_host) = agent_host.as_ref().filter(|_| multi_agent.is_some()) {
-        exports.push(agents(role, Arc::clone(agent_host), Arc::clone(mailroom)));
+        exports.push(agents(role, Arc::clone(agent_host), mailroom.cloned()));
     }
     if let Some(inference) = inference {
         exports.push(Export::new(
@@ -68,7 +68,11 @@ pub(crate) fn host_tools(
     if let Some(agent_host) = agent_host {
         exports.push(Export::new("papercut", Papercut { agent_host }));
     }
-    exports.extend(mailroom.exports());
+    exports.extend(
+        mailroom
+            .map(|mailroom| mailroom.exports())
+            .unwrap_or_default(),
+    );
     (shell, exports)
 }
 
@@ -96,7 +100,7 @@ fn ask(
 }
 
 /// `agents`: collaboration. Engineers may also start and stop others.
-fn agents(role: AgentRole, agent_host: AgentHost, mailroom: Arc<Mailroom>) -> Export {
+fn agents(role: AgentRole, agent_host: AgentHost, mailroom: Option<Arc<Mailroom>>) -> Export {
     let agents = Agents { agent_host };
     Export::build("agents", move |py| {
         let inner = match role {
@@ -106,7 +110,10 @@ fn agents(role: AgentRole, agent_host: AgentHost, mailroom: Arc<Mailroom>) -> Ex
             }
             AgentRole::Advisor { .. } => Py::new(py, agents)?.into_any(),
         };
-        mailroom.agents(py, inner)
+        match &mailroom {
+            Some(mailroom) => mailroom.agents(py, inner),
+            None => Ok(inner),
+        }
     })
 }
 

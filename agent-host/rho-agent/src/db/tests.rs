@@ -987,47 +987,6 @@ async fn the_journal_names_every_row_in_write_order() {
 }
 
 #[tokio::test]
-async fn rewind_keeps_old_claude_admission_and_allows_the_same_id_again() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = create(&mut write, None, None);
-    let exec = rho_inference::types::ExecCall {
-        id: "once".try_into().unwrap(),
-        source: "side_effect()".into(),
-    };
-    write.append_agent_event(
-        agent_id,
-        &AgentEvent::ClaudeExecAdmitted {
-            call: exec.clone(),
-            at: UnixMs(1),
-        },
-    );
-    write.rewind_agent(UnixMs(2), agent_id, AgentEventPos::new(1));
-    write.append_agent_event(
-        agent_id,
-        &AgentEvent::ClaudeExecAdmitted {
-            call: exec.clone(),
-            at: UnixMs(3),
-        },
-    );
-    write.commit();
-
-    let read = db.read();
-    assert_eq!(
-        read.agent_recovery_records(agent_id).2,
-        [exec.id.clone(), exec.id.clone()]
-    );
-    let (_, visible) = read.agent_events(agent_id);
-    assert!(matches!(
-        visible.as_slice(),
-        [AgentEvent::Created { .. }, AgentEvent::Rewound { .. }, AgentEvent::ClaudeExecAdmitted { call, .. }]
-            if call.id == exec.id
-    ));
-}
-
-#[tokio::test]
 async fn claude_output_survives_restart_and_rewind_until_handoff() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("rho.redb");

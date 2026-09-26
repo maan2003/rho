@@ -651,14 +651,6 @@ pub trait AgentReadTxnExt {
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch>;
-    fn agent_recovery_records(
-        &self,
-        agent_id: AgentId,
-    ) -> (
-        AgentEventPos,
-        Vec<(AgentEventPos, AgentEvent<'static>)>,
-        Vec<rho_inference::types::ExecId>,
-    );
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
     /// Newest text-bearing visible rows, read backward and bounded before
@@ -946,42 +938,6 @@ impl AgentReadTxnExt for ReadTxn {
             }
         }
         None
-    }
-
-    fn agent_recovery_records(
-        &self,
-        agent_id: AgentId,
-    ) -> (
-        AgentEventPos,
-        Vec<(AgentEventPos, AgentEvent<'static>)>,
-        Vec<rho_inference::types::ExecId>,
-    ) {
-        let log = self.open_table(AGENT_LOG);
-        let mut admitted = Vec::new();
-        // Include identities from hidden branches: rewinds never reauthorize them.
-        let events = rows(log.range(agent_range(agent_id))).inspect(|(_, event)| {
-            if let AgentEvent::ClaudeExecAdmitted { call, .. } = event {
-                admitted.push(call.id.clone());
-            }
-            if let Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =
-                event.native_event()
-            {
-                for block in output {
-                    if let rho_inference::types::ContextBlock::InferenceResponse { items, .. } =
-                        block
-                    {
-                        admitted.extend(items.iter().filter_map(|item| match item {
-                            rho_inference::types::InferenceResponseItem::ToolCall {
-                                id, ..
-                            } => Some(id.clone()),
-                            _ => None,
-                        }));
-                    }
-                }
-            }
-        });
-        let (next, visible) = visible_rows(events);
-        (next, visible, admitted)
     }
 
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>> {

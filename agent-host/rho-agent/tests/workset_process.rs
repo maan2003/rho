@@ -306,19 +306,23 @@ async fn streaming_crash() {
         fixture(&format!("http://{}", listener.local_addr().unwrap())).await;
     let db = pool.db().clone();
     let requests = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let server = tokio::spawn({
         let requests = requests.clone();
+        let bodies = bodies.clone();
         async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let requests = requests.clone();
+                let bodies = bodies.clone();
                 connections.spawn(async move {
                     let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
                     while let Some(Ok(message)) = socket.next().await {
                         if !message.is_text() { continue; }
                         let request: serde_json::Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
                         assert_eq!(request["type"], "response.create");
+                        bodies.lock().unwrap().push(message.to_text().unwrap().to_owned());
                         let turn = requests.fetch_add(1, Ordering::SeqCst);
                         let source = if turn == 0 {
                             "import os\nfor entry in Path('/proc/self/fd').iterdir():\n    try:\n        assert 'agents.redb' not in os.readlink(str(entry))\n    except OSError:\n        pass\n\ncounter = 42\nPath('/src/worker-pid').write_text(str(os.getpid()))\nPath('/src/side-effect').write_text('written')\n"
@@ -392,6 +396,7 @@ async fn streaming_crash() {
         std::fs::read_to_string(workset.root().join("side-effect")).unwrap(),
         "written"
     );
+    // The cut-off response left no step: its code ran, but only as streamed.
     assert!(
         !db.read()
             .agent_event_records(id)
@@ -399,21 +404,11 @@ async fn streaming_crash() {
             .iter()
             .any(|(_, event)| matches!(
                 event,
-                rho_agent::AgentEvent::Native(
-                    rho_agent::native::NativeEvent::ResponseFinished { .. }
-                )
+                rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { .. })
             ))
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        1,
-        "load replayed interrupted execution"
-    );
-    replacement.send_user_message(
-        "inspect fresh globals".into(),
-        rho_agent_types::MessageDelivery::Immediate,
-    );
+    // The restart wakes the model to say so; it asks the model afresh and
+    // never runs the interrupted code again.
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("recovered").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -424,6 +419,13 @@ async fn streaming_crash() {
     assert_eq!(
         std::fs::read_to_string(workset.root().join("recovered")).unwrap(),
         "None"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert!(bodies.lock().unwrap()[1].contains("rho restarted"));
+    assert_eq!(
+        std::fs::read_to_string(workset.root().join("worker-pid")).unwrap(),
+        worker.to_string(),
+        "load replayed interrupted execution"
     );
     pool.execution(id).await.unwrap().shutdown().await;
     server.abort();

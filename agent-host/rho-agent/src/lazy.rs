@@ -35,10 +35,6 @@ impl<T> Lazy<T> {
     pub(crate) async fn get(&self) -> anyhow::Result<&T> {
         self.value.get_or_try_init(|| (self.initialize)()).await
     }
-
-    pub(crate) fn get_if_ready(&self) -> Option<&T> {
-        self.value.get()
-    }
 }
 
 #[cfg(test)]

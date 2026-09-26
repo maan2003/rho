@@ -24,10 +24,8 @@ use senax_encoder::{Decode, Encode};
 use crate::db::{AgentEventPos, AgentRuntime, AgentSpawnedBy, ClaudeRewind, SessionBinding};
 
 pub mod agent;
-mod boundary;
 mod claude;
 pub mod native;
-pub mod python;
 pub use agent::{AgentHandle, render_agent_surface};
 
 pub mod db;

@@ -338,13 +338,8 @@ impl Services {
                 Reply::Head(self.db.read().get_agent(agent))
             }
             Request::Head => Reply::Head(self.db.read().get_agent(self.agent)),
-            Request::History { recovery } => {
-                let (next, rows, admitted) = if recovery {
-                    self.db.read().agent_recovery_records(self.agent)
-                } else {
-                    let (next, rows) = self.db.read().agent_event_records(self.agent);
-                    (next, rows, Vec::new())
-                };
+            Request::History => {
+                let (next, rows) = self.db.read().agent_event_records(self.agent);
                 let mut batch = Vec::new();
                 let mut bytes = 0;
                 for row in rows {
@@ -369,7 +364,6 @@ impl Services {
                 Reply::History {
                     next,
                     rows: Vec::new(),
-                    admitted,
                 }
             }
             Request::Append(event) => {
@@ -545,10 +539,6 @@ mod tests {
         let (next, rows) = host.history().await.unwrap();
         assert_eq!(next, appended.next());
         assert_eq!((next, rows), db.read().agent_event_records(agent));
-        let (recovery_next, recovery_rows, admitted) = host.recovery_history().await.unwrap();
-        assert_eq!(recovery_next, next);
-        assert_eq!(recovery_rows, db.read().agent_event_records(agent).1);
-        assert!(admitted.is_empty());
 
         // More than the service concurrency bound must wait, never return
         // "too many pending agent services" or lose an append.
