@@ -10,12 +10,12 @@ rust-version.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 bytes = "1"
-futures.workspace = true
 futures-util.workspace = true
+rho-inference.workspace = true
 rustls.workspace = true
 senax-encoder.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tokio-tungstenite.workspace = true
 uuid.workspace = true
 

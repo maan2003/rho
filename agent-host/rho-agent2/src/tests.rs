@@ -20,7 +20,7 @@ fn start(dir: &tempfile::TempDir, log: Log, model: Arc<Scripted>) -> (Agent, Age
     Agent::new(Config {
         id: "a1".into(),
         log,
-        model,
+        model: Arc::new(rho_inference2::Model::Scripted(model)),
         shell: shell(dir),
         instructions: "test".into(),
     })
@@ -107,7 +107,7 @@ async fn an_agent_talks_only_through_messages_and_waits_on_the_human() {
         panic!("{:?}", requests[1].items)
     };
     assert_eq!(call_id, "call_1");
-    assert_eq!(text, "New messages below.", "the cell said nothing");
+    assert_eq!(text, "Cell finished", "the cell said nothing");
     assert_eq!(second, "Message from the human:\nbye");
     drop(handle);
     running.abort();
@@ -188,7 +188,8 @@ async fn a_restarted_agent_is_told_its_notebook_is_gone() {
     .await
     .unwrap();
     let request = &model.requests()[0];
-    let Some(Item::Result { text, .. }) = request.items.last() else {
+    // The step never finished, so there is no call to answer.
+    let Some(Item::User { text, .. }) = request.items.last() else {
         panic!("{:?}", request.items)
     };
     assert!(text.contains("rho restarted"), "{text}");
@@ -202,4 +203,44 @@ async fn a_restarted_agent_is_told_its_notebook_is_gone() {
             ..
         }
     )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_off_cell_keeps_the_statements_that_ran() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model
+        .then_cut("human.send('started')\nawait asyncio.sleep(0.3)\nhuman.send('never")
+        .then("await human.reply()");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "go");
+    until_chat(&mut chat, sent("started")).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while model.remaining() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = &model.requests()[1];
+    let Some(Item::Result { call_id, text, .. }) = request
+        .items
+        .iter()
+        .rev()
+        .find(|item| matches!(item, Item::Result { .. }))
+    else {
+        panic!("{:?}", request.items)
+    };
+    assert_eq!(call_id, "call_1");
+    assert!(text.starts_with("Your response was cut off"), "{text}");
+    let steps = model.requests()[1]
+        .items
+        .iter()
+        .filter(|item| matches!(item, Item::Step(_)))
+        .count();
+    assert_eq!(steps, 1);
+    drop(handle);
+    running.abort();
 }

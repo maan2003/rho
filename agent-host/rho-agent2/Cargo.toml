@@ -11,14 +11,12 @@ anyhow.workspace = true
 bytes = "1"
 camino.workspace = true
 clap.workspace = true
-futures.workspace = true
 pyo3.workspace = true
 rand.workspace = true
-rho-agent.workspace = true
 rho-agent-types.workspace = true
 rho-fs-view.workspace = true
-rho-inference.workspace = true
 rho-inference2.workspace = true
+rho-notebook2.workspace = true
 rho-tool-shell.workspace = true
 senax-encoder.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "io-util", "signal"] }

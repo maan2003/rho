@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use futures::future::BoxFuture;
 use rho_agent2::chat::{ChatEvent, ChatKind};
 use rho_agent2::log::{Block, Log, Party};
 use rho_agent2::{Agent, Config, Inbound, Trace};
-use rho_inference2::openai::{Auth, CHATGPT_BASE_URL, Credentials, OpenAi};
+use rho_inference2::Model;
+use rho_inference2::openai::{CHATGPT_BASE_URL, OpenAi};
 use tokio::io::AsyncBufReadExt;
 
 #[derive(Parser)]
@@ -43,24 +43,6 @@ struct Args {
     trace: bool,
 }
 
-struct NamedAuth(String);
-
-impl Auth for NamedAuth {
-    fn credentials(&self) -> BoxFuture<'_, anyhow::Result<Credentials>> {
-        let name = self.0.clone();
-        Box::pin(async move {
-            let resolved = tokio::task::spawn_blocking(move || {
-                rho_inference::InferenceAuth::named(&name)?.resolve_oauth()
-            })
-            .await??;
-            Ok(Credentials {
-                bearer_token: resolved.bearer_token,
-                account_id: resolved.account_id,
-            })
-        })
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -70,12 +52,12 @@ async fn main() -> anyhow::Result<()> {
         workdir,
         rho_fs_view::PathOverrides::default(),
     );
-    let model = Arc::new(OpenAi {
+    let model = Arc::new(Model::OpenAi(OpenAi {
         base_url: args.base_url,
         model: args.model,
         effort: args.effort,
-        auth: Arc::new(NamedAuth(args.auth)),
-    });
+        auth: args.auth,
+    }));
     let (agent, handle) = Agent::new(Config {
         id: args.id.clone(),
         log: Log::open(&args.log)?,

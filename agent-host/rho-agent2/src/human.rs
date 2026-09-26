@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use rho_agent::python::Export;
+use rho_notebook2::Export;
 use tokio::sync::mpsc;
 
 use crate::log::Party;

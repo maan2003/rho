@@ -5,56 +5,46 @@
 //! instructions are developer items at the head of the input, not top-level
 //! fields.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
-use futures::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use crate::{Call, Carry, EXEC, Image, Inner, Item, Model, Request, Step, Usage};
+use crate::{Call, Carry, EXEC, Image, Inner, Item, Request, Step, Stream, Usage};
 
 pub const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_BETA: &str = "responses_websockets=2026-02-06";
 /// A step that goes this long without an event is treated as wedged.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Credentials for one request. Resolved fresh each step, so a refresh
-/// between steps is picked up.
-#[derive(Clone)]
-pub struct Credentials {
-    pub bearer_token: String,
-    pub account_id: Option<String>,
-}
-
-pub trait Auth: Send + Sync {
-    fn credentials(&self) -> BoxFuture<'_, anyhow::Result<Credentials>>;
-}
-
 pub struct OpenAi {
     pub base_url: String,
     pub model: String,
     /// `low`, `medium`, `high` or `xhigh`.
     pub effort: String,
-    pub auth: Arc<dyn Auth>,
-}
-
-impl Model for OpenAi {
-    fn step<'a>(&'a self, request: &'a Request) -> BoxFuture<'a, anyhow::Result<Step>> {
-        Box::pin(self.run(request))
-    }
+    /// The OAuth credentials file in rho's auth directory, read each step so
+    /// a refresh between steps is picked up.
+    pub auth: String,
 }
 
 impl OpenAi {
-    async fn run(&self, request: &Request) -> anyhow::Result<Step> {
+    pub(crate) async fn step(
+        &self,
+        request: &Request,
+        stream: &mut (dyn FnMut(Stream<'_>) + Send),
+    ) -> anyhow::Result<Step> {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         }
-        let credentials = self.auth.credentials().await?;
+        let name = self.auth.clone();
+        let credentials = tokio::task::spawn_blocking(move || {
+            rho_inference::InferenceAuth::named(&name)?.resolve_oauth()
+        })
+        .await??;
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
         let url = match url.split_once("://") {
             Some(("https", rest)) => format!("wss://{rest}"),
@@ -82,6 +72,8 @@ impl OpenAi {
             .await?;
 
         let mut items = Vec::new();
+        // The item whose code is streamed: the first call, as only it runs.
+        let mut streaming: Option<String> = None;
         loop {
             let message = tokio::time::timeout(EVENT_TIMEOUT, socket.next())
                 .await
@@ -98,6 +90,18 @@ impl OpenAi {
             };
             let event: Value = serde_json::from_str(&text)?;
             match event["type"].as_str().unwrap_or_default() {
+                "response.output_item.added" if streaming.is_none() && is_call(&event["item"]) => {
+                    let item = &event["item"];
+                    streaming = Some(item["id"].as_str().unwrap_or_default().to_owned());
+                    stream(Stream::Call {
+                        id: item["call_id"].as_str().unwrap_or_default(),
+                    });
+                }
+                "response.custom_tool_call_input.delta"
+                    if streaming.as_deref() == event["item_id"].as_str() =>
+                {
+                    stream(Stream::Code(event["delta"].as_str().unwrap_or_default()));
+                }
                 "response.output_item.done" => items.push(event["item"].clone()),
                 "response.completed" | "response.done" => {
                     let _ = socket.close(None).await;
@@ -178,6 +182,10 @@ impl OpenAi {
             },
         })
     }
+}
+
+fn is_call(item: &Value) -> bool {
+    item["type"] == "custom_tool_call" && item["name"] == EXEC
 }
 
 fn call_item(call: &Call) -> Value {
@@ -282,6 +290,39 @@ fn step(items: Vec<Value>, usage: &Value) -> Step {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against the real endpoint, with the `default` credentials:
+    /// `cargo test -p rho-inference2 -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn the_call_streams_in_pieces() {
+        let model = OpenAi {
+            base_url: CHATGPT_BASE_URL.into(),
+            model: "gpt-6-sol".into(),
+            effort: "low".into(),
+            auth: "default".into(),
+        };
+        let request = Request {
+            instructions: "Answer by calling exec.".into(),
+            items: vec![Item::User {
+                text: "Print the first five squares, one statement per line.".into(),
+                images: Vec::new(),
+            }],
+            cache_key: uuid::Uuid::new_v4(),
+        };
+        let mut pieces = Vec::new();
+        let step = model
+            .step(&request, &mut |piece| {
+                if let Stream::Code(code) = piece {
+                    pieces.push(code.to_owned());
+                }
+            })
+            .await
+            .unwrap();
+        let code = step.call.unwrap().code;
+        assert!(pieces.len() > 1, "{pieces:?}");
+        assert_eq!(pieces.concat(), code);
+    }
 
     #[test]
     fn a_step_keeps_one_call_and_its_reasoning_for_replay() {

@@ -11,7 +11,6 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use senax_encoder::{Decode, Encode};
 
 pub mod openai;
@@ -86,7 +85,41 @@ enum Inner {
     Scripted { call: Option<Call> },
 }
 
+/// The `exec` call as it arrives, so its code can run while the rest of
+/// the response is still being written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream<'a> {
+    /// The call has begun.
+    Call { id: &'a str },
+    /// More of its code.
+    Code(&'a str),
+}
+
 /// A model: one request in, one step out. The caller owns retries.
-pub trait Model: Send + Sync {
-    fn step<'a>(&'a self, request: &'a Request) -> BoxFuture<'a, anyhow::Result<Step>>;
+pub enum Model {
+    OpenAi(openai::OpenAi),
+    Scripted(Arc<scripted::Scripted>),
+}
+
+impl Model {
+    /// One response. `stream` sees the call's code as it arrives; the step
+    /// holds all of it, and is what to keep.
+    pub async fn step(
+        &self,
+        request: &Request,
+        stream: &mut (dyn FnMut(Stream<'_>) + Send),
+    ) -> anyhow::Result<Step> {
+        match self {
+            Model::OpenAi(model) => model.step(request, stream).await,
+            Model::Scripted(model) => model.step(request, stream).await,
+        }
+    }
+}
+
+impl Carry {
+    /// A call that was cut off: all that can be replayed is the code that
+    /// ran.
+    pub fn bare(call: Call) -> Self {
+        Self(Inner::Scripted { call: Some(call) })
+    }
 }

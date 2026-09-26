@@ -29,6 +29,7 @@ members = [
   "agent-host/rho-inference",
   "agent-host/rho-inference2",
   "agent-host/rho-agent2",
+  "agent-host/rho-notebook2",
   "crates/rho-iroh-auth",
   "crates/rho-journal",
   "crates/rho-ledger",
@@ -144,6 +145,7 @@ rho-git = { path = "agent-host/rho-git" }
 rho-image = { path = "agent-host/rho-image" }
 rho-inference = { path = "agent-host/rho-inference" }
 rho-inference2 = { path = "agent-host/rho-inference2" }
+rho-notebook2 = { path = "agent-host/rho-notebook2" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-journal = { path = "crates/rho-journal" }
 rho-ledger = { path = "crates/rho-ledger" }

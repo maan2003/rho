@@ -8,10 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent::python::{PythonExec, PythonNotebook};
 use rho_agent_types::UnixMs;
-use rho_inference::types::{ExecCall, ExecId};
-use rho_inference2::{Image, Model};
+use rho_inference2::{Call, Carry, Image, Model, Stream, Usage};
+use rho_notebook2::{CellHandle, Kind, Notebook};
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::chat::{self, ChatEvent};
@@ -68,16 +67,18 @@ pub struct Agent {
     id: String,
     log: Log,
     instructions: Arc<str>,
-    model: Arc<dyn Model>,
-    notebook: PythonNotebook,
+    model: Arc<Model>,
+    notebook: Notebook,
     mailroom: Arc<Mailroom>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
     inbox: mpsc::UnboundedReceiver<Inbound>,
     wake: Arc<Notify>,
     chat: broadcast::Sender<ChatEvent>,
     trace: broadcast::Sender<Trace>,
-    /// Live cells, oldest first; the last is the latest.
-    cells: Vec<Arc<PythonExec>>,
+    /// The latest cell. Older ones live on in the notebook's sources.
+    cell: Option<CellHandle>,
+    /// The latest step was cut off part-way through its cell.
+    interrupted: bool,
     /// The model has been told the latest cell returned.
     told_returned: bool,
     /// Messages the model has not seen, oldest first.
@@ -88,13 +89,18 @@ pub struct Agent {
     restarted: bool,
     stopped: bool,
     cache_key: u128,
-    next_cell: u64,
+}
+
+/// The call of the step in progress, as its code arrives.
+struct Streaming {
+    id: String,
+    code: String,
 }
 
 pub struct Config {
     pub id: String,
     pub log: Log,
-    pub model: Arc<dyn Model>,
+    pub model: Arc<Model>,
     pub shell: rho_tool_shell::ShellTools,
     pub instructions: Arc<str>,
 }
@@ -104,7 +110,8 @@ impl Agent {
     /// be called inside a Tokio runtime.
     pub fn new(config: Config) -> anyhow::Result<(Self, AgentHandle)> {
         let (mailroom, outbox) = Mailroom::new();
-        let notebook = PythonNotebook::new(config.shell, mailroom.exports())
+        let wake = Arc::new(Notify::new());
+        let notebook = Notebook::new(config.shell, mailroom.exports(), Arc::clone(&wake))
             .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
         let (inbox_tx, inbox) = mpsc::unbounded_channel();
         let (chat, _) = broadcast::channel(1024);
@@ -118,10 +125,11 @@ impl Agent {
             mailroom,
             outbox,
             inbox,
-            wake: Arc::new(Notify::new()),
+            wake,
             chat: chat.clone(),
             trace: trace.clone(),
-            cells: Vec::new(),
+            cell: None,
+            interrupted: false,
             told_returned: false,
             unread: Vec::new(),
             last_step: None,
@@ -130,7 +138,6 @@ impl Agent {
             restarted: false,
             stopped: false,
             cache_key: 0,
-            next_cell: 0,
         };
         agent.resume()?;
         Ok((
@@ -147,13 +154,17 @@ impl Agent {
     /// was a notebook that is now gone.
     fn resume(&mut self) -> anyhow::Result<()> {
         let mut delivered = std::collections::HashSet::new();
-        let mut had_steps = false;
+        // Any wake may have run code: streamed code runs before its step is
+        // logged.
+        let mut woken = false;
         let mut awaiting = false;
         for entry in self.log.entries() {
             match entry {
                 Entry::Created { cache_key, .. } => self.cache_key = *cache_key,
-                Entry::Step { .. } => had_steps = true,
-                Entry::Woken { messages, .. } => delivered.extend(messages.iter().copied()),
+                Entry::Woken { messages, .. } => {
+                    woken = true;
+                    delivered.extend(messages.iter().copied());
+                }
                 Entry::Awaiting { since, .. } => awaiting = since.is_some(),
                 _ => {}
             }
@@ -174,7 +185,7 @@ impl Agent {
                 at: UnixMs::now(),
                 cache_key: self.cache_key,
             })?;
-        } else if had_steps {
+        } else if woken {
             self.restarted = true;
             self.append(Entry::Notice {
                 at: UnixMs::now(),
@@ -223,9 +234,6 @@ impl Agent {
                     }
                 }
             }
-        }
-        for cell in &self.cells {
-            cell.cancel();
         }
         self.notebook.shutdown().await.map_err(anyhow::Error::msg)
     }
@@ -288,66 +296,48 @@ impl Agent {
     }
 
     fn facts(&self) -> Facts {
-        let latest = self.cells.last().map(|cell| cell.facts());
+        let sources = self.notebook.facts();
+        let latest = self
+            .cell
+            .as_ref()
+            .and_then(|cell| sources.iter().find(|s| s.session_id == cell.session_id()));
         let checkin = latest
             .and_then(|facts| facts.checkin)
             .map(|checkin| (checkin.after, checkin.wake_on_tools));
         let after = match checkin {
-            Some((after, _)) => Some(after),
+            Some((after, _)) => after,
             // Nobody needs looking in on while they only wait for the human.
             None if self.awaiting => None,
             None => Some(wake::DEFAULT_CHECKIN),
         };
-        let jobs = self.cells.iter().flat_map(|cell| cell.jobs());
+        let returned = latest
+            .and_then(|facts| facts.returned)
+            .filter(|_| !self.told_returned);
         Facts {
             message: self.unread.first().map(|(_, _, at)| *at),
-            returned: latest
-                .and_then(|facts| facts.returned)
-                .filter(|_| !self.told_returned),
-            notified: self
-                .cells
+            returned,
+            notified: sources
                 .iter()
-                .filter_map(|cell| cell.facts().notified_at)
+                .filter_map(|facts| facts.notified_at.into_iter().chain(facts.paged_at).min())
                 .min(),
-            ended: jobs.filter_map(|job| job.finished).map(|end| end.at).min(),
+            // The latest cell's end is its return, until that has been told.
+            ended: sources
+                .iter()
+                .filter(|facts| {
+                    !facts.delivered
+                        && !(returned.is_some()
+                            && facts.kind == Kind::Cell
+                            && Some(facts.session_id) == latest.map(|l| l.session_id))
+                })
+                .filter_map(|facts| facts.finished)
+                .map(|end| end.at)
+                .min(),
             checkin: self.last_step.zip(after).map(|(at, after)| at + after),
             wake_on_tools: checkin.is_none_or(|(_, wake)| wake),
             prose: self.prose > 0,
             restarted: self.restarted,
             stopped: self.stopped,
         }
-    }
-
-    /// Everything the notebook has to say: the latest cell's output first,
-    /// then each older cell's, named by its first line. Cells with nothing
-    /// left to say are forgotten.
-    fn report(&mut self) -> (Vec<String>, Vec<Image>) {
-        let mut parts = Vec::new();
-        let mut images = Vec::new();
-        let latest = self.cells.len().saturating_sub(1);
-        for (index, cell) in self.cells.iter().enumerate().rev() {
-            let Some(output) = cell.more_output() else {
-                continue;
-            };
-            cell.acknowledge_output();
-            if index == latest {
-                parts.insert(0, output.output.to_string());
-            } else {
-                parts.push(format!("From an earlier cell:\n{}", output.output));
-            }
-            images.extend(output.images.iter().map(|image| Image {
-                media_type: image.media_type.clone(),
-                data: image.data.clone(),
-            }));
-        }
-        self.cells.retain(|cell| {
-            let done = cell.done();
-            if done {
-                cell.release();
-            }
-            !done
-        });
-        (parts, images)
     }
 
     async fn wake_model(&mut self, why: Wake) -> anyhow::Result<()> {
@@ -366,8 +356,21 @@ impl Agent {
             ),
             _ => {}
         }
-        let (parts, images) = self.report();
-        lines.extend(parts);
+        if std::mem::take(&mut self.interrupted) {
+            lines.push(
+                "Your response was cut off while you were writing its cell; only the code \
+                 shown ran. Carry on from the notebook's state without replaying it."
+                    .to_owned(),
+            );
+        }
+        let mut images = Vec::new();
+        if let Some(report) = self.notebook.report() {
+            lines.push(report.text);
+            images.extend(report.images.into_iter().map(|image| Image {
+                media_type: image.media_type,
+                data: image.data,
+            }));
+        }
         self.wake_with(why, lines, images).await
     }
 
@@ -377,7 +380,7 @@ impl Agent {
         mut lines: Vec<String>,
         images: Vec<Image>,
     ) -> anyhow::Result<()> {
-        if let Some(latest) = self.cells.last() {
+        if let Some(latest) = &self.cell {
             self.told_returned = latest.facts().returned.is_some();
         }
         let messages = std::mem::take(&mut self.unread);
@@ -420,26 +423,49 @@ impl Agent {
         let mut failures = 0;
         let step = loop {
             let model = Arc::clone(&self.model);
+            // The call's code, as it arrives, runs as it arrives.
+            let (code_tx, mut code_rx) = mpsc::unbounded_channel();
+            let mut streaming = None;
             let result = {
-                let step = model.step(&request);
+                let mut forward = move |piece: Stream<'_>| {
+                    let _ = code_tx.send(match piece {
+                        Stream::Call { id } => (Some(id.to_owned()), String::new()),
+                        Stream::Code(code) => (None, code.to_owned()),
+                    });
+                };
+                let step = model.step(&request, &mut forward);
                 tokio::pin!(step);
-                // Keep recording what arrives while the model thinks.
+                // Keep recording what arrives while the model writes.
                 loop {
                     tokio::select! {
                         result = &mut step => break result,
+                        Some(piece) = code_rx.recv() => self.stream(&mut streaming, piece),
                         Some(inbound) = self.inbox.recv() => self.receive(inbound)?,
                         Some(outbound) = self.outbox.recv() => self.outbound(outbound)?,
                     }
                 }
             };
+            while let Ok(piece) = code_rx.try_recv() {
+                self.stream(&mut streaming, piece);
+            }
             match result {
-                Ok(step) => break step,
+                Ok(step) => break Ok((step, streaming)),
                 Err(error) => {
-                    failures += 1;
                     self.append(Entry::Notice {
                         at: UnixMs::now(),
                         notice: Notice::Error(format!("{error:#}")),
                     })?;
+                    // Code that already ran cannot be taken back: it stands
+                    // as the step, and the model hears it was cut off.
+                    if let (Some(cell), Some(streaming)) = (&self.cell, streaming)
+                        && let Some(ran) = cell.interrupt()
+                    {
+                        break Err(Call {
+                            id: streaming.id,
+                            code: streaming.code[..ran.min(streaming.code.len())].to_owned(),
+                        });
+                    }
+                    failures += 1;
                     if failures >= MAX_FAILURES {
                         return self.stop("the model kept failing");
                     }
@@ -447,12 +473,30 @@ impl Agent {
                 }
             }
         };
+        let at = UnixMs::now();
+        self.last_step = Some(at);
+        let (step, streaming) = match step {
+            Ok(step) => step,
+            Err(call) => {
+                self.interrupted = true;
+                self.prose = 0;
+                let _ = self.trace.send(Trace::Step {
+                    code: Some(call.code.clone()),
+                    prose: String::new(),
+                });
+                return self.append(Entry::Step {
+                    at,
+                    call: Some(call.clone()),
+                    prose: String::new(),
+                    carry: Carry::bare(call),
+                    usage: Usage::default(),
+                });
+            }
+        };
         let _ = self.trace.send(Trace::Step {
             code: step.call.as_ref().map(|call| call.code.clone()),
             prose: step.prose.clone(),
         });
-        let at = UnixMs::now();
-        self.last_step = Some(at);
         self.append(Entry::Step {
             at,
             call: step.call.clone(),
@@ -460,12 +504,25 @@ impl Agent {
             carry: step.carry,
             usage: step.usage,
         })?;
-        match step.call {
-            Some(call) => {
+        match (step.call, streaming) {
+            (Some(call), Some(streaming)) => {
                 self.prose = 0;
-                self.run_cell(call.id, call.code);
+                let cell = self.cell.as_ref().expect("a streamed call has a cell");
+                // Whatever the stream missed, then the end.
+                let rest = call.code.strip_prefix(&streaming.code).unwrap_or_default();
+                let _ = cell.feed(rest.to_owned(), true);
             }
-            None => {
+            (Some(call), None) => {
+                self.prose = 0;
+                self.cell = Some(self.notebook.run(call.code));
+                self.told_returned = false;
+            }
+            (None, streaming) => {
+                if streaming.is_some()
+                    && let Some(cell) = &self.cell
+                {
+                    cell.stop();
+                }
                 self.prose += 1;
                 if self.prose >= MAX_PROSE {
                     self.prose = 0;
@@ -476,16 +533,23 @@ impl Agent {
         Ok(())
     }
 
-    fn run_cell(&mut self, id: String, code: String) {
-        self.next_cell += 1;
-        let id = ExecId::try_from(id.as_str())
-            .or_else(|_| ExecId::try_from(format!("cell_{}", self.next_cell).as_str()))
-            .expect("a generated id is valid");
-        let cell = self
-            .notebook
-            .exec(ExecCall { id, source: code }, Arc::clone(&self.wake));
-        self.cells.push(cell);
-        self.told_returned = false;
+    /// A piece of the call being written: its start opens a cell, its code
+    /// feeds it.
+    fn stream(&mut self, streaming: &mut Option<Streaming>, (id, code): (Option<String>, String)) {
+        if let Some(id) = id {
+            self.cell = Some(self.notebook.stream());
+            self.told_returned = false;
+            *streaming = Some(Streaming {
+                id,
+                code: String::new(),
+            });
+        }
+        if let (Some(streaming), Some(cell)) = (streaming.as_mut(), &self.cell)
+            && !code.is_empty()
+        {
+            streaming.code.push_str(&code);
+            let _ = cell.feed(code, false);
+        }
     }
 
     fn stop(&mut self, why: &str) -> anyhow::Result<()> {

@@ -12659,14 +12659,12 @@ dependencies = [
  "bytes",
  "camino",
  "clap",
- "futures",
  "pyo3",
  "rand 0.8.7",
- "rho-agent",
  "rho-agent-types",
  "rho-fs-view",
- "rho-inference",
  "rho-inference2",
+ "rho-notebook2",
  "rho-tool-shell",
  "senax-encoder",
  "tempfile",
@@ -13201,8 +13199,8 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
- "futures",
  "futures-util",
+ "rho-inference",
  "rustls",
  "senax-encoder",
  "serde_json",
@@ -13280,6 +13278,20 @@ dependencies = [
  "rho-db",
  "rho-ledger",
  "rho-rpc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rho-notebook2"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "libc",
+ "pyo3",
+ "rho-agent-types",
+ "rho-fs-view",
+ "rho-tool-shell",
  "tempfile",
  "tokio",
 ]
