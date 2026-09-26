@@ -1,7 +1,6 @@
 //! Managed commands: `command()`, `write_stdin()` and `Command`. Rho owns
 //! the subprocesses and their retained output.
 use std::io::{Seek, SeekFrom, Write};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};

@@ -12584,7 +12584,9 @@ dependencies = [
  "rho-agent",
  "rho-agent-hosts",
  "rho-agent-types",
+ "rho-agent2",
  "rho-agents-client",
+ "rho-agents2-client",
  "rho-claude",
  "rho-claude-usage",
  "rho-db",
@@ -12595,6 +12597,7 @@ dependencies = [
  "rho-fs-view",
  "rho-image",
  "rho-inference",
+ "rho-inference2",
  "rho-iroh-auth",
  "rho-ledger-server",
  "rho-openai-realtime",
@@ -12605,6 +12608,7 @@ dependencies = [
  "rho-shell",
  "rho-shell-view",
  "rho-terminal",
+ "rho-tool-shell",
  "rho-visualizations",
  "rustix-openpty",
  "senax-encoder",
@@ -12719,6 +12723,22 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
  "ui",
+]
+
+[[package]]
+name = "rho-agents2-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "camino",
+ "futures",
+ "rho-agent-hosts",
+ "rho-agent-types",
+ "rho-agents2-client",
+ "rho-rpc",
+ "senax-encoder",
+ "tokio",
 ]
 
 [[package]]
@@ -13105,6 +13125,7 @@ dependencies = [
  "rho-agent-types",
  "rho-agents-client",
  "rho-agents-view",
+ "rho-agents2-client",
  "rho-browser",
  "rho-db",
  "rho-dealer",

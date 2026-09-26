@@ -75,9 +75,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the agent host.
-pub const IROH_ALPN: &[u8] = b"rho/ui/26";
+pub const IROH_ALPN: &[u8] = b"rho/ui/27";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP26";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP27";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +167,8 @@ pub enum Protocol {
     /// The agents: their journal and what is asked of them
     /// (`rho-agents-client`).
     Agents,
+    /// Agent2 chat messages and status (`rho-agents2-client`).
+    Agents2,
     /// The desktops in the host's worksets, and a live view of one
     /// (`rho-desktop-client`).
     Desktop,
@@ -666,7 +668,7 @@ mod tests {
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
         // The previous epoch's magic followed by a record's worth of bytes.
-        let mut old = &b"RUP25\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        let mut old = &b"RUP26\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 

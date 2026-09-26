@@ -19,6 +19,7 @@ use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 
 mod agents;
+mod agents2;
 pub mod debug;
 mod desktop;
 mod host;
@@ -429,6 +430,10 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(db_path);
+    let agent2_base_url = args
+        .openai_base_url
+        .clone()
+        .unwrap_or_else(|| rho_inference2::openai::CHATGPT_BASE_URL.to_owned());
     let inference = match args.openai_base_url {
         Some(endpoint) => {
             Inference::new_with_config(
@@ -496,6 +501,8 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             user_environment,
             platform_secrets,
             runtime.paths.octo_socket(),
+            state_dir.join("agent2"),
+            agent2_base_url,
         )
         .await?,
     );
@@ -911,6 +918,7 @@ impl GitTransportBroker {
 /// is handed so it does not carry a dozen handles of its own.
 struct Services {
     pool: Arc<AgentPool>,
+    agents2: Arc<agents2::Agents2>,
     db: RhoDb,
     /// Every device's sealed ledger, kept and passed between them.
     ledger: rho_ledger_server::LedgerServer,
@@ -949,14 +957,18 @@ impl Services {
         user_environment: rho_fs_view::UserEnvironment,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
+        agent2_dir: Utf8PathBuf,
+        agent2_base_url: String,
     ) -> anyhow::Result<Self> {
         let machine_seed = db.read().machine_seed();
+        let agents2 = agents2::Agents2::live(agent2_dir, agent2_base_url)?;
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let ledger = rho_ledger_server::LedgerServer::open(db.clone()).await;
         let registry = Self {
             pool,
+            agents2,
             db,
             claude,
             ledger,
@@ -1134,6 +1146,7 @@ where
 {
     match open.protocol {
         Protocol::Agents => agents::serve(services, open.unpack()?, reader, writer).await,
+        Protocol::Agents2 => agents2::serve(services, open.unpack()?, reader, writer).await,
         Protocol::Ledger => anyhow::bail!("the old ledger protocol is no longer supported"),
         Protocol::LedgerLog => services.ledger.serve(reader, writer).await,
         Protocol::Desktop => desktop::serve(services, open.unpack()?, reader, writer).await,

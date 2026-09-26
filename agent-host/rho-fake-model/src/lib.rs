@@ -45,6 +45,8 @@ pub enum Scenario {
     /// OpenAI: 100 sequential real shell commands, each output validated before
     /// continuing.
     RealToolRounds,
+    /// Agent2: a deterministic status and human-visible chat reply from exec.
+    Agent2Chat,
     /// Return a rate limit, then an overload, then allow retries to succeed.
     RateLimit,
     /// End the first stream during a text delta, then allow retries to succeed.
@@ -66,6 +68,7 @@ impl Scenario {
         match self {
             Self::Baseline => "baseline",
             Self::RealToolRounds => "real-tool-rounds",
+            Self::Agent2Chat => "agent2-chat",
             Self::RateLimit => "rate-limit",
             Self::StreamCut => "stream-cut",
             Self::SlowTrickle => "slow-trickle",
@@ -577,7 +580,30 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
         }
         remembered.push_back((response_id.clone(), tools.clone()));
     }
-    if state.config.scenario == Scenario::RealToolRounds && (!tools.is_empty() || has_tool_result) {
+    if state.config.scenario == Scenario::Agent2Chat {
+        if let Some(tool) = tools.iter().find(|tool| tool.name == "exec") {
+            append_tool_call(
+                &mut events,
+                state,
+                request_number,
+                0,
+                tool,
+                Some(
+                    "human.status('ready')\nhuman.send('fake model reply')\nawait human.reply()"
+                        .into(),
+                ),
+            );
+        } else {
+            events.push(
+                json!({"type":"response.failed","response":{"id":response_id,
+                "error":{"type":"invalid_request_error","code":"invalid_request_error",
+                "message":"agent2-chat requires exec"}}}),
+            );
+            return events;
+        }
+    } else if state.config.scenario == Scenario::RealToolRounds
+        && (!tools.is_empty() || has_tool_result)
+    {
         let outputs: Vec<_> = request
             .input
             .iter()

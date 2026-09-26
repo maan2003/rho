@@ -7,6 +7,7 @@ members = [
   "crates/prefix-id",
   "agent-host/rho-agent",
   "crates/rho-agents-client",
+  "crates/rho-agents2-client",
   "crates/rho-agents-view",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
@@ -127,7 +128,9 @@ reqwest = { version = "0.12", default-features = false, features = [
   "stream",
 ] }
 rho-agent = { path = "agent-host/rho-agent", default-features = false }
+rho-agent2 = { path = "agent-host/rho-agent2" }
 rho-agents-client = { path = "crates/rho-agents-client" }
+rho-agents2-client = { path = "crates/rho-agents2-client" }
 rho-agents-view = { path = "crates/rho-agents-view" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }

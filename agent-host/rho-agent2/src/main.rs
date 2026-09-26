@@ -83,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
                     Trace::Woken { why, report } => {
                         eprintln!("\x1b[2m── woken: {why:?}\n{report}\x1b[0m")
                     }
+                    Trace::ArchiveState { archived } => {
+                        eprintln!("agent {}", if archived { "archived" } else { "revived" });
+                    }
                     Trace::Step { code, prose } => {
                         if !prose.is_empty() {
                             eprintln!("\x1b[2m── prose (undelivered): {prose}\x1b[0m");

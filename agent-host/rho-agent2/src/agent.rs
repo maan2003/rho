@@ -36,6 +36,7 @@ pub struct Inbound {
 pub enum Trace {
     Woken { why: Wake, report: String },
     Step { code: Option<String>, prose: String },
+    ArchiveState { archived: bool },
 }
 
 /// Talks to a running agent. Dropping every handle stops it.
@@ -264,7 +265,21 @@ impl Agent {
     fn append(&mut self, entry: Entry) -> anyhow::Result<()> {
         let seq = self.log.entries().len() as u64;
         let event = chat::project(&self.id, seq, &entry);
+        let archived = match &entry {
+            Entry::Notice {
+                notice: Notice::Archived,
+                ..
+            } => Some(true),
+            Entry::Notice {
+                notice: Notice::FreshNotebook,
+                ..
+            } => Some(false),
+            _ => None,
+        };
         self.log.append(entry)?;
+        if let Some(archived) = archived {
+            let _ = self.trace.send(Trace::ArchiveState { archived });
+        }
         if let Some(event) = event {
             let _ = self.chat.send(event);
         }

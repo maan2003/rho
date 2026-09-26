@@ -28,6 +28,11 @@ octo-server.workspace = true
 octo-types.workspace = true
 prefix-id.workspace = true
 rho-agent.workspace = true
+rho-agent2.workspace = true
+rho-agents2-client.workspace = true
+rho-inference2.workspace = true
+rho-tool-shell.workspace = true
+uuid.workspace = true
 rho-claude.workspace = true
 rho-claude-usage.workspace = true
 rho-agent-types.workspace = true
@@ -61,7 +66,6 @@ tracing-subscriber = { version = "0.3", features = [
   "fmt",
 ] }
 url.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 moq-net.workspace = true

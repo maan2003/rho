@@ -414,3 +414,35 @@ fn request_timing_counts_overlap_once_and_closes_cancelled_requests() {
     drop(third);
     assert_eq!(super::snapshot(&metrics).idle_gaps_us.len(), 1);
 }
+
+#[tokio::test]
+async fn agent2_chat_scenario_speaks_only_by_exec() {
+    let mut config = FakeModelConfig::seeded(19);
+    config.scenario = Scenario::Agent2Chat;
+    let server = FakeModel::start(config).await.unwrap();
+    let url = server.openai_base_url().replace("http://", "ws://") + "/codex/responses";
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({
+                "type":"response.create","model":"gpt-test","input":[],
+                "tools":[{"type":"custom","name":"exec"}]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let events = read_turn(&mut socket).await;
+    let code: String = events
+        .iter()
+        .filter_map(|event| {
+            (event["type"] == "response.custom_tool_call_input.delta")
+                .then(|| event["delta"].as_str())
+                .flatten()
+        })
+        .collect();
+    assert!(code.contains("human.status('ready')"), "{code}");
+    assert!(code.contains("human.send('fake model reply')"), "{code}");
+    server.shutdown().await.unwrap();
+}

@@ -1,0 +1,24 @@
+[package]
+name = "rho-agents2-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+client = ["dep:anyhow", "dep:futures", "dep:rho-agent-hosts", "dep:tokio"]
+
+[dependencies]
+bytes.workspace = true
+camino.workspace = true
+rho-agent-types.workspace = true
+rho-rpc.workspace = true
+senax-encoder.workspace = true
+anyhow = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+rho-agent-hosts = { workspace = true, features = ["client"], optional = true }
+tokio = { workspace = true, features = ["io-util", "sync"], optional = true }
+
+[dev-dependencies]
+rho-agents2-client = { path = ".", features = ["client"] }
