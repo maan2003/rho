@@ -3,6 +3,10 @@
 pub mod create;
 pub mod protocol;
 #[cfg(feature = "client")]
+pub mod quota;
+#[cfg(feature = "client")]
 pub mod remote;
 #[cfg(feature = "client")]
 pub mod stream;
+#[cfg(feature = "client")]
+pub mod usage;

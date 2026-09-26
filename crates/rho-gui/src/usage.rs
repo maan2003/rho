@@ -8,8 +8,8 @@
 //! is nothing special to work on.
 //!
 //! What this module does is paint. Every number it paints comes from
-//! `rho_agents_client::usage`, which reduces a series to the width of the chart
-//! once, when the series arrives. A frame walks the reduced points and
+//! `rho_agents2_client::usage`, which reduces a series to the width of the
+//! chart once, when the series arrives. A frame walks the reduced points and
 //! nothing else: no percentiles, no smoothing, no per-sample arithmetic
 //! behind a pixel. When the window changes width the summary is built again,
 //! which is a resize and not a frame.
@@ -22,9 +22,9 @@ use gpui::{
     AnyElement, App, Bounds, Context, Entity, Hsla, PathBuilder, Pixels, Point, TextStyle, Window,
     canvas, div, point, px, rgb,
 };
-use rho_agents_client::HostId;
-use rho_agents_client::protocol::{AgentCostSeries, AgentUsageSeries};
-use rho_agents_client::usage::{
+use rho_agent_hosts::HostId;
+use rho_agents2_client::protocol::{AgentCostSeries, AgentUsageSeries};
+use rho_agents2_client::usage::{
     AgentCostSummary, ChartPoint, CostSummary, QuotaSummary, SeriesColor, ShareSummary,
 };
 use theme::ActiveTheme as _;
@@ -188,11 +188,11 @@ impl Chart {
 enum Series {
     None,
     Quota {
-        series: Vec<rho_agents_client::protocol::QuotaSeries>,
+        series: Vec<rho_agents2_client::protocol::QuotaSeries>,
         active_auth_namespaces: Vec<String>,
     },
-    Global(Vec<rho_agents_client::protocol::AgentUsageSeries>),
-    AgentCost(Vec<Vec<rho_agents_client::protocol::AgentCostSeries>>),
+    Global(Vec<rho_agents2_client::protocol::AgentUsageSeries>),
+    AgentCost(Vec<Vec<rho_agents2_client::protocol::AgentCostSeries>>),
 }
 
 /// What the block paints: already the size of the picture.
@@ -278,7 +278,7 @@ impl UsageView {
 
     pub(crate) fn quota_arrived(
         &mut self,
-        series: Vec<rho_agents_client::protocol::QuotaSeries>,
+        series: Vec<rho_agents2_client::protocol::QuotaSeries>,
         active_auth_namespaces: Vec<String>,
         cx: &mut Context<Self>,
     ) {
@@ -294,7 +294,7 @@ impl UsageView {
 
     pub(crate) fn global_usage_arrived(
         &mut self,
-        series: Vec<rho_agents_client::protocol::AgentUsageSeries>,
+        series: Vec<rho_agents2_client::protocol::AgentUsageSeries>,
         cx: &mut Context<Self>,
     ) {
         if !matches!(self.chart, Chart::ModelCost | Chart::UsageShare) {
@@ -306,7 +306,7 @@ impl UsageView {
 
     pub(crate) fn agent_cost_arrived(
         &mut self,
-        series: Vec<Vec<rho_agents_client::protocol::AgentCostSeries>>,
+        series: Vec<Vec<rho_agents2_client::protocol::AgentCostSeries>>,
         cx: &mut Context<Self>,
     ) {
         if self.chart != Chart::AgentCost {
@@ -331,7 +331,7 @@ impl UsageView {
                     active_auth_namespaces,
                 },
                 Chart::RateLimit,
-            ) => Some(Summary::Quota(rho_agents_client::usage::quota_summary(
+            ) => Some(Summary::Quota(rho_agents2_client::usage::quota_summary(
                 series,
                 active_auth_namespaces,
                 days,
@@ -339,13 +339,13 @@ impl UsageView {
                 columns,
             ))),
             (Series::Global(series), Chart::ModelCost) => Some(Summary::Cost(
-                rho_agents_client::usage::cost_summary(series, days, now, columns),
+                rho_agents2_client::usage::cost_summary(series, days, now, columns),
             )),
             (Series::Global(series), Chart::UsageShare) => Some(Summary::Share(
-                rho_agents_client::usage::share_summary(series, days, now, columns),
+                rho_agents2_client::usage::share_summary(series, days, now, columns),
             )),
             (Series::AgentCost(series), Chart::AgentCost) => Some(Summary::AgentCost(
-                rho_agents_client::usage::agent_cost_summary(series, days, now, columns),
+                rho_agents2_client::usage::agent_cost_summary(series, days, now, columns),
             )),
             // The open chart and the series in hand disagree: a request went
             // out when the chart changed and its answer has not landed yet.
@@ -620,7 +620,7 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
         (SeriesColor::Terra, "terra", summary.latest[4]),
     ]
     .into_iter()
-    .map(|(color, model, share)| rho_agents_client::usage::Legend {
+    .map(|(color, model, share)| rho_agents2_client::usage::Legend {
         color,
         label: format!("{model} {:.0}%", share * 100.0),
     })
@@ -721,7 +721,7 @@ fn render_agent_cost(summary: &AgentCostSummary, height: Pixels, cx: &App) -> An
 
 /// The legend: one coloured label per series, in the order the summary put
 /// them.
-fn legend_row(legend: &[rho_agents_client::usage::Legend], cx: &App) -> gpui::Div {
+fn legend_row(legend: &[rho_agents2_client::usage::Legend], cx: &App) -> gpui::Div {
     div()
         .flex()
         .gap_4()

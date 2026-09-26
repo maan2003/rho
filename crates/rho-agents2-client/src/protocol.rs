@@ -135,6 +135,91 @@ pub struct RewindAgent {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ListAgents;
 
+/// Every provider's quota as it stands.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaUsage;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaHistory;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct GlobalUsage {
+    pub since_ms: u64,
+}
+
+/// Raw per-agent usage needed to form cost distributions beginning at
+/// `since_ms`, with the fixed trailing-window lookback.
+#[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
+pub struct AgentCostDistribution {
+    pub since_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaSummary {
+    pub model: String,
+    /// Host-local ChatGPT OAuth namespace; absent for Claude.
+    pub auth_namespace: Option<String>,
+    pub remaining_percent: u8,
+    pub burn_10m: u16,
+    pub burn_2h: u16,
+    pub burn_1d: u16,
+    pub burn_3d: u16,
+    pub reset_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaSeries {
+    pub model: String,
+    /// Host-local ChatGPT OAuth namespace; absent for Claude.
+    pub auth_namespace: Option<String>,
+    pub points: Vec<QuotaPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct QuotaPoint {
+    pub observed_at_ms: u64,
+    pub remaining_percent: u8,
+    pub reset_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentUsageBucket {
+    pub bucket_start_ms: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub output_tokens: u64,
+    pub requests: u64,
+    pub approximate: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentUsageSeries {
+    pub model: String,
+    pub buckets: Vec<AgentUsageBucket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentCostSeries {
+    /// Host-local identity. Clients combining hosts must keep the host in the
+    /// distribution key rather than merging equal counters.
+    pub agent_id: AgentId,
+    pub model: String,
+    pub buckets: Vec<AgentUsageBucket>,
+}
+
+/// Window represented by each point in the agent-cost distribution graph.
+pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
+
+/// Host-wide authentication settings presented by a GUI host.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AuthState {
+    pub namespaces: Vec<String>,
+    pub disabled_namespaces: Vec<String>,
+    pub active_namespace: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum Open {
     Session,
@@ -147,6 +232,10 @@ rho_rpc::calls! {
         ArchiveAgent(ArchiveAgent) -> ();
         RewindAgent(RewindAgent) -> ();
         ListAgents(ListAgents) -> Vec<AgentInfo>;
+        QuotaUsage(QuotaUsage) -> Vec<QuotaSummary>;
+        QuotaHistory(QuotaHistory) -> Vec<QuotaSeries>;
+        GlobalUsage(GlobalUsage) -> Vec<AgentUsageSeries>;
+        AgentCostDistribution(AgentCostDistribution) -> Vec<AgentCostSeries>;
     }
 }
 impl rho_rpc::protocol::ProtocolOpen for Open {
@@ -210,6 +299,73 @@ mod tests {
         let bytes = senax_encoder::pack(&events[4]).unwrap();
         let decoded: ChatEvent = senax_encoder::unpack(&mut bytes.as_ref()).unwrap();
         assert_eq!(decoded, events[4]);
+    }
+
+    #[test]
+    fn usage_requests_and_replies_round_trip() {
+        fn round_trip<
+            T: senax_encoder::Packer + senax_encoder::Unpacker + PartialEq + std::fmt::Debug,
+        >(
+            value: T,
+        ) {
+            let bytes = senax_encoder::pack(&value).unwrap();
+            let decoded: T = senax_encoder::unpack(&mut bytes.as_ref()).unwrap();
+            assert_eq!(decoded, value);
+        }
+
+        for request in [
+            Request::QuotaUsage(QuotaUsage),
+            Request::QuotaHistory(QuotaHistory),
+            Request::GlobalUsage(GlobalUsage {
+                since_ms: 86_400_123,
+            }),
+            Request::AgentCostDistribution(AgentCostDistribution { since_ms: 42 }),
+        ] {
+            round_trip(Open::Request(request));
+        }
+        round_trip(rho_rpc::protocol::Answer::Done(vec![QuotaSummary {
+            model: "gpt".into(),
+            auth_namespace: Some("work".into()),
+            remaining_percent: 38,
+            burn_10m: 4,
+            burn_2h: 18,
+            burn_1d: 63,
+            burn_3d: 91,
+            reset_at_unix: Some(1_800_000_000),
+        }]));
+        round_trip(rho_rpc::protocol::Answer::Done(vec![QuotaSeries {
+            model: "opus".into(),
+            auth_namespace: None,
+            points: vec![QuotaPoint {
+                observed_at_ms: 86_400_123,
+                remaining_percent: 24,
+                reset_at_unix: Some(1_800_086_400),
+            }],
+        }]));
+        let bucket = AgentUsageBucket {
+            bucket_start_ms: 3_600_000,
+            input_tokens: 11,
+            cache_read_tokens: 23,
+            cache_write_tokens: 37,
+            cache_write_1h_tokens: 41,
+            output_tokens: 53,
+            requests: 7,
+            approximate: true,
+        };
+        round_trip(rho_rpc::protocol::Answer::Done(vec![AgentUsageSeries {
+            model: "astra".into(),
+            buckets: vec![bucket.clone()],
+        }]));
+        round_trip(rho_rpc::protocol::Answer::Done(vec![AgentCostSeries {
+            agent_id: AgentId::from_counter(7, &rho_agent_types::AgentIdDomain(2)).unwrap(),
+            model: "gpt".into(),
+            buckets: vec![bucket],
+        }]));
+        round_trip(AuthState {
+            namespaces: vec!["work".into(), "personal".into()],
+            disabled_namespaces: vec!["personal".into()],
+            active_namespace: Some("work".into()),
+        });
     }
 
     #[test]
