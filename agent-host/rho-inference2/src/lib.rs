@@ -149,6 +149,11 @@ pub enum Stream<'a> {
 /// A model: one request in, one step out. The caller owns retries.
 pub enum Model {
     OpenAi(openai::OpenAi),
+    /// Credentials come from the host for a workset worker, not its filesystem.
+    OpenAiWithAuth {
+        model: openai::OpenAi,
+        resolve_auth: openai::AuthResolver,
+    },
     Scripted(Arc<scripted::Scripted>),
 }
 
@@ -161,7 +166,11 @@ impl Model {
         stream: &mut (dyn FnMut(Stream<'_>) + Send),
     ) -> anyhow::Result<Step> {
         match self {
-            Model::OpenAi(model) => model.step(request, stream).await,
+            Model::OpenAi(model) => model.step(request, stream, None).await,
+            Model::OpenAiWithAuth {
+                model,
+                resolve_auth,
+            } => model.step(request, stream, Some(resolve_auth)).await,
             Model::Scripted(model) => model.step(request, stream).await,
         }
     }

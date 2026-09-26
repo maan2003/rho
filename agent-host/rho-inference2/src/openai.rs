@@ -5,16 +5,27 @@
 //! instructions are developer items at the head of the input, not top-level
 //! fields.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
+use futures_util::future::BoxFuture;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::{Call, CallId, Carry, EXEC, Image, Inner, Item, Request, Step, Stream, Usage};
+
+/// Resolve named OAuth credentials over a private host channel for each step.
+/// The callback returns only the bearer and account id, never the refresh
+/// secret.
+pub type AuthResolver = Arc<
+    dyn Fn(String) -> BoxFuture<'static, anyhow::Result<rho_inference::ResolvedOAuth>>
+        + Send
+        + Sync,
+>;
 
 pub const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const OPENAI_BETA: &str = "responses_websockets=2026-02-06";
@@ -78,15 +89,12 @@ impl OpenAi {
         &self,
         request: &Request,
         stream: &mut (dyn FnMut(Stream<'_>) + Send),
+        resolve_auth: Option<&AuthResolver>,
     ) -> anyhow::Result<Step> {
         if rustls::crypto::CryptoProvider::get_default().is_none() {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         }
-        let name = self.auth.clone();
-        let credentials = tokio::task::spawn_blocking(move || {
-            rho_inference::InferenceAuth::named(&name)?.resolve_oauth()
-        })
-        .await??;
+        let credentials = self.credentials(resolve_auth).await?;
         let url = format!("{}/codex/responses", self.base_url.trim_end_matches('/'));
         let url = match url.split_once("://") {
             Some(("https", rest)) => format!("wss://{rest}"),
@@ -158,6 +166,20 @@ impl OpenAi {
                 _ => {}
             }
         }
+    }
+
+    async fn credentials(
+        &self,
+        resolve_auth: Option<&AuthResolver>,
+    ) -> anyhow::Result<rho_inference::ResolvedOAuth> {
+        if let Some(resolve_auth) = resolve_auth {
+            return resolve_auth(self.auth.clone()).await;
+        }
+        let name = self.auth.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            rho_inference::InferenceAuth::named(&name)?.resolve_oauth()
+        })
+        .await??)
     }
 
     fn body(&self, request: &Request) -> Value {
@@ -333,6 +355,99 @@ fn step(items: Vec<Value>, usage: &Value) -> Step {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn injected_resolver_is_used_each_step_without_file_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver: AuthResolver = Arc::new({
+            let calls = Arc::clone(&calls);
+            move |name| {
+                assert_eq!(name, "not-a-file/invalid");
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 2 {
+                        anyhow::bail!("host auth channel closed");
+                    }
+                    Ok(rho_inference::ResolvedOAuth {
+                        bearer_token: format!("bearer-{n}"),
+                        account_id: Some(format!("account-{n}")),
+                    })
+                })
+            }
+        });
+        let model = OpenAi {
+            base_url: String::new(),
+            model: String::new(),
+            effort: Effort::Low,
+            auth: "not-a-file/invalid".into(),
+        };
+        for n in 0..2 {
+            let credentials = model.credentials(Some(&resolver)).await.unwrap();
+            assert_eq!(credentials.bearer_token, format!("bearer-{n}"));
+            assert_eq!(
+                credentials.account_id.as_deref(),
+                Some(format!("account-{n}").as_str())
+            );
+        }
+        let error = model.credentials(Some(&resolver)).await.unwrap_err();
+        assert_eq!(error.to_string(), "host auth channel closed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn model_routes_host_auth_into_request_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    assert_eq!(request.headers()["authorization"], "Bearer ephemeral");
+                    assert_eq!(request.headers()["chatgpt-account-id"], "account-9");
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let _request = socket.next().await.unwrap().unwrap();
+            socket
+                .send(WsMessage::Text(
+                    r#"{"type":"response.completed","response":{"usage":{}}}"#.into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let model = crate::Model::OpenAiWithAuth {
+            model: OpenAi {
+                base_url: format!("http://{addr}"),
+                model: "test".into(),
+                effort: Effort::Low,
+                auth: "not-a-file/invalid".into(),
+            },
+            resolve_auth: Arc::new(|name| {
+                assert_eq!(name, "not-a-file/invalid");
+                Box::pin(async {
+                    Ok(rho_inference::ResolvedOAuth {
+                        bearer_token: "ephemeral".into(),
+                        account_id: Some("account-9".into()),
+                    })
+                })
+            }),
+        };
+        let request = Request {
+            instructions: "test".into(),
+            items: Vec::new(),
+            cache_key: crate::CacheKey::new(),
+        };
+        tokio::time::timeout(Duration::from_secs(2), model.step(&request, &mut |_| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
     /// Against the real endpoint, with the `default` credentials:
     /// `cargo test -p rho-inference2 -- --ignored`.
     #[tokio::test]
@@ -354,11 +469,15 @@ mod tests {
         };
         let mut pieces = Vec::new();
         let step = model
-            .step(&request, &mut |piece| {
-                if let Stream::Code(code) = piece {
-                    pieces.push(code.to_owned());
-                }
-            })
+            .step(
+                &request,
+                &mut |piece| {
+                    if let Stream::Code(code) = piece {
+                        pieces.push(code.to_owned());
+                    }
+                },
+                None,
+            )
             .await
             .unwrap();
         let code = step.call.unwrap().code;
