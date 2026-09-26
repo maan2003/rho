@@ -157,6 +157,130 @@ async fn drive_claude(
     result.and(cleanup)
 }
 
+/// The agent2 loop uses the same workset namespace and policy channel as the
+/// legacy loops, but its own append-only log and chat projection.
+async fn drive_chat(
+    agent: rho_agent_types::AgentId,
+    bootstrap: ipc::ChatBootstrap,
+    base: Arc<crate::View>,
+    policy: Arc<super::policy::Host>,
+    sender: super::transport::Sender,
+    base_url: String,
+    mut incoming: tokio::sync::mpsc::UnboundedReceiver<super::transport::Packet>,
+) -> anyhow::Result<()> {
+    use rho_agent2::agent::{Agent as ChatAgent, Config, Inbound, Trace};
+    use rho_agent2::log::{Block, Log};
+    use rho_inference::InferenceHost as _;
+    use rho_inference2::Model;
+    use rho_inference2::openai::{AuthResolver, Effort, OpenAi};
+
+    let port = super::transport::Port::Agent(agent);
+    let setup = (|| {
+        let cwd = base.for_cwd(&bootstrap.cwd)?;
+        let path = base
+            .state_dir()
+            .join("agents")
+            .join(agent.encoded())
+            .join("log");
+        std::fs::create_dir_all(path.parent().expect("agent log parent"))?;
+        let resolve_auth: AuthResolver = Arc::new(move |_name| {
+            let policy = policy.clone();
+            Box::pin(async move {
+                let (_, auth) = policy.select_resolved().await?;
+                Ok(rho_inference::ResolvedOAuth {
+                    bearer_token: auth.bearer_token,
+                    account_id: auth.account_id,
+                })
+            })
+        });
+        let model = Arc::new(Model::OpenAiWithAuth {
+            model: OpenAi {
+                base_url,
+                model: bootstrap.model,
+                effort: bootstrap
+                    .effort
+                    .parse::<Effort>()
+                    .map_err(anyhow::Error::msg)?,
+                auth: "default".into(),
+            },
+            resolve_auth,
+        });
+        ChatAgent::new(Config {
+            id: agent,
+            log: Log::open(path.as_std_path())?,
+            model,
+            shell: rho_tool_shell::ShellTools::new(std::time::Duration::from_secs(20), cwd),
+            instructions: rho_agent2::prompt::INSTRUCTIONS.into(),
+        })
+    })();
+    let (runtime, handle) = match setup {
+        Ok(pair) => {
+            sender
+                .send(port, ipc::encode(&Message::ChatStarted { error: None })?)
+                .await?;
+            pair
+        }
+        Err(error) => {
+            sender
+                .send(
+                    port,
+                    ipc::encode(&Message::ChatStarted {
+                        error: Some(format!("{error:#}")),
+                    })?,
+                )
+                .await?;
+            return Err(error);
+        }
+    };
+    let mut chat = handle.chat();
+    let mut trace = handle.trace();
+    let mut running = Box::pin(runtime.run());
+    let result = loop {
+        tokio::select! {
+            result = &mut running => break result,
+            packet = incoming.recv() => {
+                let packet = packet.context("agent port closed")?;
+                match ipc::decode(&packet.bytes)? {
+                    Message::ChatSend { from, text } => handle.send(Inbound { from, body: vec![Block::Text(text)] })?,
+                    Message::ChatArchive => handle.archive(),
+                    Message::Stop => {
+                        drop(handle);
+                        // The notebook can still be running an admitted cell.
+                        break tokio::time::timeout(std::time::Duration::from_secs(5), &mut running).await
+                            .context("agent2 notebook did not stop")?;
+                    }
+                    _ => anyhow::bail!("unexpected agent2 control"),
+                }
+            }
+            event = chat.recv() => match event {
+                Ok(event) => sender.send(port, ipc::encode(&Message::Chat { event })?).await?,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+            },
+            event = trace.recv() => match event {
+                Ok(Trace::ArchiveState { archived }) => sender.send(port, ipc::encode(&Message::ChatArchived { archived })?).await?,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+            },
+        }
+    };
+    // `run` may finish immediately after publishing its final event. Deliver
+    // those buffered events before Stopped makes the host release this route.
+    while let Ok(event) = chat.try_recv() {
+        sender
+            .send(port, ipc::encode(&Message::Chat { event })?)
+            .await?;
+    }
+    while let Ok(event) = trace.try_recv() {
+        if let Trace::ArchiveState { archived } = event {
+            sender
+                .send(port, ipc::encode(&Message::ChatArchived { archived })?)
+                .await?;
+        }
+    }
+    result
+}
+
 pub(super) async fn run(
     socket: UnixStream,
     startup: super::process::Startup,
@@ -319,14 +443,38 @@ pub(super) async fn run(
             Ok(message) => message,
             Err(error) => break Err(error.into()),
         };
-        let Message::Bootstrap(bootstrap) = message else {
+        if !matches!(message, Message::Bootstrap(_) | Message::ChatBootstrap(_)) {
             // The old agent has drained. Late service replies have no consumer.
             continue;
-        };
+        }
         let (incoming, messages) = tokio::sync::mpsc::unbounded_channel();
         agents.lock().expect("poison").insert(agent, incoming);
         let agents = agents.clone();
         let sender = sender.clone();
+        if let Message::ChatBootstrap(chat) = message {
+            let agents = agents.clone();
+            let base = base.clone();
+            let policy = policy.clone();
+            let url = startup.responses_base_url.clone();
+            tasks.spawn(async move {
+                let result =
+                    drive_chat(agent, chat, base, policy, sender.clone(), url, messages).await;
+                agents.lock().expect("poison").remove(&agent);
+                let _ = sender
+                    .send(
+                        packet.port,
+                        ipc::encode(&Message::Stopped {
+                            error: result.err().map(|error| format!("{error:#}")),
+                        })
+                        .expect("encode stopped"),
+                    )
+                    .await;
+            });
+            continue;
+        }
+        let Message::Bootstrap(bootstrap) = message else {
+            unreachable!("checked bootstrap")
+        };
         let host = Host::connect(sender.clone(), packet.port, messages, next.clone());
         let base = base.clone();
         let claude = startup.claude.clone();

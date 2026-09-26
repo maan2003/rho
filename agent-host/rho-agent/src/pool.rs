@@ -262,6 +262,18 @@ impl AgentPool {
         processes
     }
 
+    pub(crate) async fn chat_admission(
+        &self,
+        workset: &str,
+    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.execution_slot(workset)
+            .await
+            .admission
+            .clone()
+            .read_owned()
+            .await
+    }
+
     pub(crate) async fn process(
         self: &Arc<Self>,
         view: &crate::View,
@@ -936,6 +948,12 @@ impl AgentPool {
                 );
             }
             let ids = records.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
+                anyhow::ensure!(
+                    !process.has_unmanaged_agents(&ids),
+                    "stop agent2 loops in this workset before changing its mode"
+                );
+            }
             let locks = {
                 let mut locks = pool.load_locks.lock().await;
                 ids.iter()
@@ -1105,6 +1123,10 @@ mod tests {
             .unwrap()
             .ancestors()
             .map(|path| path.join("rho-agent-worker"))
+            .chain(std::iter::once(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/debug/rho-agent-worker"),
+            ))
             .find(|path| path.is_file())
             .expect("build rho-agent-worker before the pool process test")
             .canonicalize()
@@ -1157,6 +1179,141 @@ mod tests {
         )
         .await;
         (pool, view)
+    }
+
+    #[tokio::test]
+    async fn agent2_reuses_workset_process_and_publishes_archive_before_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, view) = test_pool(directory.path()).await;
+        let (legacy_id, legacy) = pool
+            .create(
+                Default::default(),
+                None,
+                StartPlace::new(view.clone(), None),
+            )
+            .await
+            .unwrap();
+        let place = Place {
+            workset: view.workset_id().to_owned(),
+            cwd: view.cwd().to_owned(),
+            mode: view.workset_mode(),
+            origin: None,
+        };
+        let id = AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(7)).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let callback = Arc::new(move |event| {
+            let _ = events.send(event);
+        });
+        let remote = crate::worker::ChatRemote::start(
+            &pool,
+            &place,
+            id,
+            "gpt-5".into(),
+            "low".into(),
+            callback,
+        )
+        .await
+        .unwrap();
+        let process = pool.process(&view).await.unwrap();
+        assert!(
+            view.state_dir()
+                .join("agents")
+                .join(id.encoded())
+                .join("log")
+                .exists()
+        );
+        let duplicate = crate::worker::ChatRemote::start(
+            &pool,
+            &place,
+            id,
+            "gpt-5".into(),
+            "low".into(),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert!(
+            duplicate
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("already registered")
+        );
+        assert!(!*process.closed.borrow());
+        let mode_change = pool.change_mode(legacy_id, WorksetMode::Exposed).await;
+        assert!(
+            mode_change
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("agent2 loops")
+        );
+        assert!(!*process.closed.borrow());
+        remote.archive().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            crate::worker::ChatWorkerEvent::Archived(true)
+        ));
+        let peer = AgentId::from_counter(2, &rho_agent_types::AgentIdDomain(7)).unwrap();
+        remote
+            .send(rho_agent2::log::Party::Agent(peer), "hello".into())
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            crate::worker::ChatWorkerEvent::Chat(event) => {
+                assert!(matches!(event.kind, rho_agent2::chat::ChatKind::Message {
+                    from: rho_agent2::log::Party::Agent(from),
+                    to: rho_agent2::log::Party::Agent(to),
+                    body,
+                    ..
+                } if from == peer && to == id && body == vec![rho_agent2::log::Block::Text("hello".into())]));
+            }
+            _ => panic!("expected received chat event"),
+        }
+        remote.shutdown().await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event,
+            crate::worker::ChatWorkerEvent::Stopped(None)
+        ));
+        assert!(!*process.closed.borrow());
+        // Log::open can truncate a torn tail; reopen only after the worker stops.
+        let log = rho_agent2::log::Log::open(
+            view.state_dir()
+                .join("agents")
+                .join(id.encoded())
+                .join("log")
+                .as_std_path(),
+        )
+        .unwrap();
+        assert!(log.entries().iter().any(|entry| matches!(
+            entry,
+            rho_agent2::log::Entry::Notice {
+                notice: rho_agent2::log::Notice::Archived,
+                ..
+            }
+        )));
+        assert!(log.entries().iter().any(|entry| matches!(entry,
+            rho_agent2::log::Entry::Received { from: rho_agent2::log::Party::Agent(from), body, .. }
+                if *from == peer && body == &vec![rho_agent2::log::Block::Text("hello".into())]
+        )));
+        drop(log);
+        drop(legacy);
+        let changed = pool
+            .change_mode(legacy_id, WorksetMode::Exposed)
+            .await
+            .unwrap();
+        assert!(changed.contains(&legacy_id));
+        assert!(*process.closed.borrow());
     }
 
     #[tokio::test]

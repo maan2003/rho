@@ -39,6 +39,14 @@ impl Drop for Process {
 }
 
 impl Process {
+    pub(crate) fn has_unmanaged_agents(&self, legacy: &[rho_agent_types::AgentId]) -> bool {
+        self.agents
+            .lock()
+            .expect("poison")
+            .keys()
+            .any(|id| !legacy.contains(id))
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_agent_service(&self, agent: rho_agent_types::AgentId) {
         self.agents.lock().expect("poison").remove(&agent);

@@ -14,7 +14,7 @@ pub use workset::{
 mod runtime;
 mod services;
 pub(crate) use ipc::{Host, SharedCall, StoreError};
-pub use remote::Remote;
+pub use remote::{ChatRemote, ChatWorkerEvent, Remote};
 
 #[cfg(test)]
 pub(crate) fn local_services(

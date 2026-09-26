@@ -13,11 +13,18 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 7;
+pub(super) const VERSION: u32 = 8;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
     pub cwd: camino::Utf8PathBuf,
+}
+
+#[derive(Encode, Decode)]
+pub(super) struct ChatBootstrap {
+    pub cwd: camino::Utf8PathBuf,
+    pub model: String,
+    pub effort: String,
 }
 
 #[derive(Encode, Decode)]
@@ -152,6 +159,21 @@ pub(super) enum Message<'a> {
     Reply {
         id: u64,
         body: Reply,
+    },
+    ChatBootstrap(ChatBootstrap),
+    ChatStarted {
+        error: Option<String>,
+    },
+    ChatSend {
+        from: rho_agent2::log::Party,
+        text: String,
+    },
+    ChatArchive,
+    Chat {
+        event: rho_agent2::chat::ChatEvent,
+    },
+    ChatArchived {
+        archived: bool,
     },
 }
 
@@ -302,7 +324,13 @@ impl Host {
                         | Message::Status { .. }
                         | Message::Bootstrap(_)
                         | Message::Ready { .. }
-                        | Message::Controlled { .. } => {
+                        | Message::Controlled { .. }
+                        | Message::ChatBootstrap(_)
+                        | Message::ChatStarted { .. }
+                        | Message::ChatSend { .. }
+                        | Message::ChatArchive
+                        | Message::Chat { .. }
+                        | Message::ChatArchived { .. } => {
                             return Err::<(), _>(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "unexpected worker request",

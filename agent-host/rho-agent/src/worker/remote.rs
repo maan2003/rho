@@ -281,3 +281,148 @@ impl Remote {
         Ok(())
     }
 }
+
+/// What the host can observe from the agent2 loop in this workset.
+pub enum ChatWorkerEvent {
+    Chat(rho_agent2::chat::ChatEvent),
+    Archived(bool),
+    Stopped(Option<String>),
+}
+
+/// An agent2 loop on the existing workset process and agent port.
+#[derive(Clone)]
+pub struct ChatRemote(Arc<ChatInner>);
+
+struct ChatInner {
+    commands: tokio::sync::mpsc::UnboundedSender<ipc::Message<'static>>,
+    stop: Mutex<Option<oneshot::Sender<()>>>,
+    closed: watch::Receiver<bool>,
+}
+
+impl ChatInner {
+    fn stop(&self) {
+        if let Some(stop) = self.stop.lock().expect("poison").take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for ChatInner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl ChatRemote {
+    pub async fn start(
+        pool: &Arc<crate::pool::AgentPool>,
+        place: &rho_agent_types::Place,
+        id: AgentId,
+        model: String,
+        effort: String,
+        on_event: Arc<dyn Fn(ChatWorkerEvent) + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        // Mode changes hold the write side through process replacement.
+        let _admission = pool.chat_admission(&place.workset).await;
+        let view = pool.materialize_view(place).await?;
+        let process = pool.process(&view).await?;
+        let (route, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut agents = process.agents.lock().expect("poison");
+            anyhow::ensure!(!agents.contains_key(&id), "agent port already registered");
+            agents.insert(id, route);
+        }
+        let (commands, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop, mut stopping) = oneshot::channel();
+        let (closed, closed_rx) = watch::channel(false);
+        let (ready, started) = oneshot::channel();
+        let handle = Self(Arc::new(ChatInner {
+            commands,
+            stop: Mutex::new(Some(stop)),
+            closed: closed_rx,
+        }));
+        let cwd = place.cwd.clone();
+        tokio::spawn(async move {
+            let port = super::transport::Port::Agent(id);
+            let result = async {
+                process.sender.send(port, ipc::encode(&ipc::Message::ChatBootstrap(
+                    ipc::ChatBootstrap { cwd, model, effort },
+                ))?).await?;
+                let mut ready = Some(ready);
+                let mut stopping_requested = false;
+                let mut stop_deadline = tokio::time::Instant::now();
+                loop {
+                    let packet = tokio::select! {
+                        biased;
+                        _ = &mut stopping, if !stopping_requested => {
+                            stopping_requested = true;
+                            stop_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                            process.sender.send(port, ipc::encode(&ipc::Message::Stop)?).await?;
+                            continue;
+                        }
+                        _ = tokio::time::sleep_until(stop_deadline), if stopping_requested => {
+                            anyhow::bail!("agent2 worker did not stop");
+                        }
+                        command = command_rx.recv(), if !stopping_requested => {
+                            let Some(command) = command else { anyhow::bail!("agent2 commands closed"); };
+                            process.sender.send(port, ipc::encode(&command)?).await?;
+                            continue;
+                        }
+                        packet = incoming.recv() => packet.context("agent port closed")?,
+                    };
+                    match ipc::decode(&packet.bytes)? {
+                        ipc::Message::ChatStarted { error } => {
+                            let answer = error.map_or(Ok(()), |error| Err(anyhow::anyhow!(error)));
+                            if let Some(ready) = ready.take() { let _ = ready.send(answer); }
+                        }
+                        ipc::Message::Chat { event } => on_event(ChatWorkerEvent::Chat(event)),
+                        ipc::Message::ChatArchived { archived } => on_event(ChatWorkerEvent::Archived(archived)),
+                        ipc::Message::Stopped { error } => {
+                            on_event(ChatWorkerEvent::Stopped(error));
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        _ => anyhow::bail!("unexpected agent2 worker message"),
+                    }
+                }
+            }.await;
+            process.agents.lock().expect("poison").remove(&id);
+            if let Err(error) = result {
+                on_event(ChatWorkerEvent::Stopped(Some(format!("{error:#}"))));
+                process.stop();
+                let _ = process.closed.clone().wait_for(|closed| *closed).await;
+            }
+            closed.send_replace(true);
+        });
+        let result = tokio::time::timeout(Duration::from_secs(30), started)
+            .await
+            .context("agent2 startup timed out")
+            .and_then(|result| result.context("agent2 workset closed before startup"))
+            .and_then(|result| result);
+        if let Err(error) = result {
+            handle.shutdown().await;
+            return Err(error);
+        }
+        Ok(handle)
+    }
+
+    pub fn send(&self, from: rho_agent2::log::Party, text: String) -> anyhow::Result<()> {
+        anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
+        self.0
+            .commands
+            .send(ipc::Message::ChatSend { from, text })
+            .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
+    }
+
+    pub fn archive(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
+        self.0
+            .commands
+            .send(ipc::Message::ChatArchive)
+            .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
+    }
+
+    pub async fn shutdown(&self) {
+        self.0.stop();
+        let _ = self.0.closed.clone().wait_for(|closed| *closed).await;
+    }
+}
