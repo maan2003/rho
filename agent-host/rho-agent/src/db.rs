@@ -169,6 +169,21 @@ impl AgentUsageModel {
             _ => "unknown",
         }
     }
+
+    /// The model [`Self::name`] names.
+    pub fn named(name: &str) -> Self {
+        [
+            Self::GPT,
+            Self::FABLE,
+            Self::OPUS,
+            Self::TERRA,
+            Self::LUNA,
+            Self::ASTRA,
+        ]
+        .into_iter()
+        .find(|model| model.name() == name)
+        .unwrap_or(Self::UNKNOWN)
+    }
 }
 
 impl Default for AgentUsageModel {
@@ -1447,7 +1462,10 @@ fn carries_notice(event: &AgentEvent<'_>) -> bool {
         }) | AgentEvent::Transcript {
             line: crate::TranscriptLine::User { .. },
             ..
-        }
+        } | AgentEvent::Entry(crate::entry::Entry::Received {
+            from: crate::entry::Party::Human,
+            ..
+        })
     )
 }
 
@@ -1602,6 +1620,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::ExecObserved { .. }
         | AgentEvent::Native(_)
         | AgentEvent::Failed { .. }
+        | AgentEvent::Entry(_)
         | AgentEvent::Transcript { .. } => {}
     }
 }

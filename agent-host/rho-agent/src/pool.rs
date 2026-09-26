@@ -1474,10 +1474,18 @@ mod tests {
                     .1
                     .into_iter()
                     .filter_map(|(_, event)| match event {
-                        crate::AgentEvent::Accepted(crate::QueuedInput {
-                            kind: crate::InputKind::Message { content },
+                        crate::AgentEvent::Entry(crate::entry::Entry::Received {
+                            from: crate::entry::Party::Agent(_),
+                            body,
                             ..
-                        }) => Some(rho_inference::types::text_content(&content)),
+                        }) => Some(
+                            body.iter()
+                                .filter_map(|block| match block {
+                                    crate::entry::Block::Text(text) => Some(text.as_str()),
+                                    crate::entry::Block::Image(_) => None,
+                                })
+                                .collect::<String>(),
+                        ),
                         _ => None,
                     })
                     .collect::<Vec<_>>();

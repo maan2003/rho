@@ -1079,6 +1079,24 @@ fn agent_detail(
         };
     }
     match event {
+        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Woken { results, .. })) => {
+            DetailBody::Results(
+                results
+                    .into_iter()
+                    .map(
+                        |result| rho_agents_client::protocol::transcript::DetailResult {
+                            id: result.id.as_str().to_owned(),
+                            status: rho_agents_client::protocol::transcript::ToolStatus::Success,
+                            output: result.text,
+                            error: None,
+                        },
+                    )
+                    .collect(),
+            )
+        }
+        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step {
+            prose, calls, ..
+        })) => DetailBody::Response(crate::transcript::step_items(&prose, &calls)),
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
                 (!text.is_empty())

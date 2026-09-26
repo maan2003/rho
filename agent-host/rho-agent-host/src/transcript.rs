@@ -5,6 +5,7 @@
 //! the one place they become the client's words.
 
 use rho_agent::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
+use rho_agent::entry::{Block, Entry, Notice, Party, Wake};
 use rho_agent::{AgentEvent, InputKind, QueuedInput};
 use rho_agent_types::{PresentationField, UnixMs};
 use rho_agents_client::protocol::transcript::{
@@ -278,7 +279,134 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<TranscriptEvent> {
             to: (*to).into(),
             at: *at,
         },
+        AgentEvent::Entry(entry) => return strip_entry(entry),
     })
+}
+
+/// The Rho runtime's rows, in the words a reader already knows: a received
+/// message is a message, a wake the request that carried the queue, a step
+/// the model's reply, and what it sends the person a final answer.
+fn strip_entry(entry: &Entry) -> Option<TranscriptEvent> {
+    Some(match entry {
+        Entry::Received { from, body, at, .. } => TranscriptEvent::Message {
+            from: match from {
+                Party::Human => None,
+                Party::Agent(id) => Some(*id),
+            },
+            text: body
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Text(text) => Some(text.as_str()),
+                    Block::Image(_) => None,
+                })
+                .collect(),
+            delivery: rho_agent_types::MessageDelivery::NextRequest,
+            at: *at,
+        },
+        Entry::Woken {
+            why, results, at, ..
+        } => TranscriptEvent::Sent {
+            results: results
+                .iter()
+                .map(|result| ToolOutcome {
+                    id: result.id.as_str().to_owned(),
+                    status: ToolStatus::Success,
+                    started_at: *at,
+                    finished_at: *at,
+                })
+                .collect(),
+            compaction: *why == Wake::Compaction,
+            at: *at,
+        },
+        Entry::Step {
+            calls,
+            prose,
+            carry,
+            usage,
+            at,
+        } => TranscriptEvent::Replied {
+            items: step_items(prose, calls),
+            compacted: carry.has_compaction(),
+            usage: None,
+            context_used: (usage.input_tokens > 0)
+                .then(|| usage.input_tokens.saturating_add(usage.output_tokens)),
+            at: *at,
+        },
+        // Cost rides on a reply of its own, which shows nothing.
+        Entry::Usage { usage, at } => TranscriptEvent::Replied {
+            items: Vec::new(),
+            compacted: false,
+            usage: Some(Usage {
+                model: usage.model.clone(),
+                input_tokens: usage.input_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                cache_write_1h_tokens: usage.cache_write_1h_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            context_used: None,
+            at: *at,
+        },
+        Entry::Sent {
+            to: Party::Human,
+            text,
+            at,
+            ..
+        } => TranscriptEvent::Replied {
+            items: vec![Item::Text {
+                text: text.clone(),
+                phase: Some(rho_agents_client::protocol::transcript::TextPhase::FinalAnswer),
+            }],
+            compacted: false,
+            usage: None,
+            context_used: None,
+            at: *at,
+        },
+        Entry::Sent { .. } => return None,
+        Entry::Status { text, at } => TranscriptEvent::Presented {
+            title: PresentationField::Unchanged,
+            activity: PresentationField::Set(text.clone()),
+            at: *at,
+        },
+        Entry::Awaiting { .. } => return None,
+        Entry::Notice {
+            notice: Notice::Error(error),
+            at,
+        } => TranscriptEvent::Failed {
+            text: String::new(),
+            error: error.clone(),
+            retrying: true,
+            at: *at,
+        },
+        Entry::Notice { notice, at } => TranscriptEvent::Notice {
+            text: match notice {
+                Notice::Restarted => "rho restarted; the notebook was lost",
+                Notice::Archived => "archived",
+                Notice::FreshNotebook => "started a fresh notebook",
+                Notice::Error(_) => unreachable!("matched above"),
+            }
+            .to_owned(),
+            at: *at,
+        },
+        Entry::CompactionTrigger { at, .. } => TranscriptEvent::CompactionRequested { at: *at },
+    })
+}
+
+/// A step's visible items: the prose it wrote, then its calls.
+pub(crate) fn step_items(prose: &str, calls: &[rho_inference2::Call]) -> Vec<Item> {
+    (!prose.trim().is_empty())
+        .then(|| Item::Text {
+            text: prose.to_owned(),
+            phase: Some(rho_agents_client::protocol::transcript::TextPhase::Commentary),
+        })
+        .into_iter()
+        .chain(calls.iter().map(|call| Item::ToolCall {
+            id: call.id.as_str().to_owned(),
+            name: rho_inference2::EXEC.to_owned(),
+            arguments: call.code.clone(),
+            format: ArgumentsFormat::Text,
+        }))
+        .collect()
 }
 
 fn tool_outcome(result: &rho_inference::types::ToolResult) -> ToolOutcome {

@@ -86,7 +86,7 @@ pub fn worker_main() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-pub(super) mod testing {
+pub(crate) mod testing {
     use super::*;
     pub struct Endpoint {
         pub(super) sender: transport::Sender,
@@ -163,6 +163,23 @@ pub(super) mod testing {
         pub(super) async fn write(&self, message: &ipc::Message<'_>) -> std::io::Result<()> {
             self.sender.send(self.port, ipc::encode(message)?).await
         }
+    }
+    /// A worker host backed by the agent host's real services for `agent`.
+    pub(crate) fn served(
+        db: rho_db::RhoDb,
+        inference: rho_inference::Inference,
+        agent: rho_agent_types::AgentId,
+    ) -> std::sync::Arc<Host> {
+        let services = std::sync::Arc::new(services::Services::new(
+            db,
+            inference,
+            agent,
+            Default::default(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        ));
+        let (client, server) = pair();
+        tokio::spawn(services.serve(server.sender, server.port, server.incoming));
+        client.host()
     }
     pub fn pair() -> (Endpoint, Endpoint) {
         let (left, right) = tokio::net::UnixStream::pair().unwrap();

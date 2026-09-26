@@ -12538,6 +12538,8 @@ dependencies = [
  "rho-fs-view",
  "rho-image",
  "rho-inference",
+ "rho-inference2",
+ "rho-notebook2",
  "rho-rpc",
  "rho-shell",
  "rho-shell-view",
@@ -12595,6 +12597,7 @@ dependencies = [
  "rho-fs-view",
  "rho-image",
  "rho-inference",
+ "rho-inference2",
  "rho-iroh-auth",
  "rho-ledger-server",
  "rho-openai-realtime",
@@ -13173,6 +13176,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-inference2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "rho-inference",
+ "rustls",
+ "senax-encoder",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "uuid",
+]
+
+[[package]]
 name = "rho-iroh-auth"
 version = "0.1.0"
 dependencies = [
@@ -13241,6 +13261,20 @@ dependencies = [
  "rho-db",
  "rho-ledger",
  "rho-rpc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rho-notebook2"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "libc",
+ "pyo3",
+ "rho-agent-types",
+ "rho-fs-view",
+ "rho-tool-shell",
  "tempfile",
  "tokio",
 ]

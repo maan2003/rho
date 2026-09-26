@@ -393,6 +393,25 @@ impl Services {
                             * crate::db::AGENT_USAGE_BUCKET_MS;
                         write.add_agent_usage(self.agent, &usage);
                     }
+                    if let crate::AgentEvent::Entry(crate::entry::Entry::Usage { usage, at }) =
+                        event
+                    {
+                        write.add_agent_usage(
+                            self.agent,
+                            &crate::db::AgentUsageBucket {
+                                bucket_start_ms: at.0 / crate::db::AGENT_USAGE_BUCKET_MS
+                                    * crate::db::AGENT_USAGE_BUCKET_MS,
+                                model: crate::db::AgentUsageModel::named(&usage.model),
+                                input_tokens: usage.input_tokens,
+                                cache_read_tokens: usage.cache_read_tokens,
+                                cache_write_tokens: usage.cache_write_tokens,
+                                cache_write_1h_tokens: usage.cache_write_1h_tokens,
+                                output_tokens: usage.output_tokens,
+                                requests: 1,
+                                approximate: false,
+                            },
+                        );
+                    }
                 }
                 write.commit();
                 Reply::Done

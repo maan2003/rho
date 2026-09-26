@@ -1,22 +1,18 @@
-//! The Rho runtime: an agent loop built around one question, asked after
-//! every event:
+//! The Rho runtime: one agent's log, its notebook, and the loop that wakes
+//! the model.
 //!
-//! > *Should the next request start now?*
-//!
-//! The `boundary` module answers it. Everything here is mechanism — spawning,
-//! draining, persisting, publishing — and the transcript's sole writer. The
-//! loop writes the agent's raw log and, beside it, the story a reader gets
-//! records what each response cost, and keeps the
-//! presentation sidecar fed.
-//!
-//! `specs/ARCH-rho-agent.md` has the shape and the invariants.
+//! The loop does three things, over and over: record what arrives (messages
+//! from outside, and what the notebook sends out), ask [`wake::decide`]
+//! whether the model should look, and if so wake it with a report and run
+//! the cell it answers with. The model answers every wake with one `exec`
+//! call and speaks to the person only through `human.send`.
 
 mod context;
+mod mailroom;
 mod persistence;
-pub(crate) mod replay;
-#[cfg(test)]
-mod rotation_tests;
-mod streaming;
+mod tools;
+mod wake;
+
 #[cfg(test)]
 mod tests;
 
@@ -26,118 +22,33 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rho_agent_types::{
-    AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, ToolOutputStatus,
-    TurnEdge, TurnOutcome, UnixMs,
+    AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery, TurnEdge, TurnOutcome,
+    UnixMs,
 };
-#[cfg(test)]
-use rho_db::RhoDb;
-use rho_inference::config::{InferenceModel, InferenceProfile};
-use rho_inference::types::{
-    ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem, MessageSender,
-    PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId, ToolName, ToolOutput,
-};
-use rho_inference::{Inference, InferenceSession, PromptCacheKey};
+use rho_inference::Inference;
+use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
+use rho_inference::types::{PendingInferenceResponse, ToolCall, ToolName, ToolType};
+use rho_inference2::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
+use rho_notebook2::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::boundary::{
-    Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
-};
-use crate::db::{
-    AgentHead, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentUsageModel,
-    UnixMillis,
-};
-#[cfg(test)]
-use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
+use self::mailroom::{Mailroom, Outbound};
+use self::wake::{Decision, Facts};
+use crate::db::{AgentHead, AgentRoleSessionProfile as _, AgentRuntime, UnixMillis};
+use crate::entry::{Block, CallResult, Entry, MessageId, Notice, Party, ResponseUsage, Wake};
 use crate::lazy::Lazy;
-use crate::multi_agent_tools::Team;
-use crate::native::NativeEvent;
-use crate::python::Cells;
-use crate::python::host::host_tools;
 use crate::{
-    AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
-    ToolPreview, View, final_answer_text, prompt,
+    AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, ToolPreview, View, prompt,
 };
 
-/// Whether the model's turn made a call it is waiting on. Only the notebook
-/// says anything about pacing, through `set_max_wait` inside the call.
-
-// -- what is waiting to reach the model -------------------------------------
-//
-// A queue accumulates on its own and is *pulled* by the agent at a moment the
-// agent chooses; nothing here starts a request.
-// `DECISION-pull-based-sources`.
-
-/// A piece of mail, once the queue has it. Who sent it lives on the message,
-/// because that is where it varies: everyone's mail is one queue, since the
-/// decision reads it as one — the oldest across every sender is the wait being
-/// spent, and the newest across every sender is the burst that might still be
-/// going.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct MailItem {
-    pub sender: AgentId,
-    pub content: Vec<ContentPart>,
-    pub at: UnixMs,
-}
-
-/// The session-lifetime tools and prompt ingredients, built from the
-/// agent's workdirs once they are materialized. Lazy because a load must not
-/// fail on a workdir that has gone: a reader still gets the transcript, and
-/// only a turn needs the tools.
-struct Surface {
-    notebook: Arc<crate::python::PythonNotebook>,
-    prompt: PromptInputs,
-}
-
-/// Role-independent ingredients; rendering instructions never rebuilds tools.
-struct PromptInputs {
-    view: Arc<View>,
-    host: Option<Arc<crate::worker::Host>>,
-}
-
-struct Instructions {
-    text: Arc<str>,
-}
-
-impl PromptInputs {
-    async fn render(&self, role: AgentRole) -> anyhow::Result<Instructions> {
-        let team = match &self.host {
-            Some(host) => host.team().await?,
-            None => None,
-        };
-        let text = prompt::prompt(&self.view, team.as_ref(), role);
-        Ok(Instructions { text })
-    }
-}
-
-/// Inputs consumed by the session's lazy tool initialization.
-#[derive(Clone)]
-struct SurfaceInputs {
-    view: Arc<Lazy<Arc<View>>>,
-    agent_id: AgentId,
-    inference: Inference,
-    host: Arc<crate::worker::Host>,
-}
-
-impl SurfaceInputs {
-    fn lazy(&self, role: AgentRole) -> Arc<Lazy<Surface>> {
-        let inputs = self.clone();
-        Arc::new(Lazy::new(move || {
-            let inputs = inputs.clone();
-            async move {
-                let view = Arc::clone(inputs.view.get().await?);
-                let team = inputs.host.team().await?;
-                surface(
-                    view,
-                    role,
-                    inputs.agent_id,
-                    Some(&inputs.inference),
-                    team.as_ref(),
-                    Some(&inputs.host),
-                )
-            }
-        }))
-    }
-}
+/// Failed model requests in a row before the agent stops until someone
+/// writes or retries.
+const MAX_FAILURES: u32 = 3;
+/// Steps in a row without a call before the same.
+const MAX_PROSE: u32 = 3;
+/// Responses Lite's automatic provider-compaction threshold for the GPT-6
+/// models.
+const AUTO_COMPACT_TOKENS: u64 = 232_560;
 
 /// Cheap clonable handle for observing and driving a running agent.
 #[derive(Clone)]
@@ -153,86 +64,6 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
-    #[allow(clippy::too_many_arguments)]
-    fn start(
-        host: Arc<crate::worker::Host>,
-        inference: Inference,
-        profile: InferenceProfile,
-        model: InferenceModel,
-        role: AgentRole,
-        prompt_cache_key: PromptCacheKey,
-        agent_id: AgentId,
-        view: Arc<Lazy<Arc<View>>>,
-        replayed: replay::Replayed,
-        head: AgentHead,
-        total_usage: AgentUsageBucket,
-        admitted: std::collections::HashSet<ToolCallId>,
-    ) -> (Self, Agent) {
-        let session = inference.deep_session(profile, model, prompt_cache_key);
-        let name_updates = host.names();
-        let surface_inputs = SurfaceInputs {
-            view: Arc::clone(&view),
-            agent_id,
-            inference,
-            host: host.clone(),
-        };
-        let status = Arc::new(RwLock::new(AgentStatus {
-            kind: AgentStateKind::Idle,
-            queued: 0,
-        }));
-        let head = Arc::new(RwLock::new(head));
-        let (control, control_rx) = mpsc::unbounded_channel();
-        host.observe(&status);
-        let wake = Arc::new(Notify::new());
-        let mut agent = Agent {
-            writer: persistence::Writer::new(host.clone()),
-            pending_events: Vec::new(),
-            admitted,
-            host,
-            surface: surface_inputs.lazy(role),
-            model,
-            context: replayed.context,
-            provider_history: Some(replayed.history),
-            usage_caps: replayed.usage_caps,
-            session,
-            // The same phase a fresh agent starts in. Being loaded from a
-            // log is not its own kind of state, and coming up is never by
-            // itself a reason to send:
-            // `DECISION-a-restart-does-not-resume-by-itself`.
-            phase: Phase::Idle {
-                owed: replayed.owed,
-                standing: Standing::Nothing,
-            },
-            user: replayed.user,
-            mail: replayed.mail,
-            cells: Cells::new(Arc::clone(&wake)),
-            observations: Observations::default(),
-            draining: None,
-            recovery_notes: replayed.recovery_notes,
-            context_used: replayed.context_used,
-            turn: None,
-            total_usage,
-            name_updates,
-            working: false,
-            wake,
-            status: Arc::clone(&status),
-            head: Arc::clone(&head),
-            control_rx,
-        };
-        // Published before the loop's first decision, so a subscriber that
-        // arrives immediately sees the replayed transcript.
-        agent.publish_sync(None);
-        (
-            Self {
-                control,
-                status,
-                head,
-                view,
-            },
-            agent,
-        )
-    }
-
     /// The agent's view, ready once its place is.
     pub async fn view(&self) -> anyhow::Result<Arc<View>> {
         Ok(Arc::clone(self.view.get().await?))
@@ -262,84 +93,64 @@ impl AgentHandle {
         self.send_user_content(vec![ContentPart::Text { text: text.into() }], delivery);
     }
 
-    pub fn send_user_content(&self, content: Vec<ContentPart>, delivery: MessageDelivery) {
-        let _ = self.control.send(Control::User(
-            QueuedInput {
-                source: MessageSender::User,
-                kind: InputKind::Message { content },
-                delivery,
-                at: UnixMs::now(),
-            },
-            None,
-        ));
+    pub fn send_user_content(&self, content: Vec<ContentPart>, _delivery: MessageDelivery) {
+        let _ = self.control.send(Control::Received {
+            from: Party::Human,
+            content,
+            done: None,
+        });
     }
 
-    /// Send user input and wait until the loop has durably queued it.
+    /// Send user input and wait until the loop has durably logged it.
     pub async fn send_user_content_accepted(
         &self,
         content: Vec<ContentPart>,
-        delivery: MessageDelivery,
+        _delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
-        self.send(|done| {
-            Control::User(
-                QueuedInput {
-                    source: MessageSender::User,
-                    kind: InputKind::Message { content },
-                    delivery,
-                    at: UnixMs::now(),
-                },
-                Some(done),
-            )
+        self.send(|done| Control::Received {
+            from: Party::Human,
+            content,
+            done: Some(done),
         })
         .await
     }
 
     /// Deliver mail from a peer agent.
     pub fn send_agent_message(&self, sender: AgentId, text: impl Into<String>) {
-        let _ = self.control.send(Control::Mail {
-            sender,
+        let _ = self.control.send(Control::Received {
+            from: Party::Agent(sender),
             content: vec![ContentPart::Text { text: text.into() }],
-            at: UnixMs::now(),
             done: None,
         });
     }
 
-    /// Deliver mail and wait until the loop has durably queued it.
+    /// Deliver mail and wait until the loop has durably logged it.
     pub async fn send_agent_message_accepted(
         &self,
         sender: AgentId,
         text: impl Into<String>,
     ) -> anyhow::Result<()> {
         let content = vec![ContentPart::Text { text: text.into() }];
-        self.send(|done| Control::Mail {
-            sender,
+        self.send(|done| Control::Received {
+            from: Party::Agent(sender),
             content,
-            at: UnixMs::now(),
             done: Some(done),
         })
         .await
     }
 
-    /// The user explicitly asked to compact. Automatic compaction is not an
-    /// input at all — it happens while building a request.
+    /// Ask the provider to compact the context on the next request.
     pub fn compact(&self) {
-        let _ = self.control.send(Control::User(
-            QueuedInput {
-                source: MessageSender::User,
-                kind: InputKind::Compaction,
-                delivery: MessageDelivery::NextRequest,
-                at: UnixMs::now(),
-            },
-            None,
-        ));
+        let _ = self.control.send(Control::Compact);
     }
 
-    /// Abort the in-flight request and durably discard queued inputs.
+    /// Cut off the response in flight and cancel the notebook's running
+    /// work; the agent stays quiet until someone writes.
     pub fn cancel(&self) {
         let _ = self.control.send(Control::Cancel);
     }
 
-    /// Retry after a failure, or resume a request interrupted by a restart.
+    /// Wake an agent that stopped after failing.
     pub fn retry(&self) {
         let _ = self.control.send(Control::Retry);
     }
@@ -354,8 +165,8 @@ impl AgentHandle {
             .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?
     }
 
-    /// Waits for the request in flight, if any, to end, then freezes the
-    /// loop with its log flushed. Calls still running are left to die with
+    /// Waits for the response in flight, if any, to end, then freezes the
+    /// loop with its log flushed. Work still running is left to die with
     /// the process.
     pub(crate) async fn drain(&self) -> anyhow::Result<()> {
         let (reply, drained) = oneshot::channel();
@@ -378,11 +189,12 @@ impl AgentHandle {
     }
 
     pub fn change_prompt_cache_key(&self) {
-        let _ = self
-            .control
-            .send(Control::ChangePromptCacheKey(PromptCacheKey::generate()));
+        let _ = self.control.send(Control::ChangePromptCacheKey(
+            rho_inference::PromptCacheKey::generate(),
+        ));
     }
 
+    /// Branch before the `turns`-th last human message; the notebook stays.
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
         self.control
@@ -392,9 +204,6 @@ impl AgentHandle {
             .await
             .map_err(|_| anyhow::anyhow!("agent loop has stopped"))?
     }
-
-    /// Whether anyone is looking at this agent; titles and activity are
-    /// made only then.
 
     /// Hand a command to the loop and wait for it to land. An error means
     /// the agent stopped before it got there.
@@ -413,26 +222,23 @@ impl AgentHandle {
 }
 
 /// A command, and for the ones a caller may wait on, the ack that says it
-/// landed. The ack fires after the command's own handling, so anything it
-/// persisted is on disk by then — not that the model has *seen* it: that
-/// waits for a boundary the caller does not control.
+/// landed: after its row is on disk, not after the model has seen it.
 enum Control {
     Retire(oneshot::Sender<anyhow::Result<()>>),
     Drain(oneshot::Sender<()>),
-    User(QueuedInput, Option<oneshot::Sender<()>>),
-    Mail {
-        sender: AgentId,
+    Received {
+        from: Party,
         content: Vec<ContentPart>,
-        at: UnixMs,
         done: Option<oneshot::Sender<()>>,
     },
+    Compact,
     Cancel,
     Retry,
     ChangeRole {
         role: AgentRole,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
-    ChangePromptCacheKey(PromptCacheKey),
+    ChangePromptCacheKey(rho_inference::PromptCacheKey),
     Rewind {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -441,110 +247,76 @@ enum Control {
     TellTail,
 }
 
-/// Everything that can move the agent. The `select!` normalises sources into
-/// one of these and does nothing else; all judgment lives in [`Agent::handle`]
-/// and [`Agent::boundary`].
-enum Event {
-    Named(AgentHead),
-    Control(Control),
-    Inference(InferenceEvent),
-    /// A tool says something about it changed. Deliberately carries no
-    /// payload: the core asks the sources what they hold when it decides to.
-    SourceChanged,
-    /// A rhythm deadline expired; re-ask the question.
-    Tick,
+/// The latest cell, the call that wrote it, and when it started.
+struct Latest {
+    cell: CellHandle,
+    call: Call,
+    started_at: UnixMs,
 }
 
-/// What the agent is up to, and the first thing the decision asks about.
-///
-/// Either a request is in flight or it is not, and there is nothing else to be.
+/// The call of the step in progress, as its code arrives.
+struct Streaming {
+    id: CallId,
+    code: String,
+}
+
+/// Why the loop stopped waking the model, when it has.
 #[derive(Clone)]
-pub(crate) enum Phase {
-    /// No request in flight. `owed` is what the next one has to open with —
-    /// calls nothing is going to answer, which after a restart is every call
-    /// history left hanging (`SPEC-restart-recovery`). Ordinarily empty.
-    Idle {
-        owed: Vec<rho_inference::types::ExecId>,
-        standing: Standing,
-    },
-    /// A request is in flight, and nothing but an interrupt may disturb it.
-    Requesting(InFlight),
-}
-
-/// The in-flight provider response. Its streamed Python call may already have
-/// live work; abandoning the response preserves
-/// that call before the next boundary drains its output.
-#[derive(Clone, Default)]
-pub(crate) struct InFlight {
-    handoff: Vec<rho_inference::types::ExecId>,
-    pending: PendingInferenceResponse,
-    /// The prior attempt's failure, displayed while its fresh continuation
-    /// runs.
-    previous_failure: Option<Arc<str>>,
-    retry: Option<(UnixMs, u32)>,
-    stream: Option<streaming::Stream>,
-    /// This request compacted on behalf of work that still owes a reply, so a
-    /// compaction must not be where the agent stops. A fact about *this*
-    /// request, so a request that never finishes never has to unset it.
-    compaction_owes_reply: bool,
+enum Stopped {
+    /// Three steps in a row without a call, or a cancel: only the human
+    /// wakes it.
+    Quiet,
+    /// Model requests kept failing: the human or a retry wakes it.
+    Failed(Arc<str>),
 }
 
 pub(crate) struct Agent {
+    agent_id: AgentId,
     host: Arc<crate::worker::Host>,
     writer: persistence::Writer,
-    pending_events: Vec<AgentEvent<'static>>,
-    admitted: std::collections::HashSet<ToolCallId>,
-    surface: Arc<Lazy<Surface>>,
-    model: InferenceModel,
-
-    /// Live window policy; provider context itself is derived from the event
-    /// log.
-    context: context::Window,
-    // Live projection, including the ordered tail queued for replication.
-    provider_history: Option<Vec<Arc<ContextBlock>>>,
-    usage_caps: context::UsageCaps,
-
-    session: InferenceSession,
-    phase: Phase,
-
-    /// Typed input, in arrival order: discrete, never merged or summarised,
-    /// and always drained in that order.
-    user: Vec<QueuedInput>,
-    /// Everyone's mail, in arrival order.
-    mail: Vec<MailItem>,
-    /// The cells of the calls the model has made, until each has said
-    /// everything.
-    cells: Cells,
-    /// When each pending event was first seen: the clocks the boundary's
-    /// patiences run on.
-    observations: Observations,
-    /// A drain waiting for the request in flight to end: no new request
-    /// starts, and once none is in flight the log is flushed and this is
-    /// answered.
-    draining: Option<oneshot::Sender<()>>,
-    recovery_notes: Vec<String>,
-
-    context_used: Option<u64>,
-    /// What the model's latest turn settled about being looked in on. `None`
-    /// until it has spoken once — after a restart included, which is safe
-    /// because no tool survives one.
-    turn: Option<ModelTurn>,
-    /// Cumulative provider-reported usage across this agent's requests.
-    total_usage: AgentUsageBucket,
-    name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
-    /// Whether the last published state counted as a running turn, so the
-    /// story is told once per edge.
-    working: bool,
-
-    /// Content-free signal that some tool changed. Tools hold a
-    /// clone of this; the core rescans rather than being told.
+    inference: Inference,
+    model: Arc<Model>,
+    model_name: String,
+    view: Arc<Lazy<Arc<View>>>,
+    /// The visible branch of this runtime's rows, oldest first.
+    entries: Vec<Entry>,
+    notebook: Option<Notebook>,
+    mailroom: Arc<Mailroom>,
+    outbox: mpsc::UnboundedReceiver<Outbound>,
+    control_rx: mpsc::UnboundedReceiver<Control>,
     wake: Arc<Notify>,
-
     status: Arc<RwLock<AgentStatus>>,
     head: Arc<RwLock<AgentHead>>,
-    /// What clients have been told of the tail, so each publish says only
-    /// what changed.
-    control_rx: mpsc::UnboundedReceiver<Control>,
+    name_updates: tokio::sync::watch::Receiver<Option<AgentHead>>,
+    draining: Option<oneshot::Sender<()>>,
+    /// Whether the last published state counted as a running turn, so the
+    /// turn's edges are told once each.
+    working: bool,
+
+    archived: bool,
+    /// The next wake says the notebook is new.
+    fresh: bool,
+    responding: bool,
+    /// The latest cell and its call. Older ones live on in the notebook's
+    /// sources.
+    cell: Option<Latest>,
+    /// The latest step was cut off part-way through its cell.
+    interrupted: bool,
+    /// The model has been told the latest cell finished.
+    told_returned: bool,
+    /// Messages the model has not seen, oldest first.
+    unread: Vec<(MessageId, Party, UnixMs)>,
+    last_step: Option<UnixMs>,
+    awaiting: bool,
+    prose: u32,
+    restarted: bool,
+    rewound: bool,
+    retry: bool,
+    stopped: Option<Stopped>,
+    cache_key: CacheKey,
+    context_used: Option<u64>,
+    compaction_pending: bool,
+    compaction_reply: bool,
 }
 
 impl Agent {
@@ -557,424 +329,249 @@ impl Agent {
         view: Arc<Lazy<Arc<View>>>,
     ) -> anyhow::Result<(AgentHandle, Self)> {
         let head = host.head().await?;
-
         let AgentRuntime::Rho { prompt_cache_key } = head.config.runtime else {
             anyhow::bail!("agent does not use the Rho runtime");
         };
-        let profile = head
-            .config
-            .binding
-            .deep_config()
-            .ok_or_else(|| anyhow::anyhow!("Rho runtime stored with a Claude mode"))?;
-        let model = head
-            .config
-            .binding
-            .deep_model()
-            .expect("deep profile has a model");
-        host.team().await?;
-        let total_usage = host.usage_total().await?;
-        let (_, rows, admitted) = host.recovery_history().await?;
-        let admitted = admitted.into_iter().collect();
-        let replayed = replay::recover(rows.into_iter().map(|(_, event)| event).collect());
-        Ok(AgentHandle::start(
+        let (model, model_name) = model(&inference, head.config.binding)?;
+        let (_, rows) = host.history().await?;
+        let entries = rows
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Entry(entry) => Some(entry),
+                _ => None,
+            })
+            .collect();
+        let (mailroom, outbox) = Mailroom::new();
+        let status = Arc::new(RwLock::new(AgentStatus {
+            kind: AgentStateKind::Idle,
+            queued: 0,
+        }));
+        let head = Arc::new(RwLock::new(head));
+        let (control, control_rx) = mpsc::unbounded_channel();
+        host.observe(&status);
+        let mut agent = Self {
+            agent_id,
+            writer: persistence::Writer::new(host.clone()),
+            name_updates: host.names(),
             host,
             inference,
-            profile,
-            model,
-            head.config.role,
-            prompt_cache_key,
-            agent_id,
-            view,
-            replayed,
-            head,
-            total_usage,
-            admitted,
+            model: Arc::new(model),
+            model_name,
+            view: Arc::clone(&view),
+            entries,
+            notebook: None,
+            mailroom,
+            outbox,
+            control_rx,
+            wake: Arc::new(Notify::new()),
+            status: Arc::clone(&status),
+            head: Arc::clone(&head),
+            draining: None,
+            working: false,
+            archived: false,
+            fresh: false,
+            responding: false,
+            cell: None,
+            interrupted: false,
+            told_returned: false,
+            unread: Vec::new(),
+            last_step: None,
+            awaiting: false,
+            prose: 0,
+            restarted: false,
+            rewound: false,
+            retry: false,
+            stopped: None,
+            cache_key: cache_key(prompt_cache_key),
+            context_used: None,
+            compaction_pending: false,
+            compaction_reply: false,
+        };
+        agent.resume().await?;
+        agent.publish_sync();
+        Ok((
+            AgentHandle {
+                control,
+                status,
+                head,
+                view,
+            },
+            agent,
         ))
     }
 
-    /// Answer the one question after every event, act on the answer, and wait
-    /// for the next one, until the last handle is dropped.
-    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
-        self.session.abort();
-        self.cells.cancel();
-        if let Some(surface) = self.surface.get_if_ready() {
-            surface
-                .notebook
-                .shutdown()
-                .await
-                .map_err(anyhow::Error::msg)?;
+    /// Answer from `script` instead of the role's provider.
+    #[cfg(test)]
+    fn script(&mut self, script: Arc<rho_inference2::scripted::Scripted>) {
+        self.model = Arc::new(Model::Scripted(script));
+    }
+
+    /// Pick up from the log: what the model has not seen, and whether there
+    /// was a notebook that is now gone.
+    async fn resume(&mut self) -> anyhow::Result<()> {
+        let mut delivered = std::collections::HashSet::new();
+        // Any wake may have run code: streamed code runs before its step is
+        // logged.
+        let mut woken = false;
+        let mut awaiting = false;
+        for entry in &self.entries {
+            match entry {
+                Entry::Woken {
+                    messages,
+                    acknowledged,
+                    ..
+                } => {
+                    woken = true;
+                    delivered.extend(messages.iter().chain(acknowledged).copied());
+                }
+                Entry::Awaiting { since, .. } => awaiting = since.is_some(),
+                Entry::Notice {
+                    notice: Notice::Archived,
+                    ..
+                } => self.archived = true,
+                Entry::Notice {
+                    notice: Notice::FreshNotebook,
+                    ..
+                } => self.archived = false,
+                _ => {}
+            }
         }
-        self.cells.clear();
-        self.flush_events().await?;
+        for entry in &self.entries {
+            if let Entry::Received { at, id, from, .. } = entry
+                && !delivered.contains(id)
+            {
+                self.unread.push((*id, *from, *at));
+                if *from == Party::Human {
+                    self.mailroom.received();
+                }
+            }
+        }
+        if woken && !self.archived {
+            self.restarted = true;
+            self.append(Entry::Notice {
+                at: UnixMs::now(),
+                notice: Notice::Restarted,
+            })
+            .await?;
+        }
+        self.refresh_compaction_state();
+        if awaiting {
+            // Whatever awaited the human went with the old notebook.
+            self.append(Entry::Awaiting {
+                at: UnixMs::now(),
+                since: None,
+            })
+            .await?;
+        }
         Ok(())
     }
 
+    /// Answer the one question after every event, act on the answer, and
+    /// wait for the next one, until the last handle is dropped.
     pub(crate) async fn run(&mut self) -> anyhow::Result<()> {
         loop {
             self.writer.check()?;
-            if self.draining.is_some() && matches!(self.phase, Phase::Idle { .. }) {
-                // The last status says whether the agent is still at work
-                // (calls running) or done, which is what decides resuming it.
+            if self.draining.is_some() && !self.responding {
                 self.publish(None).await?;
-                self.flush_events().await?;
+                self.flush().await?;
                 let _ = self.draining.take().expect("checked above").send(());
                 // Frozen like a retired loop; the driver cancels this future
                 // when the agent host lets go.
                 std::future::pending::<()>().await;
             }
-            // One question per event. Either it says to wait and hands over the
-            // timer — so the timer and the rule behind it cannot drift apart —
-            // or it says to send, and a request in flight is never waited for.
-            let now = UnixMs::now();
-            // A draining loop only waits for the request in flight to end.
+            // A cell can archive itself as it completes. Apply what it sent
+            // before deciding whether its completion warrants a wake.
+            self.drain_outbox().await?;
             let decision = if self.draining.is_some() {
-                Boundary::No { recheck: None }
+                Decision::Later(None)
             } else {
-                self.decide(now)
+                wake::decide(&self.facts(), UnixMs::now())
             };
-            // Admission waits on the decision: a statement is not admitted
-            // into a request about to be thrown away.
-            if decision != Boundary::AbortAndResend {
-                self.admit_stream();
+            let recheck = match decision {
+                Decision::Now(why) => {
+                    self.wake_model(why).await?;
+                    continue;
+                }
+                Decision::Later(recheck) => recheck,
+            };
+            self.publish(recheck).await?;
+            let sleep = async {
+                match recheck {
+                    Some(at) => tokio::time::sleep(until(at)).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                error = self.writer.failed() => return Err(error.into()),
+                named = self.name_updates.changed() => {
+                    named.map_err(|_| anyhow::anyhow!("agent services disconnected"))?;
+                    self.named();
+                }
+                control = self.control_rx.recv() => match control {
+                    Some(control) => self.control(control).await?,
+                    None => return Ok(()),
+                },
+                Some(outbound) = self.outbox.recv() => self.outbound(outbound).await?,
+                () = self.wake.notified() => {}
+                () = sleep => {}
             }
-            let deadline = match decision {
-                Boundary::No { recheck } => recheck,
-                Boundary::AbortAndResend => {
-                    // Stop admission and preserve any executed call before
-                    // draining fresh input into the replacement request.
-                    self.abandon_stream(now).await?;
-                    self.session.abort();
-                    self.start_request(now, Some(crate::WakeFacts::interrupt()))
-                        .await?;
-                    None
-                }
-                Boundary::RetryExhausted => {
-                    let Phase::Idle {
-                        standing: Standing::Retry { error, .. },
-                        ..
-                    } = &self.phase
-                    else {
-                        unreachable!()
-                    };
-                    let error = format!("Provider retry window exhausted: {error}");
-                    self.fail(now, PendingInferenceResponse::default(), error)
-                        .await?;
-                    None
-                }
-                Boundary::Now { wake } => {
-                    self.start_request(now, Some(wake)).await?;
-                    None
-                }
-            };
-            self.publish(deadline).await?;
-            // Disabled `select!` arms still evaluate their expression, so give
-            // the timer a zero duration when nothing is armed; the guard keeps
-            // it unpolled.
-            let sleep = Duration::from_millis(
-                deadline
-                    .map(|deadline| deadline.0.saturating_sub(UnixMs::now().0))
-                    .unwrap_or(0),
-            );
-            let event = {
-                let Self {
-                    control_rx,
-                    name_updates,
-                    writer,
-                    session,
-                    wake,
-                    ..
-                } = &mut *self;
-                // Normalising sources into one Event is all that happens here;
-                // no policy, because policy is `boundary` and nowhere else.
-                tokio::select! {
-                    biased;
-                    error = writer.failed() => return Err(error.into()),
-                    named = name_updates.changed() => {
-                        named.map_err(|_| anyhow::anyhow!("agent services disconnected"))?;
-                        Some(Event::Named(name_updates.borrow_and_update().clone().expect("name update")))
-                    }
-                    control = control_rx.recv() => control.map(Event::Control),
-                    event = session.run() => Some(Event::Inference(event)),
-                    _ = wake.notified() => Some(Event::SourceChanged),
-                    _ = tokio::time::sleep(sleep), if deadline.is_some() => Some(Event::Tick),
-                }
-            };
-            let Some(event) = event else { return Ok(()) };
-            self.handle(event).await?;
         }
     }
 
-    /// The one question, asked of everything the loop knows.
-    fn decide(&mut self, now: UnixMs) -> Boundary {
-        let sources = self.sources();
-        boundary(
-            &sources,
-            self.turn.as_ref(),
-            match &self.phase {
-                Phase::Idle { standing, .. } => Some(standing),
-                Phase::Requesting(_) => None,
-            },
-            &mut self.observations,
-            now,
-        )
-    }
-
-    /// Every source, in whatever state it is in — nothing is filtered out for
-    /// having nothing to say, because deciding that is the decision's job, and
-    /// an empty queue is a fact it reads.
-    fn sources(&self) -> Vec<SourceKind> {
-        let mut sources = vec![
-            SourceKind::User {
-                interrupt: self
-                    .user
-                    .iter()
-                    .any(|input| input.delivery == MessageDelivery::Immediate),
-                // Arrival order, so the first is the one that has waited
-                // longest — the one whose patience is being spent.
-                oldest_at: self.user.first().map(|input| input.at),
-            },
-            SourceKind::Mail {
-                oldest_at: self.mail.first().map(|item| item.at),
-                newest_at: self.mail.last().map(|item| item.at),
-            },
-        ];
-        // What each call is, with nothing decided about it: every one of
-        // these is something the tool observed, and what any of them is
-        // worth is `boundary`'s business.
-        sources.extend(self.cells.sources());
-        sources
-    }
-
-    /// The single funnel. Every event lands here and does nothing but update
-    /// state; what to do about it is asked once, by the caller.
-    async fn handle(&mut self, event: Event) -> anyhow::Result<()> {
-        let now = UnixMs::now();
-        match event {
-            Event::Named(stored) => {
-                let mut head = self.head.write().expect("poison");
-                head.generated_title = stored.generated_title;
-                head.title_attempted = stored.title_attempted;
-            }
-            Event::Control(control) => self.handle_control(control, now).await?,
-            // Anything the model says outside a request of ours is somebody
-            // else's, or the tail of one already abandoned.
-            Event::Inference(event) => {
-                let Phase::Requesting(in_flight) = &mut self.phase else {
-                    return Ok(());
-                };
-                match event {
-                    InferenceEvent::RequestSent => {
-                        let handed_off = std::mem::take(&mut in_flight.handoff);
-                        for id in handed_off {
-                            self.persist(AgentEvent::ExecObserved {
-                                id,
-                                milestone: rho_agent_types::ExecMilestone::HandedOff,
-                                at: now,
-                            })
-                            .await?;
-                        }
-                    }
-                    InferenceEvent::StreamingStarted => {}
-                    InferenceEvent::ExecArgumentsFinished { id } => {
-                        self.persist(AgentEvent::ExecObserved {
-                            id,
-                            milestone: rho_agent_types::ExecMilestone::ArgumentsFinished,
-                            at: now,
-                        })
-                        .await?;
-                    }
-                    InferenceEvent::ContextItem { index, event } => {
-                        in_flight.pending.apply(index, event);
-                        if let Err(error) = self.update_stream(now).await {
-                            if error.is::<crate::worker::StoreError>() {
-                                return Err(error);
-                            }
-                            let Phase::Requesting(in_flight) = &mut self.phase else {
-                                unreachable!()
-                            };
-                            let partial = std::mem::take(&mut in_flight.pending);
-                            self.session.abort();
-                            self.fail(now, partial, error.to_string()).await?;
-                        }
-                    }
-                    InferenceEvent::TemporaryFailure { error, .. } => {
-                        let (since, attempts) = in_flight.retry.unwrap_or((now, 0));
-                        let compaction_owes_reply = in_flight.compaction_owes_reply;
-                        let partial = std::mem::take(&mut in_flight.pending);
-                        let error = error.to_string();
-                        let has_execution = self.abandon_stream(now).await?;
-                        self.persist(AgentEvent::Native(NativeEvent::RequestFailed {
-                            partial,
-                            error: error.clone(),
-                            retrying: true,
-                            at: now,
-                        }))
-                        .await?;
-                        self.session.abort();
-                        if has_execution {
-                            // Accepted Python is an ordinary model-issued exec,
-                            // not a transport retry that may bypass its sources.
-                            self.turn = Some(ModelTurn {
-                                spoke_at: now,
-                                asked: ModelAsked::Calls,
-                            });
-                        }
-                        self.phase = Phase::Idle {
-                            owed: Vec::new(),
-                            standing: if has_execution {
-                                Standing::Nothing
-                            } else {
-                                Standing::Retry {
-                                    since,
-                                    failed_at: now,
-                                    attempts: attempts + 1,
-                                    compaction_owes_reply,
-                                    error: Arc::from(error),
-                                }
-                            },
-                        };
-                    }
-                    // Nothing to abort: the request is already over, and it
-                    // is the agent that stops here rather than the request.
-                    InferenceEvent::Failed { error } => {
-                        let partial = std::mem::take(&mut in_flight.pending);
-                        self.fail(now, partial, error.to_string()).await?;
-                    }
-                    InferenceEvent::Finished {
-                        usage,
-                        provider_response_id,
-                    } => {
-                        let finished = in_flight.pending.finish();
-                        let exec = in_flight.stream.as_ref().map(|stream| stream.id.clone());
-                        if let Some(id) = exec {
-                            self.persist(AgentEvent::ExecObserved {
-                                id,
-                                milestone: rho_agent_types::ExecMilestone::ResponseFinished,
-                                at: now,
-                            })
-                            .await?;
-                        }
-                        match finished {
-                            // Finished streaming, but what arrived does not
-                            // assemble into a response.
-                            Err(error) => {
-                                let Phase::Requesting(in_flight) = &mut self.phase else {
-                                    unreachable!()
-                                };
-                                let partial = std::mem::take(&mut in_flight.pending);
-                                self.fail(now, partial, error.to_string()).await?
-                            }
-                            Ok(items) => {
-                                self.finish_request(items, provider_response_id, usage, now)
-                                    .await?
-                            }
-                        }
-                    }
-                }
-            }
-            // Both are pure prompts to re-ask the question; what a source
-            // reports is read live, so there is nothing to record here.
-            Event::SourceChanged | Event::Tick => {}
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
+        if let Some(notebook) = self.notebook.take() {
+            notebook.cancel();
+            notebook.shutdown().await.map_err(anyhow::Error::msg)?;
         }
+        self.flush().await?;
         Ok(())
     }
 
-    async fn handle_control(&mut self, control: Control, now: UnixMs) -> anyhow::Result<()> {
+    fn named(&mut self) {
+        let stored = self.name_updates.borrow_and_update().clone();
+        if let Some(stored) = stored {
+            let mut head = self.head.write().expect("poison");
+            head.generated_title = stored.generated_title;
+            head.title_attempted = stored.title_attempted;
+        }
+    }
+
+    async fn control(&mut self, control: Control) -> anyhow::Result<()> {
         match control {
             Control::Retire(reply) => {
-                if match self.decide(now) {
-                    Boundary::No { recheck } => self.status(recheck).settled(),
-                    _ => false,
-                } {
+                if self.settled() {
                     let _ = reply.send(Ok(()));
-                    // Freeze scheduling and admission at this serialized boundary.
-                    // The outer driver cancels this future on agent host disconnect.
+                    // Freeze scheduling and admission at this serialized
+                    // boundary. The driver cancels this future on agent host
+                    // disconnect.
                     std::future::pending::<()>().await;
                 } else {
                     let _ = reply.send(Err(anyhow::anyhow!("agent still has work")));
                 }
             }
-
             Control::Drain(reply) => self.draining = Some(reply),
             Control::TellTail => self.host.tell_tail(),
-            Control::User(input, done) => {
-                self.persist(AgentEvent::Accepted(input.clone())).await?;
-                if let InputKind::Message { content } = &input.kind
-                    && !rho_inference::types::text_content(content)
-                        .trim()
-                        .is_empty()
-                {
-                    self.name(&rho_inference::types::text_content(content))
-                        .await?;
-                }
-                // Queueing it is the whole of it. Whether this revives an
-                // agent that had stopped is `Standing::stopped`'s reading of
-                // the very queue this pushes onto, so there is no second
-                // place for it to be written down and go stale.
-                self.user.push(input);
-                if let Some(done) = done {
-                    let _ = done.send(());
-                }
-            }
-            Control::Mail {
-                sender,
+            Control::Received {
+                from,
                 content,
-                at,
                 done,
             } => {
-                self.persist(AgentEvent::Accepted(QueuedInput {
-                    source: MessageSender::Agent { id: sender },
-                    kind: InputKind::Message {
-                        content: content.clone(),
-                    },
-                    delivery: MessageDelivery::NextRequest,
-                    at,
-                }))
-                .await?;
-                if !rho_inference::types::text_content(&content)
-                    .trim()
-                    .is_empty()
-                {
-                    self.name(&rho_inference::types::text_content(&content))
-                        .await?;
+                let text = rho_inference::types::text_content(&content);
+                self.receive(from, blocks(content)).await?;
+                if !text.trim().is_empty() {
+                    self.name(&text).await?;
                 }
-                self.mail.push(MailItem {
-                    sender,
-                    content,
-                    at,
-                });
                 if let Some(done) = done {
                     let _ = done.send(());
                 }
             }
-            Control::Cancel => {
-                self.context.preparation = None;
-                // Ask every tool to wind down, then keep reading it: the core
-                // does not kill tools, so a tool still chooses its own last
-                // words.
-                self.abandon_stream(now).await?;
-                self.cells.cancel();
-                // A cancel is not an answer, so what is owed outlives it.
-                let owed = match &mut self.phase {
-                    Phase::Idle { owed, .. } => std::mem::take(owed),
-                    Phase::Requesting(_) => Vec::new(),
-                };
-                self.session.abort();
-                self.phase = Phase::Idle {
-                    owed,
-                    standing: Standing::Cancelled { at: now },
-                };
-                if !self.user.is_empty() || !self.mail.is_empty() {
-                    self.persist(AgentEvent::Cleared { at: now }).await?;
-                    self.user.clear();
-                    self.mail.clear();
-                }
-            }
+            Control::Compact => self.compact().await?,
+            Control::Cancel => self.interrupt(None).await?,
             Control::Retry => {
-                // Hurries the next request rather than changing what has to
-                // be in it; nothing to hurry while one is in flight.
-                if let Phase::Idle { standing, .. } = &mut self.phase {
-                    *standing = Standing::Asked;
+                if matches!(self.stopped, Some(Stopped::Failed(_))) {
+                    self.stopped = None;
+                    self.retry = true;
                 }
             }
             Control::ChangeRole { role, reply } => {
@@ -989,7 +586,7 @@ impl Agent {
             }
             Control::ChangePromptCacheKey(key) => {
                 self.host.cache_key(key).await?;
-                self.session.set_prompt_cache_key(key);
+                self.cache_key = cache_key(key);
             }
             Control::Rewind { turns, reply } => {
                 let result = self.rewind(turns).await;
@@ -1005,57 +602,31 @@ impl Agent {
         Ok(())
     }
 
-    /// The request is over and the agent stops. What the model had said
-    /// goes to the log first, so the reader keeps it and the turn's end
-    /// follows its row.
-    async fn fail(
-        &mut self,
-        now: UnixMs,
-        partial: PendingInferenceResponse,
-        error: String,
-    ) -> anyhow::Result<()> {
-        self.abandon_stream(now).await?;
-        self.persist(AgentEvent::Native(NativeEvent::RequestFailed {
-            partial,
-            error: error.clone(),
-            retrying: false,
-            at: now,
-        }))
-        .await?;
-        self.phase = Phase::Idle {
-            owed: Vec::new(),
-            standing: Standing::Failed {
-                at: now,
-                error: Arc::from(error.as_str()),
-            },
-        };
-        self.flush_events().await?;
-        self.host.failed(error).await?;
-        Ok(())
+    /// Nothing in motion, nothing waiting to be seen.
+    fn settled(&self) -> bool {
+        !self.responding && self.unread.is_empty() && !self.cell_running()
     }
 
-    // -- the user's commands that reach into the transcript -----------------
+    fn cell_running(&self) -> bool {
+        self.cell
+            .as_ref()
+            .is_some_and(|latest| latest.cell.facts().finished.is_none())
+    }
 
-    /// Nothing may be in motion: a change of transcript or of surface under
-    /// a running request or a live tool would leave one of them lying.
-    fn ensure_settled(&self, what: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(self.phase, Phase::Idle { .. }),
-            "{what} is only available while idle or errored; cancel the turn first"
-        );
-        anyhow::ensure!(
-            self.user.is_empty() && self.mail.is_empty(),
-            "{what} is not available with queued inputs"
-        );
-        anyhow::ensure!(
-            self.cells.is_empty() && !self.session.has_active_request(),
-            "{what} is not available while work is running"
-        );
+    async fn name(&mut self, input: &str) -> anyhow::Result<()> {
+        self.flush().await?;
+        let stored = self.host.name(input).await?;
+        let mut head = self.head.write().expect("poison");
+        head.generated_title = stored.generated_title;
+        head.title_attempted = stored.title_attempted;
         Ok(())
     }
 
     async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
-        self.ensure_settled("a role change")?;
+        anyhow::ensure!(
+            !self.responding && !self.cell_running(),
+            "a role change is only available while idle; cancel the turn first"
+        );
         let requested = match requested {
             AgentRole::Engineer { intelligence } => intelligence,
             _ => anyhow::bail!("role changes currently support only engineer roles"),
@@ -1087,686 +658,719 @@ impl Agent {
             return Ok(());
         }
         let binding = role.session_profile();
-        let profile = binding
-            .deep_config()
-            .ok_or_else(|| anyhow::anyhow!("role change would leave the Rho runtime"))?;
-        let model = binding
-            .deep_model()
-            .ok_or_else(|| anyhow::anyhow!("role change has no Rho model"))?;
-        anyhow::ensure!(
-            self.session.set_deep_config(profile, model),
-            "agent does not have a configurable inference session"
-        );
-        self.flush_events().await?;
+        let (model, model_name) = model(&self.inference, binding)?;
+        self.flush().await?;
         self.host.profile(role, binding).await?;
-        self.provider_history = None;
         {
             let mut head = self.head.write().expect("poison");
             head.config.role = role;
             head.config.binding = binding;
         }
-        if current.uses_notes_rotation() != role.uses_notes_rotation() {
-            self.context.rotated();
-            // Same-model roles still change the developer instructions.
-            self.session.abort();
-        }
-        self.model = model;
-        // Instructions are rendered from the current role on each request.
-        // The session's tool surface (including Python globals) stays alive.
+        self.model = Arc::new(model);
+        self.model_name = model_name;
+        // Instructions are rendered from the current role on each wake. The
+        // notebook, and its Python globals, stay alive.
         Ok(())
     }
 
-    /// Branch history before the `turns`-th last user message and start
-    /// again from there. `DECISION-history-only-branches`: what the agent
-    /// walked away from stays in the log.
+    /// Branch history before the `turns`-th last human message. What the
+    /// agent walked away from stays in the log
+    /// (`DECISION-history-only-branches`); the notebook, its globals and
+    /// anything it did are not rewound.
     async fn rewind(&mut self, turns: u32) -> anyhow::Result<()> {
         anyhow::ensure!(turns > 0, ":rewind turns must be greater than zero");
-        self.ensure_settled(":rewind")?;
-        self.flush_events().await?;
-        let cursor = {
-            let (_, records) = self.host.history().await?;
-            let user_positions = records
-                .iter()
-                .filter(|(_, event)| event.is_user_message())
-                .map(|(pos, _)| *pos)
-                .collect::<Vec<_>>();
-            if user_positions.is_empty() {
-                None
-            } else {
-                let index = user_positions.len().saturating_sub(turns as usize);
-                Some(user_positions[index])
-            }
-        };
-        let Some(cursor) = cursor else {
-            anyhow::bail!("nothing to rewind");
-        };
-        self.host.rewind(UnixMillis::now(), cursor).await?;
-        let (_, records) = self.host.history().await?;
-        let replayed = replay::replay(records.into_iter().map(|(_, event)| event).collect());
-        self.context = replayed.context;
-        self.provider_history = Some(replayed.history);
-        self.usage_caps = replayed.usage_caps;
-        self.recovery_notes = replayed.recovery_notes;
-        self.cells.set_latest(None);
-        self.user = replayed.user;
-        self.mail = replayed.mail;
-        self.context_used = replayed.context_used;
-        self.phase = Phase::Idle {
-            owed: replayed.owed,
-            standing: Standing::Nothing,
-        };
-        self.turn = None;
-        self.observations.clear();
-        self.session.abort();
-        // A rewind is told, not undone: the last title and activity still
-        // stand.
-        Ok(())
-    }
-
-    async fn name(&mut self, input: &str) -> anyhow::Result<()> {
-        self.flush_events().await?;
-        let stored = self.host.name(input).await?;
-        let mut head = self.head.write().expect("poison");
-        head.generated_title = stored.generated_title;
-        head.title_attempted = stored.title_attempted;
-        Ok(())
-    }
-
-    // -- acting on it -------------------------------------------------------
-
-    async fn start_request(
-        &mut self,
-        now: UnixMs,
-        wake: Option<crate::WakeFacts>,
-    ) -> anyhow::Result<()> {
-        // Tools and instructions come from the workdirs, which are only
-        // opened now: a load never fails on them, a turn may.
-        let surface = match self.surface.get().await {
-            Ok(surface) => surface,
-            Err(error) => {
-                self.fail(
-                    now,
-                    PendingInferenceResponse::default(),
-                    format!("{error:#}"),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let role = self.head.read().expect("poison").config.role;
-        let prompt = match surface.prompt.render(role).await {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                self.fail(
-                    now,
-                    PendingInferenceResponse::default(),
-                    format!("{error:#}"),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let notes_rotation = role.uses_notes_rotation();
-        let instructions = Arc::clone(&prompt.text);
-        // What is owed is settled here and nowhere earlier:
-        // `SPEC-restart-recovery`.
-        let previous_failure = match &self.phase {
-            Phase::Idle {
-                standing: Standing::Retry { error, .. },
-                ..
-            } => Some(error.clone()),
-            _ => None,
-        };
-        let retry = match &self.phase {
-            Phase::Idle {
-                standing:
-                    Standing::Retry {
-                        since, attempts, ..
-                    },
-                ..
-            } => Some((*since, *attempts)),
-            _ => None,
-        };
-        if self.provider_history.is_none() {
-            self.provider_input().await?;
-        }
-        let history = self.provider_history.as_ref().unwrap();
-        let pending_compaction = history
-            .iter()
-            .skip(rho_inference::types::context_window_start(history))
-            .rev()
-            .find_map(|block| match &**block {
-                ContextBlock::CompactionTrigger => Some(true),
-                ContextBlock::InferenceResponse { .. } | ContextBlock::ContextRotation { .. } => {
-                    Some(false)
-                }
-                _ => None,
-            })
-            .unwrap_or(false);
-        let manual = pending_compaction
-            || self
-                .user
-                .iter()
-                .any(|input| matches!(input.kind, InputKind::Compaction));
-        let cancel_rotation = self.context.marker.is_some();
-        if manual || cancel_rotation {
-            self.context.rotated();
-        }
-        // Explicit compaction always uses the provider, including transport retries.
-        let notes_rotation = notes_rotation && !manual;
-        // Tool eviction is a first pass; provider compaction remains the fallback.
-        self.session.set_context_rotation(notes_rotation);
-        self.context.preparation = None;
-        let retry_owes_reply = matches!(
-            &self.phase,
-            Phase::Idle {
-                standing: Standing::Retry {
-                    compaction_owes_reply: true,
-                    ..
-                },
-                ..
-            }
+        anyhow::ensure!(
+            !self.responding,
+            ":rewind is not available while the model is responding"
         );
-        let limit = self.session.auto_compact_token_limit();
-        let owed = match &mut self.phase {
-            Phase::Idle { owed, .. } => std::mem::take(owed),
-            Phase::Requesting(_) => Vec::new(),
-        };
-        let mut blocks: Vec<ContextBlock> = Vec::new();
-        if cancel_rotation {
-            blocks.push(ContextBlock::DeveloperMessage {
-                text: if manual {
-                    context::MANUAL_COMPACTION
-                } else {
-                    context::POLICY_CHANGED
-                }
-                .into(),
-            });
-        }
-        let history = self.provider_history.as_ref().unwrap();
-        if !owed.is_empty() {
-            blocks.extend(owed.iter().map(|id| {
-                rho_inference::exec::output(&rho_inference::types::ExecOutput::Reply {
-                    id: id.clone(),
-                    body: ToolOutput {
-                        full_output: None,
-                        images: Default::default(),
-                        output: Arc::new(String::new()),
-                        status: ToolOutputStatus::Cancelled,
-                    },
-                    first_block_at: now,
-                    at: now,
-                })
-            }));
-            // What the empty results cannot say themselves.
-            blocks.push(ContextBlock::UserMessage {
-                sender: MessageSender::User,
-                content: vec![ContentPart::Text {
-                    // The prose half of what the request owes the model;
-                    // the empty results above are the other half.
-                    text: "note: rho restarted. Every tool that was running is gone — foreground \
-                           and background alike — and their external side effects may remain. The empty tool results above are placeholders, not output. Recent execution may be absent from this conversation. Do not automatically replay interrupted work; inspect current state before continuing."
-                        .to_owned(),
-                }],
-            });
-        }
-        // Every source, not just whichever one triggered the boundary:
-        // `DECISION-pull-based-sources`. The order is protocol-constrained
-        // rather than chronological, so tool output leads, and each call's
-        // first contribution becomes its `ToolResult` and every later one a
-        // `ToolUpdate`, because a provider accepts exactly one result per call
-        // id: `REQ-provider-transcript-protocol`.
-        for reply in self.cells.drain() {
-            blocks.push(rho_inference::exec::output(&if reply.first {
-                rho_inference::types::ExecOutput::Reply {
-                    id: reply.id,
-                    body: reply.output,
-                    first_block_at: reply.started_at,
-                    at: now,
-                }
-            } else {
-                rho_inference::types::ExecOutput::Report {
-                    id: reply.id,
-                    body: reply.output,
-                    at: now,
-                }
-            }));
-        }
-        // Everything pending went into this request; the next event's clock
-        // starts fresh.
-        self.observations.clear();
-        {
-            // One block per sender: several messages from the same peer collapse,
-            // so a chatty one costs the model one block rather than five.
-            let mut by_sender: BTreeMap<AgentId, Vec<ContentPart>> = BTreeMap::new();
-            for item in std::mem::take(&mut self.mail) {
-                by_sender
-                    .entry(item.sender)
-                    .or_default()
-                    .extend(item.content);
-            }
-            blocks.extend(by_sender.into_iter().map(|(sender, content)| {
-                ContextBlock::UserMessage {
-                    sender: MessageSender::Agent { id: sender },
-                    content,
-                }
-            }));
-
-            let mut inputs = std::mem::take(&mut self.user);
-            inputs.sort_by_key(|input| matches!(input.kind, InputKind::Compaction));
-            blocks.extend(inputs.into_iter().map(|input| match input.kind {
-                InputKind::Message { content } => ContextBlock::UserMessage {
-                    sender: MessageSender::User,
-                    content,
-                },
-                InputKind::Compaction => ContextBlock::CompactionTrigger,
-            }));
-        }
-
-        for text in std::mem::take(&mut self.recovery_notes) {
-            let index = blocks
-                .iter()
-                .position(|block| matches!(block, ContextBlock::CompactionTrigger))
-                .unwrap_or(blocks.len());
-            blocks.insert(
-                index,
-                ContextBlock::UserMessage {
-                    sender: MessageSender::User,
-                    content: vec![ContentPart::Text { text }],
-                },
-            );
-        }
-
-        let mut evicted = false;
-        let mut used = self.context_used;
-        let compacting_already =
-            pending_compaction || blocks.contains(&ContextBlock::CompactionTrigger);
-        let mut compact = false;
-        if !compacting_already
-            && let Some((limit, occupancy)) = limit.zip(used)
-            && occupancy >= limit
-        {
-            // Compaction is the default. Only a complete eviction plan that
-            // reaches the target replaces it; never persist a partial plan.
-            compact = true;
-            if notes_rotation {
-                let active = self.cells.iter().map(|(id, _)| id.clone()).collect();
-                let notice = ContextBlock::DeveloperMessage {
-                    text: context::EVICTED.into(),
-                };
-                let notice_tokens = context::estimate(&notice);
-                let eviction = context::evict_tools(
-                    history,
-                    &active,
-                    occupancy.saturating_add(notice_tokens),
-                    &self.usage_caps,
-                );
-                let remaining = occupancy.saturating_sub(eviction.freed_tokens) + notice_tokens;
-                if remaining <= context::RETAIN_TOKENS && !eviction.call_ids.is_empty() {
-                    used = Some(remaining);
-                    blocks.push(ContextBlock::ToolHistoryEvicted {
-                        call_ids: eviction.call_ids,
-                    });
-                    blocks.push(notice);
-                    evicted = true;
-                    compact = false;
-                }
-            }
-        }
-        if compact {
-            blocks.push(ContextBlock::CompactionTrigger);
-        }
-        let compaction_owes_reply = retry_owes_reply || compact
-                || blocks
-                    .iter()
-                    .any(|block| !matches!(block, ContextBlock::CompactionTrigger)
-                        && !matches!(block, ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION));
-
-        let handoff = blocks
+        self.drain_outbox().await?;
+        self.flush().await?;
+        let (_, rows) = self.host.history().await?;
+        let humans = rows
             .iter()
-            .filter_map(|block| match block {
-                ContextBlock::ToolResults { results } => Some(results),
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    AgentEvent::Entry(Entry::Received {
+                        from: Party::Human,
+                        ..
+                    })
+                )
+            })
+            .map(|(pos, _)| *pos)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(!humans.is_empty(), "nothing to rewind");
+        let to = humans[humans.len().saturating_sub(turns as usize)];
+        self.host.rewind(UnixMillis::now(), to).await?;
+        let (_, rows) = self.host.history().await?;
+        self.entries = rows
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Entry(entry) => Some(entry),
                 _ => None,
             })
-            .flatten()
-            .map(|result| result.call_id.clone())
-            .collect::<Vec<_>>();
-        for id in &handoff {
-            self.persist(AgentEvent::ExecObserved {
-                id: id.clone(),
-                milestone: rho_agent_types::ExecMilestone::Boundary,
-                at: now,
+            .collect();
+        self.unread.clear();
+        self.last_step = None;
+        self.cell = None;
+        self.told_returned = false;
+        self.interrupted = false;
+        self.awaiting = false;
+        self.prose = 0;
+        self.stopped = None;
+        self.restarted = false;
+        self.rewound = true;
+        self.refresh_compaction_state();
+        Ok(())
+    }
+
+    /// Occupancy and an unfinished compaction, from the current branch
+    /// only: a rewind can restore a pre-compaction context.
+    fn refresh_compaction_state(&mut self) {
+        let mut used = None;
+        let mut pending = false;
+        let mut owes_reply = false;
+        let mut reply = false;
+        for entry in &self.entries {
+            match entry {
+                Entry::CompactionTrigger { manual, .. } => {
+                    pending = true;
+                    owes_reply = !manual;
+                }
+                Entry::Woken { .. } if pending => owes_reply = true,
+                Entry::Woken { .. } => reply = false,
+                Entry::Step { carry, usage, .. } => {
+                    if carry.has_compaction() {
+                        used = None;
+                    } else if usage.input_tokens > 0 {
+                        used = Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                    }
+                    if pending {
+                        reply = carry.has_compaction() && owes_reply;
+                        pending = false;
+                        owes_reply = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.context_used = used;
+        self.compaction_pending = pending;
+        self.compaction_reply = reply;
+    }
+
+    async fn compact(&mut self) -> anyhow::Result<()> {
+        if !self.archived && !self.compaction_pending {
+            self.append(Entry::CompactionTrigger {
+                at: UnixMs::now(),
+                manual: true,
             })
             .await?;
-        }
-
-        // The drain, the append and the send are one event because they are one
-        // thing: a crash between them would leave a transcript nobody drained
-        // into and a queue nobody emptied.
-        self.persist(AgentEvent::Native(NativeEvent::RequestStarted {
-            input: blocks,
-            context: None,
-            wake,
-            at: now,
-        }))
-        .await?;
-        if evicted {
-            self.context.rotated();
-            self.context_used = used;
-            self.session.abort();
-        }
-        self.cells.acknowledge();
-        let input = self.provider_input().await?;
-        self.surface
-            .get_if_ready()
-            .expect("surface initialized")
-            .notebook
-            .set_history(input.clone());
-        self.session.request(InferenceRequest {
-            instructions,
-            input,
-
-            agent_id_labels: Default::default(),
-        });
-        self.phase = Phase::Requesting(InFlight {
-            handoff,
-            retry,
-            previous_failure,
-            compaction_owes_reply,
-            ..InFlight::default()
-        });
-        Ok(())
-    }
-
-    // -- inference ----------------------------------------------------------
-
-    async fn finish_request(
-        &mut self,
-        items: Vec<InferenceResponseItem>,
-        provider_response_id: Option<ProviderResponseId>,
-        usage: Option<rho_inference::types::TokenUsage>,
-        now: UnixMs,
-    ) -> anyhow::Result<()> {
-        if let Err(error) = self.finish_stream(&items) {
-            self.fail(now, PendingInferenceResponse::default(), error)
-                .await?;
-            return Ok(());
-        }
-        let compacted = items
-            .iter()
-            .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
-        let context_used = if compacted {
-            None
-        } else {
-            usage
-                .as_ref()
-                .map(|usage| usage.input_tokens + usage.output_tokens)
-                .or(self.context_used)
-        };
-        self.context_used = context_used;
-
-        let call = match rho_inference::exec::call(&items) {
-            Ok(call) => call,
-            Err(error) => {
-                self.fail(now, PendingInferenceResponse::default(), error.into())
-                    .await?;
-                return Ok(());
-            }
-        };
-        let final_text = call.is_none().then(|| final_answer_text(&items));
-
-        // What the response cost rides on the reply itself, so a reader
-        // can price the transcript from the log alone.
-        let turn_usage = usage.as_ref().map(|usage| AgentUsageBucket {
-            model: usage_model(self.model),
-            input_tokens: usage
-                .input_tokens
-                .saturating_sub(usage.cached_input_tokens)
-                .saturating_sub(usage.cache_write_input_tokens),
-            cache_read_tokens: usage.cached_input_tokens,
-            cache_write_tokens: usage.cache_write_input_tokens,
-            output_tokens: usage.output_tokens,
-            requests: 1,
-            ..AgentUsageBucket::default()
-        });
-        self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
-            output: vec![ContextBlock::InferenceResponse {
-                items,
-                provider_response_id,
-            }],
-            context_used,
-            usage: turn_usage.clone(),
-            at: now,
-        }))
-        .await?;
-
-        if let Some(turn_usage) = turn_usage {
-            self.total_usage.add(&turn_usage);
-        }
-
-        // Everything the request carried goes with it, except whether it still
-        // owes a reply.
-        let owed_a_reply = match &self.phase {
-            Phase::Requesting(in_flight) => in_flight.compaction_owes_reply,
-            // Only a request in flight can finish.
-            Phase::Idle { .. } => false,
-        };
-
-        // A turn that issues no calls buys no further look-in: whatever is
-        // still running speaks for itself.
-        self.cells.set_latest(None);
-        self.turn = Some(ModelTurn {
-            spoke_at: now,
-            asked: if call.is_some() {
-                ModelAsked::Calls
-            } else {
-                ModelAsked::Nothing
-            },
-        });
-        if let Some(call) = call {
-            if self.cells.get(&call.id).is_some() {
-                self.cells.set_latest(Some(&call.id));
-            } else {
-                self.start_exec(call, now);
-            }
-        }
-
-        self.phase = Phase::Idle {
-            owed: Vec::new(),
-            standing: match compacted && owed_a_reply {
-                // The compaction ate the turn the model owed a reply to, so ask
-                // for it again.
-                true => Standing::Asked,
-                false => Standing::Nothing,
-            },
-        };
-
-        // A reply with no calls is the model handing back: whoever is
-        // subscribed to this agent's answers gets it as mail and the sidecar
-        // classifies it.
-        if let Some(final_text) = final_text
-            && !compacted
-        {
-            self.flush_events().await?;
-            self.host.completed(final_text).await?;
+            self.refresh_compaction_state();
         }
         Ok(())
     }
 
-    // -- tools --------------------------------------------------------------
-
-    fn start_exec(&mut self, call: rho_inference::types::ExecCall, now: UnixMs) {
-        let notebook = &self
-            .surface
-            .get_if_ready()
-            .expect("the notebook is initialized before inference")
-            .notebook;
-        self.cells.exec(notebook, call, now);
-    }
-
-    // -- plumbing -----------------------------------------------------------
-
-    /// Live provider context includes the ordered, not-yet-durable tail.
-    async fn provider_input(&mut self) -> anyhow::Result<Vec<Arc<ContextBlock>>> {
-        if self.provider_history.is_none() {
-            self.flush_events().await?;
-            let (_, records) = self.host.history().await?;
-            let replayed = replay::replay(records.into_iter().map(|(_, event)| event).collect());
-            self.provider_history = Some(replayed.history);
-            self.usage_caps = replayed.usage_caps;
-        }
-        Ok(self.provider_history.as_ref().unwrap().clone())
-    }
-
-    /// Timing travels with the next conversation boundary. The bounded writer
-    /// preserves order without making healthy inference wait for disk.
-    async fn persist(&mut self, event: AgentEvent<'static>) -> anyhow::Result<()> {
-        if matches!(event, AgentEvent::ExecObserved { .. }) {
-            self.pending_events.push(event);
-            return Ok(());
-        }
-        let native = event.native_event().cloned();
-        if let Some(NativeEvent::ResponseFinished { output, .. }) = event.native_event() {
-            for block in output {
-                if let ContextBlock::InferenceResponse { items, .. } = block {
-                    self.admitted
-                        .extend(items.iter().filter_map(|item| match item {
-                            InferenceResponseItem::ToolCall { id, .. } => Some(id.clone()),
-                            _ => None,
-                        }));
-                }
-            }
-        }
-        self.pending_events.push(event);
+    async fn append(&mut self, entry: Entry) -> anyhow::Result<()> {
         self.writer
-            .append(std::mem::take(&mut self.pending_events))
+            .append(vec![AgentEvent::Entry(entry.clone())])
             .await?;
-        if let (Some(history), Some(native)) = (&mut self.provider_history, native) {
-            self.usage_caps.observe(&native, history);
-            history.extend(native.blocks().iter().cloned().map(Arc::new));
-            if let Some(surface) = self.surface.get_if_ready() {
-                surface.notebook.set_history(history.clone());
-            }
-        }
+        self.entries.push(entry);
         Ok(())
     }
 
-    async fn flush_events(&mut self) -> anyhow::Result<()> {
-        if !self.pending_events.is_empty() {
-            self.writer
-                .append(std::mem::take(&mut self.pending_events))
-                .await?;
-        }
+    async fn flush(&mut self) -> anyhow::Result<()> {
         Ok(self.writer.flush().await?)
     }
 
-    /// What a reader sees, built from the loop's own state. `deadline` is
-    /// when the decision said to look again, if it can change by itself.
-    fn status(&self, deadline: Option<UnixMs>) -> AgentStatus {
-        let kind = match &self.phase {
-            Phase::Requesting(in_flight) => AgentStateKind::ApiStreaming {
-                pending_response: in_flight.pending.clone(),
-                previous_attempt: in_flight.previous_failure.as_ref().map(|error| {
-                    FailedInferenceResponse {
-                        partial_response: PendingInferenceResponse::default(),
-                        attempt_count: NonZeroU64::new(
-                            in_flight
-                                .retry
-                                .map_or(0, |(_, attempts)| u64::from(attempts)),
-                        )
-                        .unwrap_or(NonZeroU64::MIN),
-                        error: Arc::new(error.to_string()),
-                    }
-                }),
-            },
-            Phase::Idle { standing, .. }
-                if standing.stopped(self.user.first().map(|input| input.at)) =>
-            {
-                match standing {
-                    Standing::Failed { error, .. } => {
-                        AgentStateKind::Error(FailedInferenceResponse {
-                            partial_response: PendingInferenceResponse::default(),
-                            attempt_count: NonZeroU64::MIN,
-                            error: Arc::new(error.to_string()),
-                        })
-                    }
-                    _ => AgentStateKind::Idle,
-                }
+    async fn receive(&mut self, from: Party, body: Vec<Block>) -> anyhow::Result<()> {
+        let at = UnixMs::now();
+        let id = MessageId::new();
+        if from == Party::Human {
+            if self.archived && !self.responding {
+                self.fresh_notebook(at).await?;
             }
-            Phase::Idle { owed, .. } if !owed.is_empty() => AgentStateKind::UnfinishedTurn {
-                outstanding_calls: owed.clone().into(),
-            },
-            // The model is waiting on a call, or asked to be woken, or
-            // something queued is about to go: a turn is running.
-            Phase::Idle { .. } if self.cells.owe_reply() || deadline.is_some() => {
-                AgentStateKind::ToolCalling {
-                    previews: self
-                        .cells
-                        .iter()
-                        .map(|(id, held)| {
-                            (
-                                id.clone(),
-                                ToolPreview {
-                                    call: ToolCall {
-                                        id: id.clone(),
-                                        name: ToolName::try_from("exec").unwrap(),
-                                        tool_type: rho_inference::types::ToolType::Custom,
-                                        arguments: held.source.clone(),
-                                    },
-                                    started_at: held.started_at,
-                                    metadata: None,
-                                },
-                            )
-                        })
-                        .collect(),
-                    results: Vec::new(),
-                    // Nothing names an interval any more; the check-in is the
-                    // notebook's and is not shown here.
-                    waiting: None,
-                }
+            self.mailroom.received();
+            self.stopped = None;
+        } else {
+            self.mailroom.agent_received();
+        }
+        self.unread.push((id, from, at));
+        self.append(Entry::Received { at, id, from, body }).await
+    }
+
+    async fn fresh_notebook(&mut self, at: UnixMs) -> anyhow::Result<()> {
+        if let Some(notebook) = self.notebook.take() {
+            notebook.cancel();
+            let _ = notebook.shutdown().await;
+        }
+        self.archived = false;
+        self.fresh = true;
+        self.cell = None;
+        self.told_returned = false;
+        self.append(Entry::Notice {
+            at,
+            notice: Notice::FreshNotebook,
+        })
+        .await
+    }
+
+    async fn outbound(&mut self, outbound: Outbound) -> anyhow::Result<()> {
+        let at = UnixMs::now();
+        match outbound {
+            Outbound::Send(text) => {
+                self.append(Entry::Sent {
+                    at,
+                    id: MessageId::new(),
+                    to: Party::Human,
+                    text: text.clone(),
+                })
+                .await?;
+                // Whoever is subscribed to this agent's answers gets it as
+                // mail, and the sidecar reads what it asks of the person.
+                self.flush().await?;
+                self.host.completed(text).await?;
+                Ok(())
             }
-            Phase::Idle { .. } => AgentStateKind::Idle,
-        };
-        AgentStatus {
-            kind,
-            queued: self.user.len() + self.mail.len(),
+            Outbound::Status(text) => self.append(Entry::Status { at, text }).await,
+            Outbound::Archive => {
+                self.archived = true;
+                if let Some(notebook) = &self.notebook {
+                    notebook.cancel();
+                }
+                self.append(Entry::Notice {
+                    at,
+                    notice: Notice::Archived,
+                })
+                .await
+            }
+            Outbound::Awaiting(awaiting) if awaiting != self.awaiting => {
+                self.awaiting = awaiting;
+                self.append(Entry::Awaiting {
+                    at,
+                    since: awaiting.then_some(at),
+                })
+                .await
+            }
+            Outbound::Awaiting(_) => Ok(()),
         }
     }
 
-    fn publish_sync(&mut self, deadline: Option<UnixMs>) {
-        let status = self.status(deadline);
+    async fn drain_outbox(&mut self) -> anyhow::Result<()> {
+        while let Ok(outbound) = self.outbox.try_recv() {
+            self.outbound(outbound).await?;
+        }
+        Ok(())
+    }
+
+    fn facts(&self) -> Facts {
+        let sources = self
+            .notebook
+            .as_ref()
+            .map(|notebook| notebook.facts())
+            .unwrap_or_default();
+        let latest = self.cell.as_ref().and_then(|latest| {
+            sources
+                .iter()
+                .find(|source| source.session_id == latest.cell.session_id())
+        });
+        let (wait, wake_on_tools) = self
+            .notebook
+            .as_ref()
+            .map(|notebook| notebook.checkin())
+            .unwrap_or((wake::DEFAULT_CHECKIN, true));
+        let finished = latest
+            .and_then(|facts| facts.finished)
+            .filter(|end| !end.failed && !self.told_returned)
+            .map(|end| end.at);
+        Facts {
+            human: self
+                .unread
+                .iter()
+                .find(|(_, from, _)| *from == Party::Human)
+                .map(|(_, _, at)| *at),
+            agent: self
+                .unread
+                .iter()
+                .find(|(_, from, _)| *from != Party::Human)
+                .map(|(_, _, at)| *at),
+            finished,
+            notified: sources
+                .iter()
+                .filter_map(|facts| facts.notified_at.into_iter().chain(facts.paged_at).min())
+                .min(),
+            failure: sources
+                .iter()
+                .filter(|facts| !facts.delivered && facts.finished.is_some_and(|end| end.failed))
+                .filter_map(|facts| facts.finished.map(|end| end.at))
+                .min(),
+            checkin: self.last_step.map(|at| at + wait),
+            response_finished: self.last_step,
+            wake_on_tools,
+            prose: self.prose > 0 || self.retry,
+            restarted: self.restarted,
+            rewound: self.rewound,
+            compaction: self.compaction_pending,
+            compaction_reply: self.compaction_reply,
+            archived: self.archived,
+            prose_silenced: self.stopped.is_some(),
+        }
+    }
+
+    /// The notebook, started on first use: a load never fails on a place
+    /// that has gone, a wake may.
+    async fn notebook(&mut self) -> anyhow::Result<&Notebook> {
+        if self.notebook.is_none() {
+            let view = Arc::clone(self.view.get().await?);
+            let team = self.host.team().await?;
+            let role = self.head.read().expect("poison").config.role;
+            let (shell, exports) = tools::host_tools(
+                &view,
+                role,
+                self.agent_id,
+                Some(&self.inference),
+                team.as_ref(),
+                Some(&self.host),
+                &self.mailroom,
+            );
+            let notebook = Notebook::new(shell, exports, Arc::clone(&self.wake))
+                .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
+            self.notebook = Some(notebook);
+        }
+        Ok(self.notebook.as_ref().expect("started above"))
+    }
+
+    async fn instructions(&mut self) -> anyhow::Result<Arc<str>> {
+        let view = Arc::clone(self.view.get().await?);
+        let team = self.host.team().await?;
+        let role = self.head.read().expect("poison").config.role;
+        Ok(prompt::prompt(&view, team.as_ref(), role))
+    }
+
+    async fn wake_model(&mut self, why: Wake) -> anyhow::Result<()> {
+        self.drain_outbox().await?;
+        if self.archived {
+            return Ok(());
+        }
+        self.retry = false;
+        let prepared = async {
+            let instructions = self.instructions().await?;
+            self.notebook().await?;
+            anyhow::Ok(instructions)
+        }
+        .await;
+        let instructions = match prepared {
+            Ok(instructions) => instructions,
+            Err(error) => return self.fail(format!("{error:#}")).await,
+        };
+        let mut lines = Vec::new();
+        match why {
+            Wake::Rewound => lines.push(
+                "The human rewound your visible history. Your Python notebook, running work, \
+                 and side effects were not rewound. Check the current state before continuing."
+                    .to_owned(),
+            ),
+            Wake::Restarted => lines.push(
+                "rho restarted. Your notebook and everything running in it are gone, and \
+                 their side effects may remain. Check the current state before carrying on."
+                    .to_owned(),
+            ),
+            Wake::Prose if self.prose > 0 => lines.push(
+                "Your last response had no exec call. Text outside a call reaches nobody: \
+                 speak with human.send()."
+                    .to_owned(),
+            ),
+            _ => {}
+        }
+        if std::mem::take(&mut self.fresh) {
+            lines.push(
+                "This agent was archived. You have a fresh notebook; earlier Python state and \
+                 running work are gone."
+                    .to_owned(),
+            );
+        }
+        if std::mem::take(&mut self.interrupted) {
+            lines.push(
+                "Your response was cut off while you were writing its cell; only the code \
+                 shown ran. Carry on from the notebook's state without replaying it."
+                    .to_owned(),
+            );
+        }
+        let mut images = Vec::new();
+        if let Some(report) = self
+            .notebook
+            .as_ref()
+            .and_then(|notebook| notebook.report())
+        {
+            lines.push(report.text);
+            images.extend(report.images.into_iter().map(|image| Image {
+                media_type: image.media_type,
+                data: image.data,
+            }));
+        }
+        self.wake_with(why, instructions, lines, images).await
+    }
+
+    async fn wake_with(
+        &mut self,
+        why: Wake,
+        instructions: Arc<str>,
+        mut lines: Vec<String>,
+        images: Vec<Image>,
+    ) -> anyhow::Result<()> {
+        if self.cell.is_some() {
+            self.told_returned = true;
+        }
+        let messages = std::mem::take(&mut self.unread);
+        let humans = messages
+            .iter()
+            .filter(|(_, from, _)| *from == Party::Human)
+            .count();
+        self.mailroom.read(humans as u64);
+        if lines.is_empty() {
+            lines.push(
+                if !messages.is_empty() {
+                    "New messages below."
+                } else if why == Wake::Checkin {
+                    "Check-in: nothing new."
+                } else {
+                    "Nothing new."
+                }
+                .to_owned(),
+            );
+        }
+        let manual_only = why == Wake::Compaction
+            && messages.is_empty()
+            && images.is_empty()
+            && lines == ["Nothing new."];
+        let report = lines.join("\n\n");
+        if !manual_only {
+            let pending = self
+                .entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    Entry::Step { calls, .. } => Some(calls.clone()),
+                    Entry::Woken { .. } => Some(Vec::new()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let results = pending
+                .into_iter()
+                .map(|call| CallResult {
+                    id: call.id,
+                    text: report.clone(),
+                    images: images.clone(),
+                })
+                .collect();
+            self.append(Entry::Woken {
+                at: UnixMs::now(),
+                why,
+                report,
+                images,
+                messages: messages.into_iter().map(|(id, _, _)| id).collect(),
+                acknowledged: Vec::new(),
+                results,
+            })
+            .await?;
+            self.restarted = false;
+            self.rewound = false;
+        }
+        if let Some(notebook) = &self.notebook {
+            notebook.reset_checkin();
+        }
+        if self
+            .context_used
+            .is_some_and(|used| used >= AUTO_COMPACT_TOKENS)
+            && !self.compaction_pending
+        {
+            self.append(Entry::CompactionTrigger {
+                at: UnixMs::now(),
+                manual: false,
+            })
+            .await?;
+            self.refresh_compaction_state();
+        }
+        let request = context::request(instructions, &self.entries, self.cache_key);
+
+        self.responding = true;
+        self.publish(None).await?;
+        let mut failures = 0;
+        let step = loop {
+            let model = Arc::clone(&self.model);
+            // The call's code, as it arrives, runs as it arrives.
+            let (code_tx, mut code_rx) = mpsc::unbounded_channel();
+            let mut streaming = None;
+            let result = {
+                let mut forward = move |piece: Stream<'_>| {
+                    let _ = code_tx.send(match piece {
+                        Stream::Call { id } => (Some(id.clone()), String::new()),
+                        Stream::Code(code) => (None, code.to_owned()),
+                    });
+                };
+                let step = model.step(&request, &mut forward);
+                tokio::pin!(step);
+                // Keep recording what arrives while the model writes.
+                loop {
+                    tokio::select! {
+                        biased;
+                        error = self.writer.failed() => return Err(error.into()),
+                        result = &mut step => break result,
+                        Some(piece) = code_rx.recv() => self.stream(&mut streaming, piece),
+                        control = self.control_rx.recv() => match control {
+                            Some(Control::Cancel) => {
+                                self.interrupt(streaming).await?;
+                                return Ok(());
+                            }
+                            Some(control) => self.control(control).await?,
+                            None => return Ok(()),
+                        },
+                        Some(outbound) = self.outbox.recv() => self.outbound(outbound).await?,
+                    }
+                }
+            };
+            while let Ok(piece) = code_rx.try_recv() {
+                self.stream(&mut streaming, piece);
+            }
+            match result {
+                Ok(step) => break Ok((step, streaming)),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    self.append(Entry::Notice {
+                        at: UnixMs::now(),
+                        notice: Notice::Error(error.clone()),
+                    })
+                    .await?;
+                    // Code that already ran cannot be taken back: it stands
+                    // as the step, and the model hears it was cut off.
+                    if let (Some(latest), Some(streaming)) = (&self.cell, streaming)
+                        && let Some(ran) = latest.cell.interrupt()
+                    {
+                        break Err(Call {
+                            id: streaming.id,
+                            code: streaming.code[..ran.min(streaming.code.len())].to_owned(),
+                        });
+                    }
+                    failures += 1;
+                    if failures >= MAX_FAILURES {
+                        self.responding = false;
+                        return self.fail(error).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(2u64.pow(failures))).await;
+                }
+            }
+        };
+        self.responding = false;
+        let at = UnixMs::now();
+        self.last_step = Some(at);
+        let (step, streaming) = match step {
+            Ok(step) => step,
+            Err(call) => {
+                self.interrupted = true;
+                self.prose = 0;
+                self.append(Entry::Step {
+                    at,
+                    calls: vec![call.clone()],
+                    prose: String::new(),
+                    carry: Carry::bare(call),
+                    usage: Usage::default(),
+                })
+                .await?;
+                return self.revive_if_written(at).await;
+            }
+        };
+        let compacted = step.carry.has_compaction();
+        let usage = step.usage;
+        self.append(Entry::Step {
+            at,
+            calls: step.call.clone().into_iter().collect(),
+            prose: step.prose,
+            carry: step.carry,
+            usage,
+        })
+        .await?;
+        self.append(Entry::Usage {
+            at,
+            usage: ResponseUsage::rho(self.model_name.clone(), usage),
+        })
+        .await?;
+        self.refresh_compaction_state();
+        match (step.call, streaming) {
+            (Some(call), Some(streaming)) => {
+                self.prose = 0;
+                if let Some(latest) = &mut self.cell {
+                    // Whatever the stream missed, then the end.
+                    let rest = call.code.strip_prefix(&streaming.code).unwrap_or_default();
+                    let _ = latest.cell.feed(rest.to_owned(), true);
+                    latest.call = call;
+                }
+            }
+            (Some(call), None) => {
+                self.prose = 0;
+                let cell = self.notebook().await?.run(call.code.clone());
+                self.cell = Some(Latest {
+                    cell,
+                    call,
+                    started_at: at,
+                });
+                self.told_returned = false;
+            }
+            (None, streaming) => {
+                if compacted {
+                    self.prose = 0;
+                    return Ok(());
+                }
+                if streaming.is_some()
+                    && let Some(latest) = &self.cell
+                {
+                    latest.cell.stop();
+                }
+                self.prose += 1;
+                if self.prose >= MAX_PROSE {
+                    self.prose = 0;
+                    self.stopped = Some(Stopped::Quiet);
+                }
+            }
+        }
+        self.revive_if_written(at).await
+    }
+
+    /// The human wrote to an archived agent while it was responding.
+    async fn revive_if_written(&mut self, at: UnixMs) -> anyhow::Result<()> {
+        if self.archived && self.unread.iter().any(|(_, from, _)| *from == Party::Human) {
+            self.fresh_notebook(at).await?;
+        }
+        Ok(())
+    }
+
+    /// Model requests kept failing: stop until someone writes or retries.
+    async fn fail(&mut self, error: String) -> anyhow::Result<()> {
+        self.stopped = Some(Stopped::Failed(Arc::from(error.as_str())));
+        self.flush().await?;
+        self.host.failed(error).await?;
+        Ok(())
+    }
+
+    async fn interrupt(&mut self, streaming: Option<Streaming>) -> anyhow::Result<()> {
+        if let Some(notebook) = &self.notebook {
+            notebook.cancel();
+        }
+        self.cell = None;
+        self.responding = false;
+        self.stopped = Some(Stopped::Quiet);
+        if let Some(streaming) = streaming {
+            self.interrupted = true;
+            let call = Call {
+                id: streaming.id,
+                code: streaming.code,
+            };
+            self.append(Entry::Step {
+                at: UnixMs::now(),
+                calls: vec![call.clone()],
+                prose: String::new(),
+                carry: Carry::bare(call),
+                usage: Usage::default(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// A piece of the call being written: its start opens a cell, its code
+    /// feeds it.
+    fn stream(&mut self, streaming: &mut Option<Streaming>, (id, code): (Option<CallId>, String)) {
+        if let Some(id) = id
+            && let Some(notebook) = &self.notebook
+        {
+            self.cell = Some(Latest {
+                cell: notebook.stream(),
+                call: Call {
+                    id: id.clone(),
+                    code: String::new(),
+                },
+                started_at: UnixMs::now(),
+            });
+            self.told_returned = false;
+            *streaming = Some(Streaming {
+                id,
+                code: String::new(),
+            });
+        }
+        if let (Some(streaming), Some(latest)) = (streaming.as_mut(), &mut self.cell)
+            && !code.is_empty()
+        {
+            streaming.code.push_str(&code);
+            latest.call.code.push_str(&code);
+            let _ = latest.cell.feed(code, false);
+        }
+    }
+
+    /// What a reader sees, built from the loop's own state.
+    fn status(&self) -> AgentStatus {
+        let kind = if self.responding {
+            AgentStateKind::ApiStreaming {
+                pending_response: PendingInferenceResponse::default(),
+                previous_attempt: None,
+            }
+        } else if let Some(Stopped::Failed(error)) = &self.stopped {
+            AgentStateKind::Error(FailedInferenceResponse {
+                partial_response: PendingInferenceResponse::default(),
+                attempt_count: NonZeroU64::MIN,
+                error: Arc::new(error.to_string()),
+            })
+        } else if self.cell_running() && !self.awaiting && !self.archived {
+            let latest = self.cell.as_ref().expect("running");
+            let id = rho_inference::types::ExecId::try_from(latest.call.id.as_str().to_owned())
+                .unwrap_or_else(|_| "exec".try_into().expect("valid id"));
+            let preview = ToolPreview {
+                call: ToolCall {
+                    id: id.clone(),
+                    name: ToolName::try_from("exec").expect("valid tool name"),
+                    tool_type: ToolType::Custom,
+                    arguments: latest.call.code.clone(),
+                },
+                started_at: latest.started_at,
+                metadata: None,
+            };
+            AgentStateKind::ToolCalling {
+                previews: BTreeMap::from([(id, preview)]),
+                results: Vec::new(),
+                waiting: None,
+            }
+        } else {
+            AgentStateKind::Idle
+        };
+        AgentStatus {
+            kind,
+            queued: self.unread.len(),
+        }
+    }
+
+    fn publish_sync(&mut self) {
+        let status = self.status();
+        self.working = status.kind.is_working();
         *self.status.write().expect("poison") = status;
         self.host.published();
     }
 
     /// Publish, and tell the log when the turn's edge moved: started when
     /// the agent begins working, ended when it hands back.
-    async fn publish(&mut self, deadline: Option<UnixMs>) -> anyhow::Result<()> {
-        let status = self.status(deadline);
+    async fn publish(&mut self, _recheck: Option<UnixMs>) -> anyhow::Result<()> {
+        let status = self.status();
         let working = status.kind.is_working();
         if working != self.working {
-            let now = UnixMillis::now();
             let edge = if working {
                 TurnEdge::Started
             } else {
-                TurnEdge::Ended(match &self.phase {
-                    Phase::Idle {
-                        standing: Standing::Failed { error, .. },
-                        ..
-                    } => TurnOutcome::Errored {
+                TurnEdge::Ended(match &self.stopped {
+                    Some(Stopped::Failed(error)) => TurnOutcome::Errored {
                         message: error.to_string(),
                     },
-                    Phase::Idle {
-                        standing: Standing::Cancelled { .. },
-                        ..
-                    } => TurnOutcome::Cancelled,
                     _ => TurnOutcome::Completed,
                 })
             };
-            if !working {
-                self.flush_events().await?;
-            }
-            self.host.turn(now, edge).await?;
+            self.flush().await?;
+            self.host.turn(UnixMillis::now(), edge).await?;
             if !working {
                 self.host.settled().await?;
             }
@@ -1778,39 +1382,74 @@ impl Agent {
     }
 }
 
-fn usage_model(model: InferenceModel) -> AgentUsageModel {
-    match model {
-        InferenceModel::Gpt6Astra => AgentUsageModel::ASTRA,
-        InferenceModel::Gpt6Luna => AgentUsageModel::LUNA,
-        _ => AgentUsageModel::GPT,
-    }
+/// The inference2 model a role's binding names, and the name its usage is
+/// billed under. Credentials come from the agent host's account selection.
+fn model(
+    inference: &Inference,
+    binding: crate::db::SessionBinding,
+) -> anyhow::Result<(Model, String)> {
+    let profile: InferenceProfile = binding
+        .deep_config()
+        .ok_or_else(|| anyhow::anyhow!("Rho runtime stored with a Claude mode"))?;
+    let model: InferenceModel = binding
+        .deep_model()
+        .ok_or_else(|| anyhow::anyhow!("Rho runtime stored without a model"))?;
+    let effort = match profile.effort {
+        ReasoningEffort::Low => rho_inference2::openai::Effort::Low,
+        ReasoningEffort::Medium => rho_inference2::openai::Effort::Medium,
+        ReasoningEffort::High => rho_inference2::openai::Effort::High,
+        ReasoningEffort::Xhigh => rho_inference2::openai::Effort::XHigh,
+    };
+    let accounts = inference.clone();
+    let resolve_auth: rho_inference2::openai::AuthResolver = Arc::new(move |_| {
+        let accounts = accounts.clone();
+        Box::pin(async move {
+            let auth = accounts.auth().await?;
+            let resolved = accounts.resolve_auth(auth).await?;
+            Ok(rho_inference::ResolvedOAuth {
+                bearer_token: resolved.bearer_token,
+                account_id: resolved.account_id,
+            })
+        })
+    });
+    let billed = match model {
+        InferenceModel::Gpt6Astra => crate::db::AgentUsageModel::ASTRA,
+        InferenceModel::Gpt6Luna => crate::db::AgentUsageModel::LUNA,
+        InferenceModel::Gpt6Sol => crate::db::AgentUsageModel::GPT,
+    };
+    Ok((
+        Model::OpenAiWithAuth {
+            model: rho_inference2::openai::OpenAi {
+                base_url: inference.responses_base_url().to_owned(),
+                model: model.as_str().to_owned(),
+                effort,
+                fast: profile.fast_mode,
+                auth: String::new(),
+            },
+            resolve_auth,
+        },
+        billed.name().to_owned(),
+    ))
 }
 
-// -- the tool surface -------------------------------------------------------
+fn cache_key(key: rho_inference::PromptCacheKey) -> CacheKey {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&key.to_bytes());
+    CacheKey::from_u128(u128::from_le_bytes(bytes))
+}
 
-/// Build one session-lifetime notebook. Allowed role switches preserve its
-/// capabilities.
-#[allow(clippy::too_many_arguments)]
-fn surface(
-    view: Arc<View>,
-    role: AgentRole,
-    agent_id: AgentId,
-    inference: Option<&Inference>,
-    team: Option<&Team>,
-    host: Option<&Arc<crate::worker::Host>>,
-) -> anyhow::Result<Surface> {
-    let (shell, others) = host_tools(&view, role, agent_id, inference, team, host);
-    let notebook = Arc::new(
-        crate::python::PythonNotebook::new(shell, others)
-            .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
-    );
-    Ok(Surface {
-        notebook,
-        prompt: PromptInputs {
-            view,
-            host: host.cloned(),
-        },
-    })
+fn blocks(content: Vec<ContentPart>) -> Vec<Block> {
+    content
+        .into_iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => Block::Text(text),
+            ContentPart::Image { media_type, data } => Block::Image(Image { media_type, data }),
+        })
+        .collect()
+}
+
+fn until(at: UnixMs) -> Duration {
+    Duration::from_millis(at.0.saturating_sub(UnixMs::now().0))
 }
 
 /// The model-facing surface of a role, for a reader: the prompt and the tool

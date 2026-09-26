@@ -31,6 +31,7 @@ pub mod python;
 pub use agent::{AgentHandle, render_agent_surface};
 
 pub mod db;
+pub mod entry;
 mod image_tool;
 pub mod journal;
 mod lazy;
@@ -191,6 +192,8 @@ pub enum AgentEvent<'a> {
         id: uuid::Uuid,
         at: UnixMs,
     },
+    /// One of the Rho runtime's own rows.
+    Entry(entry::Entry),
 }
 
 /// Leased notebook contributions transferred to durable host ownership before
