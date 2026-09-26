@@ -5,10 +5,8 @@ use std::collections::{BTreeSet, HashMap};
 
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Timestamp, Zoned};
-use rho_agent_types::{AgentId, AgentIdDomain, AgentPos, AgentWant, TurnEdge, TurnOutcome, UnixMs};
-use rho_agents_client::fold::MirroredAgent;
-use rho_agents_client::protocol::transcript::{RuntimeKind, SpawnedBy, Speaker, TranscriptEvent};
-use rho_agents_client::{AgentMap, HostId};
+use rho_agent_types::{AgentId, AgentIdDomain, AgentRole, Place, UnixMs};
+use rho_agents2_client::protocol::{AgentInfo, ChatEvent, ChatKind, Effort, MessageId, Party};
 use rho_slack::config::WorkspaceName;
 use rho_slack::model::Model;
 use rho_slack::types::{ChannelId, Conversation, ConversationKind, Message, Ts, User, UserId};
@@ -30,9 +28,8 @@ enum Said {
 
 /// Everything `rank` reads, and a clock to move.
 struct World {
-    agents: AgentMap,
-    host: HostId,
-    pos: HashMap<AgentId, u64>,
+    agents: HashMap<AgentId, AgentInfo>,
+    next_id: u64,
     slack: Model,
     ts: u64,
     marks: Marks,
@@ -77,13 +74,9 @@ fn world_in(zone: TimeZone) -> World {
             members: Vec::new(),
         },
     ]);
-    let mut agents = AgentMap::default();
-    let host = HostId::default();
-    agents.set_host_data(host, 0, 0);
     World {
-        agents,
-        host,
-        pos: HashMap::new(),
+        agents: HashMap::new(),
+        next_id: 0,
         slack,
         ts: 0,
         marks: Marks::default(),
@@ -114,112 +107,81 @@ impl World {
         self.now.timestamp().as_millisecond() as u64
     }
 
-    /// One row of an agent's story, folded the way the client folds it.
-    fn log(&mut self, agent_id: AgentId, event: TranscriptEvent) {
-        let pos = self.pos.entry(agent_id).or_insert(0);
-        let mirrored = match self.agents.mirrored(agent_id) {
-            Some(mirrored) => {
-                let mut mirrored = mirrored.clone();
-                mirrored.tell(AgentPos(*pos), &event);
-                mirrored
-            }
-            None => MirroredAgent::new(self.host, agent_id, &event).unwrap(),
-        };
-        *pos += 1;
-        self.agents.told(vec![mirrored]);
-    }
-
-    fn agent_under(&mut self, name: &str, parent: Option<AgentId>) -> NodeId {
-        let agent_id = AgentId::from_counter(self.pos.len() as u64 + 1, &AgentIdDomain(0)).unwrap();
-        let at = UnixMs(self.ms());
-        self.log(
-            agent_id,
-            TranscriptEvent::Created {
-                role: rho_agent_types::AgentRole::default(),
-                runtime: RuntimeKind::Rho,
-                place: rho_agent_types::Place {
-                    workset: "0123456789ab".into(),
+    fn agent(&mut self, name: &str) -> NodeId {
+        self.next_id += 1;
+        let id = AgentId::from_counter(self.next_id, &AgentIdDomain(0)).unwrap();
+        self.agents.insert(
+            id,
+            AgentInfo {
+                id,
+                place: Place {
+                    workset: "fixture-workset".into(),
                     cwd: "/src/repo".into(),
                     mode: Default::default(),
                     origin: None,
                 },
-                spawned_by: SpawnedBy::Direct,
-                spawn_name: None,
-                parent,
-                model: "sol".into(),
-                at,
+                role: AgentRole::default(),
+                model: "gpt-6-sol".into(),
+                effort: Effort::Medium,
+                archived: false,
+                status: None,
+                chat: Vec::new(),
             },
         );
-        let node = NodeId::Agent(agent_id);
+        let node = NodeId::Agent(id);
         self.names.insert(node.clone(), name.into());
+        self.tell(Fact::Named {
+            node: node.clone(),
+            name: Some(name.into()),
+        });
         node
     }
 
-    fn agent(&mut self, name: &str) -> NodeId {
-        self.agent_under(name, None)
-    }
-
-    fn id(node: &NodeId) -> AgentId {
-        node.agent().unwrap()
-    }
-
-    fn turn(&mut self, node: &NodeId, edge: TurnEdge) {
+    fn push(&mut self, node: &NodeId, kind: ChatKind) -> u64 {
         let at = UnixMs(self.ms());
-        self.log(Self::id(node), TranscriptEvent::Turn { edge, at });
+        let agent = self.agents.get_mut(&node.agent().unwrap()).unwrap();
+        if let ChatKind::Status(text) = &kind {
+            agent.status = Some(text.clone());
+        }
+        let chat = &mut agent.chat;
+        let seq = chat.last().map_or(1, |event| event.seq + 1);
+        chat.push(ChatEvent { seq, at, kind });
+        seq
     }
 
-    fn starts(&mut self, node: &NodeId) {
-        self.turn(node, TurnEdge::Started);
-    }
-
-    fn ends(&mut self, node: &NodeId, outcome: TurnOutcome) {
-        self.turn(node, TurnEdge::Ended(outcome));
-    }
-
-    /// A whole turn, finished.
-    fn finishes(&mut self, node: &NodeId) {
-        self.starts(node);
-        self.ends(node, TurnOutcome::Completed);
-    }
-
-    fn asks(&mut self, node: &NodeId) {
-        self.starts(node);
-        let at = UnixMs(self.ms());
-        self.log(
-            Self::id(node),
-            TranscriptEvent::Wants {
-                want: AgentWant::Ask,
-                summary: None,
-                at,
-            },
-        );
-        self.ends(node, TurnOutcome::Completed);
-    }
-
-    fn errors(&mut self, node: &NodeId) {
-        self.starts(node);
-        self.ends(
+    fn reply(&mut self, node: &NodeId) {
+        let id = node.agent().unwrap();
+        self.push(
             node,
-            TurnOutcome::Errored {
-                message: "boom".into(),
+            ChatKind::Message {
+                id: MessageId(self.newest(node) + 1),
+                from: Party::Agent(id),
+                to: Party::Human,
+                text: "agent reply".into(),
             },
         );
     }
 
     fn writes_to(&mut self, node: &NodeId) {
-        let at = UnixMs(self.ms());
-        self.log(
-            Self::id(node),
-            TranscriptEvent::ClaudeMessage {
-                speaker: Speaker::User,
-                text: "go on".into(),
-                at,
+        let id = node.agent().unwrap();
+        self.push(
+            node,
+            ChatKind::Message {
+                id: MessageId(self.newest(node) + 1),
+                from: Party::Human,
+                to: Party::Agent(id),
+                text: "human request".into(),
             },
         );
     }
 
     fn newest(&self, node: &NodeId) -> u64 {
-        self.agents.agent_digest(Self::id(node)).unwrap().newest.0
+        self.agents[&node.agent().unwrap()]
+            .chat
+            .iter()
+            .map(|event| event.seq)
+            .max()
+            .unwrap_or(0)
     }
 
     fn tell(&mut self, fact: Fact) {
@@ -439,100 +401,143 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-3
 }
 
-// Agents
+// Agents: raw physical chat seq, not turn envelopes or status messages.
 
 #[test]
-fn a1_a_finished_agent_is_low_and_gone_in_three_days() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.finishes(&a);
-    assert_eq!(w.hand(), "a · finished · 0m ago");
-    assert!(w.priority(&a).unwrap() < LAMP_THRESHOLD);
-    w.pass(hours(71));
-    assert_eq!(w.hand(), "a · finished · 3.0d ago");
-    w.pass(hours(1));
-    assert_eq!(w.hand(), "");
-}
-
-#[test]
-fn a2_an_agent_asking_rises() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.asks(&a);
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
-    let first = w.priority(&a).unwrap();
-    w.pass(hours(1));
-    assert!(w.priority(&a).unwrap() > first);
-}
-
-#[test]
-fn a3_an_errored_agent_waits_on_the_user() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.errors(&a);
-    assert_eq!(w.hand(), "a · errored · 0m ago");
-    assert!(w.priority(&a).unwrap() >= AGENT_BLOCKED_HEAD_START);
-}
-
-#[test]
-fn a4_an_agent_at_work_or_holding_the_users_message_has_no_card() {
-    let mut w = world();
-    let a = w.agent("a");
-    w.starts(&a);
-    assert_eq!(w.hand(), "");
-    let b = w.agent("b");
-    w.finishes(&b);
-    w.pass(mins(1));
-    w.writes_to(&b);
-    assert_eq!(w.hand(), "", "the message is queued, the ball is with b");
-}
-
-#[test]
-fn a5_an_agent_the_user_just_wrote_to_comes_back_on_top_and_chimes() {
+fn agent_reply_requires_output_to_human_and_fades() {
     let mut w = world();
     let a = w.agent("a");
     w.writes_to(&a);
-    w.starts(&a);
+    assert_eq!(w.hand(), "");
     w.pass(mins(5));
-    let d = w.dm("D1", "U1");
-    w.ends(&a, TurnOutcome::Completed);
-    assert_eq!(w.top().as_deref(), Some("a"));
+    w.reply(&a);
+    assert_eq!(w.hand(), "a · finished · 0m ago");
     assert!(w.priority(&a).unwrap() >= CHIME_THRESHOLD);
-    assert!(w.priority(&d).is_some());
+    w.pass(hours(72));
+    assert_eq!(w.hand(), "");
 }
 
 #[test]
-fn a6_done_holds_until_a_newer_turn_ends() {
+fn human_reply_after_agent_output_suppresses_card_until_another_agent_reply() {
     let mut w = world();
     let a = w.agent("a");
-    w.finishes(&a);
-    w.done(&a);
+    w.reply(&a);
+    w.writes_to(&a);
     assert_eq!(w.hand(), "");
-    w.pass(hours(2));
-    w.finishes(&a);
+    w.reply(&a);
     assert_eq!(w.hand(), "a · finished · 0m ago");
 }
 
 #[test]
-fn a7_an_agent_made_by_an_agent_has_no_card_of_its_own() {
+fn unnamed_agent_card_uses_latest_human_request_but_name_wins() {
     let mut w = world();
-    let parent = w.agent("parent");
-    let child = w.agent_under("child", Some(World::id(&parent)));
-    w.asks(&child);
+    let a = w.agent("given");
+    let id = a.agent().unwrap();
+    w.tell(Fact::Named {
+        node: a.clone(),
+        name: None,
+    });
+    w.push(
+        &a,
+        ChatKind::Message {
+            id: MessageId(1),
+            from: Party::Human,
+            to: Party::Agent(id),
+            text: "investigate retries\nextra detail".into(),
+        },
+    );
+    w.reply(&a);
+    let sources = Sources {
+        agents: &w.agents,
+        slack: None,
+        marks: &w.marks,
+        skips: &w.skips,
+    };
+    assert_eq!(title(&sources, &a, &mut w.cache), "investigate retries");
+    w.tell(Fact::Named {
+        node: a.clone(),
+        name: Some("preferred".into()),
+    });
+    let sources = Sources {
+        agents: &w.agents,
+        slack: None,
+        marks: &w.marks,
+        skips: &w.skips,
+    };
+    assert_eq!(title(&sources, &a, &mut w.cache), "preferred");
+}
+
+#[test]
+fn physical_seen_boundary_and_status_rows_do_not_invent_output() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.push(&a, ChatKind::Status("working".into()));
+    assert_eq!(w.hand(), "");
+    w.reply(&a);
+    let seq = w.newest(&a);
+    w.done(&a);
+    assert_eq!(w.hand(), "");
+    w.push(&a, ChatKind::Status("waiting".into()));
+    assert_eq!(
+        w.hand(),
+        "",
+        "status cannot revive an already-seen agent reply"
+    );
+    w.reply(&a);
+    assert_eq!(w.hand(), "a · waiting · 0m ago");
+    assert_eq!(w.deal().cards[0].cursor, (seq + 2).to_string());
+}
+
+#[test]
+fn rewound_branch_remains_in_physical_unread_chat() {
+    let mut w = world();
+    let a = w.agent("a");
+    w.reply(&a);
+    w.done(&a);
+    w.reply(&a);
+    w.push(&a, ChatKind::Rewound { to: 1 });
+    assert_eq!(w.hand(), "a · finished · 0m ago");
+    assert_eq!(
+        w.deal().cards[0].cursor,
+        "3",
+        "rewind has its own physical seq"
+    );
+    w.done(&a);
     assert_eq!(w.hand(), "");
 }
 
 #[test]
-fn a8_a_muted_agent_or_one_whose_host_is_gone_has_nothing() {
+fn muted_and_archived_agents_have_no_source_card_but_dated_marks_stay() {
     let mut w = world();
     let a = w.agent("a");
-    w.asks(&a);
+    w.reply(&a);
     w.say(&a, Said::Mute);
     assert_eq!(w.hand(), "");
     w.say(&a, Said::Unmute);
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
-    w.agents.detach_host(w.host);
+    assert_eq!(w.hand(), "a · finished · 0m ago");
+    w.agents.get_mut(&a.agent().unwrap()).unwrap().archived = true;
     assert_eq!(w.hand(), "");
+    w.todo(&a, None);
+    assert_eq!(w.hand(), "a · todo · 0m");
+}
+
+#[test]
+fn agent_messages_to_other_agents_do_not_count_as_a_human_reply() {
+    let mut w = world();
+    let a = w.agent("a");
+    let b = w.agent("b");
+    w.push(
+        &a,
+        ChatKind::Message {
+            id: MessageId(3),
+            from: Party::Agent(a.agent().unwrap()),
+            to: Party::Agent(b.agent().unwrap()),
+            text: "side-channel".into(),
+        },
+    );
+    assert_eq!(w.hand(), "");
+    w.reply(&a);
+    assert_eq!(w.hand(), "a · finished · 0m ago");
 }
 
 // Snoozes
@@ -566,11 +571,10 @@ fn z2_a_node_back_from_a_snooze_counts_from_its_end() {
 fn z3_a_snooze_ending_on_a_node_that_wants_nothing_brings_nothing() {
     let mut w = world();
     let a = w.agent("a");
-    w.finishes(&a);
+    w.reply(&a);
     w.snooze(&a, hours(1));
     w.pass(mins(5));
     w.writes_to(&a);
-    w.starts(&a);
     let d = w.dm("D1", "U1");
     w.snooze(&d, hours(1));
     w.read(&d);
@@ -582,23 +586,21 @@ fn z3_a_snooze_ending_on_a_node_that_wants_nothing_brings_nothing() {
 fn z4_a_reply_within_the_hour_of_the_users_message_comes_through_a_snooze() {
     let mut w = world();
     let a = w.agent("a");
-    w.finishes(&a);
+    w.reply(&a);
     w.snooze(&a, hours(4));
     w.pass(mins(30));
     w.writes_to(&a);
-    w.starts(&a);
     w.pass(mins(30));
-    w.asks(&a);
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
+    w.reply(&a);
+    assert_eq!(w.hand(), "a · finished · 0m ago");
 
     let b = w.agent("b");
-    w.finishes(&b);
+    w.reply(&b);
     w.snooze(&b, hours(4));
     w.pass(mins(30));
     w.writes_to(&b);
-    w.starts(&b);
     w.pass(mins(61));
-    w.ends(&b, TurnOutcome::Completed);
+    w.reply(&b);
     assert!(
         w.priority(&b).is_none(),
         "an hour and more is not a conversation"
@@ -692,17 +694,16 @@ fn t3_a_deadline_shows_its_lead_ahead_and_jumps_once_late() {
 }
 
 #[test]
-fn t4_a_todo_on_an_agent_hides_while_it_works() {
+fn t4_a_todo_on_an_agent_stays_while_status_changes() {
     let mut w = world();
     let a = w.agent("a");
-    w.finishes(&a);
+    w.reply(&a);
     w.todo(&a, None);
-    assert_eq!(w.hand(), "a · todo · 0m");
     w.writes_to(&a);
-    w.starts(&a);
-    assert_eq!(w.hand(), "");
+    w.push(&a, ChatKind::Status("working".into()));
+    assert_eq!(w.hand(), "a · todo · 0m");
     w.pass(hours(1));
-    w.ends(&a, TurnOutcome::Completed);
+    w.reply(&a);
     assert_eq!(w.deal().cards.len(), 1);
 }
 
@@ -710,10 +711,10 @@ fn t4_a_todo_on_an_agent_hides_while_it_works() {
 fn t5_writing_to_an_agent_keeps_its_todo() {
     let mut w = world();
     let a = w.agent("a");
-    w.finishes(&a);
+    w.reply(&a);
     w.todo(&a, None);
     w.writes_to(&a);
-    w.finishes(&a);
+    w.reply(&a);
     assert!(w.marks.get(&a).facts().todo().is_some());
 }
 
@@ -853,7 +854,7 @@ fn n1_n3_a_plain_or_deleted_note_has_no_card() {
 fn x1_a_node_is_one_card_at_its_strongest() {
     let mut w = world();
     let a = w.agent("a");
-    w.asks(&a);
+    w.reply(&a);
     w.say(
         &a,
         Said::Deadline {
@@ -861,7 +862,7 @@ fn x1_a_node_is_one_card_at_its_strongest() {
             lead_days: 3,
         },
     );
-    assert_eq!(w.hand(), "a · waiting on reply · 0m");
+    assert_eq!(w.hand(), "a · finished · 0m ago");
 }
 
 #[test]
@@ -939,9 +940,8 @@ fn x4_tomorrow_is_the_users_own_midnight() {
 #[derive(Clone, Debug)]
 enum Step {
     Pass(i64),
-    Finishes(usize),
-    Asks(usize),
-    Starts(usize),
+    Reply(usize),
+    Status(usize),
     WritesTo(usize),
     Dm(usize),
     Read(usize),
@@ -956,9 +956,8 @@ fn step() -> impl proptest::strategy::Strategy<Value = Step> {
     use proptest::prelude::*;
     prop_oneof![
         (1i64..600).prop_map(Step::Pass),
-        (0usize..3).prop_map(Step::Finishes),
-        (0usize..3).prop_map(Step::Asks),
-        (0usize..3).prop_map(Step::Starts),
+        (0usize..3).prop_map(Step::Reply),
+        (0usize..3).prop_map(Step::Status),
         (0usize..3).prop_map(Step::WritesTo),
         (0usize..2).prop_map(Step::Dm),
         (0usize..2).prop_map(Step::Read),
@@ -988,9 +987,8 @@ proptest::proptest! {
         for step in steps {
             match step {
                 Step::Pass(minutes) => w.pass(mins(minutes)),
-                Step::Finishes(i) => w.finishes(&agents[i]),
-                Step::Asks(i) => w.asks(&agents[i]),
-                Step::Starts(i) => w.starts(&agents[i]),
+                Step::Reply(i) => w.reply(&agents[i]),
+                Step::Status(i) => { w.push(&agents[i], ChatKind::Status("working".into())); },
                 Step::WritesTo(i) => w.writes_to(&agents[i]),
                 Step::Dm(i) => { w.dm(dms[i], ["U1", "U2"][i]); }
                 Step::Read(i) => {
@@ -1044,14 +1042,18 @@ fn a_traced_deal_is_the_same_deal_and_says_what_it_left_out() {
     let snoozed = w.dm("D2", "U2");
     w.snooze(&snoozed, hours(1));
     let quiet = w.agent("a");
-    w.finishes(&quiet);
+    w.reply(&quiet);
     w.done(&quiet);
     let (hand, trace) = w.traced();
     assert_eq!(hand, w.deal());
     let outcome = |node: &NodeId| trace.nodes[node].outcome.clone();
-    assert!(outcome(&asking).starts_with("card at "), "{}", outcome(&asking));
+    assert!(
+        outcome(&asking).starts_with("card at "),
+        "{}",
+        outcome(&asking)
+    );
     assert!(outcome(&snoozed).starts_with("no card: snoozed until"));
-    assert_eq!(outcome(&quiet), "no card: seen through its newest");
+    assert_eq!(outcome(&quiet), "no card: seen through its last reply");
     assert!(
         trace.nodes[&asking]
             .inputs

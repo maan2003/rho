@@ -1,17 +1,18 @@
 //! The hand: every node that wants the user, ranked, read straight off the
 //! sources and what the user said about them.
 //!
-//! [`rank`] is the whole algorithm. It takes the agents as the agents map
-//! holds them, Slack as its model holds it, and the user's own facts, and
+//! [`rank`] is the whole algorithm. It takes agents as chat snapshots,
+//! Slack as its model holds it, and the user's own facts, and
 //! works each card out from scratch; nothing it decides is kept between
 //! calls except the [`Cache`], which only saves reading the same Slack
 //! title twice and never changes an answer. The cases it must meet are in
 //! `cases.md`, and each has a test under its name.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use jiff::{Timestamp, Zoned};
-use rho_agents_client::AgentMap;
+use rho_agent_types::AgentId;
+use rho_agents2_client::protocol::{AgentInfo, ChatKind, Party};
 use rho_slack::model::{Attention, Model, Unit};
 
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
@@ -99,7 +100,7 @@ pub struct Slack<'a> {
 /// Everything [`rank`] reads.
 #[derive(Clone, Copy)]
 pub struct Sources<'a> {
-    pub agents: &'a AgentMap,
+    pub agents: &'a HashMap<AgentId, AgentInfo>,
     pub slack: Option<Slack<'a>>,
     pub marks: &'a Marks,
     pub skips: &'a Skips,
@@ -215,37 +216,55 @@ fn rank_into(
     let at = now.timestamp();
     let marks = sources.marks;
     let mut parts: BTreeMap<NodeId, Vec<Part>> = BTreeMap::new();
-    let mut running = BTreeSet::new();
 
-    // Agents (A1–A9): its last turn ended with something the user has not
-    // dealt with and has not answered.
-    let agents = sources.agents;
-    for agent_id in agents.known_agents().copied() {
+    // The source is the physical append-only chat: only a message to the
+    // human can ask for attention. Status rows advance the seen cursor but
+    // cannot themselves become a reply.
+    for (&agent_id, agent) in sources.agents {
         let node = NodeId::Agent(agent_id);
-        if !agents.owned_by_user(agent_id) || agents.host_of_agent(agent_id).is_none() {
-            continue;
-        }
-        let Some(digest) = agents.agent_digest(agent_id) else {
-            continue;
-        };
-        let facts = agents.agent_facts(agent_id);
-        if facts.turn_running {
-            running.insert(node.clone());
-        }
+        let newest = agent.chat.iter().map(|event| event.seq).max().unwrap_or(0);
+        let reply = agent
+            .chat
+            .iter()
+            .filter(|event| {
+                matches!(&event.kind, ChatKind::Message {
+                from: Party::Agent(sender), to: Party::Human, ..
+            } if *sender == agent_id)
+            })
+            .max_by_key(|event| event.seq);
+        let spoke = agent
+            .chat
+            .iter()
+            .filter(|event| {
+                matches!(&event.kind, ChatKind::Message {
+                from: Party::Human, to: Party::Agent(target), ..
+            } if *target == agent_id)
+            })
+            .max_by_key(|event| event.seq);
         let seen = marks.get(&node).facts().seen_agent().unwrap_or(0);
         if let Some(trace) = trace.as_deref_mut() {
-            trace.input(&node, "agent facts", format!("{facts:?}"));
-            trace.input(&node, "digest newest", digest.newest.0.to_string());
+            trace.input(&node, "chat newest", newest.to_string());
+            trace.input(
+                &node,
+                "last reply",
+                format!("{:?}", reply.map(|event| event.seq)),
+            );
+            trace.input(
+                &node,
+                "last human message",
+                format!("{:?}", spoke.map(|event| event.seq)),
+            );
+            trace.input(&node, "status", format!("{:?}", agent.status));
             trace.input(&node, "seen through", seen.to_string());
         }
-        let quiet = if facts.turn_running {
-            Some("running")
-        } else if facts.last_turn_ended.is_none() {
-            Some("no turn has ended")
-        } else if facts.last_turn_ended <= Some(facts.last_user_message_at) {
-            Some("the user wrote after its turn ended")
-        } else if digest.newest.0 <= seen {
-            Some("seen through its newest")
+        let quiet = if agent.archived {
+            Some("archived")
+        } else if reply.is_none() {
+            Some("no agent reply")
+        } else if spoke.is_some_and(|spoke| spoke.seq > reply.expect("checked above").seq) {
+            Some("the user wrote after its reply")
+        } else if reply.expect("checked above").seq <= seen {
+            Some("seen through its last reply")
         } else {
             None
         };
@@ -255,32 +274,26 @@ fn rank_into(
             }
             continue;
         }
-        let ended = facts.last_turn_ended.expect("checked above");
-        let ended = unix(ended.0 as i64);
-        let (curve, reason) = if facts.errored || facts.needs_you_hint {
-            (
-                Curve::Waiting {
-                    head_start: curve::AGENT_BLOCKED_HEAD_START,
-                    since: ended,
-                },
-                match facts.errored {
-                    true => "errored · {age} ago",
-                    false => "waiting on reply · {age}",
-                },
-            )
-        } else {
-            (
-                Curve::Fading {
-                    head_start: curve::AGENT_FINISHED_HEAD_START,
-                    since: ended,
-                    gone_days: curve::AGENT_FINISHED_GONE_DAYS,
-                },
-                "finished · {age} ago",
-            )
-        };
-        let mut part = Part::source(curve, reason.to_owned(), digest.newest.0.to_string());
-        let spoke = unix(facts.last_user_message_at.0 as i64);
-        if facts.last_user_message_at.0 > 0 {
+        let ended = unix(reply.expect("checked above").at.0 as i64);
+        let reason = agent
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let mut part = Part::source(
+            Curve::Fading {
+                head_start: curve::AGENT_FINISHED_HEAD_START,
+                since: ended,
+                gone_days: curve::AGENT_FINISHED_GONE_DAYS,
+            },
+            reason.map_or_else(
+                || "finished · {age} ago".to_owned(),
+                |status| format!("{status} · {{age}} ago"),
+            ),
+            newest.to_string(),
+        );
+        if let Some(spoke) = spoke {
+            let spoke = unix(spoke.at.0 as i64);
             part.bonus = curve::recency_bonus(spoke, at);
             if ended.duration_since(spoke) <= curve::REPLY_BREAKTHROUGH {
                 part.breaks_snooze_set_by = Some(spoke);
@@ -376,9 +389,7 @@ fn rank_into(
     // The user's own dates (T1–T6, N2), on any node.
     for (node, held) in marks.nodes() {
         let facts = held.facts();
-        if let Some(todo) = facts.todo()
-            && !running.contains(node)
-        {
+        if let Some(todo) = facts.todo() {
             parts.entry(node.clone()).or_default().push(Part::dated(
                 Curve::Plate { since: todo.start },
                 format!("todo {}", todo.set.timestamp().as_millisecond()),
@@ -589,13 +600,35 @@ pub fn model_unit(unit: &SlackUnit) -> Unit {
 pub fn title(sources: &Sources<'_>, node: &NodeId, cache: &mut Cache) -> String {
     match node {
         NodeId::Agent(agent_id) => sources
-            .agents
-            .agent_human_name(*agent_id)
+            .marks
+            .get(node)
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                sources.agents.get(agent_id).and_then(|agent| {
+                    agent
+                        .chat
+                        .iter()
+                        .filter_map(|event| match &event.kind {
+                            ChatKind::Message {
+                                from: Party::Human,
+                                to: Party::Agent(target),
+                                text,
+                                ..
+                            } if target == agent_id => Some((event.seq, text.as_str())),
+                            _ => None,
+                        })
+                        .max_by_key(|(seq, _)| *seq)
+                        .map(|(_, text)| text)
+                })
+            })
+            .unwrap_or_default()
             .lines()
             .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned(),
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map_or_else(|| agent_id.encoded(), str::to_owned),
         NodeId::Slack(unit) => {
             let Some(slack) = sources.slack else {
                 return unit.channel.clone();
