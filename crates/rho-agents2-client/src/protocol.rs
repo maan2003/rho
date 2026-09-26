@@ -1,28 +1,9 @@
 //! The agent2 chat protocol. The host log is primary; every session begins
 //! with a snapshot, then sends append-only chat changes.
 use camino::Utf8PathBuf;
+pub use rho_agent_types::AgentId;
 use rho_agent_types::UnixMs;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
-pub struct AgentId(String);
-impl AgentId {
-    pub fn new(id: impl Into<String>) -> Result<Self, String> {
-        let id = id.into();
-        if id.trim().is_empty() {
-            return Err("an agent2 id must not be empty".into());
-        }
-        Ok(Self(id))
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-impl std::fmt::Display for AgentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub struct MessageId(pub u64);
@@ -144,7 +125,7 @@ mod tests {
     use super::*;
     #[test]
     fn request_and_chat_round_trip_without_notebook_fields() {
-        let id = AgentId::new("db8b2fab-227a-470e-81b3-3c2f542d92a7").unwrap();
+        let id = AgentId::from_counter(17, &rho_agent_types::AgentIdDomain(42)).unwrap();
         let request = Open::Request(Request::CreateAgent(CreateAgent {
             workdir: "/src/workset".into(),
             model: "gpt-6-sol".into(),

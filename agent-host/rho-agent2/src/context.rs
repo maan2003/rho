@@ -85,7 +85,7 @@ pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: CacheKey) -
 pub fn render_message(from: &Party, body: &[Block], texts: &HashMap<MessageId, String>) -> String {
     let mut out = match from {
         Party::Human => "Message from the human:\n".to_owned(),
-        Party::Agent(id) => format!("Message from agent {id}:\n"),
+        Party::Agent(id) => format!("Message from agent {}:\n", id.encoded()),
     };
     for block in body {
         match block {

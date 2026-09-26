@@ -114,7 +114,10 @@ impl Bridge {
         }
         let to = match to {
             None => Party::Human,
-            Some(id) => Party::Agent(AgentId::new(id).map_err(PyValueError::new_err)?),
+            Some(id) => Party::Agent(
+                AgentId::from_encoded(&id)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            ),
         };
         let _ = self.0.outbox.send(Outbound::Send { to, text });
         Ok(())
@@ -211,3 +214,32 @@ class Agents:
     def __repr__(self):
         return "<agents>"
 "#;
+
+#[cfg(test)]
+mod tests {
+    use rho_agent_types::AgentIdDomain;
+
+    use super::*;
+
+    #[test]
+    fn agents_send_parses_full_ids_and_rejects_invalid_labels() {
+        let (mailroom, mut outbox) = Mailroom::new();
+        let bridge = Bridge(mailroom);
+        let id = AgentId::from_counter(17, &AgentIdDomain(42)).unwrap();
+        bridge.send(Some(id.encoded()), "hello".into()).unwrap();
+        assert_eq!(
+            outbox.try_recv().unwrap(),
+            Outbound::Send {
+                to: Party::Agent(id),
+                text: "hello".into(),
+            }
+        );
+        assert!(bridge.send(Some("short".into()), "hello".into()).is_err());
+        assert!(
+            bridge
+                .send(Some("!!!!!!!!!!!!".into()), "hello".into())
+                .is_err()
+        );
+        assert!(outbox.try_recv().is_err());
+    }
+}

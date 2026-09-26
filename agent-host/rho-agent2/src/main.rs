@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, default_value = ".")]
     workdir: PathBuf,
     /// The agent's id, as other agents name it.
-    #[arg(long, default_value = "agent")]
+    #[arg(long, value_parser = AgentId::from_encoded)]
     id: AgentId,
     #[arg(long, default_value = "gpt-6-sol")]
     model: String,
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
         auth: args.auth,
     }));
     let (agent, handle) = Agent::new(Config {
-        id: args.id.clone(),
+        id: args.id,
         log: Log::open(&args.log)?,
         model,
         shell,
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         print_event(&args.id, &event);
     }
     let mut chat = handle.chat();
-    let me = args.id.clone();
+    let me = args.id;
     tokio::spawn(async move {
         while let Ok(event) = chat.recv().await {
             print_event(&me, &event);
@@ -125,13 +125,15 @@ fn print_event(me: &AgentId, event: &ChatEvent) {
                 .collect::<String>();
             match (from, to) {
                 (Party::Human, _) => {}
-                (Party::Agent(from), Party::Human) => println!("{from}> {text}"),
+                (Party::Agent(from), Party::Human) => println!("{}> {text}", from.encoded()),
                 (Party::Agent(from), Party::Agent(to)) if from == me => {
-                    println!("{from} → {to}> {text}")
+                    println!("{} → {}> {text}", from.encoded(), to.encoded())
                 }
-                (Party::Agent(from), _) => println!("{from} → {me}> {text}"),
+                (Party::Agent(from), _) => {
+                    println!("{} → {}> {text}", from.encoded(), me.encoded())
+                }
             }
         }
-        ChatKind::Status(status) => println!("[{me}: {status}]"),
+        ChatKind::Status(status) => println!("[{}: {status}]", me.encoded()),
     }
 }

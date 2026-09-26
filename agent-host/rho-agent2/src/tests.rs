@@ -18,7 +18,7 @@ fn shell(dir: &tempfile::TempDir) -> rho_tool_shell::ShellTools {
 
 fn start(dir: &tempfile::TempDir, log: Log, model: Arc<Scripted>) -> (Agent, AgentHandle) {
     Agent::new(Config {
-        id: crate::log::AgentId::new("a1").unwrap(),
+        id: crate::log::AgentId::from_counter(1, &rho_agent_types::AgentIdDomain(42)).unwrap(),
         log,
         model: Arc::new(rho_inference2::Model::Scripted(model)),
         shell: shell(dir),

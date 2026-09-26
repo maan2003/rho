@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
+pub use rho_agent_types::AgentId;
 use rho_agent_types::UnixMs;
 use rho_inference2::{CacheKey, Call, Carry, Image, Usage};
 use senax_encoder::{Decode, Encode};
@@ -21,38 +22,6 @@ impl MessageId {
 impl Default for MessageId {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// An agent, as other agents name it. Never empty.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode)]
-pub struct AgentId(String);
-
-impl AgentId {
-    pub fn new(id: impl Into<String>) -> Result<Self, String> {
-        let id = id.into();
-        if id.trim().is_empty() {
-            return Err("an agent id cannot be empty".into());
-        }
-        Ok(Self(id))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::str::FromStr for AgentId {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        Self::new(s)
-    }
-}
-
-impl std::fmt::Display for AgentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
     }
 }
 

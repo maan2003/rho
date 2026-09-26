@@ -56,7 +56,7 @@ impl HostStream for Agents2Stream {
 #[cfg(test)]
 mod tests {
     use futures::channel::mpsc;
-    use rho_agent_types::UnixMs;
+    use rho_agent_types::{AgentIdDomain, UnixMs};
     use rho_rpc::protocol::{read_frame, write_frame};
 
     use super::*;
@@ -90,7 +90,7 @@ mod tests {
         write_frame(&mut far, &ServerFrame::Snapshot { agents: Vec::new() })
             .await
             .unwrap();
-        let id = AgentId::new("abc").unwrap();
+        let id = AgentId::from_counter(23, &AgentIdDomain(42)).unwrap();
         write_frame(
             &mut far,
             &ServerFrame::Chat {
