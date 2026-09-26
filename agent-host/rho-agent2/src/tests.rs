@@ -479,3 +479,236 @@ async fn cancel_interrupts_model_step_but_allows_a_follow_up_turn() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_compaction_keeps_the_provider_boundary_and_waits_for_new_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model
+        .then_compaction()
+        .then("human.send('after compaction')");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    handle.compact().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while model.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        model.requests()[0].items.as_slice(),
+        [Item::CompactionTrigger]
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "manual-only compaction owes no answer"
+    );
+    say(&handle, "continue");
+    until_chat(&mut chat, sent("after compaction")).await;
+    let requests = model.requests();
+    assert!(matches!(requests[1].items.first(), Some(Item::Step(carry)) if carry.has_compaction()));
+    assert!(
+        !requests[1]
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::CompactionTrigger))
+    );
+    handle.stop();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn threshold_compaction_replies_from_the_new_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = Log::in_memory();
+    let call = rho_inference2::Call {
+        id: rho_inference2::CallId::new("previous"),
+        code: "print('old context')".into(),
+    };
+    log.append(Entry::Created {
+        at: rho_agent_types::UnixMs(0),
+        cache_key: Default::default(),
+    })
+    .unwrap();
+    log.append(Entry::Step {
+        at: rho_agent_types::UnixMs(1),
+        call: Some(call.clone()),
+        prose: String::new(),
+        carry: rho_inference2::Carry::bare(call),
+        usage: rho_inference2::Usage {
+            input_tokens: 232_560,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    log.append(Entry::Woken {
+        at: rho_agent_types::UnixMs(2),
+        why: Wake::Returned,
+        report: "old code returned".into(),
+        images: Vec::new(),
+        messages: Vec::new(),
+    })
+    .unwrap();
+    let model = Arc::new(Scripted::new());
+    model.then_compaction().then("human.send('continued')");
+    let (agent, handle) = start(&dir, log, Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    until_chat(&mut chat, sent("continued")).await;
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        requests[0].items.last(),
+        Some(Item::CompactionTrigger)
+    ));
+    assert!(matches!(requests[1].items.first(), Some(Item::Step(carry)) if carry.has_compaction()));
+    assert!(
+        !requests[1].items.iter().any(|item| matches!(item,
+        Item::Result { text, .. } | Item::User { text, .. } if text.contains("old code returned")))
+    );
+    handle.stop();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewind_before_compaction_reopens_the_older_branch_only() {
+    let scripted = Arc::new(Scripted::new());
+    scripted.then_compaction();
+    let compacted = rho_inference2::Model::Scripted(scripted)
+        .step(
+            &rho_inference2::Request {
+                instructions: "test".into(),
+                items: Vec::new(),
+                cache_key: Default::default(),
+            },
+            &mut |_| {},
+        )
+        .await
+        .unwrap()
+        .carry;
+    let at = rho_agent_types::UnixMs(1);
+    let mut log = Log::in_memory();
+    log.append(Entry::Woken {
+        at,
+        why: Wake::Message,
+        report: "old branch".into(),
+        images: Vec::new(),
+        messages: Vec::new(),
+    })
+    .unwrap();
+    log.append(Entry::CompactionTrigger { at, manual: true })
+        .unwrap();
+    log.append(Entry::Step {
+        at,
+        call: None,
+        prose: String::new(),
+        carry: compacted,
+        usage: Default::default(),
+    })
+    .unwrap();
+    log.append(Entry::Woken {
+        at,
+        why: Wake::Message,
+        report: "new branch".into(),
+        images: Vec::new(),
+        messages: Vec::new(),
+    })
+    .unwrap();
+    let compact_request = crate::context::request("test".into(), log.entries(), Default::default());
+    assert!(
+        matches!(compact_request.items.first(), Some(Item::Step(carry)) if carry.has_compaction())
+    );
+    assert!(!compact_request.items.iter().any(|item| matches!(item,
+        Item::User { text, .. } if text == "old branch")));
+    log.append(Entry::Rewound { at, to: 1 }).unwrap();
+    log.append(Entry::Woken {
+        at,
+        why: Wake::Rewound,
+        report: "replacement branch".into(),
+        images: Vec::new(),
+        messages: Vec::new(),
+    })
+    .unwrap();
+    let rewound = crate::context::request("test".into(), log.entries(), Default::default());
+    assert!(rewound.items.iter().any(|item| matches!(item,
+        Item::User { text, .. } if text == "old branch")));
+    assert!(rewound.items.iter().any(|item| matches!(item,
+        Item::User { text, .. } if text == "replacement branch")));
+    assert!(
+        !rewound
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Step(carry) if carry.has_compaction()))
+    );
+    assert!(
+        !rewound
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::CompactionTrigger))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_retries_a_pending_trigger_then_keeps_its_compacted_carry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log");
+    let at = rho_agent_types::UnixMs(1);
+    let mut log = Log::open(&path).unwrap();
+    log.append(Entry::Created {
+        at,
+        cache_key: Default::default(),
+    })
+    .unwrap();
+    log.append(Entry::CompactionTrigger { at, manual: true })
+        .unwrap();
+    let model = Arc::new(Scripted::new());
+    model.then_compaction();
+    let (agent, handle) = start(&dir, log, Arc::clone(&model));
+    let mut trace = handle.trace();
+    let running = tokio::spawn(agent.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(trace.recv().await.unwrap(), crate::Trace::Step { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        model.requests()[0].items.last(),
+        Some(Item::CompactionTrigger)
+    ));
+    handle.stop();
+    running.await.unwrap().unwrap();
+    assert!(
+        Log::open(&path)
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Step { carry, .. } if carry.has_compaction()))
+    );
+
+    let model = Arc::new(Scripted::new());
+    model.then("human.send('restored')");
+    let (agent, handle) = start(&dir, Log::open(&path).unwrap(), Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "after restart");
+    until_chat(&mut chat, sent("restored")).await;
+    let request = &model.requests()[0];
+    assert!(matches!(request.items.first(), Some(Item::Step(carry)) if carry.has_compaction()));
+    assert!(
+        !request
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::CompactionTrigger))
+    );
+    handle.stop();
+    running.await.unwrap().unwrap();
+}

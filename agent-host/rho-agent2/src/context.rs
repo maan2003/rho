@@ -39,15 +39,24 @@ pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: CacheKey) -
         texts.insert(*id, plain);
     }
 
+    let first = visible
+        .iter()
+        .rposition(|&position| {
+            matches!(
+                &entries[position], Entry::Step { carry, .. } if carry.has_compaction()
+            )
+        })
+        .unwrap_or(0);
     let mut items = Vec::new();
     let mut open_call = None;
-    for &position in &visible {
+    for &position in &visible[first..] {
         let entry = &entries[position];
         match entry {
             Entry::Step { call, carry, .. } => {
                 items.push(Item::Step(carry.clone()));
                 open_call = call.as_ref().map(|call| call.id.clone());
             }
+            Entry::CompactionTrigger { .. } => items.push(Item::CompactionTrigger),
             Entry::Woken {
                 report,
                 images,

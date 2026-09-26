@@ -133,6 +133,10 @@ pub struct RewindAgent {
     pub turns: u32,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CompactAgent {
+    pub agent_id: AgentId,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ListAgents;
 
 /// Every provider's quota as it stands.
@@ -231,6 +235,7 @@ rho_rpc::calls! {
         SendMessage(SendMessage) -> ();
         ArchiveAgent(ArchiveAgent) -> ();
         RewindAgent(RewindAgent) -> ();
+        CompactAgent(CompactAgent) -> ();
         ListAgents(ListAgents) -> Vec<AgentInfo>;
         QuotaUsage(QuotaUsage) -> Vec<QuotaSummary>;
         QuotaHistory(QuotaHistory) -> Vec<QuotaSeries>;

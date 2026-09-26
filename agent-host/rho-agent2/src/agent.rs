@@ -23,6 +23,9 @@ use crate::wake::{self, Decision, Facts};
 const MAX_FAILURES: u32 = 3;
 /// Steps in a row without a call before the same.
 const MAX_PROSE: u32 = 3;
+/// Responses Lite's automatic provider-compaction threshold for the supported
+/// GPT-6 models.
+const AUTO_COMPACT_TOKENS: u64 = 232_560;
 
 /// A message from outside: the human, or another agent.
 #[derive(Clone, Debug)]
@@ -93,6 +96,13 @@ impl AgentHandle {
         self.mailroom.send_to(to, text)
     }
 
+    /// Ask the provider to compact its history on the next model request.
+    pub fn compact(&self) -> anyhow::Result<()> {
+        self.control
+            .send(Control::Compact)
+            .map_err(|_| anyhow::anyhow!("the agent has stopped"))
+    }
+
     /// Branch before the Nth last human message; notebook state remains.
     pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
         let (reply, result) = oneshot::channel();
@@ -110,6 +120,7 @@ impl AgentHandle {
 }
 
 enum Control {
+    Compact,
     Rewind {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
@@ -150,6 +161,10 @@ pub struct Agent {
     rewound: bool,
     stopped: bool,
     cache_key: CacheKey,
+    context_used: Option<u64>,
+    compaction_pending: bool,
+    compaction_owes_reply: bool,
+    compaction_reply: bool,
 }
 
 /// The call of the step in progress, as its code arrives.
@@ -211,6 +226,10 @@ impl Agent {
             rewound: false,
             stopped: false,
             cache_key: CacheKey::new(),
+            context_used: None,
+            compaction_pending: false,
+            compaction_owes_reply: false,
+            compaction_reply: false,
         };
         agent.resume()?;
         let handle_mailroom = Arc::clone(&agent.mailroom);
@@ -281,6 +300,7 @@ impl Agent {
                 notice: Notice::Restarted,
             })?;
         }
+        self.refresh_compaction_state();
         if awaiting {
             // Whatever awaited the human went with the old notebook.
             self.append(Entry::Awaiting {
@@ -333,8 +353,59 @@ impl Agent {
         self.stopped = false;
         self.restarted = false;
         self.rewound = true;
+        self.refresh_compaction_state();
         // The notebook, its Python globals, and any side effects are retained.
         // Rewound human messages are intentionally absent, as on the old branch.
+        Ok(())
+    }
+
+    /// Reconstruct occupancy and an unfinished provider handoff from only
+    /// the current branch. Rewind can restore a pre-compaction context.
+    fn refresh_compaction_state(&mut self) {
+        let mut used = None;
+        let mut pending = false;
+        let mut owes_reply = false;
+        let mut reply = false;
+        for position in self.log.visible_positions() {
+            match &self.log.entries()[position] {
+                Entry::CompactionTrigger { manual, .. } => {
+                    pending = true;
+                    owes_reply = !manual;
+                }
+                Entry::Woken { .. } if pending => owes_reply = true,
+                Entry::Woken { .. } => reply = false,
+                Entry::Step { carry, usage, .. } => {
+                    if carry.has_compaction() {
+                        used = None;
+                    } else if usage.input_tokens > 0 {
+                        used = Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                    }
+                    if pending {
+                        reply = carry.has_compaction() && owes_reply;
+                        pending = false;
+                        owes_reply = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.context_used = used;
+        self.compaction_pending = pending;
+        self.compaction_owes_reply = owes_reply;
+        self.compaction_reply = reply;
+    }
+
+    fn compact(&mut self) -> anyhow::Result<()> {
+        if self.archived {
+            return Ok(());
+        }
+        if !self.compaction_pending {
+            self.append(Entry::CompactionTrigger {
+                at: UnixMs::now(),
+                manual: true,
+            })?;
+            self.refresh_compaction_state();
+        }
         Ok(())
     }
 
@@ -365,6 +436,7 @@ impl Agent {
                         _ = self.cancel.changed() => self.interrupt(None)?,
                         control = self.control.recv() => match control {
                             Some(Control::Rewind { turns, reply }) => { let _ = reply.send(self.rewind(turns)); },
+                            Some(Control::Compact) => self.compact()?,
                             None => break,
                         },
                         inbound = self.inbox.recv() => match inbound {
@@ -520,6 +592,8 @@ impl Agent {
             prose: self.prose > 0,
             restarted: self.restarted,
             rewound: self.rewound,
+            compaction: self.compaction_pending,
+            compaction_reply: self.compaction_reply,
             archived: self.archived,
             prose_silenced: self.stopped,
         }
@@ -596,21 +670,38 @@ impl Agent {
                 .to_owned(),
             );
         }
+        let manual_only = why == Wake::Compaction
+            && messages.is_empty()
+            && images.is_empty()
+            && lines == ["Nothing new."];
         let report = lines.join("\n\n");
         let _ = self.trace.send(Trace::Woken {
             why: why.clone(),
             report: report.clone(),
         });
-        self.append(Entry::Woken {
-            at: UnixMs::now(),
-            why,
-            report,
-            images,
-            messages: messages.into_iter().map(|(id, _, _)| id).collect(),
-        })?;
-        self.restarted = false;
-        self.rewound = false;
+        if !manual_only {
+            self.append(Entry::Woken {
+                at: UnixMs::now(),
+                why,
+                report,
+                images,
+                messages: messages.into_iter().map(|(id, _, _)| id).collect(),
+            })?;
+            self.restarted = false;
+            self.rewound = false;
+        }
         self.notebook.reset_checkin();
+        if self
+            .context_used
+            .is_some_and(|used| used >= AUTO_COMPACT_TOKENS)
+            && !self.compaction_pending
+        {
+            self.append(Entry::CompactionTrigger {
+                at: UnixMs::now(),
+                manual: false,
+            })?;
+            self.refresh_compaction_state();
+        }
         let request = crate::context::request(
             Arc::clone(&self.instructions),
             self.log.entries(),
@@ -708,6 +799,7 @@ impl Agent {
             code: step.call.as_ref().map(|call| call.code.clone()),
             prose: step.prose.clone(),
         });
+        let compacted = step.carry.has_compaction();
         self.append(Entry::Step {
             at,
             call: step.call.clone(),
@@ -715,6 +807,7 @@ impl Agent {
             carry: step.carry,
             usage: step.usage,
         })?;
+        self.refresh_compaction_state();
         match (step.call, streaming) {
             (Some(call), Some(streaming)) => {
                 self.prose = 0;
@@ -729,6 +822,10 @@ impl Agent {
                 self.told_returned = false;
             }
             (None, streaming) => {
+                if compacted {
+                    self.prose = 0;
+                    return Ok(());
+                }
                 if streaming.is_some()
                     && let Some(cell) = &self.cell
                 {

@@ -21,6 +21,8 @@ pub struct Facts {
     pub prose: bool,
     pub restarted: bool,
     pub rewound: bool,
+    pub compaction: bool,
+    pub compaction_reply: bool,
     pub archived: bool,
     pub prose_silenced: bool,
 }
@@ -34,6 +36,12 @@ pub enum Decision {
 pub fn decide(facts: &Facts, now: UnixMs) -> Decision {
     if facts.archived {
         return Decision::Later(None);
+    }
+    if facts.compaction_reply {
+        return Decision::Now(Wake::CompactionReply);
+    }
+    if facts.compaction {
+        return Decision::Now(Wake::Compaction);
     }
     let base = |at: UnixMs| at.max(facts.response_finished.unwrap_or(at));
     let mut due = Vec::new();

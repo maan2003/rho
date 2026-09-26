@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context as _, anyhow};
 use camino::Utf8PathBuf;
 use rho_agent::pool::{Agent2ToolHandler, AgentPool};
-use rho_agent::{ChatRemote, ChatWorkerEvent};
+use rho_agent::{ChatRemote, ChatRuntime, ChatWorkerEvent};
 use rho_agent_types::{AgentIdDomain, AgentRole, Place, WorksetMode, WorkspaceInfo};
 use rho_agent2::chat as chat2;
 use rho_agent2::human::{Agent2Call, Agent2Reply};
@@ -234,6 +234,7 @@ impl Agents2 {
             info.role,
             info.parent,
             info.user_owned,
+            ChatRuntime::Rho,
             observer,
         )
         .await?;
@@ -684,6 +685,17 @@ impl Agents2 {
         remote.rewind(call.turns).await
     }
 
+    fn compact(&self, call: wire::CompactAgent) -> anyhow::Result<()> {
+        let remote = self
+            .records
+            .lock()
+            .unwrap()
+            .get(&call.agent_id)
+            .map(|record| record.remote.clone())
+            .ok_or_else(|| anyhow!("agent {} not found", call.agent_id.encoded()))?;
+        remote.compact()
+    }
+
     fn archive(&self, call: wire::ArchiveAgent) -> anyhow::Result<()> {
         let remote = self
             .records
@@ -846,8 +858,51 @@ where
             wire::Request::RewindAgent(call) => {
                 respond(&mut writer, call, |call| manager.rewind(call)).await
             }
+            wire::Request::CompactAgent(call) => {
+                respond(&mut writer, call, |call| async { manager.compact(call) }).await
+            }
             wire::Request::ListAgents(call) => {
                 respond(&mut writer, call, |_| async { Ok(manager.snapshot()) }).await
+            }
+            wire::Request::QuotaUsage(call) => {
+                respond(&mut writer, call, |_| async {
+                    Ok(crate::usage::quota_summaries(
+                        manager.pool.db(),
+                        manager.pool.inference(),
+                    ))
+                })
+                .await
+            }
+            wire::Request::QuotaHistory(call) => {
+                respond(&mut writer, call, |_| async {
+                    Ok(crate::usage::quota_history(
+                        manager.pool.db(),
+                        manager.pool.inference(),
+                    ))
+                })
+                .await
+            }
+            wire::Request::GlobalUsage(call) => {
+                respond(
+                    &mut writer,
+                    call,
+                    |wire::GlobalUsage { since_ms }| async move {
+                        manager.pool.flush_agent_usage(None).await;
+                        Ok(crate::usage::global_usage(manager.pool.db(), since_ms))
+                    },
+                )
+                .await
+            }
+            wire::Request::AgentCostDistribution(call) => {
+                respond(
+                    &mut writer,
+                    call,
+                    |wire::AgentCostDistribution { since_ms }| async move {
+                        manager.pool.flush_agent_usage(None).await;
+                        crate::usage::agent_costs(manager.pool.db(), since_ms)
+                    },
+                )
+                .await
             }
         },
     }

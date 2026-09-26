@@ -46,7 +46,9 @@ pub fn project(me: &AgentId, seq: u64, entry: &Entry) -> Option<ChatEvent> {
         },
         Entry::Status { text, .. } => ChatKind::Status(text.clone()),
         Entry::Rewound { to, .. } => ChatKind::Rewound { to: *to },
-        Entry::Awaiting { .. } | Entry::Notice { .. } => return None,
+        Entry::Awaiting { .. } | Entry::Notice { .. } | Entry::CompactionTrigger { .. } => {
+            return None;
+        }
         Entry::Created { .. } | Entry::Step { .. } | Entry::Woken { .. } => return None,
     };
     Some(ChatEvent {

@@ -47,8 +47,8 @@ use rho_agents2_client::create::{
 };
 use rho_agents2_client::protocol::{
     AgentId as Agent2Id, AgentInfo as Agent2Info, ArchiveAgent as ArchiveAgent2,
-    CreateAgent as CreateAgent2, Effort as Agent2Effort, RewindAgent as RewindAgent2,
-    SendMessage as SendMessage2, ServerFrame as Agent2Frame,
+    CompactAgent as CompactAgent2, CreateAgent as CreateAgent2, Effort as Agent2Effort,
+    RewindAgent as RewindAgent2, SendMessage as SendMessage2, ServerFrame as Agent2Frame,
 };
 use rho_agents2_client::remote::Agents2Link;
 use rho_agents2_client::stream::{Agents2Event, Agents2Stream};
@@ -306,7 +306,7 @@ pub struct Workspace {
     /// Everything the usage screen is drawn from, and the screen itself:
     /// see [`crate::usage::Usage`].
     usage: crate::usage::Usage,
-    quotas: rho_agents_client::quota::Quotas,
+    quotas: rho_agents2_client::quota::Quotas,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -1843,7 +1843,14 @@ impl Workspace {
                 cx.notify();
             }
             rho_agents_client::model::ModelMsg::Auth { auth } => {
-                self.quotas.set_auth(host, auth);
+                self.quotas.set_auth(
+                    host,
+                    rho_agents2_client::protocol::AuthState {
+                        namespaces: auth.namespaces,
+                        disabled_namespaces: auth.disabled_namespaces,
+                        active_namespace: auth.active_namespace,
+                    },
+                );
                 if let Some(view) = self.usage.opened_view() {
                     let history = self.quotas.merged_history(&self.hosts);
                     let active = self.quotas.active_namespaces(&self.hosts);
@@ -1862,7 +1869,22 @@ impl Workspace {
                 cx.notify();
             }
             rho_agents_client::model::ModelMsg::QuotaUsage { summaries } => {
-                self.quotas.set_summaries(host, summaries);
+                self.quotas.set_summaries(
+                    host,
+                    summaries
+                        .into_iter()
+                        .map(|summary| rho_agents2_client::protocol::QuotaSummary {
+                            model: summary.model,
+                            auth_namespace: summary.auth_namespace,
+                            remaining_percent: summary.remaining_percent,
+                            burn_10m: summary.burn_10m,
+                            burn_2h: summary.burn_2h,
+                            burn_1d: summary.burn_1d,
+                            burn_3d: summary.burn_3d,
+                            reset_at_unix: summary.reset_at_unix,
+                        })
+                        .collect(),
+                );
                 cx.notify();
             }
         }
@@ -2685,6 +2707,13 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_compact(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_agent2() {
+            if let Some((host, _)) = self.agent2.get(&id) {
+                self.call_agent2(*host, CompactAgent2 { agent_id: id }, cx, |_, (), _, _| {});
+                self.notice_on(Some(&id), "compacting context", StyleClass::SystemInfo, cx);
+            }
+            return;
+        }
         if let Some(agent_id) = self.subject_agent_or_notice("compact", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
@@ -5049,7 +5078,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn merged_quota_summaries_for_test(
         &self,
-    ) -> Vec<rho_agents_client::protocol::QuotaSummary> {
+    ) -> Vec<rho_agents2_client::protocol::QuotaSummary> {
         self.quotas.merged_summaries(&self.hosts)
     }
 
@@ -6918,10 +6947,24 @@ impl Workspace {
         }
     }
 
+    fn ask_every_host2<C: rho_rpc::protocol::Call + Clone>(
+        &self,
+        call: C,
+        cx: &mut Context<Self>,
+        arrived: fn(&mut Self, HostId, C::Reply, &mut Context<Self>),
+    ) {
+        for host in self.hosts.ids() {
+            self.call_agent2(host, call.clone(), cx, move |this, reply, _, cx| {
+                arrived(this, host, reply, cx);
+                cx.notify();
+            });
+        }
+    }
+
     fn quota_history_arrived(
         &mut self,
         host: HostId,
-        series: Vec<rho_agents_client::protocol::QuotaSeries>,
+        series: Vec<rho_agents2_client::protocol::QuotaSeries>,
         cx: &mut Context<Self>,
     ) {
         self.quotas.set_history(host, series);
@@ -6935,7 +6978,7 @@ impl Workspace {
     fn global_usage_arrived(
         &mut self,
         host: HostId,
-        series: Vec<rho_agents_client::protocol::AgentUsageSeries>,
+        series: Vec<rho_agents2_client::protocol::AgentUsageSeries>,
         cx: &mut Context<Self>,
     ) {
         self.usage.record_global(host, series);
@@ -6948,7 +6991,7 @@ impl Workspace {
     fn agent_cost_arrived(
         &mut self,
         host: HostId,
-        series: Vec<rho_agents_client::protocol::AgentCostSeries>,
+        series: Vec<rho_agents2_client::protocol::AgentCostSeries>,
         cx: &mut Context<Self>,
     ) {
         self.usage.record_agent_cost(host, series);
@@ -6972,20 +7015,24 @@ impl Workspace {
         // the answers come back.
         match crate::usage::Usage::request_for(chart, days, now_ms()) {
             crate::usage::Request::QuotaHistory => {
-                self.ask_every_host(agents::QuotaHistory, cx, Self::quota_history_arrived);
+                self.ask_every_host2(
+                    rho_agents2_client::protocol::QuotaHistory,
+                    cx,
+                    Self::quota_history_arrived,
+                );
                 let history = self.quotas.merged_history(&self.hosts);
                 let active = self.quotas.active_namespaces(&self.hosts);
                 view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
             }
             crate::usage::Request::GlobalUsage { since_ms } => {
-                let call = agents::GlobalUsage { since_ms };
-                self.ask_every_host(call, cx, Self::global_usage_arrived);
+                let call = rho_agents2_client::protocol::GlobalUsage { since_ms };
+                self.ask_every_host2(call, cx, Self::global_usage_arrived);
                 let usage = self.usage.merged_global();
                 view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
             }
             crate::usage::Request::AgentCostDistribution { since_ms } => {
-                let call = agents::AgentCostDistribution { since_ms };
-                self.ask_every_host(call, cx, Self::agent_cost_arrived);
+                let call = rho_agents2_client::protocol::AgentCostDistribution { since_ms };
+                self.ask_every_host2(call, cx, Self::agent_cost_arrived);
                 let usage = self.usage.merged_agent_cost();
                 view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
             }

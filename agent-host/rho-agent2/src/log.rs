@@ -62,6 +62,10 @@ pub enum Wake {
     Restarted,
     /// The model's history has branched; notebook state was not changed.
     Rewound,
+    /// Request the provider to compact the current context.
+    Compaction,
+    /// Continue a turn after a provider-only compaction response.
+    CompactionReply,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -121,6 +125,12 @@ pub enum Entry {
         at: UnixMs,
         notice: Notice,
     },
+    /// Provider compaction is requested through the model's normal input.
+    CompactionTrigger {
+        at: UnixMs,
+        /// A pure manual request needs no model answer after compaction.
+        manual: bool,
+    },
     /// Branch before physical log index `to`; abandoned events remain on disk.
     Rewound {
         at: UnixMs,
@@ -139,7 +149,8 @@ impl Entry {
             | Entry::Status { at, .. }
             | Entry::Awaiting { at, .. }
             | Entry::Notice { at, .. }
-            | Entry::Rewound { at, .. } => *at,
+            | Entry::Rewound { at, .. }
+            | Entry::CompactionTrigger { at, .. } => *at,
         }
     }
 }
