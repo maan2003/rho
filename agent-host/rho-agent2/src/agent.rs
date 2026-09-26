@@ -77,6 +77,7 @@ pub struct Agent {
     shell: rho_tool_shell::ShellTools,
     archived: bool,
     fresh: bool,
+    responding: bool,
     mailroom: Arc<Mailroom>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
     inbox: mpsc::UnboundedReceiver<Inbound>,
@@ -133,6 +134,7 @@ impl Agent {
             shell: config.shell,
             archived: false,
             fresh: false,
+            responding: false,
             mailroom,
             outbox,
             inbox,
@@ -273,21 +275,8 @@ impl Agent {
         let at = UnixMs::now();
         let id = MessageId::new();
         if inbound.from == Party::Human {
-            if self.archived {
-                self.notebook = Notebook::new(
-                    self.shell.clone(),
-                    self.mailroom.exports(),
-                    Arc::clone(&self.wake),
-                )
-                .map_err(anyhow::Error::msg)?;
-                self.archived = false;
-                self.fresh = true;
-                self.cell = None;
-                self.last_step = None;
-                self.append(Entry::Notice {
-                    at,
-                    notice: Notice::FreshNotebook,
-                })?;
+            if self.archived && !self.responding {
+                self.fresh_notebook(at)?;
             }
             self.mailroom.received();
             self.stopped = false;
@@ -300,6 +289,23 @@ impl Agent {
             id,
             from: inbound.from,
             body: inbound.body,
+        })
+    }
+
+    fn fresh_notebook(&mut self, at: UnixMs) -> anyhow::Result<()> {
+        self.notebook = Notebook::new(
+            self.shell.clone(),
+            self.mailroom.exports(),
+            Arc::clone(&self.wake),
+        )
+        .map_err(anyhow::Error::msg)?;
+        self.archived = false;
+        self.fresh = true;
+        self.cell = None;
+        self.told_returned = false;
+        self.append(Entry::Notice {
+            at,
+            notice: Notice::FreshNotebook,
         })
     }
 
@@ -468,6 +474,7 @@ impl Agent {
             self.cache_key,
         );
 
+        self.responding = true;
         let mut failures = 0;
         let step = loop {
             let model = Arc::clone(&self.model);
@@ -521,6 +528,7 @@ impl Agent {
                 }
             }
         };
+        self.responding = false;
         let at = UnixMs::now();
         self.last_step = Some(at);
         let (step, streaming) = match step {
@@ -532,13 +540,17 @@ impl Agent {
                     code: Some(call.code.clone()),
                     prose: String::new(),
                 });
-                return self.append(Entry::Step {
+                self.append(Entry::Step {
                     at,
                     call: Some(call.clone()),
                     prose: String::new(),
                     carry: Carry::bare(call),
                     usage: Usage::default(),
-                });
+                })?;
+                if self.archived && self.unread.iter().any(|(_, from, _)| *from == Party::Human) {
+                    self.fresh_notebook(at)?;
+                }
+                return Ok(());
             }
         };
         let _ = self.trace.send(Trace::Step {
@@ -577,6 +589,9 @@ impl Agent {
                     self.stopped = true;
                 }
             }
+        }
+        if self.archived && self.unread.iter().any(|(_, from, _)| *from == Party::Human) {
+            self.fresh_notebook(at)?;
         }
         Ok(())
     }

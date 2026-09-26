@@ -334,3 +334,36 @@ async fn archive_mutes_until_human_revives_a_fresh_notebook() {
     drop(handle);
     running.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn human_revives_archive_only_after_the_streaming_response_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    let mut code = String::from("archive()\n");
+    for n in 0..30 {
+        code.push_str(&format!("x{n} = {n}\n"));
+    }
+    model
+        .then(&code)
+        .then("human.send('revived')\nawait human.reply()");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut trace = handle.trace();
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "archive then return");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(trace.recv().await.unwrap(), crate::Trace::Woken { .. }) {}
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    say(&handle, "return during response");
+    until_chat(&mut chat, sent("revived")).await;
+    assert!(
+        model.requests()[1].items.iter().any(
+            |item| matches!(item, Item::Result { text, .. } if text.contains("fresh notebook"))
+        )
+    );
+    drop(handle);
+    running.abort();
+}
