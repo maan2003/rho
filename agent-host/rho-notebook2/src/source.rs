@@ -325,6 +325,9 @@ impl Source {
                 Some(Ok(CommandExit {
                     exit_code: None, ..
                 })) => "Process ended without an exit code".to_owned(),
+                Some(Err(error)) if error == "Command cancelled" => {
+                    "Process ended without an exit code".to_owned()
+                }
                 Some(Err(error)) => format!("Command failed: {error}"),
                 None => "Command ended".to_owned(),
             },

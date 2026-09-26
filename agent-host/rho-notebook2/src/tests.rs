@@ -197,7 +197,10 @@ async fn cancelling_a_task_kills_its_command_quietly() {
     );
     let text = notebook.report().unwrap().text;
     assert!(text.contains("Task cancelled"), "{text}");
-    assert!(!text.contains("Task failed"), "{text}");
+    assert!(
+        !text.contains("Task failed") && !text.contains("Command failed"),
+        "{text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
