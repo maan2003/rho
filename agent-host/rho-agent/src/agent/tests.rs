@@ -228,7 +228,43 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
 }
 
 #[tokio::test]
-async fn a_restart_tells_the_model_and_keeps_unread_messages() {
+async fn a_restart_does_not_resume_a_running_cell_by_itself() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then("import asyncio\nawait asyncio.sleep(600)");
+    let (handle, task) = harness.start(&script).await;
+    say(&handle, "first").await;
+    requests(&script, 1).await;
+    harness
+        .until("the step", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Step { .. }))
+        })
+        .await;
+    drop(handle);
+    task.await.unwrap();
+
+    let script = Arc::new(Scripted::new());
+    script.then("await human.reply()");
+    let (handle, _task) = harness.start(&script).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(script.requests().is_empty(), "coming up is not a wake");
+
+    say(&handle, "second").await;
+    let told = told(&requests(&script, 1).await[0]);
+    assert!(told.contains("rho restarted"), "{told}");
+    assert!(harness.entries().iter().any(|entry| matches!(
+        entry,
+        Entry::Notice {
+            notice: Notice::Restarted,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn a_restart_leaves_a_waiting_model_until_the_human_speaks() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
     script.then("await human.reply()");
@@ -246,25 +282,33 @@ async fn a_restart_tells_the_model_and_keeps_unread_messages() {
 
     let script = Arc::new(Scripted::new());
     script.then("await human.reply()");
-    let (_handle, _task) = harness.start(&script).await;
-    let told = told(&requests(&script, 1).await[0]);
-    assert!(told.contains("rho restarted"), "{told}");
-    let entries = harness.entries();
-    assert!(entries.iter().any(|entry| matches!(
+    let (handle, _task) = harness.start(&script).await;
+    // What awaited the human went with the old notebook.
+    harness
+        .until("the wait ending", |entries| {
+            matches!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(entry, Entry::Awaiting { .. }))
+                    .nth(1),
+                Some(Entry::Awaiting { since: None, .. })
+            )
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(script.requests().is_empty(), "a reload is not a wake");
+    assert!(!harness.entries().iter().any(|entry| matches!(
         entry,
         Entry::Notice {
             notice: Notice::Restarted,
             ..
         }
     )));
-    // What awaited the human went with the old notebook.
-    assert!(matches!(
-        entries
-            .iter()
-            .filter(|entry| matches!(entry, Entry::Awaiting { .. }))
-            .nth(1),
-        Some(Entry::Awaiting { since: None, .. })
-    ));
+
+    say(&handle, "second").await;
+    let told = told(&requests(&script, 1).await[0]);
+    assert!(told.contains("rho restarted"), "{told}");
+    assert!(told.contains("second"), "{told}");
 }
 
 #[tokio::test]

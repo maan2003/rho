@@ -7,7 +7,7 @@
 //! the cell it answers with. The model answers every wake with one `exec`
 //! call and speaks to the person only through `human.send`.
 
-mod context;
+pub(crate) mod context;
 pub(crate) mod mailroom;
 mod persistence;
 pub(crate) mod tools;
@@ -309,6 +309,8 @@ pub(crate) struct Agent {
     last_step: Option<UnixMs>,
     awaiting: bool,
     prose: u32,
+    /// The notebook went with a restart since the model's last wake: tell
+    /// it at the next. Coming up is never itself a wake.
     restarted: bool,
     rewound: bool,
     retry: bool,
@@ -448,11 +450,6 @@ impl Agent {
         }
         if woken && !self.archived {
             self.restarted = true;
-            self.append(Entry::Notice {
-                at: UnixMs::now(),
-                notice: Notice::Restarted,
-            })
-            .await?;
         }
         self.refresh_compaction_state();
         if awaiting {
@@ -908,7 +905,6 @@ impl Agent {
             response_finished: self.last_step,
             wake_on_tools,
             prose: self.prose > 0 || self.retry,
-            restarted: self.restarted,
             rewound: self.rewound,
             compaction: self.compaction_pending,
             compaction_reply: self.compaction_reply,
@@ -964,15 +960,22 @@ impl Agent {
             Err(error) => return self.fail(format!("{error:#}")).await,
         };
         let mut lines = Vec::new();
+        if self.restarted {
+            self.append(Entry::Notice {
+                at: UnixMs::now(),
+                notice: Notice::Restarted,
+            })
+            .await?;
+            lines.push(
+                "rho restarted. Your notebook and everything running in it are gone, and \
+                 their side effects may remain. Check the current state before carrying on."
+                    .to_owned(),
+            );
+        }
         match why {
             Wake::Rewound => lines.push(
                 "The human rewound your visible history. Your Python notebook, running work, \
                  and side effects were not rewound. Check the current state before continuing."
-                    .to_owned(),
-            ),
-            Wake::Restarted => lines.push(
-                "rho restarted. Your notebook and everything running in it are gone, and \
-                 their side effects may remain. Check the current state before carrying on."
                     .to_owned(),
             ),
             Wake::Prose if self.prose > 0 => lines.push(

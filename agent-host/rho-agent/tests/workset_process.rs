@@ -407,8 +407,17 @@ async fn streaming_crash() {
                 rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { .. })
             ))
     );
-    // The restart wakes the model to say so; it asks the model afresh and
-    // never runs the interrupted code again.
+    // Coming up is not a wake, and the interrupted code never runs again.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "load replayed interrupted execution"
+    );
+    replacement.send_user_message(
+        "inspect fresh globals".into(),
+        rho_agent_types::MessageDelivery::Immediate,
+    );
     tokio::time::timeout(Duration::from_secs(15), async {
         while !workset.root().join("recovered").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;

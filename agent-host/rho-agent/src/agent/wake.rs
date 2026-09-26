@@ -19,7 +19,6 @@ pub(crate) struct Facts {
     pub response_finished: Option<UnixMs>,
     pub wake_on_tools: bool,
     pub prose: bool,
-    pub restarted: bool,
     pub rewound: bool,
     pub compaction: bool,
     pub compaction_reply: bool,
@@ -56,9 +55,6 @@ pub(crate) fn decide(facts: &Facts, now: UnixMs) -> Decision {
     }
     if let Some(at) = facts.agent {
         due.push((base(at) + Duration::from_secs(15), Wake::AgentMessage));
-    }
-    if facts.restarted {
-        due.push((now, Wake::Restarted));
     }
     if facts.rewound {
         due.push((now, Wake::Rewound));
@@ -211,16 +207,6 @@ mod tests {
                 UnixMs(1)
             ),
             Decision::Now(Wake::Prose)
-        );
-        assert_eq!(
-            decide(
-                &Facts {
-                    restarted: true,
-                    ..base.clone()
-                },
-                UnixMs(1)
-            ),
-            Decision::Now(Wake::Restarted)
         );
         assert_eq!(
             decide(
