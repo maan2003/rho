@@ -12545,6 +12545,7 @@ dependencies = [
  "rho-tool-shell",
  "rho-watch",
  "rho-web-search",
+ "rho-workset",
  "rustix 1.1.4",
  "rustix-openpty",
  "rustls",
@@ -13616,6 +13617,24 @@ dependencies = [
  "text",
  "theme",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
+]
+
+[[package]]
+name = "rho-workset"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "futures",
+ "libc",
+ "rho-agent-types",
+ "rho-devshell",
+ "rho-fs-view",
+ "rho-shell",
+ "rho-shell-view",
+ "rho-terminal",
+ "rustix-openpty",
+ "tokio",
 ]
 
 [[package]]

@@ -38,8 +38,7 @@ pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
 pub mod prompt;
-pub mod shell;
-pub mod terminal;
+pub use rho_workset::{shell, terminal};
 mod title;
 mod worker;
 pub use worker::{

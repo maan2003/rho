@@ -6,6 +6,7 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "agent-host/rho-agent",
+  "agent-host/rho-workset",
   "crates/rho-agents-client",
   "crates/rho-agents2-client",
   "crates/rho-agents-view",
@@ -128,6 +129,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "stream",
 ] }
 rho-agent = { path = "agent-host/rho-agent", default-features = false }
+rho-workset = { path = "agent-host/rho-workset" }
 rho-agent2 = { path = "agent-host/rho-agent2" }
 rho-agents-client = { path = "crates/rho-agents-client" }
 rho-agents2-client = { path = "crates/rho-agents2-client" }
