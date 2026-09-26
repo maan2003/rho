@@ -48,8 +48,8 @@ use rho_agents2_client::create::{
 };
 use rho_agents2_client::protocol::{
     AgentId as Agent2Id, AgentInfo as Agent2Info, ArchiveAgent as ArchiveAgent2,
-    CreateAgent as CreateAgent2, Effort as Agent2Effort, SendMessage as SendMessage2,
-    ServerFrame as Agent2Frame,
+    CreateAgent as CreateAgent2, Effort as Agent2Effort, RewindAgent as RewindAgent2,
+    SendMessage as SendMessage2, ServerFrame as Agent2Frame,
 };
 use rho_agents2_client::remote::Agents2Link;
 use rho_agents2_client::stream::{Agents2Event, Agents2Stream};
@@ -253,7 +253,7 @@ pub struct Workspace {
     /// Which pane the point is in. The window's, not the map's.
     pub(crate) selection: Selection,
     models: HashMap<AgentId, Entity<AgentModel>>,
-    agent2: HashMap<Agent2Id, (HostId, Agent2Info)>,
+    pub(crate) agent2: HashMap<Agent2Id, (HostId, Agent2Info)>,
     agent2_events: futures_mpsc::UnboundedSender<Agents2Event>,
     pending_agent2_open: Option<Agent2Id>,
     /// Weak project cache keyed by host-side workspace identity, qualified
@@ -1117,7 +1117,10 @@ impl Workspace {
     /// The agent host an agent lives on. `None` only before its first summary
     /// or creation notice has landed.
     fn host_of(&self, agent_id: AgentId) -> Option<HostId> {
-        self.registry.host_of_agent(agent_id)
+        self.agent2
+            .get(&agent_id)
+            .map(|(host, _)| *host)
+            .or_else(|| self.registry.host_of_agent(agent_id))
     }
 
     /// A host's agents, while the host is attached.
@@ -1360,13 +1363,19 @@ impl Workspace {
         let now = jiff::Timestamp::now();
         let hand = self.hand(cx).cards;
         let registry = &self.registry;
+        let agents = &self.agent2;
         // The name the user gave it, with the handle beside it to tell two
         // of the same name apart — the same label a transcript tab carries,
         // because a card and the surface it opens are the same agent and
         // were reading as two.
         let mut rows = crate::home::split_hand(&hand, |card| {
             crate::home::card_title(card, |agent_id| {
-                registry.agent_name_with_labels(agent_id, registry.agent_display_label(agent_id))
+                if agents.contains_key(&agent_id) {
+                    card.title.clone()
+                } else {
+                    registry
+                        .agent_name_with_labels(agent_id, registry.agent_display_label(agent_id))
+                }
             })
         });
         let now_ms = now.as_millisecond();
@@ -1679,6 +1688,7 @@ impl Workspace {
             .registry
             .known_agents()
             .copied()
+            .chain(self.agent2.keys().copied())
             .collect::<HashSet<_>>();
         let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
@@ -2598,6 +2608,20 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_rewind(&mut self, turns: u32, window: &Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_agent2() {
+            if let Some((host, _)) = self.agent2.get(&id) {
+                self.call_agent2(
+                    *host,
+                    RewindAgent2 {
+                        agent_id: id,
+                        turns,
+                    },
+                    cx,
+                    |_, (), _, _| {},
+                );
+            }
+            return;
+        }
         if let Some(agent_id) = self.subject_agent_or_notice("rewind", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
@@ -3141,7 +3165,12 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
+        let workspace = self
+            .agent2
+            .get(&agent_id)
+            .map(|(_, info)| rho_agent_types::WorkspaceInfo::Workset(info.place.clone()))
+            .or_else(|| self.registry.agent_workspace(agent_id));
+        let Some(workspace) = workspace else {
             self.notice_on(
                 None,
                 "open: agent has no workspace",
@@ -3370,12 +3399,24 @@ impl Workspace {
                 if let Some((owner, info)) = self.agent2.get_mut(&agent_id) {
                     if *owner == host && !info.chat.iter().any(|existing| existing.seq == event.seq)
                     {
-                        if let rho_agents2_client::protocol::ChatKind::Status(status) = &event.kind
-                        {
-                            info.status = Some(status.clone());
-                        }
+                        let status_changed = matches!(
+                            &event.kind,
+                            rho_agents2_client::protocol::ChatKind::Status(_)
+                                | rho_agents2_client::protocol::ChatKind::Rewound { .. }
+                        );
                         info.chat.push(event);
                         info.chat.sort_by_key(|event| event.seq);
+                        if status_changed {
+                            info.status = rho_agents2_client::protocol::visible_chat(&info.chat)
+                                .into_iter()
+                                .rev()
+                                .find_map(|event| match &event.kind {
+                                    rho_agents2_client::protocol::ChatKind::Status(text) => {
+                                        Some(text.clone())
+                                    }
+                                    _ => None,
+                                });
+                        }
                         changed.push(agent_id);
                     }
                 }
@@ -3391,6 +3432,8 @@ impl Workspace {
         }
         if !changed.is_empty() {
             self.refresh_draft_agent_targets(cx);
+            self.invalidate_dealer_signals(cx);
+            self.refresh_home(cx);
         }
         for id in changed {
             if let Some((_, info)) = self.agent2.get(&id) {
@@ -3416,7 +3459,8 @@ impl Workspace {
         if !self.agent2.contains_key(&id) {
             return;
         }
-        self.active_context = ContextId::Draft;
+        self.selection.select_agent(id);
+        self.active_context = self.context_for_agent(id);
         let surface = self.make_surface(SurfaceKey::Agent2(id), window, cx);
         self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
@@ -3868,6 +3912,10 @@ impl Workspace {
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent2.contains_key(&agent_id) {
+            self.open_agent2(agent_id, window, cx);
+            return;
+        }
         rho_journal::record(rho_journal::Event::AgentOpened {
             agent_id: agent_id.into(),
         });
@@ -4170,6 +4218,10 @@ impl Workspace {
         // Any other route to the draft page composes at the root; only
         // `n a` sets an area, and it sets it after this.
         self.draft_area = None;
+        if let Some(agent_id) = agent_id.filter(|id| self.agent2.contains_key(id)) {
+            self.open_agent2(agent_id, window, cx);
+            return;
+        }
         if let Some(agent_id) = agent_id {
             // Selection is the strongest signal: the transcript about to be
             // shown is the newest of the active set.
@@ -4219,7 +4271,13 @@ impl Workspace {
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::Note(_) => "note".to_owned(),
-            SurfaceKey::Agent2(id) => format!("agent2 {}", id.encoded()),
+            SurfaceKey::Agent2(id) => self
+                .attention
+                .marks
+                .get(&rho_dealer::NodeId::Agent(*id))
+                .name
+                .clone()
+                .unwrap_or_else(|| id.encoded()),
             SurfaceKey::Transcript(agent_id) => self
                 .registry
                 .agent_name_with_labels(*agent_id, self.registry.agent_display_label(*agent_id)),
@@ -4258,7 +4316,7 @@ impl Workspace {
             SurfaceKey::Usage => "usage",
             SurfaceKey::Note(_) => "note",
             SurfaceKey::Transcript(_) => "transcript",
-            SurfaceKey::Agent2(_) => "agent2 chat",
+            SurfaceKey::Agent2(_) => "agent chat",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Terminal { .. } => "terminal",
@@ -5247,7 +5305,8 @@ impl Workspace {
     /// focus from it.
     pub(crate) fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = match &self.active_surface().key {
-            SurfaceKey::Transcript(agent_id)
+            SurfaceKey::Agent2(agent_id)
+            | SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
@@ -5255,8 +5314,7 @@ impl Workspace {
             | SurfaceKey::Home
             | SurfaceKey::Messages
             | SurfaceKey::Usage
-            | SurfaceKey::Note(_)
-            | SurfaceKey::Agent2(_) => None,
+            | SurfaceKey::Note(_) => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackInventory(_)
@@ -5368,7 +5426,9 @@ impl Workspace {
     /// visible surface, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         let selected = match self.active_surface().key.clone() {
-            SurfaceKey::Transcript(agent_id) | SurfaceKey::Shell(agent_id) => {
+            SurfaceKey::Agent2(agent_id)
+            | SurfaceKey::Transcript(agent_id)
+            | SurfaceKey::Shell(agent_id) => {
                 self.selection.select_agent(agent_id);
                 Some(agent_id)
             }
@@ -5386,8 +5446,7 @@ impl Workspace {
             | SurfaceKey::Note(_)
             | SurfaceKey::Messages
             | SurfaceKey::Usage
-            | SurfaceKey::File { .. }
-            | SurfaceKey::Agent2(_) => None,
+            | SurfaceKey::File { .. } => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackInventory(_)
@@ -6285,8 +6344,12 @@ impl Workspace {
                 });
                 self.selection.select_agent(agent_id);
                 self.active_context = self.context_for_agent(agent_id);
-                self.activate_agent(agent_id, cx);
-                self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
+                if self.agent2.contains_key(&agent_id) {
+                    self.make_surface(SurfaceKey::Agent2(agent_id), window, cx)
+                } else {
+                    self.activate_agent(agent_id, cx);
+                    self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
+                }
             }
             // A Slack card is a conversation: the deal view is the
             // conversation surface itself, opened the way `enter` opens
@@ -8475,6 +8538,8 @@ mod agent2_chat_tests {
                                 id: base_id,
                                 place: base_place.clone(),
                                 role: AgentRole::default(),
+                                parent: None,
+                                user_owned: false,
                                 model: "gpt-6-sol".into(),
                                 effort: Agent2Effort::Medium,
                                 archived: false,
@@ -8535,6 +8600,8 @@ mod agent2_chat_tests {
                                     origin: Some("/src/original".into()),
                                 },
                                 role: request.role,
+                                parent: None,
+                                user_owned: false,
                                 model: request.model,
                                 effort: request.effort,
                                 archived: false,
@@ -8566,6 +8633,91 @@ mod agent2_chat_tests {
     }
 
     #[gpui::test]
+    fn new_chat_card_opens_and_verdict_tracks_physical_log_position(cx: &mut TestAppContext) {
+        use rho_dealer::facts::Seen;
+        use rho_dealer::{Card, CardKind, NodeId};
+
+        let workspace = crate::tests::test_workspace(cx);
+        let id = Agent2Id::from_counter(42, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let node = NodeId::Agent(id);
+        let info = Agent2Info {
+            id,
+            place: rho_agent_types::Place {
+                workset: "test-workset".into(),
+                cwd: "/src/work".into(),
+                mode: Default::default(),
+                origin: None,
+            },
+            role: AgentRole::default(),
+            parent: None,
+            user_owned: false,
+            model: "gpt-6-sol".into(),
+            effort: Agent2Effort::Medium,
+            archived: false,
+            status: None,
+            chat: vec![ChatEvent {
+                seq: 19,
+                at: UnixMs(17),
+                kind: ChatKind::Message {
+                    id: MessageId(8),
+                    from: Party::Agent(id),
+                    to: Party::Human,
+                    text: "review the patch".into(),
+                },
+            }],
+        };
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId(0),
+                        frame: Agent2Frame::Snapshot { agents: vec![info] },
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(workspace.seen(&node, cx), Seen::Agent(19));
+                assert!(
+                    workspace.find_candidates(cx).iter().any(|candidate| {
+                        candidate.target == crate::find::FindTarget::Agent(id)
+                    })
+                );
+                let card = Card {
+                    node: node.clone(),
+                    kind: CardKind::Agent,
+                    title: "review the patch".into(),
+                    context: String::new(),
+                    label: String::new(),
+                    priority: 1.0,
+                    cursor: "19".into(),
+                    skipped: false,
+                };
+                workspace.open_card(card, window, cx);
+                assert_eq!(workspace.active_surface().key, SurfaceKey::Agent2(id));
+                assert_eq!(workspace.surface_node(cx), Some(node.clone()));
+                assert_eq!(workspace.subject(window, cx).agent, Some(id));
+                // Branch markers do not rewrite the physical seen cursor.
+                workspace.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId(0),
+                        frame: Agent2Frame::Chat {
+                            agent_id: id,
+                            event: ChatEvent {
+                                seq: 20,
+                                at: UnixMs(20),
+                                kind: ChatKind::Rewound { to: 19 },
+                            },
+                        },
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(workspace.seen(&node, cx), Seen::Agent(20));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn stream_refreshes_chat_without_erasing_composition_or_replaying_events(
         cx: &mut TestAppContext,
     ) {
@@ -8580,6 +8732,8 @@ mod agent2_chat_tests {
                 origin: None,
             },
             role: AgentRole::default(),
+            parent: None,
+            user_owned: false,
             model: "gpt-6-sol".into(),
             effort: Agent2Effort::Medium,
             archived: false,

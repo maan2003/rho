@@ -455,8 +455,13 @@ impl Workspace {
     /// Everything the dealer reads, as it stands.
     fn with_sources<R>(&self, cx: &gpui::App, read: impl FnOnce(&Sources<'_>) -> R) -> R {
         let session = self.slack.session().map(|session| session.read(cx));
+        let agents: HashMap<_, _> = self
+            .agent2
+            .iter()
+            .map(|(id, (_, info))| (*id, info.clone()))
+            .collect();
         let sources = Sources {
-            agents: &self.registry,
+            agents: &agents,
             slack: session.map(|session| rank::Slack {
                 model: session.model(),
                 mirror: session.mirror(),
@@ -616,9 +621,14 @@ impl Workspace {
     pub(crate) fn seen(&self, node: &NodeId, cx: &gpui::App) -> Seen {
         match node {
             NodeId::Agent(agent_id) => Seen::Agent(
-                self.registry
-                    .agent_digest(*agent_id)
-                    .map_or(0, |digest| digest.newest.0),
+                self.agent2
+                    .get(agent_id)
+                    .map(|(_, info)| info.chat.iter().map(|event| event.seq).max().unwrap_or(0))
+                    .unwrap_or_else(|| {
+                        self.registry
+                            .agent_digest(*agent_id)
+                            .map_or(0, |digest| digest.newest.0)
+                    }),
             ),
             NodeId::Slack(unit) => self
                 .slack

@@ -3,7 +3,7 @@
 use editor::Editor;
 use gpui::{AppContext as _, Context, Entity, Window};
 use language::{Buffer, Capability};
-use rho_agents2_client::protocol::{AgentInfo, ChatKind, Party};
+use rho_agents2_client::protocol::{AgentInfo, ChatKind, Party, visible_chat};
 
 #[derive(Clone)]
 pub(crate) struct ChatView {
@@ -81,7 +81,7 @@ impl ChatView {
 
 fn chat_text(info: &AgentInfo) -> String {
     let mut text = format!(
-        "agent2 {}\n{} · {} · {:?}{}\n",
+        "agent {}\n{} · {} · {:?}{}\n",
         info.id.encoded(),
         info.place.cwd,
         info.model,
@@ -94,7 +94,7 @@ fn chat_text(info: &AgentInfo) -> String {
     text.push_str(
         "\nEnter: send · Shift+Enter: newline · Space h x: archive · Space h o: open another\n\n",
     );
-    for event in &info.chat {
+    for event in visible_chat(&info.chat) {
         match &event.kind {
             ChatKind::Message {
                 from,
@@ -111,6 +111,7 @@ fn chat_text(info: &AgentInfo) -> String {
                 text.push('\n');
             }
             ChatKind::Status(status) => text.push_str(&format!("[{status}]\n\n")),
+            ChatKind::Rewound { .. } => text.push_str("[history rewound · notebook unchanged]\n\n"),
         }
     }
     text
@@ -142,6 +143,8 @@ mod tests {
                 origin: None,
             },
             role: rho_agent_types::AgentRole::default(),
+            parent: None,
+            user_owned: false,
             model: "gpt-6-sol".into(),
             effort: Effort::High,
             archived: true,
@@ -174,5 +177,28 @@ mod tests {
         assert!(text.contains("status: waiting"));
         assert!(text.contains("you → agent:\n  first line\n  second line\n"));
         assert!(text.contains("agent → you:\n  answer\n"));
+
+        // The raw stream keeps an abandoned reply, but the chat surface
+        // shows only the branch after the rewind marker.
+        let mut info = info;
+        info.chat.push(ChatEvent {
+            seq: 3,
+            at: UnixMs(3),
+            kind: ChatKind::Rewound { to: 2 },
+        });
+        info.chat.push(ChatEvent {
+            seq: 4,
+            at: UnixMs(4),
+            kind: ChatKind::Message {
+                id: MessageId(3),
+                from: Party::Agent(info.id),
+                to: Party::Human,
+                text: "new answer".into(),
+            },
+        });
+        let text = chat_text(&info);
+        assert!(!text.contains("agent → you:\n  answer\n"));
+        assert!(text.contains("[history rewound · notebook unchanged]"));
+        assert!(text.contains("agent → you:\n  new answer\n"));
     }
 }

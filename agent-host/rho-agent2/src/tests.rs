@@ -23,6 +23,7 @@ fn start(dir: &tempfile::TempDir, log: Log, model: Arc<Scripted>) -> (Agent, Age
         model: Arc::new(rho_inference2::Model::Scripted(model)),
         shell: shell(dir),
         instructions: "test".into(),
+        agent_tools: None,
     })
     .unwrap()
 }
@@ -415,4 +416,56 @@ async fn rewind_branches_context_but_preserves_live_notebook_state() {
             .any(|entry| matches!(entry, Entry::Received { body, .. }
         if body == &[Block::Text("discard this prompt".into())]))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_during_a_streaming_model_step_drains_the_notebook() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model.then(&"marker = 1\n".repeat(250));
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let running = tokio::spawn(agent.run());
+    say(&handle, "start a long model step");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while model.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.stop();
+    tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("stop interrupts the in-flight provider step")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_interrupts_model_step_but_allows_a_follow_up_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model
+        .then(&"marker = 1\n".repeat(250))
+        .then("human.send('followed up')");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "start a long model step");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while model.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.cancel();
+    say(&handle, "please follow up");
+    until_chat(&mut chat, sent("followed up")).await;
+    handle.stop();
+    tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

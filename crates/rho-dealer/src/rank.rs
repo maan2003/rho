@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use jiff::{Timestamp, Zoned};
 use rho_agent_types::AgentId;
-use rho_agents2_client::protocol::{AgentInfo, ChatKind, Party};
+use rho_agents2_client::protocol::{AgentInfo, ChatKind, Party, visible_chat};
 use rho_slack::model::{Attention, Model, Unit};
 
 use crate::curve::{self, Curve, DEAL_QUEUE_FLOOR};
@@ -221,6 +221,9 @@ fn rank_into(
     // human can ask for attention. Status rows advance the seen cursor but
     // cannot themselves become a reply.
     for (&agent_id, agent) in sources.agents {
+        if agent.parent.is_some() && !agent.user_owned {
+            continue;
+        }
         let node = NodeId::Agent(agent_id);
         let newest = agent.chat.iter().map(|event| event.seq).max().unwrap_or(0);
         let reply = agent
@@ -607,9 +610,8 @@ pub fn title(sources: &Sources<'_>, node: &NodeId, cache: &mut Cache) -> String 
             .filter(|name| !name.trim().is_empty())
             .or_else(|| {
                 sources.agents.get(agent_id).and_then(|agent| {
-                    agent
-                        .chat
-                        .iter()
+                    visible_chat(&agent.chat)
+                        .into_iter()
                         .filter_map(|event| match &event.kind {
                             ChatKind::Message {
                                 from: Party::Human,

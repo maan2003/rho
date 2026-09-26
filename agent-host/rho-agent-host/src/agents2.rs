@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, anyhow};
 use camino::Utf8PathBuf;
-use rho_agent::pool::AgentPool;
+use rho_agent::pool::{Agent2ToolHandler, AgentPool};
 use rho_agent::{ChatRemote, ChatWorkerEvent};
 use rho_agent_types::{AgentIdDomain, AgentRole, Place, WorksetMode, WorkspaceInfo};
 use rho_agent2::chat as chat2;
+use rho_agent2::human::{Agent2Call, Agent2Reply};
 use rho_agent2::log::{self, Block, Entry, Notice};
 use rho_agents2_client::protocol as wire;
 use rho_fs_view::Workset;
@@ -26,6 +27,10 @@ struct Stored {
     role: AgentRole,
     model: String,
     effort: String,
+    #[senax(default)]
+    parent: Option<wire::AgentId>,
+    #[senax(default)]
+    user_owned: bool,
 }
 struct Record {
     info: wire::AgentInfo,
@@ -74,6 +79,15 @@ impl Agents2 {
             records: Mutex::new(HashMap::new()),
             changes: broadcast::channel(1024).0,
         });
+        let weak = Arc::downgrade(&manager);
+        let handler: Agent2ToolHandler = Arc::new(move |source, call| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let manager = weak.upgrade().context("chat manager is shutting down")?;
+                manager.tool_call(source, call).await
+            })
+        });
+        manager.pool.install_agent2_tool_handler(handler)?;
         for entry in std::fs::read_dir(&manager.root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -108,6 +122,8 @@ impl Agents2 {
                 id,
                 stored.place,
                 stored.role,
+                stored.parent,
+                stored.user_owned,
                 stored.model,
                 effort,
                 log::Log::open(log_path.as_std_path())?,
@@ -140,6 +156,8 @@ impl Agents2 {
         id: wire::AgentId,
         place: Place,
         role: AgentRole,
+        parent: Option<wire::AgentId>,
+        user_owned: bool,
         model: String,
         effort: wire::Effort,
         log: log::Log,
@@ -164,14 +182,19 @@ impl Agents2 {
             .into_iter()
             .filter_map(convert_chat)
             .collect();
-        let status = chat.iter().rev().find_map(|event| match &event.kind {
-            wire::ChatKind::Status(text) => Some(text.clone()),
-            _ => None,
-        });
+        let status = wire::visible_chat(&chat)
+            .into_iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                wire::ChatKind::Status(text) => Some(text.clone()),
+                _ => None,
+            });
         wire::AgentInfo {
             id,
             place,
             role,
+            parent,
+            user_owned,
             model,
             effort,
             archived,
@@ -207,6 +230,9 @@ impl Agents2 {
             id,
             info.model.clone(),
             info.effort.to_string(),
+            info.role,
+            info.parent,
+            info.user_owned,
             observer,
         )
         .await?;
@@ -253,10 +279,19 @@ impl Agents2 {
             {
                 return;
             }
-            if let wire::ChatKind::Status(text) = &event.kind {
-                record.info.status = Some(text.clone());
-            }
             record.info.chat.push(event.clone());
+            if matches!(
+                event.kind,
+                wire::ChatKind::Status(_) | wire::ChatKind::Rewound { .. }
+            ) {
+                record.info.status = wire::visible_chat(&record.info.chat)
+                    .into_iter()
+                    .rev()
+                    .find_map(|event| match &event.kind {
+                        wire::ChatKind::Status(text) => Some(text.clone()),
+                        _ => None,
+                    });
+            }
         }
         let _ = self.changes.send(wire::ServerFrame::Chat {
             agent_id: *id,
@@ -346,6 +381,15 @@ impl Agents2 {
     }
 
     async fn create(self: &Arc<Self>, call: wire::CreateAgent) -> anyhow::Result<wire::AgentId> {
+        self.create_with_parent(call, None, false).await
+    }
+
+    async fn create_with_parent(
+        self: &Arc<Self>,
+        call: wire::CreateAgent,
+        parent: Option<wire::AgentId>,
+        user_owned: bool,
+    ) -> anyhow::Result<wire::AgentId> {
         anyhow::ensure!(!call.model.trim().is_empty(), "model is empty");
         let place = self.resolve_place(call.start, call.mode).await?;
         let id = {
@@ -369,6 +413,8 @@ impl Agents2 {
             role: call.role,
             model: call.model.clone(),
             effort: call.effort.to_string(),
+            parent,
+            user_owned,
         };
         std::fs::write(dir.join("config.senax"), senax_encoder::pack(&stored)?)?;
         let workset = self.pool.worksets().open_workset(&place.workset).await?;
@@ -377,6 +423,8 @@ impl Agents2 {
             id,
             place,
             call.role,
+            parent,
+            user_owned,
             call.model,
             call.effort,
             log::Log::open(log_path.as_std_path())?,
@@ -398,6 +446,202 @@ impl Agents2 {
         Ok(id)
     }
 
+    async fn tool_call(
+        self: &Arc<Self>,
+        source: wire::AgentId,
+        call: Agent2Call,
+    ) -> anyhow::Result<Agent2Reply> {
+        let origin = self
+            .records
+            .lock()
+            .unwrap()
+            .get(&source)
+            .map(|record| record.info.clone())
+            .ok_or_else(|| anyhow!("agent {} not found", source.encoded()))?;
+        anyhow::ensure!(
+            call.allowed(origin.role),
+            "tool not available to this agent role"
+        );
+        let text = match call {
+            Agent2Call::SpawnEngineer {
+                task_name,
+                prompt,
+                workdir,
+            } => {
+                let role = match origin.role {
+                    AgentRole::Engineer {
+                        intelligence: rho_agent_types::EngineerIntelligence::Mini,
+                    } => origin.role,
+                    _ => AgentRole::default(),
+                };
+                self.spawn_child(&origin, task_name, prompt, workdir, role, false)
+                    .await?
+            }
+            Agent2Call::SpawnUserOwnedEngineer {
+                task_name,
+                prompt,
+                workdir,
+            } => {
+                anyhow::ensure!(
+                    origin.parent.is_none() || origin.user_owned,
+                    "only a user-managed agent can spawn a user-owned Engineer"
+                );
+                self.spawn_child(
+                    &origin,
+                    task_name,
+                    prompt,
+                    workdir,
+                    AgentRole::default(),
+                    true,
+                )
+                .await?
+            }
+            Agent2Call::SpawnAdvisor { message } => {
+                use rho_agent_types::{AdvisorIntelligence, EngineerIntelligence};
+                let intelligence = match origin.role {
+                    AgentRole::Engineer {
+                        intelligence: EngineerIntelligence::Mini,
+                    } => AdvisorIntelligence::Low,
+                    AgentRole::Engineer {
+                        intelligence: EngineerIntelligence::High,
+                    } => AdvisorIntelligence::Medium1,
+                    _ => AdvisorIntelligence::Medium,
+                };
+                self.spawn_child(
+                    &origin,
+                    "advisor".into(),
+                    message,
+                    None,
+                    AgentRole::Advisor { intelligence },
+                    false,
+                )
+                .await?
+            }
+            Agent2Call::Message { agent_id, message } => {
+                anyhow::ensure!(agent_id != source, "cannot send a message to yourself");
+                anyhow::ensure!(!message.trim().is_empty(), "message is empty");
+                let remote = self
+                    .records
+                    .lock()
+                    .unwrap()
+                    .get(&agent_id)
+                    .map(|record| record.remote.clone())
+                    .ok_or_else(|| anyhow!("agent {} not found", agent_id.encoded()))?;
+                remote.send(log::Party::Agent(source), message)?;
+                format!("Message sent to {}.", agent_id.encoded())
+            }
+            Agent2Call::Cancel { agent_id } => {
+                anyhow::ensure!(agent_id != source, "cannot interrupt yourself");
+                let remote = {
+                    let records = self.records.lock().unwrap();
+                    let target = records
+                        .get(&agent_id)
+                        .ok_or_else(|| anyhow!("agent {} not found", agent_id.encoded()))?;
+                    anyhow::ensure!(
+                        target.info.parent == Some(source) && !target.info.user_owned,
+                        "only the managing agent can interrupt this Engineer"
+                    );
+                    anyhow::ensure!(target.info.role.is_engineer(), "target is not an Engineer");
+                    target.remote.clone()
+                };
+                remote.cancel()?;
+                format!(
+                    "Engineer {} interrupted; it remains available for follow-up.",
+                    agent_id.encoded()
+                )
+            }
+            Agent2Call::Team => {
+                let records = self.records.lock().unwrap();
+                let mut team = records
+                    .values()
+                    .filter(|record| record.info.parent == Some(source))
+                    .map(|record| {
+                        format!(
+                            "{} · {} · {}",
+                            record.info.id.encoded(),
+                            if record.info.user_owned {
+                                "user-owned"
+                            } else {
+                                "delegated"
+                            },
+                            record.info.status.as_deref().unwrap_or("idle")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                team.sort();
+                let parent = origin
+                    .parent
+                    .map_or_else(|| "the human".to_owned(), |id| id.encoded());
+                format!(
+                    "You are {}. Parent: {}.\n{}",
+                    source.encoded(),
+                    parent,
+                    if team.is_empty() {
+                        "No agents in your team.".to_owned()
+                    } else {
+                        team.join("\n")
+                    }
+                )
+            }
+        };
+        Ok(Agent2Reply { text })
+    }
+
+    async fn spawn_child(
+        self: &Arc<Self>,
+        origin: &wire::AgentInfo,
+        task_name: String,
+        prompt: String,
+        workdir: Option<String>,
+        role: AgentRole,
+        user_owned: bool,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(!task_name.trim().is_empty(), "task name is empty");
+        anyhow::ensure!(!prompt.trim().is_empty(), "prompt is empty");
+        let mut place = origin.place.clone();
+        if let Some(workdir) = workdir {
+            let requested = camino::Utf8Path::new(&workdir);
+            place.cwd = if requested.is_absolute() {
+                requested.to_owned()
+            } else {
+                place.cwd.join(requested)
+            };
+            let workset = self.pool.worksets().open_workset(&place.workset).await?;
+            anyhow::ensure!(
+                workset.host_path(&place.cwd)?.is_dir(),
+                "subagent working directory does not exist: {}",
+                place.cwd
+            );
+        }
+        let id = self
+            .create_with_parent(
+                wire::CreateAgent {
+                    start: wire::StartMode::Join(wire::JoinTarget::Workspace(
+                        WorkspaceInfo::Workset(place.clone()),
+                    )),
+                    mode: place.mode,
+                    role,
+                    model: origin.model.clone(),
+                    effort: origin.effort,
+                    initial_message: Some(prompt),
+                },
+                Some(origin.id),
+                user_owned,
+            )
+            .await?;
+        Ok(format!(
+            "Spawned {} for task \"{}\" in {}. {}",
+            id.encoded(),
+            task_name,
+            place.cwd,
+            if user_owned {
+                "It reports to the user."
+            } else {
+                "It reports to you by message."
+            }
+        ))
+    }
+
     fn send(&self, call: wire::SendMessage) -> anyhow::Result<()> {
         anyhow::ensure!(!call.text.trim().is_empty(), "message is empty");
         let remote = self
@@ -409,6 +653,17 @@ impl Agents2 {
             .ok_or_else(|| anyhow!("agent {} not found", call.agent_id.encoded()))?;
         remote.send(log::Party::Human, call.text)
     }
+    async fn rewind(&self, call: wire::RewindAgent) -> anyhow::Result<()> {
+        let remote = self
+            .records
+            .lock()
+            .unwrap()
+            .get(&call.agent_id)
+            .map(|record| record.remote.clone())
+            .ok_or_else(|| anyhow!("agent {} not found", call.agent_id.encoded()))?;
+        remote.rewind(call.turns).await
+    }
+
     fn archive(&self, call: wire::ArchiveAgent) -> anyhow::Result<()> {
         let remote = self
             .records
@@ -443,6 +698,7 @@ fn convert_chat(event: chat2::ChatEvent) -> Option<wire::ChatEvent> {
                 .join("\n"),
         },
         chat2::ChatKind::Status(text) => wire::ChatKind::Status(text),
+        chat2::ChatKind::Rewound { to } => wire::ChatKind::Rewound { to },
     };
     Some(wire::ChatEvent {
         seq: event.seq,
@@ -557,6 +813,9 @@ where
             }
             wire::Request::ArchiveAgent(call) => {
                 respond(&mut writer, call, |call| async { manager.archive(call) }).await
+            }
+            wire::Request::RewindAgent(call) => {
+                respond(&mut writer, call, |call| manager.rewind(call)).await
             }
             wire::Request::ListAgents(call) => {
                 respond(&mut writer, call, |_| async { Ok(manager.snapshot()) }).await
@@ -743,6 +1002,80 @@ mod tests {
             .unwrap();
         assert_eq!(joined.place, place);
         assert_eq!(joined.role, role);
+        let child_reply = manager
+            .tool_call(
+                first,
+                Agent2Call::SpawnEngineer {
+                    task_name: "review".into(),
+                    prompt: "review the change".into(),
+                    workdir: None,
+                },
+            )
+            .await
+            .unwrap();
+        let child = manager
+            .snapshot()
+            .into_iter()
+            .find(|info| info.parent == Some(first) && !info.user_owned)
+            .unwrap();
+        assert_eq!(child.place, place);
+        assert_eq!(child.role, AgentRole::default());
+        assert!(child_reply.text.contains(&child.id.encoded()));
+        assert!(
+            manager
+                .tool_call(
+                    child.id,
+                    Agent2Call::SpawnUserOwnedEngineer {
+                        task_name: "escape".into(),
+                        prompt: "try".into(),
+                        workdir: None,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .tool_call(first, Agent2Call::Cancel { agent_id: second })
+                .await
+                .is_err(),
+            "a peer cannot interrupt an agent it did not manage"
+        );
+        assert!(
+            manager
+                .tool_call(
+                    first,
+                    Agent2Call::SpawnEngineer {
+                        task_name: "bad path".into(),
+                        prompt: "try".into(),
+                        workdir: Some("../../outside".into()),
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .tool_call(first, Agent2Call::Team)
+                .await
+                .unwrap()
+                .text
+                .contains(&child.id.encoded())
+        );
+        manager
+            .tool_call(first, Agent2Call::Cancel { agent_id: child.id })
+            .await
+            .unwrap();
+        manager
+            .tool_call(
+                first,
+                Agent2Call::Message {
+                    agent_id: child.id,
+                    message: "follow up".into(),
+                },
+            )
+            .await
+            .unwrap();
         manager
             .archive(wire::ArchiveAgent { agent_id: second })
             .unwrap();
@@ -790,6 +1123,49 @@ mod tests {
         })
         .await
         .unwrap();
+        manager
+            .send(wire::SendMessage {
+                agent_id: first,
+                text: "abandoned human prompt".into(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager.snapshot().into_iter().find(|info| info.id == first).unwrap().chat.iter().any(|event| {
+                matches!(&event.kind, wire::ChatKind::Message { from: wire::Party::Human, text, .. } if text == "abandoned human prompt")
+            }) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        manager
+            .rewind(wire::RewindAgent {
+                agent_id: first,
+                turns: 1,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager
+                .snapshot()
+                .into_iter()
+                .find(|info| info.id == first)
+                .unwrap()
+                .chat
+                .iter()
+                .any(|event| matches!(event.kind, wire::ChatKind::Rewound { .. }))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first_chat = manager
+            .snapshot()
+            .into_iter()
+            .find(|info| info.id == first)
+            .unwrap()
+            .chat;
+        assert!(first_chat.iter().any(|event| matches!(&event.kind, wire::ChatKind::Message { text, .. } if text == "abandoned human prompt")));
+        assert!(!wire::visible_chat(&first_chat).iter().any(|event| matches!(&event.kind, wire::ChatKind::Message { text, .. } if text == "abandoned human prompt")));
         let remotes: Vec<_> = manager
             .records
             .lock()
@@ -817,6 +1193,13 @@ mod tests {
             .unwrap();
         assert_eq!(revived.place, place);
         assert!(revived.archived);
+        let revived_child = reloaded
+            .snapshot()
+            .into_iter()
+            .find(|info| info.id == child.id)
+            .unwrap();
+        assert_eq!(revived_child.parent, Some(first));
+        assert!(!revived_child.user_owned);
         assert!(reloaded.snapshot().into_iter().find(|info| info.id == first).unwrap().chat.iter().any(|event| {
             matches!(&event.kind, wire::ChatKind::Message { text, .. } if text == "mail inside workset")
         }));

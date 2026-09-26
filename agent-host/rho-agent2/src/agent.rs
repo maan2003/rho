@@ -11,10 +11,10 @@ use std::time::Duration;
 use rho_agent_types::UnixMs;
 use rho_inference2::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
 use rho_notebook2::{CellHandle, Notebook};
-use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 use crate::chat::{self, ChatEvent};
-use crate::human::{Mailroom, Outbound};
+use crate::human::{Agent2HostCall, Mailroom, Outbound};
 use crate::log::{AgentId, Block, Entry, Log, MessageId, Notice, Party, Wake};
 use crate::wake::{self, Decision, Facts};
 
@@ -44,6 +44,8 @@ pub enum Trace {
 pub struct AgentHandle {
     inbox: mpsc::UnboundedSender<Inbound>,
     control: mpsc::UnboundedSender<Control>,
+    stop: watch::Sender<bool>,
+    cancel: watch::Sender<u64>,
     chat: broadcast::Sender<ChatEvent>,
     trace: broadcast::Sender<Trace>,
     mailroom: Arc<Mailroom>,
@@ -63,6 +65,17 @@ impl AgentHandle {
 
     pub fn archive(&self) {
         self.mailroom.archive();
+    }
+
+    /// Stop the loop and let it drain its notebook before worker shutdown.
+    pub fn stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Interrupt this turn and its running notebook work; later messages may
+    /// resume it.
+    pub fn cancel(&self) {
+        self.cancel.send_modify(|generation| *generation += 1);
     }
 
     /// Branch before the Nth last human message; notebook state remains.
@@ -102,6 +115,8 @@ pub struct Agent {
     outbox: mpsc::UnboundedReceiver<Outbound>,
     inbox: mpsc::UnboundedReceiver<Inbound>,
     control: mpsc::UnboundedReceiver<Control>,
+    stop: watch::Receiver<bool>,
+    cancel: watch::Receiver<u64>,
     wake: Arc<Notify>,
     chat: broadcast::Sender<ChatEvent>,
     trace: broadcast::Sender<Trace>,
@@ -134,18 +149,21 @@ pub struct Config {
     pub model: Arc<Model>,
     pub shell: rho_tool_shell::ShellTools,
     pub instructions: Arc<str>,
+    pub agent_tools: Option<Agent2HostCall>,
 }
 
 impl Agent {
     /// An agent over `config.log`, carrying on from whatever it holds. Must
     /// be called inside a Tokio runtime.
     pub fn new(config: Config) -> anyhow::Result<(Self, AgentHandle)> {
-        let (mailroom, outbox) = Mailroom::new();
+        let (mailroom, outbox) = Mailroom::new(config.agent_tools);
         let wake = Arc::new(Notify::new());
         let notebook = Notebook::new(config.shell.clone(), mailroom.exports(), Arc::clone(&wake))
             .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
         let (inbox_tx, inbox) = mpsc::unbounded_channel();
         let (control_tx, control) = mpsc::unbounded_channel();
+        let (stop_tx, stop) = watch::channel(false);
+        let (cancel_tx, cancel) = watch::channel(0);
         let (chat, _) = broadcast::channel(1024);
         let (trace, _) = broadcast::channel(1024);
         let mut agent = Self {
@@ -162,6 +180,8 @@ impl Agent {
             outbox,
             inbox,
             control,
+            stop,
+            cancel,
             wake,
             chat: chat.clone(),
             trace: trace.clone(),
@@ -184,6 +204,8 @@ impl Agent {
             AgentHandle {
                 inbox: inbox_tx,
                 control: control_tx,
+                stop: stop_tx,
+                cancel: cancel_tx,
                 chat,
                 trace,
                 mailroom: handle_mailroom,
@@ -308,6 +330,9 @@ impl Agent {
     /// Run until every handle is dropped.
     pub async fn run(mut self) -> anyhow::Result<()> {
         loop {
+            if *self.stop.borrow() {
+                break;
+            }
             match wake::decide(&self.facts(), UnixMs::now()) {
                 Decision::Now(why) => self.wake_model(why).await?,
                 Decision::Later(recheck) => {
@@ -318,6 +343,8 @@ impl Agent {
                         }
                     };
                     tokio::select! {
+                        _ = self.stop.changed() => {},
+                        _ = self.cancel.changed() => self.interrupt(None)?,
                         control = self.control.recv() => match control {
                             Some(Control::Rewind { turns, reply }) => { let _ = reply.send(self.rewind(turns)); },
                             None => break,
@@ -588,6 +615,11 @@ impl Agent {
                 // Keep recording what arrives while the model writes.
                 loop {
                     tokio::select! {
+                        _ = self.stop.changed() => return Ok(()),
+                        _ = self.cancel.changed() => {
+                            self.interrupt(streaming)?;
+                            return Ok(());
+                        },
                         result = &mut step => break result,
                         Some(piece) = code_rx.recv() => self.stream(&mut streaming, piece),
                         Some(inbound) = self.inbox.recv() => self.receive(inbound)?,
@@ -619,7 +651,10 @@ impl Agent {
                     if failures >= MAX_FAILURES {
                         return Err(error);
                     }
-                    tokio::time::sleep(Duration::from_secs(2u64.pow(failures))).await;
+                    tokio::select! {
+                        _ = self.stop.changed() => return Ok(()),
+                        _ = tokio::time::sleep(Duration::from_secs(2u64.pow(failures))) => {},
+                    }
                 }
             }
         };
@@ -687,6 +722,28 @@ impl Agent {
         }
         if self.archived && self.unread.iter().any(|(_, from, _)| *from == Party::Human) {
             self.fresh_notebook(at)?;
+        }
+        Ok(())
+    }
+
+    fn interrupt(&mut self, streaming: Option<Streaming>) -> anyhow::Result<()> {
+        self.notebook.cancel();
+        self.cell = None;
+        self.responding = false;
+        self.stopped = true;
+        if let Some(streaming) = streaming {
+            self.interrupted = true;
+            let call = Call {
+                id: streaming.id,
+                code: streaming.code,
+            };
+            self.append(Entry::Step {
+                at: UnixMs::now(),
+                call: Some(call.clone()),
+                prose: String::new(),
+                carry: Carry::bare(call),
+                usage: Usage::default(),
+            })?;
         }
         Ok(())
     }

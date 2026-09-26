@@ -24,6 +24,8 @@ pub enum ChatKind {
     },
     /// Replaces the last status.
     Status(String),
+    /// Append-only branch marker; `to` names a physical log position.
+    Rewound { to: u64 },
 }
 
 /// The chat event an entry makes, if any. `me` is the agent's own id, the
@@ -43,7 +45,8 @@ pub fn project(me: &AgentId, seq: u64, entry: &Entry) -> Option<ChatEvent> {
             body: vec![Block::Text(text.clone())],
         },
         Entry::Status { text, .. } => ChatKind::Status(text.clone()),
-        Entry::Awaiting { .. } | Entry::Notice { .. } | Entry::Rewound { .. } => return None,
+        Entry::Rewound { to, .. } => ChatKind::Rewound { to: *to },
+        Entry::Awaiting { .. } | Entry::Notice { .. } => return None,
         Entry::Created { .. } | Entry::Step { .. } | Entry::Woken { .. } => return None,
     };
     Some(ChatEvent {

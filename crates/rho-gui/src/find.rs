@@ -435,6 +435,38 @@ impl Workspace {
                 recency: hit.recency,
             });
         }
+        for (agent_id, (_, info)) in &self.agent2 {
+            if info.parent.is_some() && !info.user_owned {
+                continue;
+            }
+            let node = NodeId::Agent(*agent_id);
+            if marks.get(&node).facts().muted() {
+                continue;
+            }
+            let title = self.node_title(&node, cx);
+            let aka = rho_agents2_client::protocol::visible_chat(&info.chat)
+                .into_iter()
+                .filter_map(|event| match &event.kind {
+                    rho_agents2_client::protocol::ChatKind::Message {
+                        from: rho_agents2_client::protocol::Party::Human,
+                        text,
+                        ..
+                    } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            candidates.push(FindCandidate {
+                labels: labelled(&node, &title),
+                aka,
+                path: title,
+                kind: "agent",
+                target: FindTarget::Agent(*agent_id),
+                recency: info
+                    .chat
+                    .last()
+                    .map_or(0, |event| event.at.0.min(i64::MAX as u64) as i64),
+            });
+        }
         let mut slack = self.slack_find_candidates(cx);
         // A Slack room is findable because Slack says it exists, so its
         // labels are joined on here.

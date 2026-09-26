@@ -21,12 +21,30 @@ pub enum ChatKind {
         text: String,
     },
     Status(String),
+    /// Branch before a physical log position. All events remain in the stream.
+    Rewound {
+        to: u64,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ChatEvent {
     pub seq: u64,
     pub at: UnixMs,
     pub kind: ChatKind,
+}
+
+/// The current chat branch. Physical log sequence numbers remain stable so
+/// nested rewinds can name a position on an older branch without deleting
+/// abandoned events from the stream or reconnect snapshot.
+pub fn visible_chat(events: &[ChatEvent]) -> Vec<&ChatEvent> {
+    let mut visible = Vec::new();
+    for event in events {
+        if let ChatKind::Rewound { to } = event.kind {
+            visible.retain(|kept: &&ChatEvent| kept.seq < to);
+        }
+        visible.push(event);
+    }
+    visible
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -65,6 +83,10 @@ pub struct AgentInfo {
     pub id: AgentId,
     pub place: Place,
     pub role: AgentRole,
+    /// Spawning agent, if this agent was delegated.
+    pub parent: Option<AgentId>,
+    /// A delegated agent explicitly handed to the user is user-managed.
+    pub user_owned: bool,
     pub model: String,
     pub effort: Effort,
     pub archived: bool,
@@ -104,6 +126,11 @@ pub struct ArchiveAgent {
     pub agent_id: AgentId,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct RewindAgent {
+    pub agent_id: AgentId,
+    pub turns: u32,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ListAgents;
 
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
@@ -116,6 +143,7 @@ rho_rpc::calls! {
         CreateAgent(CreateAgent) -> AgentId;
         SendMessage(SendMessage) -> ();
         ArchiveAgent(ArchiveAgent) -> ();
+        RewindAgent(RewindAgent) -> ();
         ListAgents(ListAgents) -> Vec<AgentInfo>;
     }
 }
@@ -140,6 +168,34 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_rewinds_project_current_chat_without_erasing_stream() {
+        let event = |seq, kind| ChatEvent {
+            seq,
+            at: UnixMs(seq),
+            kind,
+        };
+        let events = vec![
+            event(1, ChatKind::Status("kept".into())),
+            event(3, ChatKind::Status("abandoned".into())),
+            event(4, ChatKind::Rewound { to: 3 }),
+            event(6, ChatKind::Status("temporary".into())),
+            event(8, ChatKind::Rewound { to: 3 }),
+            event(10, ChatKind::Status("now".into())),
+        ];
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            visible_chat(&events)
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 8, 10]
+        );
+        let bytes = senax_encoder::pack(&events[4]).unwrap();
+        let decoded: ChatEvent = senax_encoder::unpack(&mut bytes.as_ref()).unwrap();
+        assert_eq!(decoded, events[4]);
+    }
+
     #[test]
     fn request_and_chat_round_trip_without_notebook_fields() {
         let id = AgentId::from_counter(17, &rho_agent_types::AgentIdDomain(42)).unwrap();
@@ -181,6 +237,8 @@ mod tests {
                 id,
                 place,
                 role: AgentRole::default(),
+                parent: None,
+                user_owned: false,
                 model: "gpt-6-sol".into(),
                 effort: Effort::Low,
                 archived: false,

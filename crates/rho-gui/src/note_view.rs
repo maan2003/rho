@@ -526,7 +526,8 @@ impl Workspace {
     pub(crate) fn surface_node(&self, cx: &gpui::App) -> Option<NodeId> {
         match &self.active_surface().key {
             SurfaceKey::Note(node) => Some(node.clone()),
-            SurfaceKey::Transcript(agent_id)
+            SurfaceKey::Agent2(agent_id)
+            | SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => Some(NodeId::Agent(*agent_id)),

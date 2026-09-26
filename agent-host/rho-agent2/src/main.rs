@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         model,
         shell,
         instructions: rho_agent2::prompt::INSTRUCTIONS.into(),
+        agent_tools: None,
     })?;
     for event in agent.chat() {
         print_event(&args.id, &event);
@@ -135,5 +136,9 @@ fn print_event(me: &AgentId, event: &ChatEvent) {
             }
         }
         ChatKind::Status(status) => println!("[{}: {status}]", me.encoded()),
+        ChatKind::Rewound { to } => println!(
+            "[{}: rewound to log position {to}; notebook unchanged]",
+            me.encoded()
+        ),
     }
 }

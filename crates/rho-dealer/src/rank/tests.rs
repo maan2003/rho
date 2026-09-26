@@ -121,6 +121,8 @@ impl World {
                     origin: None,
                 },
                 role: AgentRole::default(),
+                parent: None,
+                user_owned: false,
                 model: "gpt-6-sol".into(),
                 effort: Effort::Medium,
                 archived: false,
@@ -454,6 +456,23 @@ fn unnamed_agent_card_uses_latest_human_request_but_name_wins() {
         skips: &w.skips,
     };
     assert_eq!(title(&sources, &a, &mut w.cache), "investigate retries");
+    w.push(&a, ChatKind::Rewound { to: 1 });
+    w.push(
+        &a,
+        ChatKind::Message {
+            id: MessageId(2),
+            from: Party::Human,
+            to: Party::Agent(id),
+            text: "try another approach".into(),
+        },
+    );
+    let sources = Sources {
+        agents: &w.agents,
+        slack: None,
+        marks: &w.marks,
+        skips: &w.skips,
+    };
+    assert_eq!(title(&sources, &a, &mut w.cache), "try another approach");
     w.tell(Fact::Named {
         node: a.clone(),
         name: Some("preferred".into()),
@@ -504,6 +523,25 @@ fn rewound_branch_remains_in_physical_unread_chat() {
     );
     w.done(&a);
     assert_eq!(w.hand(), "");
+}
+
+#[test]
+fn delegated_children_do_not_become_user_cards_unless_handed_to_user() {
+    let mut w = world();
+    let parent = w.agent("parent");
+    let child = w.agent("child");
+    let parent_id = parent.agent().unwrap();
+    let child_id = child.agent().unwrap();
+    let child_info = w.agents.get_mut(&child_id).unwrap();
+    child_info.parent = Some(parent_id);
+    w.reply(&child);
+    assert_eq!(
+        w.hand(),
+        "",
+        "the delegated child speaks to its parent, not the user's dealer"
+    );
+    w.agents.get_mut(&child_id).unwrap().user_owned = true;
+    assert_eq!(w.hand(), "child · finished · 0m ago");
 }
 
 #[test]

@@ -12898,7 +12898,7 @@ dependencies = [
  "jiff",
  "proptest",
  "rho-agent-types",
- "rho-agents-client",
+ "rho-agents2-client",
  "rho-slack",
  "senax-encoder",
  "uuid",
