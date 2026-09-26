@@ -200,13 +200,40 @@ impl OpenAi {
                 "content": [{ "type": "input_text", "text": &*request.instructions }],
             }),
         ];
-        for item in &request.items {
+        // Keep the latest provider compaction item itself and everything after it.
+        let latest_compaction = request
+            .items
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, item)| match item {
+                Item::Step(Carry(Inner::OpenAi { items })) => items
+                    .iter()
+                    .rposition(|item| {
+                        serde_json::from_str::<Value>(item)
+                            .is_ok_and(|item| item["type"] == "compaction")
+                    })
+                    .map(|offset| (index, offset)),
+                Item::Step(Carry(Inner::ScriptedCompaction)) => Some((index, 0)),
+                _ => None,
+            });
+        let mut compaction_requested = false;
+        for (index, item) in request.items.iter().enumerate() {
+            if latest_compaction.is_some_and(|(start, _)| index < start) {
+                continue;
+            }
             match item {
                 Item::Step(Carry(Inner::OpenAi { items })) => input.extend(
                     items
                         .iter()
+                        .skip(match latest_compaction {
+                            Some((start, offset)) if start == index => offset,
+                            _ => 0,
+                        })
                         .filter_map(|item| serde_json::from_str::<Value>(item).ok()),
                 ),
+                Item::Step(Carry(Inner::ScriptedCompaction)) => {}
+                Item::CompactionTrigger => compaction_requested = true,
                 // Another provider's step: all that can be said is the call.
                 Item::Step(Carry(Inner::Scripted { call })) => {
                     if let Some(call) = call {
@@ -228,6 +255,9 @@ impl OpenAi {
                     "content": content(text, images, false),
                 })),
             }
+        }
+        if compaction_requested {
+            input.push(json!({ "type": "compaction_trigger" }));
         }
         json!({
             "type": "response.create",
@@ -291,6 +321,7 @@ fn step(items: Vec<Value>, usage: &Value) -> Step {
     let mut carry = Vec::new();
     for item in items {
         let replay = match item["type"].as_str().unwrap_or_default() {
+            "compaction" if item["encrypted_content"].is_string() => item,
             "reasoning" if item["encrypted_content"].is_string() => json!({
                 "type": "reasoning",
                 "id": item["id"],
@@ -483,6 +514,148 @@ mod tests {
         let code = step.call.unwrap().code;
         assert!(pieces.len() > 1, "{pieces:?}");
         assert_eq!(pieces.concat(), code);
+    }
+
+    fn test_model() -> OpenAi {
+        OpenAi {
+            base_url: String::new(),
+            model: "test".into(),
+            effort: Effort::Low,
+            auth: String::new(),
+        }
+    }
+
+    fn test_request(items: Vec<Item>) -> Request {
+        Request {
+            instructions: "instructions".into(),
+            items,
+            cache_key: crate::CacheKey(17),
+        }
+    }
+
+    #[test]
+    fn ordinary_request_keeps_its_input_and_wire_fields() {
+        let body = test_model().body(&test_request(vec![
+            Item::Step(Carry(Inner::OpenAi {
+                items: vec![json!({"type":"reasoning","id":"rs_before"}).to_string()],
+            })),
+            Item::Result {
+                call_id: CallId::new("different-call"),
+                text: "the result".into(),
+                images: vec![],
+            },
+            Item::User {
+                text: "next".into(),
+                images: vec![],
+            },
+        ]));
+        assert_eq!(
+            body,
+            json!({
+                "type": "response.create",
+                "model": "test",
+                "instructions": "",
+                "input": [
+                    {
+                        "type": "additional_tools", "role": "developer",
+                        "tools": [{
+                            "type": "custom", "name": "exec",
+                            "description": "Run Python in your notebook. Every response is one call to this tool.",
+                            "format": {"type": "text"},
+                        }],
+                    },
+                    {
+                        "type": "message", "role": "developer",
+                        "content": [{"type": "input_text", "text": "instructions"}],
+                    },
+                    {"type": "reasoning", "id": "rs_before"},
+                    {"type": "custom_tool_call_output", "call_id": "different-call", "output": "the result"},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]},
+                ],
+                "store": false,
+                "parallel_tool_calls": false,
+                "text": {"verbosity": "low"},
+                "reasoning": {"context": "all_turns", "effort": "low", "summary": "auto"},
+                "service_tier": "default",
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": crate::CacheKey(17).to_string(),
+                "client_metadata": {"ws_request_header_x_openai_internal_codex_responses_lite": "true"},
+            })
+        );
+    }
+
+    #[test]
+    fn triggers_appear_once_at_the_end_of_the_input() {
+        let body = test_model().body(&test_request(vec![
+            Item::CompactionTrigger,
+            Item::User {
+                text: "new".into(),
+                images: vec![],
+            },
+            Item::CompactionTrigger,
+        ]));
+        assert_eq!(
+            body["input"].as_array().unwrap()[2..],
+            [
+                json!({"type":"message", "role":"user", "content":[{"type":"input_text","text":"new"}]}),
+                json!({"type":"compaction_trigger"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_compaction_replays_itself_and_only_the_input_after_it() {
+        let older = json!({"type":"compaction", "id":"old", "encrypted_content":"old-key"});
+        let latest = json!({
+            "type":"compaction", "id":"new", "encrypted_content":"new-key",
+            "provider_extra":{"opaque":[1, "z"]},
+        });
+        let response = step(
+            vec![
+                json!({"type":"reasoning", "id":"rs_dropped", "encrypted_content":"reason"}),
+                older.clone(),
+                json!({"type":"message", "id":"msg_dropped", "content":[]}),
+                latest.clone(),
+                json!({"type":"message", "id":"msg_kept", "content":[{"text":"later"}]}),
+            ],
+            &json!({}),
+        );
+        assert!(response.carry.has_compaction());
+        let Carry(Inner::OpenAi { items }) = &response.carry else {
+            panic!()
+        };
+        assert_eq!(serde_json::from_str::<Value>(&items[3]).unwrap(), latest);
+        let body = test_model().body(&test_request(vec![
+            Item::User {
+                text: "discard this".into(),
+                images: vec![],
+            },
+            Item::CompactionTrigger,
+            Item::Step(Carry(Inner::OpenAi {
+                items: vec![json!({"type":"compaction", "id":"earlier-step", "encrypted_content":"previous-key"}).to_string()],
+            })),
+            Item::Step(response.carry),
+            Item::Result {
+                call_id: CallId::new("after"),
+                text: "kept".into(),
+                images: vec![],
+            },
+            Item::CompactionTrigger,
+            Item::User {
+                text: "last".into(),
+                images: vec![],
+            },
+        ]));
+        assert_eq!(
+            body["input"].as_array().unwrap()[2..],
+            [
+                latest,
+                json!({"type":"message", "role":"assistant", "id":"msg_kept", "content":[{"type":"output_text", "text":"later"}]}),
+                json!({"type":"custom_tool_call_output", "call_id":"after", "output":"kept"}),
+                json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"last"}]}),
+                json!({"type":"compaction_trigger"}),
+            ]
+        );
     }
 
     #[test]

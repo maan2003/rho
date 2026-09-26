@@ -8,6 +8,7 @@ use crate::{Call, CallId, Carry, Inner, Request, Step, Stream, Usage};
 enum Scripting {
     Call(String),
     Prose,
+    Compaction,
     /// The call's code streams, then the response fails.
     Cut(String),
 }
@@ -38,6 +39,12 @@ impl Scripted {
     /// The next step writes prose and makes no call.
     pub fn then_prose(&self) -> &Self {
         self.steps.lock().unwrap().push_back(Scripting::Prose);
+        self
+    }
+
+    /// The next step returns a provider compaction boundary without a call.
+    pub fn then_compaction(&self) -> &Self {
+        self.steps.lock().unwrap().push_back(Scripting::Compaction);
         self
     }
 
@@ -72,10 +79,11 @@ impl Scripted {
         let Some(next) = next else {
             anyhow::bail!("the script has ended");
         };
-        let (code, cut) = match next {
-            Scripting::Call(code) => (Some(code), false),
-            Scripting::Prose => (None, false),
-            Scripting::Cut(code) => (Some(code), true),
+        let (code, cut, compacted) = match next {
+            Scripting::Call(code) => (Some(code), false, false),
+            Scripting::Prose => (None, false, false),
+            Scripting::Compaction => (None, false, true),
+            Scripting::Cut(code) => (Some(code), true, false),
         };
         let call = code.map(|code| {
             let mut n = self.calls.lock().unwrap();
@@ -97,14 +105,55 @@ impl Scripted {
             anyhow::bail!("the connection dropped");
         }
         Ok(Step {
-            prose: if call.is_none() {
+            prose: if call.is_none() && !compacted {
                 "prose".into()
             } else {
                 String::new()
             },
-            carry: Carry(Inner::Scripted { call: call.clone() }),
+            carry: Carry(if compacted {
+                Inner::ScriptedCompaction
+            } else {
+                Inner::Scripted { call: call.clone() }
+            }),
             call,
             usage: Usage::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Item;
+
+    #[tokio::test]
+    async fn scripted_compaction_marks_a_replay_boundary() {
+        let model = Scripted::new();
+        model.then("print(1)").then_compaction().then("print(2)");
+        let request = Request {
+            instructions: "hello".into(),
+            items: vec![],
+            cache_key: crate::CacheKey::new(),
+        };
+        let first = model.step(&request, &mut |_| {}).await.unwrap();
+        assert!(!first.carry.has_compaction());
+        let compacted = model.step(&request, &mut |_| {}).await.unwrap();
+        assert!(compacted.carry.has_compaction());
+        assert!(compacted.call.is_none());
+        assert!(compacted.prose.is_empty());
+        let later = model.step(&request, &mut |_| {}).await.unwrap();
+        let replay = Request {
+            items: vec![
+                Item::Step(first.carry),
+                Item::Step(compacted.carry),
+                Item::Step(later.carry),
+            ],
+            ..request
+        };
+        model.then_prose();
+        model.step(&replay, &mut |_| {}).await.unwrap();
+        let seen = model.requests();
+        assert_eq!(seen.len(), 4);
+        assert!(matches!(&seen[3].items[1], Item::Step(carry) if carry.has_compaction()));
     }
 }

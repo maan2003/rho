@@ -83,6 +83,8 @@ impl PartialEq<str> for CallId {
 pub enum Item {
     /// One of the model's earlier responses, replayed as it came.
     Step(Carry),
+    /// Ask the provider to compact its context on the next response.
+    CompactionTrigger,
     /// What an earlier step's `exec` call produced.
     Result {
         call_id: CallId,
@@ -134,6 +136,8 @@ enum Inner {
     OpenAi { items: Vec<String> },
     /// A scripted step: the call is all there is.
     Scripted { call: Option<Call> },
+    /// A scripted response standing in for a provider compaction.
+    ScriptedCompaction,
 }
 
 /// The `exec` call as it arrives, so its code can run while the rest of
@@ -177,6 +181,18 @@ impl Model {
 }
 
 impl Carry {
+    /// Whether this response contains a provider compaction boundary.
+    pub fn has_compaction(&self) -> bool {
+        match &self.0 {
+            Inner::OpenAi { items } => items.iter().any(|item| {
+                serde_json::from_str::<serde_json::Value>(item)
+                    .is_ok_and(|item| item["type"] == "compaction")
+            }),
+            Inner::ScriptedCompaction => true,
+            Inner::Scripted { .. } => false,
+        }
+    }
+
     /// A call that was cut off: all that can be replayed is the code that
     /// ran.
     pub fn bare(call: Call) -> Self {
