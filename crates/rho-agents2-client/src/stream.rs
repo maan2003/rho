@@ -35,8 +35,11 @@ impl HostStream for Agents2Stream {
             let first = match read_frame::<_, ServerFrame>(&mut stream).await {
                 Ok(frame @ ServerFrame::Snapshot { .. }) => frame,
                 Ok(_) => anyhow::bail!("agent2 session began without a snapshot"),
-                Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|io|
-                    io.kind() == std::io::ErrorKind::UnexpectedEof) => {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof) =>
+                {
                     return std::future::pending().await;
                 }
                 Err(error) => return Err(error),
@@ -47,5 +50,68 @@ impl HostStream for Agents2Stream {
                 sender.unbounded_send(Agents2Event { host, frame })?;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::channel::mpsc;
+    use rho_agent_types::UnixMs;
+    use rho_rpc::protocol::{read_frame, write_frame};
+
+    use super::*;
+    use crate::protocol::{AgentId, ChatEvent, ChatKind};
+
+    #[tokio::test]
+    async fn unsupported_optional_stream_does_not_reconnect_legacy_host() {
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _) = mpsc::unbounded();
+        let stream = Agents2Stream::new(HostId(3), events);
+        let running = tokio::spawn(stream.run(Dialer::InProcess(host_tx)));
+        let mut far = host_rx.recv().await.unwrap();
+        let open: rho_rpc::protocol::Open = read_frame(&mut far).await.unwrap();
+        assert_eq!(open.protocol, rho_rpc::protocol::Protocol::Agents2);
+        drop(far); // An older host rejects the unknown protocol at Open.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(80), running)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshots_and_chat_stream_in_order_and_later_eof_reconnects() {
+        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut received) = mpsc::unbounded();
+        let stream = Agents2Stream::new(HostId(9), events);
+        let running = tokio::spawn(stream.run(Dialer::InProcess(host_tx)));
+        let mut far = host_rx.recv().await.unwrap();
+        let _: rho_rpc::protocol::Open = read_frame(&mut far).await.unwrap();
+        write_frame(&mut far, &ServerFrame::Snapshot { agents: Vec::new() })
+            .await
+            .unwrap();
+        let id = AgentId::new("abc").unwrap();
+        write_frame(
+            &mut far,
+            &ServerFrame::Chat {
+                agent_id: id.clone(),
+                event: ChatEvent {
+                    seq: 2,
+                    at: UnixMs(34),
+                    kind: ChatKind::Status("ready".into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        use futures::StreamExt as _;
+        assert!(
+            matches!(received.next().await.unwrap().frame, ServerFrame::Snapshot { agents } if agents.is_empty())
+        );
+        assert!(
+            matches!(received.next().await.unwrap().frame, ServerFrame::Chat { agent_id, .. } if agent_id == id)
+        );
+        drop(far);
+        assert!(running.await.unwrap().is_err());
     }
 }

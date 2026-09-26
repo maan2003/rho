@@ -781,9 +781,16 @@ fn append_tool_call(
     });
     events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
     for chunk in chunks(&arguments, &state.config, request_number) {
-        events.push(json!({"type":delta_type,"output_index":output_index,"delta":chunk}));
+        events.push(
+            json!({"type":delta_type,"output_index":output_index,"item_id":id,"delta":chunk}),
+        );
     }
-    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
+    let argument_field = if custom { "input" } else { "arguments" };
+    events.push(
+        json!({"type":"response.output_item.done","output_index":output_index,"item":{
+            "type":item_type,"id":id,"call_id":call_id,"name":tool.name,argument_field:arguments
+        }}),
+    );
 }
 
 fn append_reasoning(events: &mut Vec<Value>, request_number: u64, output_index: usize) {

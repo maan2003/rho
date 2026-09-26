@@ -444,5 +444,19 @@ async fn agent2_chat_scenario_speaks_only_by_exec() {
         .collect();
     assert!(code.contains("human.status('ready')"), "{code}");
     assert!(code.contains("human.send('fake model reply')"), "{code}");
+    let item = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["name"] == "exec"
+        })
+        .unwrap();
+    assert_eq!(item["item"]["input"], code);
+    let item_id = &item["item"]["id"];
+    assert!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "response.custom_tool_call_input.delta")
+            .all(|event| &event["item_id"] == item_id)
+    );
     server.shutdown().await.unwrap();
 }

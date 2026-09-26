@@ -88,6 +88,10 @@ impl Drop for Children {
 pub fn run(args: Args) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     ensure_network_namespace()?;
+    ensure!(
+        args.scenario != Scenario::Agent2Chat,
+        "agent2-chat uses the agent2 protocol, not the legacy fake-model-proof"
+    );
     ensure!(args.seconds > 0, "--seconds must be greater than zero");
     ensure!(args.rounds > 0, "--rounds must be greater than zero");
     tokio::runtime::Builder::new_multi_thread()
@@ -587,6 +591,7 @@ fn scenario_complete(
         Scenario::FortyToolCalls => calls >= 40 && results >= 40,
         Scenario::ReasoningCompaction => compacted >= 1,
         Scenario::ClarifyingQuestion => clarifying >= 1,
+        Scenario::Agent2Chat => unreachable!("checked when proof starts"),
     }
 }
 
@@ -669,6 +674,7 @@ fn verify_scenario(scenario: Scenario, rounds: usize, results: &ScenarioResults<
                 "agent host did not retain the compaction item"
             );
         }
+        Scenario::Agent2Chat => unreachable!("checked when proof starts"),
         Scenario::ClarifyingQuestion => {
             ensure!(
                 results.clarifying == 1,
