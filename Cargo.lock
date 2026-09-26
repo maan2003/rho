@@ -13625,15 +13625,20 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "bytes",
+ "camino",
  "futures",
  "libc",
  "rho-agent-types",
+ "rho-desktop-client",
  "rho-devshell",
  "rho-fs-view",
  "rho-shell",
  "rho-shell-view",
  "rho-terminal",
  "rustix-openpty",
+ "senax-encoder",
+ "serde_json",
  "tokio",
 ]
 

@@ -267,7 +267,9 @@ pub(super) async fn run(
                         let sender = sender.clone();
                         tasks.spawn(async move {
                             if let Err(error) = execution
-                                .attach(port, attach, sender.clone(), messages)
+                                .attach(port, attach, sender.clone(), messages, |id, body| {
+                                    super::workset::encode(&W::Reply { id, body })
+                                })
                                 .await
                             {
                                 let _ = sender

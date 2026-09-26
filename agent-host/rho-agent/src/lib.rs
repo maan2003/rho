@@ -591,6 +591,11 @@ impl StartPlace {
         }
     }
 
+    /// Finish placing this workset, retrying a failed clone on the next call.
+    pub async fn materialize_view(&self) -> anyhow::Result<Arc<View>> {
+        Ok(self.view.get().await?.clone())
+    }
+
     /// Marks the workset as made by this creation.
     pub fn owning_workset(mut self) -> Self {
         self.owned_workset = Some(self.place.workset.clone());

@@ -16,23 +16,23 @@ const MAX_MESSAGES: usize = 32;
 const AGENT_WINDOW: usize = 16;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Encode, Decode)]
-pub(super) enum Port {
+pub enum Port {
     Workset,
     Agent(rho_agent_types::AgentId),
     Terminal(u64),
     Shell(u64),
 }
 
-pub(crate) struct Packet {
-    pub(super) port: Port,
-    pub(super) bytes: Bytes,
+pub struct Packet {
+    pub port: Port,
+    pub bytes: Bytes,
     // Travels with agent inbox entries; moving just `bytes` would release early.
     _received: Option<Received>,
 }
 
-#[cfg(test)]
 impl Packet {
-    pub(super) fn for_test(port: Port, bytes: Bytes) -> Self {
+    #[doc(hidden)]
+    pub fn for_test(port: Port, bytes: Bytes) -> Self {
         Self {
             port,
             bytes,
@@ -90,7 +90,7 @@ struct Outgoing {
 }
 
 #[derive(Clone)]
-pub(super) struct Sender {
+pub struct Sender {
     queue: mpsc::UnboundedSender<Queued>,
     windows: Arc<Mutex<Windows>>,
     control: Arc<Semaphore>,
@@ -261,7 +261,7 @@ impl Writer {
     }
 }
 
-pub(super) struct Receiver {
+pub struct Receiver {
     socket: tokio::net::unix::OwnedReadHalf,
     partial: HashMap<Port, Vec<u8>>,
     windows: Arc<Mutex<Windows>>,
@@ -329,9 +329,7 @@ impl Receiver {
     }
 }
 
-pub(super) fn connect(
-    socket: UnixStream,
-) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
+pub fn connect(socket: UnixStream) -> (Sender, Receiver, tokio::task::JoinHandle<io::Result<()>>) {
     let (reader, writer) = socket.into_split();
     let (queue, incoming) = mpsc::unbounded_channel();
     let control = Arc::new(Semaphore::new(8));

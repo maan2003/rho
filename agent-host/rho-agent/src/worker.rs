@@ -4,8 +4,8 @@ mod ipc;
 mod policy;
 mod process;
 mod remote;
-mod transport;
 pub use process::Process;
+use rho_workset::transport;
 mod workset;
 pub use workset::{
     Action as WorksetAction, Attach as WorksetAttach, Client as WorksetClient,
