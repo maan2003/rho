@@ -42,8 +42,8 @@ pub use rho_workset::{shell, terminal};
 mod title;
 mod worker;
 pub use worker::{
-    Process as WorksetProcess, WorksetAction, WorksetAttach, WorksetClient, WorksetReply,
-    worker_main,
+    ChatRemote, ChatWorkerEvent, Process as WorksetProcess, WorksetAction, WorksetAttach,
+    WorksetClient, WorksetReply, worker_main,
 };
 
 /// Model-facing prompt and top-level tools for a newly created role. Dynamic

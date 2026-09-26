@@ -1,35 +1,35 @@
-//! Agent2 chat service. Its per-agent host log is primary; sessions receive
-//! only its chat projection. Notebook reports never cross this protocol.
+//! Chat service: host-owned metadata and append-only logs, worker-owned
+//! notebooks. Sessions receive only the chat projection, never cells or tool
+//! output.
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use camino::Utf8PathBuf;
-use rho_agent_types::AgentIdDomain;
-use rho_agent2::agent::{Agent, AgentHandle, Config, Inbound, Trace};
+use rho_agent::pool::AgentPool;
+use rho_agent::{ChatRemote, ChatWorkerEvent};
+use rho_agent_types::{AgentIdDomain, AgentRole, Place, WorksetMode, WorkspaceInfo};
 use rho_agent2::chat as chat2;
 use rho_agent2::log::{self, Block, Entry, Notice};
 use rho_agents2_client::protocol as wire;
-use rho_inference2::Model;
-use rho_inference2::openai::{Effort as ModelEffort, OpenAi};
+use rho_fs_view::Workset;
 use rho_rpc::protocol::{Answer, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::broadcast;
 
-use crate::Services;
+use crate::{Services, expand_home, visible_path};
 
-#[derive(Serialize, Deserialize)]
+#[derive(senax_encoder::Pack, senax_encoder::Unpack)]
 struct Stored {
-    workdir: String,
+    place: Place,
+    role: AgentRole,
     model: String,
     effort: String,
 }
 struct Record {
     info: wire::AgentInfo,
-    handle: AgentHandle,
+    remote: Arc<ChatRemote>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,18 +40,18 @@ struct Identity {
 
 pub(crate) struct Agents2 {
     root: Utf8PathBuf,
+    pool: Arc<AgentPool>,
     identity: Mutex<Identity>,
     records: Mutex<HashMap<wire::AgentId, Record>>,
     changes: broadcast::Sender<wire::ServerFrame>,
-    make_model: Arc<dyn Fn(&wire::AgentInfo) -> Arc<Model> + Send + Sync>,
 }
 
 impl Agents2 {
-    fn open(
+    async fn open(
         root: Utf8PathBuf,
+        pool: Arc<AgentPool>,
         machine_seed: u64,
         initial_counter: u64,
-        make_model: impl Fn(&wire::AgentInfo) -> Arc<Model> + Send + Sync + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&root)?;
         let identity_path = root.join("identity.json");
@@ -69,10 +69,10 @@ impl Agents2 {
         );
         let manager = Arc::new(Self {
             root,
+            pool,
             identity: Mutex::new(identity),
             records: Mutex::new(HashMap::new()),
             changes: broadcast::channel(1024).0,
-            make_model: Arc::new(make_model),
         });
         for entry in std::fs::read_dir(&manager.root)? {
             let entry = entry?;
@@ -86,131 +86,157 @@ impl Agents2 {
                     continue;
                 }
             };
-            let metadata = entry.path().join("config.json");
+            let metadata = entry.path().join("config.senax");
             let stored: Stored = match std::fs::read(&metadata)
                 .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .and_then(|bytes| senax_encoder::unpack(&mut bytes.as_slice()).ok())
             {
                 Some(stored) => stored,
                 None => {
-                    tracing::warn!(path = %metadata.display(), "skipping agent2 without valid metadata");
+                    tracing::warn!(path = %metadata.display(), "skipping agent without valid metadata");
                     continue;
                 }
             };
             let effort: wire::Effort = stored.effort.parse().map_err(anyhow::Error::msg)?;
-            let log = log::Log::open(&manager.log_path(&id))?;
-            let archived = log
-                .entries()
-                .iter()
-                .rev()
-                .find_map(|entry| match entry {
-                    Entry::Notice {
-                        notice: Notice::Archived,
-                        ..
-                    } => Some(true),
-                    Entry::Notice {
-                        notice: Notice::FreshNotebook,
-                        ..
-                    } => Some(false),
-                    _ => None,
-                })
-                .unwrap_or(false);
-            let info = wire::AgentInfo {
+            let workset = manager
+                .pool
+                .worksets()
+                .open_workset(&stored.place.workset)
+                .await?;
+            let log_path = Self::log_path(&workset, &id)?;
+            let info = Self::info_from_log(
                 id,
-                workdir: stored.workdir.into(),
-                model: stored.model,
+                stored.place,
+                stored.role,
+                stored.model,
                 effort,
-                archived,
-                status: None,
-                chat: Vec::new(),
-            };
-            manager.start(info, log)?;
+                log::Log::open(log_path.as_std_path())?,
+            );
+            manager.start(info).await?;
         }
         Ok(manager)
     }
 
-    pub(crate) fn live(
+    pub(crate) async fn live(
         root: Utf8PathBuf,
-        base_url: String,
+        pool: Arc<AgentPool>,
         machine_seed: u64,
         initial_counter: u64,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::open(root, machine_seed, initial_counter, move |info| {
-            Arc::new(Model::OpenAi(OpenAi {
-                base_url: base_url.clone(),
-                model: info.model.clone(),
-                effort: match info.effort {
-                    wire::Effort::Low => ModelEffort::Low,
-                    wire::Effort::Medium => ModelEffort::Medium,
-                    wire::Effort::High => ModelEffort::High,
-                    wire::Effort::XHigh => ModelEffort::XHigh,
-                },
-                auth: "default".into(),
-            }))
-        })
+        Self::open(root, pool, machine_seed, initial_counter).await
     }
 
-    fn log_path(&self, id: &wire::AgentId) -> PathBuf {
-        self.root.join(id.encoded()).join("log").into_std_path_buf()
+    fn log_path(workset: &Workset, id: &wire::AgentId) -> anyhow::Result<Utf8PathBuf> {
+        let path = workset
+            .state_dir()?
+            .join("agents")
+            .join(id.encoded())
+            .join("log");
+        std::fs::create_dir_all(path.parent().expect("agent log has a directory"))?;
+        Ok(path)
     }
 
-    fn start(self: &Arc<Self>, mut info: wire::AgentInfo, log: log::Log) -> anyhow::Result<()> {
-        let id = info.id.clone();
-        let shell = rho_tool_shell::ShellTools::in_directory(
-            Duration::from_secs(20),
-            info.workdir.clone(),
-            rho_fs_view::PathOverrides::default(),
-        );
-        let (agent, handle) = Agent::new(Config {
-            id,
-            log,
-            model: (self.make_model)(&info),
-            shell,
-            instructions: rho_agent2::prompt::INSTRUCTIONS.into(),
-        })?;
-        info.chat = agent.chat().into_iter().filter_map(convert_chat).collect();
-        info.status = info.chat.iter().rev().find_map(|event| match &event.kind {
+    fn info_from_log(
+        id: wire::AgentId,
+        place: Place,
+        role: AgentRole,
+        model: String,
+        effort: wire::Effort,
+        log: log::Log,
+    ) -> wire::AgentInfo {
+        let archived = log
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::Notice {
+                    notice: Notice::Archived,
+                    ..
+                } => Some(true),
+                Entry::Notice {
+                    notice: Notice::FreshNotebook,
+                    ..
+                } => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let chat: Vec<_> = chat2::chat(&id, log.entries())
+            .into_iter()
+            .filter_map(convert_chat)
+            .collect();
+        let status = chat.iter().rev().find_map(|event| match &event.kind {
             wire::ChatKind::Status(text) => Some(text.clone()),
             _ => None,
         });
-        let mut chat = handle.chat();
-        let mut trace = handle.trace();
-        self.records
-            .lock()
-            .unwrap()
-            .insert(id.clone(), Record { info, handle });
+        wire::AgentInfo {
+            id,
+            place,
+            role,
+            model,
+            effort,
+            archived,
+            status,
+            chat,
+        }
+    }
+
+    async fn start(self: &Arc<Self>, info: wire::AgentInfo) -> anyhow::Result<()> {
+        let id = info.id;
         let weak = Arc::downgrade(self);
-        let observer_id = id.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    received = chat.recv() => match received {
-                        Ok(event) => {
-                            if let Some(manager) = weak.upgrade() && let Some(event) = convert_chat(event) {
-                                manager.on_chat(&observer_id, event);
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            tracing::warn!(agent_id = %observer_id.encoded(), "agent2 chat observer lagged; reread on host restart");
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    },
-                    received = trace.recv() => match received {
-                        Ok(Trace::ArchiveState { archived }) => {
-                            if let Some(manager) = weak.upgrade() { manager.on_archive(&observer_id, archived); }
-                        }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
+        // The worker can publish before its startup acknowledgement. Queue
+        // those events until the record exists, then replay under this lock:
+        // later events cannot overtake earlier sequence numbers.
+        let pending: Arc<Mutex<Option<Vec<ChatWorkerEvent>>>> =
+            Arc::new(Mutex::new(Some(Vec::new())));
+        let observer_pending = pending.clone();
+        let observer = Arc::new(move |event| {
+            let mut queue = observer_pending.lock().unwrap();
+            if let Some(queue) = queue.as_mut() {
+                queue.push(event);
+            } else {
+                drop(queue);
+                if let Some(manager) = weak.upgrade() {
+                    manager.on_worker_event(id, event);
                 }
             }
         });
-        tokio::spawn(async move {
-            if let Err(error) = agent.run().await {
-                tracing::error!(agent_id = %id.encoded(), %error, "agent2 runtime exited");
-            }
-        });
+        // The process enters the workset namespace before its notebook starts.
+        let remote = ChatRemote::start(
+            &self.pool,
+            &info.place,
+            id,
+            info.model.clone(),
+            info.effort.to_string(),
+            observer,
+        )
+        .await?;
+        self.records.lock().unwrap().insert(
+            id,
+            Record {
+                info,
+                remote: Arc::new(remote),
+            },
+        );
+        let mut guard = pending.lock().unwrap();
+        for event in guard.take().expect("pending until agent is registered") {
+            self.on_worker_event(id, event);
+        }
         Ok(())
+    }
+
+    fn on_worker_event(&self, id: wire::AgentId, event: ChatWorkerEvent) {
+        match event {
+            ChatWorkerEvent::Chat(event) => {
+                if let Some(event) = convert_chat(event) {
+                    self.on_chat(&id, event);
+                }
+            }
+            ChatWorkerEvent::Archived(archived) => self.on_archive(&id, archived),
+            ChatWorkerEvent::Stopped(Some(error)) => {
+                tracing::error!(agent_id = %id.encoded(), %error, "agent runtime stopped");
+            }
+            ChatWorkerEvent::Stopped(None) => {}
+        }
     }
 
     fn on_chat(&self, id: &wire::AgentId, event: wire::ChatEvent) {
@@ -233,10 +259,9 @@ impl Agents2 {
             record.info.chat.push(event.clone());
         }
         let _ = self.changes.send(wire::ServerFrame::Chat {
-            agent_id: id.clone(),
+            agent_id: *id,
             event: event.clone(),
         });
-        // The sender's logged mail is delivered to the recipient's own log.
         if let wire::ChatKind::Message {
             from: wire::Party::Agent(sender),
             to: wire::Party::Agent(recipient),
@@ -246,17 +271,14 @@ impl Agents2 {
             && sender == *id
             && recipient != *id
         {
-            let recipient_handle = self
+            let remote = self
                 .records
                 .lock()
                 .unwrap()
                 .get(&recipient)
-                .map(|record| record.handle.clone());
-            if let Some(handle) = recipient_handle {
-                let _ = handle.send(Inbound {
-                    from: log::Party::Agent(sender),
-                    body: vec![Block::Text(text)],
-                });
+                .map(|record| record.remote.clone());
+            if let Some(remote) = remote {
+                let _ = remote.send(log::Party::Agent(sender), text);
             }
         }
     }
@@ -265,7 +287,7 @@ impl Agents2 {
         if let Some(record) = self.records.lock().unwrap().get_mut(id) {
             record.info.archived = archived;
             let _ = self.changes.send(wire::ServerFrame::Archived {
-                agent_id: id.clone(),
+                agent_id: *id,
                 archived,
             });
         }
@@ -286,12 +308,46 @@ impl Agents2 {
         self.changes.subscribe()
     }
 
-    fn create(self: &Arc<Self>, call: wire::CreateAgent) -> anyhow::Result<wire::AgentId> {
-        let workdir = std::fs::canonicalize(&call.workdir)
-            .with_context(|| format!("workdir {}", call.workdir))?;
-        anyhow::ensure!(workdir.is_dir(), "agent2 workdir must be a directory");
-        let workdir = Utf8PathBuf::try_from(workdir).context("workdir is not UTF-8")?;
+    async fn resolve_place(
+        &self,
+        start: wire::StartMode,
+        mode: WorksetMode,
+    ) -> anyhow::Result<Place> {
+        match start {
+            wire::StartMode::NewOn { repo, revset } => {
+                let origin = expand_home(&repo).unwrap_or(repo);
+                let name = rho_fs_view::repo_name(origin.as_str())
+                    .with_context(|| format!("no repository name in {origin}"))?;
+                let workset = self.pool.worksets().create().await?;
+                let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
+                workset.checkout(&checkout, &revset).await?;
+                Ok(Place {
+                    workset: workset.id().to_owned(),
+                    cwd: visible_path(&workset, &checkout)?,
+                    mode,
+                    origin: Some(origin),
+                })
+            }
+            wire::StartMode::Join(wire::JoinTarget::Workspace(WorkspaceInfo::Workset(
+                mut place,
+            ))) => {
+                place.mode = mode;
+                let workset = self.pool.worksets().open_workset(&place.workset).await?;
+                anyhow::ensure!(
+                    workset.host_path(&place.cwd)?.is_dir(),
+                    "workset working directory is missing"
+                );
+                Ok(place)
+            }
+            wire::StartMode::Join(_) => anyhow::bail!(
+                "agents no longer work in the user's own checkout: start on the repository's URL or path instead"
+            ),
+        }
+    }
+
+    async fn create(self: &Arc<Self>, call: wire::CreateAgent) -> anyhow::Result<wire::AgentId> {
         anyhow::ensure!(!call.model.trim().is_empty(), "model is empty");
+        let place = self.resolve_place(call.start, call.mode).await?;
         let id = {
             let mut identity = self.identity.lock().unwrap();
             let id = wire::AgentId::from_counter(
@@ -309,21 +365,23 @@ impl Agents2 {
         let dir = self.root.join(id.encoded());
         std::fs::create_dir(&dir)?;
         let stored = Stored {
-            workdir: workdir.to_string(),
+            place: place.clone(),
+            role: call.role,
             model: call.model.clone(),
             effort: call.effort.to_string(),
         };
-        std::fs::write(dir.join("config.json"), serde_json::to_vec(&stored)?)?;
-        let info = wire::AgentInfo {
-            id: id.clone(),
-            workdir,
-            model: call.model,
-            effort: call.effort,
-            archived: false,
-            status: None,
-            chat: Vec::new(),
-        };
-        self.start(info, log::Log::open(&self.log_path(&id))?)?;
+        std::fs::write(dir.join("config.senax"), senax_encoder::pack(&stored)?)?;
+        let workset = self.pool.worksets().open_workset(&place.workset).await?;
+        let log_path = Self::log_path(&workset, &id)?;
+        let info = Self::info_from_log(
+            id,
+            place,
+            call.role,
+            call.model,
+            call.effort,
+            log::Log::open(log_path.as_std_path())?,
+        );
+        self.start(info).await?;
         let _ = self.changes.send(wire::ServerFrame::Created {
             agent: self
                 .records
@@ -335,38 +393,31 @@ impl Agents2 {
                 .clone(),
         });
         if let Some(text) = call.initial_message {
-            self.send(wire::SendMessage {
-                agent_id: id.clone(),
-                text,
-            })?;
+            self.send(wire::SendMessage { agent_id: id, text })?;
         }
         Ok(id)
     }
 
     fn send(&self, call: wire::SendMessage) -> anyhow::Result<()> {
         anyhow::ensure!(!call.text.trim().is_empty(), "message is empty");
-        let handle = self
+        let remote = self
             .records
             .lock()
             .unwrap()
             .get(&call.agent_id)
-            .map(|record| record.handle.clone())
-            .ok_or_else(|| anyhow!("agent2 {} not found", call.agent_id.encoded()))?;
-        handle.send(Inbound {
-            from: log::Party::Human,
-            body: vec![Block::Text(call.text)],
-        })
+            .map(|record| record.remote.clone())
+            .ok_or_else(|| anyhow!("agent {} not found", call.agent_id.encoded()))?;
+        remote.send(log::Party::Human, call.text)
     }
     fn archive(&self, call: wire::ArchiveAgent) -> anyhow::Result<()> {
-        let handle = self
+        let remote = self
             .records
             .lock()
             .unwrap()
             .get(&call.agent_id)
-            .map(|record| record.handle.clone())
-            .ok_or_else(|| anyhow!("agent2 {} not found", call.agent_id.encoded()))?;
-        handle.archive();
-        Ok(())
+            .map(|record| record.remote.clone())
+            .ok_or_else(|| anyhow!("agent {} not found", call.agent_id.encoded()))?;
+        remote.archive()
     }
 }
 
@@ -499,7 +550,7 @@ where
         }
         wire::Open::Request(request) => match request {
             wire::Request::CreateAgent(call) => {
-                respond(&mut writer, call, |call| async { manager.create(call) }).await
+                respond(&mut writer, call, |call| manager.create(call)).await
             }
             wire::Request::SendMessage(call) => {
                 respond(&mut writer, call, |call| async { manager.send(call) }).await
@@ -531,171 +582,243 @@ where
 
 #[cfg(test)]
 mod tests {
-    use rho_inference2::scripted::Scripted;
+    use rho_db::RhoDb;
+    use rho_inference::Inference;
 
     use super::*;
 
-    async fn until(mut good: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(12), async {
-            while !good() {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+    async fn test_manager(root: &std::path::Path) -> Arc<Agents2> {
+        let worker = std::env::current_exe()
+            .unwrap()
+            .ancestors()
+            .map(|path| path.join("rho-agent-worker"))
+            .chain(std::iter::once(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/debug/rho-agent-worker"),
+            ))
+            .find(|path| path.is_file())
+            .expect("build rho-agent-worker before workset test");
+        let bin = worker.parent().unwrap();
+        let mut environment = std::env::vars_os()
+            .filter(|(name, _)| name != "PATH")
+            .collect::<Vec<_>>();
+        environment.push((
+            "PATH".into(),
+            std::env::join_paths(
+                std::iter::once(bin.to_owned())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        ));
+        let worksets = rho_fs_view::Worksets::open(
+            root.join("worksets-state"),
+            rho_fs_view::UserEnvironment::new(environment),
+            Default::default(),
+            rho_fs_view::StoreService::None,
+        )
+        .await
+        .unwrap();
+        let db = RhoDb::open(root.join("agent.redb"));
+        let inference = Inference::new_with_config(
+            db.clone(),
+            rho_inference::InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
+        )
+        .await
+        .unwrap();
+        let pool = AgentPool::new(
+            db,
+            inference,
+            worksets,
+            rho_claude::accounts::ClaudePaths::at(
+                Utf8PathBuf::try_from(root.join("claude")).unwrap(),
+            ),
+        )
+        .await;
+        Agents2::open(
+            Utf8PathBuf::try_from(root.join("agents-state")).unwrap(),
+            pool,
+            13,
+            0,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_on_checkout_and_join_share_worker_and_persist_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("source");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repo.join("selected"), "old").unwrap();
+        git(&["add", "selected"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--quiet",
+            "-m",
+            "old",
+        ]);
+        std::fs::write(repo.join("selected"), "new").unwrap();
+        git(&["add", "selected"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--quiet",
+            "-m",
+            "new",
+        ]);
+        let manager = test_manager(dir.path()).await;
+        let role = AgentRole::default();
+        let origin = Utf8PathBuf::try_from(repo).unwrap();
+        let first = manager
+            .create(wire::CreateAgent {
+                start: wire::StartMode::NewOn {
+                    repo: origin.clone(),
+                    revset: "HEAD~1".into(),
+                },
+                mode: WorksetMode::View,
+                role,
+                model: "gpt-6-sol".into(),
+                effort: wire::Effort::Medium,
+                initial_message: None,
+            })
+            .await
+            .unwrap();
+        let place = manager
+            .snapshot()
+            .into_iter()
+            .find(|info| info.id == first)
+            .unwrap()
+            .place;
+        assert_eq!(place.cwd, Utf8PathBuf::from("/src/source"));
+        assert_eq!(place.origin.as_ref(), Some(&origin));
+        let workset = manager
+            .pool
+            .worksets()
+            .open_workset(&place.workset)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workset.host_path(&place.cwd).unwrap().join("selected"))
+                .unwrap(),
+            "old"
+        );
+        let second = manager
+            .create(wire::CreateAgent {
+                start: wire::StartMode::Join(wire::JoinTarget::Workspace(WorkspaceInfo::Workset(
+                    place.clone(),
+                ))),
+                mode: WorksetMode::View,
+                role,
+                model: "gpt-6-sol".into(),
+                effort: wire::Effort::High,
+                initial_message: None,
+            })
+            .await
+            .unwrap();
+        let joined = manager
+            .snapshot()
+            .into_iter()
+            .find(|info| info.id == second)
+            .unwrap();
+        assert_eq!(joined.place, place);
+        assert_eq!(joined.role, role);
+        manager
+            .archive(wire::ArchiveAgent { agent_id: second })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager
+                .snapshot()
+                .into_iter()
+                .find(|info| info.id == second)
+                .unwrap()
+                .archived
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("agent2 update arrived");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn chat_archive_revival_and_host_restart_use_the_persistent_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
-        let script = Arc::new(Scripted::new());
-        script
-            .then("human.status('ready')\nhuman.send('hello')\nawait human.reply()")
-            .then("human.send('fresh')\nawait human.reply()");
-        let make_model = {
-            let script = script.clone();
-            move |_: &wire::AgentInfo| Arc::new(Model::Scripted(script.clone()))
-        };
-        let manager = Agents2::open(root.clone(), 0, 0, make_model).unwrap();
-        let id = manager
-            .create(wire::CreateAgent {
-                workdir,
-                model: "scripted".into(),
-                effort: wire::Effort::High,
-                initial_message: Some("start".into()),
-            })
-            .unwrap();
-        until(|| {
-            manager.snapshot()[0].chat.iter().any(|event| {
-                matches!(&event.kind,
-            wire::ChatKind::Message { text, from: wire::Party::Agent(_), .. } if text == "hello")
-            })
-        })
-        .await;
-        assert_eq!(manager.snapshot()[0].status.as_deref(), Some("ready"));
-        manager
-            .archive(wire::ArchiveAgent {
-                agent_id: id.clone(),
-            })
-            .unwrap();
-        until(|| manager.snapshot()[0].archived).await;
-        manager
-            .send(wire::SendMessage {
-                agent_id: id.clone(),
-                text: "return".into(),
-            })
-            .unwrap();
-        until(|| {
-            manager.snapshot()[0].chat.iter().any(|event| {
-                matches!(&event.kind,
-            wire::ChatKind::Message { text, from: wire::Party::Agent(_), .. } if text == "fresh")
-            })
-        })
-        .await;
-        assert!(!manager.snapshot()[0].archived);
-        let before = manager.snapshot()[0].chat.clone();
-        drop(manager);
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let restart_script = Arc::new(Scripted::new());
-        restart_script.then("human.send('restarted')\nawait human.reply()");
-        let reloaded = Agents2::open(root, 0, 0, move |_: &wire::AgentInfo| {
-            Arc::new(Model::Scripted(restart_script.clone()))
-        })
         .unwrap();
-        assert_eq!(reloaded.snapshot()[0].chat, before);
-        until(|| reloaded.snapshot()[0].chat.iter().any(|event| matches!(&event.kind,
-            wire::ChatKind::Message { text, from: wire::Party::Agent(_), .. } if text == "restarted"))).await;
-        assert_eq!(reloaded.snapshot()[0].id, id);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ids_continue_after_restart_in_the_host_machine_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
-        let model = Arc::new(Scripted::new());
-        let manager = Agents2::open(root.clone(), 77, 19, {
-            let model = model.clone();
-            move |_| Arc::new(Model::Scripted(model.clone()))
-        })
-        .unwrap();
-        let new_agent = || wire::CreateAgent {
-            workdir: workdir.clone(),
-            model: "scripted".into(),
-            effort: wire::Effort::Medium,
-            initial_message: None,
-        };
-        let first = manager.create(new_agent()).unwrap();
-        assert_eq!(first.to_counter(&AgentIdDomain(77)), 20);
-        drop(manager);
-        let restarted = Agents2::open(root.clone(), 77, 19, move |_| {
-            Arc::new(Model::Scripted(model.clone()))
-        })
-        .unwrap();
-        let second = restarted.create(new_agent()).unwrap();
-        assert_eq!(second.to_counter(&AgentIdDomain(77)), 21);
-        assert_ne!(second, first);
-        assert!(
-            Agents2::open(root, 78, 19, |_| Arc::new(Model::Scripted(Arc::new(
-                Scripted::new()
-            ))))
-            .is_err()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn agent_mail_routes_into_recipient_chat_and_model() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
-        let script = Arc::new(Scripted::new());
-        let manager = Agents2::open(root, 0, 0, {
-            let script = script.clone();
-            move |_: &wire::AgentInfo| Arc::new(Model::Scripted(script.clone()))
-        })
-        .unwrap();
-        let recipient = manager
-            .create(wire::CreateAgent {
-                workdir: workdir.clone(),
-                model: "scripted".into(),
-                effort: wire::Effort::Low,
-                initial_message: None,
-            })
+        let first_remote = manager
+            .records
+            .lock()
+            .unwrap()
+            .get(&first)
+            .unwrap()
+            .remote
+            .clone();
+        first_remote
+            .send(log::Party::Agent(second), "mail inside workset".into())
             .unwrap();
-        let sender = manager
-            .create(wire::CreateAgent {
-                workdir,
-                model: "scripted".into(),
-                effort: wire::Effort::High,
-                initial_message: None,
-            })
-            .unwrap();
-        script
-            .then(&format!(
-                "agents.send('{}', 'ping')\nawait human.reply()",
-                recipient.encoded()
-            ))
-            .then("human.send('mail delivered')\nawait human.reply()");
-        manager
-            .send(wire::SendMessage {
-                agent_id: sender,
-                text: "send mail".into(),
-            })
-            .unwrap();
-        until(|| {
-            manager
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !manager
                 .snapshot()
+                .into_iter()
+                .find(|info| info.id == first)
+                .unwrap()
+                .chat
                 .iter()
-                .find(|agent| agent.id == recipient)
-                .is_some_and(|agent| {
-                    agent.chat.iter().any(|event| {
-                        matches!(&event.kind,
-                wire::ChatKind::Message { text, from: wire::Party::Agent(_), .. } if text == "ping")
-                    })
+                .any(|event| {
+                    matches!(&event.kind, wire::ChatKind::Message {
+                    from: wire::Party::Agent(sender),
+                    to: wire::Party::Agent(recipient), text, ..
+                } if *sender == second && *recipient == first && text == "mail inside workset")
                 })
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         })
-        .await;
+        .await
+        .unwrap();
+        let remotes: Vec<_> = manager
+            .records
+            .lock()
+            .unwrap()
+            .values()
+            .map(|record| record.remote.clone())
+            .collect();
+        for remote in remotes {
+            remote.shutdown().await;
+        }
+        let pool = manager.pool.clone();
+        drop(manager);
+        let reloaded = Agents2::open(
+            Utf8PathBuf::try_from(dir.path().join("agents-state")).unwrap(),
+            pool,
+            13,
+            0,
+        )
+        .await
+        .unwrap();
+        let revived = reloaded
+            .snapshot()
+            .into_iter()
+            .find(|info| info.id == second)
+            .unwrap();
+        assert_eq!(revived.place, place);
+        assert!(revived.archived);
+        assert!(reloaded.snapshot().into_iter().find(|info| info.id == first).unwrap().chat.iter().any(|event| {
+            matches!(&event.kind, wire::ChatKind::Message { text, .. } if text == "mail inside workset")
+        }));
     }
 }

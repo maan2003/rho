@@ -430,10 +430,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(db_path);
-    let agent2_base_url = args
-        .openai_base_url
-        .clone()
-        .unwrap_or_else(|| rho_inference2::openai::CHATGPT_BASE_URL.to_owned());
     let inference = match args.openai_base_url {
         Some(endpoint) => {
             Inference::new_with_config(
@@ -502,7 +498,6 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             platform_secrets,
             runtime.paths.octo_socket(),
             state_dir.join("agent2"),
-            agent2_base_url,
         )
         .await?,
     );
@@ -958,15 +953,15 @@ impl Services {
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
         agent2_dir: Utf8PathBuf,
-        agent2_base_url: String,
     ) -> anyhow::Result<Self> {
         let machine_seed = db.read().machine_seed();
         let agents2 = agents2::Agents2::live(
             agent2_dir,
-            agent2_base_url,
+            pool.clone(),
             db.read().machine_seed(),
             db.read().last_agent_counter(),
-        )?;
+        )
+        .await?;
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
