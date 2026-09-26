@@ -41,3 +41,5 @@ tracing = { workspace = true, optional = true }
 rho-desktop-client = { path = ".", features = ["client"] }
 
 rho-desktop-media = { workspace = true, features = ["encoder"] }
+
+tokio = { workspace = true, features = ["test-util"] }

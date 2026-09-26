@@ -151,6 +151,35 @@ fn decode_packets(
     Ok(())
 }
 
+// Measure payload delivery, not idle time between captures. The initial rate
+// matches the encoder's 2 Mbps target; complete keyframes calibrate it too.
+struct Delivery {
+    bytes_per_second: f64,
+}
+impl Default for Delivery {
+    fn default() -> Self {
+        Self { bytes_per_second: 250_000.0 }
+    }
+}
+impl Delivery {
+    fn budget(&self, bytes: u64, rtt: Duration) -> Duration {
+        Duration::from_secs_f64(bytes as f64 / self.bytes_per_second)
+            + (rtt * 4).max(Duration::from_millis(150))
+    }
+    fn observe(&mut self, bytes: usize, elapsed: Duration, rtt: Duration) {
+        // An already buffered frame says nothing about available bandwidth.
+        // Tiny deltas are usually application/packet timing, not a bandwidth
+        // sample; letting one loss-delayed delta set the rate would inflate
+        // the next large frame's deadline arbitrarily.
+        if elapsed < rtt.max(Duration::from_millis(1)) || bytes < 16 * 1024 {
+            return;
+        }
+        let rate = bytes as f64 / elapsed.as_secs_f64();
+        // React immediately to a slower path; approach increases gradually.
+        self.bytes_per_second = rate.min(self.bytes_per_second * 0.75 + rate * 0.25);
+    }
+}
+
 async fn receive_packets(
     origin: moq_net::origin::Producer,
     packets: mpsc::Sender<Encoded>,
@@ -158,7 +187,9 @@ async fn receive_packets(
     quality: watch::Sender<Option<Input>>,
     started: Instant,
     desktop_id: u64,
+    rtt: impl Fn() -> Duration,
 ) -> Result<()> {
+    let mut delivery = Delivery::default();
     let mut announced = origin.consume().announced();
     loop {
         let update = announced
@@ -183,9 +214,9 @@ async fn receive_packets(
         "desktop video subscribed"
     );
     let mut rate = 2_000_000u32;
-    let mut sample = Instant::now();
+    let mut sample = tokio::time::Instant::now();
     let mut baseline: Option<i128> = None;
-    let clock = Instant::now();
+    let clock = tokio::time::Instant::now();
     let mut first_packet = true;
 
     let mut next_group = subscription.next_group().await?;
@@ -211,19 +242,26 @@ async fn receive_packets(
                     return Err(moq_net::Error::Cancel);
                 }
                 let timestamp = frame.timestamp;
-                // Idle groups have nothing to catch up on. Only a started
-                // dependent frame has a delivery deadline; a large keyframe
-                // must be allowed to arrive even over a slow path.
+                // No deadline while waiting for a frame to be captured. Once
+                // its header arrives, allow serialization plus loss recovery.
+                // Newer groups can still preempt this read at any time.
+                let path_rtt = rtt();
+                let budget = delivery.budget(frame.size, path_rtt);
+                let started = tokio::time::Instant::now();
                 let payload = if keyframe {
                     frame.read_all().await?
                 } else {
-                    tokio::time::timeout(Duration::from_millis(150), frame.read_all())
+                    tokio::time::timeout(budget, frame.read_all())
                         .await
                         .map_err(|_| {
                             moq_net::Error::Stream(moq_net::StreamError::DeliveryTimeout)
                         })??
                 };
-                Ok::<_, moq_net::Error>(Some(moq_net::frame::Frame { timestamp, payload }))
+                delivery.observe(payload.len(), started.elapsed(), path_rtt);
+                Ok::<_, moq_net::Error>(Some((
+                    moq_net::frame::Frame { timestamp, payload },
+                    budget,
+                )))
             };
             tokio::pin!(read);
             let frame = tokio::select! {
@@ -241,7 +279,7 @@ async fn receive_packets(
                 frame = &mut read => frame,
             };
             match frame {
-                Ok(Some(frame)) => {
+                Ok(Some((frame, budget))) => {
                     if first_packet {
                         tracing::info!(
                             desktop_id,
@@ -262,7 +300,7 @@ async fn receive_packets(
                     *base = (*base).min(offset);
                     let lag = offset - *base;
                     if sample.elapsed() >= Duration::from_secs(1) {
-                        let congested = lag > 150_000;
+                        let congested = lag > budget.as_micros() as i128;
                         rate = if congested {
                             rate * 3 / 4
                         } else {
@@ -273,7 +311,7 @@ async fn receive_packets(
                             bitrate: rate,
                             keyframe: false,
                         }));
-                        sample = Instant::now();
+                        sample = tokio::time::Instant::now();
                     }
                     let id = FrameId {
                         group: sequence,
@@ -287,10 +325,10 @@ async fn receive_packets(
                         }
                         feedback.lag_us = lag as u64;
                     }
-                    // Do not reject the recovery keyframe for the very
-                    // backlog it was requested to fix.
-                    if (!first_in_group && lag > 150_000)
-                        || packets
+                    // A fully delivered frame is useful even after a slow
+                    // transfer. Age alone must not discard the final static
+                    // refinement; newer groups already supersede old work.
+                    if packets
                             .try_send(Encoded {
                                 id,
                                 payload: frame.payload,
@@ -412,7 +450,7 @@ async fn open_stream(
         elapsed_ms = started.elapsed().as_millis(),
         "desktop open acknowledged"
     );
-    subscribe(transport, stream, started, id).await
+    subscribe(transport, stream, started, id, connection).await
 }
 
 async fn subscribe(
@@ -420,6 +458,7 @@ async fn subscribe(
     stream: rho_rpc::Stream,
     started: Instant,
     desktop_id: u64,
+    connection: iroh::endpoint::Connection,
 ) -> Result<Viewer> {
     let (mut reader, mut writer) = stream.into_split();
     let origin = rho_desktop_media::media::origin();
@@ -446,6 +485,11 @@ async fn subscribe(
             quality,
             started,
             desktop_id,
+            || connection.paths().iter()
+                .filter(|path| path.is_selected())
+                .map(|path| path.rtt())
+                .max()
+                .unwrap_or(Duration::from_millis(100)),
         );
         let control = async {
             let mut ticks = tokio::time::interval(Duration::from_millis(100));
@@ -507,6 +551,101 @@ mod tests {
             group,
             timestamp_us,
         }
+    }
+
+    #[test]
+    fn delivery_budget_uses_size_rtt_and_unbuffered_goodput() {
+        let mut delivery = Delivery::default();
+        assert_eq!(delivery.budget(400_000, Duration::from_millis(200)), Duration::from_millis(2400));
+        assert_eq!(delivery.budget(100_000, Duration::from_millis(400)), Duration::from_secs(2));
+        delivery.observe(250_000, Duration::from_secs(2), Duration::from_millis(200));
+        assert_eq!(delivery.budget(400_000, Duration::from_millis(200)), Duration::from_secs(4));
+        delivery.observe(2_000_000, Duration::ZERO, Duration::from_millis(200));
+        delivery.observe(100, Duration::from_secs(2), Duration::from_millis(200));
+        assert_eq!(delivery.budget(400_000, Duration::from_millis(200)), Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_refinement_and_rtt_delayed_frame_arrive_before_stall_recovery() -> Result<()> {
+        let origin = rho_desktop_media::media::origin();
+        let broadcast = origin.create_broadcast("app")?;
+        broadcast.announce(Default::default())?;
+        let track = broadcast.create_track(
+            "video",
+            Some(moq_net::track::Info::default().with_timescale(moq_net::Timescale::MICRO)),
+        )?;
+        let receiving_origin = rho_desktop_media::media::origin();
+        let (sender, receiver) = tokio::io::duplex(64 * 1024);
+        let (_publisher, _subscriber) = tokio::try_join!(
+            rho_desktop_media::media::local_server(sender, &origin),
+            rho_desktop_media::media::local_client(receiver, receiving_origin.clone()),
+        )?;
+        let (packets, mut received) = mpsc::channel(2);
+        let (quality, quality_updates) = watch::channel(None);
+        let progress = Arc::new(Progress::default());
+        let rtt = Arc::new(AtomicU64::new(200));
+        let path = rtt.clone();
+        let receiving = tokio::spawn(receive_packets(
+            receiving_origin, packets, progress.clone(), quality, Instant::now(), 0,
+            move || Duration::from_millis(path.load(Ordering::Relaxed)),
+        ));
+        track.used().await?;
+        let mut group = track.append_group()?;
+        group.write_frame(
+            moq_net::Timestamp::from_micros(10)?,
+            bytes::Bytes::from_static(b"key"),
+        )?;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), received.recv()).await?.unwrap().payload.as_ref(), b"key");
+        // A 400 KB refinement at 2 Mbps takes 1.6s, even without loss.
+        let mut refinement = group.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(20)?,
+            size: 400_000,
+        })?;
+        tokio::task::yield_now().await;
+        for _ in 0..16 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            refinement.write(bytes::Bytes::from(vec![37; 25_000]))?;
+        }
+        refinement.finish()?;
+        let packet = tokio::time::timeout(Duration::from_secs(3), received.recv()).await?.unwrap();
+        assert_eq!(packet.id, id(group.sequence, 20));
+        assert_eq!(packet.payload.as_ref(), vec![37; 400_000]);
+        // An expected long serialization is not itself congestion.
+        assert_eq!(*quality_updates.borrow(), Some(Input::Quality {
+            bitrate: 2_100_000, keyframe: false,
+        }));
+        assert!(!progress.feedback.lock().unwrap().recover);
+
+        // A changed route has a longer RTT. A loss-delayed tiny frame is
+        // allowed to arrive; it must not poison the bandwidth estimate.
+        rtt.store(400, Ordering::Relaxed);
+        let mut delayed = group.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(30)?,
+            size: 100,
+        })?;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        delayed.write(bytes::Bytes::from(vec![91; 100]))?;
+        delayed.finish()?;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), received.recv()).await?.unwrap().payload.as_ref(), vec![91; 100]);
+
+        // After completion, a static screen never times out.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!progress.feedback.lock().unwrap().recover);
+        // But a started frame that stops delivering still recovers, using
+        // this path's current 4-RTT allowance rather than the old 150ms.
+        let _stalled = group.create_frame(moq_net::frame::Info {
+            timestamp: moq_net::Timestamp::from_micros(40)?,
+            size: 100,
+        })?;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1550)).await;
+        assert!(!progress.feedback.lock().unwrap().recover);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert!(progress.feedback.lock().unwrap().recover);
+        receiving.abort();
+        Ok(())
     }
 
     #[test]
@@ -584,6 +723,7 @@ mod tests {
                 quality,
                 Instant::now(),
                 0,
+                || Duration::from_millis(10),
             ));
             track.used().await?;
             let mut old = track.append_group()?;
@@ -648,6 +788,7 @@ mod tests {
                 quality,
                 Instant::now(),
                 0,
+                || Duration::from_millis(10),
             ));
             track.used().await?;
             let mut old = track.append_group()?;

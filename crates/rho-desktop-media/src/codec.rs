@@ -96,7 +96,9 @@ impl Encoder {
     pub fn quality(&mut self, bitrate: usize, settled: bool) -> Result<()> {
         let mut params = vpx::ReconfigureParams::default();
         params.target_bitrate = Some(bitrate);
-        params.max_quantizer = Some(if settled { 12 } else { 40 });
+        // Text must converge to a clean image after motion stops. A merely
+        // lower lossy quantizer leaves ringing in the final static frame.
+        params.max_quantizer = Some(if settled { 0 } else { 40 });
         self.inner.reconfigure(&params)?;
         Ok(())
     }
@@ -221,6 +223,39 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn settled_frame_repairs_lossy_text_edges_without_a_keyframe() -> Result<()> {
+        let (w, h) = (257, 129);
+        let mut pixels = Vec::new();
+        // Narrow, asymmetric strokes with antialiased gray edges. Grayscale
+        // has no chroma detail to lose. Allow only the integer color
+        // conversion's rounding error, not lossy compression residue.
+        for y in 0..h {
+            for x in 0..w {
+                let gray = [19, 57, 113, 201, 239][(x / 3 + y / 5) % 5];
+                pixels.extend_from_slice(&[gray, gray, gray, 255]);
+            }
+        }
+        let mut encoder = Encoder::new(w, h, 128_000)?;
+        let mut decoder = Decoder::new()?;
+        for round in 0..2 {
+            encoder.quality(128_000, false)?;
+            let motion = encoder.encode(&pixels, round == 0)?.remove(0);
+            decoder.decode(&motion.data)?.unwrap();
+            encoder.quality(128_000, true)?;
+            let refined = encoder.encode(&pixels, false)?.remove(0);
+            assert!(!refined.keyframe);
+            let image = decoder.decode(&refined.data)?.unwrap();
+            let max_error = image.bgra.iter().zip(&pixels)
+                .map(|(got, want)| (*got as i16 - *want as i16).abs())
+                .max().unwrap();
+            assert!(max_error <= 2, "round {round}: maximum channel error {max_error}");
+            // Exercise the transition back out of zero-quantizer refinement.
+            pixels[..4].copy_from_slice(&[87, 87, 87, 255]);
+        }
+        Ok(())
+    }
+
     #[test]
     fn retained_planes_survive_reuse_keyframes_and_decoder_drop() -> Result<()> {
         let (width, height) = (65, 47);
