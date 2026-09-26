@@ -9,7 +9,7 @@ use rho_agent::db::{
     QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent_types::AgentId;
-use rho_agents_client::protocol::{
+use rho_agents2_client::protocol::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, QuotaPoint,
     QuotaSeries, QuotaSummary,
 };
@@ -215,7 +215,7 @@ pub(crate) fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSerie
             points: history
                 .points
                 .into_iter()
-                .map(|point| rho_agents_client::protocol::QuotaPoint {
+                .map(|point| QuotaPoint {
                     observed_at_ms: point.observed_at.0,
                     remaining_percent: point.remaining_percent,
                     reset_at_unix: point.reset_at_unix,
@@ -314,11 +314,11 @@ pub(crate) fn global_usage(db: &RhoDb, since_ms: u64) -> Vec<AgentUsageSeries> {
 /// first window is whole, and no further back than the chart ever shows.
 pub(crate) fn agent_costs(db: &RhoDb, since_ms: u64) -> anyhow::Result<Vec<AgentCostSeries>> {
     const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
-    const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_agents_client::protocol::AGENT_COST_WINDOW_DAYS;
+    const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_agents2_client::protocol::AGENT_COST_WINDOW_DAYS;
 
     let now = rho_agent_types::UnixMs::now().0;
     let earliest = since_ms
-        .saturating_sub(rho_agents_client::protocol::AGENT_COST_WINDOW_DAYS * DAY_MS)
+        .saturating_sub(rho_agents2_client::protocol::AGENT_COST_WINDOW_DAYS * DAY_MS)
         .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
     hourly_agent_cost_series(db, rho_agent_types::UnixMs(earliest))
 }

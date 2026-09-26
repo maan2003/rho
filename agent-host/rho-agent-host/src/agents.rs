@@ -10,11 +10,13 @@ use std::sync::atomic::Ordering;
 use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 use rho_agent_types::{AgentId, MessageDelivery, Seq, WorkspaceInfo};
+use rho_agents_client::protocol as legacy;
 use rho_agents_client::protocol::{
     AgentCommand, AgentCostDistribution, ClaudeAccountList, ClaudeAccounts, ClientFrame,
     GlobalUsage, NewAgent, Open, QuotaHistory, QuotaUsage, RecordVisualization, Request,
     ServerFrame, SetAuthAccountEnabled, SetClaudeAccount, Visualization, VisualizationContent,
 };
+use rho_agents2_client::protocol as agents2;
 use rho_db::RhoDb;
 use rho_rpc::protocol::{Answer, Call, Opened, write_frame};
 use rho_shell_view::protocol as shell;
@@ -230,7 +232,10 @@ where
                         }
                     }
                 }
-                let summaries = usage::quota_summaries(&services.db, &services.inference);
+                let summaries = usage::quota_summaries(&services.db, &services.inference)
+                    .into_iter()
+                    .map(legacy_quota_summary)
+                    .collect();
                 if outgoing_tx
                     .send(ServerFrame::QuotaUsage { summaries })
                     .is_err()
@@ -502,20 +507,29 @@ where
         }
         Request::QuotaUsage(call) => {
             respond(writer, call, |QuotaUsage| async {
-                Ok(usage::quota_summaries(&services.db, &services.inference))
+                Ok(usage::quota_summaries(&services.db, &services.inference)
+                    .into_iter()
+                    .map(legacy_quota_summary)
+                    .collect())
             })
             .await
         }
         Request::QuotaHistory(call) => {
             respond(writer, call, |QuotaHistory| async {
-                Ok(usage::quota_history(&services.db, &services.inference))
+                Ok(usage::quota_history(&services.db, &services.inference)
+                    .into_iter()
+                    .map(legacy_quota_series)
+                    .collect())
             })
             .await
         }
         Request::GlobalUsage(call) => {
             respond(writer, call, |GlobalUsage { since_ms }| async move {
                 services.pool.flush_agent_usage(None).await;
-                Ok(usage::global_usage(&services.db, since_ms))
+                Ok(usage::global_usage(&services.db, since_ms)
+                    .into_iter()
+                    .map(legacy_agent_usage_series)
+                    .collect())
             })
             .await
         }
@@ -526,10 +540,78 @@ where
                 |AgentCostDistribution { since_ms }| async move {
                     services.pool.flush_agent_usage(None).await;
                     usage::agent_costs(&services.db, since_ms)
+                        .map(|series| series.into_iter().map(legacy_agent_cost_series).collect())
                 },
             )
             .await
         }
+    }
+}
+
+// Only the transitional agents protocol needs conversions. Agent2 replies use
+// the host's source types directly.
+fn legacy_quota_summary(summary: agents2::QuotaSummary) -> legacy::QuotaSummary {
+    legacy::QuotaSummary {
+        model: summary.model,
+        auth_namespace: summary.auth_namespace,
+        remaining_percent: summary.remaining_percent,
+        burn_10m: summary.burn_10m,
+        burn_2h: summary.burn_2h,
+        burn_1d: summary.burn_1d,
+        burn_3d: summary.burn_3d,
+        reset_at_unix: summary.reset_at_unix,
+    }
+}
+
+fn legacy_quota_series(series: agents2::QuotaSeries) -> legacy::QuotaSeries {
+    legacy::QuotaSeries {
+        model: series.model,
+        auth_namespace: series.auth_namespace,
+        points: series
+            .points
+            .into_iter()
+            .map(|point| legacy::QuotaPoint {
+                observed_at_ms: point.observed_at_ms,
+                remaining_percent: point.remaining_percent,
+                reset_at_unix: point.reset_at_unix,
+            })
+            .collect(),
+    }
+}
+
+fn legacy_usage_bucket(bucket: agents2::AgentUsageBucket) -> legacy::AgentUsageBucket {
+    legacy::AgentUsageBucket {
+        bucket_start_ms: bucket.bucket_start_ms,
+        input_tokens: bucket.input_tokens,
+        cache_read_tokens: bucket.cache_read_tokens,
+        cache_write_tokens: bucket.cache_write_tokens,
+        cache_write_1h_tokens: bucket.cache_write_1h_tokens,
+        output_tokens: bucket.output_tokens,
+        requests: bucket.requests,
+        approximate: bucket.approximate,
+    }
+}
+
+fn legacy_agent_usage_series(series: agents2::AgentUsageSeries) -> legacy::AgentUsageSeries {
+    legacy::AgentUsageSeries {
+        model: series.model,
+        buckets: series
+            .buckets
+            .into_iter()
+            .map(legacy_usage_bucket)
+            .collect(),
+    }
+}
+
+fn legacy_agent_cost_series(series: agents2::AgentCostSeries) -> legacy::AgentCostSeries {
+    legacy::AgentCostSeries {
+        agent_id: series.agent_id,
+        model: series.model,
+        buckets: series
+            .buckets
+            .into_iter()
+            .map(legacy_usage_bucket)
+            .collect(),
     }
 }
 
@@ -1149,7 +1231,104 @@ fn detail_update(
 mod tests {
     use std::sync::Arc;
 
-    use super::{detail_result, detail_update};
+    use super::{
+        agents2, detail_result, detail_update, legacy, legacy_agent_cost_series,
+        legacy_agent_usage_series, legacy_quota_series, legacy_quota_summary,
+    };
+
+    #[test]
+    fn legacy_usage_replies_keep_all_new_source_fields() {
+        let quota = agents2::QuotaSummary {
+            model: "gpt".into(),
+            auth_namespace: Some("work".into()),
+            remaining_percent: 31,
+            burn_10m: 7,
+            burn_2h: 18,
+            burn_1d: 42,
+            burn_3d: 96,
+            reset_at_unix: Some(1_800_000_123),
+        };
+        assert_eq!(
+            legacy_quota_summary(quota),
+            legacy::QuotaSummary {
+                model: "gpt".into(),
+                auth_namespace: Some("work".into()),
+                remaining_percent: 31,
+                burn_10m: 7,
+                burn_2h: 18,
+                burn_1d: 42,
+                burn_3d: 96,
+                reset_at_unix: Some(1_800_000_123),
+            }
+        );
+
+        let history = agents2::QuotaSeries {
+            model: "opus".into(),
+            auth_namespace: None,
+            points: vec![agents2::QuotaPoint {
+                observed_at_ms: 12_345,
+                remaining_percent: 64,
+                reset_at_unix: Some(1_900_000_000),
+            }],
+        };
+        assert_eq!(
+            legacy_quota_series(history),
+            legacy::QuotaSeries {
+                model: "opus".into(),
+                auth_namespace: None,
+                points: vec![legacy::QuotaPoint {
+                    observed_at_ms: 12_345,
+                    remaining_percent: 64,
+                    reset_at_unix: Some(1_900_000_000),
+                }],
+            }
+        );
+
+        let bucket = agents2::AgentUsageBucket {
+            bucket_start_ms: 3_600_000,
+            input_tokens: 11,
+            cache_read_tokens: 23,
+            cache_write_tokens: 37,
+            cache_write_1h_tokens: 41,
+            output_tokens: 53,
+            requests: 7,
+            approximate: true,
+        };
+        let expected_bucket = legacy::AgentUsageBucket {
+            bucket_start_ms: 3_600_000,
+            input_tokens: 11,
+            cache_read_tokens: 23,
+            cache_write_tokens: 37,
+            cache_write_1h_tokens: 41,
+            output_tokens: 53,
+            requests: 7,
+            approximate: true,
+        };
+        assert_eq!(
+            legacy_agent_usage_series(agents2::AgentUsageSeries {
+                model: "astra".into(),
+                buckets: vec![bucket.clone()],
+            }),
+            legacy::AgentUsageSeries {
+                model: "astra".into(),
+                buckets: vec![expected_bucket.clone()],
+            }
+        );
+        let agent_id =
+            rho_agent_types::AgentId::from_counter(9, &rho_agent_types::AgentIdDomain(2)).unwrap();
+        assert_eq!(
+            legacy_agent_cost_series(agents2::AgentCostSeries {
+                agent_id,
+                model: "terra".into(),
+                buckets: vec![bucket],
+            }),
+            legacy::AgentCostSeries {
+                agent_id,
+                model: "terra".into(),
+                buckets: vec![expected_bucket],
+            }
+        );
+    }
 
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
