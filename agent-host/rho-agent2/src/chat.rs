@@ -2,10 +2,11 @@
 //! cells, output or reasoning in it.
 
 use rho_agent_types::UnixMs;
+use senax_encoder::{Decode, Encode};
 
 use crate::log::{AgentId, Block, Entry, MessageId, Party};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct ChatEvent {
     /// The entry's position in the log: a sync cursor.
     pub seq: u64,
@@ -13,7 +14,7 @@ pub struct ChatEvent {
     pub kind: ChatKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum ChatKind {
     Message {
         id: MessageId,
@@ -42,7 +43,7 @@ pub fn project(me: &AgentId, seq: u64, entry: &Entry) -> Option<ChatEvent> {
             body: vec![Block::Text(text.clone())],
         },
         Entry::Status { text, .. } => ChatKind::Status(text.clone()),
-        Entry::Awaiting { .. } | Entry::Notice { .. } => return None,
+        Entry::Awaiting { .. } | Entry::Notice { .. } | Entry::Rewound { .. } => return None,
         Entry::Created { .. } | Entry::Step { .. } | Entry::Woken { .. } => return None,
     };
     Some(ChatEvent {

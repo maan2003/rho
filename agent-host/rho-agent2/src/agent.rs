@@ -11,7 +11,7 @@ use std::time::Duration;
 use rho_agent_types::UnixMs;
 use rho_inference2::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
 use rho_notebook2::{CellHandle, Notebook};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
 use crate::chat::{self, ChatEvent};
 use crate::human::{Mailroom, Outbound};
@@ -43,6 +43,7 @@ pub enum Trace {
 #[derive(Clone)]
 pub struct AgentHandle {
     inbox: mpsc::UnboundedSender<Inbound>,
+    control: mpsc::UnboundedSender<Control>,
     chat: broadcast::Sender<ChatEvent>,
     trace: broadcast::Sender<Trace>,
     mailroom: Arc<Mailroom>,
@@ -64,9 +65,27 @@ impl AgentHandle {
         self.mailroom.archive();
     }
 
+    /// Branch before the Nth last human message; notebook state remains.
+    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
+        let (reply, result) = oneshot::channel();
+        self.control
+            .send(Control::Rewind { turns, reply })
+            .map_err(|_| anyhow::anyhow!("the agent has stopped"))?;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("the agent has stopped"))?
+    }
+
     pub fn trace(&self) -> broadcast::Receiver<Trace> {
         self.trace.subscribe()
     }
+}
+
+enum Control {
+    Rewind {
+        turns: u32,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 pub struct Agent {
@@ -82,6 +101,7 @@ pub struct Agent {
     mailroom: Arc<Mailroom>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
     inbox: mpsc::UnboundedReceiver<Inbound>,
+    control: mpsc::UnboundedReceiver<Control>,
     wake: Arc<Notify>,
     chat: broadcast::Sender<ChatEvent>,
     trace: broadcast::Sender<Trace>,
@@ -97,6 +117,7 @@ pub struct Agent {
     awaiting: bool,
     prose: u32,
     restarted: bool,
+    rewound: bool,
     stopped: bool,
     cache_key: CacheKey,
 }
@@ -124,6 +145,7 @@ impl Agent {
         let notebook = Notebook::new(config.shell.clone(), mailroom.exports(), Arc::clone(&wake))
             .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
         let (inbox_tx, inbox) = mpsc::unbounded_channel();
+        let (control_tx, control) = mpsc::unbounded_channel();
         let (chat, _) = broadcast::channel(1024);
         let (trace, _) = broadcast::channel(1024);
         let mut agent = Self {
@@ -139,6 +161,7 @@ impl Agent {
             mailroom,
             outbox,
             inbox,
+            control,
             wake,
             chat: chat.clone(),
             trace: trace.clone(),
@@ -150,6 +173,7 @@ impl Agent {
             awaiting: false,
             prose: 0,
             restarted: false,
+            rewound: false,
             stopped: false,
             cache_key: CacheKey::new(),
         };
@@ -159,6 +183,7 @@ impl Agent {
             agent,
             AgentHandle {
                 inbox: inbox_tx,
+                control: control_tx,
                 chat,
                 trace,
                 mailroom: handle_mailroom,
@@ -174,7 +199,9 @@ impl Agent {
         // logged.
         let mut woken = false;
         let mut awaiting = false;
-        for entry in self.log.entries() {
+        let visible = self.log.visible_positions();
+        for &position in &visible {
+            let entry = &self.log.entries()[position];
             match entry {
                 Entry::Created { cache_key, .. } => self.cache_key = *cache_key,
                 Entry::Woken { messages, .. } => {
@@ -193,7 +220,8 @@ impl Agent {
                 _ => {}
             }
         }
-        for entry in self.log.entries() {
+        for &position in &visible {
+            let entry = &self.log.entries()[position];
             if let Entry::Received { at, id, from, .. } = entry
                 && !delivered.contains(id)
             {
@@ -231,6 +259,48 @@ impl Agent {
         chat::chat(&self.id, self.log.entries())
     }
 
+    /// The requested history branch is represented by a new physical log row,
+    /// never by deleting the abandoned branch (DECISION-history-only-branches).
+    fn rewind(&mut self, turns: u32) -> anyhow::Result<()> {
+        anyhow::ensure!(turns > 0, "rewind turns must be greater than zero");
+        self.drain()?;
+        let human_positions: Vec<_> = self
+            .log
+            .visible_positions()
+            .into_iter()
+            .filter(|&position| {
+                matches!(
+                    self.log.entries()[position],
+                    Entry::Received {
+                        from: Party::Human,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        anyhow::ensure!(!human_positions.is_empty(), "nothing to rewind");
+        let index = human_positions.len().saturating_sub(turns as usize);
+        let to = human_positions[index] as u64;
+        self.append(Entry::Rewound {
+            at: UnixMs::now(),
+            to,
+        })?;
+        self.unread.clear();
+        self.last_step = None;
+        self.cell = None;
+        self.told_returned = false;
+        self.interrupted = false;
+        self.responding = false;
+        self.awaiting = false;
+        self.prose = 0;
+        self.stopped = false;
+        self.restarted = false;
+        self.rewound = true;
+        // The notebook, its Python globals, and any side effects are retained.
+        // Rewound human messages are intentionally absent, as on the old branch.
+        Ok(())
+    }
+
     pub fn log(&self) -> &Log {
         &self.log
     }
@@ -248,6 +318,10 @@ impl Agent {
                         }
                     };
                     tokio::select! {
+                        control = self.control.recv() => match control {
+                            Some(Control::Rewind { turns, reply }) => { let _ = reply.send(self.rewind(turns)); },
+                            None => break,
+                        },
                         inbound = self.inbox.recv() => match inbound {
                             Some(inbound) => self.receive(inbound)?,
                             None => break,
@@ -400,6 +474,7 @@ impl Agent {
             wake_on_tools,
             prose: self.prose > 0,
             restarted: self.restarted,
+            rewound: self.rewound,
             archived: self.archived,
             prose_silenced: self.stopped,
         }
@@ -409,6 +484,10 @@ impl Agent {
         self.drain()?;
         let mut lines = Vec::new();
         match why {
+            Wake::Rewound => lines.push(
+                "The human rewound your visible history. Your Python notebook, running work, and side effects were not rewound. Check the current state before continuing."
+                    .to_owned(),
+            ),
             Wake::Restarted => lines.push(
                 "rho restarted. Your notebook and everything running in it are gone, and \
                  their side effects may remain. Check the current state before carrying on."
@@ -482,6 +561,7 @@ impl Agent {
             messages: messages.into_iter().map(|(id, _, _)| id).collect(),
         })?;
         self.restarted = false;
+        self.rewound = false;
         self.notebook.reset_checkin();
         let request = crate::context::request(
             Arc::clone(&self.instructions),

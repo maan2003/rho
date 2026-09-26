@@ -15,7 +15,9 @@ use crate::log::{Block, Entry, MessageId, Party};
 pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: CacheKey) -> Request {
     let mut texts: HashMap<MessageId, String> = HashMap::new();
     let mut messages: HashMap<MessageId, (Party, Vec<Block>)> = HashMap::new();
-    for entry in entries {
+    let visible = crate::log::visible_positions(entries);
+    for &position in &visible {
+        let entry = &entries[position];
         match entry {
             Entry::Received { id, from, body, .. } => {
                 messages.insert(*id, (from.clone(), body.clone()));
@@ -39,7 +41,8 @@ pub fn request(instructions: Arc<str>, entries: &[Entry], cache_key: CacheKey) -
 
     let mut items = Vec::new();
     let mut open_call = None;
-    for entry in entries {
+    for &position in &visible {
+        let entry = &entries[position];
         match entry {
             Entry::Step { call, carry, .. } => {
                 items.push(Item::Step(carry.clone()));

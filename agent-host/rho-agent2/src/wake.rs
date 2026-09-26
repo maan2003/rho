@@ -20,6 +20,7 @@ pub struct Facts {
     pub wake_on_tools: bool,
     pub prose: bool,
     pub restarted: bool,
+    pub rewound: bool,
     pub archived: bool,
     pub prose_silenced: bool,
 }
@@ -50,6 +51,9 @@ pub fn decide(facts: &Facts, now: UnixMs) -> Decision {
     }
     if facts.restarted {
         due.push((now, Wake::Restarted));
+    }
+    if facts.rewound {
+        due.push((now, Wake::Rewound));
     }
     if facts.prose {
         due.push((now, Wake::Prose));

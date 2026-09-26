@@ -367,3 +367,52 @@ async fn human_revives_archive_only_after_the_streaming_response_finishes() {
     drop(handle);
     running.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewind_branches_context_but_preserves_live_notebook_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log");
+    let model = Arc::new(Scripted::new());
+    model
+        .then("marker = 31\nhuman.send('first branch')\nawait human.reply()")
+        .then("human.send(f'marker={marker}')\nawait human.reply()");
+    let (agent, handle) = start(&dir, Log::open(&path).unwrap(), Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "discard this prompt");
+    until_chat(&mut chat, sent("first branch")).await;
+    handle.rewind(1).await.unwrap();
+    until_chat(&mut chat, sent("marker=31")).await;
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let text = requests[1]
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::User { text, .. } | Item::Result { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("rewound your visible history"), "{text}");
+    assert!(!text.contains("discard this prompt"), "{text}");
+    assert!(!text.contains("first branch"), "{text}");
+    assert!(matches!(
+        handle.rewind(0).await,
+        Err(error) if error.to_string().contains("greater than zero")
+    ));
+    drop(handle);
+    running.abort();
+    let log = Log::open(&path).unwrap();
+    assert!(
+        log.entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Rewound { .. }))
+    );
+    assert!(
+        log.entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Received { body, .. }
+        if body == &[Block::Text("discard this prompt".into())]))
+    );
+}

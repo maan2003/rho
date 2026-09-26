@@ -60,6 +60,8 @@ pub enum Wake {
     Prose,
     /// The host restarted; everything running is gone.
     Restarted,
+    /// The model's history has branched; notebook state was not changed.
+    Rewound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -119,6 +121,11 @@ pub enum Entry {
         at: UnixMs,
         notice: Notice,
     },
+    /// Branch before physical log index `to`; abandoned events remain on disk.
+    Rewound {
+        at: UnixMs,
+        to: u64,
+    },
 }
 
 impl Entry {
@@ -131,9 +138,22 @@ impl Entry {
             | Entry::Sent { at, .. }
             | Entry::Status { at, .. }
             | Entry::Awaiting { at, .. }
-            | Entry::Notice { at, .. } => *at,
+            | Entry::Notice { at, .. }
+            | Entry::Rewound { at, .. } => *at,
         }
     }
+}
+
+/// Physical indices on the branch selected by append-only rewind markers.
+pub fn visible_positions(entries: &[Entry]) -> Vec<usize> {
+    let mut visible = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if let Entry::Rewound { to, .. } = entry {
+            visible.retain(|kept| (*kept as u64) < *to);
+        }
+        visible.push(position);
+    }
+    visible
 }
 
 /// The log in memory, and on disk as length-prefixed senax records when it
@@ -204,6 +224,13 @@ impl Log {
         Ok(())
     }
 
+    /// Physical positions of the current branch, oldest first. Rewind
+    /// markers remain visible, while entries on abandoned branches do not.
+    /// Positions, unlike branch indices, never change after an append.
+    pub fn visible_positions(&self) -> Vec<usize> {
+        visible_positions(&self.entries)
+    }
+
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -240,5 +267,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(Log::open(&path).unwrap().entries().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+
+    fn text(id: u64) -> Entry {
+        Entry::Received {
+            at: UnixMs(id),
+            id: MessageId(id),
+            from: Party::Human,
+            body: vec![Block::Text(format!("message {id}"))],
+        }
+    }
+
+    #[test]
+    fn rewinds_select_an_append_only_lineage_even_after_a_second_fork() {
+        let mut log = Log::in_memory();
+        for entry in [text(1), text(2), text(3)] {
+            log.append(entry).unwrap();
+        }
+        log.append(Entry::Rewound {
+            at: UnixMs(4),
+            to: 1,
+        })
+        .unwrap();
+        log.append(text(5)).unwrap();
+        log.append(Entry::Rewound {
+            at: UnixMs(6),
+            to: 1,
+        })
+        .unwrap();
+        log.append(text(7)).unwrap();
+        assert_eq!(log.entries().len(), 7, "abandoned branch remains on disk");
+        assert_eq!(log.visible_positions(), vec![0, 5, 6]);
     }
 }
