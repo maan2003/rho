@@ -33,8 +33,8 @@ const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 const FILESYSTEM_LABEL_INLAY_ID: usize = 5;
 
-pub use rho_agents_client::create::{
-    AUTO_BASE_REV, DEFAULT_FILESYSTEM, DEFAULT_ROLE, DEFAULT_START, StartFieldMode,
+pub use rho_agents2_client::create::{
+    DEFAULT_FILESYSTEM, DEFAULT_ROLE, DEFAULT_START, StartFieldMode,
 };
 
 impl StartFieldModeLabel for StartFieldMode {

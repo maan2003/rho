@@ -2,7 +2,7 @@
 //! with a snapshot, then sends append-only chat changes.
 use camino::Utf8PathBuf;
 pub use rho_agent_types::AgentId;
-use rho_agent_types::UnixMs;
+use rho_agent_types::{AgentRole, Place, UnixMs, WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
@@ -63,7 +63,8 @@ impl std::fmt::Display for Effort {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct AgentInfo {
     pub id: AgentId,
-    pub workdir: Utf8PathBuf,
+    pub place: Place,
+    pub role: AgentRole,
     pub model: String,
     pub effort: Effort,
     pub archived: bool,
@@ -72,11 +73,27 @@ pub struct AgentInfo {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct CreateAgent {
-    pub workdir: Utf8PathBuf,
+    pub start: StartMode,
+    pub mode: WorksetMode,
+    pub role: AgentRole,
     pub model: String,
     pub effort: Effort,
     pub initial_message: Option<String>,
 }
+/// Where the workset starts: a fresh clone on a revision or an existing place.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum StartMode {
+    NewOn { repo: Utf8PathBuf, revset: String },
+    Join(JoinTarget),
+}
+
+/// The existing worktree or user's checkout to join.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum JoinTarget {
+    Workspace(WorkspaceInfo),
+    User { repo: Utf8PathBuf },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct SendMessage {
     pub agent_id: AgentId,
@@ -127,7 +144,12 @@ mod tests {
     fn request_and_chat_round_trip_without_notebook_fields() {
         let id = AgentId::from_counter(17, &rho_agent_types::AgentIdDomain(42)).unwrap();
         let request = Open::Request(Request::CreateAgent(CreateAgent {
-            workdir: "/src/workset".into(),
+            start: StartMode::NewOn {
+                repo: "/src/workset".into(),
+                revset: "origin/main".into(),
+            },
+            mode: WorksetMode::Exposed,
+            role: AgentRole::default(),
             model: "gpt-6-sol".into(),
             effort: Effort::High,
             initial_message: Some("hello".into()),
@@ -135,6 +157,42 @@ mod tests {
         let bytes = senax_encoder::pack(&request).unwrap();
         let decoded: Open = senax_encoder::unpack(&mut bytes.as_ref()).unwrap();
         assert_eq!(decoded, request);
+        let place = Place {
+            workset: "workset-6".into(),
+            cwd: "/src/child".into(),
+            mode: WorksetMode::View,
+            origin: Some("/src/base".into()),
+        };
+        let joined = Open::Request(Request::CreateAgent(CreateAgent {
+            start: StartMode::Join(JoinTarget::Workspace(place.clone().into())),
+            mode: WorksetMode::Exposed,
+            role: AgentRole::default(),
+            model: "gpt-6-sol".into(),
+            effort: Effort::Low,
+            initial_message: None,
+        }));
+        let bytes = senax_encoder::pack(&joined).unwrap();
+        assert_eq!(
+            senax_encoder::unpack::<Open>(&mut bytes.as_ref()).unwrap(),
+            joined
+        );
+        let snapshot = ServerFrame::Snapshot {
+            agents: vec![AgentInfo {
+                id,
+                place,
+                role: AgentRole::default(),
+                model: "gpt-6-sol".into(),
+                effort: Effort::Low,
+                archived: false,
+                status: Some("working".into()),
+                chat: Vec::new(),
+            }],
+        };
+        let bytes = senax_encoder::pack(&snapshot).unwrap();
+        assert_eq!(
+            senax_encoder::unpack::<ServerFrame>(&mut bytes.as_ref()).unwrap(),
+            snapshot
+        );
         let frame = ServerFrame::Chat {
             agent_id: id.clone(),
             event: ChatEvent {

@@ -32,11 +32,7 @@ use rho_agent_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_agent_types::AdvisorIntelligence;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
-use rho_agents_client::create::{
-    StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
-    parse_workset_mode,
-};
-use rho_agents_client::protocol::{AgentCommand, NewAgent};
+use rho_agents_client::protocol::AgentCommand;
 use rho_agents_client::remote::AgentsLink;
 use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
@@ -45,6 +41,10 @@ use rho_agents_view::agent_view::AgentModel;
 use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
+};
+use rho_agents2_client::create::{
+    StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
+    parse_workset_mode,
 };
 use rho_agents2_client::protocol::{
     AgentId as Agent2Id, AgentInfo as Agent2Info, ArchiveAgent as ArchiveAgent2,
@@ -2265,6 +2265,13 @@ impl Workspace {
     /// What the map says about the label in the start field. The map is
     /// still the shell's; `rho-agents` is handed the answer, not the map.
     fn start_base(&self, target: &str) -> StartBase {
+        let label = target.strip_prefix('@').unwrap_or(target);
+        if let Some((_, (host, info))) = self.agent2.iter().find(|(id, _)| id.encoded() == label) {
+            return StartBase {
+                host: Some(*host),
+                workspace: Some(info.place.clone().into()),
+            };
+        }
         let agent = self.registry.agent_by_label(target);
         StartBase {
             host: agent.and_then(|agent_id| self.host_of(agent_id)),
@@ -2307,7 +2314,7 @@ impl Workspace {
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
         } else {
-            match rho_agents_client::create::resolve_workdir(&self.hosts, &field) {
+            match rho_agents2_client::create::resolve_workdir(&self.hosts, &field) {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
                     self.refuse_draft(&message, cx);
@@ -2348,18 +2355,36 @@ impl Workspace {
                 return;
             }
         };
+        let initial_message = if content
+            .iter()
+            .any(|part| matches!(part, ContentPart::Image { .. }))
+        {
+            self.refuse_draft(
+                "image attachments are not supported by this agent host yet",
+                cx,
+            );
+            return;
+        } else {
+            content.into_iter().find_map(|part| match part {
+                ContentPart::Text { text } => Some(text),
+                ContentPart::Image { .. } => None,
+            })
+        };
+        let Some(link) = self.agent2_link(host) else {
+            self.refuse_draft("not connected to an agent host", cx);
+            return;
+        };
         self.awaiting_draft_agent = Some(host);
         // `n a` chose an area, and that is where the agent is filed; an
         // ordinary draft has none and starts at the root.
         self.pending_agent_filing = self.draft_area.take().map(|area| (host, area));
-        let Some(agents) = self.agents(host) else {
-            return;
-        };
-        let reply = agents.call(NewAgent {
-            role,
+        let reply = link.call(CreateAgent2 {
             start,
             mode,
-            content: Some(content),
+            role,
+            model: "gpt-6-sol".to_owned(),
+            effort: Agent2Effort::Medium,
+            initial_message,
         });
         cx.spawn_in(window, async move |this, cx| {
             let reply = reply.await;
@@ -2404,13 +2429,11 @@ impl Workspace {
                 return;
             }
         };
-        self.note_agent_created(host, agent_id);
         if let Some((_, area)) = filing {
             let writes = self.new_thing_marks(&rho_dealer::NodeId::Agent(agent_id), Some(&area));
             self.write_marks(writes, cx);
         }
         if awaited {
-            self.activate_agent(agent_id, cx);
             // The draft became this agent: reset the compose surface and
             // follow the new agent.
             let label = self
@@ -2421,11 +2444,15 @@ impl Workspace {
                 view.set_body_text("", cx);
                 view.clear_attachments(cx);
                 view.set_workdir_text(&label, cx);
-                view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
-                view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
-                view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
+                view.set_role_text(rho_agents2_client::create::DEFAULT_ROLE, cx);
+                view.set_start_text(rho_agents2_client::create::DEFAULT_START, cx);
+                view.set_filesystem_text(rho_agents2_client::create::DEFAULT_FILESYSTEM, cx);
             });
-            self.select_agent(Some(agent_id), window, cx);
+            if self.agent2.contains_key(&agent_id) {
+                self.open_agent2(agent_id, window, cx);
+            } else {
+                self.pending_agent2_open = Some(agent_id);
+            }
         }
         self.invalidate_dealer_signals(cx);
         cx.notify();
@@ -3037,12 +3064,12 @@ impl Workspace {
         // A project is a label carrying the URL the agent host clones. A path
         // would have the agent host read the user's checkout, which it no
         // longer does.
-        if !rho_agents_client::create::is_repository_url(&path) {
+        if !rho_agents2_client::create::is_repository_url(&path) {
             let message = format!("a project is a repository URL, not a path: `{path}`");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
         }
-        let workdir = match rho_agents_client::create::resolve_workdir(&self.hosts, &path) {
+        let workdir = match rho_agents2_client::create::resolve_workdir(&self.hosts, &path) {
             Ok(workdir) => workdir,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -3362,6 +3389,9 @@ impl Workspace {
                 }
             }
         }
+        if !changed.is_empty() {
+            self.refresh_draft_agent_targets(cx);
+        }
         for id in changed {
             if let Some((_, info)) = self.agent2.get(&id) {
                 for surfaces in self.surfaces.values() {
@@ -3398,14 +3428,14 @@ impl Workspace {
                 .agent2
                 .iter()
                 .filter(|(id, (_, info))| {
-                    id.encoded().contains(input) || info.workdir.as_str().contains(input)
+                    id.encoded().contains(input) || info.place.cwd.as_str().contains(input)
                 })
                 .map(|(id, (host, info))| crate::minibuffer::Candidate {
                     value: id.encoded(),
                     description: format!(
                         "{} · {} · {}{}",
                         workspace.hosts.host_label(*host),
-                        info.workdir,
+                        info.place.cwd,
                         info.status.as_deref().unwrap_or("idle"),
                         if info.archived { " · archived" } else { "" }
                     ),
@@ -3431,207 +3461,6 @@ impl Workspace {
         );
         self.open_prompt("agent2 chat:", complete, submit, window, cx);
         self.set_prompt_complete_whole_input();
-    }
-
-    fn prompt_agent2_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|this: &Workspace, input: &str, _: &App| {
-            this.hosts
-                .iter()
-                .filter(|host| host.name.contains(input))
-                .map(|host| crate::minibuffer::Candidate {
-                    value: host.name.clone(),
-                    description: host.status.label(),
-                })
-                .collect()
-        });
-        let submit = std::rc::Rc::new(
-            |this: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                if let Some(host) = this.hosts.by_name(input.trim()).map(|host| host.id) {
-                    this.prompt_agent2_workdir(host, window, cx);
-                } else {
-                    this.notice_on(None, "unknown host", StyleClass::StatusError, cx);
-                }
-            },
-        );
-        self.open_prompt("agent2 host:", complete, submit, window, cx);
-    }
-
-    fn prompt_agent2_workdir(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(move |this: &Workspace, input: &str, _: &App| {
-            this.hosts
-                .workdirs()
-                .into_iter()
-                .filter(|workdir| {
-                    workdir.host == host
-                        && (workdir.name.contains(input) || workdir.path.as_str().contains(input))
-                })
-                .map(|workdir| crate::minibuffer::Candidate {
-                    value: workdir.path.to_string(),
-                    description: workdir.name.clone(),
-                })
-                .collect()
-        });
-        let submit = std::rc::Rc::new(
-            move |this: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                if !input.trim().is_empty() {
-                    this.prompt_agent2_model(host, input.trim().into(), window, cx);
-                }
-            },
-        );
-        self.open_prompt(
-            "agent2 workdir (absolute path):",
-            complete,
-            submit,
-            window,
-            cx,
-        );
-    }
-
-    fn prompt_agent2_model(
-        &mut self,
-        host: HostId,
-        workdir: camino::Utf8PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let complete = std::rc::Rc::new(|_: &Workspace, input: &str, _: &App| {
-            ["gpt-6-sol"]
-                .into_iter()
-                .filter(|model| model.contains(input))
-                .map(|model| crate::minibuffer::Candidate {
-                    value: model.to_owned(),
-                    description: "default model".to_owned(),
-                })
-                .collect()
-        });
-        let submit = std::rc::Rc::new(
-            move |this: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let model = if input.trim().is_empty() {
-                    "gpt-6-sol"
-                } else {
-                    input.trim()
-                }
-                .to_owned();
-                this.prompt_agent2_effort(host, workdir.clone(), model, window, cx);
-            },
-        );
-        self.open_prompt(
-            "agent2 model (default gpt-6-sol):",
-            complete,
-            submit,
-            window,
-            cx,
-        );
-    }
-
-    fn prompt_agent2_effort(
-        &mut self,
-        host: HostId,
-        workdir: camino::Utf8PathBuf,
-        model: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let complete = std::rc::Rc::new(|_: &Workspace, input: &str, _: &App| {
-            ["low", "medium", "high", "xhigh"]
-                .into_iter()
-                .filter(|value| value.contains(input))
-                .map(|value| crate::minibuffer::Candidate {
-                    value: value.to_owned(),
-                    description: String::new(),
-                })
-                .collect()
-        });
-        let submit = std::rc::Rc::new(
-            move |this: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let effort = match input.trim() {
-                    "" | "medium" => Agent2Effort::Medium,
-                    "low" => Agent2Effort::Low,
-                    "high" => Agent2Effort::High,
-                    "xhigh" => Agent2Effort::XHigh,
-                    _ => {
-                        this.notice_on(
-                            None,
-                            "effort must be low, medium, high, or xhigh",
-                            StyleClass::StatusError,
-                            cx,
-                        );
-                        return;
-                    }
-                };
-                this.prompt_agent2_initial(
-                    host,
-                    workdir.clone(),
-                    model.clone(),
-                    effort,
-                    window,
-                    cx,
-                );
-            },
-        );
-        self.open_prompt(
-            "agent2 effort (default medium):",
-            complete,
-            submit,
-            window,
-            cx,
-        );
-    }
-
-    fn prompt_agent2_initial(
-        &mut self,
-        host: HostId,
-        workdir: camino::Utf8PathBuf,
-        model: String,
-        effort: Agent2Effort,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &App| Vec::new());
-        let submit = std::rc::Rc::new(
-            move |this: &mut Workspace,
-                  input: String,
-                  _window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let initial_message = (!input.trim().is_empty()).then_some(input);
-                this.call_agent2(
-                    host,
-                    CreateAgent2 {
-                        workdir: workdir.clone(),
-                        model: model.clone(),
-                        effort,
-                        initial_message,
-                    },
-                    cx,
-                    |this, id, window, cx| {
-                        if this.agent2.contains_key(&id) {
-                            this.open_agent2(id, window, cx);
-                        } else {
-                            this.pending_agent2_open = Some(id);
-                        }
-                    },
-                );
-            },
-        );
-        self.open_prompt(
-            "agent2 first message (optional):",
-            complete,
-            submit,
-            window,
-            cx,
-        );
     }
 
     fn active_agent2(&self) -> Option<Agent2Id> {
@@ -3940,7 +3769,7 @@ impl Workspace {
     ) {
         match working_directory {
             Some(argument) => {
-                let workdir = match rho_agents_client::create::resolve_workdir(
+                let workdir = match rho_agents2_client::create::resolve_workdir(
                     &self.hosts,
                     argument.as_str(),
                 ) {
@@ -4168,6 +3997,16 @@ impl Workspace {
     /// What an agent's workset was cloned from, as a host-qualified workdir:
     /// what a new sibling agent should inherit.
     fn agent_workdir(&self, agent_id: AgentId) -> Option<HostPath> {
+        if let Some((host, info)) = self.agent2.get(&agent_id) {
+            return Some(HostPath {
+                host: *host,
+                path: info
+                    .place
+                    .origin
+                    .clone()
+                    .unwrap_or_else(|| info.place.cwd.clone()),
+            });
+        }
         Some(HostPath {
             host: self.host_of(agent_id)?,
             path: self.registry.agent_origin(agent_id)?,
@@ -6123,7 +5962,6 @@ impl Workspace {
             Command::SlackSaveForLater => self.slack_save_for_later(window, cx),
             Command::SlackRegister => self.prompt_slack_register(window, cx),
             Command::HostsList => self.cmd_hosts(cx),
-            Command::Agent2Create => self.prompt_agent2_create(window, cx),
             Command::Agent2Open => self.prompt_agent2_open(window, cx),
             Command::Agent2Send => self.prompt_agent2_send(window, cx),
             Command::Agent2Archive => self.cmd_agent2_archive(cx),
@@ -6907,9 +6745,9 @@ impl Workspace {
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
-            view.set_role_text(rho_agents_client::create::DEFAULT_ROLE, cx);
-            view.set_start_text(rho_agents_client::create::DEFAULT_START, cx);
-            view.set_filesystem_text(rho_agents_client::create::DEFAULT_FILESYSTEM, cx);
+            view.set_role_text(rho_agents2_client::create::DEFAULT_ROLE, cx);
+            view.set_start_text(rho_agents2_client::create::DEFAULT_START, cx);
+            view.set_filesystem_text(rho_agents2_client::create::DEFAULT_FILESYSTEM, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
         // The draft exists to be written in, so it opens ready to type.
@@ -7925,7 +7763,11 @@ impl Workspace {
     }
 
     fn agent_target_hints(&self) -> Vec<(String, String)> {
-        let mut hints = Vec::new();
+        let mut hints = self
+            .agent2
+            .iter()
+            .map(|(id, (_, info))| (id.encoded(), info.place.cwd.to_string()))
+            .collect::<Vec<_>>();
         for agent_id in self.registry.known_agents() {
             let id_label = self.registry.agent_id_label(*agent_id);
             if let Some(display_name) = self.registry.agent_display_name(*agent_id) {
@@ -8603,6 +8445,127 @@ mod agent2_chat_tests {
     use super::*;
 
     #[gpui::test]
+    fn draft_join_uses_agent_place_and_files_the_created_chat(cx: &mut TestAppContext) {
+        use rho_agents2_client::protocol::{JoinTarget, StartMode};
+        use rho_dealer::NodeId;
+
+        let workspace = crate::tests::test_workspace(cx);
+        let base_id = Agent2Id::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let new_id = Agent2Id::from_counter(3, &rho_agent_types::AgentIdDomain(0)).unwrap();
+        let base_place = rho_agent_types::Place {
+            workset: "base-workset".into(),
+            cwd: "/src/base".into(),
+            mode: rho_agent_types::WorksetMode::View,
+            origin: Some("/src/original".into()),
+        };
+        let (label, mut host) = workspace
+            .update(cx, |this, window, cx| {
+                crate::tests::story::feed(
+                    this,
+                    HostId::default(),
+                    crate::tests::story::ready_with(Vec::new(), 0),
+                    window,
+                    cx,
+                );
+                this.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId::default(),
+                        frame: Agent2Frame::Created {
+                            agent: Agent2Info {
+                                id: base_id,
+                                place: base_place.clone(),
+                                role: AgentRole::default(),
+                                model: "gpt-6-sol".into(),
+                                effort: Agent2Effort::Medium,
+                                archived: false,
+                                status: None,
+                                chat: Vec::new(),
+                            },
+                        },
+                    },
+                    window,
+                    cx,
+                );
+                let label = this.mint_label("work/next", cx).unwrap();
+                this.new_agent_in_area(Some(NodeId::Label(label)), window, cx);
+                this.draft_model.update(cx, |draft, cx| {
+                    draft.set_workdir_text("/src/other", cx);
+                    draft.set_start_text(&base_id.encoded(), cx);
+                    draft.cycle_start_mode(cx);
+                    draft.set_role_text("high-eng", cx);
+                    draft.set_filesystem_text("exposed", cx);
+                    draft.set_body_text("join the review", cx);
+                });
+                let host = this.host_in_process_for_test(HostId::default());
+                this.submit_draft(window, cx);
+                (label, host)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let mut calls = crate::tests::story::agent2_calls(&mut host);
+        assert_eq!(calls.len(), 1);
+        let (call, mut stream) = calls.pop().unwrap();
+        let rho_agents2_client::protocol::Request::CreateAgent(request) = call else {
+            panic!("not a create call: {call:?}")
+        };
+        assert_eq!(
+            request.start,
+            StartMode::Join(JoinTarget::Workspace(base_place.into()))
+        );
+        assert_eq!(request.mode, rho_agent_types::WorksetMode::Exposed);
+        assert_eq!(
+            request.role,
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High
+            }
+        );
+        assert_eq!(request.initial_message.as_deref(), Some("join the review"));
+        workspace
+            .update(cx, |this, window, cx| {
+                this.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId::default(),
+                        frame: Agent2Frame::Created {
+                            agent: Agent2Info {
+                                id: new_id,
+                                place: rho_agent_types::Place {
+                                    workset: "base-workset".into(),
+                                    cwd: "/src/base".into(),
+                                    mode: rho_agent_types::WorksetMode::Exposed,
+                                    origin: Some("/src/original".into()),
+                                },
+                                role: request.role,
+                                model: request.model,
+                                effort: request.effort,
+                                archived: false,
+                                status: None,
+                                chat: Vec::new(),
+                            },
+                        },
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        crate::tests::story::answer(&mut stream, rho_rpc::protocol::Answer::Done(new_id));
+        cx.run_until_parked();
+        workspace
+            .update(cx, |this, _, cx| {
+                assert_eq!(this.active_surface().key, SurfaceKey::Agent2(new_id));
+                assert!(
+                    this.attention
+                        .marks
+                        .get(&NodeId::Agent(new_id))
+                        .labels
+                        .contains(&label)
+                );
+                assert!(this.draft_model.read(cx).body_text(cx).is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn stream_refreshes_chat_without_erasing_composition_or_replaying_events(
         cx: &mut TestAppContext,
     ) {
@@ -8610,7 +8573,13 @@ mod agent2_chat_tests {
         let id = Agent2Id::from_counter(2, &rho_agent_types::AgentIdDomain(0)).unwrap();
         let info = Agent2Info {
             id: id.clone(),
-            workdir: "/src/work".into(),
+            place: rho_agent_types::Place {
+                workset: "test-workset".into(),
+                cwd: "/src/work".into(),
+                mode: Default::default(),
+                origin: None,
+            },
+            role: AgentRole::default(),
             model: "gpt-6-sol".into(),
             effort: Agent2Effort::Medium,
             archived: false,

@@ -83,7 +83,7 @@ fn chat_text(info: &AgentInfo) -> String {
     let mut text = format!(
         "agent2 {}\n{} · {} · {:?}{}\n",
         info.id.encoded(),
-        info.workdir,
+        info.place.cwd,
         info.model,
         info.effort,
         if info.archived { " · archived" } else { "" }
@@ -135,7 +135,13 @@ mod tests {
         let id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let info = AgentInfo {
             id: id.clone(),
-            workdir: "/src/project".into(),
+            place: rho_agent_types::Place {
+                workset: "test-workset".into(),
+                cwd: "/src/project".into(),
+                mode: Default::default(),
+                origin: None,
+            },
+            role: rho_agent_types::AgentRole::default(),
             model: "gpt-6-sol".into(),
             effort: Effort::High,
             archived: true,

@@ -8,7 +8,6 @@ use rho_agent_hosts::connection::ConnEvent;
 use rho_agent_types::{
     AgentId, AgentPos, AgentRole, MessageDelivery, Place, PresentationField, Seq, TurnEdge, UnixMs,
 };
-use rho_agents_client::protocol as agents;
 use rho_agents_client::protocol::transcript::{LogEntry, TranscriptEvent};
 use rho_agents_client::stream::AgentFrame;
 use rho_rpc::protocol::{Answer, Open, read_frame, write_frame};
@@ -232,17 +231,16 @@ pub fn ready_with(heads: Vec<UiAgentHead>, agent_counter: u64) -> Frame {
     ])
 }
 
-/// The calls a host in this process has been asked so far
-/// ([`crate::workspace::Workspace::host_in_process_for_test`]), each with
-/// the stream to answer it on.
-pub fn calls(
+/// The new agent protocol's calls, alongside the legacy session used by older
+/// tests.
+pub fn agent2_calls(
     streams: &mut tokio::sync::mpsc::UnboundedReceiver<rho_rpc::Stream>,
-) -> Vec<(agents::Request, rho_rpc::Stream)> {
+) -> Vec<(rho_agents2_client::protocol::Request, rho_rpc::Stream)> {
     let mut calls = Vec::new();
     while let Ok(mut stream) = streams.try_recv() {
         let open = futures::executor::block_on(read_frame::<_, Open>(&mut stream))
             .expect("a stream opens by saying what it is for");
-        if let Ok(agents::Open::Request(request)) = open.unpack() {
+        if let Ok(rho_agents2_client::protocol::Open::Request(request)) = open.unpack() {
             calls.push((request, stream));
         }
     }

@@ -5033,12 +5033,24 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
 
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
     cx.run_until_parked();
-    let mut calls = story::calls(&mut host);
+    let mut calls = story::agent2_calls(&mut host);
     assert_eq!(calls.len(), 1, "the draft makes one call");
     let (call, mut stream) = calls.pop().unwrap();
-    assert!(
-        matches!(call, rho_agents_client::protocol::Request::New(_)),
-        "the draft asked for a new agent: {call:?}"
+    let rho_agents2_client::protocol::Request::CreateAgent(request) = call else {
+        panic!("the draft asked for a new agent: {call:?}")
+    };
+    assert_eq!(
+        request.start,
+        rho_agents2_client::protocol::StartMode::NewOn {
+            repo: "/tmp/repo".into(),
+            revset: String::new(),
+        }
+    );
+    assert_eq!(request.mode, rho_agent_types::WorksetMode::View);
+    assert_eq!(request.role, rho_agent_types::AgentRole::default());
+    assert_eq!(
+        request.initial_message.as_deref(),
+        Some("look at the readme")
     );
     story::answer(
         &mut stream,
