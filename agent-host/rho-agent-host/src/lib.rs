@@ -963,10 +963,12 @@ impl Services {
         let machine_seed = db.read().machine_seed();
         let agents2 = agents2::Agents2::live(
             agent2_dir,
+            pool.worksets().clone(),
             agent2_base_url,
             db.read().machine_seed(),
             db.read().last_agent_counter(),
-        )?;
+        )
+        .await?;
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
