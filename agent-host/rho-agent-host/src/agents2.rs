@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use camino::Utf8PathBuf;
+use rho_agent_types::AgentIdDomain;
 use rho_agent2::agent::{Agent, AgentHandle, Config, Inbound, Trace};
 use rho_agent2::chat as chat2;
 use rho_agent2::log::{self, Block, Entry, Notice};
@@ -31,8 +32,15 @@ struct Record {
     handle: AgentHandle,
 }
 
+#[derive(Serialize, Deserialize)]
+struct Identity {
+    machine_seed: u64,
+    next_counter: u64,
+}
+
 pub(crate) struct Agents2 {
     root: Utf8PathBuf,
+    identity: Mutex<Identity>,
     records: Mutex<HashMap<wire::AgentId, Record>>,
     changes: broadcast::Sender<wire::ServerFrame>,
     make_model: Arc<dyn Fn(&wire::AgentInfo) -> Arc<Model> + Send + Sync>,
@@ -41,11 +49,27 @@ pub(crate) struct Agents2 {
 impl Agents2 {
     fn open(
         root: Utf8PathBuf,
+        machine_seed: u64,
+        initial_counter: u64,
         make_model: impl Fn(&wire::AgentInfo) -> Arc<Model> + Send + Sync + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&root)?;
+        let identity_path = root.join("identity.json");
+        let identity: Identity = if identity_path.exists() {
+            serde_json::from_slice(&std::fs::read(&identity_path)?)?
+        } else {
+            Identity {
+                machine_seed,
+                next_counter: initial_counter.saturating_add(1),
+            }
+        };
+        anyhow::ensure!(
+            identity.machine_seed == machine_seed,
+            "agent identity belongs to another host"
+        );
         let manager = Arc::new(Self {
             root,
+            identity: Mutex::new(identity),
             records: Mutex::new(HashMap::new()),
             changes: broadcast::channel(1024).0,
             make_model: Arc::new(make_model),
@@ -55,8 +79,13 @@ impl Agents2 {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            let id = wire::AgentId::new(entry.file_name().to_string_lossy().into_owned())
-                .map_err(anyhow::Error::msg)?;
+            let id = match wire::AgentId::from_encoded(&entry.file_name().to_string_lossy()) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(path = %entry.path().display(), %error, "skipping unrecognized agent directory");
+                    continue;
+                }
+            };
             let metadata = entry.path().join("config.json");
             let stored: Stored = match std::fs::read(&metadata)
                 .ok()
@@ -100,8 +129,13 @@ impl Agents2 {
         Ok(manager)
     }
 
-    pub(crate) fn live(root: Utf8PathBuf, base_url: String) -> anyhow::Result<Arc<Self>> {
-        Self::open(root, move |info| {
+    pub(crate) fn live(
+        root: Utf8PathBuf,
+        base_url: String,
+        machine_seed: u64,
+        initial_counter: u64,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open(root, machine_seed, initial_counter, move |info| {
             Arc::new(Model::OpenAi(OpenAi {
                 base_url: base_url.clone(),
                 model: info.model.clone(),
@@ -117,7 +151,7 @@ impl Agents2 {
     }
 
     fn log_path(&self, id: &wire::AgentId) -> PathBuf {
-        self.root.join(id.as_str()).join("log").into_std_path_buf()
+        self.root.join(id.encoded()).join("log").into_std_path_buf()
     }
 
     fn start(self: &Arc<Self>, mut info: wire::AgentInfo, log: log::Log) -> anyhow::Result<()> {
@@ -128,7 +162,7 @@ impl Agents2 {
             rho_fs_view::PathOverrides::default(),
         );
         let (agent, handle) = Agent::new(Config {
-            id: log::AgentId::new(id.as_str()).map_err(anyhow::Error::msg)?,
+            id,
             log,
             model: (self.make_model)(&info),
             shell,
@@ -157,7 +191,7 @@ impl Agents2 {
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            tracing::warn!(%observer_id, "agent2 chat observer lagged; reread on host restart");
+                            tracing::warn!(agent_id = %observer_id.encoded(), "agent2 chat observer lagged; reread on host restart");
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     },
@@ -173,7 +207,7 @@ impl Agents2 {
         });
         tokio::spawn(async move {
             if let Err(error) = agent.run().await {
-                tracing::error!(%id, %error, "agent2 runtime exited");
+                tracing::error!(agent_id = %id.encoded(), %error, "agent2 runtime exited");
             }
         });
         Ok(())
@@ -220,9 +254,7 @@ impl Agents2 {
                 .map(|record| record.handle.clone());
             if let Some(handle) = recipient_handle {
                 let _ = handle.send(Inbound {
-                    from: log::Party::Agent(
-                        log::AgentId::new(sender.as_str()).expect("nonempty agent id"),
-                    ),
+                    from: log::Party::Agent(sender),
                     body: vec![Block::Text(text)],
                 });
             }
@@ -247,7 +279,7 @@ impl Agents2 {
             .values()
             .map(|record| record.info.clone())
             .collect();
-        agents.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        agents.sort_by_key(|agent| agent.id);
         agents
     }
     fn subscribe(&self) -> broadcast::Receiver<wire::ServerFrame> {
@@ -260,9 +292,21 @@ impl Agents2 {
         anyhow::ensure!(workdir.is_dir(), "agent2 workdir must be a directory");
         let workdir = Utf8PathBuf::try_from(workdir).context("workdir is not UTF-8")?;
         anyhow::ensure!(!call.model.trim().is_empty(), "model is empty");
-        let id =
-            wire::AgentId::new(uuid::Uuid::new_v4().to_string()).map_err(anyhow::Error::msg)?;
-        let dir = self.root.join(id.as_str());
+        let id = {
+            let mut identity = self.identity.lock().unwrap();
+            let id = wire::AgentId::from_counter(
+                identity.next_counter,
+                &AgentIdDomain(identity.machine_seed),
+            )
+            .ok_or_else(|| anyhow!("agent ID counter exhausted"))?;
+            identity.next_counter += 1;
+            std::fs::write(
+                self.root.join("identity.json"),
+                serde_json::to_vec(&*identity)?,
+            )?;
+            id
+        };
+        let dir = self.root.join(id.encoded());
         std::fs::create_dir(&dir)?;
         let stored = Stored {
             workdir: workdir.to_string(),
@@ -307,7 +351,7 @@ impl Agents2 {
             .unwrap()
             .get(&call.agent_id)
             .map(|record| record.handle.clone())
-            .ok_or_else(|| anyhow!("agent2 {} not found", call.agent_id))?;
+            .ok_or_else(|| anyhow!("agent2 {} not found", call.agent_id.encoded()))?;
         handle.send(Inbound {
             from: log::Party::Human,
             body: vec![Block::Text(call.text)],
@@ -320,7 +364,7 @@ impl Agents2 {
             .unwrap()
             .get(&call.agent_id)
             .map(|record| record.handle.clone())
-            .ok_or_else(|| anyhow!("agent2 {} not found", call.agent_id))?;
+            .ok_or_else(|| anyhow!("agent2 {} not found", call.agent_id.encoded()))?;
         handle.archive();
         Ok(())
     }
@@ -329,7 +373,7 @@ impl Agents2 {
 fn convert_party(party: log::Party) -> Option<wire::Party> {
     match party {
         log::Party::Human => Some(wire::Party::Human),
-        log::Party::Agent(id) => Some(wire::Party::Agent(wire::AgentId::new(id.as_str()).ok()?)),
+        log::Party::Agent(id) => Some(wire::Party::Agent(id)),
     }
 }
 fn convert_chat(event: chat2::ChatEvent) -> Option<wire::ChatEvent> {
@@ -514,7 +558,7 @@ mod tests {
             let script = script.clone();
             move |_: &wire::AgentInfo| Arc::new(Model::Scripted(script.clone()))
         };
-        let manager = Agents2::open(root.clone(), make_model).unwrap();
+        let manager = Agents2::open(root.clone(), 0, 0, make_model).unwrap();
         let id = manager
             .create(wire::CreateAgent {
                 workdir,
@@ -556,7 +600,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let restart_script = Arc::new(Scripted::new());
         restart_script.then("human.send('restarted')\nawait human.reply()");
-        let reloaded = Agents2::open(root, move |_: &wire::AgentInfo| {
+        let reloaded = Agents2::open(root, 0, 0, move |_: &wire::AgentInfo| {
             Arc::new(Model::Scripted(restart_script.clone()))
         })
         .unwrap();
@@ -567,12 +611,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn ids_continue_after_restart_in_the_host_machine_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
+        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
+        let model = Arc::new(Scripted::new());
+        let manager = Agents2::open(root.clone(), 77, 19, {
+            let model = model.clone();
+            move |_| Arc::new(Model::Scripted(model.clone()))
+        })
+        .unwrap();
+        let new_agent = || wire::CreateAgent {
+            workdir: workdir.clone(),
+            model: "scripted".into(),
+            effort: wire::Effort::Medium,
+            initial_message: None,
+        };
+        let first = manager.create(new_agent()).unwrap();
+        assert_eq!(first.to_counter(&AgentIdDomain(77)), 20);
+        drop(manager);
+        let restarted = Agents2::open(root.clone(), 77, 19, move |_| {
+            Arc::new(Model::Scripted(model.clone()))
+        })
+        .unwrap();
+        let second = restarted.create(new_agent()).unwrap();
+        assert_eq!(second.to_counter(&AgentIdDomain(77)), 21);
+        assert_ne!(second, first);
+        assert!(
+            Agents2::open(root, 78, 19, |_| Arc::new(Model::Scripted(Arc::new(
+                Scripted::new()
+            ))))
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn agent_mail_routes_into_recipient_chat_and_model() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
         let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
         let script = Arc::new(Scripted::new());
-        let manager = Agents2::open(root, {
+        let manager = Agents2::open(root, 0, 0, {
             let script = script.clone();
             move |_: &wire::AgentInfo| Arc::new(Model::Scripted(script.clone()))
         })
@@ -596,7 +675,7 @@ mod tests {
         script
             .then(&format!(
                 "agents.send('{}', 'ping')\nawait human.reply()",
-                recipient.as_str()
+                recipient.encoded()
             ))
             .then("human.send('mail delivered')\nawait human.reply()");
         manager

@@ -961,7 +961,12 @@ impl Services {
         agent2_base_url: String,
     ) -> anyhow::Result<Self> {
         let machine_seed = db.read().machine_seed();
-        let agents2 = agents2::Agents2::live(agent2_dir, agent2_base_url)?;
+        let agents2 = agents2::Agents2::live(
+            agent2_dir,
+            agent2_base_url,
+            db.read().machine_seed(),
+            db.read().last_agent_counter(),
+        )?;
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
@@ -1016,6 +1021,18 @@ impl Services {
         mode: WorksetMode,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.refuse_while_stopping()?;
+        let start = self.resolve_start_place(start, mode).await?;
+        let (agent_id, agent) = self.pool.create(role, None, start).await?;
+        Ok((agent_id, agent))
+    }
+
+    /// Resolve the user's new-on or join choice to the exact workset place
+    /// and filesystem view shared by agents and their workset resources.
+    async fn resolve_start_place(
+        &self,
+        start: StartMode,
+        mode: WorksetMode,
+    ) -> anyhow::Result<rho_agent::StartPlace> {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
                 // The agent exists at once; its workset is placed (cloned
@@ -1069,8 +1086,7 @@ impl Services {
                 );
             }
         };
-        let (agent_id, agent) = self.pool.create(role, None, start).await?;
-        Ok((agent_id, agent))
+        Ok(start)
     }
 
     async fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
