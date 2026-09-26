@@ -1293,6 +1293,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            initial,
+            crate::worker::ChatWorkerEvent::RunningSince(None)
+        ));
         let process = pool.process(&view).await.unwrap();
         let resource = pool.execution_place(&place).await.unwrap();
         assert!(Arc::ptr_eq(&process, &resource));

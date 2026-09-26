@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 10;
+pub(super) const VERSION: u32 = 12;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -177,6 +177,10 @@ pub(super) enum Message<'a> {
         from: rho_agent2::log::Party,
         text: String,
     },
+    ChatSendTo {
+        to: rho_agent2::log::Party,
+        text: String,
+    },
     ChatArchive,
     ChatCancel,
     ChatTool {
@@ -200,6 +204,9 @@ pub(super) enum Message<'a> {
     },
     ChatArchived {
         archived: bool,
+    },
+    ChatRunning {
+        since: Option<rho_agent_types::UnixMs>,
     },
 }
 
@@ -354,6 +361,7 @@ impl Host {
                         | Message::ChatBootstrap(_)
                         | Message::ChatStarted { .. }
                         | Message::ChatSend { .. }
+                        | Message::ChatSendTo { .. }
                         | Message::ChatArchive
                         | Message::ChatCancel
                         | Message::ChatTool { .. }
@@ -361,7 +369,8 @@ impl Host {
                         | Message::ChatRewind { .. }
                         | Message::ChatRewound { .. }
                         | Message::Chat { .. }
-                        | Message::ChatArchived { .. } => {
+                        | Message::ChatArchived { .. }
+                        | Message::ChatRunning { .. } => {
                             return Err::<(), _>(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "unexpected worker request",
@@ -742,6 +751,17 @@ mod tests {
             request: 43, result: Agent2ToolResult::Error(error)
         } if error == "advisor cannot spawn")
         );
+        let target =
+            rho_agent_types::AgentId::from_counter(13, &rho_agent_types::AgentIdDomain(7)).unwrap();
+        host.write(&Message::ChatSendTo {
+            to: rho_agent2::log::Party::Agent(target),
+            text: "logged before relay".into(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(worker.read().await.unwrap(), Message::ChatSendTo {
+            to: rho_agent2::log::Party::Agent(agent_id), text
+        } if agent_id == target && text == "logged before relay"));
     }
 
     #[tokio::test]

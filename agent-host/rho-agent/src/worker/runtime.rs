@@ -176,6 +176,32 @@ impl Drop for ChatToolPending {
     }
 }
 
+/// Translate ephemeral trace observations to the host's current running state.
+async fn publish_chat_trace(
+    event: rho_agent2::agent::Trace,
+    sender: &super::transport::Sender,
+    port: super::transport::Port,
+    running_since: &mut Option<rho_agent_types::UnixMs>,
+) -> anyhow::Result<()> {
+    use rho_agent2::agent::Trace;
+    let message = match event {
+        Trace::Woken { .. } => {
+            let since = rho_agent_types::UnixMs::now();
+            *running_since = Some(since);
+            Message::ChatRunning { since: Some(since) }
+        }
+        Trace::Step { .. } | Trace::Settled => {
+            if running_since.take().is_none() {
+                return Ok(());
+            }
+            Message::ChatRunning { since: None }
+        }
+        Trace::ArchiveState { archived } => Message::ChatArchived { archived },
+    };
+    sender.send(port, ipc::encode(&message)?).await?;
+    Ok(())
+}
+
 /// The agent2 loop uses the same workset namespace and policy channel as the
 /// legacy loops, but its own append-only log and chat projection.
 async fn drive_chat(
@@ -188,7 +214,7 @@ async fn drive_chat(
     next: Arc<AtomicU64>,
     mut incoming: tokio::sync::mpsc::UnboundedReceiver<super::transport::Packet>,
 ) -> anyhow::Result<()> {
-    use rho_agent2::agent::{Agent as ChatAgent, Config, Inbound, Trace};
+    use rho_agent2::agent::{Agent as ChatAgent, Config, Inbound};
     use rho_agent2::human::Agent2HostCall;
     use rho_agent2::log::{Block, Log};
     use rho_inference::InferenceHost as _;
@@ -304,6 +330,10 @@ async fn drive_chat(
     };
     let mut chat = handle.chat();
     let mut trace = handle.trace();
+    let mut running_since = None;
+    sender
+        .send(port, ipc::encode(&Message::ChatRunning { since: None })?)
+        .await?;
     let mut running = Box::pin(runtime.run());
     let result = loop {
         tokio::select! {
@@ -312,6 +342,7 @@ async fn drive_chat(
                 let packet = packet.context("agent port closed")?;
                 match ipc::decode(&packet.bytes)? {
                     Message::ChatSend { from, text } => handle.send(Inbound { from, body: vec![Block::Text(text)] })?,
+                    Message::ChatSendTo { to, text } => handle.send_to(to, text)?,
                     Message::ChatArchive => handle.archive(),
                     Message::ChatCancel => handle.cancel(),
                     Message::ChatToolReply { request, result } => {
@@ -348,8 +379,8 @@ async fn drive_chat(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
             },
             event = trace.recv() => match event {
-                Ok(Trace::ArchiveState { archived }) => sender.send(port, ipc::encode(&Message::ChatArchived { archived })?).await?,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Ok(event) => publish_chat_trace(event, &sender, port, &mut running_since).await?,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
             },
         }
@@ -362,11 +393,12 @@ async fn drive_chat(
             .await?;
     }
     while let Ok(event) = trace.try_recv() {
-        if let Trace::ArchiveState { archived } = event {
-            sender
-                .send(port, ipc::encode(&Message::ChatArchived { archived })?)
-                .await?;
-        }
+        publish_chat_trace(event, &sender, port, &mut running_since).await?;
+    }
+    if running_since.is_some() {
+        sender
+            .send(port, ipc::encode(&Message::ChatRunning { since: None })?)
+            .await?;
     }
     result
 }
@@ -627,6 +659,85 @@ pub(super) async fn run(
 #[cfg(test)]
 mod chat_tool_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn running_trace_reports_start_step_and_interrupt_on_the_worker_port() {
+        use rho_agent2::agent::Trace;
+        use rho_agent2::log::Wake;
+
+        let (worker, mut host) = crate::worker::testing::pair();
+        let mut since = None;
+        publish_chat_trace(
+            Trace::Woken {
+                why: Wake::Message,
+                report: "new task".into(),
+            },
+            &worker.sender,
+            worker.port,
+            &mut since,
+        )
+        .await
+        .unwrap();
+        let Message::ChatRunning { since: Some(first) } = host.read().await.unwrap() else {
+            panic!("missing running start");
+        };
+        assert_eq!(since, Some(first));
+        publish_chat_trace(
+            Trace::Step {
+                code: None,
+                prose: "done".into(),
+            },
+            &worker.sender,
+            worker.port,
+            &mut since,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            host.read().await.unwrap(),
+            Message::ChatRunning { since: None }
+        ));
+        assert_eq!(since, None);
+
+        publish_chat_trace(
+            Trace::Woken {
+                why: Wake::AgentMessage,
+                report: "follow-up".into(),
+            },
+            &worker.sender,
+            worker.port,
+            &mut since,
+        )
+        .await
+        .unwrap();
+        let Message::ChatRunning {
+            since: Some(second),
+        } = host.read().await.unwrap()
+        else {
+            panic!("missing next running start");
+        };
+        assert_eq!(since, Some(second));
+        publish_chat_trace(Trace::Settled, &worker.sender, worker.port, &mut since)
+            .await
+            .unwrap();
+        assert!(matches!(
+            host.read().await.unwrap(),
+            Message::ChatRunning { since: None }
+        ));
+        assert_eq!(since, None);
+        publish_chat_trace(
+            Trace::ArchiveState { archived: true },
+            &worker.sender,
+            worker.port,
+            &mut since,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            host.read().await.unwrap(),
+            Message::ChatArchived { archived: true }
+        ));
+    }
 
     #[test]
     fn cancelling_an_agent2_tool_releases_its_waiter() {

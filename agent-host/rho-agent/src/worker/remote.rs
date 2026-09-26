@@ -286,6 +286,7 @@ impl Remote {
 pub enum ChatWorkerEvent {
     Chat(rho_agent2::chat::ChatEvent),
     Archived(bool),
+    RunningSince(Option<rho_agent_types::UnixMs>),
     Stopped(Option<String>),
 }
 
@@ -387,6 +388,7 @@ impl ChatRemote {
                         }
                         ipc::Message::Chat { event } => on_event(ChatWorkerEvent::Chat(event)),
                         ipc::Message::ChatArchived { archived } => on_event(ChatWorkerEvent::Archived(archived)),
+                        ipc::Message::ChatRunning { since } => on_event(ChatWorkerEvent::RunningSince(since)),
                         ipc::Message::ChatTool { request, call } => {
                             let pool = pool.clone();
                             let sender = process.sender.clone();
@@ -438,6 +440,14 @@ impl ChatRemote {
         self.0
             .commands
             .send(ipc::Message::ChatSend { from, text })
+            .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
+    }
+
+    pub fn send_to(&self, to: rho_agent2::log::Party, text: String) -> anyhow::Result<()> {
+        anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
+        self.0
+            .commands
+            .send(ipc::Message::ChatSendTo { to, text })
             .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
     }
 

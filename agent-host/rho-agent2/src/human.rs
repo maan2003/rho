@@ -110,6 +110,14 @@ impl Mailroom {
         )
     }
 
+    /// Queue an outgoing message in this agent's log before the host relays it.
+    pub fn send_to(&self, to: Party, text: String) -> anyhow::Result<()> {
+        anyhow::ensure!(!text.trim().is_empty(), "a message needs text");
+        self.outbox
+            .send(Outbound::Send { to, text })
+            .map_err(|_| anyhow::anyhow!("agent notebook closed"))
+    }
+
     /// An agent message arrived.
     pub fn agent_received(&self) {
         self.waits.lock().unwrap().agent_received += 1;
@@ -477,6 +485,24 @@ mod tests {
         );
         assert!(matches!(received.recv().await.unwrap(), Agent2Call::Team));
         notebook.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn host_sent_agent_message_uses_the_outbound_log_path() {
+        let (mailroom, mut outbox) = Mailroom::new(None);
+        let target = AgentId::from_counter(9, &AgentIdDomain(42)).unwrap();
+        mailroom
+            .send_to(Party::Agent(target), "delegated result".into())
+            .unwrap();
+        assert_eq!(
+            outbox.try_recv().unwrap(),
+            Outbound::Send {
+                to: Party::Agent(target),
+                text: "delegated result".into()
+            }
+        );
+        assert!(mailroom.send_to(Party::Human, "  ".into()).is_err());
+        assert!(outbox.try_recv().is_err());
     }
 
     #[test]
