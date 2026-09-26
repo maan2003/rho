@@ -7,12 +7,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use camino::Utf8PathBuf;
-use rho_agent_types::{AgentIdDomain, AgentRole, Place, WorksetMode, WorkspaceInfo};
+use rho_agent_types::AgentIdDomain;
 use rho_agent2::agent::{Agent, AgentHandle, Config, Inbound, Trace};
 use rho_agent2::chat as chat2;
 use rho_agent2::log::{self, Block, Entry, Notice};
 use rho_agents2_client::protocol as wire;
-use rho_fs_view::Worksets;
 use rho_inference2::Model;
 use rho_inference2::openai::{Effort as ModelEffort, OpenAi};
 use rho_rpc::protocol::{Answer, write_frame};
@@ -20,12 +19,11 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::broadcast;
 
-use crate::{Services, expand_home, visible_path};
+use crate::Services;
 
-#[derive(senax_encoder::Pack, senax_encoder::Unpack)]
+#[derive(Serialize, Deserialize)]
 struct Stored {
-    place: Place,
-    role: AgentRole,
+    workdir: String,
     model: String,
     effort: String,
 }
@@ -42,7 +40,6 @@ struct Identity {
 
 pub(crate) struct Agents2 {
     root: Utf8PathBuf,
-    worksets: Arc<Worksets>,
     identity: Mutex<Identity>,
     records: Mutex<HashMap<wire::AgentId, Record>>,
     changes: broadcast::Sender<wire::ServerFrame>,
@@ -50,9 +47,8 @@ pub(crate) struct Agents2 {
 }
 
 impl Agents2 {
-    async fn open(
+    fn open(
         root: Utf8PathBuf,
-        worksets: Arc<Worksets>,
         machine_seed: u64,
         initial_counter: u64,
         make_model: impl Fn(&wire::AgentInfo) -> Arc<Model> + Send + Sync + 'static,
@@ -73,7 +69,6 @@ impl Agents2 {
         );
         let manager = Arc::new(Self {
             root,
-            worksets,
             identity: Mutex::new(identity),
             records: Mutex::new(HashMap::new()),
             changes: broadcast::channel(1024).0,
@@ -91,10 +86,10 @@ impl Agents2 {
                     continue;
                 }
             };
-            let metadata = entry.path().join("config.senax");
+            let metadata = entry.path().join("config.json");
             let stored: Stored = match std::fs::read(&metadata)
                 .ok()
-                .and_then(|bytes| senax_encoder::unpack(&mut bytes.as_slice()).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             {
                 Some(stored) => stored,
                 None => {
@@ -122,28 +117,25 @@ impl Agents2 {
                 .unwrap_or(false);
             let info = wire::AgentInfo {
                 id,
-                place: stored.place,
-                role: stored.role,
+                workdir: stored.workdir.into(),
                 model: stored.model,
                 effort,
                 archived,
                 status: None,
                 chat: Vec::new(),
             };
-            let directory = manager.shell_directory(&info.place).await?;
-            manager.start(info, log, directory)?;
+            manager.start(info, log)?;
         }
         Ok(manager)
     }
 
-    pub(crate) async fn live(
+    pub(crate) fn live(
         root: Utf8PathBuf,
-        worksets: Arc<Worksets>,
         base_url: String,
         machine_seed: u64,
         initial_counter: u64,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::open(root, worksets, machine_seed, initial_counter, move |info| {
+        Self::open(root, machine_seed, initial_counter, move |info| {
             Arc::new(Model::OpenAi(OpenAi {
                 base_url: base_url.clone(),
                 model: info.model.clone(),
@@ -156,69 +148,18 @@ impl Agents2 {
                 auth: "default".into(),
             }))
         })
-        .await
-    }
-
-    async fn shell_directory(&self, place: &Place) -> anyhow::Result<Utf8PathBuf> {
-        let workset = self.worksets.open_workset(&place.workset).await?;
-        let directory = workset.host_path(&place.cwd)?;
-        anyhow::ensure!(
-            directory.is_dir(),
-            "workset working directory does not exist: {directory}"
-        );
-        Ok(directory)
-    }
-
-    async fn resolve_place(
-        &self,
-        start: wire::StartMode,
-        mode: WorksetMode,
-    ) -> anyhow::Result<Place> {
-        match start {
-            wire::StartMode::NewOn { repo, revset } => {
-                let origin = expand_home(&repo).unwrap_or(repo);
-                let name = rho_fs_view::repo_name(origin.as_str())
-                    .with_context(|| format!("no repository name in {origin}"))?;
-                let workset = self.worksets.create().await?;
-                let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
-                workset.checkout(&checkout, &revset).await?;
-                Ok(Place {
-                    workset: workset.id().to_owned(),
-                    cwd: visible_path(&workset, &checkout)?,
-                    mode,
-                    origin: Some(origin),
-                })
-            }
-            wire::StartMode::Join(wire::JoinTarget::Workspace(WorkspaceInfo::Workset(
-                mut place,
-            ))) => {
-                place.mode = mode;
-                self.shell_directory(&place).await?;
-                Ok(place)
-            }
-            wire::StartMode::Join(_) => anyhow::bail!(
-                "agents no longer work in the user's own checkout: start on the repository's URL or path instead"
-            ),
-        }
     }
 
     fn log_path(&self, id: &wire::AgentId) -> PathBuf {
         self.root.join(id.encoded()).join("log").into_std_path_buf()
     }
 
-    fn start(
-        self: &Arc<Self>,
-        mut info: wire::AgentInfo,
-        log: log::Log,
-        directory: Utf8PathBuf,
-    ) -> anyhow::Result<()> {
+    fn start(self: &Arc<Self>, mut info: wire::AgentInfo, log: log::Log) -> anyhow::Result<()> {
         let id = info.id.clone();
-        // TODO: Start the notebook inside a workset child process before using the
-        // namespace view. The in-process runtime cannot enter `/src` safely.
         let shell = rho_tool_shell::ShellTools::in_directory(
             Duration::from_secs(20),
-            directory,
-            self.worksets.path_overrides().clone(),
+            info.workdir.clone(),
+            rho_fs_view::PathOverrides::default(),
         );
         let (agent, handle) = Agent::new(Config {
             id,
@@ -345,10 +286,12 @@ impl Agents2 {
         self.changes.subscribe()
     }
 
-    async fn create(self: &Arc<Self>, call: wire::CreateAgent) -> anyhow::Result<wire::AgentId> {
+    fn create(self: &Arc<Self>, call: wire::CreateAgent) -> anyhow::Result<wire::AgentId> {
+        let workdir = std::fs::canonicalize(&call.workdir)
+            .with_context(|| format!("workdir {}", call.workdir))?;
+        anyhow::ensure!(workdir.is_dir(), "agent2 workdir must be a directory");
+        let workdir = Utf8PathBuf::try_from(workdir).context("workdir is not UTF-8")?;
         anyhow::ensure!(!call.model.trim().is_empty(), "model is empty");
-        let place = self.resolve_place(call.start, call.mode).await?;
-        let directory = self.shell_directory(&place).await?;
         let id = {
             let mut identity = self.identity.lock().unwrap();
             let id = wire::AgentId::from_counter(
@@ -366,23 +309,21 @@ impl Agents2 {
         let dir = self.root.join(id.encoded());
         std::fs::create_dir(&dir)?;
         let stored = Stored {
-            place: place.clone(),
-            role: call.role,
+            workdir: workdir.to_string(),
             model: call.model.clone(),
             effort: call.effort.to_string(),
         };
-        std::fs::write(dir.join("config.senax"), senax_encoder::pack(&stored)?)?;
+        std::fs::write(dir.join("config.json"), serde_json::to_vec(&stored)?)?;
         let info = wire::AgentInfo {
             id: id.clone(),
-            place,
-            role: call.role,
+            workdir,
             model: call.model,
             effort: call.effort,
             archived: false,
             status: None,
             chat: Vec::new(),
         };
-        self.start(info, log::Log::open(&self.log_path(&id))?, directory)?;
+        self.start(info, log::Log::open(&self.log_path(&id))?)?;
         let _ = self.changes.send(wire::ServerFrame::Created {
             agent: self
                 .records
@@ -558,7 +499,7 @@ where
         }
         wire::Open::Request(request) => match request {
             wire::Request::CreateAgent(call) => {
-                respond(&mut writer, call, |call| manager.create(call)).await
+                respond(&mut writer, call, |call| async { manager.create(call) }).await
             }
             wire::Request::SendMessage(call) => {
                 respond(&mut writer, call, |call| async { manager.send(call) }).await
@@ -594,44 +535,6 @@ mod tests {
 
     use super::*;
 
-    async fn test_worksets(dir: &std::path::Path) -> Arc<Worksets> {
-        Worksets::open(
-            dir.join("worksets-state"),
-            rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),
-            Default::default(),
-            rho_fs_view::StoreService::None,
-        )
-        .await
-        .unwrap()
-    }
-
-    async fn test_place(worksets: &Arc<Worksets>) -> Place {
-        let workset = worksets.create().await.unwrap();
-        Place {
-            workset: workset.id().to_owned(),
-            cwd: "/src".into(),
-            mode: WorksetMode::View,
-            origin: None,
-        }
-    }
-
-    fn new_agent(
-        place: Place,
-        effort: wire::Effort,
-        initial_message: Option<&str>,
-    ) -> wire::CreateAgent {
-        wire::CreateAgent {
-            start: wire::StartMode::Join(wire::JoinTarget::Workspace(WorkspaceInfo::Workset(
-                place,
-            ))),
-            mode: WorksetMode::View,
-            role: AgentRole::default(),
-            model: "scripted".into(),
-            effort,
-            initial_message: initial_message.map(str::to_owned),
-        }
-    }
-
     async fn until(mut good: impl FnMut() -> bool) {
         tokio::time::timeout(Duration::from_secs(12), async {
             while !good() {
@@ -643,133 +546,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn new_on_checks_out_selected_revision_and_join_reuses_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("source");
-        std::fs::create_dir(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let result = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-        };
-        git(&["init", "--quiet"]);
-        std::fs::write(repo.join("selection"), "base").unwrap();
-        git(&["add", "selection"]);
-        git(&[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.org",
-            "commit",
-            "--quiet",
-            "-m",
-            "base",
-        ]);
-        std::fs::write(repo.join("selection"), "newer").unwrap();
-        git(&["add", "selection"]);
-        git(&[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.org",
-            "commit",
-            "--quiet",
-            "-m",
-            "newer",
-        ]);
-
-        let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let worksets = test_worksets(dir.path()).await;
-        let model = Arc::new(Scripted::new());
-        let manager = Agents2::open(root.clone(), worksets.clone(), 3, 0, {
-            let model = model.clone();
-            move |_| Arc::new(Model::Scripted(model.clone()))
-        })
-        .await
-        .unwrap();
-        let origin = Utf8PathBuf::try_from(repo).unwrap();
-        let role = AgentRole::default();
-        let first = manager
-            .create(wire::CreateAgent {
-                start: wire::StartMode::NewOn {
-                    repo: origin.clone(),
-                    revset: "HEAD~1".into(),
-                },
-                mode: WorksetMode::View,
-                role,
-                model: "scripted".into(),
-                effort: wire::Effort::Medium,
-                initial_message: None,
-            })
-            .await
-            .unwrap();
-        let place = manager
-            .snapshot()
-            .into_iter()
-            .find(|info| info.id == first)
-            .unwrap()
-            .place;
-        assert_eq!(place.cwd, Utf8PathBuf::from("/src/source"));
-        assert_eq!(place.origin.as_ref(), Some(&origin));
-        let workset = worksets.open_workset(&place.workset).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(workset.host_path(&place.cwd).unwrap().join("selection"))
-                .unwrap(),
-            "base"
-        );
-        let second = manager
-            .create(wire::CreateAgent {
-                start: wire::StartMode::Join(wire::JoinTarget::Workspace(WorkspaceInfo::Workset(
-                    place.clone(),
-                ))),
-                mode: WorksetMode::Exposed,
-                role,
-                model: "scripted".into(),
-                effort: wire::Effort::High,
-                initial_message: None,
-            })
-            .await
-            .unwrap();
-        let joined = manager
-            .snapshot()
-            .into_iter()
-            .find(|info| info.id == second)
-            .unwrap();
-        assert_eq!(joined.place.workset, place.workset);
-        assert_eq!(joined.place.cwd, place.cwd);
-        assert_eq!(joined.place.mode, WorksetMode::Exposed);
-        assert_eq!(joined.role, role);
-        drop(manager);
-        let reloaded = Agents2::open(root, worksets, 3, 0, move |_| {
-            Arc::new(Model::Scripted(model.clone()))
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            reloaded
-                .snapshot()
-                .into_iter()
-                .find(|info| info.id == second)
-                .unwrap()
-                .place,
-            joined.place
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn chat_archive_revival_and_host_restart_use_the_persistent_log() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let worksets = test_worksets(dir.path()).await;
-        let place = test_place(&worksets).await;
+        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
         let script = Arc::new(Scripted::new());
         script
             .then("human.status('ready')\nhuman.send('hello')\nawait human.reply()")
@@ -778,12 +558,14 @@ mod tests {
             let script = script.clone();
             move |_: &wire::AgentInfo| Arc::new(Model::Scripted(script.clone()))
         };
-        let manager = Agents2::open(root.clone(), worksets.clone(), 0, 0, make_model)
-            .await
-            .unwrap();
+        let manager = Agents2::open(root.clone(), 0, 0, make_model).unwrap();
         let id = manager
-            .create(new_agent(place, wire::Effort::High, Some("start")))
-            .await
+            .create(wire::CreateAgent {
+                workdir,
+                model: "scripted".into(),
+                effort: wire::Effort::High,
+                initial_message: Some("start".into()),
+            })
             .unwrap();
         until(|| {
             manager.snapshot()[0].chat.iter().any(|event| {
@@ -818,10 +600,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let restart_script = Arc::new(Scripted::new());
         restart_script.then("human.send('restarted')\nawait human.reply()");
-        let reloaded = Agents2::open(root, worksets, 0, 0, move |_: &wire::AgentInfo| {
+        let reloaded = Agents2::open(root, 0, 0, move |_: &wire::AgentInfo| {
             Arc::new(Model::Scripted(restart_script.clone()))
         })
-        .await
         .unwrap();
         assert_eq!(reloaded.snapshot()[0].chat, before);
         until(|| reloaded.snapshot()[0].chat.iter().any(|event| matches!(&event.kind,
@@ -833,32 +614,33 @@ mod tests {
     async fn ids_continue_after_restart_in_the_host_machine_domain() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let worksets = test_worksets(dir.path()).await;
-        let place = test_place(&worksets).await;
+        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
         let model = Arc::new(Scripted::new());
-        let manager = Agents2::open(root.clone(), worksets.clone(), 77, 19, {
+        let manager = Agents2::open(root.clone(), 77, 19, {
             let model = model.clone();
             move |_| Arc::new(Model::Scripted(model.clone()))
         })
-        .await
         .unwrap();
-        let new_agent = || new_agent(place.clone(), wire::Effort::Medium, None);
-        let first = manager.create(new_agent()).await.unwrap();
+        let new_agent = || wire::CreateAgent {
+            workdir: workdir.clone(),
+            model: "scripted".into(),
+            effort: wire::Effort::Medium,
+            initial_message: None,
+        };
+        let first = manager.create(new_agent()).unwrap();
         assert_eq!(first.to_counter(&AgentIdDomain(77)), 20);
         drop(manager);
-        let restarted = Agents2::open(root.clone(), worksets.clone(), 77, 19, move |_| {
+        let restarted = Agents2::open(root.clone(), 77, 19, move |_| {
             Arc::new(Model::Scripted(model.clone()))
         })
-        .await
         .unwrap();
-        let second = restarted.create(new_agent()).await.unwrap();
+        let second = restarted.create(new_agent()).unwrap();
         assert_eq!(second.to_counter(&AgentIdDomain(77)), 21);
         assert_ne!(second, first);
         assert!(
-            Agents2::open(root, worksets, 78, 19, |_| Arc::new(Model::Scripted(
-                Arc::new(Scripted::new())
-            )))
-            .await
+            Agents2::open(root, 78, 19, |_| Arc::new(Model::Scripted(Arc::new(
+                Scripted::new()
+            ))))
             .is_err()
         );
     }
@@ -867,22 +649,28 @@ mod tests {
     async fn agent_mail_routes_into_recipient_chat_and_model() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8PathBuf::try_from(dir.path().join("state")).unwrap();
-        let worksets = test_worksets(dir.path()).await;
-        let place = test_place(&worksets).await;
+        let workdir = Utf8PathBuf::try_from(dir.path().to_path_buf()).unwrap();
         let script = Arc::new(Scripted::new());
-        let manager = Agents2::open(root, worksets, 0, 0, {
+        let manager = Agents2::open(root, 0, 0, {
             let script = script.clone();
             move |_: &wire::AgentInfo| Arc::new(Model::Scripted(script.clone()))
         })
-        .await
         .unwrap();
         let recipient = manager
-            .create(new_agent(place.clone(), wire::Effort::Low, None))
-            .await
+            .create(wire::CreateAgent {
+                workdir: workdir.clone(),
+                model: "scripted".into(),
+                effort: wire::Effort::Low,
+                initial_message: None,
+            })
             .unwrap();
         let sender = manager
-            .create(new_agent(place, wire::Effort::High, None))
-            .await
+            .create(wire::CreateAgent {
+                workdir,
+                model: "scripted".into(),
+                effort: wire::Effort::High,
+                initial_message: None,
+            })
             .unwrap();
         script
             .then(&format!(
