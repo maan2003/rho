@@ -663,8 +663,8 @@ where
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
     let agent = services.resolve_display_agent_id(agent).await?;
-    let process = services.pool.execution(agent).await?;
-    let cwd = services.db.read().get_agent(agent).config.place.cwd;
+    let process = services.resource_execution(agent).await?;
+    let cwd = services.resource_cwd(agent);
     process
         .action(rho_agent::WorksetAction::ShellStart {
             agent,
@@ -682,8 +682,7 @@ async fn shell_attach(
 ) -> anyhow::Result<rho_agent::WorksetClient> {
     let agent = services.resolve_display_agent_id(agent).await?;
     services
-        .pool
-        .execution(agent)
+        .resource_execution(agent)
         .await?
         .attach(rho_agent::WorksetAttach::Shell { agent })
         .await
@@ -715,8 +714,7 @@ async fn shell_list(
 async fn shell_close(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
     let agent = services.resolve_display_agent_id(agent).await?;
     services
-        .pool
-        .execution(agent)
+        .resource_execution(agent)
         .await?
         .action(rho_agent::WorksetAction::ShellClose { agent })
         .await?;
@@ -815,8 +813,8 @@ async fn terminal_attach(
     rows: u16,
 ) -> anyhow::Result<rho_agent::WorksetClient> {
     let agent = services.resolve_display_agent_id(agent).await?;
-    let process = services.pool.execution(agent).await?;
-    let cwd = services.db.read().get_agent(agent).config.place.cwd;
+    let process = services.resource_execution(agent).await?;
+    let cwd = services.resource_cwd(agent);
     let shell = services
         .user_environment
         .get("SHELL")

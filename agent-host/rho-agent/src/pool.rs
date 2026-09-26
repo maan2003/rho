@@ -239,6 +239,18 @@ impl AgentPool {
         self.process(&view).await
     }
 
+    /// Resource sessions for an agent whose place is owned outside the legacy
+    /// DB.
+    pub async fn execution_place(
+        self: &Arc<Self>,
+        place: &Place,
+    ) -> anyhow::Result<Arc<crate::worker::Process>> {
+        let slot = self.execution_slot(&place.workset).await;
+        let _admission = slot.admission.clone().read_owned().await;
+        let view = self.materialize_view(place).await?;
+        self.process(&view).await
+    }
+
     pub async fn executions(&self) -> Vec<Arc<crate::worker::Process>> {
         let slots = self
             .processes
@@ -1215,6 +1227,8 @@ mod tests {
         .await
         .unwrap();
         let process = pool.process(&view).await.unwrap();
+        let resource = pool.execution_place(&place).await.unwrap();
+        assert!(Arc::ptr_eq(&process, &resource));
         assert!(
             view.state_dir()
                 .join("agents")

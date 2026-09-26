@@ -1084,12 +1084,54 @@ impl Services {
         Ok(start)
     }
 
+    async fn resource_execution(
+        &self,
+        id: AgentId,
+    ) -> anyhow::Result<Arc<rho_agent::WorksetProcess>> {
+        if let Some(agent) = self
+            .agents2
+            .snapshot()
+            .into_iter()
+            .find(|agent| agent.id == id)
+        {
+            self.pool.execution_place(&agent.place).await
+        } else {
+            self.pool.execution(id).await
+        }
+    }
+
+    fn resource_cwd(&self, id: AgentId) -> Utf8PathBuf {
+        self.agents2
+            .snapshot()
+            .into_iter()
+            .find(|agent| agent.id == id)
+            .map_or_else(
+                || self.db.read().get_agent(id).config.place.cwd,
+                |agent| agent.place.cwd,
+            )
+    }
+
     async fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
         let text = agent_id.trim();
         let (prefix, raw_agent_id) = match text.split_once('-') {
             Some((prefix, raw)) => (Some(prefix), raw),
             None => (None, text),
         };
+        if let Ok(id) = AgentId::from_encoded(raw_agent_id)
+            && let Some(agent) = self
+                .agents2
+                .snapshot()
+                .into_iter()
+                .find(|agent| agent.id == id)
+        {
+            if let Some(prefix) = prefix {
+                anyhow::ensure!(
+                    prefix == agent.role.handle_prefix(),
+                    "agent handle prefix does not match its role"
+                );
+            }
+            return Ok(id);
+        }
         let resolved = match self.pool.resolve_agent_id(raw_agent_id)? {
             prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
             prefix_id::PrefixResolution::Ambiguous { .. } => {
@@ -1704,7 +1746,7 @@ where
     use rho_desktop_proto::{Input, Packet, Request, Response};
     let result = async {
         let agent = services.resolve_display_agent_id(&agent).await?;
-        let process = services.pool.execution(agent).await?;
+        let process = services.resource_execution(agent).await?;
         #[cfg(not(target_os = "linux"))]
         anyhow::bail!("agent desktops require a Linux agent host");
         #[cfg(target_os = "linux")]
