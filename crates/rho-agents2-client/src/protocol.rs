@@ -273,6 +273,12 @@ pub enum ServerFrame {
         agent_id: AgentId,
         since: Option<UnixMs>,
     },
+    Auth {
+        auth: AuthState,
+    },
+    QuotaUsage {
+        summaries: Vec<QuotaSummary>,
+    },
 }
 
 #[cfg(test)]
@@ -447,5 +453,33 @@ mod tests {
             senax_encoder::unpack::<ServerFrame>(&mut bytes.as_ref()).unwrap(),
             frame
         );
+        let frames = [
+            ServerFrame::Auth {
+                auth: AuthState {
+                    namespaces: vec!["primary".into(), "secondary".into()],
+                    disabled_namespaces: vec!["secondary".into()],
+                    active_namespace: Some("primary".into()),
+                },
+            },
+            ServerFrame::QuotaUsage {
+                summaries: vec![QuotaSummary {
+                    model: "gpt".into(),
+                    auth_namespace: Some("primary".into()),
+                    remaining_percent: 13,
+                    burn_10m: 2,
+                    burn_2h: 4,
+                    burn_1d: 9,
+                    burn_3d: 21,
+                    reset_at_unix: Some(456),
+                }],
+            },
+        ];
+        for frame in frames {
+            let bytes = senax_encoder::pack(&frame).unwrap();
+            assert_eq!(
+                senax_encoder::unpack::<ServerFrame>(&mut bytes.as_ref()).unwrap(),
+                frame
+            );
+        }
     }
 }

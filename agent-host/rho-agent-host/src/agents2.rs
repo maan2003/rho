@@ -739,6 +739,23 @@ fn convert_chat(event: chat2::ChatEvent) -> Option<wire::ChatEvent> {
     })
 }
 
+fn auth_frame(services: &Services) -> wire::ServerFrame {
+    let auth = services.auth_state();
+    wire::ServerFrame::Auth {
+        auth: wire::AuthState {
+            namespaces: auth.namespaces,
+            disabled_namespaces: auth.disabled_namespaces,
+            active_namespace: auth.active_namespace,
+        },
+    }
+}
+
+fn quota_frame(services: &Services) -> wire::ServerFrame {
+    wire::ServerFrame::QuotaUsage {
+        summaries: crate::usage::quota_summaries(&services.db, &services.inference),
+    }
+}
+
 pub(crate) async fn serve<R, W>(
     services: Arc<Services>,
     open: wire::Open,
@@ -771,9 +788,29 @@ where
                 &wire::ServerFrame::Snapshot { agents: snapshot },
             )
             .await?;
+            let mut inference = services.inference.subscribe();
+            let mut quota = services.quota.subscribe();
+            let mut refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            refresh.tick().await;
+            write_frame(&mut writer, &auth_frame(&services)).await?;
+            write_frame(&mut writer, &quota_frame(&services)).await?;
             loop {
                 let change = tokio::select! {
                     change = changes.recv() => change,
+                    result = inference.changed() => {
+                        if result.is_err() { break Ok(()); }
+                        write_frame(&mut writer, &auth_frame(&services)).await?;
+                        continue;
+                    }
+                    result = quota.changed() => {
+                        if result.is_err() { break Ok(()); }
+                        write_frame(&mut writer, &quota_frame(&services)).await?;
+                        continue;
+                    }
+                    _ = refresh.tick() => {
+                        write_frame(&mut writer, &quota_frame(&services)).await?;
+                        continue;
+                    }
                     input = reader.read_u8() => match input {
                         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
                         Err(error) => break Err(error.into()),
@@ -823,6 +860,13 @@ where
                             )
                             .await?;
                         }
+                    }
+                    Ok(wire::ServerFrame::Auth { auth }) => {
+                        write_frame(&mut writer, &wire::ServerFrame::Auth { auth }).await?;
+                    }
+                    Ok(wire::ServerFrame::QuotaUsage { summaries }) => {
+                        write_frame(&mut writer, &wire::ServerFrame::QuotaUsage { summaries })
+                            .await?;
                     }
                     Ok(wire::ServerFrame::Snapshot { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {

@@ -3503,6 +3503,19 @@ impl Workspace {
                     }
                 }
             }
+            Agent2Frame::Auth { auth } => {
+                self.quotas.set_auth(host, auth);
+                if let Some(view) = self.usage.opened_view() {
+                    let history = self.quotas.merged_history(&self.hosts);
+                    let active = self.quotas.active_namespaces(&self.hosts);
+                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
+                }
+                cx.notify();
+            }
+            Agent2Frame::QuotaUsage { summaries } => {
+                self.quotas.set_summaries(host, summaries);
+                cx.notify();
+            }
             Agent2Frame::RunningSince { agent_id, since } => {
                 if let Some((owner, info)) = self.agent2.get_mut(&agent_id)
                     && *owner == host
