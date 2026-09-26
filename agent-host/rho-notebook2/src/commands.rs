@@ -189,7 +189,7 @@ pub(crate) fn command(
 /// How a command ended, as awaiting its handle returns it.
 fn exit_reply(id: u64, result: Result<CommandExit, String>) -> Reply {
     Ok(result.unwrap_or(CommandExit {
-        id,
+        id: u64::from(crate::source::session_id(id)),
         exit_code: None,
     }))
     .map(|exit| {
@@ -256,8 +256,8 @@ pub(crate) struct Command {
 #[pymethods]
 impl Command {
     #[getter]
-    fn id(&self) -> u64 {
-        self.id
+    fn id(&self) -> u32 {
+        crate::source::session_id(self.id)
     }
 
     /// The live command a report's session ID refers to.
@@ -345,7 +345,7 @@ impl Command {
     }
 
     fn __repr__(&self) -> String {
-        format!("<command {}>", self.id)
+        format!("<command {}>", crate::source::session_id(self.id))
     }
 }
 
@@ -419,7 +419,7 @@ pub(crate) async fn run_command(
             wake.notify_one();
         }
         Ok(CommandExit {
-            id: job.id,
+            id: u64::from(crate::source::session_id(job.id)),
             exit_code,
         })
     };

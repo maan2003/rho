@@ -289,3 +289,19 @@ async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
         "{text}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_handle_and_await_result_use_scrambled_session_id() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("job = command('exit 7')\nprint(job.id, (await job)['id'])".into());
+    finished(&wake, &cell).await;
+    let command = notebook
+        .facts()
+        .iter()
+        .find(|f| f.kind == crate::Kind::Command)
+        .unwrap()
+        .session_id;
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains(&format!("{command} {command}")), "{text}");
+    assert!(!text.contains("2 2"), "raw internal ID leaked: {text}");
+}
