@@ -7,7 +7,6 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -33,6 +32,7 @@ pub(crate) fn session_id(internal_id: u64) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Cell,
+    Task,
     Command,
     Call,
 }
@@ -82,6 +82,9 @@ pub(crate) struct Process {
 }
 
 pub(crate) struct State {
+    pub(crate) output_bytes: usize,
+    pub(crate) dropped_output: bool,
+    pub(crate) pending_failure: bool,
     pub(crate) budget: usize,
     /// Output not yet reported. A call's arrives with its end; a cell's and
     /// a command's as they come.
@@ -112,18 +115,8 @@ pub(crate) struct State {
 pub(crate) struct CellState {
     pub(crate) returned: Option<UnixMs>,
     pub(crate) cancelled: bool,
-    pub(crate) checkin: Option<Checkin>,
     pub(crate) stream: StreamProgress,
     pub(crate) stream_stopped: bool,
-}
-
-/// What a cell's wait controls asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Checkin {
-    /// `set_max_wait`, if it was called.
-    pub after: Option<Duration>,
-    /// Cleared by `suppress_tool_wakeups()`.
-    pub wake_on_tools: bool,
 }
 
 /// How far a streamed cell's code has got, as byte ends of whole top-level
@@ -141,6 +134,20 @@ pub(crate) struct Log {
     pub(crate) dropped: usize,
     pub(crate) cursor: usize,
     pub(crate) exit: Option<Result<CommandExit, String>>,
+    pub(crate) gone: bool,
+}
+
+impl State {
+    pub(crate) fn output(&mut self, bytes: &[u8]) {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let keep = bytes.len().min(LIMIT.saturating_sub(self.output_bytes));
+        self.unsent.push(&bytes[..keep]);
+        self.output_bytes += keep;
+        if keep < bytes.len() && !self.dropped_output {
+            self.dropped_output = true;
+            self.unsent.push(b"\n[output past 4 MB was dropped]\n");
+        }
+    }
 }
 
 impl Source {
@@ -161,6 +168,9 @@ impl Source {
             cancel: Notify::new(),
             process,
             state: Mutex::new(State {
+                output_bytes: 0,
+                dropped_output: false,
+                pending_failure: false,
                 budget,
                 unsent: BoundedOutput::for_tokens(Some(budget)),
                 since: None,
@@ -186,7 +196,7 @@ impl Source {
     /// Whether it still owes a report: its end, or pages asked for since.
     pub(crate) fn owes_report(&self) -> bool {
         let state = self.state.lock().unwrap();
-        !state.delivered || !state.pages.is_empty()
+        !state.delivered || !state.pages.is_empty() || !state.unsent.is_empty()
     }
 
     pub(crate) fn take_images(&self) -> Vec<Image> {
@@ -195,7 +205,7 @@ impl Source {
 
     fn label(&self) -> &str {
         match self.kind {
-            Kind::Cell => "Cell",
+            Kind::Cell | Kind::Task => "Task",
             Kind::Command => "Command",
             Kind::Call => &self.name,
         }
@@ -206,17 +216,29 @@ impl Source {
     pub(crate) fn report(&self, old: bool) -> Option<String> {
         let mut state = self.state.lock().unwrap();
         let state = &mut *state;
+        if state.pending_failure {
+            return None;
+        }
         if !state.pages.is_empty() {
             return Some(self.answer_pages(state, old));
         }
         if state.delivered {
-            return None;
+            if state.unsent.is_empty() {
+                return None;
+            }
+            state.notified = None;
+            state.since = None;
+            return Some(format!(
+                "Session ID: {}\nOutput:\n{}",
+                session_id(self.id),
+                take(state)
+            ));
         }
         state.notified = None;
         // A call's text is its result, so it arrives with its end.
         let output =
             !state.unsent.is_empty() && (self.kind != Kind::Call || state.finished.is_some());
-        if state.finished.is_some() && !state.announced && self.kind != Kind::Command {
+        if state.finished.is_some() && !state.announced && !state.failed {
             // Ended before anyone heard of it: its words are plain.
             state.delivered = true;
             let mut parts = Vec::new();
@@ -227,7 +249,7 @@ impl Source {
                 parts.push(format!("{} failed: {error}", self.name));
             }
             // A silent cell still ended, and the model is owed that much.
-            if self.kind == Kind::Cell && parts.is_empty() {
+            if matches!(self.kind, Kind::Cell | Kind::Task) && parts.is_empty() {
                 parts.push(self.end(state));
             }
             return (!parts.is_empty()).then(|| parts.join("\n"));
@@ -237,20 +259,36 @@ impl Source {
         }
         let mut parts = Vec::new();
         if state.finished.is_some() {
-            if state.announced {
+            if state.announced || self.kind != Kind::Cell {
                 parts.push(format!("Session ID: {}", session_id(self.id)));
             }
+            if old {
+                match self.kind {
+                    Kind::Command => parts.push(format!("Command: {}", self.name)),
+                    Kind::Task => parts.push(format!("Task: {}()", self.name)),
+                    _ => {}
+                }
+            }
             parts.push(self.end(state));
+            if matches!(self.kind, Kind::Cell | Kind::Task)
+                && let Some(error) = &state.error
+            {
+                parts.push(error.clone());
+            }
         } else {
             state.announced = true;
             parts.push(format!(
-                "{} running with session ID {}",
+                "{} running in background with session ID {}",
                 self.label(),
                 session_id(self.id)
             ));
-        }
-        if old && self.kind == Kind::Command {
-            parts.push(format!("Command: {}", self.name));
+            if old {
+                match self.kind {
+                    Kind::Command => parts.push(format!("Command: {}", self.name)),
+                    Kind::Task => parts.push(format!("Task: {}()", self.name)),
+                    _ => {}
+                }
+            }
         }
         if output {
             // A report and `more_output` share one cursor, so a page after a
@@ -272,9 +310,9 @@ impl Source {
     /// How it ended, in one line.
     fn end(&self, state: &State) -> String {
         match self.kind {
-            Kind::Cell if state.cell.cancelled => "Cell cancelled".to_owned(),
-            Kind::Cell if state.failed => "Cell failed".to_owned(),
-            Kind::Cell => "Cell finished".to_owned(),
+            Kind::Cell | Kind::Task if state.cell.cancelled => "Task cancelled".to_owned(),
+            Kind::Cell | Kind::Task if state.failed => "Task failed".to_owned(),
+            Kind::Cell | Kind::Task => "Task finished".to_owned(),
             Kind::Call => match &state.error {
                 Some(error) => format!("{} failed: {error}", self.name),
                 None => format!("{} finished", self.name),
@@ -301,14 +339,14 @@ impl Source {
             parts.push(format!("Command: {}", self.name));
         }
         state.paged_at = None;
-        for tokens in std::mem::take(&mut state.pages) {
-            parts.push(page(state, tokens));
-        }
         if state.finished.is_none() {
             state.announced = true;
         } else if !state.delivered {
             parts.push(self.end(state));
             state.delivered = true;
+        }
+        for tokens in std::mem::take(&mut state.pages) {
+            parts.push(page(state, tokens));
         }
         parts.join("\n")
     }
@@ -323,7 +361,6 @@ impl Source {
             notified_at: state.notified,
             paged_at: state.paged_at,
             returned: state.cell.returned,
-            checkin: state.cell.checkin,
             finished: state.finished.map(|at| End {
                 at,
                 failed: state.failed,
@@ -349,6 +386,9 @@ fn page(state: &mut State, max_tokens: usize) -> String {
     let Some(log) = state.log.as_mut() else {
         return "[only a command can be paged]".to_owned();
     };
+    if log.gone {
+        return "[retained output is gone: notebook reached its 50 MB limit]".to_owned();
+    }
     let start = log.cursor;
     let size = (log.len - start).min(max_tokens * 4);
     let mut bytes = vec![0; size];
@@ -408,7 +448,6 @@ pub struct SourceFacts {
     pub paged_at: Option<UnixMs>,
     /// A cell's code returned. Work it started may still run.
     pub returned: Option<UnixMs>,
-    pub checkin: Option<Checkin>,
     pub finished: Option<End>,
     /// Its end has been reported.
     pub delivered: bool,

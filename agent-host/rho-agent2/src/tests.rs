@@ -5,7 +5,7 @@ use rho_inference2::Item;
 use rho_inference2::scripted::Scripted;
 
 use crate::chat::ChatKind;
-use crate::log::{Block, Entry, Log, Notice, Party, Wake};
+use crate::log::{Block, Entry, Log, Party, Wake};
 use crate::{Agent, AgentHandle, Config, Inbound};
 
 fn shell(dir: &tempfile::TempDir) -> rho_tool_shell::ShellTools {
@@ -73,16 +73,14 @@ async fn an_agent_talks_only_through_messages_and_waits_on_the_human() {
 
     say(&handle, "hi");
     until_chat(&mut chat, sent("hello")).await;
-    until_chat(&mut chat, |kind| {
-        matches!(kind, ChatKind::Awaiting(Some(_)))
-    })
-    .await;
     say(&handle, "bye");
-    until_chat(&mut chat, |kind| matches!(kind, ChatKind::Awaiting(None))).await;
-    until_chat(&mut chat, |kind| {
-        matches!(kind, ChatKind::Awaiting(Some(_)))
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while model.remaining() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
-    .await;
+    .await
+    .unwrap();
     assert_eq!(model.remaining(), 0);
 
     let requests = model.requests();
@@ -107,7 +105,7 @@ async fn an_agent_talks_only_through_messages_and_waits_on_the_human() {
         panic!("{:?}", requests[1].items)
     };
     assert_eq!(call_id, "call_1");
-    assert_eq!(text, "Cell finished", "the cell said nothing");
+    assert_eq!(text, "Task finished", "the cell said nothing");
     assert_eq!(second, "Message from the human:\nbye");
     drop(handle);
     running.abort();
@@ -174,10 +172,10 @@ async fn a_restarted_agent_is_told_its_notebook_is_gone() {
     model.then("await human.reply()");
     let (agent, handle) = start(&dir, Log::open(&path).unwrap(), Arc::clone(&model));
     assert!(
-        agent
+        !agent
             .chat()
             .iter()
-            .any(|event| event.kind == ChatKind::Notice(Notice::Restarted))
+            .any(|event| matches!(event.kind, ChatKind::Status(_)))
     );
     let running = tokio::spawn(agent.run());
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -241,6 +239,98 @@ async fn a_cut_off_cell_keeps_the_statements_that_ran() {
         .filter(|item| matches!(item, Item::Step(_)))
         .count();
     assert_eq!(steps, 1);
+    drop(handle);
+    running.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_mid_response_waits_two_seconds_after_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model
+        .then("x = 1\ny = 2\nz = 3\na = 4\nb = 5\nc = 6\nawait asyncio.sleep(5)")
+        .then("human.send('saw second')\nawait human.reply()");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut trace = handle.trace();
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "first");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(trace.recv().await.unwrap(), crate::Trace::Woken { .. }) {}
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    say(&handle, "second");
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(trace.recv().await.unwrap(), crate::Trace::Step { .. }) {
+                break tokio::time::Instant::now();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    until_chat(&mut chat, sent("saw second")).await;
+    assert!(
+        completed.elapsed() >= Duration::from_millis(1900),
+        "mid-response mail woke too soon: {:?}",
+        completed.elapsed()
+    );
+    drop(handle);
+    running.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checkin_runs_while_awaiting_human_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model
+        .then("set_max_wait(1)\nawait human.reply()")
+        .then("human.send('checked')\nawait human.reply()");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut trace = handle.trace();
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "wait");
+    until_chat(&mut chat, sent("checked")).await;
+    let mut saw_checkin = false;
+    while let Ok(event) = trace.try_recv() {
+        if matches!(
+            event,
+            crate::Trace::Woken {
+                why: Wake::Checkin,
+                ..
+            }
+        ) {
+            saw_checkin = true;
+        }
+    }
+    assert!(saw_checkin);
+    drop(handle);
+    running.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn archive_mutes_until_human_revives_a_fresh_notebook() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = Arc::new(Scripted::new());
+    model
+        .then("archive()")
+        .then("human.send(str('x' in globals()))\nawait human.reply()");
+    let (agent, handle) = start(&dir, Log::in_memory(), Arc::clone(&model));
+    let mut chat = handle.chat();
+    let running = tokio::spawn(agent.run());
+    say(&handle, "archive");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(model.remaining(), 1, "archive allowed an automatic wake");
+    say(&handle, "return");
+    until_chat(&mut chat, sent("False")).await;
+    assert!(
+        model.requests()[1].items.iter().any(
+            |item| matches!(item, Item::Result { text, .. } if text.contains("fresh notebook"))
+        )
+    );
     drop(handle);
     running.abort();
 }

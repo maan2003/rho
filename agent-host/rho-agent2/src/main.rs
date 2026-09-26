@@ -130,8 +130,5 @@ fn print_event(me: &str, event: &ChatEvent) {
             }
         }
         ChatKind::Status(status) => println!("[{me}: {status}]"),
-        ChatKind::Awaiting(Some(_)) => println!("[{me} is waiting for you]"),
-        ChatKind::Awaiting(None) => {}
-        ChatKind::Notice(notice) => println!("[{me}: {notice:?}]"),
     }
 }

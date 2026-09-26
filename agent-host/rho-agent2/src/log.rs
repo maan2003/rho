@@ -48,11 +48,12 @@ pub enum Block {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Wake {
     Message,
+    AgentMessage,
     /// The latest cell's code returned.
     Returned,
     Notify,
     /// A command or host call ended.
-    Ended,
+    Failure,
     Checkin,
     /// The last step wrote prose and made no call.
     Prose,
@@ -64,8 +65,8 @@ pub enum Wake {
 pub enum Notice {
     Error(String),
     Restarted,
-    /// The agent stopped trying until the human writes.
-    Stopped(String),
+    Archived,
+    FreshNotebook,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

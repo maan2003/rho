@@ -15,8 +15,7 @@ use crate::notebook::{Shared, current, register};
 use crate::runtime::{Build, Inbox, Message, Reply, resolved};
 use crate::source::{CommandExit, Kind, Log, Process, Source};
 
-const LOG_LIMIT: usize = 8 * 1024 * 1024;
-const JOB_LIMIT: usize = 64;
+const LOG_LIMIT: usize = 4 * 1024 * 1024;
 const OUTPUT_TOKEN_LIMIT: usize = 10000;
 
 fn command_name(cmd: &str) -> String {
@@ -39,18 +38,6 @@ fn new_job(
     budget: usize,
 ) -> Result<Arc<Source>, String> {
     let mut jobs = shared.sources.lock().unwrap();
-    if jobs.len() >= JOB_LIMIT {
-        let old = jobs
-            .iter()
-            .find(|(_, j)| j.kind == Kind::Command && j.state.lock().unwrap().delivered)
-            .map(|(id, _)| *id);
-        match old {
-            Some(id) => jobs.remove(&id),
-            None => {
-                return Err("64 sources are still active or awaiting delivery".into());
-            }
-        };
-    }
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     let (writes, queued) = tokio::sync::mpsc::unbounded_channel();
     let job = Arc::new(Source::new(
@@ -65,11 +52,22 @@ fn new_job(
             done: watch::channel(false).0,
         }),
         Some(Log {
-            file: tempfile::tempfile().map_err(|e| e.to_string())?,
+            file: {
+                let dir = std::env::var_os("XDG_STATE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                            .join(".local/state")
+                    })
+                    .join("rho/notebook-output");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                tempfile::tempfile_in(dir).map_err(|e| e.to_string())?
+            },
             len: 0,
             dropped: 0,
             cursor: 0,
             exit: None,
+            gone: false,
         }),
     ));
     jobs.insert(id, Arc::clone(&job));
@@ -122,11 +120,16 @@ pub(crate) fn command(
     // Published synchronously: write_stdin in the same cell can refer to
     // a command whose process has not started yet.
     let job = new_job(shared, &cell, &cmd, budget).map_err(PyRuntimeError::new_err)?;
+    crate::interpreter::kernel(py)?
+        .getattr("CELL")?
+        .call_method0("get")?
+        .call_method1("command", (future.clone_ref(py),))?;
     let id = job.id;
     let shell = shared.shell.clone();
     let reply = future.clone_ref(py);
     let inbox = Arc::clone(&shared.inbox);
     let wake = Arc::clone(&shared.wake);
+    let shared_for_work = Arc::clone(shared);
     let registered = register(
         shared,
         &cell,
@@ -135,8 +138,16 @@ pub(crate) fn command(
             let process = job.process();
             let mut writes = (process.queued.lock().unwrap().take())
                 .expect("a command's task takes its writes once");
-            let result =
-                run_command(&shell, &job, &wake, &cmd, workdir.as_deref(), &mut writes).await;
+            let result = run_command(
+                &shell,
+                &job,
+                &wake,
+                &cmd,
+                workdir.as_deref(),
+                &mut writes,
+                &shared_for_work,
+            )
+            .await;
             // Whatever is still queued never reaches the process.
             writes.close();
             while let Ok(write) = writes.try_recv() {
@@ -161,7 +172,7 @@ pub(crate) fn command(
             wake.notify_one();
             result
         },
-        move |result| inbox.post(Message::Done(reply, exit_reply(result))),
+        move |result| inbox.post(Message::Done(reply, exit_reply(id, result))),
     );
     if let Err(error) = registered {
         shared.sources.lock().unwrap().remove(&id);
@@ -174,8 +185,12 @@ pub(crate) fn command(
 }
 
 /// How a command ended, as awaiting its handle returns it.
-fn exit_reply(result: Result<CommandExit, String>) -> Reply {
-    result.map(|exit| {
+fn exit_reply(id: u64, result: Result<CommandExit, String>) -> Reply {
+    Ok(result.unwrap_or(CommandExit {
+        id,
+        exit_code: None,
+    }))
+    .map(|exit| {
         Box::new(move |py: Python<'_>| Ok(exit.into_pyobject(py)?.into_any().unbind())) as Build
     })
 }
@@ -219,9 +234,7 @@ impl StdinWrite {
     fn settle(self, result: Result<(), String>, job: &Source) {
         if let Err(error) = &result {
             let mut state = job.state.lock().unwrap();
-            state
-                .unsent
-                .push(format!("write_stdin failed: {error}\n").as_bytes());
+            state.output(format!("write_stdin failed: {error}\n").as_bytes());
             state.since.get_or_insert_with(UnixMs::now);
         }
         let (future, inbox) = self.reply;
@@ -295,7 +308,7 @@ impl Command {
                             break Err(error.to_string());
                         }
                     };
-                    inbox.post(Message::Done(reply, exit_reply(result)));
+                    inbox.post(Message::Done(reply, exit_reply(job.id, result)));
                 });
                 result.insert(future).clone_ref(py)
             }
@@ -341,6 +354,7 @@ pub(crate) async fn run_command(
     cmd: &str,
     workdir: Option<&str>,
     writes: &mut tokio::sync::mpsc::UnboundedReceiver<StdinWrite>,
+    shared: &Shared,
 ) -> Result<CommandExit, String> {
     let mut process = tokio::select! {
         biased;
@@ -377,9 +391,14 @@ pub(crate) async fn run_command(
             let event = process.next().await;
             match event {
                 ProcessEvent::Output(chunk) => {
+                    shared.retain_space(job.id, chunk.len());
                     let mut state = job.state.lock().unwrap();
                     let log = state.log.as_mut().expect("a command keeps a log");
-                    let keep = chunk.len().min(LOG_LIMIT - log.len);
+                    let keep = if log.gone {
+                        0
+                    } else {
+                        chunk.len().min(LOG_LIMIT - log.len)
+                    };
                     log.file
                         .seek(SeekFrom::Start(log.len as u64))
                         .map_err(|e| e.to_string())?;
@@ -388,7 +407,7 @@ pub(crate) async fn run_command(
                         .map_err(|e| e.to_string())?;
                     log.len += keep;
                     log.dropped = log.dropped.saturating_add(chunk.len() - keep);
-                    state.unsent.push(&chunk);
+                    state.output(&chunk);
                     state.since.get_or_insert_with(UnixMs::now);
                 }
                 ProcessEvent::Exited(status) => exit_code = status.code(),

@@ -39,8 +39,10 @@ pub(crate) struct Shared {
     /// Cells, commands and calls: one ID space, one table.
     pub(crate) next_id: AtomicU64,
     pub(crate) sources: Mutex<BTreeMap<u64, Arc<Source>>>,
+    pub(crate) retention: Mutex<()>,
     /// Cell ids in the order they started, to tell old sources from new.
     cells: Mutex<Vec<u64>>,
+    checkin: Mutex<(std::time::Duration, bool)>,
     pub(crate) shell: ShellTools,
     /// Woken on any change. `notify_one` stores a permit, so a change that
     /// lands while the owner is busy is not lost.
@@ -74,7 +76,9 @@ impl Notebook {
             tasks: Mutex::new(HostTasks::default()),
             next_id: AtomicU64::new(1),
             sources: Mutex::default(),
+            retention: Mutex::default(),
             cells: Mutex::default(),
+            checkin: Mutex::new((std::time::Duration::from_secs(120), true)),
             shell: shell.clone(),
             wake,
         });
@@ -140,6 +144,14 @@ impl Notebook {
         }
     }
 
+    pub fn checkin(&self) -> (std::time::Duration, bool) {
+        *self.shared.checkin.lock().unwrap()
+    }
+
+    pub fn reset_checkin(&self) {
+        *self.shared.checkin.lock().unwrap() = (std::time::Duration::from_secs(120), true);
+    }
+
     /// Every source that still has something to say, or may yet: what the
     /// owner decides when to report from.
     pub fn facts(&self) -> Vec<SourceFacts> {
@@ -158,7 +170,15 @@ impl Notebook {
         let sources = shared.sources.lock().unwrap().clone();
         let mut chunks = Vec::new();
         let mut images = Vec::new();
-        for source in sources.values() {
+        for source in sources
+            .values()
+            .filter(|s| s.id == cells.last().copied().unwrap_or(0))
+            .chain(
+                sources
+                    .values()
+                    .filter(|s| s.id != cells.last().copied().unwrap_or(0)),
+            )
+        {
             // Named when two or more cells have started since its own.
             let old = cells.iter().filter(|cell| **cell > source.cell).count() >= 2;
             if let Some(text) = source.report(old) {
@@ -166,9 +186,7 @@ impl Notebook {
             }
             images.extend(source.take_images());
         }
-        shared.sources.lock().unwrap().retain(|_, source| {
-            source.kind == Kind::Command || !source.state.lock().unwrap().delivered
-        });
+        // Contexts can emit output after the task ends; keep every source.
         (!chunks.is_empty() || !images.is_empty()).then(|| Report {
             text: chunks.join("\n\n"),
             images,
@@ -218,7 +236,7 @@ impl Drop for Notebook {
 }
 
 fn cancel(shared: &Shared, source: &Source) {
-    if source.kind == Kind::Cell {
+    if matches!(source.kind, Kind::Cell | Kind::Task) {
         let mut state = source.state.lock().unwrap();
         if state.finished.is_none() {
             state.cell.cancelled = true;
@@ -233,18 +251,7 @@ fn cancel(shared: &Shared, source: &Source) {
 /// A cell's own words for an error it ends in.
 fn fail(state: &mut State, error: &str) {
     state.failed = true;
-    say(state, error, false);
-}
-
-fn say(state: &mut State, text: &str, notify: bool) {
-    state.unsent.push(text.as_bytes());
-    if !text.ends_with('\n') {
-        state.unsent.push(b"\n");
-    }
-    state.since.get_or_insert_with(UnixMs::now);
-    if notify {
-        state.notified.get_or_insert_with(UnixMs::now);
-    }
+    state.error = Some(error.to_owned());
 }
 
 /// The owner's hold on one cell.
@@ -297,18 +304,47 @@ impl CellHandle {
     /// Stop this cell and what it started.
     pub fn cancel(&self) {
         let sources = self.shared.sources.lock().unwrap().clone();
-        for source in sources.values().filter(|s| s.cell == self.cell.id) {
+        for source in sources
+            .values()
+            .filter(|s| s.id == self.cell.id || (s.kind == Kind::Command && s.cell == self.cell.id))
+        {
             cancel(&self.shared, source);
         }
     }
 }
 
 impl Shared {
+    /// Keep at most 50 MB across live retained command logs, dropping oldest
+    /// first.
+    pub(crate) fn retain_space(&self, current: u64, incoming: usize) {
+        let _guard = self.retention.lock().unwrap();
+        let sources = self.sources.lock().unwrap();
+        let mut total: usize = sources
+            .values()
+            .filter_map(|source| source.state.lock().unwrap().log.as_ref().map(|log| log.len))
+            .sum();
+        for source in sources.values().filter(|source| source.id != current) {
+            if total + incoming <= 50 * 1024 * 1024 {
+                break;
+            }
+            let mut state = source.state.lock().unwrap();
+            if let Some(log) = state.log.as_mut()
+                && !log.gone
+            {
+                total -= log.len;
+                log.gone = true;
+                log.len = 0;
+                log.cursor = 0;
+                let _ = log.file.set_len(0);
+            }
+        }
+    }
+
     /// The runtime ended: every cell still running learns why.
     pub(crate) fn stop_runtime(&self, error: Option<String>) {
         self.stopped.store(true, Ordering::Release);
         for source in self.sources.lock().unwrap().values() {
-            if source.kind != Kind::Cell {
+            if !matches!(source.kind, Kind::Cell | Kind::Task) {
                 source.cancel.notify_one();
                 continue;
             }
@@ -422,6 +458,26 @@ impl Cell {
         self.source.id
     }
 
+    fn pending_failure(&self) {
+        self.source.state.lock().unwrap().pending_failure = true;
+    }
+
+    fn claimed(&self) {
+        let mut state = self.source.state.lock().unwrap();
+        state.pending_failure = false;
+        state.delivered = true;
+        state.finished = Some(UnixMs::now());
+        self.shared.wake.notify_one();
+    }
+
+    fn cancel_commands(&self) {
+        for source in self.shared.sources.lock().unwrap().values() {
+            if source.cell == self.source.id && source.kind == Kind::Command {
+                source.cancel.notify_one();
+            }
+        }
+    }
+
     fn started(&self) {}
 
     fn unit_ready(&self, end: usize) {
@@ -449,50 +505,46 @@ impl Cell {
             state.cell.returned = Some(UnixMs::now());
             if let Some(error) = &error {
                 fail(&mut state, error);
+                state.finished = state.cell.returned;
             }
         }
     }
 
     /// Everything the cell started has ended; `error` is what failed after
     /// its code returned.
-    fn finished(&self, error: Option<String>) {
+    fn finished(&self, error: Option<String>, cancelled: bool) {
         if let Some(mut state) = self.state() {
+            state.cell.cancelled = cancelled;
+            state.pending_failure = false;
             if let Some(error) = error {
                 fail(&mut state, &error);
             }
-            state.finished = Some(UnixMs::now());
+            state.finished = Some(if state.failed && self.source.kind == Kind::Task {
+                UnixMs(UnixMs::now().0.saturating_sub(20_000))
+            } else {
+                UnixMs::now()
+            });
             state.cell.returned.get_or_insert(UnixMs::now());
         }
     }
 
     fn text(&self, text: &str, important: bool) {
-        if let Some(mut state) = self.state() {
-            state.unsent.push(text.as_bytes());
-            state.since.get_or_insert_with(UnixMs::now);
-            if important {
-                state.notified.get_or_insert_with(UnixMs::now);
-            }
+        let mut state = self.source.state.lock().unwrap();
+        state.output(text.as_bytes());
+        state.since.get_or_insert_with(UnixMs::now);
+        if important {
+            state.notified.get_or_insert_with(UnixMs::now);
         }
+        self.shared.wake.notify_one();
     }
 
     fn max_wait(&self, seconds: u64) {
-        if let Some(mut state) = self.state() {
-            checkin(&mut state).after = Some(std::time::Duration::from_secs(seconds));
-        }
+        self.shared.checkin.lock().unwrap().0 = std::time::Duration::from_secs(seconds);
     }
 
     fn suppress_tool_wakeups(&self) {
-        if let Some(mut state) = self.state() {
-            checkin(&mut state).wake_on_tools = false;
-        }
+        self.shared.checkin.lock().unwrap().1 = false;
     }
-}
-
-fn checkin(state: &mut State) -> &mut crate::source::Checkin {
-    state.cell.checkin.get_or_insert(crate::source::Checkin {
-        after: None,
-        wake_on_tools: true,
-    })
 }
 
 /// A notebook global provided by the host, typically a `#[pyclass]` whose
@@ -576,7 +628,7 @@ impl ToolCx {
     pub fn report(&self, text: &str) {
         if !text.is_empty() {
             let mut state = self.source.state.lock().unwrap();
-            state.unsent.push(text.as_bytes());
+            state.output(text.as_bytes());
             state.since.get_or_insert_with(UnixMs::now);
         }
     }

@@ -33,235 +33,110 @@ DIAGNOSTICS = sys.stderr
 
 
 class Owner:
-    """One cell and the work it has started."""
+    """One task's output, commands and completion; children copy its context only."""
 
-    def __init__(self, cell, forget):
+    def __init__(self, cell, notebook):
         self.cell = cell
-        self.forget = forget
-        self.lock = threading.Lock()
-        # The cell's own code (or open stream) until it returns.
-        self.live = 1
-        # Tasks and handles, for cancellation.
-        self.work = set()
-        self.has_returned = False
-        # What failed after the code returned; the return reports its own.
-        self.error = None
+        self.notebook = notebook
+        self.commands = set()
+        self.task = None
         self.done = False
 
-    def hold(self, work=None):
-        with self.lock:
-            if self.done:
-                return False
-            self.live += 1
-            if work is not None:
-                self.work.add(work)
-            return True
+    def __await__(self):
+        return self.task.__await__()
 
-    def release(self, work=None):
-        with self.lock:
-            self.work.discard(work)
-            self.live -= 1
-            if self.live or self.done:
-                return
-            self.done = True
-        self.forget()
-        self.cell.finished(self.error)
+    def failed(self, exc):
+        self.cell.pending_failure()
+        self.done = True
+        task = self.task
+        def report():
+            if task._log_traceback:
+                self.cell.finished(format_error(exc, self.cell.id), False)
+                task.exception()
+            else:
+                self.cell.claimed()
+            self.notebook.tasks.pop(self.cell.id, None)
+        self.notebook.loop.call_later(20, report, context=self.notebook.context)
 
-    def returned(self, error):
-        self.has_returned = True
-        self.cell.returned(error)
-        self.release()
+    def command(self, future):
+        self.commands.add(future)
+        future.add_done_callback(self.commands.discard)
 
-    def cancel(self):
-        with self.lock:
-            work = list(self.work)
-        if work and self.has_returned and self.error is None:
-            self.error = 'CancelledError'
-        for item in work:
-            # A task's scheduled step delivers the cancellation the task
-            # itself receives; cancelling the step would strand the task.
-            if not isinstance(getattr(getattr(item, '_callback', None), '__self__', None), asyncio.Task):
-                item.cancel()
-
-
-def fileno(fd):
-    return fd if isinstance(fd, int) else int(fd.fileno())
-
-
-def owner_of(context):
-    return (CELL.get() if context is None else context.get(CELL))
-
-
-class OwnedMixin:
-    """A handle that holds its cell until it has run or been cancelled."""
-
-    __slots__ = ()
-
-    def _run(self):
+    async def finish(self, code):
         try:
-            super()._run()
-        finally:
-            self._release()
+            value = await code
+        except asyncio.CancelledError:
+            self.cell.cancel_commands()
+            self.cell.finished(None, True)
+            self.notebook.tasks.pop(self.cell.id, None)
+            self.done = True
+            raise
+        except BaseException as exc:
+            self.failed(exc)
+            raise
+        # A command belongs to this task even if nobody explicitly awaited it.
+        while self.commands:
+            await asyncio.gather(*(asyncio.shield(f) for f in tuple(self.commands)))
+        self.cell.finished(None, False)
+        self.notebook.tasks.pop(self.cell.id, None)
+        self.done = True
+        return value
 
     def cancel(self):
-        if not self._cancelled:
-            super().cancel()
-            self._release()
-
-    def _release(self):
-        owner, self._owner = self._owner, None
-        if owner is not None:
-            owner.release(self)
-
-
-class OwnedHandle(OwnedMixin, events.Handle):
-    __slots__ = ('_owner',)
-
-
-class OwnedTimerHandle(OwnedMixin, events.TimerHandle):
-    __slots__ = ('_owner',)
+        self.cell.cancel_commands()
+        if self.task is not None:
+            self.task.cancel()
 
 
 class NotebookEventLoop(asyncio.SelectorEventLoop):
-    """The stock selector loop, counting each cell's tasks, callbacks and
-    descriptor watchers."""
-
-    def __init__(self):
-        # Set before the base class registers its self-pipe reader.
-        self._watchers = {}
+    def __init__(self, notebook):
         super().__init__()
+        self.notebook = notebook
 
-    def _owned(self, handle_type, owned_type, context, *args):
-        owner = owner_of(context)
-        if owner is None:
-            return handle_type(*args)
-        handle = owned_type(*args)
-        handle._owner = owner if owner.hold(handle) else None
-        return handle
-
-    def _call_soon(self, callback, args, context):
-        handle = self._owned(events.Handle, OwnedHandle, context, callback, args, self, context)
-        if handle._source_traceback:
-            del handle._source_traceback[-1]
-        self._ready.append(handle)
-        return handle
-
-    def call_at(self, when, callback, *args, context=None):
-        if when is None:
-            raise TypeError("when cannot be None")
-        self._check_closed()
-        if self._debug:
-            self._check_thread()
-            self._check_callback(callback, 'call_at')
-        timer = self._owned(
-            events.TimerHandle, OwnedTimerHandle, context, when, callback, args, self, context)
-        if timer._source_traceback:
-            del timer._source_traceback[-1]
-        heapq.heappush(self._scheduled, timer)
-        timer._scheduled = True
-        return timer
+    def run_in_executor(self, executor, func, *args):
+        context = contextvars.copy_context()
+        return super().run_in_executor(executor, context.run, func, *args)
 
     def create_task(self, coro, **kwargs):
-        task = super().create_task(coro, **kwargs)
-        owner = task.get_context().get(CELL)
-        if owner is not None and not task.done() and owner.hold(task):
-            task.add_done_callback(lambda task: owner.release(task))
+        creator = owner_of(kwargs.get('context'))
+        if creator is None:
+            return super().create_task(coro, **kwargs)
+        name = getattr(coro, '__name__', type(coro).__name__)
+        cell = self.notebook.driver.new_task(creator.cell.id, name)
+        owner = Owner(cell, self.notebook)
+        context = kwargs.pop('context', None) or contextvars.copy_context()
+        context.run(CELL.set, owner)
+        task = super().create_task(owner.finish(coro), context=context, **kwargs)
+        owner.task = task
+        self.notebook.tasks[cell.id] = owner
+        def cancelled(task):
+            if task.cancelled() and not owner.done:
+                cell.cancel_commands()
+                cell.finished(None, True)
+                owner.done = True
+                self.notebook.tasks.pop(cell.id, None)
+        task.add_done_callback(cancelled, context=self.notebook.context)
         return task
 
-    def call_exception_handler(self, context):
-        """Report a failure to the cell whose task or callback failed, and
-        only to it: asyncio runs only custom handlers in the failing work's
-        context, and a task can be destroyed on any thread."""
-        source = context.get('future') or context.get('handle')
-        get_context = getattr(source, 'get_context', None)
-        source_context = get_context() if get_context else getattr(source, '_context', None)
-        owner = source_context.get(CELL) if source_context is not None else None
-        token = CELL.set(owner)
-        try:
-            return super().call_exception_handler(context)
-        finally:
-            CELL.reset(token)
 
-    # A watched descriptor holds the cell that registered it until removed.
-
-    def _watch(self, kind, fd):
-        key = (kind, fileno(fd))
-        self._unwatch(key)
-        owner = CELL.get()
-        if owner is not None and owner.hold():
-            self._watchers[key] = owner
-
-    def _unwatch(self, key):
-        owner = self._watchers.pop(key, None)
-        if owner is None:
-            return
-        if self.is_closed():
-            owner.release()
-        else:
-            # A callback that removes its own watcher still belongs to the
-            # cell until it returns, failure report included.
-            self.call_soon(owner.release, context=contextvars.Context())
-
-    def _add_reader(self, fd, callback, *args):
-        self._watch('r', fd)
-        return super()._add_reader(fd, callback, *args)
-
-    def _remove_reader(self, fd):
-        self._unwatch(('r', fileno(fd)))
-        return super()._remove_reader(fd)
-
-    def _add_writer(self, fd, callback, *args):
-        self._watch('w', fd)
-        return super()._add_writer(fd, callback, *args)
-
-    def _remove_writer(self, fd):
-        self._unwatch(('w', fileno(fd)))
-        return super()._remove_writer(fd)
+def owner_of(context):
+    return CELL.get() if context is None else context.get(CELL)
 
 
-# A thread holds the cell it started in until it ends.
-
+# Thread output inherits the starting task's context, without holding it open.
 _thread_start = threading.Thread.start
-_thread_bootstrap_inner = threading.Thread._bootstrap_inner
-
 
 def _start(self):
     if self._target is executor_thread._worker:
-        # Pool workers outlive whichever cell first used the pool; each work
-        # item runs in its submitter's context.
         self._context = contextvars.Context()
-    elif self._context is None and sys.flags.thread_inherit_context:
+    elif self._context is None and CELL.get() is not None:
         self._context = contextvars.copy_context()
-    owner = self._context.get(CELL) if self._context is not None else None
-    if owner is not None and owner.hold():
-        self._rho_owner = owner
-    try:
-        _thread_start(self)
-    except BaseException:
-        self._release_owner()
-        raise
-
-
-def _bootstrap_inner(self):
-    try:
-        _thread_bootstrap_inner(self)
-    finally:
-        self._release_owner()
-
-
-def _release_owner(self):
-    owner = self.__dict__.pop('_rho_owner', None)
-    if owner is not None:
-        owner.release()
-
+    return _thread_start(self)
 
 threading.Thread.start = _start
-threading.Thread._bootstrap_inner = _bootstrap_inner
-threading.Thread._release_owner = _release_owner
 
-
-def format_error(exc):
-    """`Type: message` and the frames of cell code and libraries."""
+def format_error(exc, task_id=None):
+    """`Type: message` and the frames of task code and libraries."""
     message = str(exc)
     lines = [f'{type(exc).__name__}: {message}' if message else type(exc).__name__]
     for frame, lineno in traceback.walk_tb(exc.__traceback__):
@@ -269,9 +144,35 @@ def format_error(exc):
         if filename == __file__ or frame.f_globals.get('__name__', '').startswith('asyncio'):
             continue
         if filename.startswith('<rho-cell-'):
-            filename = '<exec>'
+            from_id = int(filename[len('<rho-cell-'):-1])
+            filename = f'<task {session_id(task_id or from_id)}>'
         lines.append(f'  {filename}:{lineno} in {frame.f_code.co_name}')
     return '\n'.join(lines)
+
+
+def session_id(internal_id):
+    x = internal_id % 9000
+    left, right = divmod(x, 100)
+    left = (left + right * right + 17 * right + 43) % 90
+    right = (right + left * left + 29 * left + 71) % 100
+    left = (left + right * right + 53 * right + 19) % 90
+    right = (right + left * left + 11 * left + 37) % 100
+    return 1000 + 100 * left + right
+
+
+class Task:
+    """A task named in a report; awaiting propagates its original exception."""
+    @staticmethod
+    def from_session_id(label):
+        notebook = NOTEBOOK
+        matches = [owner for id, owner in notebook.tasks.items()
+                   if session_id(id) == label]
+        if len(matches) != 1:
+            raise RuntimeError(f'No unique live task has session ID {label}')
+        return matches[0]
+
+    def __await__(self):
+        return self.task.__await__()
 
 
 # Statements a later line can extend.
@@ -361,9 +262,12 @@ class Notebook:
         self.context = contextvars.copy_context()
         self.namespace = namespace(exports)
         self.loop = None
+        self.tasks = {}
+        global NOTEBOOK
+        NOTEBOOK = self
 
     def run(self):
-        self.loop = NotebookEventLoop()
+        self.loop = NotebookEventLoop(self)
         self.loop.add_reader(self.driver.fd, self.drain)
         try:
             self.loop.run_forever()
@@ -378,8 +282,9 @@ class Notebook:
                 traceback.print_exc(file=DIAGNOSTICS)
 
     def owner(self, cell):
-        owner = Owner(cell, lambda: self.cells.pop(cell.id, None))
+        owner = Owner(cell, self)
         self.cells[cell.id] = owner
+        self.tasks[cell.id] = owner
         return owner
 
     def compile(self, source, filename):
@@ -394,9 +299,6 @@ class Notebook:
         return code
 
     def run_code(self, owner, code, done):
-        """Run compiled code in the cell's context; `done(error)` once it has
-        returned. Awaiting code starts as an eager task, so code before its
-        first suspension runs before later inputs."""
         context = self.context.copy()
         context.run(CELL.set, owner)
         try:
@@ -408,19 +310,47 @@ class Notebook:
             done(None)
             return
 
+        async def run():
+            return await result
+
+        # This is the exec's own code, not a created child task.
+        task = asyncio.tasks.Task(run(), loop=self.loop, context=context, eager_start=True)
+        owner.task = task
         def finished(task):
             if task.cancelled():
-                done('CancelledError')
-            elif task.exception() is not None:
-                done(format_error(task.exception()))
-            else:
+                owner.cell.cancel_commands()
+                owner.cell.finished(None, True)
+                owner.done = True
+            elif task._exception is not None:
+                owner.cell.returned(None)
+                owner.failed(task._exception)
+            elif not owner.done:
                 done(None)
-
-        task = self.loop.create_task(result, context=context, eager_start=True)
         if task.done():
             finished(task)
         else:
             task.add_done_callback(finished, context=self.context)
+
+    def finish_owner(self, owner, error):
+        if owner.done:
+            return
+        if error is not None:
+            owner.done = True
+            owner.cell.returned(error)
+            owner.cell.finished(None, False)
+            self.tasks.pop(owner.cell.id, None)
+            self.cells.pop(owner.cell.id, None)
+            return
+        owner.cell.returned(None)
+        async def wait():
+            while owner.commands:
+                await asyncio.gather(*(asyncio.shield(f) for f in tuple(owner.commands)))
+            owner.done = True
+            owner.cell.finished(None, False)
+            self.tasks.pop(owner.cell.id, None)
+            self.cells.pop(owner.cell.id, None)
+        # An implicit wait must not create another reported task.
+        asyncio.tasks.Task(wait(), loop=self.loop, context=self.context)
 
     def on_execute(self, cell, source):
         owner = self.owner(cell)
@@ -429,9 +359,9 @@ class Notebook:
         try:
             code = self.compile(source, filename)
         except BaseException as exc:
-            owner.returned(format_error(exc))
+            self.finish_owner(owner, format_error(exc))
             return
-        self.run_code(owner, code, owner.returned)
+        self.run_code(owner, code, lambda error: self.finish_owner(owner, error))
 
     def on_begin(self, cell):
         owner = self.owner(cell)
@@ -468,7 +398,7 @@ class Notebook:
 
     def on_cancel(self, cell):
         self.on_stop(cell)
-        owner = self.cells.get(cell)
+        owner = self.tasks.get(cell)
         if owner is not None:
             owner.cancel()
 
@@ -496,7 +426,6 @@ class Notebook:
         end, code = stream.pending
         stream.pending = None
         stream.running = end
-        stream.owner.hold()
         self.run_code(stream.owner, code, lambda error: self.settled(stream, end, error))
 
     def settled(self, stream, end, error):
@@ -506,12 +435,11 @@ class Notebook:
             self.close(stream, error)
         else:
             self.advance(stream)
-        stream.owner.release()
 
     def close(self, stream, error):
         if self.streams.get(stream.owner.cell.id) is stream:
             del self.streams[stream.owner.cell.id]
-            stream.owner.returned(error)
+            self.finish_owner(stream.owner, error)
 
 
 # The Python-facing API.
@@ -578,8 +506,8 @@ def notify(value, *, max_tokens=None):
 
 
 def set_max_wait(seconds):
-    if not is_int(seconds) or not 1 <= seconds <= 3600:
-        raise ValueError('seconds must be an integer from 1 through 3600')
+    if not is_int(seconds) or seconds < 1:
+        raise ValueError('seconds must be a positive integer')
     owner = CELL.get()
     if owner is not None:
         owner.cell.max_wait(seconds)
@@ -609,6 +537,7 @@ def namespace(exports):
         'set_max_wait': set_max_wait,
         'suppress_tool_wakeups': suppress_tool_wakeups,
         'asyncio': asyncio,
+        'Task': Task,
         'Path': pathlib.Path,
         'pathlib': pathlib,
         **modules,

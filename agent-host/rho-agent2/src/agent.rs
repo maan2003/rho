@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rho_agent_types::UnixMs;
 use rho_inference2::{Call, Carry, Image, Model, Stream, Usage};
-use rho_notebook2::{CellHandle, Kind, Notebook};
+use rho_notebook2::{CellHandle, Notebook};
 use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::chat::{self, ChatEvent};
@@ -44,6 +44,7 @@ pub struct AgentHandle {
     inbox: mpsc::UnboundedSender<Inbound>,
     chat: broadcast::Sender<ChatEvent>,
     trace: broadcast::Sender<Trace>,
+    mailroom: Arc<Mailroom>,
 }
 
 impl AgentHandle {
@@ -58,6 +59,10 @@ impl AgentHandle {
         self.chat.subscribe()
     }
 
+    pub fn archive(&self) {
+        self.mailroom.archive();
+    }
+
     pub fn trace(&self) -> broadcast::Receiver<Trace> {
         self.trace.subscribe()
     }
@@ -69,6 +74,9 @@ pub struct Agent {
     instructions: Arc<str>,
     model: Arc<Model>,
     notebook: Notebook,
+    shell: rho_tool_shell::ShellTools,
+    archived: bool,
+    fresh: bool,
     mailroom: Arc<Mailroom>,
     outbox: mpsc::UnboundedReceiver<Outbound>,
     inbox: mpsc::UnboundedReceiver<Inbound>,
@@ -79,7 +87,7 @@ pub struct Agent {
     cell: Option<CellHandle>,
     /// The latest step was cut off part-way through its cell.
     interrupted: bool,
-    /// The model has been told the latest cell returned.
+    /// The model has been told the latest task finished.
     told_returned: bool,
     /// Messages the model has not seen, oldest first.
     unread: Vec<(MessageId, Party, UnixMs)>,
@@ -111,7 +119,7 @@ impl Agent {
     pub fn new(config: Config) -> anyhow::Result<(Self, AgentHandle)> {
         let (mailroom, outbox) = Mailroom::new();
         let wake = Arc::new(Notify::new());
-        let notebook = Notebook::new(config.shell, mailroom.exports(), Arc::clone(&wake))
+        let notebook = Notebook::new(config.shell.clone(), mailroom.exports(), Arc::clone(&wake))
             .map_err(|error| anyhow::anyhow!("the notebook failed to start: {error}"))?;
         let (inbox_tx, inbox) = mpsc::unbounded_channel();
         let (chat, _) = broadcast::channel(1024);
@@ -122,6 +130,9 @@ impl Agent {
             instructions: config.instructions,
             model: config.model,
             notebook,
+            shell: config.shell,
+            archived: false,
+            fresh: false,
             mailroom,
             outbox,
             inbox,
@@ -140,12 +151,14 @@ impl Agent {
             cache_key: 0,
         };
         agent.resume()?;
+        let handle_mailroom = Arc::clone(&agent.mailroom);
         Ok((
             agent,
             AgentHandle {
                 inbox: inbox_tx,
                 chat,
                 trace,
+                mailroom: handle_mailroom,
             },
         ))
     }
@@ -166,6 +179,14 @@ impl Agent {
                     delivered.extend(messages.iter().copied());
                 }
                 Entry::Awaiting { since, .. } => awaiting = since.is_some(),
+                Entry::Notice {
+                    notice: Notice::Archived,
+                    ..
+                } => self.archived = true,
+                Entry::Notice {
+                    notice: Notice::FreshNotebook,
+                    ..
+                } => self.archived = false,
                 _ => {}
             }
         }
@@ -185,7 +206,7 @@ impl Agent {
                 at: UnixMs::now(),
                 cache_key: self.cache_key,
             })?;
-        } else if woken {
+        } else if woken && !self.archived {
             self.restarted = true;
             self.append(Entry::Notice {
                 at: UnixMs::now(),
@@ -252,8 +273,26 @@ impl Agent {
         let at = UnixMs::now();
         let id = MessageId::new();
         if inbound.from == Party::Human {
+            if self.archived {
+                self.notebook = Notebook::new(
+                    self.shell.clone(),
+                    self.mailroom.exports(),
+                    Arc::clone(&self.wake),
+                )
+                .map_err(anyhow::Error::msg)?;
+                self.archived = false;
+                self.fresh = true;
+                self.cell = None;
+                self.last_step = None;
+                self.append(Entry::Notice {
+                    at,
+                    notice: Notice::FreshNotebook,
+                })?;
+            }
             self.mailroom.received();
             self.stopped = false;
+        } else {
+            self.mailroom.agent_received();
         }
         self.unread.push((id, inbound.from.clone(), at));
         self.append(Entry::Received {
@@ -274,6 +313,14 @@ impl Agent {
                 text,
             }),
             Outbound::Status(text) => self.append(Entry::Status { at, text }),
+            Outbound::Archive => {
+                self.archived = true;
+                self.notebook.cancel();
+                self.append(Entry::Notice {
+                    at,
+                    notice: Notice::Archived,
+                })
+            }
             Outbound::Awaiting(awaiting) if awaiting != self.awaiting => {
                 self.awaiting = awaiting;
                 self.append(Entry::Awaiting {
@@ -301,42 +348,39 @@ impl Agent {
             .cell
             .as_ref()
             .and_then(|cell| sources.iter().find(|s| s.session_id == cell.session_id()));
-        let checkin = latest
-            .and_then(|facts| facts.checkin)
-            .map(|checkin| (checkin.after, checkin.wake_on_tools));
-        let after = match checkin {
-            Some((after, _)) => after,
-            // Nobody needs looking in on while they only wait for the human.
-            None if self.awaiting => None,
-            None => Some(wake::DEFAULT_CHECKIN),
-        };
-        let returned = latest
-            .and_then(|facts| facts.returned)
-            .filter(|_| !self.told_returned);
+        let (wait, wake_on_tools) = self.notebook.checkin();
+        let finished = latest
+            .and_then(|facts| facts.finished)
+            .filter(|end| !end.failed && !self.told_returned)
+            .map(|end| end.at);
         Facts {
-            message: self.unread.first().map(|(_, _, at)| *at),
-            returned,
+            human: self
+                .unread
+                .iter()
+                .find(|(_, from, _)| *from == Party::Human)
+                .map(|(_, _, at)| *at),
+            agent: self
+                .unread
+                .iter()
+                .find(|(_, from, _)| *from != Party::Human)
+                .map(|(_, _, at)| *at),
+            finished,
             notified: sources
                 .iter()
                 .filter_map(|facts| facts.notified_at.into_iter().chain(facts.paged_at).min())
                 .min(),
-            // The latest cell's end is its return, until that has been told.
-            ended: sources
+            failure: sources
                 .iter()
-                .filter(|facts| {
-                    !facts.delivered
-                        && !(returned.is_some()
-                            && facts.kind == Kind::Cell
-                            && Some(facts.session_id) == latest.map(|l| l.session_id))
-                })
-                .filter_map(|facts| facts.finished)
-                .map(|end| end.at)
+                .filter(|facts| !facts.delivered && facts.finished.is_some_and(|end| end.failed))
+                .filter_map(|facts| facts.finished.map(|end| end.at))
                 .min(),
-            checkin: self.last_step.zip(after).map(|(at, after)| at + after),
-            wake_on_tools: checkin.is_none_or(|(_, wake)| wake),
+            checkin: self.last_step.map(|at| at + wait),
+            response_finished: self.last_step,
+            wake_on_tools,
             prose: self.prose > 0,
             restarted: self.restarted,
-            stopped: self.stopped,
+            archived: self.archived,
+            prose_silenced: self.stopped,
         }
     }
 
@@ -355,6 +399,9 @@ impl Agent {
                     .to_owned(),
             ),
             _ => {}
+        }
+        if std::mem::take(&mut self.fresh) {
+            lines.push("This agent was archived. You have a fresh notebook; earlier Python state and running work are gone.".to_owned());
         }
         if std::mem::take(&mut self.interrupted) {
             lines.push(
@@ -380,8 +427,8 @@ impl Agent {
         mut lines: Vec<String>,
         images: Vec<Image>,
     ) -> anyhow::Result<()> {
-        if let Some(latest) = &self.cell {
-            self.told_returned = latest.facts().returned.is_some();
+        if self.cell.is_some() {
+            self.told_returned = true;
         }
         let messages = std::mem::take(&mut self.unread);
         let humans = messages
@@ -414,6 +461,7 @@ impl Agent {
             messages: messages.into_iter().map(|(id, _, _)| id).collect(),
         })?;
         self.restarted = false;
+        self.notebook.reset_checkin();
         let request = crate::context::request(
             Arc::clone(&self.instructions),
             self.log.entries(),
@@ -467,7 +515,7 @@ impl Agent {
                     }
                     failures += 1;
                     if failures >= MAX_FAILURES {
-                        return self.stop("the model kept failing");
+                        return Err(error);
                     }
                     tokio::time::sleep(Duration::from_secs(2u64.pow(failures))).await;
                 }
@@ -526,7 +574,7 @@ impl Agent {
                 self.prose += 1;
                 if self.prose >= MAX_PROSE {
                     self.prose = 0;
-                    return self.stop("the model answered in prose instead of code");
+                    self.stopped = true;
                 }
             }
         }
@@ -550,14 +598,6 @@ impl Agent {
             streaming.code.push_str(&code);
             let _ = cell.feed(code, false);
         }
-    }
-
-    fn stop(&mut self, why: &str) -> anyhow::Result<()> {
-        self.stopped = true;
-        self.append(Entry::Notice {
-            at: UnixMs::now(),
-            notice: Notice::Stopped(why.to_owned()),
-        })
     }
 }
 

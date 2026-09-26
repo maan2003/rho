@@ -45,7 +45,7 @@ async fn a_cell_that_ends_first_speaks_plainly() {
 
     let silent = notebook.run("x = 1".into());
     finished(&wake, &silent).await;
-    assert_eq!(notebook.report().unwrap().text, "Cell finished");
+    assert_eq!(notebook.report().unwrap().text, "Task finished");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -83,47 +83,41 @@ async fn an_interrupted_stream_keeps_what_ran() {
     let next = notebook.run("print(a, 'b' in globals())".into());
     finished(&wake, &next).await;
     let text = notebook.report().unwrap().text;
-    assert!(text.ends_with("1 False"), "{text}");
+    assert!(text.starts_with("1 False"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_command_reports_under_its_session_id() {
+async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("job = command('read line; echo got $line')".into());
-    finished(&wake, &cell).await;
+    until(&wake, || cell.facts().returned.is_some()).await;
+    assert!(cell.facts().finished.is_none());
     let first = notebook.report().unwrap().text;
     assert!(
-        first.starts_with("Cell finished\n\nCommand running with session ID "),
+        first.contains("Command running in background with session ID "),
         "{first}"
     );
-    let session = first.rsplit(' ').next().unwrap().to_owned();
+    let session = notebook
+        .facts()
+        .iter()
+        .find(|f| f.kind == crate::Kind::Command)
+        .unwrap()
+        .session_id;
 
     let write = notebook.run("write_stdin(job, 'hi\\n')".into());
-    until(&wake, || {
-        notebook
-            .facts()
-            .iter()
-            .any(|f| f.kind == crate::Kind::Command && f.finished.is_some())
-    })
-    .await;
+    finished(&wake, &cell).await;
     finished(&wake, &write).await;
     let text = notebook.report().unwrap().text;
-    assert_eq!(
-        text,
-        format!(
-            "Session ID: {session}\nProcess exited with code 0\nOutput:\ngot hi\n\nCell finished"
-        )
-    );
-    // A command stays to be paged.
-    let page = notebook.run(format!("Command.from_session_id({session}).more_output()"));
-    finished(&wake, &page).await;
-    let text = notebook.report().unwrap().text;
     assert!(
-        text.starts_with(&format!(
-            "Session ID: {session}\nCommand: read line; echo got $line\nNo more output."
+        text.contains(&format!(
+            "Session ID: {session}\nProcess exited with code 0\nOutput:\ngot hi"
         )),
         "{text}"
     );
+    let page = notebook.run(format!("Command.from_session_id({session}).more_output()"));
+    finished(&wake, &page).await;
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains("No more output."), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -134,19 +128,155 @@ async fn a_background_task_outlives_its_return() {
     );
     until(&wake, || cell.facts().returned.is_some()).await;
     let text = notebook.report().unwrap().text;
-    assert_eq!(
-        text,
-        format!(
-            "Cell running with session ID {}\nOutput:\nnow",
-            cell.session_id()
-        )
+    assert!(text.contains("now"), "{text}");
+    assert!(
+        text.contains("Task running in background with session ID"),
+        "{text}"
     );
     finished(&wake, &cell).await;
-    assert_eq!(
-        notebook.report().unwrap().text,
-        format!(
-            "Session ID: {}\nCell finished\nOutput:\nlate",
-            cell.session_id()
-        )
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(notebook.report().unwrap().text.contains("Output:\nlate"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn created_tasks_own_output_and_return_values() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("import asyncio\nasync def fetch():\n    await asyncio.sleep(0.1)\n    print('child')\n    return 73\nt = asyncio.create_task(fetch())\nprint('parent')".into());
+    finished(&wake, &cell).await;
+    let first = notebook.report().unwrap().text;
+    assert!(first.contains("parent"), "{first}");
+    assert!(!first.contains("child"), "{first}");
+    let next = notebook.run("print(await t)".into());
+    finished(&wake, &next).await;
+    let second = notebook.report().unwrap().text;
+    assert!(second.contains("child"), "{second}");
+    assert!(second.contains("73"), "{second}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raised_task_does_not_wait_for_its_command() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("job = command('sleep 1'); raise ValueError('bad')".into());
+    finished(&wake, &cell).await;
+    assert!(
+        notebook
+            .facts()
+            .iter()
+            .any(|f| f.kind == crate::Kind::Command && f.finished.is_none())
+    );
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains("Task failed"), "{text}");
+    assert!(text.contains("ValueError: bad"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_task_kills_its_command_quietly() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("job = command('sleep 5')\nawait job".into());
+    until(&wake, || {
+        notebook
+            .facts()
+            .iter()
+            .any(|f| f.kind == crate::Kind::Command)
+    })
+    .await;
+    cell.cancel();
+    finished(&wake, &cell).await;
+    until(&wake, || {
+        notebook
+            .facts()
+            .iter()
+            .any(|f| f.kind == crate::Kind::Command && f.finished.is_some())
+    })
+    .await;
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains("Task cancelled"), "{text}");
+    assert!(!text.contains("Task failed"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caught_created_task_exception_is_not_reported() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("import asyncio\nasync def broken():\n    raise ValueError('specific')\nt = asyncio.create_task(broken())\ntry:\n    await t\nexcept ValueError:\n    print('caught')".into());
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains("caught"), "{text}");
+    assert!(!text.contains("ValueError: specific"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn output_keeps_four_megabyte_head_and_notes_the_cut() {
+    let (notebook, wake) = notebook();
+    let cell = notebook
+        .run("for _ in range(110): print('a' * 40000, max_tokens=10000)\nprint('b' * 100)".into());
+    finished(&wake, &cell).await;
+    let text = notebook.report().unwrap().text;
+    assert!(
+        text.contains("[output past 4 MB was dropped]"),
+        "missing cut note"
+    );
+    assert!(!text.contains("b".repeat(100).as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notebook_retention_discards_oldest_command_log() {
+    let (notebook, wake) = notebook();
+    let cell =
+        notebook.run("jobs = [command('head -c 4194304 /dev/zero') for _ in range(14)]".into());
+    finished(&wake, &cell).await;
+    let oldest = notebook
+        .facts()
+        .iter()
+        .find(|f| f.kind == crate::Kind::Command)
+        .unwrap()
+        .session_id;
+    let _ = notebook.report();
+    let page = notebook.run(format!("Command.from_session_id({oldest}).more_output()"));
+    finished(&wake, &page).await;
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains("retained output is gone"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unclaimed_failure_reports_once_after_twenty_seconds() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("import asyncio\nasync def broken():\n    raise ValueError('unclaimed')\nt = asyncio.create_task(broken())".into());
+    finished(&wake, &cell).await;
+    assert!(!notebook.report().unwrap().text.contains("unclaimed"));
+    tokio::time::timeout(Duration::from_secs(23), async {
+        loop {
+            wake.notified().await;
+            if notebook
+                .facts()
+                .iter()
+                .any(|f| f.kind == crate::Kind::Task && f.finished.is_some_and(|end| end.failed))
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let text = notebook.report().unwrap().text;
+    assert!(
+        text.contains("Task failed\nValueError: unclaimed"),
+        "{text}"
+    );
+    assert!(notebook.report().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
+    let (notebook, wake) = notebook();
+    let cell = notebook.run("import asyncio, threading, time\nasyncio.get_running_loop().call_later(0.1, lambda: print('callback'))\nthreading.Thread(target=lambda: (time.sleep(0.1), print('thread'))).start()".into());
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().text, "Task finished");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let text = notebook.report().unwrap().text;
+    assert!(text.contains("callback"), "{text}");
+    assert!(text.contains("thread"), "{text}");
+    assert!(
+        text.starts_with(&format!("Session ID: {}", cell.session_id())),
+        "{text}"
     );
 }

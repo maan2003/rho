@@ -3,7 +3,7 @@
 
 use rho_agent_types::UnixMs;
 
-use crate::log::{Block, Entry, MessageId, Notice, Party};
+use crate::log::{Block, Entry, MessageId, Party};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatEvent {
@@ -23,9 +23,6 @@ pub enum ChatKind {
     },
     /// Replaces the last status.
     Status(String),
-    /// Since when the agent waits on the human; `None` once it does not.
-    Awaiting(Option<UnixMs>),
-    Notice(Notice),
 }
 
 /// The chat event an entry makes, if any. `me` is the agent's own id, the
@@ -45,8 +42,7 @@ pub fn project(me: &str, seq: u64, entry: &Entry) -> Option<ChatEvent> {
             body: vec![Block::Text(text.clone())],
         },
         Entry::Status { text, .. } => ChatKind::Status(text.clone()),
-        Entry::Awaiting { since, .. } => ChatKind::Awaiting(*since),
-        Entry::Notice { notice, .. } => ChatKind::Notice(notice.clone()),
+        Entry::Awaiting { .. } | Entry::Notice { .. } => return None,
         Entry::Created { .. } | Entry::Step { .. } | Entry::Woken { .. } => return None,
     };
     Some(ChatEvent {

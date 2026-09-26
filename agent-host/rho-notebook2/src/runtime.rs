@@ -14,7 +14,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::notebook::{Cell, Export, Shared};
-use crate::source::Source;
+use crate::source::{Kind, Source};
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
@@ -258,6 +258,18 @@ impl Driver {
 
     /// Inputs posted since the last drain, in order, as tuples. Finished
     /// host work resolves its futures here.
+    fn new_task(&self, parent: u64, name: String) -> Cell {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let source = Arc::new(Source::new(id, Kind::Task, name, parent, 10000, None, None));
+        self.shared
+            .sources
+            .lock()
+            .unwrap()
+            .insert(id, Arc::clone(&source));
+        self.shared.wake.notify_one();
+        Cell::new(Arc::clone(&self.shared), source)
+    }
+
     fn drain(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let mut inputs = Vec::new();
         for message in self.shared.inbox.take() {

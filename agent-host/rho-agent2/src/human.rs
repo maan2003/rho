@@ -25,6 +25,7 @@ pub enum Outbound {
         text: String,
     },
     Status(String),
+    Archive,
     /// Whether some cell now awaits `human.reply()`.
     Awaiting(bool),
 }
@@ -39,6 +40,7 @@ pub struct Mailroom {
 struct Waits {
     /// Human messages received, ever.
     received: u64,
+    agent_received: u64,
     /// Of those, not yet shown to the model.
     unread: u64,
     /// Cells awaiting `human.reply()`.
@@ -55,6 +57,15 @@ impl Mailroom {
             }),
             rx,
         )
+    }
+
+    /// An agent message arrived.
+    pub fn agent_received(&self) {
+        self.waits.lock().unwrap().agent_received += 1;
+    }
+
+    pub fn archive(&self) {
+        let _ = self.outbox.send(Outbound::Archive);
     }
 
     /// A human message arrived.
@@ -77,6 +88,10 @@ impl Mailroom {
         vec![
             Export::build("human", move |py| build(py, "Human", human)),
             Export::build("agents", move |py| build(py, "Agents", agents)),
+            Export::build("archive", {
+                let mailroom = Arc::clone(self);
+                move |py| Py::new(py, Bridge(mailroom))?.getattr(py, "archive")
+            }),
         ]
     }
 }
@@ -106,6 +121,10 @@ impl Bridge {
         Ok(())
     }
 
+    fn archive(&self) {
+        self.0.archive();
+    }
+
     fn status(&self, text: String) {
         let _ = self.0.outbox.send(Outbound::Status(text));
     }
@@ -119,6 +138,14 @@ impl Bridge {
             let _ = self.0.outbox.send(Outbound::Awaiting(true));
         }
         waits.received - waits.unread
+    }
+
+    fn agent_wait(&self) -> u64 {
+        self.0.waits.lock().unwrap().agent_received
+    }
+
+    fn agent_replied(&self, since: u64) -> bool {
+        self.0.waits.lock().unwrap().agent_received > since
     }
 
     fn replied(&self, since: u64) -> bool {
@@ -175,6 +202,12 @@ class Agents:
     def send(self, agent_id, text):
         """Send another agent a message."""
         self._bridge.send(str(agent_id), str(text))
+
+    async def reply(self):
+        """Wait for the next agent message; it arrives in the model report."""
+        since = self._bridge.agent_wait()
+        while not self._bridge.agent_replied(since):
+            await _asyncio.sleep(0.1)
 
     def __repr__(self):
         return "<agents>"
