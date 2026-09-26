@@ -12652,6 +12652,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-agent2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "camino",
+ "clap",
+ "futures",
+ "pyo3",
+ "rand 0.8.7",
+ "rho-agent",
+ "rho-agent-types",
+ "rho-fs-view",
+ "rho-inference",
+ "rho-inference2",
+ "rho-tool-shell",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rho-agents-client"
 version = "0.1.0"
 dependencies = [
@@ -13168,6 +13191,23 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "rho-inference2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "futures-util",
+ "rustls",
+ "senax-encoder",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
  "uuid",
 ]
 
