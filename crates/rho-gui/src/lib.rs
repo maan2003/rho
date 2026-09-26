@@ -10,6 +10,7 @@ pub(crate) mod draft;
 pub(crate) mod find;
 pub(crate) mod git_approval;
 pub mod home;
+pub(crate) mod messages;
 pub mod minibuffer;
 pub mod note_view;
 pub(crate) mod overlay;
