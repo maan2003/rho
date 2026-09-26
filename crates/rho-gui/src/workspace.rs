@@ -38,7 +38,6 @@ use rho_agents_client::session::ActiveAgents;
 use rho_agents_client::store::FrameSummary;
 use rho_agents_client::{AgentMap, HostId, protocol as agents};
 use rho_agents_view::agent_view::AgentModel;
-use rho_agents_view::messages::MessageLog;
 use rho_agents_view::{
     DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup, TranscriptFrame,
 };
@@ -59,6 +58,7 @@ use theme::ActiveTheme as _;
 
 use crate::chime::Chime;
 use crate::draft::DraftModel;
+use crate::messages::MessageLog;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
 use crate::search;
@@ -1436,6 +1436,51 @@ impl Workspace {
                 }
             })
             .collect();
+        rows.running
+            .extend(self.agent2.values().filter_map(|(_, info)| {
+                let started = info.running_since?;
+                if info.parent.is_some() && !info.user_owned {
+                    return None;
+                }
+                let node = rho_dealer::NodeId::Agent(info.id);
+                if self.attention.marks.get(&node).facts().put_away(now) {
+                    return None;
+                }
+                let last_line = info
+                    .status
+                    .clone()
+                    .or_else(|| {
+                        rho_agents2_client::protocol::visible_chat(&info.chat)
+                            .into_iter()
+                            .rev()
+                            .find_map(|event| match &event.kind {
+                                rho_agents2_client::protocol::ChatKind::Message {
+                                    from: rho_agents2_client::protocol::Party::Agent(sender),
+                                    text,
+                                    ..
+                                } if *sender == info.id => Some(text.clone()),
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or_default();
+                Some(crate::home::RunningRow {
+                    agent_id: info.id,
+                    name: self.node_title(&node, cx),
+                    topic: self
+                        .node_context(&node, cx)
+                        .split(", ")
+                        .next()
+                        .and_then(|path| path.rsplit('/').next())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    elapsed: crate::home::elapsed_label(
+                        started.0.min(i64::MAX as u64) as i64,
+                        now_ms,
+                    ),
+                    last_line,
+                })
+            }));
+        rows.running.sort_by(|a, b| a.name.cmp(&b.name));
         rows
     }
 
@@ -3427,6 +3472,15 @@ impl Workspace {
                         info.archived = archived;
                         changed.push(agent_id);
                     }
+                }
+            }
+            Agent2Frame::RunningSince { agent_id, since } => {
+                if let Some((owner, info)) = self.agent2.get_mut(&agent_id)
+                    && *owner == host
+                    && info.running_since != since
+                {
+                    info.running_since = since;
+                    changed.push(agent_id);
                 }
             }
         }
@@ -8544,6 +8598,7 @@ mod agent2_chat_tests {
                                 effort: Agent2Effort::Medium,
                                 archived: false,
                                 status: None,
+                                running_since: None,
                                 chat: Vec::new(),
                             },
                         },
@@ -8606,6 +8661,7 @@ mod agent2_chat_tests {
                                 effort: request.effort,
                                 archived: false,
                                 status: None,
+                                running_since: None,
                                 chat: Vec::new(),
                             },
                         },
@@ -8655,6 +8711,7 @@ mod agent2_chat_tests {
             effort: Agent2Effort::Medium,
             archived: false,
             status: None,
+            running_since: None,
             chat: vec![ChatEvent {
                 seq: 19,
                 at: UnixMs(17),
@@ -8713,6 +8770,42 @@ mod agent2_chat_tests {
                     cx,
                 );
                 assert_eq!(workspace.seen(&node, cx), Seen::Agent(20));
+                workspace.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId(0),
+                        frame: Agent2Frame::RunningSince {
+                            agent_id: id,
+                            since: Some(UnixMs::now()),
+                        },
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    workspace
+                        .home_rows(cx)
+                        .running
+                        .iter()
+                        .any(|row| row.agent_id == id)
+                );
+                workspace.handle_agent2_event(
+                    Agents2Event {
+                        host: HostId(0),
+                        frame: Agent2Frame::RunningSince {
+                            agent_id: id,
+                            since: None,
+                        },
+                    },
+                    window,
+                    cx,
+                );
+                assert!(
+                    !workspace
+                        .home_rows(cx)
+                        .running
+                        .iter()
+                        .any(|row| row.agent_id == id)
+                );
             })
             .unwrap();
     }
@@ -8738,6 +8831,7 @@ mod agent2_chat_tests {
             effort: Agent2Effort::Medium,
             archived: false,
             status: None,
+            running_since: None,
             chat: vec![],
         };
         workspace

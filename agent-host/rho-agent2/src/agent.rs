@@ -34,9 +34,19 @@ pub struct Inbound {
 /// What a side pane can watch live: the model's work, which is never synced.
 #[derive(Clone, Debug)]
 pub enum Trace {
-    Woken { why: Wake, report: String },
-    Step { code: Option<String>, prose: String },
-    ArchiveState { archived: bool },
+    Woken {
+        why: Wake,
+        report: String,
+    },
+    Step {
+        code: Option<String>,
+        prose: String,
+    },
+    ArchiveState {
+        archived: bool,
+    },
+    /// An interrupted turn stopped without a model step.
+    Settled,
 }
 
 /// Talks to a running agent. Dropping every handle stops it.
@@ -76,6 +86,11 @@ impl AgentHandle {
     /// resume it.
     pub fn cancel(&self) {
         self.cancel.send_modify(|generation| *generation += 1);
+    }
+
+    /// Record and deliver a message from this agent through its own chat log.
+    pub fn send_to(&self, to: Party, text: String) -> anyhow::Result<()> {
+        self.mailroom.send_to(to, text)
     }
 
     /// Branch before the Nth last human message; notebook state remains.
@@ -333,6 +348,9 @@ impl Agent {
             if *self.stop.borrow() {
                 break;
             }
+            // A cell can archive itself as it completes. Apply its outbound
+            // notice before deciding whether its completion warrants a wake.
+            self.drain()?;
             match wake::decide(&self.facts(), UnixMs::now()) {
                 Decision::Now(why) => self.wake_model(why).await?,
                 Decision::Later(recheck) => {
@@ -509,6 +527,9 @@ impl Agent {
 
     async fn wake_model(&mut self, why: Wake) -> anyhow::Result<()> {
         self.drain()?;
+        if self.archived {
+            return Ok(());
+        }
         let mut lines = Vec::new();
         match why {
             Wake::Rewound => lines.push(
@@ -731,6 +752,7 @@ impl Agent {
         self.cell = None;
         self.responding = false;
         self.stopped = true;
+        let _ = self.trace.send(Trace::Settled);
         if let Some(streaming) = streaming {
             self.interrupted = true;
             let call = Call {

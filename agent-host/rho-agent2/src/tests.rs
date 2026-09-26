@@ -168,6 +168,13 @@ async fn a_restarted_agent_is_told_its_notebook_is_gone() {
     drop(handle);
     running.abort();
     let _ = running.await;
+    // The model step may finish after sending the message but before abort.
+    // Restart must explain lost notebook state whether its call was logged or not.
+    let had_step = Log::open(&path)
+        .unwrap()
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry, Entry::Step { .. }));
 
     let model = Arc::new(Scripted::new());
     model.then("await human.reply()");
@@ -187,11 +194,14 @@ async fn a_restarted_agent_is_told_its_notebook_is_gone() {
     .await
     .unwrap();
     let request = &model.requests()[0];
-    // The step never finished, so there is no call to answer.
-    let Some(Item::User { text, .. }) = request.items.last() else {
-        panic!("{:?}", request.items)
-    };
-    assert!(text.contains("rho restarted"), "{text}");
+    // A logged call receives the restart as its result; an interrupted step
+    // receives it as a user report. Neither path can inherit the old notebook.
+    match (had_step, request.items.last()) {
+        (true, Some(Item::Result { text, .. })) | (false, Some(Item::User { text, .. })) => {
+            assert!(text.contains("rho restarted"), "{text}")
+        }
+        _ => panic!("{:?}", request.items),
+    }
     drop(handle);
     running.abort();
     let log = Log::open(&path).unwrap();

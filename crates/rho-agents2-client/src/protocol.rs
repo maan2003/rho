@@ -91,6 +91,8 @@ pub struct AgentInfo {
     pub effort: Effort,
     pub archived: bool,
     pub status: Option<String>,
+    /// Active model turn, as reported by the workset worker; not durable.
+    pub running_since: Option<UnixMs>,
     pub chat: Vec<ChatEvent>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -159,10 +161,24 @@ impl rho_rpc::protocol::ProtocolOpen for Open {
 
 #[derive(Clone, Debug, PartialEq, Pack, Unpack)]
 pub enum ServerFrame {
-    Snapshot { agents: Vec<AgentInfo> },
-    Created { agent: AgentInfo },
-    Chat { agent_id: AgentId, event: ChatEvent },
-    Archived { agent_id: AgentId, archived: bool },
+    Snapshot {
+        agents: Vec<AgentInfo>,
+    },
+    Created {
+        agent: AgentInfo,
+    },
+    Chat {
+        agent_id: AgentId,
+        event: ChatEvent,
+    },
+    Archived {
+        agent_id: AgentId,
+        archived: bool,
+    },
+    RunningSince {
+        agent_id: AgentId,
+        since: Option<UnixMs>,
+    },
 }
 
 #[cfg(test)]
@@ -243,6 +259,7 @@ mod tests {
                 effort: Effort::Low,
                 archived: false,
                 status: Some("working".into()),
+                running_since: None,
                 chat: Vec::new(),
             }],
         };

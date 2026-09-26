@@ -149,6 +149,7 @@ mod tests {
             effort: Effort::High,
             archived: true,
             status: Some("waiting".into()),
+            running_since: None,
             chat: vec![
                 ChatEvent {
                     seq: 1,

@@ -199,6 +199,7 @@ impl Agents2 {
             effort,
             archived,
             status,
+            running_since: None,
             chat,
         }
     }
@@ -258,6 +259,7 @@ impl Agents2 {
                 }
             }
             ChatWorkerEvent::Archived(archived) => self.on_archive(&id, archived),
+            ChatWorkerEvent::RunningSince(since) => self.on_running(&id, since),
             ChatWorkerEvent::Stopped(Some(error)) => {
                 tracing::error!(agent_id = %id.encoded(), %error, "agent runtime stopped");
             }
@@ -324,6 +326,18 @@ impl Agents2 {
             let _ = self.changes.send(wire::ServerFrame::Archived {
                 agent_id: *id,
                 archived,
+            });
+        }
+    }
+
+    fn on_running(&self, id: &wire::AgentId, since: Option<rho_agent_types::UnixMs>) {
+        if let Some(record) = self.records.lock().unwrap().get_mut(id)
+            && record.info.running_since != since
+        {
+            record.info.running_since = since;
+            let _ = self.changes.send(wire::ServerFrame::RunningSince {
+                agent_id: *id,
+                since,
             });
         }
     }
@@ -520,14 +534,20 @@ impl Agents2 {
             Agent2Call::Message { agent_id, message } => {
                 anyhow::ensure!(agent_id != source, "cannot send a message to yourself");
                 anyhow::ensure!(!message.trim().is_empty(), "message is empty");
-                let remote = self
-                    .records
-                    .lock()
-                    .unwrap()
-                    .get(&agent_id)
-                    .map(|record| record.remote.clone())
-                    .ok_or_else(|| anyhow!("agent {} not found", agent_id.encoded()))?;
-                remote.send(log::Party::Agent(source), message)?;
+                let remote = {
+                    let records = self.records.lock().unwrap();
+                    anyhow::ensure!(
+                        records.contains_key(&agent_id),
+                        "agent {} not found",
+                        agent_id.encoded()
+                    );
+                    records
+                        .get(&source)
+                        .expect("validated source")
+                        .remote
+                        .clone()
+                };
+                remote.send_to(log::Party::Agent(agent_id), message)?;
                 format!("Message sent to {}.", agent_id.encoded())
             }
             Agent2Call::Cancel { agent_id } => {
@@ -783,6 +803,15 @@ where
                         )
                         .await?;
                     }
+                    Ok(wire::ServerFrame::RunningSince { agent_id, since }) => {
+                        if seen.contains_key(&agent_id) {
+                            write_frame(
+                                &mut writer,
+                                &wire::ServerFrame::RunningSince { agent_id, since },
+                            )
+                            .await?;
+                        }
+                    }
                     Ok(wire::ServerFrame::Snapshot { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let agents = manager.snapshot();
@@ -1002,6 +1031,26 @@ mod tests {
             .unwrap();
         assert_eq!(joined.place, place);
         assert_eq!(joined.role, role);
+        manager.on_running(&first, Some(rho_agent_types::UnixMs(1234)));
+        assert_eq!(
+            manager
+                .snapshot()
+                .into_iter()
+                .find(|info| info.id == first)
+                .unwrap()
+                .running_since,
+            Some(rho_agent_types::UnixMs(1234))
+        );
+        manager.on_running(&first, None);
+        assert_eq!(
+            manager
+                .snapshot()
+                .into_iter()
+                .find(|info| info.id == first)
+                .unwrap()
+                .running_since,
+            None
+        );
         let child_reply = manager
             .tool_call(
                 first,
@@ -1076,6 +1125,39 @@ mod tests {
             )
             .await
             .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let agents = manager.snapshot();
+                let source = agents.iter().find(|info| info.id == first).unwrap();
+                let recipient = agents.iter().find(|info| info.id == child.id).unwrap();
+                let sent = source
+                    .chat
+                    .iter()
+                    .filter(|event| {
+                        matches!(&event.kind,
+                    wire::ChatKind::Message { from: wire::Party::Agent(sender),
+                    to: wire::Party::Agent(target), text, .. }
+                    if *sender == first && *target == child.id && text == "follow up")
+                    })
+                    .count();
+                let received = recipient
+                    .chat
+                    .iter()
+                    .filter(|event| {
+                        matches!(&event.kind,
+                    wire::ChatKind::Message { from: wire::Party::Agent(sender),
+                    to: wire::Party::Agent(target), text, .. }
+                    if *sender == first && *target == child.id && text == "follow up")
+                    })
+                    .count();
+                if sent == 1 && received == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
         manager
             .archive(wire::ArchiveAgent { agent_id: second })
             .unwrap();

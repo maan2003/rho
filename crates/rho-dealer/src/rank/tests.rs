@@ -127,6 +127,7 @@ impl World {
                 effort: Effort::Medium,
                 archived: false,
                 status: None,
+                running_since: None,
                 chat: Vec::new(),
             },
         );
