@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 12;
+pub(super) const VERSION: u32 = 13;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -182,6 +182,7 @@ pub(super) enum Message<'a> {
         text: String,
     },
     ChatArchive,
+    ChatCompact,
     ChatCancel,
     ChatTool {
         request: u64,
@@ -363,6 +364,7 @@ impl Host {
                         | Message::ChatSend { .. }
                         | Message::ChatSendTo { .. }
                         | Message::ChatArchive
+                        | Message::ChatCompact
                         | Message::ChatCancel
                         | Message::ChatTool { .. }
                         | Message::ChatToolReply { .. }
@@ -692,6 +694,13 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chat_compact_crosses_the_worker_channel() {
+        let (mut worker, host) = crate::worker::testing::pair();
+        host.write(&Message::ChatCompact).await.unwrap();
+        assert!(matches!(worker.read().await.unwrap(), Message::ChatCompact));
+    }
 
     #[tokio::test]
     async fn agent2_collaboration_crosses_the_worker_channel_with_full_arguments_and_reply() {

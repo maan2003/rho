@@ -459,6 +459,14 @@ impl ChatRemote {
             .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
     }
 
+    pub fn compact(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
+        self.0
+            .commands
+            .send(ipc::Message::ChatCompact)
+            .map_err(|_| anyhow::anyhow!("agent2 worker closed"))
+    }
+
     pub fn cancel(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!*self.0.closed.borrow(), "agent2 worker closed");
         self.0

@@ -344,6 +344,7 @@ async fn drive_chat(
                     Message::ChatSend { from, text } => handle.send(Inbound { from, body: vec![Block::Text(text)] })?,
                     Message::ChatSendTo { to, text } => handle.send_to(to, text)?,
                     Message::ChatArchive => handle.archive(),
+                    Message::ChatCompact => handle.compact()?,
                     Message::ChatCancel => handle.cancel(),
                     Message::ChatToolReply { request, result } => {
                         if let Some(wait) = pending.lock().expect("poison").remove(&request) {
