@@ -11,6 +11,17 @@ pub enum ReasoningEffort {
     High,
 }
 
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+}
+
 /// Which Responses-API model a step talks to. Not part of
 /// [`InferenceProfile`]: agent modes carry it separately, so persisted configs
 /// stay unchanged.

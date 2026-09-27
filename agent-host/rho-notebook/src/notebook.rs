@@ -12,11 +12,14 @@ use pyo3::prelude::*;
 use pyo3::{IntoPyObjectExt, PyClass, PyClassInitializer};
 use rho_agent_types::UnixMs;
 use rho_tool_shell::ShellTools;
+use senax_encoder::{Decode, Encode};
 use tokio::sync::Notify;
 
 use crate::Image;
 use crate::runtime::{Build, Inbox, Input, Message};
-use crate::source::{Kind, SessionId, Source, SourceFacts, SourceId, State, StreamProgress};
+use crate::source::{
+    Header, Kind, SessionId, Source, SourceFacts, SourceId, SourceUpdate, State, StreamProgress,
+};
 
 /// How much of one cell's own output a report carries.
 const CELL_TOKENS: usize = 10000;
@@ -56,11 +59,124 @@ struct HostTasks {
     failure: Option<String>,
 }
 
-/// What a report carries to the model.
-#[derive(Clone, Debug, Default)]
+/// Persistable contributions from notebook sources, in first-seen order.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Report {
+    entries: Vec<Entry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+enum Entry {
+    Source(Vec<SourceUpdate>),
+    Imported { text: String, images: Vec<Image> },
+}
+
+/// The presentation sent to the model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderedReport {
     pub text: String,
     pub images: Vec<Image>,
+}
+
+impl Report {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Carry historical text as opaque content; never infer source state from
+    /// it.
+    pub fn from_text(text: String, images: Vec<Image>) -> Self {
+        if text.is_empty() && images.is_empty() {
+            return Self::default();
+        }
+        Self {
+            entries: vec![Entry::Imported { text, images }],
+        }
+    }
+
+    /// Combine source updates by their notebook-lifetime-unique identities.
+    /// Contributions arrive in log order; equal text is still new output.
+    pub fn merge(&mut self, newer: Report) {
+        for entry in newer.entries {
+            match entry {
+                Entry::Source(updates) => {
+                    let id = updates[0].identity;
+                    if let Some(Entry::Source(existing)) = self.entries.iter_mut().find(
+                        |entry| matches!(entry, Entry::Source(events) if events[0].identity == id),
+                    ) {
+                        existing.extend(updates);
+                    } else {
+                        self.entries.push(Entry::Source(updates));
+                    }
+                }
+                imported => self.entries.push(imported),
+            }
+        }
+    }
+
+    pub fn render(&self) -> RenderedReport {
+        let mut chunks = Vec::new();
+        let mut images = Vec::new();
+        for entry in &self.entries {
+            match entry {
+                Entry::Imported {
+                    text,
+                    images: entry_images,
+                } => {
+                    if !text.is_empty() {
+                        chunks.push(text.clone());
+                    }
+                    images.extend(entry_images.iter().cloned());
+                }
+                Entry::Source(updates) => {
+                    images.extend(
+                        updates
+                            .iter()
+                            .flat_map(|update| update.images.iter().cloned()),
+                    );
+                    let with_header: Vec<_> = updates
+                        .iter()
+                        .filter_map(|update| {
+                            update
+                                .header
+                                .as_ref()
+                                .map(|header| (update.session, header))
+                        })
+                        .collect();
+                    let header = with_header
+                        .iter()
+                        .rev()
+                        .find(|(_, header)| matches!(header, Header::Finished { .. }))
+                        .or_else(|| {
+                            with_header
+                                .iter()
+                                .rev()
+                                .find(|(_, header)| !matches!(header, Header::Session))
+                        })
+                        .or_else(|| with_header.last());
+                    let mut parts = Vec::new();
+                    if let Some((session, header)) = header {
+                        let rendered = header.render(*session);
+                        if !rendered.is_empty() {
+                            parts.push(rendered);
+                        }
+                    }
+                    parts.extend(
+                        updates
+                            .iter()
+                            .flat_map(|update| update.parts.iter().map(|part| part.render())),
+                    );
+                    if !parts.is_empty() {
+                        chunks.push(parts.join("\n").trim_end().to_owned());
+                    }
+                }
+            }
+        }
+        RenderedReport {
+            text: chunks.join("\n\n"),
+            images,
+        }
+    }
 }
 
 impl Notebook {
@@ -168,8 +284,7 @@ impl Notebook {
         let shared = &self.shared;
         let cells = shared.cells.lock().unwrap().clone();
         let sources = shared.sources.lock().unwrap().clone();
-        let mut chunks = Vec::new();
-        let mut images = Vec::new();
+        let mut report = Report::default();
         for source in sources
             .values()
             .filter(|s| s.id == cells.last().copied().unwrap_or(SourceId(0)))
@@ -179,18 +294,12 @@ impl Notebook {
                     .filter(|s| s.id != cells.last().copied().unwrap_or(SourceId(0))),
             )
         {
-            // Named when two or more cells have started since its own.
             let old = cells.iter().filter(|cell| **cell > source.cell).count() >= 2;
-            if let Some(text) = source.report(old) {
-                chunks.push(text.trim_end().to_owned());
+            if let Some(update) = source.report(old) {
+                report.entries.push(Entry::Source(vec![update]));
             }
-            images.extend(source.take_images());
         }
-        // Contexts can emit output after the task ends; keep every source.
-        (!chunks.is_empty() || !images.is_empty()).then(|| Report {
-            text: chunks.join("\n\n"),
-            images,
-        })
+        (!report.is_empty()).then_some(report)
     }
 
     /// Stop every cell and everything they started. Each reports how it
@@ -703,4 +812,142 @@ where
         &shared.runtime,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod report_tests {
+    use uuid::Uuid;
+
+    use super::{Entry, Report};
+    use crate::Image;
+    use crate::source::{Header, Outcome, Part, SourceUpdate};
+
+    fn image(byte: u8) -> Image {
+        Image {
+            media_type: "image/png".into(),
+            data: vec![byte],
+        }
+    }
+
+    fn update(id: Uuid, header: Header, parts: Vec<Part>, images: Vec<Image>) -> Report {
+        Report {
+            entries: vec![Entry::Source(vec![SourceUpdate {
+                identity: id,
+                session: 1234,
+                header: Some(header),
+                parts,
+                images,
+            }])],
+        }
+    }
+
+    #[test]
+    fn merge_replaces_running_status_but_never_deduplicates_equal_output() {
+        let id = Uuid::new_v4();
+        let mut report = update(
+            id,
+            Header::Running {
+                label: "Command".into(),
+                old_name: None,
+            },
+            vec![Part::Output("same".into())],
+            vec![image(1)],
+        );
+        let end = update(
+            id,
+            Header::Finished {
+                session: true,
+                old_name: Some("Command: echo hi".into()),
+                end: Outcome::ProcessExited(7),
+            },
+            vec![
+                Part::Output("same".into()),
+                Part::Output("different".into()),
+            ],
+            vec![image(2)],
+        );
+        report.merge(end); // Equal text in separate drains is separate output.
+        let rendered = report.render();
+        assert_eq!(
+            rendered.text,
+            "Session ID: 1234\nCommand: echo hi\nProcess exited with code 7\nOutput:\nsame\nOutput:\nsame\nOutput:\ndifferent"
+        );
+        assert_eq!(rendered.images, vec![image(1), image(2)]);
+        assert_eq!(rendered, report.render());
+        let mut bytes = senax_encoder::encode(&report).unwrap();
+        let persisted: Report = senax_encoder::decode(&mut bytes).unwrap();
+        assert_eq!(persisted, report);
+        assert_eq!(persisted.render(), rendered);
+    }
+
+    #[test]
+    fn same_displayed_session_across_notebook_lifetimes_does_not_merge() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut report = update(
+            first,
+            Header::Plain,
+            vec![Part::Text("first".into())],
+            vec![],
+        );
+        report.merge(update(
+            second,
+            Header::Plain,
+            vec![Part::Text("second".into())],
+            vec![],
+        ));
+        assert_eq!(report.render().text, "first\n\nsecond");
+        assert_eq!(report.entries.len(), 2);
+    }
+
+    #[test]
+    fn page_and_truncation_survive_merging_without_reinterpreting_text() {
+        let id = Uuid::new_v4();
+        let mut report = update(
+            id,
+            Header::Running {
+                label: "Command".into(),
+                old_name: None,
+            },
+            vec![Part::Output("head\n[output truncated]\ntail".into())],
+            vec![],
+        );
+        report.merge(update(
+            id,
+            Header::Page {
+                old_name: Some("Command: job".into()),
+                end: None,
+            },
+            vec![Part::Page {
+                output: "next".into(),
+                finished: false,
+                remaining: 17,
+                dropped: 0,
+            }],
+            vec![],
+        ));
+        let text = report.render().text;
+        assert!(text.contains("head\n[output truncated]\ntail"));
+        assert!(text.contains(
+            "Output:\nnext\n[17 more bytes; call more_output() again for the next page]"
+        ));
+        assert_eq!(report.render().text, text);
+    }
+
+    #[test]
+    fn imported_text_is_opaque_and_ordered() {
+        let mut report = Report::from_text("Session ID: 1234\nOutput:\nold".into(), vec![image(3)]);
+        report.merge(update(
+            Uuid::new_v4(),
+            Header::Plain,
+            vec![Part::Text("new".into())],
+            vec![],
+        ));
+        assert_eq!(
+            report.render().text,
+            "Session ID: 1234\nOutput:\nold\n\nnew"
+        );
+        assert_eq!(report.render().images, vec![image(3)]);
+        assert!(Report::from_text(String::new(), vec![]).is_empty());
+    }
 }

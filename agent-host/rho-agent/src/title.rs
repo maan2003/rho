@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rho_agent_types::{AgentId, UnixMs};
 use rho_db::RhoDb;
-use rho_inference::Inference;
+use crate::inference::Inference;
 use tokio::sync::Semaphore;
 
 use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
@@ -141,7 +141,7 @@ fn first_task_text(history: &[AgentEvent<'_>], current: &str) -> Option<String> 
             AgentEvent::Accepted(QueuedInput {
                 kind: InputKind::Message { content },
                 ..
-            }) => Some(rho_inference::types::text_content(content)),
+            }) => Some(rho_agent_types::transcript::text_content(content)),
             AgentEvent::Transcript {
                 line: TranscriptLine::User { text },
                 wake: None,
@@ -164,7 +164,7 @@ mod tests {
     use super::*;
     use crate::db::{AgentProfileWriteTxnExt as _, SessionBinding};
 
-    fn user(text: &str, source: rho_inference::types::MessageSender) -> AgentEvent<'static> {
+    fn user(text: &str, source: rho_agent_types::transcript::MessageSender) -> AgentEvent<'static> {
         AgentEvent::Accepted(QueuedInput {
             source,
             kind: InputKind::Message {
@@ -183,11 +183,11 @@ mod tests {
                 &[
                     user(
                         "first peer task",
-                        rho_inference::types::MessageSender::Agent { id: peer }
+                        rho_agent_types::transcript::MessageSender::Agent { id: peer }
                     ),
                     user(
                         "unrelated later request",
-                        rho_inference::types::MessageSender::User
+                        rho_agent_types::transcript::MessageSender::User
                     ),
                 ],
                 "current"
@@ -209,7 +209,7 @@ mod tests {
         );
         assert_eq!(
             first_task_text(
-                &[user(" ", rho_inference::types::MessageSender::User)],
+                &[user(" ", rho_agent_types::transcript::MessageSender::User)],
                 "later"
             ),
             None
@@ -240,17 +240,14 @@ mod tests {
             );
             let first = write.append_agent_event(
                 agent,
-                &user("name this task", rho_inference::types::MessageSender::User),
+                &user(
+                    "name this task",
+                    rho_agent_types::transcript::MessageSender::User,
+                ),
             );
             write.commit();
-            let inference = Inference::new_with_config(
-                db.clone(),
-                rho_inference::InferenceConfig::with_responses_base_url("http://127.0.0.1:1")
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-            let mut task = Task::new(inference.clone());
+            let inference = crate::inference::testing::accounts();
+            let mut task = Task::new(inference.client());
             task.start(&db, agent, "not the first message", |_| async {
                 panic!("cancelled naming ran")
             })
@@ -263,7 +260,7 @@ mod tests {
             let mut write = db.write().await;
             write.rewind_agent(UnixMs(2), agent, first);
             write.commit();
-            let mut task = Task::new(inference);
+            let mut task = Task::new(inference.client());
             task.start(&db, agent, "new task after rewind", |_| async {
                 panic!("naming retried")
             })

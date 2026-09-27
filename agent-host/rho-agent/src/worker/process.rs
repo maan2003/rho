@@ -271,8 +271,25 @@ impl Process {
                 socket.write_all(&bytes).await?;
                 let (sender, mut receiver, mut writer) = transport::connect(socket);
                 let _ = connected.send(sender.clone());
-                let (policy_incoming, policy_messages) = mpsc::channel(super::policy::MAX_REQUESTS);
-                let policy = super::policy::serve(inference, sender.clone(), policy_messages);
+                let (policy_incoming, policy_messages) = mpsc::channel(32);
+                let policy_sender: crate::inference::PolicySender = Arc::new({
+                    let sender = sender.clone();
+                    move |bytes| {
+                        let sender = sender.clone();
+                        Box::pin(async move {
+                            sender
+                                .send(
+                                    transport::Port::Workset,
+                                    super::workset::encode(&super::workset::Message::Policy(
+                                        bytes,
+                                    ))?,
+                                )
+                                .await?;
+                            Ok(())
+                        })
+                    }
+                });
+                let policy = inference.serve_policy(policy_sender, policy_messages);
                 tokio::pin!(policy);
                 let result = tokio::select! {
                     result = &mut policy => result,

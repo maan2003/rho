@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::oauth::ResolvedAuth;
 use super::ws;
 use crate::accounts::SelectedAuth;
-use crate::inference::Inference;
+use crate::inference::Accounts;
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -192,7 +192,7 @@ impl RouteSelector {
             .collect()
     }
 
-    pub(crate) async fn probe_once(&self, inference: &Inference) {
+    pub(crate) async fn probe_once(&self, inference: &Accounts) {
         let selected = match inference.select().await {
             Ok(selected) => selected,
             Err(error) => {

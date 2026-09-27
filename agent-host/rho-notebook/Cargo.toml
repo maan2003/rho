@@ -7,10 +7,13 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 libc.workspace = true
 pyo3.workspace = true
 rho-agent-types.workspace = true
 rho-tool-shell.workspace = true
+senax-encoder.workspace = true
+uuid.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "rt", "macros", "time"] }
 

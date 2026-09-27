@@ -3,15 +3,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use rho_agent_types::transcript::{
+    ContextBlock, InferenceResponseItem, MessageSender, OpenAiResponsesProviderData as Provider,
+    ToolResult,
+};
 use rho_agent_types::{AgentId, ContentPart, MessagePhase, UnixMs};
 use rho_db::{SenValue, WriteTxn};
-use rho_inference::OpenAiResponsesProviderData as Provider;
-use rho_inference::types::{ContextBlock, InferenceResponseItem, MessageSender, ToolResult};
 use serde_json::json;
 
+use super::legacy::Entry;
+use super::legacy::provider::{Call, CallResult, Carry};
 use super::{AGENT_HEADS, AGENT_LOG, AgentRuntime, agent_range, fold_head, rows};
 use crate::db::legacy::NativeEvent;
-use crate::entry::{Block, CallResult, Entry, MessageId, Notice, Party, Wake};
+use crate::entry::{Block, MessageId, Notice, Party, Wake};
+use crate::inference::{Image, Usage};
 use crate::{AgentEvent, InputKind};
 
 pub(super) fn migrate(write: &mut WriteTxn) {
@@ -51,7 +56,7 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
             .1
             .into_iter()
             .filter_map(|(_, event)| match event {
-                AgentEvent::Entry(entry) => Some(entry),
+                AgentEvent::LegacyEntry(entry) => Some(entry),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -71,24 +76,18 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
         .iter()
         .filter(|entry| matches!(entry, Entry::Received { id, .. } if !delivered.contains(id)))
         .count();
-    let request = crate::agent::context::request(
-        "".into(),
-        &entries,
-        rho_inference::step::CacheKey::from_u128(0),
-    );
+    let request = crate::db::legacy::request(&entries);
     let answered = request
-        .items()
         .iter()
         .filter_map(|item| match item {
-            rho_inference::step::Item::Result { call_id, .. } => Some(call_id.clone()),
+            super::legacy::Item::Result(result) => Some(result.display_id().to_owned()),
             _ => None,
         })
         .collect::<HashSet<_>>();
     let mut unanswered = request
-        .items()
         .iter()
         .flat_map(|item| match item {
-            rho_inference::step::Item::Step(carry) => carry.call_ids(),
+            super::legacy::Item::Step(calls) => calls.clone(),
             _ => Vec::new(),
         })
         .filter(|id| !answered.contains(id))
@@ -99,7 +98,7 @@ fn check(write: &mut WriteTxn, agent_id: AgentId, unmatched: usize) {
         .rev()
         .find(|entry| matches!(entry, Entry::Step { .. } | Entry::Woken { .. }))
     {
-        unanswered.retain(|id| !calls.iter().any(|call| call.id == *id));
+        unanswered.retain(|id| !calls.iter().any(|call| call.display_id() == id.as_str()));
     }
     if unmatched + unread + unanswered.len() > 0 {
         eprintln!(
@@ -127,7 +126,7 @@ fn migrate_agent(write: &mut WriteTxn, agent_id: AgentId) -> usize {
         if let Some(entry) = convert.row(pos, &event) {
             log.insert(
                 &(agent_id, pos),
-                SenValue::borrowed(&AgentEvent::Entry(entry)),
+                SenValue::borrowed(&AgentEvent::LegacyEntry(entry)),
             );
         }
     }
@@ -350,20 +349,16 @@ impl Convert {
                     at: *at,
                     calls,
                     prose,
-                    carry: rho_inference::step::Carry::from_openai_items(if before {
-                        Vec::new()
-                    } else {
-                        carry
-                    }),
-                    usage: usage.as_ref().map_or_else(Default::default, |bucket| {
-                        rho_inference::step::Usage {
+                    carry: Carry::from_openai_items(if before { Vec::new() } else { carry }),
+                    usage: usage
+                        .as_ref()
+                        .map_or_else(Default::default, |bucket| Usage {
                             input_tokens: bucket
                                 .input_tokens
                                 .saturating_add(bucket.cache_read_tokens),
                             cached_tokens: bucket.cache_read_tokens,
                             output_tokens: bucket.output_tokens,
-                        }
-                    }),
+                        }),
                 }
             }
             _ => return None,
@@ -479,7 +474,7 @@ impl Convert {
             let text = extra.join("\n\n");
             match results
                 .iter_mut()
-                .find(|result| self.calls.contains(result.id.as_str()))
+                .find(|result| self.calls.contains(result.display_id()))
             {
                 Some(result) => {
                     result.text.push_str("\n\n");
@@ -515,7 +510,7 @@ fn party(sender: MessageSender) -> Party {
 fn block_of(part: &ContentPart) -> Block {
     match part {
         ContentPart::Text { text } => Block::Text(text.clone()),
-        ContentPart::Image { media_type, data } => Block::Image(rho_inference::step::Image {
+        ContentPart::Image { media_type, data } => Block::Image(Image {
             media_type: media_type.clone(),
             data: data.clone(),
         }),
@@ -523,19 +518,19 @@ fn block_of(part: &ContentPart) -> Block {
 }
 
 fn call_result(result: &ToolResult) -> CallResult {
-    CallResult {
-        id: rho_inference::step::CallId::new(result.call_id.as_str()),
-        text: (*result.body.output).clone(),
-        images: result
+    CallResult::from_legacy(
+        result.call_id.as_str(),
+        (*result.body.output).clone(),
+        result
             .body
             .images
             .iter()
-            .map(|image| rho_inference::step::Image {
+            .map(|image| Image {
                 media_type: image.media_type.clone(),
                 data: image.data.clone(),
             })
             .collect(),
-    }
+    )
 }
 
 fn carry_calls(carry: &[String]) -> Vec<String> {
@@ -569,7 +564,7 @@ fn response(
     output: &[ContextBlock],
     dropped: &dyn Fn(&str) -> bool,
     pos: u64,
-) -> (Vec<rho_inference::step::Call>, Vec<String>, String) {
+) -> (Vec<Call>, Vec<String>, String) {
     let mut calls = Vec::new();
     let mut carry = Vec::new();
     let mut prose = String::new();
@@ -584,7 +579,7 @@ fn response(
                 content,
                 phase,
             } => {
-                let text = rho_inference::types::text_content(content);
+                let text = rho_agent_types::transcript::text_content(content);
                 prose.push_str(&text);
                 let id = match provider_specific.as_any().downcast_ref::<Provider>() {
                     Some(Provider::Message { item_id }) => item_id.as_str().to_owned(),
@@ -610,10 +605,7 @@ fn response(
                 arguments,
                 ..
             } => {
-                calls.push(rho_inference::step::Call {
-                    id: rho_inference::step::CallId::new(id.as_str()),
-                    code: arguments.clone(),
-                });
+                calls.push(Call::from_legacy(id.as_str(), arguments.clone()));
                 if dropped(id.as_str()) {
                     continue;
                 }
@@ -627,7 +619,7 @@ fn response(
                     "type": "custom_tool_call",
                     "id": item_id,
                     "call_id": id.as_str(),
-                    "name": rho_inference::step::EXEC,
+                    "name": "exec",
                     "input": arguments,
                 })
             }
@@ -672,8 +664,7 @@ fn response(
 #[cfg(test)]
 mod tests {
     use rho_agent_types::MessageDelivery;
-    use rho_inference::step::Item;
-    use rho_inference::types::{
+    use rho_agent_types::transcript::{
         ProviderResponseItemId, ToolCallId, ToolName, ToolOutput, ToolType,
     };
 
@@ -683,6 +674,7 @@ mod tests {
     };
     use super::*;
     use crate::QueuedInput;
+    use crate::db::legacy::Item;
 
     fn accepted(source: MessageSender, text: &str) -> AgentEvent<'static> {
         AgentEvent::Accepted(QueuedInput {
@@ -808,14 +800,14 @@ mod tests {
         let entries = rows[1..]
             .iter()
             .map(|(_, event)| match event {
-                AgentEvent::Entry(entry) => entry.clone(),
+                AgentEvent::LegacyEntry(entry) => entry.clone(),
                 other => panic!("not converted: {other:?}"),
             })
             .collect::<Vec<_>>();
         assert!(
             matches!(
                 &entries[2],
-                Entry::Step { calls, .. } if calls[0].id == *"c1"
+                Entry::Step { calls, .. } if calls[0].display_id() == "c1"
             ),
             "the evicted call is still there to read"
         );
@@ -841,17 +833,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(unread, vec![MessageId(rows[8].0.pos)]);
 
-        let request = crate::agent::context::request(
-            "".into(),
-            &entries,
-            rho_inference::step::CacheKey::new(),
-        );
+        let request = crate::db::legacy::request(&entries);
         let shown = request
-            .items()
             .iter()
             .map(|item| match item {
-                Item::Step(carry) => format!("step {:?}", carry.call_ids()),
-                Item::Result { call_id, text, .. } => format!("result {call_id}: {text}"),
+                Item::Step(calls) => format!("step {calls:?}"),
+                Item::Result(result) => format!("result {}: {}", result.display_id(), result.text),
                 Item::User { text, .. } => format!("user {text}"),
                 Item::CompactionTrigger => "compact".into(),
             })
@@ -861,7 +848,7 @@ mod tests {
             [
                 "user Message from the human:\nhi",
                 "step []",
-                "step [CallId(\"c2\")]",
+                "step [\"c2\"]",
                 "result c2: two\n\nnote",
                 "step []",
             ]

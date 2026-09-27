@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use rho_agent_types::{AgentRole, UnixMs};
 use rho_db::RhoDb;
-use rho_inference::step::Item;
-use rho_inference::step::scripted::Scripted;
 
+use super::scripted::Scripted;
 use super::*;
 use crate::db::{
     AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentRoleSessionProfile as _, AgentRuntime,
     AgentWriteTxnExt as _,
 };
 use crate::entry::{Block, Entry, Notice, Party};
+use crate::inference::Item;
 
 struct Harness {
     _directory: tempfile::TempDir,
@@ -27,7 +27,7 @@ struct Harness {
 impl Harness {
     async fn new() -> Self {
         // The worker installs one at startup; the notebook's web client needs it.
-        rho_inference::ensure_crypto_provider();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));
         let mut write = db.write().await;
@@ -42,20 +42,15 @@ impl Harness {
             role,
             role.session_profile(),
             AgentRuntime::Rho {
-                prompt_cache_key: rho_inference::PromptCacheKey::generate(),
+                prompt_cache_key: crate::inference::PromptCacheKey::generate(),
             },
             crate::db::AgentOrigin::User,
         );
         write.commit();
-        let inference = Inference::new_with_config(
-            db.clone(),
-            rho_inference::InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
-        )
-        .await
-        .unwrap();
+        let accounts = crate::inference::testing::accounts();
         let host = crate::worker::local_services(
             db.clone(),
-            inference.clone(),
+            accounts.clone(),
             agent,
             std::sync::Weak::new(),
         );
@@ -83,7 +78,7 @@ impl Harness {
             db,
             agent,
             host,
-            inference,
+            inference: accounts.client(),
             view: Arc::new(Lazy::ready(view)),
         }
     }
@@ -142,19 +137,20 @@ async fn say(handle: &AgentHandle, text: &str) {
 }
 
 /// Everything a request tells the model, besides replayed steps.
-fn told(request: &rho_inference::step::Request) -> String {
+fn told(request: &crate::inference::Request) -> String {
     request
         .items()
         .iter()
         .filter_map(|item| match item {
-            Item::Result { text, .. } | Item::User { text, .. } => Some(text.as_str()),
+            Item::Report { text, .. } => Some(text.as_str()),
+            Item::User { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-async fn requests(script: &Scripted, count: usize) -> Vec<rho_inference::step::Request> {
+async fn requests(script: &Scripted, count: usize) -> Vec<crate::inference::Request> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let requests = script.requests();
@@ -210,9 +206,10 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     let told = told(&second[1]);
     assert!(told.contains("second"), "{told}");
     assert!(
-        second[1].items().iter().any(
-            |item| matches!(item, Item::Result { call_id, .. } if call_id.as_str() == "call_1")
-        ),
+        second[1]
+            .items()
+            .iter()
+            .any(|item| matches!(item, Item::Report {reply_to:Some(carry),..} if carry.display_calls()[0].display_id() == "call_1")),
         "the first call's result is reported"
     );
     harness
@@ -431,14 +428,9 @@ async fn waiting_still_checks_in_and_archive_revival_has_a_fresh_notebook() {
             state.archived && state.running_tasks == 0
         })
         .await;
-    assert!(
-        !entries
-            .iter()
-            .any(|entry| matches!(entry, Entry::Activity { .. }))
-    );
     assert!(entries.iter().any(|entry| matches!(
         entry,
-        Entry::Woken {
+        Entry::RequestSent {
             why: Wake::Checkin,
             ..
         }
@@ -646,7 +638,7 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
         attempts[1]
             .items()
             .iter()
-            .any(|item| matches!(item, Item::Step(carry) if !carry.call_ids().is_empty())),
+            .any(|item| matches!(item, Item::Step {carry,..} if carry.has_call())),
         "the next request must record admitted code, not replay the failed request"
     );
 }
@@ -668,7 +660,10 @@ async fn code_fragments_wait_for_a_publication_frame() {
     let mut streaming = None;
     agent.stream(
         &mut streaming,
-        (Some(CallId::new("call-id")), String::new()),
+        (
+            Some(scripted::carry(Call::new("call-id", String::new()))),
+            String::new(),
+        ),
     );
     for _ in 0..100 {
         agent.stream(&mut streaming, (None, "# fragment\n".into()));
@@ -727,23 +722,33 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
                 let first = response_id.get_or_insert_with(|| response.id.clone());
                 assert_eq!(*first, response.id);
                 if let Some(rho_agents_client::protocol::transcript::Item::ToolCall {
-                    arguments, ..
-                }) = response.items.first() {
+                    arguments,
+                    ..
+                }) = response.items.first()
+                {
                     assert!(arguments.starts_with(&previous));
                     grew |= !previous.is_empty() && arguments.len() > previous.len();
                     previous = arguments.clone();
                 }
             } else if response_id.is_some() {
-                assert!(harness.entries().iter().any(|entry| matches!(
-                    entry, Entry::Step { calls, .. } if calls.first().is_some_and(|call| call.code == code)
-                )), "clearing the live response must follow the durable step");
+                assert!(
+                    harness.entries().iter().any(|entry| matches!(
+                        entry, Entry::Step { exec, .. } if exec.as_deref() == Some(code.as_str())
+                    )),
+                    "clearing the live response must follow the durable step"
+                );
                 assert_eq!(status.runtime.inference, InferenceState::Idle);
-                assert!(status.runtime.running_tasks > 0, "the cell still awaits the human");
+                assert!(
+                    status.runtime.running_tasks > 0,
+                    "the cell still awaits the human"
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     // No GUI focuses this harness. Current state still reaches the host feed,
     // but the potentially large response body is not broadcast.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -767,13 +772,378 @@ async fn live_response_is_replaced_only_after_its_step_is_durable() {
     .await
     .unwrap();
     assert!(grew, "must exercise multiple streamed replacements");
-    assert!(
-        !harness
-            .entries()
-            .iter()
-            .any(|entry| matches!(entry, Entry::Activity { .. }))
-    );
     handle.cancel();
     drop(handle);
     task.await.unwrap();
+}
+
+/// Exercise the agent-owned boundary through the same injected session API used
+/// in production. Provider wire replay is tested independently in
+/// rho-inference.
+#[tokio::test]
+async fn warm_suffix_and_database_fallback_keep_the_original_request_boundary() {
+    use crate::inference::{Continuation, Request};
+    struct Controlled(mpsc::UnboundedSender<(Request, mpsc::UnboundedSender<Event>)>);
+    impl crate::inference::Session for Controlled {
+        fn start(&self, request: Request) -> Response {
+            let (events, response) = mpsc::unbounded_channel();
+            self.0.send((request, events)).unwrap();
+            response
+        }
+    }
+    fn answer(events: mpsc::UnboundedSender<Event>, id: &str) {
+        events
+            .send(Event::Completed(Step {
+                continuation: Some(Continuation::new(id.into())),
+                call: None,
+                prose: format!("ack-{id}"),
+                carry: Carry::new(serde_json::json!(format!("ack-{id}")), vec![], false),
+                usage: crate::inference::Usage::default(),
+            }))
+            .unwrap();
+    }
+    let (submitted, mut requests) =
+        mpsc::unbounded_channel::<(Request, mpsc::UnboundedSender<Event>)>();
+    let (reconnecting, reconnect) = oneshot::channel();
+    let (resume, resumed) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (first, events) = requests.recv().await.unwrap();
+        assert!(first.continuation.is_none());
+        assert!(told(&first).contains("first-message"));
+        answer(events, "r1");
+        let (second, events) = requests.recv().await.unwrap();
+        assert_eq!(second.continuation, Some(Continuation::new("r1".into())));
+        assert!(told(&second).contains("second-message"));
+        assert!(!told(&second).contains("first-message"));
+        answer(events, "r2");
+        let (third, events) = requests.recv().await.unwrap();
+        assert_eq!(third.continuation, Some(Continuation::new("r2".into())));
+        reconnecting.send(()).unwrap();
+        resumed.await.unwrap();
+        events.send(Event::NeedsContext).unwrap();
+        let (replay, events) = requests.recv().await.unwrap();
+        assert!(replay.continuation.is_none());
+        let text = format!("{:?}", replay.items);
+        for expected in [
+            "first-message",
+            "second-message",
+            "third-message",
+            "ack-r1",
+            "ack-r2",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("late-message"));
+        assert!(
+            !replay
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::CompactionTrigger))
+        );
+        answer(events, "r3");
+        let (fourth, events) = requests.recv().await.unwrap();
+        assert_eq!(fourth.continuation, Some(Continuation::new("r3".into())));
+        assert!(told(&fourth).contains("late-message"));
+        assert!(matches!(fourth.items.last(), Some(Item::CompactionTrigger)));
+        answer(events, "r4");
+    });
+    let harness = Harness::new().await;
+    let (handle, mut agent) = Agent::load(
+        harness.agent,
+        harness.host.clone(),
+        harness.inference.clone(),
+        harness.view.clone(),
+    )
+    .await
+    .unwrap();
+    agent.session = Arc::new(Controlled(submitted));
+    let instructions: Arc<str> = "test instructions".into();
+    for text in ["first-message", "second-message"] {
+        agent
+            .receive(Party::Human, vec![Block::Text(text.into())])
+            .await
+            .unwrap();
+        agent
+            .wake_with(Wake::Message, instructions.clone(), Report::default())
+            .await
+            .unwrap();
+        assert!(
+            agent.context.input().is_empty(),
+            "completed input retained in RAM"
+        );
+    }
+    agent
+        .receive(Party::Human, vec![Block::Text("third-message".into())])
+        .await
+        .unwrap();
+    let control = async {
+        reconnect.await.unwrap();
+        handle.compact();
+        handle
+            .send_agent_message_accepted(harness.agent, "late-message")
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            agent.wake_with(Wake::Message, instructions.clone(), Report::default()),
+            control
+        )
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+    assert!(
+        agent.compaction.pending,
+        "concurrent compaction must remain pending"
+    );
+    agent
+        .wake_with(Wake::Message, instructions, Report::default())
+        .await
+        .unwrap();
+    assert!(agent.context.input().is_empty());
+    agent.shutdown().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_logs_only_new_contributions_but_builds_one_combined_input() {
+    let harness = Harness::new().await;
+    let script = Arc::new(Scripted::new());
+    script.then_transient().then("await human.reply()");
+    let (_handle, mut agent) = Agent::load(
+        harness.agent,
+        harness.host.clone(),
+        harness.inference.clone(),
+        harness.view.clone(),
+    )
+    .await
+    .unwrap();
+    agent.script(script.clone());
+    agent.notebook().await.unwrap();
+    agent
+        .append(Entry::Step {
+            at: UnixMs::now(),
+            exec: Some("pass".into()),
+            prose: String::new(),
+            usage: None,
+            carry: scripted::carry(Call::new("preceding-exec", "pass".into())),
+        })
+        .await
+        .unwrap();
+    agent
+        .receive(Party::Human, vec![Block::Text("initial-message".into())])
+        .await
+        .unwrap();
+    let first = Report {
+        notebook: rho_notebook::Report::from_text("alpha-output".into(), vec![]),
+        ..Report::default()
+    };
+    agent
+        .wake_with(Wake::Notify, "system".into(), first)
+        .await
+        .unwrap();
+    assert!(agent.backoff.is_some());
+
+    agent
+        .receive(
+            Party::Human,
+            vec![Block::Text("arrived-after-failure".into())],
+        )
+        .await
+        .unwrap();
+    let second = Report {
+        notebook: rho_notebook::Report::from_text("beta-output".into(), vec![]),
+        ..Report::default()
+    };
+    agent
+        .wake_with(Wake::Notify, "system".into(), second)
+        .await
+        .unwrap();
+    agent.flush().await.unwrap();
+    let attempts = script.requests();
+    assert_eq!(attempts.len(), 2);
+    let result = attempts[1]
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            Item::Report {
+                text,
+                images,
+                reply_to: Some(carry),
+            } => Some((text, images, carry)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].2.display_calls()[0].display_id(),
+        "preceding-exec"
+    );
+    assert_eq!(result[0].0, "alpha-output\n\nbeta-output");
+    let text = told(&attempts[1]);
+    assert_eq!(text.matches("initial-message").count(), 1);
+    assert_eq!(text.matches("arrived-after-failure").count(), 1);
+    let logged = harness
+        .entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::RequestSent { report, .. } => Some(report.render().text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(logged, ["alpha-output", "beta-output"]);
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn indexed_cold_load_and_queued_boundary_preserve_messages_across_compaction() {
+    let harness = Harness::new().await;
+    let (_, mut agent) = Agent::load(
+        harness.agent,
+        harness.host.clone(),
+        harness.inference.clone(),
+        harness.view.clone(),
+    )
+    .await
+    .unwrap();
+    // These recovery facts precede the retained replay range.
+    agent
+        .append(Entry::Notice {
+            at: UnixMs(1),
+            notice: Notice::FreshNotebook,
+        })
+        .await
+        .unwrap();
+    agent
+        .append(Entry::Awaiting {
+            at: UnixMs(2),
+            since: Some(UnixMs(2)),
+        })
+        .await
+        .unwrap();
+    agent
+        .receive(Party::Human, vec![Block::Text("old-discarded".into())])
+        .await
+        .unwrap();
+    agent
+        .append(Entry::CompactionTrigger {
+            at: UnixMs(3),
+            manual: false,
+        })
+        .await
+        .unwrap();
+    agent
+        .append(Entry::RequestSent {
+            at: UnixMs(4),
+            why: Wake::Compaction,
+            compact: true,
+            imported: None,
+            report: Report::default(),
+        })
+        .await
+        .unwrap();
+    agent
+        .receive(Party::Human, vec![Block::Text("during-compaction".into())])
+        .await
+        .unwrap();
+    agent
+        .append(Entry::Step {
+            at: UnixMs(5),
+            exec: None,
+            prose: String::new(),
+            usage: None,
+            carry: Carry::new(serde_json::json!("retained-compaction"), vec![], true),
+        })
+        .await
+        .unwrap();
+    agent
+        .receive(
+            Party::Agent(harness.agent),
+            vec![Block::Text("after-compaction".into())],
+        )
+        .await
+        .unwrap();
+    agent.shutdown().await.unwrap();
+    drop(agent);
+
+    let (_, mut agent) = Agent::load(
+        harness.agent,
+        harness.host.clone(),
+        harness.inference.clone(),
+        harness.view.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(agent.restarted);
+    assert!(!agent.awaiting, "restart clears the obsolete notebook wait");
+    assert!(
+        agent.compaction.reply,
+        "automatic compaction still owes a reply"
+    );
+    assert_eq!(
+        agent
+            .unread
+            .iter()
+            .map(|(_, from, _)| *from)
+            .collect::<Vec<_>>(),
+        [Party::Human, Party::Agent(harness.agent)]
+    );
+
+    // Freeze while persistence is blocked. A later request and compaction must
+    // not move this prepared turn's cutoff or its replay start.
+    agent.flush().await.unwrap();
+    let write = harness.db.write().await;
+    agent
+        .append(Entry::RequestSent {
+            at: UnixMs(6),
+            why: Wake::Message,
+            compact: false,
+            imported: None,
+            report: Report {
+                messages: agent.unread.iter().map(|(id, _, _)| *id).collect(),
+                ..Report::default()
+            },
+        })
+        .await
+        .unwrap();
+    let mut turn = agent.prepare_turn("system".into()).await.unwrap();
+    agent
+        .receive(Party::Human, vec![Block::Text("too-late".into())])
+        .await
+        .unwrap();
+    agent
+        .append(Entry::RequestSent {
+            at: UnixMs(7),
+            why: Wake::Compaction,
+            compact: true,
+            imported: None,
+            report: Report::default(),
+        })
+        .await
+        .unwrap();
+    agent
+        .append(Entry::Step {
+            at: UnixMs(8),
+            exec: None,
+            prose: String::new(),
+            usage: None,
+            carry: Carry::new(serde_json::json!("later-compaction"), vec![], true),
+        })
+        .await
+        .unwrap();
+    drop(write);
+    agent.flush().await.unwrap();
+
+    let request = turn.request(&harness.host).await.unwrap();
+    let text = format!("{:?}", request.items());
+    assert!(text.contains("retained-compaction"), "{text}");
+    for message in ["during-compaction", "after-compaction"] {
+        assert_eq!(text.matches(message).count(), 1, "{text}");
+    }
+    for excluded in ["old-discarded", "too-late", "later-compaction"] {
+        assert!(!text.contains(excluded), "{text}");
+    }
+    agent.shutdown().await.unwrap();
 }

@@ -5,12 +5,12 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rho_agent_types::AgentId;
 use rho_db::RhoDb;
-use rho_inference::Inference;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use super::ipc::{self, Message, Reply, Request};
 use crate::db::{AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentWriteTxnExt as _};
+use crate::inference::Accounts;
 
 struct Controls {
     closed: bool,
@@ -34,14 +34,14 @@ pub(super) struct Services {
 impl Services {
     pub(super) fn new(
         db: RhoDb,
-        inference: Inference,
+        inference: Accounts,
         agent: AgentId,
         pool: std::sync::Weak<crate::pool::AgentPool>,
         next_control: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (ready, _) = tokio::sync::watch::channel(false);
-        let title = tokio::sync::Mutex::new(crate::title::Task::new(inference));
+        let title = tokio::sync::Mutex::new(crate::title::Task::new(inference.client()));
         let (status, _) = tokio::sync::watch::channel(crate::AgentStatus::default());
         Self {
             stopped: std::sync::atomic::AtomicBool::new(false),
@@ -332,8 +332,24 @@ impl Services {
                 Reply::Head(self.db.read().get_agent(agent))
             }
             Request::Head => Reply::Head(self.db.read().get_agent(self.agent)),
-            Request::History => {
-                let (next, rows) = self.db.read().agent_event_records(self.agent);
+            Request::History | Request::NativeHistory(_) => {
+                let read = self.db.read();
+                let native = if let Request::NativeHistory(boundary) = request {
+                    Some((
+                        boundary.unwrap_or_else(|| read.agent_context_boundary(self.agent)),
+                        read.agent_native_recovery(self.agent),
+                    ))
+                } else {
+                    None
+                };
+                let (next, rows) = match &native {
+                    Some((boundary, _)) => (
+                        boundary.through,
+                        read.agent_context_records(self.agent, *boundary),
+                    ),
+                    None => read.agent_event_records(self.agent),
+                };
+                drop(read);
                 let mut batch = Vec::new();
                 let mut bytes = 0;
                 for row in rows {
@@ -355,9 +371,16 @@ impl Services {
                         .send(Message::HistoryBatch { id, rows: batch })
                         .await?;
                 }
-                Reply::History {
-                    next,
-                    rows: Vec::new(),
+                match native {
+                    Some((boundary, recovery)) => Reply::NativeHistory {
+                        boundary,
+                        recovery,
+                        rows: Vec::new(),
+                    },
+                    None => Reply::History {
+                        next,
+                        rows: Vec::new(),
+                    },
                 }
             }
             Request::Append(event) => {
@@ -370,8 +393,11 @@ impl Services {
                 let mut write = self.db.write().await;
                 for event in &events {
                     write.append_agent_event(self.agent, event);
-                    if let crate::AgentEvent::Entry(crate::entry::Entry::Usage { usage, at }) =
-                        event
+                    if let crate::AgentEvent::Entry(crate::entry::Entry::Step {
+                        usage: Some(usage),
+                        at,
+                        ..
+                    }) = event
                     {
                         write.add_agent_usage(
                             self.agent,
@@ -390,8 +416,9 @@ impl Services {
                         );
                     }
                 }
+                let boundary = write.agent_context_boundary(self.agent);
                 write.commit();
-                Reply::Done
+                Reply::Boundary(boundary)
             }
             Request::Profile { role, binding } => {
                 let mut write = self.db.write().await;
@@ -466,26 +493,21 @@ mod tests {
             role,
             role.session_profile(),
             AgentRuntime::Rho {
-                prompt_cache_key: rho_inference::PromptCacheKey::generate(),
+                prompt_cache_key: crate::inference::PromptCacheKey::generate(),
             },
             crate::db::AgentOrigin::User,
         );
         for _ in 0..3 {
             write.append_agent_event(
                 agent,
-                &AgentEvent::Notice {
-                    text: "x".repeat(700_000).into(),
+                &AgentEvent::Entry(crate::entry::Entry::Status {
+                    text: "x".repeat(700_000),
                     at: UnixMs(2),
-                },
+                }),
             );
         }
         write.commit();
-        let inference = Inference::new_with_config(
-            db.clone(),
-            rho_inference::InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
-        )
-        .await
-        .unwrap();
+        let inference = crate::inference::testing::accounts();
         let services = Arc::new(Services::new(
             db.clone(),
             inference,
@@ -522,6 +544,15 @@ mod tests {
         let (next, rows) = host.history().await.unwrap();
         assert_eq!(next, appended.next());
         assert_eq!((next, rows), db.read().agent_event_records(agent));
+        let (boundary, _, entries) = host.native_history(None).await.unwrap();
+        assert_eq!(boundary.through, next);
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries.iter().all(|entry| matches!(
+                entry, crate::entry::Entry::Status { text, .. } if text.len() == 700_000
+            )),
+            "all native history frames must reach the caller"
+        );
 
         // More than the service concurrency bound must wait, never return
         // "too many pending agent services" or lose an append.

@@ -30,7 +30,7 @@ use crate::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; an agent host with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v7");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v8");
 /// Which host an agent was heard from, so a host's rows can go together.
 const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v5");
 /// One agent's mirror, ordered by position, agent first: a range read
@@ -53,8 +53,9 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// the agent host, and rows naming their role no longer decode.
 /// v7: code-first explicit messages and notebook reports replace old
 /// projections.
+/// v8: typed report migration remaps log positions and journal sequence.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<TranscriptEvent>> =
-    TableDefinition::new("gui_mirror_events_v7");
+    TableDefinition::new("gui_mirror_events_v8");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
@@ -68,7 +69,9 @@ const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
 
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 23] = [
+const RETIRED_TABLES: [&str; 25] = [
+    "gui_mirror_host_v7",
+    "gui_mirror_events_v7",
     // Code-first projection and host migration remap historical row positions.
     // Drop the cursor together with the rows; preserve user verdicts.
     "gui_mirror_host_v6",
@@ -227,9 +230,12 @@ impl Mirror {
     /// kind of client state is in there too, under its own names; this
     /// touches the agent mirror's and nothing else.
     pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
-        // v6 projections used pre-migration host positions. Keep mute, but a
-        // handled-through cursor into rewritten history has no meaning.
-        let reset_verdict_positions = db.read().has_table("gui_mirror_host_v6");
+        // Rewritten host positions invalidate a handled-through cursor, but
+        // verdicts themselves are the user's data and remain intact.
+        let read = db.read();
+        let reset_verdict_positions =
+            read.has_table("gui_mirror_host_v6") || read.has_table("gui_mirror_host_v7");
+        drop(read);
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
@@ -771,7 +777,7 @@ mod tests {
     #[test]
     fn rewritten_positions_reset_seen_cursor_but_keep_mute() {
         const OLD_HOSTS: TableDefinition<&str, Sen<StoredHost>> =
-            TableDefinition::new("gui_mirror_host_v6");
+            TableDefinition::new("gui_mirror_host_v7");
         let dir = tempfile::tempdir().unwrap();
         let db = RhoDb::open(dir.path().join("client.redb"));
         let id = agent_id(4);

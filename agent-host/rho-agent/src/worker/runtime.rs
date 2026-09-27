@@ -162,6 +162,7 @@ pub(super) async fn run(
     socket: UnixStream,
     startup: super::process::Startup,
     base: Arc<crate::View>,
+    factory: crate::inference::WorkerFactory,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
 
@@ -182,7 +183,24 @@ pub(super) async fn run(
         clients: Arc::default(),
     });
     let next = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let policy = super::policy::Host::new(sender.clone(), next.clone());
+    let policy_sender: crate::inference::PolicySender = Arc::new({
+        let sender = sender.clone();
+        move |bytes| {
+            let sender = sender.clone();
+            Box::pin(async move {
+                sender
+                    .send(
+                        Port::Workset,
+                        super::workset::encode(&super::workset::Message::Policy(bytes))?,
+                    )
+                    .await?;
+                Ok(())
+            })
+        }
+    });
+    let provider = factory(&startup.responses_base_url, policy_sender)?;
+    let inference = provider.inference;
+    let policy = provider.policy;
     let devshell_dir = base.devshell_cache().as_std_path();
     let mut devshells = rho_devshell::Resolver::new(
         Some(rho_devshell::Client::new(devshell_dir)),
@@ -195,13 +213,6 @@ pub(super) async fn run(
         Err(error) => eprintln!("rho: not watching dev shell inputs: {error}"),
     }
     rho_devshell::install(devshells);
-    let inference = rho_inference::Inference::from_host(
-        policy.clone(),
-        rho_inference::InferenceConfig::with_responses_base_url(
-            startup.responses_base_url.clone(),
-        )?,
-    );
-
     let mut tasks = tokio::task::JoinSet::new();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = 'connection: loop {
@@ -236,7 +247,7 @@ pub(super) async fn run(
                 use super::workset::{Message as W, Reply};
                 match message {
                     W::Policy(message) => {
-                        if let Err(error) = policy.receive(message) {
+                        if let Err(error) = policy.receive(&message) {
                             break Err(error);
                         }
                     }

@@ -1,6 +1,6 @@
 use rho_agent_types::ToolOutputStatus;
+use rho_agent_types::transcript::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_fs_view::PathOverrides;
-use rho_inference::types::{ToolCall, ToolCallId, ToolName, ToolType};
 
 use super::*;
 

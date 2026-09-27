@@ -49,7 +49,7 @@ fn main() {
         let end = cell.facts().finished.unwrap();
         let report = notebook.report().unwrap_or_default();
         assert!(!end.failed, "{report:?}");
-        assert!(report.text.contains("/src/project"), "{report:?}");
+        assert!(report.render().text.contains("/src/project"), "{report:?}");
         assert_eq!(
             std::fs::read_to_string(work.join("project/value")).unwrap(),
             "python"

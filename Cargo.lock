@@ -12538,7 +12538,6 @@ dependencies = [
  "rho-devshell",
  "rho-fs-view",
  "rho-image",
- "rho-inference",
  "rho-notebook",
  "rho-rpc",
  "rho-shell",
@@ -12555,7 +12554,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
  "uuid",
 ]
 
@@ -12647,11 +12645,14 @@ dependencies = [
 name = "rho-agent-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "camino",
+ "inventory",
  "prefix-id",
  "senax-encoder",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -12764,7 +12765,6 @@ dependencies = [
  "rho-agent-types",
  "rho-devshell",
  "rho-fs-view",
- "rho-inference",
  "rustix 1.1.4",
  "senax-encoder",
  "serde",
@@ -13137,7 +13137,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
- "rho-inference",
+ "rho-agent-types",
  "tokio",
 ]
 
@@ -13148,19 +13148,27 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "camino",
  "clap",
  "dirs",
  "fnv",
  "futures",
  "futures-util",
- "inventory",
  "notify",
  "rand 0.8.7",
  "redb",
  "reqwest 0.12.28",
+ "rho-agent",
  "rho-agent-types",
+ "rho-claude",
  "rho-db",
+ "rho-fs-view",
+ "rho-rpc",
+ "rho-shell-view",
+ "rho-terminal",
+ "rho-web-search",
  "rpassword",
+ "rustix 1.1.4",
  "rustls",
  "senax-encoder",
  "serde",
@@ -13251,14 +13259,17 @@ dependencies = [
 name = "rho-notebook"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "camino",
  "libc",
  "pyo3",
  "rho-agent-types",
  "rho-fs-view",
  "rho-tool-shell",
+ "senax-encoder",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -13481,7 +13492,6 @@ dependencies = [
  "rho-db",
  "rho-devshell",
  "rho-fs-view",
- "rho-inference",
  "rho-watch",
  "rustix 1.1.4",
  "senax-encoder",
@@ -13536,10 +13546,11 @@ dependencies = [
 name = "rho-web-search"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "futures",
  "reqwest 0.12.28",
  "rho-agent-types",
- "rho-inference",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

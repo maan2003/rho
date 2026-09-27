@@ -10,9 +10,9 @@ use pyo3::PyClassInitializer;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rho_agent_types::transcript::{ImageDetail, ToolExecutionContext};
 use rho_agent_types::{AgentId, AgentRole};
-use rho_inference::Inference;
-use rho_inference::types::{ImageDetail, ToolExecutionContext};
+use crate::inference::Inference;
 use rho_notebook::{Export, operation};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::{WebRequest, WebSearchTools};
@@ -61,7 +61,13 @@ pub(crate) fn host_tools(
         exports.push(Export::new(
             "web",
             Web {
-                tools: WebSearchTools::new(inference.clone(), agent_id.encoded().to_owned()),
+                tools: WebSearchTools::new({
+                    let inference = inference.clone();
+                    Arc::new(move || {
+                        let inference = inference.clone();
+                        Box::pin(async move { inference.web_credentials().await })
+                    })
+                }, agent_id.encoded().to_owned()),
             },
         ));
     }

@@ -5,9 +5,9 @@ mod search;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use rho_agent_types::ContentPart;
-use rho_inference::Inference;
-use rho_inference::types::{ContextBlock, InferenceResponseItem, ToolExecutionContext};
+use rho_agent_types::transcript::{ContextBlock, InferenceResponseItem, ToolExecutionContext};
 
 use crate::search::{
     AllowedCaller, ContentItem, ExternalWebAccess, MessagePhase, ResponseItem, SearchCommands,
@@ -23,18 +23,29 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const ASSISTANT_CONTEXT_TOKENS: usize = 1_000;
 const APPROX_CHARS_PER_TOKEN: u64 = 4;
 
+/// Resolved ChatGPT OAuth credentials used only to authorize web search
+/// requests.
+pub struct Credentials {
+    pub bearer_token: String,
+    pub account_id: Option<String>,
+}
+
+/// Supplies fresh credentials for each `web.run` request.
+pub type CredentialsProvider =
+    Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Credentials>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct WebSearchTools {
-    inference: Inference,
+    credentials: CredentialsProvider,
     session_id: Arc<str>,
     client: reqwest::Client,
     search_url: Arc<str>,
 }
 
 impl WebSearchTools {
-    pub fn new(inference: Inference, session_id: impl Into<Arc<str>>) -> Self {
+    pub fn new(credentials: CredentialsProvider, session_id: impl Into<Arc<str>>) -> Self {
         Self {
-            inference,
+            credentials,
             session_id: session_id.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
@@ -51,16 +62,9 @@ impl WebSearchTools {
         context: ToolExecutionContext,
     ) -> Result<String, String> {
         let commands = request.0;
-        let auth = self
-            .inference
-            .auth()
+        let auth = (self.credentials)()
             .await
-            .map_err(|error| format!("selecting ChatGPT OAuth credentials: {error}"))?;
-        let auth = self
-            .inference
-            .resolve_auth(auth)
-            .await
-            .map_err(|error| format!("resolving ChatGPT OAuth credentials: {error}"))?;
+            .map_err(|error| format!("obtaining ChatGPT OAuth credentials: {error:#}"))?;
         let request = SearchRequest {
             id: self.session_id.to_string(),
             model: context.model.to_string(),
@@ -264,11 +268,115 @@ mod tests {
 
     use super::*;
 
+    fn install_tls_provider() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    #[tokio::test]
+    async fn requests_use_fresh_credentials_and_only_send_present_account_id() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        install_tls_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/search", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut headers = String::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    stream.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line.to_ascii_lowercase());
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                requests.push((
+                    headers,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                ));
+                let response = "{\"output\":\"search result\",\"encrypted_output\":null}";
+                stream.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                ).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let credentials: CredentialsProvider = Arc::new(move || {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Credentials {
+                    bearer_token: format!("token-{n}"),
+                    account_id: (n == 0).then(|| "account-first".to_owned()),
+                })
+            })
+        });
+        let mut tools = WebSearchTools::new(credentials, "agent-session");
+        tools.search_url = url.into();
+        for _ in 0..2 {
+            assert_eq!(
+                tools
+                    .run(
+                        WebRequest::default(),
+                        ToolExecutionContext {
+                            model: "gpt-test".into(),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                "search result"
+            );
+        }
+        let requests = server.await.unwrap();
+        assert!(requests[0].0.contains("authorization: bearer token-0\r\n"));
+        assert!(
+            requests[0]
+                .0
+                .contains("chatgpt-account-id: account-first\r\n")
+        );
+        assert!(requests[1].0.contains("authorization: bearer token-1\r\n"));
+        assert!(!requests[1].0.contains("chatgpt-account-id:"));
+        assert_eq!(requests[0].1["id"], "agent-session");
+        assert_eq!(requests[1].1["model"], "gpt-test");
+    }
+
+    #[tokio::test]
+    async fn credential_failure_does_not_make_http_request() {
+        install_tls_provider();
+        let credentials: CredentialsProvider =
+            Arc::new(|| Box::pin(async { Err(anyhow::anyhow!("no account available")) }));
+        let mut tools = WebSearchTools::new(credentials, "agent-session");
+        tools.search_url = "http://127.0.0.1:9/search".into();
+        assert_eq!(
+            tools
+                .run(WebRequest::default(), ToolExecutionContext::default())
+                .await,
+            Err("obtaining ChatGPT OAuth credentials: no account available".to_owned())
+        );
+    }
+
     #[test]
     fn recent_input_keeps_two_user_turns_and_caps_assistant_text() {
         fn user(text: &str) -> Arc<ContextBlock> {
             Arc::new(ContextBlock::UserMessage {
-                sender: rho_inference::types::MessageSender::User,
+                sender: rho_agent_types::transcript::MessageSender::User,
                 content: vec![ContentPart::Text { text: text.into() }],
             })
         }
@@ -276,7 +384,7 @@ mod tests {
             Arc::new(ContextBlock::InferenceResponse {
                 items: vec![InferenceResponseItem::AssistantMessage {
                     provider_specific: Box::new(
-                        rho_inference::types::UnknownProviderSpecificData {
+                        rho_agent_types::transcript::UnknownProviderSpecificData {
                             body: Default::default(),
                             tag: "test".to_owned(),
                         },

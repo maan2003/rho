@@ -1,11 +1,8 @@
 //! Host credentials, quota and route policy for the Responses transport.
-mod cache_key;
-mod legacy;
 pub(crate) mod oauth;
 mod route;
 pub(crate) mod ws;
-pub use cache_key::PromptCacheKey;
-pub use legacy::OpenAiResponsesProviderData;
+pub use rho_agent::inference::PromptCacheKey;
 pub use oauth::{InferenceAuth, ResolvedAuth, ResolvedOAuth};
 pub(crate) use route::RouteSelector;
 pub use route::{DialRoute, InferenceRouteProbe, RouteSelection};

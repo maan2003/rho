@@ -14,9 +14,9 @@ use rho_agents_client::protocol::{
     QuotaSeries, QuotaSummary,
 };
 use rho_db::RhoDb;
-use rho_inference::Inference;
+use rho_inference::Accounts;
 
-pub(crate) fn quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSummary> {
+pub(crate) fn quota_summaries(db: &RhoDb, inference: &Accounts) -> Vec<QuotaSummary> {
     let mut summaries = claude_quota_summaries(db);
     summaries.extend(
         inference
@@ -201,7 +201,7 @@ fn merge_hourly_agent_cost_bucket(
     Ok(())
 }
 
-pub(crate) fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
+pub(crate) fn quota_history(db: &RhoDb, inference: &Accounts) -> Vec<QuotaSeries> {
     let mut series = claude_quota_history(db);
     let since = rho_agent_types::UnixMs(
         rho_agent_types::UnixMs::now()

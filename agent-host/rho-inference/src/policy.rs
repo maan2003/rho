@@ -4,57 +4,26 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::future::BoxFuture;
-use rho_inference::{
-    DialRoute, Inference, InferenceHost, QuotaUpdate, RouteSelection, SelectedAuth,
-};
+use rho_agent::inference::{PolicyClient, PolicySender};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::{transport, workset};
+use crate::{
+    Accounts, Inference, PolicyCall, PolicyReply as Reply, PolicyRequest as Request, RouteSelection,
+};
 
-pub(super) const MAX_REQUESTS: usize = 32;
-
-#[derive(Encode, Decode)]
-pub(super) enum Request {
-    SelectAccount,
-    ResolveAuth(rho_inference::InferenceAuth),
-    RateLimited(SelectedAuth),
-    Quota {
-        selected: SelectedAuth,
-        quota: QuotaUpdate,
-    },
-    RouteFailed {
-        route: DialRoute,
-        selected: Option<SelectedAuth>,
-    },
-}
+pub(crate) const MAX_REQUESTS: usize = 32;
 
 #[derive(Encode, Decode)]
-pub(super) enum Reply {
-    Account(SelectedAuth),
-    Auth(rho_inference::ResolvedAuth),
-    RateLimited(bool),
-    Done,
-    Error(String),
-}
-
-#[derive(Encode, Decode)]
-pub(super) enum Message {
+pub(crate) enum Message {
     Request { id: u64, body: Request },
     Reply { id: u64, body: Reply },
     Route(RouteSelection),
-    Credentials(rho_inference::CredentialSnapshot),
+    Credentials(crate::CredentialSnapshot),
 }
 
-async fn send(sender: &transport::Sender, message: Message) -> anyhow::Result<()> {
-    sender
-        .send(
-            transport::Port::Workset,
-            workset::encode(&workset::Message::Policy(message))?,
-        )
-        .await?;
-    Ok(())
+async fn send(sender: &PolicySender, message: Message) -> anyhow::Result<()> {
+    sender(senax_encoder::encode(&message)?.to_vec()).await
 }
 
 #[derive(Default)]
@@ -78,37 +47,57 @@ impl Drop for Pending {
     }
 }
 
-pub(super) struct Host {
-    sender: transport::Sender,
-    next: Arc<AtomicU64>,
+pub(crate) struct Host {
+    sender: PolicySender,
+    next: AtomicU64,
     admission: Arc<tokio::sync::Semaphore>,
     replies: Arc<Mutex<Replies>>,
     routes: watch::Sender<RouteSelection>,
-    credentials: watch::Sender<Option<rho_inference::CredentialSnapshot>>,
+    credentials: watch::Sender<crate::CredentialSnapshot>,
     closed: watch::Sender<bool>,
 }
 impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorksetInferenceHost")
+        f.debug_struct("WorksetInferencePolicy")
             .finish_non_exhaustive()
     }
 }
 impl Host {
-    pub(super) fn new(sender: transport::Sender, next: Arc<AtomicU64>) -> Arc<Self> {
+    pub(crate) fn new(sender: PolicySender) -> Arc<Self> {
         Arc::new(Self {
             sender,
-            next,
+            next: AtomicU64::new(1),
             admission: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS)),
             replies: Arc::default(),
             routes: watch::Sender::new(RouteSelection::default()),
-            credentials: watch::Sender::new(None),
+            credentials: watch::Sender::new(crate::CredentialSnapshot {
+                revision: 0,
+                state: crate::CredentialState::Pending,
+            }),
             closed: watch::Sender::new(false),
         })
     }
 
+    pub(crate) fn inference(
+        &self,
+        config: crate::InferenceConfig,
+    ) -> (Inference, mpsc::Receiver<PolicyCall>) {
+        let (calls, receiver) = mpsc::channel(MAX_REQUESTS);
+        (
+            Inference::from_worker(
+                calls,
+                self.credentials.subscribe(),
+                self.routes.subscribe(),
+                self.closed.subscribe(),
+                config,
+            ),
+            receiver,
+        )
+    }
+
     // Called by the workset reader: install state/replies synchronously, never
     // await a service or an agent. No second inbox or reader task is needed.
-    pub(super) fn receive(&self, message: Message) -> anyhow::Result<()> {
+    fn receive_message(&self, message: Message) -> anyhow::Result<()> {
         match message {
             Message::Reply { id, body } => {
                 if let Some((reply, _credit)) =
@@ -119,13 +108,10 @@ impl Host {
             }
             Message::Credentials(snapshot) => {
                 self.credentials.send_if_modified(|current| {
-                    if current
-                        .as_ref()
-                        .is_some_and(|old| snapshot.revision <= old.revision)
-                    {
+                    if snapshot.revision <= current.revision {
                         return false;
                     }
-                    *current = Some(snapshot);
+                    *current = snapshot;
                     true
                 });
             }
@@ -143,7 +129,7 @@ impl Host {
         Ok(())
     }
 
-    pub(super) fn disconnect(&self) {
+    fn disconnected(&self) {
         let mut pending = self.replies.lock().expect("poison");
         pending.closed = true;
         self.admission.close();
@@ -151,7 +137,7 @@ impl Host {
         self.closed.send_replace(true);
     }
 
-    async fn request(&self, body: Request) -> anyhow::Result<Reply> {
+    pub(crate) async fn request(&self, body: Request) -> anyhow::Result<Reply> {
         let credit = self
             .admission
             .clone()
@@ -183,100 +169,35 @@ impl Host {
         }
     }
 
-    #[cfg(test)]
-    pub(super) async fn closed(&self) {
+    pub(crate) async fn closed(&self) {
         let _ = self.closed.subscribe().wait_for(|closed| *closed).await;
     }
 }
 
-impl InferenceHost for Host {
-    fn select_resolved(
-        &self,
-    ) -> BoxFuture<'_, anyhow::Result<(SelectedAuth, rho_inference::ResolvedAuth)>> {
-        Box::pin(async {
-            let mut credentials = self.credentials.subscribe();
-            let mut closed = self.closed.subscribe();
-            loop {
-                anyhow::ensure!(!*closed.borrow_and_update(), "agent connection closed");
-                if let Some(result) = credentials
-                    .borrow_and_update()
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.current())
-                {
-                    return result;
-                }
-                tokio::select! {
-                    biased;
-                    _ = closed.changed() => anyhow::bail!("agent connection closed"),
-                    change = credentials.changed() => change?,
-                }
-            }
-        })
+impl PolicyClient for Host {
+    fn receive(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut remaining = bytes;
+        let message = senax_encoder::decode(&mut remaining)
+            .map_err(|_| anyhow::anyhow!("invalid inference policy message"))?;
+        anyhow::ensure!(
+            remaining.is_empty(),
+            "trailing inference policy message data"
+        );
+        self.receive_message(message)
     }
 
-    fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>> {
-        Box::pin(async {
-            match self.request(Request::SelectAccount).await? {
-                Reply::Account(selected) => Ok(selected),
-                _ => anyhow::bail!("unexpected account service reply"),
-            }
-        })
-    }
-
-    fn resolve_auth(
-        &self,
-        auth: rho_inference::InferenceAuth,
-    ) -> BoxFuture<'_, anyhow::Result<rho_inference::ResolvedAuth>> {
-        Box::pin(async move {
-            match self.request(Request::ResolveAuth(auth)).await? {
-                Reply::Auth(auth) => Ok(auth),
-                _ => anyhow::bail!("unexpected credential service reply"),
-            }
-        })
-    }
-
-    fn mark_rate_limited(&self, selected: SelectedAuth) -> BoxFuture<'_, bool> {
-        Box::pin(async move {
-            matches!(
-                self.request(Request::RateLimited(selected)).await,
-                Ok(Reply::RateLimited(true))
-            )
-        })
-    }
-
-    fn observe_quota(&self, selected: SelectedAuth, quota: QuotaUpdate) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let _ = self.request(Request::Quota { selected, quota }).await;
-        })
-    }
-
-    fn route_updates(&self) -> watch::Receiver<RouteSelection> {
-        self.routes.subscribe()
-    }
-
-    fn report_connect_failure(
-        &self,
-        route: DialRoute,
-        selected: Option<SelectedAuth>,
-    ) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let _ = self.request(Request::RouteFailed { route, selected }).await;
-        })
+    fn disconnect(&self) {
+        self.disconnected();
     }
 }
 
-async fn call(
-    inference: &Inference,
-    body: Request,
-    sender: &transport::Sender,
-) -> anyhow::Result<Reply> {
+async fn call(inference: &Accounts, body: Request, sender: &PolicySender) -> anyhow::Result<Reply> {
     Ok(match body {
         Request::ResolveAuth(auth) => Reply::Auth(inference.resolve_auth(auth).await?),
         Request::SelectAccount => Reply::Account(inference.select().await?),
         Request::RateLimited(selected) => {
             let changed = inference.mark_rate_limited(&selected).await;
-            // Install the replacement before the retry can select again.
-            // Older background pushes are rejected by snapshot revision.
+            // Publish the replacement before acknowledging the retry.
             let snapshot = inference.credential_snapshot().await?;
             send(sender, Message::Credentials(snapshot)).await?;
             Reply::RateLimited(changed)
@@ -290,18 +211,16 @@ async fn call(
                 .report_connect_failure(route, selected.as_ref())
                 .await;
             let route = inference.route_updates().borrow().clone();
-            // The caller observes the demotion before its acknowledgement.
-            // Revision checking also rejects older watch notifications.
             send(sender, Message::Route(route)).await?;
             Reply::Done
         }
     })
 }
 
-pub(super) async fn serve(
-    inference: Inference,
-    sender: transport::Sender,
-    mut incoming: mpsc::Receiver<Message>,
+pub(crate) async fn serve(
+    inference: Accounts,
+    sender: PolicySender,
+    mut incoming: mpsc::Receiver<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let mut routes = inference.route_updates();
     let mut credentials = inference.credential_updates();
@@ -313,7 +232,11 @@ pub(super) async fn serve(
                     biased;
                     Some(result) = calls.join_next(), if !calls.is_empty() => { result??; }
                     message = incoming.recv() => {
-                        let message = message.ok_or_else(|| anyhow::anyhow!("workset policy connection closed"))?;
+                        let bytes = message.ok_or_else(|| anyhow::anyhow!("workset policy connection closed"))?;
+                        let mut remaining = bytes.as_slice();
+                        let message = senax_encoder::decode(&mut remaining)
+                            .map_err(|_| anyhow::anyhow!("invalid inference policy request"))?;
+                        anyhow::ensure!(remaining.is_empty(), "trailing inference policy request data");
                         let Message::Request { id, body } = message else {
                             anyhow::bail!("unexpected workset policy message");
                         };
@@ -324,9 +247,7 @@ pub(super) async fn serve(
                         let inference = inference.clone();
                         let sender = sender.clone();
                         calls.spawn(async move {
-                            let result = async {
-                                call(&inference, body, &sender).await
-                            }.await;
+                            let result = call(&inference, body, &sender).await;
                             let body = result.unwrap_or_else(|error| Reply::Error(error.to_string()));
                             send(&sender, Message::Reply { id, body }).await
                         });
@@ -353,14 +274,69 @@ pub(super) async fn serve(
         } => result,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SelectedAuth;
+
+    struct Server {
+        policy: Arc<Host>,
+        incoming: mpsc::Receiver<Vec<u8>>,
+    }
+    impl Server {
+        async fn read_policy(&mut self) -> anyhow::Result<Message> {
+            let bytes = self
+                .incoming
+                .recv()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("policy disconnected"))?;
+            let mut remaining = bytes.as_slice();
+            Ok(senax_encoder::decode(&mut remaining)?)
+        }
+        async fn write_policy(&self, message: &Message) -> anyhow::Result<()> {
+            self.policy.receive(&senax_encoder::encode(message)?)
+        }
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.policy.disconnect();
+        }
+    }
+    fn pair() -> (Arc<Host>, Server) {
+        let (sender, incoming) = mpsc::channel(MAX_REQUESTS * 2);
+        let sender: PolicySender = Arc::new(move |bytes| {
+            let sender = sender.clone();
+            Box::pin(async move {
+                sender
+                    .send(bytes)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("policy disconnected"))
+            })
+        });
+        let policy = Host::new(sender);
+        (policy.clone(), Server { policy, incoming })
+    }
+
+    fn worker_inference(host: &Arc<Host>) -> Inference {
+        let (inference, mut calls) = host.inference(
+            crate::InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
+        );
+        let host = host.clone();
+        tokio::spawn(async move {
+            while let Some(call) = calls.recv().await {
+                let host = host.clone();
+                tokio::spawn(async move {
+                    let _ = call.reply.send(host.request(call.body).await);
+                });
+            }
+        });
+        inference
+    }
+
     #[tokio::test]
     async fn cancelled_published_requests_keep_credit_until_reply_and_disconnect_wakes_waiters() {
-        let (client, mut server) = crate::worker::testing::pair();
-        let host = client.policy();
+        let (client, mut server) = pair();
+        let host = client;
         let mut first = tokio::task::JoinSet::new();
         for _ in 0..MAX_REQUESTS {
             let host = host.clone();
@@ -419,18 +395,19 @@ mod tests {
 
     #[tokio::test]
     async fn account_selection_waits_for_push_without_an_rpc() {
-        let (client, mut server) = crate::worker::testing::pair();
-        let host = client.policy();
-        let request = tokio::spawn(async move { host.select_resolved().await });
+        let (client, mut server) = pair();
+        let host = client;
+        let inference = worker_inference(&host);
+        let request = tokio::spawn(async move { inference.select_resolved().await });
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), server.read_policy())
                 .await
                 .is_err()
         );
         server
-            .write_policy(&Message::Credentials(rho_inference::CredentialSnapshot {
+            .write_policy(&Message::Credentials(crate::CredentialSnapshot {
                 revision: 1,
-                state: rho_inference::CredentialState::Unavailable {
+                state: crate::CredentialState::Unavailable {
                     selected: None,
                     error: "no credentials".into(),
                 },
@@ -445,18 +422,18 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_ack_installs_replacement_and_reconnect_resolves_pinned_auth() {
-        let (client, mut server) = crate::worker::testing::pair();
-        let host = client.policy();
-        let auth_a = rho_inference::InferenceAuth::named("fixture-a").unwrap();
-        let auth_b = rho_inference::InferenceAuth::named("fixture-b").unwrap();
+        let (client, mut server) = pair();
+        let host = client;
+        let auth_a = crate::InferenceAuth::named("fixture-a").unwrap();
+        let auth_b = crate::InferenceAuth::named("fixture-b").unwrap();
         // SelectedAuth is opaque outside inference; construct a wire fixture.
         #[derive(Encode)]
         struct SelectedWire {
-            auth: rho_inference::InferenceAuth,
+            auth: crate::InferenceAuth,
             namespace: Option<String>,
             account_id: Option<String>,
         }
-        let selected = |auth: &rho_inference::InferenceAuth| {
+        let selected = |auth: &crate::InferenceAuth| {
             let bytes = senax_encoder::encode(&SelectedWire {
                 auth: auth.clone(),
                 namespace: None,
@@ -467,15 +444,15 @@ mod tests {
         };
         let a = selected(&auth_a);
         let b = selected(&auth_b);
-        let resolved = |token: &str| rho_inference::ResolvedAuth {
+        let resolved = |token: &str| crate::ResolvedAuth {
             bearer_token: token.into(),
             account_id: None,
             client_secret: [0; 32],
         };
         let snapshot = |revision, selected, token: &str| {
-            Message::Credentials(rho_inference::CredentialSnapshot {
+            Message::Credentials(crate::CredentialSnapshot {
                 revision,
-                state: rho_inference::CredentialState::Ready {
+                state: crate::CredentialState::Ready {
                     selected,
                     auth: resolved(token),
                     refresh_at: u64::MAX,
@@ -486,11 +463,13 @@ mod tests {
             .write_policy(&snapshot(1, a.clone(), "a"))
             .await
             .unwrap();
-        assert_eq!(host.select_resolved().await.unwrap().1.bearer_token, "a");
-        let config =
-            rho_inference::InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap();
-        let first_agent = Inference::from_host(host.clone(), config.clone());
-        let second_agent = Inference::from_host(host.clone(), config);
+        let inference = worker_inference(&host);
+        assert_eq!(
+            inference.select_resolved().await.unwrap().1.bearer_token,
+            "a"
+        );
+        let first_agent = worker_inference(&host);
+        let second_agent = worker_inference(&host);
         assert_eq!(
             first_agent.select_resolved().await.unwrap().1.bearer_token,
             "a"
@@ -499,7 +478,7 @@ mod tests {
         let limit = tokio::spawn({
             let host = host.clone();
             let a = a.clone();
-            async move { host.mark_rate_limited(a).await }
+            async move { worker_inference(&host).mark_rate_limited(&a).await }
         });
         let Message::Request {
             id,
@@ -524,7 +503,10 @@ mod tests {
             .await
             .unwrap();
         assert!(limit.await.unwrap());
-        assert_eq!(host.select_resolved().await.unwrap().1.bearer_token, "b");
+        assert_eq!(
+            inference.select_resolved().await.unwrap().1.bearer_token,
+            "b"
+        );
         assert_eq!(
             second_agent.select_resolved().await.unwrap().1.bearer_token,
             "b"
@@ -533,7 +515,7 @@ mod tests {
         let reconnect = tokio::spawn({
             let host = host.clone();
             let auth_a = auth_a.clone();
-            async move { host.resolve_auth(auth_a).await }
+            async move { worker_inference(&host).resolve_auth(auth_a).await }
         });
         let Message::Request {
             id,
@@ -557,18 +539,21 @@ mod tests {
             reconnect.await.unwrap().unwrap().bearer_token,
             "refreshed-a"
         );
-        assert_eq!(host.select_resolved().await.unwrap().1.bearer_token, "b");
+        assert_eq!(
+            inference.select_resolved().await.unwrap().1.bearer_token,
+            "b"
+        );
     }
 
     #[tokio::test]
     async fn credential_push_revision_and_reply_fence_prevent_stale_replacement() {
-        let (client, mut server) = crate::worker::testing::pair();
-        let host = client.policy();
+        let (client, mut server) = pair();
+        let host = client;
         for (revision, error) in [(8, "replacement"), (3, "obsolete")] {
             server
-                .write_policy(&Message::Credentials(rho_inference::CredentialSnapshot {
+                .write_policy(&Message::Credentials(crate::CredentialSnapshot {
                     revision,
-                    state: rho_inference::CredentialState::Unavailable {
+                    state: crate::CredentialState::Unavailable {
                         selected: None,
                         error: error.into(),
                     },
@@ -579,7 +564,7 @@ mod tests {
         // Use a normal correlated reply to fence receipt of both pushes.
         let call = tokio::spawn({
             let host = host.clone();
-            async move { host.select().await }
+            async move { worker_inference(&host).select().await }
         });
         let Message::Request {
             id,
@@ -596,9 +581,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(call.await.unwrap().unwrap_err().to_string(), "fenced");
+        let inference = worker_inference(&host);
         for _ in 0..3 {
             assert_eq!(
-                host.select_resolved().await.unwrap_err().to_string(),
+                inference.select_resolved().await.unwrap_err().to_string(),
                 "replacement"
             );
         }
@@ -610,7 +596,7 @@ mod tests {
         drop(server);
         host.closed().await;
         assert_eq!(
-            host.select_resolved().await.unwrap_err().to_string(),
+            inference.select_resolved().await.unwrap_err().to_string(),
             "agent connection closed"
         );
     }

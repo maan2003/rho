@@ -13,7 +13,7 @@ use rho_agent_hosts::protocol::GitProviderFrame;
 use rho_agent_types::{AgentId, AgentRole, ContentPart, Place, WorksetMode, WorkspaceInfo};
 use rho_agents_client::protocol::{AuthState, JoinTarget, StartMode};
 use rho_db::RhoDb;
-use rho_inference::Inference;
+use rho_inference::Accounts;
 use rho_rpc::protocol::server::{Server, ServerConnection};
 use rho_rpc::protocol::{Open, Opened, Protocol, read_frame, write_frame};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
@@ -475,13 +475,13 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     let db = RhoDb::open(db_path);
     let inference = match args.openai_base_url {
         Some(endpoint) => {
-            Inference::new_with_config(
+            Accounts::new_with_config(
                 db.clone(),
                 rho_inference::InferenceConfig::with_responses_base_url(endpoint)?,
             )
             .await?
         }
-        None => Inference::new(db.clone()).await?,
+        None => Accounts::new(db.clone()).await?,
     };
     let path_overrides = PathOverrides {
         before: args
@@ -531,7 +531,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
-    let pool = AgentPool::new(db.clone(), inference.clone(), worksets, claude.clone()).await;
+    let pool = AgentPool::new(db.clone(), Arc::new(inference.clone()), worksets, claude.clone()).await;
     let services = Arc::new(
         Services::new(
             db,
@@ -959,7 +959,7 @@ struct Services {
     /// Every device's sealed ledger, kept and passed between them.
     ledger: rho_ledger_server::LedgerServer,
     visualizations: rho_visualizations::VisualizationStore,
-    inference: Inference,
+    inference: Accounts,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
@@ -987,7 +987,7 @@ impl Services {
     #[allow(clippy::too_many_arguments)]
     async fn new(
         db: RhoDb,
-        inference: Inference,
+        inference: Accounts,
         pool: Arc<AgentPool>,
         claude: rho_claude::accounts::ClaudePaths,
         user_environment: rho_fs_view::UserEnvironment,

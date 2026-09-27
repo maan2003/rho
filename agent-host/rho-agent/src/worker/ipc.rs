@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 11;
+pub(super) const VERSION: u32 = 16;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -67,13 +67,14 @@ pub(super) enum Request<'a> {
     Settled,
     Head,
     History,
+    NativeHistory(Option<crate::db::ContextBoundary>),
     Append(AgentEvent<'a>),
     AppendBatch(Vec<AgentEvent<'static>>),
     Profile {
         role: AgentRole,
         binding: SessionBinding,
     },
-    CacheKey(rho_inference::PromptCacheKey),
+    CacheKey(crate::inference::PromptCacheKey),
     Rewind {
         at: UnixMs,
         to: AgentEventPos,
@@ -102,6 +103,12 @@ pub(super) enum Reply {
         next: AgentEventPos,
         rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
     },
+    NativeHistory {
+        boundary: crate::db::ContextBoundary,
+        recovery: crate::db::NativeRecovery,
+        rows: Vec<(AgentEventPos, AgentEvent<'static>)>,
+    },
+    Boundary(crate::db::ContextBoundary),
     Position(AgentEventPos),
     ClaudeAccount(String),
     ClaudePendingOutput(Option<crate::ClaudeOutputBatch>),
@@ -268,6 +275,19 @@ impl Host {
                                         history.append(&mut rows);
                                         Reply::History {
                                             next,
+                                            rows: history,
+                                        }
+                                    }
+                                    Reply::NativeHistory {
+                                        boundary,
+                                        recovery,
+                                        mut rows,
+                                    } => {
+                                        let mut history = waiter.history;
+                                        history.append(&mut rows);
+                                        Reply::NativeHistory {
+                                            boundary,
+                                            recovery,
                                             rows: history,
                                         }
                                     }
@@ -475,6 +495,41 @@ impl Host {
             _ => Err(StoreError(anyhow::anyhow!("unexpected history reply"))),
         }
     }
+    pub(crate) async fn native_history(
+        &self,
+        boundary: Option<crate::db::ContextBoundary>,
+    ) -> Result<
+        (
+            crate::db::ContextBoundary,
+            crate::db::NativeRecovery,
+            Vec<crate::entry::Entry>,
+        ),
+        StoreError,
+    > {
+        match self
+            .request(Request::NativeHistory(boundary))
+            .await
+            .map_err(StoreError)?
+        {
+            Reply::NativeHistory {
+                boundary,
+                recovery,
+                rows,
+            } => Ok((
+                boundary,
+                recovery,
+                rows.into_iter()
+                    .filter_map(|(_, event)| match event {
+                        AgentEvent::Entry(entry) => Some(entry),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
+            _ => Err(StoreError(anyhow::anyhow!(
+                "unexpected native history reply"
+            ))),
+        }
+    }
     pub(crate) async fn append(&self, event: AgentEvent<'_>) -> Result<AgentEventPos, StoreError> {
         match self
             .request(Request::Append(event))
@@ -488,8 +543,15 @@ impl Host {
     pub(crate) async fn append_batch(
         &self,
         events: Vec<AgentEvent<'static>>,
-    ) -> Result<(), StoreError> {
-        self.change(Request::AppendBatch(events)).await
+    ) -> Result<crate::db::ContextBoundary, StoreError> {
+        match self
+            .request(Request::AppendBatch(events))
+            .await
+            .map_err(StoreError)?
+        {
+            Reply::Boundary(boundary) => Ok(boundary),
+            _ => Err(StoreError(anyhow::anyhow!("unexpected append batch reply"))),
+        }
     }
 
     pub(crate) async fn record_usage(&self, usage: AgentUsageBucket) -> Result<(), StoreError> {
@@ -566,7 +628,7 @@ impl Host {
     }
     pub(crate) async fn cache_key(
         &self,
-        key: rho_inference::PromptCacheKey,
+        key: crate::inference::PromptCacheKey,
     ) -> Result<(), StoreError> {
         self.change(Request::CacheKey(key)).await
     }
@@ -760,8 +822,8 @@ mod tests {
                     id: 19,
                     body: Request::Append(AgentEvent::Native(
                         crate::db::legacy::NativeEvent::RequestStarted {
-                            input: vec![rho_inference::types::ContextBlock::UserMessage {
-                                sender: rho_inference::types::MessageSender::User,
+                            input: vec![rho_agent_types::transcript::ContextBlock::UserMessage {
+                                sender: rho_agent_types::transcript::MessageSender::User,
                                 content: vec![rho_agent_types::ContentPart::Text {
                                     text: "a".repeat(count),
                                 }],
@@ -787,7 +849,8 @@ mod tests {
         else {
             panic!("wrong logical message")
         };
-        let rho_inference::types::ContextBlock::UserMessage { content, .. } = &input[0] else {
+        let rho_agent_types::transcript::ContextBlock::UserMessage { content, .. } = &input[0]
+        else {
             panic!()
         };
         let rho_agent_types::ContentPart::Text { text } = &content[0] else {

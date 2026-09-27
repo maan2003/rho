@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
+use rho_agent_types::transcript::{ExecId, ImageContent, ToolOutput};
 use rho_agent_types::{ToolOutputStatus, UnixMs};
 use rho_claude::mcp::{reply, text_item, tool_result};
-use rho_inference::types::{ExecId, ImageContent, ToolOutput};
 use rho_notebook::{CellHandle, Notebook};
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -300,7 +300,7 @@ impl PythonHost {
         {
             self.progress.told_returned = true;
         }
-        let report = self.notebook.report()?;
+        let report = self.notebook.report()?.render();
         Some(output(
             report.text,
             report

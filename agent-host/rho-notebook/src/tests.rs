@@ -39,13 +39,13 @@ async fn a_cell_that_ends_first_speaks_plainly() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("print(6 * 7)".into());
     finished(&wake, &cell).await;
-    assert_eq!(notebook.report().unwrap().text, "42");
+    assert_eq!(notebook.report().unwrap().render().text, "42");
     assert!(notebook.report().is_none());
     assert!(notebook.facts().is_empty());
 
     let silent = notebook.run("x = 1".into());
     finished(&wake, &silent).await;
-    assert_eq!(notebook.report().unwrap().text, "Task finished");
+    assert_eq!(notebook.report().unwrap().render().text, "Task finished");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -54,7 +54,14 @@ async fn a_raise_is_the_cells_output() {
     let cell = notebook.run("raise ValueError('nope')".into());
     finished(&wake, &cell).await;
     assert!(cell.facts().finished.unwrap().failed);
-    assert!(notebook.report().unwrap().text.contains("ValueError: nope"));
+    assert!(
+        notebook
+            .report()
+            .unwrap()
+            .render()
+            .text
+            .contains("ValueError: nope")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -69,7 +76,7 @@ async fn streamed_statements_run_as_they_arrive() {
     assert!(cell.facts().returned.is_none());
     cell.feed("ond')\n".into(), true).unwrap();
     finished(&wake, &cell).await;
-    assert_eq!(notebook.report().unwrap().text, "first\nsecond");
+    assert_eq!(notebook.report().unwrap().render().text, "first\nsecond");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -82,7 +89,7 @@ async fn an_interrupted_stream_keeps_what_ran() {
     finished(&wake, &cell).await;
     let next = notebook.run("print(a, 'b' in globals())".into());
     finished(&wake, &next).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.starts_with("1 False"), "{text}");
 }
 
@@ -92,7 +99,7 @@ async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     let cell = notebook.run("job = command('read line; echo got $line')".into());
     until(&wake, || cell.facts().returned.is_some()).await;
     assert!(cell.facts().finished.is_none());
-    let first = notebook.report().unwrap().text;
+    let first = notebook.report().unwrap().render().text;
     assert!(
         first.contains("Command running in background with session ID "),
         "{first}"
@@ -107,7 +114,7 @@ async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     let write = notebook.run("write_stdin(job, 'hi\\n')".into());
     finished(&wake, &cell).await;
     finished(&wake, &write).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(
         text.contains(&format!(
             "Session ID: {session}\nProcess exited with code 0\nOutput:\ngot hi"
@@ -116,7 +123,7 @@ async fn a_command_implicitly_holds_its_task_and_can_be_paged() {
     );
     let page = notebook.run(format!("Command.from_session_id({session}).more_output()"));
     finished(&wake, &page).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains("No more output."), "{text}");
 }
 
@@ -127,7 +134,7 @@ async fn a_background_task_outlives_its_return() {
         "import asyncio\nasync def later():\n    await asyncio.sleep(0.2)\n    print('late')\nasyncio.create_task(later())\nprint('now')".into(),
     );
     until(&wake, || cell.facts().returned.is_some()).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains("now"), "{text}");
     assert!(
         text.contains("Task running in background with session ID"),
@@ -135,7 +142,14 @@ async fn a_background_task_outlives_its_return() {
     );
     finished(&wake, &cell).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert!(notebook.report().unwrap().text.contains("Output:\nlate"));
+    assert!(
+        notebook
+            .report()
+            .unwrap()
+            .render()
+            .text
+            .contains("Output:\nlate")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -143,12 +157,12 @@ async fn created_tasks_own_output_and_return_values() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("import asyncio\nasync def fetch():\n    await asyncio.sleep(0.1)\n    print('child')\n    return 73\nt = asyncio.create_task(fetch())\nprint('parent')".into());
     finished(&wake, &cell).await;
-    let first = notebook.report().unwrap().text;
+    let first = notebook.report().unwrap().render().text;
     assert!(first.contains("parent"), "{first}");
     assert!(!first.contains("child"), "{first}");
     let next = notebook.run("print(await t)".into());
     finished(&wake, &next).await;
-    let second = notebook.report().unwrap().text;
+    let second = notebook.report().unwrap().render().text;
     assert!(second.contains("child"), "{second}");
     assert!(second.contains("73"), "{second}");
 }
@@ -164,7 +178,7 @@ async fn a_raised_task_does_not_wait_for_its_command() {
             .iter()
             .any(|f| f.kind == crate::Kind::Command && f.finished.is_none())
     );
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains("Task failed"), "{text}");
     assert!(text.contains("ValueError: bad"), "{text}");
 }
@@ -195,7 +209,7 @@ async fn cancelling_a_task_kills_its_command_quietly() {
             .iter()
             .any(|f| f.kind == crate::Kind::Command && f.finished.unwrap().failed)
     );
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains("Task cancelled"), "{text}");
     assert!(
         !text.contains("Task failed") && !text.contains("Command failed"),
@@ -208,7 +222,7 @@ async fn a_caught_created_task_exception_is_not_reported() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("import asyncio\nasync def broken():\n    raise ValueError('specific')\nt = asyncio.create_task(broken())\ntry:\n    await t\nexcept ValueError:\n    print('caught')".into());
     finished(&wake, &cell).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains("caught"), "{text}");
     assert!(!text.contains("ValueError: specific"), "{text}");
 }
@@ -219,7 +233,7 @@ async fn output_keeps_four_megabyte_head_and_notes_the_cut() {
     let cell = notebook
         .run("for _ in range(110): print('a' * 40000, max_tokens=10000)\nprint('b' * 100)".into());
     finished(&wake, &cell).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(
         text.contains("[output past 4 MB was dropped]"),
         "missing cut note"
@@ -242,7 +256,7 @@ async fn notebook_retention_discards_oldest_command_log() {
     let _ = notebook.report();
     let page = notebook.run(format!("Command.from_session_id({oldest}).more_output()"));
     finished(&wake, &page).await;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains("retained output is gone"), "{text}");
 }
 
@@ -251,7 +265,14 @@ async fn unclaimed_failure_reports_once_after_twenty_seconds() {
     let (notebook, wake) = notebook();
     let cell = notebook.run("import asyncio\nasync def broken():\n    raise ValueError('unclaimed')\nt = asyncio.create_task(broken())".into());
     finished(&wake, &cell).await;
-    assert!(!notebook.report().unwrap().text.contains("unclaimed"));
+    assert!(
+        !notebook
+            .report()
+            .unwrap()
+            .render()
+            .text
+            .contains("unclaimed")
+    );
     tokio::time::timeout(Duration::from_secs(23), async {
         loop {
             wake.notified().await;
@@ -266,7 +287,7 @@ async fn unclaimed_failure_reports_once_after_twenty_seconds() {
     })
     .await
     .unwrap();
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(
         text.contains("Task failed\nValueError: unclaimed"),
         "{text}"
@@ -277,17 +298,34 @@ async fn unclaimed_failure_reports_once_after_twenty_seconds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn callbacks_and_threads_do_not_hold_a_task_but_keep_its_output() {
     let (notebook, wake) = notebook();
-    let cell = notebook.run("import asyncio, threading, time\nasyncio.get_running_loop().call_later(0.1, lambda: print('callback'))\nthreading.Thread(target=lambda: (time.sleep(0.1), print('thread'))).start()".into());
-    finished(&wake, &cell).await;
-    assert_eq!(notebook.report().unwrap().text, "Task finished");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let text = notebook.report().unwrap().text;
-    assert!(text.contains("callback"), "{text}");
-    assert!(text.contains("thread"), "{text}");
-    assert!(
-        text.starts_with(&format!("Session ID: {}", cell.session_id())),
-        "{text}"
+    let cell = notebook.run(
+        "import asyncio, threading\ncallback_gate = asyncio.get_running_loop().create_future()\ncallback_gate.add_done_callback(lambda _: print('callback'))\nthread_gate = threading.Event()\nthreading.Thread(target=lambda: (thread_gate.wait(), print('thread'))).start()".into(),
     );
+    finished(&wake, &cell).await;
+    assert_eq!(notebook.report().unwrap().render().text, "Task finished");
+
+    // Release both only after the original task's end has been reported.
+    // A fixed delay lets a loaded test runner observe the callback too early.
+    let release = notebook.run("callback_gate.set_result(None)\nthread_gate.set()".into());
+    finished(&wake, &release).await;
+    let mut report = crate::Report::default();
+    until(&wake, || {
+        if let Some(update) = notebook.report() {
+            report.merge(update);
+        }
+        let text = report.render().text;
+        text.contains("callback") && text.contains("thread")
+    })
+    .await;
+    let text = report.render().text;
+    let (_, original) = text
+        .split_once(&format!("Session ID: {}\n", cell.session_id()))
+        .expect("late output retains the original cell's session");
+    // Output chunks can themselves contain blank lines; only a new session
+    // header starts another source.
+    let original = original.split("\n\nSession ID: ").next().unwrap();
+    assert!(original.contains("callback"), "{text}");
+    assert!(original.contains("thread"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -301,7 +339,7 @@ async fn command_handle_and_await_result_use_scrambled_session_id() {
         .find(|f| f.kind == crate::Kind::Command)
         .unwrap()
         .session_id;
-    let text = notebook.report().unwrap().text;
+    let text = notebook.report().unwrap().render().text;
     assert!(text.contains(&format!("{command} {command}")), "{text}");
     assert!(!text.contains("2 2"), "raw internal ID leaked: {text}");
 }
@@ -313,8 +351,25 @@ async fn checkin_remains_configurable_without_tool_suppression() {
     let cell =
         notebook.run("print('suppress_tool_wakeups' in globals())\nset_max_wait(317)".into());
     finished(&wake, &cell).await;
-    assert_eq!(notebook.report().unwrap().text, "False");
+    assert_eq!(notebook.report().unwrap().render().text, "False");
     assert_eq!(notebook.checkin(), Duration::from_secs(317));
     notebook.reset_checkin();
     assert_eq!(notebook.checkin(), Duration::from_secs(120));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_from_new_notebooks_with_reused_session_labels_stay_separate() {
+    let (first, wake) = notebook();
+    let cell = first.run("print('first lifetime')".into());
+    finished(&wake, &cell).await;
+    let label = cell.session_id();
+    let mut report = first.report().unwrap();
+    drop(first);
+
+    let (second, wake) = notebook();
+    let cell = second.run("print('second lifetime')".into());
+    finished(&wake, &cell).await;
+    assert_eq!(cell.session_id(), label);
+    report.merge(second.report().unwrap());
+    assert_eq!(report.render().text, "first lifetime\n\nsecond lifetime");
 }

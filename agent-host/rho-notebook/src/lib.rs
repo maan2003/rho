@@ -11,11 +11,12 @@ mod source;
 #[cfg(test)]
 mod tests;
 
-pub use notebook::{CellHandle, Export, Notebook, Report, ToolCx, operation};
+pub use notebook::{CellHandle, Export, Notebook, RenderedReport, Report, ToolCx, operation};
+use senax_encoder::{Decode, Encode};
 pub use source::{End, Kind, SessionId, SourceFacts, StreamProgress};
 
 /// An image a report shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Image {
     pub media_type: String,
     pub data: Vec<u8>,

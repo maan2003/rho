@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use rho_agent_types::AgentId;
 use rho_db::{SenValue, WriteTxn};
 
+use super::legacy::Entry;
 use super::{AGENT_HEADS, AGENT_LOG, AgentEventPos, JOURNAL, fold_head};
-use crate::entry::{Block, Entry, MessageId, Party, Wake};
+use crate::entry::{Block, MessageId, Party, Wake};
 use crate::{AgentEvent, TranscriptLine};
 
 pub(super) fn migrate(write: &mut WriteTxn) {
@@ -48,11 +49,11 @@ fn rewrite(
     for ((agent, pos), event) in old {
         let mut rows = vec![event.clone()];
         match &event {
-            AgentEvent::Entry(Entry::Step { at, prose, .. })
+            AgentEvent::LegacyEntry(Entry::Step { at, prose, .. })
                 if spoken.contains_key(&(agent, pos)) =>
             {
                 if !prose.is_empty() {
-                    rows.push(AgentEvent::Entry(Entry::Sent {
+                    rows.push(AgentEvent::LegacyEntry(Entry::Sent {
                         at: *at,
                         id: MessageId::new(),
                         to: Party::Human,
@@ -60,7 +61,7 @@ fn rewrite(
                     }));
                 }
                 if let Some(usage) = &spoken[&(agent, pos)] {
-                    rows.push(AgentEvent::Entry(Entry::Usage {
+                    rows.push(AgentEvent::LegacyEntry(Entry::Usage {
                         at: *at,
                         usage: crate::entry::ResponseUsage {
                             model: usage.model.name().to_owned(),
@@ -78,7 +79,7 @@ fn rewrite(
                 at,
                 ..
             } if !text.is_empty() => {
-                rows.push(AgentEvent::Entry(Entry::Sent {
+                rows.push(AgentEvent::LegacyEntry(Entry::Sent {
                     at: *at,
                     id: MessageId::new(),
                     to: Party::Human,
@@ -95,13 +96,13 @@ fn rewrite(
                 .starts_with("This session is being continued from a previous conversation") =>
             {
                 let id = MessageId::new();
-                rows.push(AgentEvent::Entry(Entry::Received {
+                rows.push(AgentEvent::LegacyEntry(Entry::Received {
                     at: *at,
                     id,
                     from: Party::Human,
                     body: vec![Block::Text(text.clone())],
                 }));
-                rows.push(AgentEvent::Entry(Entry::Woken {
+                rows.push(AgentEvent::LegacyEntry(Entry::Woken {
                     at: *at,
                     why: Wake::Message,
                     report: String::new(),
@@ -241,25 +242,25 @@ mod tests {
         assert_eq!(log.len(), 10);
         assert!(matches!(log[6].1, AgentEvent::Rewound { to, .. } if to.pos == 4));
         assert!(
-            matches!(&log[5].1, AgentEvent::Entry(Entry::Sent { text, .. }) if text == "historical answer")
+            matches!(&log[5].1, AgentEvent::LegacyEntry(Entry::Sent { text, .. }) if text == "historical answer")
         );
         let (_, visible) = super::super::visible_rows(log.into_iter());
         assert!(
             !visible
                 .iter()
-                .any(|(_, event)| matches!(event, AgentEvent::Entry(Entry::Sent { .. })))
+                .any(|(_, event)| matches!(event, AgentEvent::LegacyEntry(Entry::Sent { .. })))
         );
         let ids = visible
             .iter()
             .filter_map(|(_, event)| match event {
-                AgentEvent::Entry(Entry::Received { id, .. }) => Some(*id),
+                AgentEvent::LegacyEntry(Entry::Received { id, .. }) => Some(*id),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let delivered = visible
             .iter()
             .flat_map(|(_, event)| match event {
-                AgentEvent::Entry(Entry::Woken { messages, .. }) => messages.clone(),
+                AgentEvent::LegacyEntry(Entry::Woken { messages, .. }) => messages.clone(),
                 _ => vec![],
             })
             .collect::<Vec<_>>();
@@ -289,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn native_prose_and_cost_are_migrated_but_code_first_prose_is_not_sent() {
         use rho_agent_types::ContentPart;
-        use rho_inference::types::{ContextBlock, InferenceResponseItem};
+        use rho_agent_types::transcript::{ContextBlock, InferenceResponseItem};
         let dir = tempfile::tempdir().unwrap();
         let db = rho_db::RhoDb::open(dir.path().join("native.redb"));
         let mut write = db.write().await;
@@ -311,7 +312,7 @@ mod tests {
                 output: vec![ContextBlock::InferenceResponse {
                     items: vec![InferenceResponseItem::AssistantMessage {
                         provider_specific: Box::new(
-                            rho_inference::OpenAiResponsesProviderData::Message {
+                            rho_agent_types::transcript::OpenAiResponsesProviderData::Message {
                                 item_id: "old-message".try_into().unwrap(),
                             },
                         ),
@@ -336,11 +337,11 @@ mod tests {
         );
         write.append_agent_event(
             agent,
-            &AgentEvent::Entry(Entry::Step {
+            &AgentEvent::LegacyEntry(Entry::Step {
                 at: UnixMs(3),
                 calls: vec![],
                 prose: "private new prose".into(),
-                carry: rho_inference::step::Carry::from_openai_items(vec![]),
+                carry: super::super::legacy::provider::Carry::from_openai_items(vec![]),
                 usage: Default::default(),
             }),
         );
@@ -355,16 +356,16 @@ mod tests {
         let sent = rows
             .iter()
             .filter_map(|(_, event)| match event {
-                AgentEvent::Entry(Entry::Sent { text, .. }) => Some(text.as_str()),
+                AgentEvent::LegacyEntry(Entry::Sent { text, .. }) => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(sent, ["old answer"]);
         assert!(rows.iter().any(|(_, event)| matches!(event,
-            AgentEvent::Entry(Entry::Usage { usage, .. }) if usage.input_tokens == 101
+            AgentEvent::LegacyEntry(Entry::Usage { usage, .. }) if usage.input_tokens == 101
                 && usage.cache_read_tokens == 37 && usage.output_tokens == 19)));
         assert!(rows.iter().any(|(_, event)| matches!(event,
-            AgentEvent::Entry(Entry::Step { usage, prose, .. }) if prose == "old answer"
+            AgentEvent::LegacyEntry(Entry::Step { usage, prose, .. }) if prose == "old answer"
                 && usage.input_tokens == 138)));
     }
 }

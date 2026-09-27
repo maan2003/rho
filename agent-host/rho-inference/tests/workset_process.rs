@@ -108,13 +108,18 @@ async fn agents_and_terminal_share_workset_and_mode_change_drains_all_agents() {
         rho_agent_types::WorksetMode::Exposed
     );
     // Development integration checks require both companions built first:
-    // cargo build -p rho-agent -p rho-shell --bins
+    // cargo build -p rho-inference -p rho-shell --bins
     use rho_shell_view::protocol::{ShellClientFrame, ShellServerFrame};
-    let shell = std::path::Path::new(env!("CARGO_BIN_EXE_rho-agent-worker"))
-        .ancestors()
-        .map(|path| path.join("rho-shell"))
-        .find(|path| path.is_file())
-        .expect("build rho-shell companion before workset integration tests");
+    // /src is replaced by the workset even in exposed mode. Stage the
+    // companion inside that workset rather than assuming the checkout is visible.
+    let shell =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/rho-shell");
+    assert!(
+        shell.is_file(),
+        "build rho-shell companion before workset integration tests"
+    );
+    std::fs::copy(&shell, workset.root().join("rho-shell-test")).unwrap();
+    let shell = std::path::PathBuf::from("/src/rho-shell-test");
     replacement
         .action(WorksetAction::ShellStart {
             agent: first,
@@ -234,7 +239,7 @@ async fn fixture(
         )
         .unwrap();
     let db = rho_db::RhoDb::open(root.join("agents.redb"));
-    let inference = rho_inference::Inference::new_with_config(
+    let inference = rho_inference::Accounts::new_with_config(
         db.clone(),
         rho_inference::InferenceConfig::with_responses_base_url(endpoint).unwrap(),
     )
@@ -242,7 +247,7 @@ async fn fixture(
     .unwrap();
     let pool = AgentPool::new(
         db,
-        inference,
+        Arc::new(inference),
         worksets,
         rho_claude::accounts::ClaudePaths::at(
             camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),

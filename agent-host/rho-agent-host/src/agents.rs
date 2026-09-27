@@ -392,11 +392,20 @@ async fn send_journal_from(
         let entries = page
             .into_iter()
             .filter_map(|(seq, agent_id, pos, event)| {
+                let prior_carry = matches!(
+                    event,
+                    rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
+                        imported: None,
+                        ..
+                    })
+                )
+                .then(|| db.read().agent_input_carry(agent_id, pos))
+                .flatten();
                 Some(rho_agents_client::protocol::transcript::LogEntry {
                     seq,
                     agent_id,
                     pos: pos.into(),
-                    event: crate::transcript::strip(&event)?,
+                    event: crate::transcript::strip(&event, prior_carry.as_ref())?,
                 })
             })
             .collect::<Vec<_>>();
@@ -1020,23 +1029,29 @@ fn agent_detail(
     use rho_agents_client::protocol::transcript::DetailBody;
     let event = db.read().agent_event(agent_id, pos.into());
     match event {
-        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Woken { results, .. })) => {
-            DetailBody::Results(
-                results
-                    .into_iter()
-                    .map(
-                        |result| rho_agents_client::protocol::transcript::DetailResult {
-                            id: result.id.as_str().to_owned(),
-                            status: rho_agents_client::protocol::transcript::ToolStatus::Reported,
-                            output: result.text,
-                            error: None,
-                        },
-                    )
-                    .collect(),
+        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::RequestSent {
+            report,
+            imported,
+            ..
+        })) => DetailBody::Results(
+            crate::transcript::report_results(
+                &report,
+                db.read().agent_input_carry(agent_id, pos.into()).as_ref(),
+                imported.as_ref(),
             )
-        }
-        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { calls, .. })) => {
-            DetailBody::Response(crate::transcript::step_items(&calls))
+            .into_iter()
+            .map(
+                |result| rho_agents_client::protocol::transcript::DetailResult {
+                    id: result.display_id().to_owned(),
+                    status: rho_agents_client::protocol::transcript::ToolStatus::Reported,
+                    output: result.text,
+                    error: None,
+                },
+            )
+            .collect(),
+        ),
+        Some(rho_agent::AgentEvent::Entry(rho_agent::entry::Entry::Step { carry, .. })) => {
+            DetailBody::Response(crate::transcript::step_items(&carry.display_calls()))
         }
         Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
             rho_agent::TranscriptLine::Assistant { calls, .. } => DetailBody::Response(
@@ -1071,11 +1086,11 @@ fn agent_detail(
                 .items
                 .iter()
                 .filter_map(|slot| match slot {
-                    rho_inference::types::StreamingContextItemState::Pending(item)
-                    | rho_inference::types::StreamingContextItemState::Finished(item) => {
+                    rho_agent_types::transcript::StreamingContextItemState::Pending(item)
+                    | rho_agent_types::transcript::StreamingContextItemState::Finished(item) => {
                         crate::transcript::to_item(item)
                     }
-                    rho_inference::types::StreamingContextItemState::Empty => None,
+                    rho_agent_types::transcript::StreamingContextItemState::Empty => None,
                 })
                 .collect(),
         ),
@@ -1084,7 +1099,7 @@ fn agent_detail(
 }
 
 fn detail_result(
-    result: &rho_inference::types::ToolResult,
+    result: &rho_agent_types::transcript::ToolResult,
 ) -> rho_agents_client::protocol::transcript::DetailResult {
     use rho_agents_client::protocol::transcript::ToolStatus;
     rho_agents_client::protocol::transcript::DetailResult {
@@ -1103,10 +1118,10 @@ mod tests {
 
     #[test]
     fn tool_detail_reads_the_complete_host_record() {
-        let result = rho_inference::types::ToolResult {
-            call_id: rho_inference::types::ToolCallId::try_from("call-1").unwrap(),
-            tool_type: rho_inference::types::ToolType::Custom,
-            body: rho_inference::types::ToolOutput {
+        let result = rho_agent_types::transcript::ToolResult {
+            call_id: rho_agent_types::transcript::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_agent_types::transcript::ToolType::Custom,
+            body: rho_agent_types::transcript::ToolOutput {
                 output: Arc::new("bounded model view".to_owned()),
                 full_output: Some(Arc::new("complete host record".to_owned())),
                 images: Arc::new(Vec::new()),

@@ -1,7 +1,6 @@
 //! Process-local runtime connections. Shared services remain in the agent host.
 
 mod ipc;
-mod policy;
 mod process;
 mod remote;
 mod transport;
@@ -19,7 +18,7 @@ pub use remote::Remote;
 #[cfg(test)]
 pub(crate) fn local_services(
     db: rho_db::RhoDb,
-    inference: rho_inference::Inference,
+    inference: crate::inference::Accounts,
     agent: rho_agent_types::AgentId,
     pool: std::sync::Weak<crate::pool::AgentPool>,
 ) -> std::sync::Arc<Host> {
@@ -40,7 +39,7 @@ pub(crate) fn local_services(
 }
 
 /// Entry point of the companion process; callers must not have started threads.
-pub fn worker_main() -> anyhow::Result<()> {
+pub fn worker_main(factory: crate::inference::WorkerFactory) -> anyhow::Result<()> {
     use std::io::Read as _;
     let mut socket = runtime::control_socket()?;
     let mut length = [0; 4];
@@ -81,7 +80,13 @@ pub fn worker_main() -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(async {
-            runtime::run(tokio::net::UnixStream::from_std(socket)?, startup, view).await
+            runtime::run(
+                tokio::net::UnixStream::from_std(socket)?,
+                startup,
+                view,
+                factory,
+            )
+            .await
         })
 }
 
@@ -101,54 +106,6 @@ pub(crate) mod testing {
                 self.incoming,
                 std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             )
-        }
-        pub(super) fn policy(self) -> std::sync::Arc<super::policy::Host> {
-            let policy = super::policy::Host::new(
-                self.sender,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            );
-            let reader = policy.clone();
-            let mut incoming = self.incoming;
-            tokio::spawn(async move {
-                while let Some(bytes) = incoming.recv().await {
-                    let Ok(super::workset::Message::Policy(message)) =
-                        super::workset::decode(&bytes.bytes)
-                    else {
-                        break;
-                    };
-                    if reader.receive(message).is_err() {
-                        break;
-                    }
-                }
-                reader.disconnect();
-            });
-            policy
-        }
-        pub(super) async fn read_policy(&mut self) -> anyhow::Result<super::policy::Message> {
-            let bytes = self
-                .incoming
-                .recv()
-                .await
-                .ok_or_else(|| anyhow::anyhow!("policy disconnected"))?;
-            let super::workset::Message::Policy(message) = super::workset::decode(&bytes.bytes)?
-            else {
-                anyhow::bail!("not a policy message");
-            };
-            Ok(message)
-        }
-        pub(super) async fn write_policy(
-            &self,
-            message: &super::policy::Message,
-        ) -> anyhow::Result<()> {
-            // Encode the outer named workset variant without cloning secrets.
-            #[derive(senax_encoder::Encode)]
-            enum Frame<'a> {
-                Policy(&'a super::policy::Message),
-            }
-            self.sender
-                .send(self.port, super::workset::encode(&Frame::Policy(message))?)
-                .await?;
-            Ok(())
         }
         pub(super) async fn read(&mut self) -> std::io::Result<ipc::Message<'static>> {
             ipc::decode(

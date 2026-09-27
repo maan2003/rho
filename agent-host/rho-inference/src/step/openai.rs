@@ -6,19 +6,39 @@
 //! instructions are developer items at the head of the input, not top-level
 //! fields.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use super::{Call, CallId, Carry, EXEC, Image, Inner, Item, Request, Step, Stream, Usage};
-use crate::Inference;
-use crate::config::InferenceModel;
+use super::{
+    Call, CallId, CallResult, Carry, EXEC, Event, Image, Item, Observation, Request, Response,
+    Step, Usage,
+};
+use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::responses::{DialRoute, QuotaUpdate, ws};
+
+/// Replay fragments must reach serde_json's writer without becoming Values.
+#[derive(serde::Serialize)]
+struct Body<'a> {
+    #[serde(flatten)]
+    fields: Value,
+    input: Vec<Cow<'a, RawValue>>,
+}
+#[derive(serde::Deserialize)]
+struct Incoming<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'a, str>,
+    #[serde(default, borrow)]
+    item: Option<&'a RawValue>,
+}
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(300);
 const PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -39,29 +59,9 @@ struct Connection {
 
 struct Previous {
     id: String,
-    lineage: uuid::Uuid,
-    at: usize,
-    carry: Carry,
     instructions: Arc<str>,
 }
 
-/// An idle connection still answers pings and observes close/route changes.
-/// Taking it out before a request makes cancellation drop the in-flight socket.
-pub(crate) struct Idle {
-    take: Option<tokio::sync::oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<Option<Connection>>,
-}
-impl Drop for Idle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-impl Idle {
-    async fn take(mut self) -> Option<Connection> {
-        let _ = self.take.take()?.send(());
-        (&mut self.task).await.ok().flatten()
-    }
-}
 impl Connection {
     async fn next(
         &mut self,
@@ -80,193 +80,236 @@ impl Connection {
             }
         }
     }
+}
+/// One task owns the socket for its entire lifetime, including idle keepalive.
+#[derive(Clone)]
+pub struct InferenceSession {
+    commands: mpsc::UnboundedSender<Start>,
+}
 
-    fn park(mut self, inference: Inference, model: InferenceModel, fast: bool) -> Idle {
-        let (take, mut taken) = tokio::sync::oneshot::channel();
-        let mut routes = inference.route_updates();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = &mut taken => return result.ok().map(|_| self),
-                    changed = routes.changed() => {
-                        if changed.is_err() || routes.borrow().for_model(model, fast, Some(&self.selected)) != self.route {
-                            return None;
+struct Start {
+    request: Request,
+    selected: crate::SelectedAuth,
+    auth: crate::ResolvedAuth,
+    tools: bool,
+    events: mpsc::UnboundedSender<Event>,
+}
+
+struct Session {
+    base_url: Arc<str>,
+    model: InferenceModel,
+    effort: ReasoningEffort,
+    fast: bool,
+    routes: watch::Receiver<crate::RouteSelection>,
+    observations: mpsc::UnboundedSender<Observation>,
+}
+
+impl InferenceSession {
+    pub fn new(
+        base_url: Arc<str>,
+        profile: InferenceProfile,
+        model: InferenceModel,
+        routes: watch::Receiver<crate::RouteSelection>,
+    ) -> (Self, mpsc::UnboundedReceiver<Observation>) {
+        let (commands, incoming) = mpsc::unbounded_channel();
+        let (observations, reports) = mpsc::unbounded_channel();
+        let session = Session {
+            base_url,
+            model,
+            effort: profile.effort,
+            fast: profile.fast_mode,
+            routes,
+            observations,
+        };
+        tokio::spawn(session.run(incoming));
+        (Self { commands }, reports)
+    }
+
+    pub fn start(
+        &self,
+        request: Request,
+        selected: crate::SelectedAuth,
+        auth: crate::ResolvedAuth,
+    ) -> Response {
+        self.send(request, selected, auth, true)
+    }
+
+    pub fn text_start(
+        &self,
+        instructions: Arc<str>,
+        input: String,
+        selected: crate::SelectedAuth,
+        auth: crate::ResolvedAuth,
+    ) -> Response {
+        self.send(
+            Request::new(
+                instructions,
+                vec![Item::User {
+                    text: input,
+                    images: vec![],
+                }],
+                super::CacheKey::new(),
+            ),
+            selected,
+            auth,
+            false,
+        )
+    }
+
+    fn send(
+        &self,
+        request: Request,
+        selected: crate::SelectedAuth,
+        auth: crate::ResolvedAuth,
+        tools: bool,
+    ) -> Response {
+        let (events, response) = mpsc::unbounded_channel();
+        let _ = self.commands.send(Start {
+            request,
+            selected,
+            auth,
+            tools,
+            events,
+        });
+        response
+    }
+}
+
+impl Session {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Start>) {
+        let mut connection: Option<Connection> = None;
+        loop {
+            tokio::select! {
+                biased;
+                start = commands.recv() => {
+                    let Some(start) = start else { return };
+                    // A queued request may have been abandoned before admission.
+                    if start.events.is_closed() { continue; }
+                    let result = tokio::select! {
+                        biased;
+                        _ = start.events.closed() => {
+                            connection = None;
+                            continue;
                         }
+                        result = self.exchange(&mut connection, &start) => result,
+                    };
+                    let event = match result {
+                        Ok(event) => event,
+                        Err(error) => {
+                            connection = None;
+                            Event::Failed(error)
+                        }
+                    };
+                    if start.events.send(event).is_err() {
+                        // Caller did not accept completion; never continue its turn.
+                        connection = None;
                     }
-                    message = self.next(None) => match message {
+                }
+                changed = self.routes.changed() => {
+                    if changed.is_err() { return; }
+                    if connection.as_ref().is_some_and(|c|
+                        self.routes.borrow().for_model(self.model, self.fast, Some(&c.selected)) != c.route
+                    ) { connection = None; }
+                }
+                message = async { connection.as_mut().unwrap().next(None).await }, if connection.is_some() => {
+                    let conn = connection.as_mut().unwrap();
+                    match message {
                         Ok(Some(WsMessage::Ping(payload))) => {
-                            if self.socket.send(WsMessage::Pong(payload)).await.is_err() { return None; }
+                            if conn.socket.send(WsMessage::Pong(payload)).await.is_err() { connection = None; }
                         }
                         Ok(Some(WsMessage::Pong(_))) => {}
                         Ok(Some(WsMessage::Text(text))) => {
                             if let Ok(event) = serde_json::from_str::<Value>(&text) {
                                 if let Some(quota) = QuotaUpdate::from_event(&event) {
-                                    inference.observe_quota(&self.selected, quota).await;
+                                    self.quota(&conn.selected, quota).await;
                                 } else if matches!(event["type"].as_str(), Some("error" | "response.failed")) {
-                                    return None;
+                                    connection = None;
                                 }
                             }
                         }
-                        _ => return None,
+                        _ => connection = None,
                     }
                 }
             }
+        }
+    }
+
+    async fn quota(&self, selected: &crate::SelectedAuth, quota: QuotaUpdate) {
+        let (done, acknowledged) = oneshot::channel();
+        let _ = self.observations.send(Observation::Quota {
+            selected: selected.clone(),
+            quota,
+            done,
         });
-        Idle {
-            take: Some(take),
-            task,
-        }
-    }
-}
-
-pub struct OpenAi {
-    pub(crate) inference: Inference,
-    pub(crate) model: InferenceModel,
-    pub(crate) effort: Effort,
-    pub(crate) fast: bool,
-    pub(crate) idle: tokio::sync::Mutex<Option<Idle>>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Effort {
-    Low,
-    #[default]
-    Medium,
-    High,
-    XHigh,
-}
-
-impl Effort {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-        }
-    }
-}
-
-impl std::str::FromStr for Effort {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "low" => Ok(Self::Low),
-            "medium" => Ok(Self::Medium),
-            "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::XHigh),
-            _ => Err(format!(
-                "unknown effort {s:?}: use low, medium, high or xhigh"
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for Effort {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl OpenAi {
-    pub(crate) async fn step(
-        &self,
-        request: &Request,
-        stream: &mut (dyn FnMut(Stream<'_>) + Send),
-    ) -> anyhow::Result<Step> {
-        self.exchange(request, true, stream).await
-    }
-
-    pub(crate) async fn text(
-        &self,
-        instructions: Arc<str>,
-        input: String,
-    ) -> anyhow::Result<String> {
-        let request = Request::new(
-            instructions,
-            vec![Item::User {
-                text: input,
-                images: Vec::new(),
-            }],
-            super::CacheKey::new(),
-        );
-        let response = self.exchange(&request, false, &mut |_| {}).await?;
-        if response.call.is_some() {
-            bail!("text completion returned a tool call");
-        }
-        Ok(response.prose)
+        let _ = acknowledged.await;
     }
 
     async fn exchange(
         &self,
-        request: &Request,
-        tools: bool,
-        stream: &mut (dyn FnMut(Stream<'_>) + Send),
-    ) -> anyhow::Result<Step> {
-        // Hold admission, not the connection, in the mutex while in flight.
-        // An aborted caller drops its local connection and cannot reuse a partial turn.
-        let mut idle = self.idle.lock().await;
-        let (mut selected, resolved) = self.inference.select_resolved().await?;
+        slot: &mut Option<Connection>,
+        start: &Start,
+    ) -> anyhow::Result<Event> {
+        let request = &start.request;
+        let tools = start.tools;
+        let mut selected = start.selected.clone();
+        let resolved = start.auth.clone();
         selected.account_id = resolved.account_id.clone();
         let route = self
-            .inference
-            .route_for_model(self.model, self.fast, Some(&selected));
-        let connection = match idle.take() {
-            Some(parked) => parked.take().await.filter(|c| {
-                c.selected == selected
-                    && c.auth.bearer_token == resolved.bearer_token
-                    && c.auth.client_secret == resolved.client_secret
-                    && c.auth.account_id == resolved.account_id
-                    && c.route == route
-                    && c.cache_key == request.cache_key
-                    && c.opened.elapsed() < MAX_CONNECTION_AGE
-            }),
-            None => None,
-        };
-        let mut connection = match connection {
-            Some(c) => c,
-            None => {
-                self.connect(request.cache_key, selected, resolved, route)
-                    .await?
-            }
-        };
-        let previous = connection.previous.take().filter(|p|
-            tools && p.lineage == request.lineage
-            && (Arc::ptr_eq(&p.instructions, &request.instructions) || p.instructions == request.instructions)
-            && matches!(request.items.get(p.at), Some(Item::Step(carry)) if carry.same_response(&p.carry))
-            && !p.carry.has_compaction());
-        let mut body = self.body_from(request, previous.as_ref().map(|p| p.at + 1).unwrap_or(0));
-        if let Some(previous) = previous {
-            body["previous_response_id"] = Value::String(previous.id);
+            .routes
+            .borrow()
+            .for_model(self.model, self.fast, Some(&selected));
+        if slot.as_ref().is_some_and(|c| {
+            c.selected != selected
+                || c.auth.bearer_token != resolved.bearer_token
+                || c.auth.client_secret != resolved.client_secret
+                || c.auth.account_id != resolved.account_id
+                || c.route != route
+                || c.cache_key != request.cache_key
+                || c.opened.elapsed() >= MAX_CONNECTION_AGE
+        }) {
+            *slot = None;
         }
-        body["prompt_cache_key"] = request
+        if slot.is_none() {
+            *slot = Some(
+                self.connect(request.cache_key, selected, resolved, route)
+                    .await?,
+            );
+        }
+        let connection = slot.as_mut().unwrap();
+        let previous = connection.previous.take().filter(|p| {
+            tools
+                && request.previous_response_id.as_ref() == Some(&p.id)
+                && p.instructions == request.instructions
+        });
+        if request.previous_response_id.is_some() && previous.is_none() {
+            return Ok(Event::NeedsContext);
+        }
+        let mut body = self.body_from(request, previous.is_some());
+        if let Some(previous) = previous {
+            body.fields["previous_response_id"] = Value::String(previous.id);
+        }
+        body.fields["prompt_cache_key"] = request
             .cache_key
-            .wire_uuid(
-                self.inference.responses_base_url(),
-                connection.auth.client_secret,
-            )
+            .wire_uuid(&self.base_url, connection.auth.client_secret)
             .to_string()
             .into();
         if !tools {
-            body["input"].as_array_mut().unwrap().remove(0);
+            body.input.remove(0);
         }
         connection
             .socket
-            .send(WsMessage::Text(body.to_string().into()))
+            .send(WsMessage::Text(serde_json::to_string(&body)?.into()))
             .await?;
-        let result = self.read_response(&mut connection, stream).await?;
-        let (step, response_id, complete_replay) = result;
+        let (mut step, response_id, complete_replay) =
+            self.read_response(connection, &start.events).await?;
         if tools && complete_replay && !step.carry.has_compaction() {
+            step.response_id = response_id.clone();
             connection.previous = response_id.map(|id| Previous {
                 id,
-                lineage: request.lineage,
-                at: request.items.len(),
-                carry: step.carry.clone(),
                 instructions: request.instructions.clone(),
             });
         }
-        *idle = Some(connection.park(self.inference.clone(), self.model, self.fast));
-        Ok(step)
+        Ok(Event::Completed(step))
     }
 
     async fn connect(
@@ -278,10 +321,10 @@ impl OpenAi {
     ) -> anyhow::Result<Connection> {
         crate::ensure_crypto_provider();
         let request = ws::request(
-            self.inference.responses_base_url(),
+            &self.base_url,
             Some(
                 &cache_key
-                    .wire_uuid(self.inference.responses_base_url(), resolved.client_secret)
+                    .wire_uuid(&self.base_url, resolved.client_secret)
                     .to_string(),
             ),
             &resolved,
@@ -291,15 +334,19 @@ impl OpenAi {
             && route != DialRoute::Dns
             && !matches!(websocket_status(error), Some(401 | 403 | 429))
         {
-            self.inference
-                .report_connect_failure(route, Some(&selected))
-                .await;
+            let (done, acknowledged) = oneshot::channel();
+            let _ = self.observations.send(Observation::RouteFailed {
+                route,
+                selected: selected.clone(),
+                done,
+            });
+            let _ = acknowledged.await;
             route = DialRoute::Dns;
             let request = ws::request(
-                self.inference.responses_base_url(),
+                &self.base_url,
                 Some(
                     &cache_key
-                        .wire_uuid(self.inference.responses_base_url(), resolved.client_secret)
+                        .wire_uuid(&self.base_url, resolved.client_secret)
                         .to_string(),
                 ),
                 &resolved,
@@ -310,10 +357,7 @@ impl OpenAi {
             Ok(connection) => connection,
             Err(error) => {
                 if websocket_status(&error) == Some(429) {
-                    if self.inference.mark_rate_limited(&selected).await {
-                        return Err(super::Retryable(error.to_string()).into());
-                    }
-                    bail!("provider quota exhausted: {error}");
+                    return Err(super::RateLimited(error.to_string()).into());
                 }
                 return Err(error).context("connecting to the Responses endpoint");
             }
@@ -336,7 +380,7 @@ impl OpenAi {
     async fn read_response(
         &self,
         connection: &mut Connection,
-        stream: &mut (dyn FnMut(Stream<'_>) + Send),
+        events: &mpsc::UnboundedSender<Event>,
     ) -> anyhow::Result<(Step, Option<String>, bool)> {
         let mut deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
         let mut items = Vec::new();
@@ -360,11 +404,43 @@ impl OpenAi {
                 _ => continue,
             };
             deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+            let incoming: Incoming<'_> = serde_json::from_str(&text)?;
+            if incoming.kind == "response.output_item.done" {
+                items.push(
+                    incoming
+                        .item
+                        .ok_or_else(|| anyhow::anyhow!("completed output item missing"))?
+                        .to_owned(),
+                );
+                continue;
+            }
+            if matches!(
+                incoming.kind.as_ref(),
+                "response.completed" | "response.done"
+            ) {
+                #[derive(serde::Deserialize)]
+                struct Completion {
+                    response: Completed,
+                }
+                #[derive(serde::Deserialize)]
+                struct Completed {
+                    id: Option<String>,
+                    #[serde(default)]
+                    usage: Value,
+                }
+                // item.done is the source of items; do not parse/copy response.output.
+                let completed: Completion = serde_json::from_str(&text)?;
+                let count = items.len();
+                let answer = step(items, &completed.response.usage);
+                let complete_replay = answer
+                    .carry
+                    .prepared()
+                    .is_some_and(|p| p.items.len() == count);
+                return Ok((answer, completed.response.id, complete_replay));
+            }
             let event: Value = serde_json::from_str(&text)?;
             if let Some(quota) = QuotaUpdate::from_event(&event) {
-                self.inference
-                    .observe_quota(&connection.selected, quota)
-                    .await;
+                self.quota(&connection.selected, quota).await;
             }
             match event["type"].as_str().unwrap_or_default() {
                 "response.output_item.added" if streaming.is_none() && is_call(&event["item"]) => {
@@ -373,8 +449,11 @@ impl OpenAi {
                         item["id"].as_str().unwrap_or_default().to_owned(),
                         event["output_index"].clone(),
                     ));
-                    stream(Stream::Call {
-                        id: &CallId::new(item["call_id"].as_str().unwrap_or_default()),
+                    let _ = events.send(Event::Call {
+                        carry: Carry::bare(Call {
+                            id: CallId::new(item["call_id"].as_str().unwrap_or_default()),
+                            code: String::new(),
+                        }),
                     });
                 }
                 "response.custom_tool_call_input.delta"
@@ -385,20 +464,8 @@ impl OpenAi {
                         }
                     }) =>
                 {
-                    stream(Stream::Code(event["delta"].as_str().unwrap_or_default()))
-                }
-                "response.output_item.done" => items.push(event["item"].clone()),
-                "response.completed" | "response.done" => {
-                    let count = items.len();
-                    let answer = step(items, &event["response"]["usage"]);
-                    let complete_replay = answer
-                        .carry
-                        .prepared()
-                        .is_some_and(|p| p.items.len() == count);
-                    return Ok((
-                        answer,
-                        event["response"]["id"].as_str().map(str::to_owned),
-                        complete_replay,
+                    let _ = events.send(Event::Code(
+                        event["delta"].as_str().unwrap_or_default().to_owned(),
                     ));
                 }
                 "response.incomplete" => bail!(
@@ -418,7 +485,7 @@ impl OpenAi {
                     {
                         true
                     } else if is_rate_limit(error) {
-                        self.inference.mark_rate_limited(&connection.selected).await
+                        return Err(super::RateLimited(format!("provider error: {error}")).into());
                     } else {
                         ["code", "type"].iter().any(|key| {
                             matches!(
@@ -448,11 +515,12 @@ impl OpenAi {
 
     #[cfg(test)]
     fn body(&self, request: &Request) -> Value {
-        self.body_from(request, 0)
+        serde_json::from_str(&serde_json::to_string(&self.body_from(request, false)).unwrap())
+            .unwrap()
     }
 
-    fn body_from(&self, request: &Request, start: usize) -> Value {
-        let mut input = if start == 0 {
+    fn body_from<'a>(&self, request: &'a Request, continuation: bool) -> Body<'a> {
+        let input = if !continuation {
             vec![
                 json!({
                     "type": "additional_tools",
@@ -473,80 +541,72 @@ impl OpenAi {
         } else {
             Vec::new()
         };
-        // Context already discarded everything before its latest compaction.
+        let mut input: Vec<Cow<'a, RawValue>> = input
+            .into_iter()
+            .map(|item| Cow::Owned(serde_json::value::to_raw_value(&item).expect("request item")))
+            .collect();
+        // Full requests discard everything before their latest compaction.
         // Cached metadata also handles a compaction within one response.
         let mut compaction_requested = false;
-        for item in request.items.iter().skip(start) {
+        for item in request.items.iter() {
             match item {
-                Item::Step(carry) => match &*carry.0 {
-                    Inner::OpenAi { .. } => {
-                        let prepared = carry.prepared().unwrap();
-                        input.extend(
-                            prepared
-                                .items
-                                .iter()
-                                .skip(prepared.compaction.unwrap_or(0))
-                                .cloned(),
-                        );
-                    }
-                    Inner::ScriptedCompaction => {}
-                    Inner::Scripted { call } => {
-                        if let Some(call) = call {
-                            input.push(call_item(call));
-                        }
-                    }
-                },
+                Item::Step(carry) => {
+                    let prepared = carry.prepared().expect("provider replay items");
+                    input.extend(
+                        prepared
+                            .items
+                            .into_iter()
+                            .skip(prepared.compaction.unwrap_or(0))
+                            .map(Cow::Borrowed),
+                    );
+                }
                 Item::CompactionTrigger => compaction_requested = true,
-                Item::Result {
-                    call_id,
+                Item::Report { .. } => unreachable!("requests resolve reports"),
+                Item::Result(CallResult {
+                    id: call_id,
+                    function,
                     text,
                     images,
-                } => input.push(json!({
-                    "type": "custom_tool_call_output",
+                }) => input.push(Cow::Owned(serde_json::value::to_raw_value(&json!({
+                    "type": if *function { "function_call_output" } else { "custom_tool_call_output" },
                     "call_id": call_id.as_str(),
                     "output": content(text, images, true),
-                })),
-                Item::User { text, images } => input.push(json!({
+                })).expect("tool output"))),
+                Item::User { text, images } => input.push(Cow::Owned(serde_json::value::to_raw_value(&json!({
                     "type": "message",
                     "role": "user",
                     "content": content(text, images, false),
-                })),
+                })).expect("user message"))),
             }
         }
         if compaction_requested {
-            input.push(json!({ "type": "compaction_trigger" }));
+            input.push(Cow::Owned(
+                serde_json::value::to_raw_value(&json!({ "type": "compaction_trigger" })).unwrap(),
+            ));
         }
-        json!({
-            "type": "response.create",
-            "model": self.model.as_str(),
-            "instructions": "",
-            "input": input,
-            "store": false,
-            "parallel_tool_calls": false,
-            "text": { "verbosity": "low" },
-            "reasoning": { "context": "all_turns", "effort": self.effort.as_str(), "summary": "auto" },
-            "service_tier": if self.fast { "priority" } else { "default" },
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": request.cache_key.to_string(),
-            "client_metadata": {
-                "ws_request_header_x_openai_internal_codex_responses_lite": "true",
-            },
-        })
+        Body {
+            input,
+            fields: json!({
+                "type": "response.create",
+                "model": self.model.as_str(),
+                "instructions": "",
+                "store": false,
+                "parallel_tool_calls": false,
+                "text": { "verbosity": "low" },
+                "reasoning": { "context": "all_turns", "effort": self.effort.as_str(), "summary": "auto" },
+                "service_tier": if self.fast { "priority" } else { "default" },
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": request.cache_key.to_string(),
+                "client_metadata": {
+                    "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+                },
+            }),
+        }
     }
 }
 
 fn is_call(item: &Value) -> bool {
     item["type"] == "custom_tool_call" && item["name"] == EXEC
-}
-
-fn call_item(call: &Call) -> Value {
-    json!({
-        "type": "custom_tool_call",
-        "id": format!("ctc_{}", call.id),
-        "call_id": call.id.as_str(),
-        "name": EXEC,
-        "input": call.code,
-    })
 }
 
 /// Text alone as a string; with images, content parts. Tool output may be
@@ -569,66 +629,40 @@ fn content(text: &str, images: &[Image], output: bool) -> Value {
     Value::Array(parts)
 }
 
-/// The step the output items make. The first `exec` call is the call; a
-/// second is dropped, since nothing will ever answer it. Items are kept in
-/// the shape they are replayed in.
-fn step(items: Vec<Value>, usage: &Value) -> Step {
-    let mut call = None;
+/// Extract execution/display facts, but keep every completed item verbatim.
+fn step(items: Vec<Box<RawValue>>, usage: &Value) -> Step {
     let mut prose = String::new();
-    let mut carry = Vec::new();
-    for item in items {
-        let replay = match item["type"].as_str().unwrap_or_default() {
-            "compaction" if item["encrypted_content"].is_string() => item,
-            "reasoning" if item["encrypted_content"].is_string() => json!({
-                "type": "reasoning",
-                "id": item["id"],
-                "encrypted_content": item["encrypted_content"],
-                "summary": item["summary"],
-            }),
-            "custom_tool_call" | "function_call" if call.is_none() => {
-                let code = item["input"]
-                    .as_str()
-                    .or_else(|| item["arguments"].as_str())
-                    .unwrap_or_default()
-                    .to_owned();
-                let this = Call {
-                    id: CallId::new(item["call_id"].as_str().unwrap_or_default()),
-                    code,
-                };
-                let replay = json!({
-                    "type": "custom_tool_call",
-                    "id": item["id"],
-                    "call_id": this.id.as_str(),
-                    "name": EXEC,
-                    "input": this.code,
-                });
-                call = Some(this);
-                replay
+    for raw in &items {
+        let meta: super::ItemMeta<'_> =
+            serde_json::from_str(raw.get()).expect("completed item metadata");
+        if meta.kind == "message" {
+            #[derive(serde::Deserialize)]
+            struct Message {
+                #[serde(default)]
+                content: Vec<Part>,
             }
-            "message" => {
-                let text = item["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|part| part["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("");
-                prose.push_str(&text);
-                json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "id": item["id"],
-                    "content": [{ "type": "output_text", "text": text }],
-                })
+            #[derive(serde::Deserialize)]
+            struct Part {
+                text: Option<String>,
             }
-            _ => continue,
-        };
-        carry.push(replay);
+            let message: Message = serde_json::from_str(raw.get()).expect("completed message");
+            for part in message.content {
+                if let Some(text) = part.text {
+                    prose.push_str(&text);
+                }
+            }
+        }
     }
+    let carry = Carry::from_raw_items(items, true);
+    let call = carry.0.display_calls().into_iter().next().map(|call| Call {
+        id: CallId::new(call.display_id()),
+        code: call.code,
+    });
     Step {
+        response_id: None,
         call,
         prose,
-        carry: Carry::from_openai_values(carry),
+        carry,
         usage: Usage {
             input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
             cached_tokens: usage["input_tokens_details"]["cached_tokens"]
@@ -656,12 +690,11 @@ fn is_rate_limit(error: &Value) -> bool {
 mod tests {
     use std::sync::Mutex;
 
-    use futures::future::BoxFuture;
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     use super::*;
     use crate::accounts::SelectedAuth;
-    use crate::inference::{InferenceConfig, InferenceHost};
+    use crate::inference::{Inference, InferenceConfig, PolicyReply, PolicyRequest};
     use crate::responses::{InferenceAuth, RouteSelection};
 
     #[derive(Debug)]
@@ -669,13 +702,33 @@ mod tests {
         selected: SelectedAuth,
         calls: Mutex<Vec<&'static str>>,
         route: watch::Sender<RouteSelection>,
+        credentials: watch::Sender<crate::CredentialSnapshot>,
         stable: std::sync::atomic::AtomicBool,
         replacement: std::sync::atomic::AtomicBool,
     }
     impl Host {
+        fn snapshot(&self, nth: usize) -> crate::CredentialSnapshot {
+            crate::CredentialSnapshot {
+                revision: nth as u64,
+                state: crate::CredentialState::Ready {
+                    selected: self.selected.clone(),
+                    auth: crate::ResolvedAuth {
+                        bearer_token: format!("ephemeral-{nth}"),
+                        account_id: Some("account-9".into()),
+                        client_secret: [0; 32],
+                    },
+                    refresh_at: u64::MAX,
+                },
+            }
+        }
+
         fn new() -> Arc<Self> {
             let (route, _) = watch::channel(RouteSelection::default());
-            Arc::new(Self {
+            let (credentials, _) = watch::channel(crate::CredentialSnapshot {
+                revision: 0,
+                state: crate::CredentialState::Pending,
+            });
+            let host = Arc::new(Self {
                 selected: SelectedAuth {
                     auth: InferenceAuth::oauth_file("/nonexistent/host-only"),
                     namespace: Some("test".into()),
@@ -683,80 +736,95 @@ mod tests {
                 },
                 calls: Mutex::new(vec![]),
                 route,
+                credentials,
                 stable: false.into(),
                 replacement: true.into(),
-            })
+            });
+            host.credentials.send_replace(host.snapshot(1));
+            host
         }
-    }
-    impl InferenceHost for Host {
-        fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>> {
-            Box::pin(async { panic!("transport must use host's atomic selection and resolution") })
-        }
-        fn select_resolved(
-            &self,
-        ) -> BoxFuture<'_, anyhow::Result<(SelectedAuth, crate::ResolvedAuth)>> {
-            Box::pin(async {
-                let mut calls = self.calls.lock().unwrap();
-                let nth = calls
-                    .iter()
-                    .filter(|call| **call == "select-resolved")
-                    .count()
-                    + 1;
-                calls.push("select-resolved");
-                let nth = if self.stable.load(std::sync::atomic::Ordering::Relaxed) {
-                    1
-                } else {
-                    nth
-                };
-                Ok((
-                    self.selected.clone(),
-                    crate::ResolvedAuth {
-                        bearer_token: format!("ephemeral-{nth}"),
-                        account_id: Some("account-9".into()),
-                        client_secret: [0; 32],
-                    },
-                ))
-            })
-        }
-        fn resolve_auth(
-            &self,
-            _: InferenceAuth,
-        ) -> BoxFuture<'_, anyhow::Result<crate::ResolvedAuth>> {
-            Box::pin(async { panic!("transport must not resolve auth from worker filesystem") })
-        }
-        fn mark_rate_limited(&self, selected: SelectedAuth) -> BoxFuture<'_, bool> {
-            Box::pin(async move {
-                assert_eq!(selected.account_id.as_deref(), Some("account-9"));
-                self.calls.lock().unwrap().push("limited");
-                self.replacement.load(std::sync::atomic::Ordering::Relaxed)
-            })
-        }
-        fn observe_quota(&self, selected: SelectedAuth, quota: QuotaUpdate) -> BoxFuture<'_, ()> {
-            Box::pin(async move {
-                assert_eq!(selected.account_id.as_deref(), Some("account-9"));
-                assert_eq!(quota.weekly_used_percent, 17);
-                assert_eq!(quota.routing_used_percent, 83);
-                self.calls.lock().unwrap().push("quota");
-            })
-        }
-        fn route_updates(&self) -> watch::Receiver<RouteSelection> {
-            self.route.subscribe()
-        }
-        fn report_connect_failure(
-            &self,
-            _: DialRoute,
-            _: Option<SelectedAuth>,
-        ) -> BoxFuture<'_, ()> {
-            Box::pin(async { panic!("unexpected route failure") })
+
+        fn policy(self: &Arc<Self>, addr: std::net::SocketAddr) -> Inference {
+            let (calls, mut receiver) = mpsc::channel::<crate::inference::PolicyCall>(32);
+            let host = self.clone();
+            tokio::spawn(async move {
+                while let Some(call) = receiver.recv().await {
+                    let reply = match call.body {
+                        PolicyRequest::RateLimited(selected) => {
+                            assert_eq!(selected.account_id.as_deref(), Some("account-9"));
+                            host.calls.lock().unwrap().push("limited");
+                            PolicyReply::RateLimited(
+                                host.replacement.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                        }
+                        PolicyRequest::Quota { selected, quota } => {
+                            assert_eq!(selected.account_id.as_deref(), Some("account-9"));
+                            assert_eq!(quota.weekly_used_percent, 17);
+                            assert_eq!(quota.routing_used_percent, 83);
+                            host.calls.lock().unwrap().push("quota");
+                            if !host.stable.load(std::sync::atomic::Ordering::Relaxed) {
+                                let nth = host.credentials.borrow().revision as usize + 1;
+                                host.credentials.send_replace(host.snapshot(nth));
+                            }
+                            PolicyReply::Done
+                        }
+                        PolicyRequest::RouteFailed { .. } => panic!("unexpected route failure"),
+                        PolicyRequest::SelectAccount | PolicyRequest::ResolveAuth(_) => {
+                            panic!("transport must use pushed credential selection")
+                        }
+                    };
+                    let _ = call.reply.send(Ok(reply));
+                }
+            });
+            let (_closed, closed) = watch::channel(false);
+            Inference::from_worker(
+                calls,
+                self.credentials.subscribe(),
+                self.route.subscribe(),
+                closed,
+                InferenceConfig::with_responses_base_url(format!("http://{addr}")).unwrap(),
+            )
         }
     }
 
-    fn model(host: Arc<Host>, addr: std::net::SocketAddr) -> crate::step::Model {
-        Inference::from_host(
-            host,
-            InferenceConfig::with_responses_base_url(format!("http://{addr}")).unwrap(),
-        )
-        .model(Default::default(), InferenceModel::Gpt6Sol)
+    struct TestInferenceSession {
+        session: InferenceSession,
+        policy: Inference,
+    }
+    impl TestInferenceSession {
+        async fn step(
+            &self,
+            request: &Request,
+            stream: &mut (dyn FnMut(Event) + Send),
+        ) -> anyhow::Result<Step> {
+            let (selected, auth) = self.policy.select_resolved().await?;
+            let mut response = self.session.start(request.clone(), selected.clone(), auth);
+            while let Some(event) = response.recv().await {
+                match event {
+                    Event::Completed(step) => return Ok(step),
+                    Event::NeedsContext => return Err(anyhow::anyhow!("needs context")),
+                    Event::Failed(error) => {
+                        if self.policy.retryable(&error, &selected).await {
+                            return Err(super::super::Retryable(error.to_string()).into());
+                        }
+                        return Err(error);
+                    }
+                    event => stream(event),
+                }
+            }
+            bail!("session closed")
+        }
+        async fn text(&self, instructions: Arc<str>, input: String) -> anyhow::Result<String> {
+            self.policy.text(instructions, input).await
+        }
+    }
+
+    fn session(host: Arc<Host>, addr: std::net::SocketAddr) -> TestInferenceSession {
+        let policy = host.policy(addr);
+        TestInferenceSession {
+            session: policy.session(Default::default(), InferenceModel::Gpt6Sol),
+            policy,
+        }
     }
 
     fn request() -> Request {
@@ -770,17 +838,137 @@ mod tests {
         )
     }
 
-    fn local_model() -> OpenAi {
-        OpenAi {
-            inference: Inference::from_host(
-                Host::new(),
-                InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
-            ),
+    fn local_model() -> Session {
+        let (_routes, routes) = watch::channel(crate::RouteSelection::default());
+        let (observations, _) = mpsc::unbounded_channel();
+        Session {
+            base_url: "http://127.0.0.1:1".into(),
             model: InferenceModel::Gpt6Sol,
-            effort: Effort::Low,
+            effort: ReasoningEffort::Low,
             fast: false,
-            idle: Default::default(),
+            routes,
+            observations,
         }
+    }
+
+    #[tokio::test]
+    async fn item_done_bytes_survive_persistence_and_actual_wire_replay() {
+        const ITEMS: [&str; 5] = [
+            r#"{ "type" : "reasoning", "id":"rs", "encrypted_content":"opaque\u002b", "summary":[], "future":1e+9999 }"#,
+            r#"{"type":"message", "id":"msg", "role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"hi\u0021","annotations":[{"type":"future","v":3.00}]},{"type":"refusal","refusal":"unchanged"}]}"#,
+            r#"{ "type":"function_call","id":"fc","call_id":"function-7","name":"exec","arguments":"print(7)","status":"completed","future":{"z":0,"a":-0.0} }"#,
+            r#"{"type":"future_item", "unrecognized":[1,  2],"text":"\u0061"}"#,
+            r#"{ "type":"custom_tool_call","id":"extra","call_id":"not-executed","name":"exec","input":"must_not_run()" }"#,
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            envelope(&mut socket).await;
+            for item in ITEMS {
+                socket
+                    .send(WsMessage::Text(
+                        format!(r#"{{"type":"response.output_item.done","item":{item}}}"#).into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            // Completed output is deliberately different. item.done owns item bytes.
+            socket.send(WsMessage::Text(r#"{"type":"response.completed","response":{"id":"raw-r1","usage":{},"output":[{"type":"message","content":[{"text":"wrong source","unknown":1e+9999}]}]}}"#.into())).await.unwrap();
+            let wire = loop {
+                match socket.next().await.unwrap().unwrap() {
+                    WsMessage::Text(text) => break text,
+                    WsMessage::Ping(bytes) => socket.send(WsMessage::Pong(bytes)).await.unwrap(),
+                    _ => {}
+                }
+            };
+            #[derive(serde::Deserialize)]
+            struct Input {
+                input: Vec<Box<RawValue>>,
+            }
+            let sent: Input = serde_json::from_str(&wire).unwrap();
+            assert_eq!(sent.input.len(), 7); // tools, instructions, four retained items, result
+            for (actual, expected) in sent.input[2..6].iter().zip(&ITEMS[..4]) {
+                assert_eq!(actual.get(), *expected, "replayed item bytes changed");
+            }
+            let result: Value = serde_json::from_str(sent.input[6].get()).unwrap();
+            assert_eq!(
+                result,
+                json!({"type":"function_call_output","call_id":"function-7","output":"seven"})
+            );
+            assert!(
+                !wire.contains("not-executed"),
+                "never replay an unanswered extra call"
+            );
+            complete(&mut socket, "raw-r2", false).await;
+        });
+        let host = Host::new();
+        host.stable
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let session = session(host, addr);
+        let answer = infer(&session, full(vec![user("first")])).await;
+        assert_eq!(answer.prose, "hi!");
+        assert_eq!(answer.call.as_ref().unwrap().code, "print(7)");
+        assert!(
+            answer.response_id.is_none(),
+            "filtered response cannot use server continuation"
+        );
+        let entry = rho_agent::entry::Entry::Step {
+            at: rho_agent_types::UnixMs(9),
+            exec: Some("print(7)".into()),
+            prose: answer.prose,
+            carry: answer.carry.0,
+            usage: None,
+        };
+        let bytes = senax_encoder::encode(&entry).unwrap();
+        let decoded: rho_agent::entry::Entry = senax_encoder::decode(&mut bytes.as_ref()).unwrap();
+        let rho_agent::entry::Entry::Step { carry, .. } = decoded else {
+            panic!()
+        };
+        let carry = Carry(carry);
+        let stored = carry.replay();
+        assert_eq!(
+            stored.items.len(),
+            ITEMS.len(),
+            "store every done item, even unexecuted calls"
+        );
+        for (actual, expected) in stored.items.iter().zip(ITEMS) {
+            assert_eq!(actual.get(), expected, "persisted item bytes changed");
+        }
+        let results = carry.reply("seven", &[]);
+        let mut replay = vec![Item::Step(carry)];
+        replay.extend(results.into_iter().map(Item::Result));
+        infer(&session, full(replay)).await;
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn compaction_selects_raw_items_without_rewriting_them() {
+        const OLD: &str = r#"{"type":"message","id":"old"}"#;
+        const SUMMARY: &str =
+            r#"{ "type":"compaction", "encrypted_content":"a\u002bb", "future":2e3 }"#;
+        const TAIL: &str = r#"{ "type":"future", "payload": [1,  4] }"#;
+        let carry = Carry::from_raw_items(
+            [OLD, SUMMARY, TAIL]
+                .into_iter()
+                .map(|s| RawValue::from_string(s.into()).unwrap())
+                .collect(),
+            true,
+        );
+        let request = full(vec![user("evicted"), Item::Step(carry)]);
+        let model = local_model();
+        let wire = serde_json::to_string(&model.body_from(&request, false)).unwrap();
+        #[derive(serde::Deserialize)]
+        struct Input {
+            input: Vec<Box<RawValue>>,
+        }
+        let sent: Input = serde_json::from_str(&wire).unwrap();
+        assert_eq!(sent.input.len(), 4);
+        assert_eq!(sent.input[2].get(), SUMMARY);
+        assert_eq!(sent.input[3].get(), TAIL);
+        assert!(!wire.contains("evicted"));
+        assert!(!wire.contains("\"old\""));
     }
 
     #[test]
@@ -788,11 +976,12 @@ mod tests {
         let body = local_model().body(&Request::new(
             "instructions".into(),
             vec![
-                Item::Result {
-                    call_id: CallId::new("call-1"),
+                Item::Result(CallResult {
+                    id: CallId::new("call-1"),
+                    function: false,
                     text: "result".into(),
                     images: vec![],
-                },
+                }),
                 Item::User {
                     text: "next".into(),
                     images: vec![],
@@ -861,17 +1050,22 @@ mod tests {
                 json!({"type":"message","id":"msg","content":[{"text":"prose"}]}),
                 json!({"type":"custom_tool_call","id":"one","call_id":"first","input":"print(1)"}),
                 json!({"type":"custom_tool_call","id":"two","call_id":"second","input":"print(2)"}),
-            ],
+            ]
+            .iter()
+            .map(|item| serde_json::value::to_raw_value(item).unwrap())
+            .collect(),
             &json!({"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}),
         );
         assert_eq!(answer.call.unwrap().id.as_str(), "first");
         assert_eq!(answer.prose, "prose");
         assert_eq!(answer.usage.cached_tokens, 4);
         assert_eq!(answer.carry.call_ids(), [CallId::new("first")]);
-        let Inner::OpenAi { items, .. } = &*answer.carry.0 else {
-            panic!()
-        };
+        let items = answer.carry.prepared().unwrap().items;
         assert_eq!(items.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<Value>(items[2].get()).unwrap()["call_id"],
+            "first"
+        );
     }
 
     #[tokio::test]
@@ -919,13 +1113,17 @@ mod tests {
             }
         });
         let host = Host::new();
-        let model = model(host.clone(), addr);
+        let session = session(host.clone(), addr);
         for _ in 0..2 {
             let mut stream = Vec::new();
-            let result = model
+            let result = session
                 .step(&request(), &mut |event| match event {
-                    Stream::Call { id } => stream.push(format!("id:{id}")),
-                    Stream::Code(code) => stream.push(code.into()),
+                    Event::Call { carry } => stream.push(format!(
+                        "id:{}",
+                        carry.with_code(String::new()).display_id()
+                    )),
+                    Event::Code(code) => stream.push(code),
+                    _ => unreachable!(),
                 })
                 .await
                 .unwrap();
@@ -941,10 +1139,7 @@ mod tests {
             );
         }
         server.await.unwrap();
-        assert_eq!(
-            *host.calls.lock().unwrap(),
-            ["select-resolved", "quota", "select-resolved", "quota"]
-        );
+        assert_eq!(*host.calls.lock().unwrap(), ["quota", "quota"]);
     }
 
     #[tokio::test]
@@ -958,14 +1153,14 @@ mod tests {
             socket.send(WsMessage::Text(json!({"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"weekly quota"}}}).to_string().into())).await.unwrap();
         });
         let host = Host::new();
-        let error = model(host.clone(), addr)
+        let error = session(host.clone(), addr)
             .step(&request(), &mut |_| {})
             .await
             .unwrap_err();
         assert!(error.to_string().contains("weekly quota"));
         assert!(super::super::is_retryable(&error));
         server.await.unwrap();
-        assert_eq!(*host.calls.lock().unwrap(), ["select-resolved", "limited"]);
+        assert_eq!(*host.calls.lock().unwrap(), ["limited"]);
     }
 
     #[tokio::test]
@@ -983,9 +1178,9 @@ mod tests {
                 }).to_string().into())).await.unwrap();
             }
         });
-        let model = model(Host::new(), addr);
+        let session = session(Host::new(), addr);
         for (code, retryable) in cases {
-            let error = model.step(&request(), &mut |_| {}).await.unwrap_err();
+            let error = session.step(&request(), &mut |_| {}).await.unwrap_err();
             assert_eq!(super::super::is_retryable(&error), retryable, "{code}");
         }
         server.await.unwrap();
@@ -1016,7 +1211,7 @@ mod tests {
         });
         let host = Host::new();
         assert_eq!(
-            model(host, addr)
+            session(host, addr)
                 .text("instructions".into(), "name this".into())
                 .await
                 .unwrap(),
@@ -1053,17 +1248,35 @@ mod tests {
         }
     }
 
-    async fn infer(model: &crate::step::Model, context: &super::super::Context) -> Step {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            model.step(
-                &context.request("instructions".into(), super::super::CacheKey::from_u128(19)),
-                &mut |_| {},
-            ),
+    async fn infer(session: &TestInferenceSession, request: Request) -> Step {
+        tokio::time::timeout(Duration::from_secs(5), session.step(&request, &mut |_| {}))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn full(items: Vec<Item>) -> Request {
+        Request::new(
+            "instructions".into(),
+            items,
+            super::super::CacheKey::from_u128(19),
         )
-        .await
-        .unwrap()
-        .unwrap()
+    }
+
+    fn delta(previous: &str, items: Vec<Item>) -> Request {
+        Request::continuation(
+            "instructions".into(),
+            items,
+            super::super::CacheKey::from_u128(19),
+            previous.into(),
+        )
+    }
+
+    fn user(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            images: vec![],
+        }
     }
 
     #[tokio::test]
@@ -1119,34 +1332,40 @@ mod tests {
         let host = Host::new();
         host.stable
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let model = model(host, addr);
-        let mut context = super::super::Context::default();
-        context.push(Item::User {
-            text: "first".into(),
-            images: vec![],
-        });
-        let answer = infer(&model, &context).await;
-        context.push(Item::Step(answer.carry));
+        let session = session(host, addr);
+        let answer = infer(&session, full(vec![user("first")])).await;
+        assert_eq!(answer.response_id.as_deref(), Some("r1"));
+        // Caller discards the old response; continuation needs only its ID.
+        drop(answer);
         tokio::time::timeout(Duration::from_secs(5), pong_rx)
             .await
             .unwrap()
             .unwrap();
-        context.push(Item::Result {
-            call_id: CallId::new("call-r1"),
-            text: "output".into(),
-            images: vec![],
-        });
-        context.push(Item::User {
-            text: "second".into(),
-            images: vec![],
-        });
-        let answer = infer(&model, &context).await;
-        context.push(Item::Step(answer.carry));
-        context.push(Item::User {
-            text: "third".into(),
-            images: vec![],
-        });
-        infer(&model, &context).await;
+        let answer = infer(
+            &session,
+            delta(
+                "r1",
+                vec![
+                    Item::Result(CallResult {
+                        id: CallId::new("call-r1"),
+                        function: false,
+                        text: "output".into(),
+                        images: vec![],
+                    }),
+                    user("second"),
+                ],
+            ),
+        )
+        .await;
+        assert!(
+            answer.response_id.is_none(),
+            "compaction requires full replay"
+        );
+        infer(
+            &session,
+            full(vec![Item::Step(answer.carry), user("third")]),
+        )
+        .await;
         server.await.unwrap();
     }
 
@@ -1180,26 +1399,26 @@ mod tests {
         let host = Host::new();
         host.stable
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let model = model(host, addr);
-        let mut context = super::super::Context::default();
-        context.push(Item::User {
-            text: "first".into(),
-            images: vec![],
-        });
-        let answer = infer(&model, &context).await;
-        context.push(Item::Step(answer.carry));
-        context.push(Item::Result {
-            call_id: CallId::new("call-r1"),
+        let session = session(host, addr);
+        let answer = infer(&session, full(vec![user("first")])).await;
+        let suffix = vec![Item::Result(CallResult {
+            id: CallId::new("call-r1"),
+            function: false,
             text: "result".into(),
             images: vec![],
-        });
-        let request = context.request("instructions".into(), super::super::CacheKey::from_u128(19));
-        let error = tokio::time::timeout(Duration::from_secs(5), model.step(&request, &mut |_| {}))
-            .await
-            .unwrap()
-            .unwrap_err();
+        })];
+        let request = delta("r1", suffix.clone());
+        let error = session.step(&request, &mut |_| {}).await.unwrap_err();
         assert!(super::super::is_retryable(&error));
-        infer(&model, &context).await;
+        // A retry cannot send just the suffix on the replacement connection.
+        let error = session
+            .step(&request, &mut |_| panic!("no code before replay"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "needs context");
+        let mut replay = vec![user("first"), Item::Step(answer.carry)];
+        replay.extend(suffix);
+        infer(&session, full(replay)).await;
         server.await.unwrap();
     }
 
@@ -1220,31 +1439,23 @@ mod tests {
         let host = Host::new();
         host.stable
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let model = model(host, addr);
-        let mut original = super::super::Context::default();
-        original.push(Item::User {
-            text: "original".into(),
-            images: vec![],
-        });
-        let first = infer(&model, &original).await;
-        let mut rebuilt = super::super::Context::default();
-        rebuilt.push(Item::User {
-            text: "different prefix".into(),
-            images: vec![],
-        });
-        rebuilt.push(Item::Step(first.carry));
-        let second = infer(&model, &rebuilt).await;
-        rebuilt.push(Item::Step(second.carry));
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            model.step(
-                &rebuilt.request("changed".into(), super::super::CacheKey::from_u128(19)),
-                &mut |_| {},
-            ),
+        let session = session(host, addr);
+        let first = infer(&session, full(vec![user("original")])).await;
+        // Rewind/rebuild explicitly sends full context, even on a warm socket.
+        let second = infer(
+            &session,
+            full(vec![user("different prefix"), Item::Step(first.carry)]),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        let mut changed = delta(second.response_id.as_deref().unwrap(), vec![user("next")]);
+        changed.instructions = "changed".into();
+        let error = session
+            .step(&changed, &mut |_| panic!("must load full context"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "needs context");
+        changed.previous_response_id = None;
+        infer(&session, changed).await;
         server.await.unwrap();
     }
 
@@ -1268,13 +1479,13 @@ mod tests {
         let host = Host::new();
         host.stable
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let model = Arc::new(model(host, addr));
-        let running = model.clone();
+        let session = Arc::new(session(host, addr));
+        let running = session.clone();
         let task = tokio::spawn(async move {
             let mut admitted = Some(admitted);
             running
                 .step(&request(), &mut |event| {
-                    if matches!(event, Stream::Code(_)) {
+                    if matches!(event, Event::Code(_)) {
                         if let Some(tx) = admitted.take() {
                             let _ = tx.send(());
                         }
@@ -1288,10 +1499,13 @@ mod tests {
             .unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(Duration::from_secs(5), model.step(&request(), &mut |_| {}))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.step(&request(), &mut |_| {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
     }
     #[tokio::test]
@@ -1299,11 +1513,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let host = Host::new();
-        let crate::step::Model::OpenAi(openai) = model(host.clone(), addr) else {
-            unreachable!()
-        };
+        let mut openai = local_model();
+        openai.base_url = format!("http://{addr}").into();
         let connecting = tokio::spawn(async move {
-            let (mut selected, resolved) = openai.inference.select_resolved().await.unwrap();
+            let mut selected = host.selected.clone();
+            let crate::CredentialState::Ready { auth: resolved, .. } = host.snapshot(1).state
+            else {
+                unreachable!()
+            };
             selected.account_id = resolved.account_id.clone();
             let connection = openai
                 .connect(
@@ -1321,8 +1538,10 @@ mod tests {
         let (openai, mut connection) = connecting.await.unwrap();
         tokio::time::pause();
         let start = tokio::time::Instant::now();
-        let reading =
-            tokio::spawn(async move { openai.read_response(&mut connection, &mut |_| {}).await });
+        let reading = tokio::spawn(async move {
+            let (events, _response) = mpsc::unbounded_channel();
+            openai.read_response(&mut connection, &events).await
+        });
         tokio::task::yield_now().await;
         tokio::time::advance(EVENT_TIMEOUT / 2).await;
         socket.send(WsMessage::Pong(vec![1].into())).await.unwrap();
@@ -1358,25 +1577,90 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         host.replacement
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        let model = model(host, addr);
-        let mut context = super::super::Context::default();
-        context.push(Item::User {
-            text: "first".into(),
-            images: vec![],
-        });
-        let answer = infer(&model, &context).await;
-        context.push(Item::Step(answer.carry));
-        let error = tokio::time::timeout(
-            Duration::from_secs(5),
-            model.step(
-                &context.request("instructions".into(), super::super::CacheKey::from_u128(99)),
-                &mut |_| {},
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        let session = session(host, addr);
+        let answer = infer(&session, full(vec![user("first")])).await;
+        let mut request = delta(answer.response_id.as_deref().unwrap(), vec![user("next")]);
+        request.cache_key = super::super::CacheKey::from_u128(99);
+        let error = session.step(&request, &mut |_| {}).await.unwrap_err();
+        assert_eq!(error.to_string(), "needs context");
+        request.previous_response_id = None;
+        let error = session.step(&request, &mut |_| {}).await.unwrap_err();
         assert!(!super::super::is_retryable(&error));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_runs_without_polling_and_skips_cancelled_queued_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (started, start_seen) = oneshot::channel();
+        let (finished, finish_seen) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            assert!(envelope(&mut socket).await.to_string().contains("first"));
+            started.send(()).unwrap();
+            // No completion: dropping the response receiver must close this
+            // active socket before another request can run.
+            loop {
+                match socket.next().await {
+                    Some(Ok(WsMessage::Ping(bytes))) => {
+                        socket.send(WsMessage::Pong(bytes)).await.unwrap()
+                    }
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    other => panic!("unexpected active message: {other:?}"),
+                }
+            }
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let body = envelope(&mut socket).await;
+            assert!(body.to_string().contains("third"));
+            assert!(!body.to_string().contains("abandoned"));
+            assert!(body.get("previous_response_id").is_none());
+            complete(&mut socket, "r3", false).await;
+            finished.send(()).unwrap();
+            // Dropping the last session handle also terminates the idle owner.
+            loop {
+                match socket.next().await {
+                    Some(Ok(WsMessage::Ping(bytes))) => {
+                        socket.send(WsMessage::Pong(bytes)).await.unwrap()
+                    }
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    other => panic!("unexpected idle message: {other:?}"),
+                }
+            }
+        });
+        let host = Host::new();
+        let test = session(host, addr);
+        let (selected, auth) = test.policy.select_resolved().await.unwrap();
+        let first = test
+            .session
+            .start(full(vec![user("first")]), selected.clone(), auth.clone());
+        // No step future or receiver poll is required to drive the socket.
+        tokio::time::timeout(Duration::from_secs(5), start_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        let abandoned = test.session.start(
+            full(vec![user("abandoned")]),
+            selected.clone(),
+            auth.clone(),
+        );
+        drop(abandoned);
+        drop(first);
+        let mut third = test
+            .session
+            .start(full(vec![user("third")]), selected, auth);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), third.recv()).await.unwrap(),
+            Some(Event::Completed(Step {response_id: Some(id), ..})) if id == "r3"
+        ));
+        finish_seen.await.unwrap();
+        drop(third);
+        drop(test);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

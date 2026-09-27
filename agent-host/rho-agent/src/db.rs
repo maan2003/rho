@@ -13,17 +13,20 @@ use rho_agent_types::{
     Seq, TurnEdge, UnixMs, WorksetMode,
 };
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
-use rho_inference::PromptCacheKey;
-pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
 use crate::AgentEvent;
+use crate::inference::PromptCacheKey;
+pub(crate) use crate::inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::journal::{Feed, Journal, LogAppended};
 
 mod code_first_migration;
 mod entries_migration;
+mod native;
+pub use native::{ContextBoundary, NativeRecovery};
 pub(crate) mod legacy;
+mod reports_migration;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -68,7 +71,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "7f24a9d3";
+const CURRENT_AGENT_DB_FORMAT: &str = "dc371fa2";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -87,6 +90,11 @@ const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
         from: "e31bcf82",
         to: "7f24a9d3",
         migrate: migrate_workset_modes,
+    },
+    AgentDbMigration {
+        from: "7f24a9d3",
+        to: "dc371fa2",
+        migrate: reports_migration::migrate,
     },
 ];
 
@@ -684,6 +692,16 @@ pub trait AgentReadTxnExt {
     /// The agent's history as it stands: every row a later `Rewound` did
     /// not take back, oldest first, and where the next row goes.
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
+    /// Frozen native replay range for the log's current visible branch.
+    fn agent_context_boundary(&self, agent_id: AgentId) -> ContextBoundary;
+    fn agent_native_recovery(&self, agent_id: AgentId) -> NativeRecovery;
+    /// Visible native entries in this fixed half-open range, independent of
+    /// later appends.
+    fn agent_context_records(
+        &self,
+        agent_id: AgentId,
+        boundary: ContextBoundary,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
     fn agent_event_records(
         &self,
         agent_id: AgentId,
@@ -691,6 +709,13 @@ pub trait AgentReadTxnExt {
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch>;
     /// One row, hidden or not.
     fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
+    /// Last response on the visible branch before this input's position.
+    fn agent_input_carry(
+        &self,
+        agent_id: AgentId,
+        before: AgentEventPos,
+    ) -> Option<crate::inference::Carry>;
+
     /// Newest text-bearing visible rows, read backward and bounded before
     /// decoding/building a Luna request.
 
@@ -721,6 +746,8 @@ pub trait AgentReadTxnExt {
 #[allow(clippy::too_many_arguments)]
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
+    /// Capture the exact native replay boundary within the append transaction.
+    fn agent_context_boundary(&mut self, agent_id: AgentId) -> ContextBoundary;
 
     /// Appends one event at the agent's tail and names it in the journal.
     /// The tail is read from the table, not from a runtime's cursor, so
@@ -963,6 +990,53 @@ impl AgentReadTxnExt for ReadTxn {
         visible_rows(rows(log.range(agent_range(agent_id))))
     }
 
+    fn agent_context_boundary(&self, agent_id: AgentId) -> ContextBoundary {
+        let cursor = self
+            .open_table(native::NATIVE_CURSORS)
+            .get(&agent_id)
+            .map(|value| value.value().into_owned())
+            .unwrap_or_default();
+        ContextBoundary {
+            from: cursor.from,
+            through: self.get_agent(agent_id).next,
+        }
+    }
+
+    fn agent_native_recovery(&self, agent_id: AgentId) -> NativeRecovery {
+        self.open_table(native::NATIVE_CURSORS)
+            .get(&agent_id)
+            .map(|value| value.value().into_owned().recovery)
+            .unwrap_or_default()
+    }
+
+    fn agent_context_records(
+        &self,
+        agent_id: AgentId,
+        boundary: ContextBoundary,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)> {
+        if boundary.from >= boundary.through {
+            return Vec::new();
+        }
+        let log = self.open_table(AGENT_LOG);
+        let mut hidden = Hidden::default();
+        let mut visible = Vec::new();
+        for (key, value) in log
+            .range((agent_id, boundary.from.pos)..(agent_id, boundary.through.pos))
+            .rev()
+        {
+            let pos = AgentEventPos::new(key.value().1);
+            if hidden.from.is_some_and(|from| pos.pos >= from) {
+                continue;
+            }
+            let event = value.value().into_owned();
+            if hidden.visible(pos, &event) && matches!(event, AgentEvent::Entry(_)) {
+                visible.push((pos, event));
+            }
+        }
+        visible.reverse();
+        visible
+    }
+
     fn agent_pending_claude_output(&self, agent_id: AgentId) -> Option<crate::ClaudeOutputBatch> {
         let log = self.open_table(AGENT_LOG);
         let mut handed_off = BTreeSet::new();
@@ -977,6 +1051,24 @@ impl AgentReadTxnExt for ReadTxn {
                     return (!handed_off.contains(&batch.id)).then_some(batch);
                 }
                 _ => {}
+            }
+        }
+        None
+    }
+
+    fn agent_input_carry(
+        &self,
+        agent_id: AgentId,
+        before: AgentEventPos,
+    ) -> Option<crate::inference::Carry> {
+        let log = self.open_table(AGENT_LOG);
+        let mut hidden = Hidden::default();
+        for (pos, event) in rows(log.range((agent_id, 0)..(agent_id, before.pos)).rev()) {
+            if !hidden.visible(pos, &event) {
+                continue;
+            }
+            if let AgentEvent::Entry(crate::entry::Entry::Step { carry, .. }) = event {
+                return Some(carry);
             }
         }
         None
@@ -1103,6 +1195,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(FORMAT);
         self.open_table(AGENT_LOG);
         self.open_table(AGENT_HEADS);
+        self.open_table(native::NATIVE_CURSORS);
         self.open_table(WORKSET_MODES);
         self.open_table(WORKSET_AGENTS);
         self.open_table(JOURNAL);
@@ -1117,6 +1210,21 @@ impl AgentWriteTxnExt for WriteTxn {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
     }
+    fn agent_context_boundary(&mut self, agent_id: AgentId) -> ContextBoundary {
+        let from = self
+            .open_table(native::NATIVE_CURSORS)
+            .get(&agent_id)
+            .map(|row| row.value().into_owned().from)
+            .unwrap_or_default();
+        let through = self
+            .open_table(AGENT_LOG)
+            .range(agent_range(agent_id))
+            .next_back()
+            .map(|(key, _)| AgentEventPos::new(key.value().1).next())
+            .unwrap_or_default();
+        ContextBoundary { from, through }
+    }
+
     fn append_agent_event(&mut self, agent_id: AgentId, event: &AgentEvent<'_>) -> AgentEventPos {
         let pos = {
             let log = self.open_table(AGENT_LOG);
@@ -1131,6 +1239,7 @@ impl AgentWriteTxnExt for WriteTxn {
         );
         self.open_table(AGENT_LOG)
             .insert(&(agent_id, pos.pos), SenValue::borrowed(event));
+        native::append(self, agent_id, pos, event);
         let head = if pos == AgentEventPos::ZERO {
             created_head(event, pos)
         } else {
@@ -1494,7 +1603,7 @@ fn carries_notice(event: &AgentEvent<'_>) -> bool {
     matches!(
         event,
         AgentEvent::Accepted(crate::QueuedInput {
-            source: rho_inference::types::MessageSender::User,
+            source: rho_agent_types::transcript::MessageSender::User,
             kind: crate::InputKind::Message { .. },
             ..
         }) | AgentEvent::Transcript {
@@ -1659,6 +1768,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::ExecObserved { .. }
         | AgentEvent::Native(_)
         | AgentEvent::Failed { .. }
+        | AgentEvent::LegacyEntry(_)
         | AgentEvent::Entry(_)
         | AgentEvent::Transcript { .. } => {}
     }
@@ -1765,6 +1875,7 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
         }
         drop(log);
         write.open_table(AGENT_HEADS).remove(&agent_id);
+        write.open_table(native::NATIVE_CURSORS).remove(&agent_id);
         deleted.push((agent_id, keys.len()));
 
         let mut usage = write.open_table(AGENT_USAGE_BUCKETS);

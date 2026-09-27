@@ -9,16 +9,19 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use rho_agent_types::transcript::{
+    ContextBlock, MessageSender, PendingInferenceResponse, ToolSpec,
+};
 use rho_agent_types::{
     AgentId, AgentRole, AgentWant, ContentPart, MessageDelivery, Place, TurnEdge, UnixMs,
     WorksetMode,
 };
-use rho_inference::types::{ContextBlock, MessageSender, PendingInferenceResponse, ToolSpec};
 use senax_encoder::{Decode, Encode};
 
 use crate::db::{AgentEventPos, AgentRuntime, AgentSpawnedBy, ClaudeRewind, SessionBinding};
 
 pub mod agent;
+pub mod inference;
 mod claude;
 mod runtime;
 pub use agent::{AgentHandle, render_agent_surface};
@@ -166,14 +169,14 @@ pub enum AgentEvent<'a> {
     /// It neither changes native context nor claims ownership of Claude
     /// history.
     ExecObserved {
-        id: rho_inference::types::ExecId,
+        id: rho_agent_types::transcript::ExecId,
         milestone: rho_agent_types::ExecMilestone,
         at: UnixMs,
     },
     /// Claude owns its conversation; this records only Rho's permission to
     /// execute a cell, committed before the notebook can perform side effects.
     ClaudeExecAdmitted {
-        call: rho_inference::types::ExecCall,
+        call: rho_agent_types::transcript::ExecCall,
         at: UnixMs,
     },
     /// Canonical native conversation records; legacy block rows are read-only.
@@ -185,7 +188,11 @@ pub enum AgentEvent<'a> {
         id: uuid::Uuid,
         at: UnixMs,
     },
+    /// Temporary decoder for pre-typed-report rows; migrated before use.
+    #[senax(rename = "Entry")]
+    LegacyEntry(db::legacy::Entry),
     /// One of the Rho runtime's own rows.
+    #[senax(rename = "TypedEntry")]
     Entry(entry::Entry),
 }
 
@@ -195,8 +202,8 @@ pub enum AgentEvent<'a> {
 pub struct ClaudeOutputBatch {
     pub id: uuid::Uuid,
     pub outputs: Vec<(
-        rho_inference::types::ExecId,
-        rho_inference::types::ToolOutput,
+        rho_agent_types::transcript::ExecId,
+        rho_agent_types::transcript::ToolOutput,
     )>,
     pub wake: WakeFacts,
     pub at: UnixMs,
@@ -315,7 +322,7 @@ pub enum RuntimeChange {
     ClaudeRewound {
         session_id: uuid::Uuid,
     },
-    PromptCacheKey(rho_inference::PromptCacheKey),
+    PromptCacheKey(crate::inference::PromptCacheKey),
 }
 
 /// One input waiting to reach the model. Persisted verbatim inside
@@ -356,7 +363,7 @@ pub enum TranscriptLine {
     },
     /// What the calls came back with.
     ToolResults {
-        results: Vec<rho_inference::types::ToolResult>,
+        results: Vec<rho_agent_types::transcript::ToolResult>,
     },
     /// Claude compacted the context here.
     Compacted { context_used: Option<u64> },

@@ -12,7 +12,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rho_agent_types::UnixMs;
 use rho_tool_shell::{BoundedOutput, decode_output_lossy};
+use senax_encoder::{Decode, Encode};
 use tokio::sync::{Notify, mpsc, watch};
+use uuid::Uuid;
 
 use crate::Image;
 use crate::commands::StdinWrite;
@@ -84,6 +86,7 @@ impl<'py> IntoPyObject<'py> for CommandExit {
 
 pub(crate) struct Source {
     pub(crate) id: SourceId,
+    pub(crate) identity: Uuid,
     pub(crate) kind: Kind,
     /// A command's line, a call's name; a cell's is "Cell".
     pub(crate) name: String,
@@ -187,6 +190,7 @@ impl Source {
     ) -> Self {
         Self {
             id,
+            identity: Uuid::new_v4(),
             kind,
             name,
             cell,
@@ -224,10 +228,6 @@ impl Source {
         !state.delivered || !state.pages.is_empty() || !state.unsent.is_empty()
     }
 
-    pub(crate) fn take_images(&self) -> Vec<Image> {
-        std::mem::take(&mut self.state.lock().unwrap().images)
-    }
-
     fn label(&self) -> &str {
         match self.kind {
             Kind::Cell | Kind::Task => "Task",
@@ -236,147 +236,144 @@ impl Source {
         }
     }
 
-    /// Everything unsent, if anything. `old` names a command started two or
-    /// more cells back, so the model can place it.
-    pub(crate) fn report(&self, old: bool) -> Option<String> {
+    /// Drain one structured update, including image-only updates.
+    pub(crate) fn report(&self, old: bool) -> Option<SourceUpdate> {
         let mut state = self.state.lock().unwrap();
         let state = &mut *state;
-        if state.pending_failure {
-            return None;
-        }
-        if !state.pages.is_empty() {
-            return Some(self.answer_pages(state, old));
-        }
-        if state.delivered {
-            if state.unsent.is_empty() {
-                return None;
-            }
-            state.notified = None;
-            state.since = None;
-            return Some(format!(
-                "Session ID: {}\nOutput:\n{}",
-                self.id.session(),
-                take(state)
-            ));
-        }
-        state.notified = None;
-        // A call's text is its result, so it arrives with its end.
-        let output =
-            !state.unsent.is_empty() && (self.kind != Kind::Call || state.finished.is_some());
-        if state.finished.is_some() && !state.announced && !state.failed {
-            // Ended before anyone heard of it: its words are plain.
-            state.delivered = true;
-            let mut parts = Vec::new();
-            if output {
-                parts.push(take(state));
-            }
-            if let (Kind::Call, Some(error)) = (self.kind, &state.error) {
-                parts.push(format!("{} failed: {error}", self.name));
-            }
-            // A silent cell still ended, and the model is owed that much.
-            if matches!(self.kind, Kind::Cell | Kind::Task) && parts.is_empty() {
-                parts.push(self.end(state));
-            }
-            return (!parts.is_empty()).then(|| parts.join("\n"));
-        }
-        if !output && state.finished.is_none() && state.announced {
-            return None;
-        }
+        let mut header = None;
         let mut parts = Vec::new();
-        if state.finished.is_some() {
-            if state.announced || self.kind != Kind::Cell {
-                parts.push(format!("Session ID: {}", self.id.session()));
-            }
-            if old {
-                match self.kind {
-                    Kind::Command => parts.push(format!("Command: {}", self.name)),
-                    Kind::Task => parts.push(format!("Task: {}()", self.name)),
-                    _ => {}
+        if !state.pending_failure {
+            if !state.pages.is_empty() {
+                header = Some(self.answer_pages(state, old, &mut parts));
+            } else if state.delivered {
+                if !state.unsent.is_empty() {
+                    state.notified = None;
+                    state.since = None;
+                    header = Some(Header::Session);
+                    parts.push(Part::Output(take(state)));
+                }
+            } else {
+                state.notified = None;
+                let output = !state.unsent.is_empty()
+                    && (self.kind != Kind::Call || state.finished.is_some());
+                if state.finished.is_some() && !state.announced && !state.failed {
+                    state.delivered = true;
+                    header = Some(Header::Plain);
+                    if output {
+                        parts.push(Part::Text(take(state)));
+                    }
+                    if let (Kind::Call, Some(error)) = (self.kind, &state.error) {
+                        parts.push(Part::Outcome(Outcome::CallFailed {
+                            name: self.name.clone(),
+                            error: error.clone(),
+                        }));
+                    }
+                    if matches!(self.kind, Kind::Cell | Kind::Task) && parts.is_empty() {
+                        parts.push(Part::Outcome(self.end(state)));
+                    }
+                    if parts.is_empty() {
+                        header = None;
+                    }
+                } else if output || state.finished.is_some() || !state.announced {
+                    if state.finished.is_some() {
+                        header = Some(Header::Finished {
+                            session: state.announced || self.kind != Kind::Cell,
+                            old_name: old.then(|| self.old_name()).flatten(),
+                            end: self.end(state),
+                        });
+                        if matches!(self.kind, Kind::Cell | Kind::Task)
+                            && let Some(error) = &state.error
+                        {
+                            parts.push(Part::Text(error.clone()));
+                        }
+                    } else {
+                        state.announced = true;
+                        header = Some(Header::Running {
+                            label: self.label().to_owned(),
+                            old_name: old.then(|| self.old_name()).flatten(),
+                        });
+                    }
+                    if output {
+                        let complete = !state.unsent.is_truncated();
+                        if complete && let Some(log) = &mut state.log {
+                            log.cursor = log.len;
+                        }
+                        parts.push(Part::Output(take(state)));
+                    }
+                    state.since = None;
+                    if state.finished.is_some() {
+                        state.delivered = true;
+                    }
                 }
             }
-            parts.push(self.end(state));
-            if matches!(self.kind, Kind::Cell | Kind::Task)
-                && let Some(error) = &state.error
-            {
-                parts.push(error.clone());
-            }
-        } else {
-            state.announced = true;
-            parts.push(format!(
-                "{} running in background with session ID {}",
-                self.label(),
-                self.id.session()
-            ));
-            if old {
-                match self.kind {
-                    Kind::Command => parts.push(format!("Command: {}", self.name)),
-                    Kind::Task => parts.push(format!("Task: {}()", self.name)),
-                    _ => {}
-                }
-            }
         }
-        if output {
-            // A report and `more_output` share one cursor, so a page after a
-            // report carries on where the report stopped. A report that
-            // dropped its middle leaves the cursor, so the span can be paged.
-            let complete = !state.unsent.is_truncated();
-            if complete && let Some(log) = &mut state.log {
-                log.cursor = log.len;
-            }
-            parts.push(format!("Output:\n{}", take(state)));
+        let images = std::mem::take(&mut state.images);
+        if header.is_none() && images.is_empty() {
+            return None;
         }
-        state.since = None;
-        if state.finished.is_some() {
-            state.delivered = true;
-        }
-        Some(parts.join("\n"))
+        Some(SourceUpdate {
+            identity: self.identity,
+            session: self.id.session().get(),
+            header,
+            parts,
+            images,
+        })
     }
 
-    /// How it ended, in one line.
-    fn end(&self, state: &State) -> String {
+    fn old_name(&self) -> Option<String> {
         match self.kind {
-            Kind::Cell | Kind::Task if state.cell.cancelled => "Task cancelled".to_owned(),
-            Kind::Cell | Kind::Task if state.failed => "Task failed".to_owned(),
-            Kind::Cell | Kind::Task => "Task finished".to_owned(),
+            Kind::Command => Some(format!("Command: {}", self.name)),
+            Kind::Task => Some(format!("Task: {}()", self.name)),
+            _ => None,
+        }
+    }
+
+    /// Snapshot how it ended; its wording belongs to report rendering.
+    fn end(&self, state: &State) -> Outcome {
+        match self.kind {
+            Kind::Cell | Kind::Task if state.cell.cancelled => Outcome::TaskCancelled,
+            Kind::Cell | Kind::Task if state.failed => Outcome::TaskFailed,
+            Kind::Cell | Kind::Task => Outcome::TaskFinished,
             Kind::Call => match &state.error {
-                Some(error) => format!("{} failed: {error}", self.name),
-                None => format!("{} finished", self.name),
+                Some(error) => Outcome::CallFailed {
+                    name: self.name.clone(),
+                    error: error.clone(),
+                },
+                None => Outcome::CallFinished(self.name.clone()),
             },
             Kind::Command => match state.log.as_ref().and_then(|log| log.exit.as_ref()) {
                 Some(Ok(CommandExit {
                     exit_code: Some(code),
                     ..
-                })) => format!("Process exited with code {code}"),
+                })) => Outcome::ProcessExited(*code),
                 Some(Ok(CommandExit {
                     exit_code: None, ..
-                })) => "Process ended without an exit code".to_owned(),
-                Some(Err(error)) if error == "Command cancelled" => {
-                    "Process ended without an exit code".to_owned()
-                }
-                Some(Err(error)) => format!("Command failed: {error}"),
-                None => "Command ended".to_owned(),
+                })) => Outcome::ProcessMissingExit,
+                Some(Err(error)) if error == "Command cancelled" => Outcome::ProcessMissingExit,
+                Some(Err(error)) => Outcome::CommandFailed(error.clone()),
+                None => Outcome::CommandEnded,
             },
         }
     }
 
     /// The pages `more_output` asked for, under the session ID the model
     /// asked by, with the end too if that has not been reported yet.
-    fn answer_pages(&self, state: &mut State, old: bool) -> String {
-        let mut parts = vec![format!("Session ID: {}", self.id.session())];
-        if old {
-            parts.push(format!("Command: {}", self.name));
-        }
+    fn answer_pages(&self, state: &mut State, old: bool, parts: &mut Vec<Part>) -> Header {
+        let old_name = old.then(|| format!("Command: {}", self.name));
         state.paged_at = None;
         if state.finished.is_none() {
             state.announced = true;
-        } else if !state.delivered {
-            parts.push(self.end(state));
-            state.delivered = true;
         }
+        let end = if state.finished.is_some() && !state.delivered {
+            state.delivered = true;
+            Some(self.end(state))
+        } else {
+            None
+        };
         for tokens in std::mem::take(&mut state.pages) {
             parts.push(page(state, tokens));
         }
-        parts.join("\n")
+        Header::Page { old_name, end }
     }
 
     pub(crate) fn facts(&self) -> SourceFacts {
@@ -409,13 +406,15 @@ fn take(state: &mut State) -> String {
 /// The next page of a command's log, from where the last report or page
 /// stopped. Paging takes over from the automatic report: what was waiting
 /// to be reported is dropped, so the reply does not say it twice.
-fn page(state: &mut State, max_tokens: usize) -> String {
+fn page(state: &mut State, max_tokens: usize) -> Part {
     let finished = state.finished.is_some();
     let Some(log) = state.log.as_mut() else {
-        return "[only a command can be paged]".to_owned();
+        return Part::Text("[only a command can be paged]".to_owned());
     };
     if log.gone {
-        return "[retained output is gone: notebook reached its 50 MB limit]".to_owned();
+        return Part::Text(
+            "[retained output is gone: notebook reached its 50 MB limit]".to_owned(),
+        );
     }
     let start = log.cursor;
     let size = (log.len - start).min(max_tokens * 4);
@@ -425,7 +424,7 @@ fn page(state: &mut State, max_tokens: usize) -> String {
         .seek(SeekFrom::Start(start as u64))
         .and_then(|_| log.file.read_exact(&mut bytes));
     if let Err(error) = read {
-        return format!("[the retained output could not be read: {error}]");
+        return Part::Text(format!("[the retained output could not be read: {error}]"));
     }
     // Do not split a UTF-8 character merely because a page hit its budget.
     if size < log.len - start
@@ -439,27 +438,155 @@ fn page(state: &mut State, max_tokens: usize) -> String {
     let dropped = log.dropped;
     state.unsent = BoundedOutput::for_tokens(Some(state.budget));
     state.since = None;
-    let page = String::from_utf8_lossy(&bytes).into_owned();
-    let mut parts = vec![if page.is_empty() {
-        if finished {
-            "No more output.".to_owned()
-        } else {
-            "No more output yet. Output and completion arrive automatically.".to_owned()
+    Part::Page {
+        output: String::from_utf8_lossy(&bytes).into_owned(),
+        finished,
+        remaining,
+        dropped,
+    }
+}
+
+/// One source's contribution to a notebook report. Its identity is independent
+/// of the session label, which repeats across notebook lifetimes.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) struct SourceUpdate {
+    pub(crate) identity: Uuid,
+    pub(crate) session: u32,
+    pub(crate) header: Option<Header>,
+    pub(crate) parts: Vec<Part>,
+    pub(crate) images: Vec<Image>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum Header {
+    Plain,
+    Running {
+        label: String,
+        old_name: Option<String>,
+    },
+    Finished {
+        session: bool,
+        old_name: Option<String>,
+        end: Outcome,
+    },
+    Session,
+    Page {
+        old_name: Option<String>,
+        end: Option<Outcome>,
+    },
+}
+
+impl Header {
+    pub(crate) fn render(&self, session_id: u32) -> String {
+        let mut lines = Vec::new();
+        match self {
+            Self::Plain => {}
+            Self::Running { label, old_name } => {
+                lines.push(format!(
+                    "{label} running in background with session ID {session_id}"
+                ));
+                lines.extend(old_name.iter().cloned());
+            }
+            Self::Finished {
+                session,
+                old_name,
+                end,
+            } => {
+                if *session {
+                    lines.push(format!("Session ID: {session_id}"));
+                }
+                lines.extend(old_name.iter().cloned());
+                lines.push(end.render());
+            }
+            Self::Session => lines.push(format!("Session ID: {session_id}")),
+            Self::Page { old_name, end } => {
+                lines.push(format!("Session ID: {session_id}"));
+                lines.extend(old_name.iter().cloned());
+                lines.extend(end.iter().map(Outcome::render));
+            }
         }
-    } else {
-        format!("Output:\n{page}")
-    }];
-    if remaining > 0 {
-        parts.push(format!(
-            "[{remaining} more bytes; call more_output() again for the next page]"
-        ));
+        lines.join("\n")
     }
-    if dropped > 0 {
-        parts.push(format!(
-            "[{dropped} bytes never reached the log: the command outran its limit]"
-        ));
+}
+
+/// One source's completion, retained as facts until presentation.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum Outcome {
+    TaskFinished,
+    TaskFailed,
+    TaskCancelled,
+    ProcessExited(i32),
+    ProcessMissingExit,
+    CallFinished(String),
+    CallFailed { name: String, error: String },
+    CommandFailed(String),
+    CommandEnded,
+}
+
+impl Outcome {
+    fn render(&self) -> String {
+        match self {
+            Self::TaskFinished => "Task finished".into(),
+            Self::TaskFailed => "Task failed".into(),
+            Self::TaskCancelled => "Task cancelled".into(),
+            Self::ProcessExited(code) => format!("Process exited with code {code}"),
+            Self::ProcessMissingExit => "Process ended without an exit code".into(),
+            Self::CallFinished(name) => format!("{name} finished"),
+            Self::CallFailed { name, error } => format!("{name} failed: {error}"),
+            Self::CommandFailed(error) => format!("Command failed: {error}"),
+            Self::CommandEnded => "Command ended".into(),
+        }
     }
-    parts.join("\n")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum Part {
+    Text(String),
+    Outcome(Outcome),
+    Output(String),
+    Page {
+        output: String,
+        finished: bool,
+        remaining: usize,
+        dropped: usize,
+    },
+}
+
+impl Part {
+    pub(crate) fn render(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Outcome(outcome) => outcome.render(),
+            Self::Output(text) => format!("Output:\n{text}"),
+            Self::Page {
+                output,
+                finished,
+                remaining,
+                dropped,
+            } => {
+                let mut parts = vec![if output.is_empty() {
+                    if *finished {
+                        "No more output.".to_owned()
+                    } else {
+                        "No more output yet. Output and completion arrive automatically.".to_owned()
+                    }
+                } else {
+                    format!("Output:\n{output}")
+                }];
+                if *remaining > 0 {
+                    parts.push(format!(
+                        "[{remaining} more bytes; call more_output() again for the next page]"
+                    ));
+                }
+                if *dropped > 0 {
+                    parts.push(format!(
+                        "[{dropped} bytes never reached the log: the command outran its limit]"
+                    ));
+                }
+                parts.join("\n")
+            }
+        }
+    }
 }
 
 /// One source, as its reader sees it. Observations, not verdicts.
@@ -491,7 +618,53 @@ pub struct End {
 
 #[cfg(test)]
 mod tests {
-    use super::SourceId;
+    use rho_agent_types::UnixMs;
+
+    use super::{Header, Kind, Outcome, Part, Source, SourceId};
+
+    #[test]
+    fn source_snapshots_completion_facts_instead_of_rendered_status() {
+        let cell = Source::new(
+            SourceId(1),
+            Kind::Cell,
+            "Cell".into(),
+            SourceId(1),
+            100,
+            None,
+            None,
+        );
+        cell.state.lock().unwrap().finished = Some(UnixMs(10));
+        let plain = cell.report(false).unwrap();
+        assert_eq!(plain.header, Some(Header::Plain));
+        assert_eq!(plain.parts, vec![Part::Outcome(Outcome::TaskFinished)]);
+
+        let call = Source::new(
+            SourceId(2),
+            Kind::Call,
+            "fetch".into(),
+            SourceId(1),
+            100,
+            None,
+            None,
+        );
+        {
+            let mut state = call.state.lock().unwrap();
+            state.finished = Some(UnixMs(20));
+            state.failed = true;
+            state.error = Some("refused".into());
+        }
+        assert_eq!(
+            call.report(false).unwrap().header,
+            Some(Header::Finished {
+                session: true,
+                old_name: None,
+                end: Outcome::CallFailed {
+                    name: "fetch".into(),
+                    error: "refused".into()
+                },
+            })
+        );
+    }
 
     #[test]
     fn labels_are_distinct_within_a_cycle_and_in_range() {

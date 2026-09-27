@@ -11,15 +11,15 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
+use rho_agent_types::transcript::{ContextItemEvent, PendingInferenceResponse};
 use rho_agent_types::{AgentId, AgentRole, ContentPart, EngineerIntelligence, MessageDelivery};
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
-use rho_inference::Inference;
-use rho_inference::types::{ContextItemEvent, PendingInferenceResponse};
+use crate::inference::Inference;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind, UnixMillis};
-use crate::entry::{Block, Entry, MessageId, Notice, Party};
+use crate::entry::{Block, Entry, MessageId, Notice, Party, Report};
 use crate::runtime::mailroom::{Mailroom, Outbound};
 use crate::{
     AgentEvent, AgentState, AgentStatus, InferenceState, InputKind, InputQueues, QueuedInput,
@@ -339,7 +339,7 @@ pub(crate) struct ClaudeLoop {
     pending_response: PendingInferenceResponse,
     response_id: Option<String>,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
-    response_execs: BTreeMap<usize, rho_inference::types::ExecId>,
+    response_execs: BTreeMap<usize, rho_agent_types::transcript::ExecId>,
     queued_turns: VecDeque<ClaudeTurn>,
     /// Usage of the in-flight message: `message_start` seeds it,
     /// `message_delta` overlays the final counts (`message_start`'s
@@ -414,7 +414,7 @@ fn refresh_pending_partial(
     for (slot, item) in items.values().enumerate() {
         if matches!(
             pending.items.get(slot),
-            Some(rho_inference::types::StreamingContextItemState::Pending(_))
+            Some(rho_agent_types::transcript::StreamingContextItemState::Pending(_))
         ) && let Ok(item) = item.to_streaming_context_item()
         {
             pending.apply(slot, ContextItemEvent::Update(item));
@@ -654,12 +654,19 @@ impl ClaudeLoop {
         if !self.uncertain_receipts.is_empty() {
             let at = rho_agent_types::UnixMs::now();
             let acknowledged = std::mem::take(&mut self.uncertain_receipts);
-            self.entry(Entry::Woken {
-                at, why: crate::entry::Wake::Restarted,
-                report: "Claude restarted before confirming whether queued messages entered its context; they were not resent to avoid duplicate work.".into(),
-                images: Vec::new(), messages: Vec::new(),
-                acknowledged,
-                results: Vec::new(),
+            self.entry(Entry::RequestSent {
+                at,
+                why: crate::entry::Wake::Restarted,
+                report: Report {
+                    notebook: rho_notebook::Report::from_text(
+                        "Claude restarted before confirming whether queued messages entered its context; they were not resent to avoid duplicate work.".into(),
+                        Vec::new(),
+                    ),
+                    acknowledged,
+                    ..Default::default()
+                },
+                compact: false,
+            imported: None,
             }).await?;
             self.entry(Entry::Notice {
                 at,
@@ -866,7 +873,7 @@ impl ClaudeLoop {
                             .map(|part| match part {
                                 ContentPart::Text { text } => Block::Text(text),
                                 ContentPart::Image { media_type, data } => {
-                                    Block::Image(rho_inference::step::Image { media_type, data })
+                                    Block::Image(crate::inference::Image { media_type, data })
                                 }
                             })
                             .collect(),
@@ -894,7 +901,7 @@ impl ClaudeLoop {
                 {
                     let named = self
                         .host
-                        .name(&rho_inference::types::text_content(&content))
+                        .name(&rho_agent_types::transcript::text_content(&content))
                         .await?;
                     self.apply_name(named);
                 }
@@ -932,7 +939,7 @@ impl ClaudeLoop {
                 };
                 let content = Arc::new(content);
                 let input = QueuedInput {
-                    source: rho_inference::types::MessageSender::User,
+                    source: rho_agent_types::transcript::MessageSender::User,
                     kind: InputKind::Message {
                         content: (*content).clone(),
                     },
@@ -969,7 +976,7 @@ impl ClaudeLoop {
                             .map(|part| match part {
                                 ContentPart::Text { text } => Block::Text(text),
                                 ContentPart::Image { media_type, data } => {
-                                    Block::Image(rho_inference::step::Image { media_type, data })
+                                    Block::Image(crate::inference::Image { media_type, data })
                                 }
                             })
                             .collect(),
@@ -1164,11 +1171,19 @@ impl ClaudeLoop {
                     });
                 let (_, _, uncertain) = recover_receipts(entries);
                 if !uncertain.is_empty() {
-                    self.entry(Entry::Woken {
-                        at, why: crate::entry::Wake::Restarted,
-                        report: "Archiving stopped Claude before confirming whether queued messages entered its context; they were not resent to avoid duplicate work.".into(),
-                        images: Vec::new(), messages: Vec::new(),
-                        acknowledged: uncertain, results: Vec::new(),
+                    self.entry(Entry::RequestSent {
+                        at,
+                        why: crate::entry::Wake::Restarted,
+                        report: Report {
+                            notebook: rho_notebook::Report::from_text(
+                                "Archiving stopped Claude before confirming whether queued messages entered its context; they were not resent to avoid duplicate work.".into(),
+                                Vec::new(),
+                            ),
+                            acknowledged: uncertain,
+                            ..Default::default()
+                        },
+                        compact: false,
+            imported: None,
                     }).await?;
                 }
                 if self.awaiting {
@@ -1725,17 +1740,20 @@ impl ClaudeLoop {
                 }
                 if !self.delivered.is_empty() {
                     for (id, why, output) in std::mem::take(&mut self.delivered) {
-                        let (report, images) = output
-                            .as_ref()
-                            .map_or_else(|| (String::new(), Vec::new()), |batch| batch.report());
-                        self.entry(Entry::Woken {
+                        self.entry(Entry::RequestSent {
                             at: rho_agent_types::UnixMs::now(),
                             why,
-                            report,
-                            images,
-                            messages: id.into_iter().collect(),
-                            acknowledged: Vec::new(),
-                            results: Vec::new(),
+                            report: Report {
+                                notebook: output
+                                    .as_ref()
+                                    .map_or_else(rho_notebook::Report::default, |batch| {
+                                        batch.report()
+                                    }),
+                                messages: id.into_iter().collect(),
+                                ..Default::default()
+                            },
+                            compact: false,
+                            imported: None,
                         })
                         .await?;
                     }
@@ -1887,7 +1905,7 @@ impl ClaudeLoop {
                             let now = rho_agent_types::UnixMs::now();
                             self.host
                                 .append(AgentEvent::ClaudeExecAdmitted {
-                                    call: rho_inference::types::ExecCall {
+                                    call: rho_agent_types::transcript::ExecCall {
                                         id: exec_id.clone(),
                                         source: source.clone(),
                                     },
@@ -1984,15 +2002,15 @@ impl ClaudeLoop {
                     .await?;
                     if self.respond_control(&pending.request_id, Ok(reply)).await {
                         self.output_handed_off(batch).await?;
-                        let (report, images) = delivered.report();
-                        self.entry(Entry::Woken {
+                        self.entry(Entry::RequestSent {
                             at: rho_agent_types::UnixMs::now(),
                             why: crate::entry::Wake::Returned,
-                            report,
-                            images,
-                            messages: Vec::new(),
-                            acknowledged: Vec::new(),
-                            results: Vec::new(),
+                            report: Report {
+                                notebook: delivered.report(),
+                                ..Default::default()
+                            },
+                            compact: false,
+                            imported: None,
                         })
                         .await?;
                         self.observe_exec(
@@ -2475,7 +2493,7 @@ impl ClaudeLoop {
 
     async fn observe_exec(
         &self,
-        id: rho_inference::types::ExecId,
+        id: rho_agent_types::transcript::ExecId,
         milestone: rho_agent_types::ExecMilestone,
         at: rho_agent_types::UnixMs,
     ) -> anyhow::Result<()> {
@@ -2498,7 +2516,7 @@ impl ClaudeLoop {
                 index,
                 content_block: rho_claude::protocol::StreamContentBlock::ToolUse { id, name, .. },
             } if name == "mcp__py__exec" => {
-                let id = rho_inference::types::ExecId::try_from(id.as_str())?;
+                let id = rho_agent_types::transcript::ExecId::try_from(id.as_str())?;
                 self.response_execs.insert(*index, id.clone());
                 self.observe_exec(id, rho_agent_types::ExecMilestone::FirstBlock, now)
                     .await?;
@@ -2581,23 +2599,32 @@ impl ClaudeLoop {
 }
 
 impl crate::ClaudeOutputBatch {
-    fn report(&self) -> (String, Vec<rho_inference::step::Image>) {
+    fn report(&self) -> rho_notebook::Report {
         let text = self
             .outputs
             .iter()
             .map(|(_, output)| output.output.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let images = self
+        let images: Vec<crate::inference::Image> = self
             .outputs
             .iter()
             .flat_map(|(_, output)| output.images.iter())
-            .map(|image| rho_inference::step::Image {
+            .map(|image| crate::inference::Image {
                 media_type: image.media_type.clone(),
                 data: image.data.clone(),
             })
             .collect();
-        (text, images)
+        rho_notebook::Report::from_text(
+            text,
+            images
+                .into_iter()
+                .map(|image: crate::inference::Image| rho_notebook::Image {
+                    media_type: image.media_type,
+                    data: image.data,
+                })
+                .collect(),
+        )
     }
 
     fn message(&self) -> Vec<ContentPart> {
@@ -2674,12 +2701,8 @@ fn recover_receipts(
                 ..
             } => archived_since = None,
             Entry::Received { at, id, from, body } => received.push((at, id, from, body, position)),
-            Entry::Woken {
-                messages,
-                acknowledged,
-                ..
-            } => {
-                accounted.extend(messages.into_iter().chain(acknowledged));
+            Entry::RequestSent { report, .. } => {
+                accounted.extend(report.messages.into_iter().chain(report.acknowledged));
             }
             _ => {}
         }
@@ -2781,7 +2804,7 @@ mod tests {
 
     #[test]
     fn pending_context_copies_only_finished_blocks_or_failure_partials() {
-        use rho_inference::types::{StreamingContextItem, StreamingContextItemState};
+        use rho_agent_types::transcript::{StreamingContextItem, StreamingContextItemState};
         let mut items = BTreeMap::new();
         let mut pending = PendingInferenceResponse::default();
         let call = ClaudeStreamItem::ToolUse {
@@ -2908,14 +2931,15 @@ mod tests {
             at: rho_agent_types::UnixMs(at),
             notice,
         };
-        let woken = |ids: Vec<MessageId>| Entry::Woken {
+        let woken = |ids: Vec<MessageId>| Entry::RequestSent {
             at: rho_agent_types::UnixMs(20),
             why: crate::entry::Wake::Message,
-            report: String::new(),
-            images: Vec::new(),
-            messages: ids,
-            acknowledged: Vec::new(),
-            results: Vec::new(),
+            report: Report {
+                messages: ids,
+                ..Default::default()
+            },
+            compact: false,
+            imported: None,
         };
         let entries = vec![
             received(1, Party::Human, 1),
@@ -2948,8 +2972,8 @@ mod tests {
             )]
         );
         let mut acknowledgement = woken(Vec::new());
-        if let Entry::Woken { acknowledged, .. } = &mut acknowledgement {
-            acknowledged.push(MessageId(1));
+        if let Entry::RequestSent { report, .. } = &mut acknowledgement {
+            report.acknowledged.push(MessageId(1));
         }
         let (archived, deferred, uncertain) =
             recover_receipts(vec![received(1, Party::Human, 1), acknowledgement]);
@@ -2988,14 +3012,16 @@ mod tests {
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].1, MessageId(3));
         let mut accounted = entries;
-        accounted.push(Entry::Woken {
+        accounted.push(Entry::RequestSent {
             at,
             why: crate::entry::Wake::Restarted,
-            report: "uncertain delivery".into(),
-            images: Vec::new(),
-            messages: Vec::new(),
-            acknowledged: uncertain,
-            results: Vec::new(),
+            report: Report {
+                notebook: rho_notebook::Report::from_text("uncertain delivery".into(), Vec::new()),
+                acknowledged: uncertain,
+                ..Default::default()
+            },
+            compact: false,
+            imported: None,
         });
         let (_, deferred, uncertain) = recover_receipts(accounted);
         assert!(
@@ -3033,7 +3059,7 @@ mod tests {
             usage_provider: crate::db::AgentUsageModel::FABLE,
         };
         state.queued_inputs.push(QueuedInput {
-            source: rho_inference::types::MessageSender::User,
+            source: rho_agent_types::transcript::MessageSender::User,
             kind: InputKind::Message {
                 content: (*text("claude-normalized text")).clone(),
             },

@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use rho_agent::db::{AgentReadTxnExt as _, AgentRuntime};
 use rho_agent_types::{AdvisorIntelligence, AgentRole, EngineerIntelligence};
 use rho_db::RhoDb;
-use rho_inference::Inference;
+use rho_inference::Accounts;
 
 use crate::default_db_path;
 
@@ -555,9 +555,15 @@ async fn print_context(
                     }) = event
                     {
                         responses += 1;
-                        if usage.input_tokens > 0 {
-                            context_used =
-                                Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                        if let Some(usage) = usage
+                            && usage.input_tokens.saturating_add(usage.cache_read_tokens) > 0
+                        {
+                            context_used = Some(
+                                usage
+                                    .input_tokens
+                                    .saturating_add(usage.cache_read_tokens)
+                                    .saturating_add(usage.output_tokens),
+                            );
                         }
                     }
                 }
@@ -647,7 +653,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
-    Inference::migrate(db).await?;
+    Accounts::migrate(db).await?;
     rho_agent::db::prepare(db).await;
     Ok(())
 }

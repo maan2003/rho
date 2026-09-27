@@ -108,10 +108,10 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
     )?;
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));
     rho_inference::ensure_crypto_provider();
-    let inference = rho_inference::Inference::new(db.clone()).await?;
+    let inference = rho_inference::Accounts::new(db.clone()).await?;
     let pool = rho_agent::pool::AgentPool::new(
         db.clone(),
-        inference,
+        std::sync::Arc::new(inference),
         worksets,
         // An eval runs on its own directory, not on the user's Claude state.
         rho_claude::accounts::ClaudePaths::at(camino::Utf8PathBuf::try_from(
@@ -174,23 +174,33 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         };
         match event {
             AgentEvent::Entry(entry) => match entry {
-                Entry::Woken { results, .. } => {
+                Entry::RequestSent {
+                    report, imported, ..
+                } => {
                     requests += 1;
                     emit(json!({"type":"request", "number":requests}))?;
+                    let prior = db.read().agent_input_carry(id, appended.pos.into());
+                    let results = rho_inference::transcript::report_results(
+                        &report,
+                        prior.as_ref(),
+                        imported.as_ref(),
+                    );
                     for result in results {
                         emit(
-                            json!({"type":"notebook_report", "id":result.id.as_str(), "output":result.text}),
+                            json!({"type":"notebook_report", "id":result.display_id(), "output":result.text}),
                         )?;
                     }
                 }
-                Entry::Step {
-                    calls: step_calls, ..
-                } => {
-                    for call in step_calls {
+                Entry::Step { carry, usage, .. } => {
+                    for call in carry.display_calls() {
                         calls.insert("exec".to_owned());
                         emit(
-                            json!({"type":"tool_call", "id":call.id.as_str(), "name":"exec", "arguments":call.code}),
+                            json!({"type":"tool_call", "id":call.display_id(), "name":"exec", "arguments":call.code}),
                         )?;
+                    }
+                    if let Some(usage) = usage {
+                        emit(json!({"type":"usage", "input_tokens":usage.input_tokens,
+                            "cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}))?;
                     }
                 }
                 Entry::Sent {
@@ -203,10 +213,6 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                     }
                     final_answer.push_str(&text);
                     emit(json!({"type":"message", "text":text}))?;
-                }
-                Entry::Usage { usage, .. } => {
-                    emit(json!({"type":"usage", "input_tokens":usage.input_tokens,
-                        "cached_input_tokens":usage.cache_read_tokens,"output_tokens":usage.output_tokens}))?;
                 }
                 _ => {}
             },

@@ -1,8 +1,8 @@
 use rho_agent_types::{ContentPart, MessageDelivery, Place, TurnOutcome, UnixMs};
 use rho_db::RhoDb;
-use rho_inference::PromptCacheKey;
 
 use super::*;
+use crate::inference::PromptCacheKey;
 
 #[test]
 fn canonical_bindings_round_trip() {
@@ -372,7 +372,7 @@ fn agent_roles_resolve_the_current_model_matrix() {
     );
 }
 
-use rho_inference::types::MessageSender;
+use rho_agent_types::transcript::MessageSender;
 
 use crate::{InputKind, QueuedInput};
 
@@ -578,11 +578,13 @@ async fn init_agent_tables_stamps_current_db_format() {
 
 #[test]
 fn migration_accepts_only_the_live_source_format() {
-    assert_eq!(AGENT_DB_MIGRATIONS.len(), 2);
+    assert_eq!(AGENT_DB_MIGRATIONS.len(), 3);
     assert_eq!(AGENT_DB_MIGRATIONS[0].from, "a7e43d91");
     assert_eq!(AGENT_DB_MIGRATIONS[0].to, "e31bcf82");
     assert_eq!(AGENT_DB_MIGRATIONS[1].from, "e31bcf82");
-    assert_eq!(AGENT_DB_MIGRATIONS[1].to, CURRENT_AGENT_DB_FORMAT);
+    assert_eq!(AGENT_DB_MIGRATIONS[1].to, "7f24a9d3");
+    assert_eq!(AGENT_DB_MIGRATIONS[2].from, "7f24a9d3");
+    assert_eq!(AGENT_DB_MIGRATIONS[2].to, CURRENT_AGENT_DB_FORMAT);
 }
 
 #[tokio::test]
@@ -1010,7 +1012,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
         id: uuid::Uuid::new_v4(),
         outputs: vec![(
             "exec-once".try_into().unwrap(),
-            rho_inference::types::ToolOutput {
+            rho_agent_types::transcript::ToolOutput {
                 output: std::sync::Arc::new("already ran".into()),
                 full_output: None,
                 images: Default::default(),
@@ -1037,7 +1039,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
         batch.id = uuid::Uuid::new_v4();
         batch.outputs.push((
             "exec-fresh".try_into().unwrap(),
-            rho_inference::types::ToolOutput {
+            rho_agent_types::transcript::ToolOutput {
                 output: std::sync::Arc::new("new output".into()),
                 ..batch.outputs[0].1.clone()
             },
@@ -1086,7 +1088,7 @@ async fn claude_output_survives_restart_and_rewind_until_handoff() {
 #[tokio::test]
 async fn native_later_image_survives_reopen_and_provider_projection() {
     use rho_agent_types::ToolOutputStatus;
-    use rho_inference::types::{ContextBlock, ExecOutput, ToolOutput};
+    use rho_agent_types::transcript::{ContextBlock, ExecOutput, ToolOutput};
 
     use crate::db::legacy::NativeEvent;
     let temp = tempfile::tempdir().unwrap();
@@ -1097,10 +1099,10 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
         full_output: None,
         status: ToolOutputStatus::Success,
     };
-    let image = rho_inference::types::ImageContent {
+    let image = rho_agent_types::transcript::ImageContent {
         media_type: "image/png".into(),
         data: vec![1, 2, 3],
-        detail: rho_inference::types::ImageDetail::Original,
+        detail: rho_agent_types::transcript::ImageDetail::Original,
     };
     let later = ToolOutput {
         output: std::sync::Arc::new("later".into()),
@@ -1151,8 +1153,10 @@ async fn native_later_image_survives_reopen_and_provider_projection() {
     assert_eq!(update.output.as_str(), "later");
 }
 
-fn legacy_output(output: &rho_inference::types::ExecOutput) -> rho_inference::types::ContextBlock {
-    use rho_inference::types::{ContextBlock, ExecOutput, ToolResult, ToolType, ToolUpdate};
+fn legacy_output(
+    output: &rho_agent_types::transcript::ExecOutput,
+) -> rho_agent_types::transcript::ContextBlock {
+    use rho_agent_types::transcript::{ContextBlock, ExecOutput, ToolResult, ToolType, ToolUpdate};
     match output {
         ExecOutput::Reply {
             id,
@@ -1314,4 +1318,245 @@ async fn migration_marks_legacy_mixed_modes_until_explicit_transition() {
         ids.iter()
             .all(|id| reopened.read().get_agent(*id).place().mode == WorksetMode::View)
     );
+}
+
+fn native_request(imported: bool, compact: bool) -> AgentEvent<'static> {
+    AgentEvent::Entry(crate::entry::Entry::RequestSent {
+        at: UnixMs(1),
+        why: crate::entry::Wake::Message,
+        report: crate::entry::Report::default(),
+        compact,
+        imported: imported.then(|| crate::inference::Carry::new("legacy", vec![], false)),
+    })
+}
+
+fn native_step(compacted: bool, tokens: Option<u64>) -> AgentEvent<'static> {
+    AgentEvent::Entry(crate::entry::Entry::Step {
+        at: UnixMs(2),
+        exec: None,
+        prose: String::new(),
+        carry: crate::inference::Carry::new("response", vec![], compacted),
+        usage: tokens.map(|input_tokens| crate::entry::ResponseUsage {
+            model: "test".into(),
+            input_tokens,
+            cache_read_tokens: 3,
+            cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
+            output_tokens: 2,
+        }),
+    })
+}
+
+fn native_received(id: u64) -> AgentEvent<'static> {
+    AgentEvent::Entry(crate::entry::Entry::Received {
+        at: UnixMs(id),
+        id: crate::entry::MessageId(id),
+        from: crate::entry::Party::Human,
+        body: vec![crate::entry::Block::Text(format!("message {id}"))],
+    })
+}
+
+#[tokio::test]
+async fn native_compaction_keeps_received_during_response_and_freezes_cutoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    write.append_agent_event(agent, &native_received(11));
+    write.append_agent_event(agent, &native_request(false, true));
+    write.append_agent_event(agent, &native_received(22));
+    write.append_agent_event(agent, &native_step(true, None));
+    let frozen = AgentWriteTxnExt::agent_context_boundary(&mut write, agent);
+    assert_eq!(
+        frozen,
+        ContextBoundary {
+            from: AgentEventPos::new(3),
+            through: AgentEventPos::new(5)
+        }
+    );
+    write.append_agent_event(agent, &native_received(33));
+    write.append_agent_event(agent, &native_request(false, false));
+    write.append_agent_event(agent, &native_step(false, Some(17)));
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(
+        read.agent_context_boundary(agent).through,
+        AgentEventPos::new(8)
+    );
+    assert_eq!(
+        read.agent_context_records(agent, frozen)
+            .iter()
+            .map(|(p, _)| p.pos)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    let recovery = read.agent_native_recovery(agent);
+    assert!(recovery.woken);
+    assert_eq!(recovery.compaction.context_used, Some(22));
+}
+
+#[tokio::test]
+async fn native_nested_rewinds_restore_prior_state_and_frozen_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    write.append_agent_event(agent, &native_received(1)); // 1
+    write.append_agent_event(agent, &native_request(false, false)); // 2
+    write.append_agent_event(agent, &native_step(false, Some(7))); // 3
+    write.append_agent_event(agent, &native_request(false, true)); // 4
+    write.append_agent_event(agent, &native_step(true, None)); // 5
+    let frozen = AgentWriteTxnExt::agent_context_boundary(&mut write, agent);
+    assert_eq!(frozen.from.pos, 5);
+    write.rewind_agent(UnixMs(2), agent, AgentEventPos::new(4)); // 6, restore usage
+    assert_eq!(
+        AgentWriteTxnExt::agent_context_boundary(&mut write, agent)
+            .from
+            .pos,
+        0
+    );
+    assert_eq!(
+        write
+            .open_table(native::NATIVE_CURSORS)
+            .get(&agent)
+            .unwrap()
+            .value()
+            .into_owned()
+            .recovery
+            .compaction
+            .context_used,
+        Some(12)
+    );
+    write.append_agent_event(agent, &native_request(false, true)); // 7
+    write.append_agent_event(agent, &native_step(true, None)); // 8
+    assert_eq!(
+        AgentWriteTxnExt::agent_context_boundary(&mut write, agent)
+            .from
+            .pos,
+        8
+    );
+    write.rewind_agent(UnixMs(3), agent, AgentEventPos::new(3)); // 9, hides first compaction AND nested branch
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.agent_context_boundary(agent).from.pos, 0);
+    assert_eq!(
+        read.agent_native_recovery(agent).compaction.context_used,
+        None
+    );
+    // Original cutoff ignores all later rewinds; the compacted Step still stands
+    // there.
+    assert_eq!(
+        read.agent_context_records(agent, frozen)
+            .iter()
+            .map(|(p, _)| p.pos)
+            .collect::<Vec<_>>(),
+        [5]
+    );
+    assert_eq!(
+        read.agent_context_records(agent, read.agent_context_boundary(agent))
+            .iter()
+            .map(|(p, _)| p.pos)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[tokio::test]
+async fn native_imported_requests_preserve_legacy_prefix_on_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    write.append_agent_event(agent, &native_received(1));
+    write.append_agent_event(agent, &native_request(true, true));
+    write.append_agent_event(agent, &native_received(2));
+    write.append_agent_event(agent, &native_step(true, None));
+    // An imported compaction cannot discard the earlier selectively delivered
+    // input.
+    assert_eq!(
+        AgentWriteTxnExt::agent_context_boundary(&mut write, agent)
+            .from
+            .pos,
+        0
+    );
+    write.commit();
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+    let read = db.read();
+    assert_eq!(read.agent_context_boundary(agent).from.pos, 0);
+    assert_eq!(
+        read.agent_context_records(agent, read.agent_context_boundary(agent))
+            .iter()
+            .map(|(p, _)| p.pos)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+}
+
+#[tokio::test]
+async fn native_recovery_notices_and_awaiting_follow_visible_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent = create(&mut write, None, None);
+    let entry = |entry| AgentEvent::Entry(entry);
+    write.append_agent_event(
+        agent,
+        &entry(crate::entry::Entry::Awaiting {
+            at: UnixMs(2),
+            since: Some(UnixMs(1)),
+        }),
+    ); // 1
+    write.append_agent_event(
+        agent,
+        &entry(crate::entry::Entry::Notice {
+            at: UnixMs(3),
+            notice: crate::entry::Notice::Archived,
+        }),
+    ); // 2
+    write.append_agent_event(
+        agent,
+        &entry(crate::entry::Entry::CompactionTrigger {
+            at: UnixMs(4),
+            manual: false,
+        }),
+    ); // 3
+    write.append_agent_event(agent, &native_request(false, true)); // 4
+    write.append_agent_event(agent, &native_step(true, None)); // 5
+    let before = write
+        .open_table(native::NATIVE_CURSORS)
+        .get(&agent)
+        .unwrap()
+        .value()
+        .into_owned()
+        .recovery;
+    assert!(before.archived && before.awaiting && before.woken);
+    assert!(before.compaction.reply && !before.compaction.pending);
+    write.rewind_agent(UnixMs(6), agent, AgentEventPos::new(2));
+    let restored = write
+        .open_table(native::NATIVE_CURSORS)
+        .get(&agent)
+        .unwrap()
+        .value()
+        .into_owned()
+        .recovery;
+    assert!(!restored.archived && restored.awaiting && !restored.woken);
+    assert!(!restored.compaction.reply);
+    write.append_agent_event(
+        agent,
+        &entry(crate::entry::Entry::Awaiting {
+            at: UnixMs(7),
+            since: None,
+        }),
+    );
+    write.commit();
+    let recovery = db.read().agent_native_recovery(agent);
+    assert!(!recovery.archived && !recovery.awaiting && !recovery.woken);
 }
