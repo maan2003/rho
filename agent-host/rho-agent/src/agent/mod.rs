@@ -1142,6 +1142,16 @@ impl Agent {
             // The call's code, as it arrives, runs as it arrives.
             let (code_tx, mut code_rx) = mpsc::unbounded_channel();
             let mut streaming = None;
+            // Full replaceable snapshots copy the accumulated code. Coalesce
+            // provider fragments into 50 ms display frames rather than copying
+            // on every fragment (the last fragment is published before commit).
+            // Each frame still copies/serializes O(current response bytes),
+            // including once per focused listener; long streams can remain
+            // quadratic in bytes over time, bounded by frame count, not chunks.
+            let mut stream_frame = tokio::time::interval(Duration::from_millis(50));
+            stream_frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut pending_stream = false;
+            let mut stream_needs_runtime = false;
             let result = {
                 let mut forward = move |piece: Stream<'_>| {
                     let _ = code_tx.send(match piece {
@@ -1157,7 +1167,16 @@ impl Agent {
                         biased;
                         error = self.writer.failed() => return Err(error.into()),
                         result = &mut step => break result,
-                        Some(piece) = code_rx.recv() => self.stream(&mut streaming, piece),
+                        Some(piece) = code_rx.recv() => {
+                            stream_needs_runtime |= piece.0.is_some();
+                            self.stream(&mut streaming, piece);
+                            pending_stream = true;
+                        },
+                        _ = stream_frame.tick(), if pending_stream => {
+                            self.publish_stream(streaming.as_ref(), stream_needs_runtime);
+                            pending_stream = false;
+                            stream_needs_runtime = false;
+                        },
                         control = self.control_rx.recv() => match control {
                             Some(Control::Cancel) => {
                                 self.interrupt(streaming).await?;
@@ -1176,7 +1195,12 @@ impl Agent {
             };
             drop(request);
             while let Ok(piece) = code_rx.try_recv() {
+                stream_needs_runtime |= piece.0.is_some();
                 self.stream(&mut streaming, piece);
+                pending_stream = true;
+            }
+            if pending_stream {
+                self.publish_stream(streaming.as_ref(), stream_needs_runtime);
             }
             match result {
                 Ok(step) => Ok((step, streaming)),
@@ -1351,12 +1375,38 @@ impl Agent {
             latest.call.code.push_str(&code);
             let _ = latest.cell.feed(code, false);
         }
-        self.writing = streaming.as_ref().map(|stream| Call {
+    }
+
+    fn publish_stream(&mut self, streaming: Option<&Streaming>, refresh_runtime: bool) {
+        self.writing = streaming.map(|stream| Call {
             id: stream.id.clone(),
             code: stream.code.clone(),
         });
-        *self.status.write().expect("poison") = self.status();
+        if refresh_runtime {
+            // Starting a cell changes occupancy; subsequent fragments do not.
+            *self.status.write().expect("poison") = self.status();
+        } else {
+            // Notebook and mail events publish runtime independently. A code
+            // frame only changes this response; don't scan retained sources.
+            self.status.write().expect("poison").response = self.response();
+        }
         self.host.published();
+    }
+
+    fn response(&self) -> Option<StreamingResponse> {
+        self.responding.then(|| StreamingResponse {
+            id: self.response_id.clone(),
+            items: self
+                .writing
+                .iter()
+                .map(|call| Item::ToolCall {
+                    id: call.id.as_str().to_owned(),
+                    name: "exec".to_owned(),
+                    arguments: call.code.clone(),
+                    format: ArgumentsFormat::Text,
+                })
+                .collect(),
+        })
     }
 
     /// What a reader sees, built from the loop's own state.
@@ -1398,19 +1448,7 @@ impl Agent {
                 },
                 archived: self.archived,
             },
-            response: self.responding.then(|| StreamingResponse {
-                id: self.response_id.clone(),
-                items: self
-                    .writing
-                    .iter()
-                    .map(|call| Item::ToolCall {
-                        id: call.id.as_str().to_owned(),
-                        name: "exec".to_owned(),
-                        arguments: call.code.clone(),
-                        format: ArgumentsFormat::Text,
-                    })
-                    .collect(),
-            }),
+            response: self.response(),
             queued: self.unread.len(),
         }
     }

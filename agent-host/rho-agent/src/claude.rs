@@ -378,22 +378,64 @@ fn claude_status(
     queued: usize,
 ) -> AgentStatus {
     AgentStatus {
-        runtime: RuntimeState {
-            inference: if matches!(inference, InferenceState::Responding)
-                && python.is_some_and(python_host::PythonHost::has_pending)
-            {
-                InferenceState::Idle
-            } else {
-                inference.clone()
-            },
-            running_tasks: python.map_or(0, python_host::PythonHost::running_tasks),
-            awaiting_human,
-            checkin_at: python.and_then(python_host::PythonHost::checkin_at),
-            archived,
-        },
+        runtime: claude_runtime(inference, python, awaiting_human, archived),
         response: live_response(response_id, stream_items),
         queued,
     }
+}
+
+fn claude_runtime(
+    inference: &InferenceState,
+    python: Option<&python_host::PythonHost>,
+    awaiting_human: bool,
+    archived: bool,
+) -> RuntimeState {
+    RuntimeState {
+        inference: if matches!(inference, InferenceState::Responding)
+            && python.is_some_and(python_host::PythonHost::has_pending)
+        {
+            InferenceState::Idle
+        } else {
+            inference.clone()
+        },
+        running_tasks: python.map_or(0, python_host::PythonHost::running_tasks),
+        awaiting_human,
+        checkin_at: python.and_then(python_host::PythonHost::checkin_at),
+        archived,
+    }
+}
+
+/// Materialize unfinished provider context only when a failure needs the
+/// partial response. Finished slots are already authoritative and immutable.
+fn refresh_pending_partial(
+    pending: &mut PendingInferenceResponse,
+    items: &BTreeMap<usize, ClaudeStreamItem>,
+) {
+    for (slot, item) in items.values().enumerate() {
+        if matches!(
+            pending.items.get(slot),
+            Some(rho_inference::types::StreamingContextItemState::Pending(_))
+        ) && let Ok(item) = item.to_streaming_context_item()
+        {
+            pending.apply(slot, ContextItemEvent::Update(item));
+        }
+    }
+}
+
+/// Finish with the latest bytes rather than the fragment present at start.
+fn finish_stream_block(
+    pending: &mut PendingInferenceResponse,
+    items: &BTreeMap<usize, ClaudeStreamItem>,
+    index: usize,
+) -> anyhow::Result<bool> {
+    let Some(item) = items.get(&index) else {
+        return Ok(false);
+    };
+    let item = item.to_streaming_context_item()?;
+    let slot = items.range(..index).count();
+    pending.apply(slot, ContextItemEvent::Update(item));
+    pending.apply(slot, ContextItemEvent::Finish);
+    Ok(true)
 }
 
 struct ClaudeTurn {
@@ -629,6 +671,14 @@ impl ClaudeLoop {
             .await?;
         }
         self.published();
+        // Only body deltas are frame-limited; lifecycle and notebook changes
+        // continue to publish immediately. Each frame still serializes the
+        // complete current payload for focused listeners; this bounds its
+        // frequency, not its total cumulative bytes. The complete last body
+        // is flushed on the next non-delta event, including block completion.
+        let mut stream_frame = tokio::time::interval(Duration::from_millis(50));
+        stream_frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut stream_dirty = false;
         loop {
             // The notebook can finish between iterations; compare against the
             // last published observation rather than freshly sampled facts.
@@ -650,17 +700,38 @@ impl ClaudeLoop {
                         }
                         control = control_rx.recv() => ClaudeLoopEvent::Control(control),
                         Some(outbound) = self.outbox.recv() => ClaudeLoopEvent::Outbound(outbound),
-                        event = process.next_event() => ClaudeLoopEvent::Protocol(Box::new(event)),
+                        _ = stream_frame.tick(), if stream_dirty => ClaudeLoopEvent::StreamFrame,
                         _ = python_wake(notify.as_deref(), recheck) => ClaudeLoopEvent::PythonWake,
+                        event = process.next_event() => ClaudeLoopEvent::Protocol(Box::new(event)),
                     }
                 };
                 match event {
-                    ClaudeLoopEvent::PythonWake => {}
-                    ClaudeLoopEvent::Outbound(outbound) => self.outbound(outbound).await?,
-                    ClaudeLoopEvent::Control(Some(control)) => self.handle_control(control).await?,
+                    ClaudeLoopEvent::PythonWake => {
+                        stream_dirty = false;
+                    }
+                    ClaudeLoopEvent::StreamFrame => {
+                        self.drain_outbox().await?;
+                        self.python_tick().await?;
+                        self.published();
+                        stream_dirty = false;
+                        continue;
+                    }
+                    ClaudeLoopEvent::Outbound(outbound) => {
+                        stream_dirty = false;
+                        self.outbound(outbound).await?;
+                    }
+                    ClaudeLoopEvent::Control(Some(control)) => {
+                        stream_dirty = false;
+                        self.handle_control(control).await?;
+                    }
                     ClaudeLoopEvent::Control(None) => return Ok(()),
                     ClaudeLoopEvent::Protocol(event) => match *event {
-                        Ok(Some(event)) => self.handle_event(event).await?,
+                        Ok(Some(event)) => {
+                            stream_dirty = matches!(&event,
+                                rho_claude::ClaudeEvent::StreamEvent(stream)
+                                if matches!(stream.event, rho_claude::protocol::MessageStreamEvent::ContentBlockDelta { .. }));
+                            self.handle_event(event).await?;
+                        }
                         Ok(None) => {
                             self.process = None;
                             self.forget_pending_exec();
@@ -690,8 +761,13 @@ impl ClaudeLoop {
                         }
                     },
                 }
-                // Every event may have changed what the notebook's cells
-                // have to say or whether the model can hear it; ask once.
+                // A body delta only appends to stream_items. Python wakes and
+                // outbound/lifecycle events have their own higher-priority
+                // branches, so do not rescan retained notebook sources or
+                // rebuild provider context on every fragment.
+                if stream_dirty {
+                    continue;
+                }
                 self.drain_outbox().await?;
                 self.python_tick().await?;
             } else {
@@ -713,8 +789,14 @@ impl ClaudeLoop {
                 }
             }
             self.drain_outbox().await?;
-            self.published();
-            let current = self.snapshot().runtime;
+            let current = self.runtime_snapshot();
+            if !stream_dirty
+                || current != initial_runtime
+                || self.execution_generation != initial_execution_generation
+            {
+                self.published();
+                stream_dirty = false;
+            }
             let started = !initial_runtime.is_working() && current.is_working();
             let settled = (initial_runtime.is_working() && !current.is_working())
                 || (self.execution_generation != initial_execution_generation
@@ -2327,6 +2409,15 @@ impl ClaudeLoop {
         )
     }
 
+    fn runtime_snapshot(&self) -> RuntimeState {
+        claude_runtime(
+            &self.state.kind,
+            self.python.as_ref(),
+            self.awaiting,
+            self.archived,
+        )
+    }
+
     fn published(&self) {
         *self.status.write().expect("poison") = self.snapshot();
         self.host.published();
@@ -2360,6 +2451,9 @@ impl ClaudeLoop {
         }
         // The row first, so what Claude had said is kept and the tail
         // the loop tells next follows it.
+        // Fragments live in stream_items; materialize the latest incomplete
+        // provider items once if the stream fails mid-block.
+        refresh_pending_partial(&mut self.pending_response, &self.stream_items);
         let partial = std::mem::take(&mut self.pending_response);
         {
             self.host
@@ -2449,18 +2543,15 @@ impl ClaudeLoop {
             rho_claude::protocol::MessageStreamEvent::ContentBlockDelta { index, delta } => {
                 if let Some(item) = self.stream_items.get_mut(&index) {
                     item.apply_delta(delta)?;
-                    let streaming = item.to_streaming_context_item()?;
-                    let slot = self.tail_slot(index);
-                    self.pending_response
-                        .apply(slot, ContextItemEvent::Update(streaming));
-                    self.set_streaming_kind();
+                    // stream_items owns the partial bytes until a block closes
+                    // or a failure needs them. Neither provider context nor the
+                    // GUI needs a second complete copy for every fragment.
+                    self.state.kind = InferenceState::Responding;
                 }
             }
             // The block's own event may have let it go already.
             rho_claude::protocol::MessageStreamEvent::ContentBlockStop { index } => {
-                if self.stream_items.contains_key(&index) {
-                    let slot = self.tail_slot(index);
-                    self.pending_response.apply(slot, ContextItemEvent::Finish);
+                if finish_stream_block(&mut self.pending_response, &self.stream_items, index)? {
                     self.set_streaming_kind();
                 }
             }
@@ -2552,6 +2643,7 @@ async fn python_wake(
 }
 
 enum ClaudeLoopEvent {
+    StreamFrame,
     PythonWake,
     Outbound(Outbound),
     Control(Option<ClaudeControl>),
@@ -2687,6 +2779,61 @@ fn write_generated_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_context_copies_only_finished_blocks_or_failure_partials() {
+        use rho_inference::types::{StreamingContextItem, StreamingContextItemState};
+        let mut items = BTreeMap::new();
+        let mut pending = PendingInferenceResponse::default();
+        let call = ClaudeStreamItem::ToolUse {
+            id: "call-1".into(),
+            name: "mcp__py__exec".into(),
+            arguments: "{}".into(),
+        };
+        pending.apply(
+            0,
+            ContextItemEvent::Update(call.to_streaming_context_item().unwrap()),
+        );
+        items.insert(4, call);
+        for partial_json in ["{\"code\":", "\"print(42)\"}"] {
+            items
+                .get_mut(&4)
+                .unwrap()
+                .apply_delta(rho_claude::protocol::ContentBlockDelta::InputJsonDelta {
+                    partial_json: partial_json.into(),
+                })
+                .unwrap();
+        }
+        assert!(
+            matches!(&pending.items[0], StreamingContextItemState::Pending(
+            StreamingContextItem::ToolCall { arguments, .. }) if arguments.with_str(|text| text == "{}"))
+        );
+        assert!(finish_stream_block(&mut pending, &items, 4).unwrap());
+        assert!(
+            matches!(&pending.items[0], StreamingContextItemState::Finished(
+            StreamingContextItem::ToolCall { arguments, .. }) if arguments.with_str(|text| text == "{\"code\":\"print(42)\"}"))
+        );
+        let mut reasoning = ClaudeStreamItem::Thinking("initial".into());
+        pending.apply(
+            1,
+            ContextItemEvent::Update(reasoning.to_streaming_context_item().unwrap()),
+        );
+        reasoning
+            .apply_delta(rho_claude::protocol::ContentBlockDelta::ThinkingDelta {
+                thinking: " plus final".into(),
+            })
+            .unwrap();
+        items.insert(9, reasoning);
+        refresh_pending_partial(&mut pending, &items);
+        assert!(
+            matches!(&pending.items[1], StreamingContextItemState::Pending(
+            StreamingContextItem::RawReasoning { content, .. }) if content.with_str(|text| text == "initial plus final"))
+        );
+        assert!(
+            matches!(&pending.items[0], StreamingContextItemState::Finished(
+            StreamingContextItem::ToolCall { arguments, .. }) if arguments.with_str(|text| text == "{\"code\":\"print(42)\"}"))
+        );
+    }
 
     #[tokio::test]
     async fn notebook_wait_keeps_partial_response_but_is_not_model_inference() {

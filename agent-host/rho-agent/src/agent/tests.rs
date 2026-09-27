@@ -616,10 +616,22 @@ async fn exhausted_retry_window_stops_without_another_request() {
 async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying() {
     let harness = Harness::new().await;
     let script = Arc::new(Scripted::new());
-    script.then_cut("counter = globals().get('counter', 0) + 1\n");
+    let (admit, cut) = tokio::sync::oneshot::channel();
+    script.then_cut_after(
+        "counter = globals().get('counter', 0) + 1\nhuman.send('admitted')\n",
+        cut,
+    );
     script.then("human.send(str(counter))\nawait human.reply()");
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "count once").await;
+    harness
+        .until("actual admission", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Sent { text, .. } if text == "admitted"))
+        })
+        .await;
+    admit.send(()).unwrap();
     harness
         .until("counter message", |entries| {
             entries
@@ -637,6 +649,58 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
             .any(|item| matches!(item, Item::Step(carry) if !carry.call_ids().is_empty())),
         "the next request must record admitted code, not replay the failed request"
     );
+}
+
+#[tokio::test]
+async fn code_fragments_wait_for_a_publication_frame() {
+    let harness = Harness::new().await;
+    let (_, mut agent) = Agent::load(
+        harness.agent,
+        harness.host.clone(),
+        harness.inference.clone(),
+        harness.view.clone(),
+    )
+    .await
+    .unwrap();
+    agent.notebook().await.unwrap();
+    agent.responding = true;
+    agent.response_id = "response-id".into();
+    let mut streaming = None;
+    agent.stream(
+        &mut streaming,
+        (Some(CallId::new("call-id")), String::new()),
+    );
+    for _ in 0..100 {
+        agent.stream(&mut streaming, (None, "# fragment\n".into()));
+    }
+    assert!(
+        agent.status.read().unwrap().response.is_none(),
+        "fragments must not copy accumulated code into status"
+    );
+    agent.publish_stream(streaming.as_ref(), true);
+    let published = agent.status.read().unwrap().response.clone().unwrap();
+    assert_eq!(published.id, "response-id");
+    assert_eq!(
+        published.items,
+        vec![rho_agents_client::protocol::transcript::Item::ToolCall {
+            id: "call-id".into(),
+            name: "exec".into(),
+            arguments: "# fragment\n".repeat(100),
+            format: ArgumentsFormat::Text,
+        }]
+    );
+    agent.stream(&mut streaming, (None, "# final\n".into()));
+    assert_eq!(
+        agent.status.read().unwrap().response.as_ref(),
+        Some(&published)
+    );
+    agent.publish_stream(streaming.as_ref(), false);
+    assert!(
+        matches!(&agent.status.read().unwrap().response.as_ref().unwrap().items[0],
+        rho_agents_client::protocol::transcript::Item::ToolCall { arguments, .. }
+        if arguments.ends_with("# final\n"))
+    );
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -144,10 +144,6 @@ impl Layered {
         self.state.usage = self.fold.usage.clone();
         self.state.exec_timings = self.fold.exec_timings.clone();
     }
-
-    fn compose(&mut self) {
-        self.compose_from(0);
-    }
 }
 
 /// Runtime snapshots replace the response and state together. The Claude
@@ -228,7 +224,7 @@ impl AgentStore {
     /// The transcript as folded from the mirror. The live tail, if any,
     /// stays on top of it.
     pub fn set_fold(&mut self, agent_id: AgentId, fold: UiAgentState) -> FrameSummary {
-        self.change(agent_id, |layered| {
+        self.change(agent_id, false, |layered| {
             layered.fold = fold;
             layered.refresh_committed_tools();
         })
@@ -286,12 +282,12 @@ impl AgentStore {
 
     /// One change to what the runtime has past the mirror.
     pub fn apply_live(&mut self, agent_id: AgentId, live: Live) -> FrameSummary {
-        self.change(agent_id, |layered| layered.tail.apply(live))
+        self.change(agent_id, true, |layered| layered.tail.apply(live))
     }
 
     /// Drop ephemeral status and response when transport is lost.
     pub fn disconnect(&mut self, agent_id: AgentId) -> FrameSummary {
-        self.change(agent_id, |layered| {
+        self.change(agent_id, true, |layered| {
             layered.tail.runtime = None;
             layered.tail.response = None;
             layered.tail.queue.clear();
@@ -308,21 +304,47 @@ impl AgentStore {
         self.states.remove(&agent_id);
     }
 
-    fn change(&mut self, agent_id: AgentId, change: impl FnOnce(&mut Layered)) -> FrameSummary {
+    fn change(
+        &mut self,
+        agent_id: AgentId,
+        tail_only: bool,
+        change: impl FnOnce(&mut Layered),
+    ) -> FrameSummary {
         let layered = self.states.entry(agent_id).or_insert_with(|| Layered {
             fold: empty_state(),
             tail: Tail::default(),
             state: empty_state(),
             committed_tools: Default::default(),
         });
-        let old = std::mem::replace(&mut layered.state, empty_state());
+        // The durable prefix cannot change on a live update. Keep its Arc
+        // pointers in place and compare only the old and new live suffix:
+        // O(tail blocks + their payload), independent of loaded history.
+        // A replacement snapshot still has to materialize its whole tail.
+        let from = if tail_only {
+            layered.fold.blocks.len()
+        } else {
+            0
+        };
+        let old_status = layered.state.status;
+        let old_tail = layered.state.blocks.split_off(from);
         change(layered);
-        layered.compose();
-        let mut summary = summarize(&old.blocks, &layered.state.blocks);
+        layered.compose_from(from);
+        let mut summary = summarize(&old_tail, &layered.state.blocks[from..]);
+        if let Some(index) = &mut summary.first_changed_block {
+            *index += from;
+        }
+        match &mut summary.incremental {
+            Some(
+                IncrementalUpdate::AssistantText { index }
+                | IncrementalUpdate::ReasoningText { index }
+                | IncrementalUpdate::Tool { index },
+            ) => *index += from,
+            None => {}
+        }
         // Elision gives the last fold in an open turn a limited visible tail,
         // so ending (or reopening) a turn re-renders its last block even when
         // no block content changed.
-        if turn_open(old.status) != turn_open(layered.state.status)
+        if turn_open(old_status) != turn_open(layered.state.status)
             && !layered.state.blocks.is_empty()
         {
             summary = summary.merge(FrameSummary {
@@ -457,6 +479,49 @@ mod tests {
         );
         store.apply_live(agent(), snapshot("second", vec![text("new")]));
         assert_eq!(blocks(&store), vec![block(&text("new"))]);
+    }
+
+    #[test]
+    fn live_changes_touch_only_the_suffix_of_a_long_fold() {
+        let mut store = AgentStore::default();
+        let mut fold = empty_state();
+        fold.blocks = (0..1_000)
+            .map(|index| {
+                Arc::new(UiBlock::Notice {
+                    text: index.to_string(),
+                })
+            })
+            .collect();
+        let first = Arc::clone(&fold.blocks[0]);
+        let last = Arc::clone(&fold.blocks[999]);
+        store.set_fold(agent(), fold);
+        assert_eq!(
+            store.apply_live(agent(), snapshot("response", vec![text("part")])),
+            FrameSummary {
+                first_changed_block: Some(1_000),
+                incremental: None,
+            }
+        );
+        assert_eq!(
+            store.apply_live(agent(), snapshot("response", vec![text("partial")])),
+            FrameSummary {
+                first_changed_block: Some(1_000),
+                incremental: Some(IncrementalUpdate::AssistantText { index: 1_000 }),
+            }
+        );
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 1_001);
+        assert!(Arc::ptr_eq(&state.blocks[0], &first));
+        assert!(Arc::ptr_eq(&state.blocks[999], &last));
+        // Ending the turn also changes the final folded row's elision.
+        assert_eq!(
+            store.disconnect(agent()),
+            FrameSummary {
+                first_changed_block: Some(999),
+                incremental: None,
+            }
+        );
+        assert_eq!(store.get(&agent()).unwrap().blocks.len(), 1_000);
     }
 
     #[test]

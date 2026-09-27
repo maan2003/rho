@@ -178,10 +178,17 @@ impl Services {
                                 continue;
                             }
                             Message::Status { status, queue } => {
-                                let mut snapshot = status.clone();
-                                if !self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
-                                    snapshot.response = None;
-                                }
+                                // Only focused clients receive the response body. Avoid
+                                // cloning its growing text for an unfocused publication.
+                                let snapshot = if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
+                                    status.clone()
+                                } else {
+                                    crate::AgentStatus {
+                                        runtime: status.runtime.clone(),
+                                        response: None,
+                                        queued: status.queued,
+                                    }
+                                };
                                 crate::journal::tell_status(
                                     &self.db, self.agent, Arc::new(snapshot), queue.map(Arc::from),
                                 );

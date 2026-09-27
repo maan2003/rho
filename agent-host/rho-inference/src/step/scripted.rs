@@ -12,6 +12,7 @@ enum Scripting {
     Compaction,
     /// The call's code streams, then the response fails.
     Cut(String),
+    CutAfter(String, tokio::sync::oneshot::Receiver<()>),
 }
 
 /// Answers each request with the next scripted cell, and keeps every request
@@ -59,6 +60,21 @@ impl Scripted {
         self
     }
 
+    /// Like `then_cut`, but wait for an observed admission before dropping
+    /// the scripted provider connection. Used to test a cut *after* Python
+    /// has actually run the prefix, independently of machine scheduling.
+    pub fn then_cut_after(
+        &self,
+        code: &str,
+        admitted: tokio::sync::oneshot::Receiver<()>,
+    ) -> &Self {
+        self.steps
+            .lock()
+            .unwrap()
+            .push_back(Scripting::CutAfter(code.to_owned(), admitted));
+        self
+    }
+
     /// The next exchange fails before admitting any code.
     pub fn then_transient(&self) -> &Self {
         self.steps.lock().unwrap().push_back(Scripting::Transient);
@@ -86,12 +102,13 @@ impl Scripted {
         let Some(next) = next else {
             anyhow::bail!("the script has ended");
         };
-        let (code, cut, compacted) = match next {
+        let (code, cut, compacted, admitted) = match next {
             Scripting::Transient => return Err(super::Retryable("temporary outage".into()).into()),
-            Scripting::Call(code) => (Some(code), false, false),
-            Scripting::Prose => (None, false, false),
-            Scripting::Compaction => (None, false, true),
-            Scripting::Cut(code) => (Some(code), true, false),
+            Scripting::Call(code) => (Some(code), false, false, None),
+            Scripting::Prose => (None, false, false, None),
+            Scripting::Compaction => (None, false, true, None),
+            Scripting::Cut(code) => (Some(code), true, false, None),
+            Scripting::CutAfter(code, admitted) => (Some(code), true, false, Some(admitted)),
         };
         let call = code.map(|code| {
             let mut n = self.calls.lock().unwrap();
@@ -108,6 +125,11 @@ impl Scripted {
                 // As a provider would: the rest is still being written.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
+        }
+        if let Some(admitted) = admitted {
+            admitted
+                .await
+                .map_err(|_| anyhow::anyhow!("admission gate dropped"))?;
         }
         if cut {
             return Err(super::Retryable("the connection dropped".into()).into());
