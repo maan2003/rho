@@ -42,10 +42,7 @@ impl Services {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (ready, _) = tokio::sync::watch::channel(false);
         let title = tokio::sync::Mutex::new(crate::title::Task::new(inference));
-        let (status, _) = tokio::sync::watch::channel(crate::AgentStatus {
-            kind: crate::AgentStateKind::Idle,
-            queued: 0,
-        });
+        let (status, _) = tokio::sync::watch::channel(crate::AgentStatus::default());
         Self {
             stopped: std::sync::atomic::AtomicBool::new(false),
             commands,
@@ -74,12 +71,13 @@ impl Services {
 
         use crate::db::AgentWriteTxnExt as _;
         let status = crate::AgentStatus {
-            kind: crate::AgentStateKind::Error(crate::FailedInferenceResponse {
-                partial_response: Default::default(),
-                attempt_count: std::num::NonZeroU64::MIN,
-                error: Arc::new(error.clone()),
-            }),
-            queued: 0,
+            runtime: crate::RuntimeState {
+                inference: crate::InferenceState::Failed {
+                    error: error.clone(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
         };
         // The supervisor knows the process ended, not which unrecorded Python
         // statements ran. Record only that coarse lifecycle fact.
@@ -92,15 +90,12 @@ impl Services {
         write.commit();
         if let Some(pool) = self.pool.upgrade() {
             pool.settle_turn(self.agent).await;
-            if pool.is_live(self.agent) {
-                crate::journal::tell_status(
-                    &self.db,
-                    self.agent,
-                    Arc::new(status.clone()),
-                    None,
-                    true,
-                );
-            }
+            crate::journal::tell_status(
+                &self.db,
+                self.agent,
+                Arc::new(status.clone()),
+                Some(Arc::from([])),
+            );
         }
         self.status.send_replace(status);
     }
@@ -144,9 +139,6 @@ impl Services {
                 .expect("one agent host connection");
             let (outgoing, mut messages) = mpsc::channel::<Message<'static>>(32);
             let mut calls = JoinSet::new();
-            // Whether this loop's tail has been told since it was last not
-            // live; the first status after that is told whole.
-            let mut told = false;
             let result = tokio::select! {
                 result = async {
                     loop {
@@ -185,19 +177,14 @@ impl Services {
                                 }
                                 continue;
                             }
-                            Message::Status { status, queue, reset } => {
-                                if self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
-                                    crate::journal::tell_status(
-                                        &self.db,
-                                        self.agent,
-                                        Arc::new(status.clone()),
-                                        queue.map(Arc::from),
-                                        reset || !told,
-                                    );
-                                    told = true;
-                                } else {
-                                    told = false;
+                            Message::Status { status, queue } => {
+                                let mut snapshot = status.clone();
+                                if !self.pool.upgrade().is_some_and(|pool| pool.is_live(self.agent)) {
+                                    snapshot.response = None;
                                 }
+                                crate::journal::tell_status(
+                                    &self.db, self.agent, Arc::new(snapshot), queue.map(Arc::from),
+                                );
                                 self.status.send_replace(status);
                                 continue;
                             }

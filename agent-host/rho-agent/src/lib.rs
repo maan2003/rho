@@ -7,18 +7,13 @@
 //! the text helpers both runtimes tell the story with.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use rho_agent_types::{
-    AgentId, AgentRole, AgentWant, ContentPart, MessageDelivery, Place, TurnEdge, TurnOutcome,
-    UnixMs, WorksetMode,
+    AgentId, AgentRole, AgentWant, ContentPart, MessageDelivery, Place, TurnEdge, UnixMs,
+    WorksetMode,
 };
-use rho_inference::types::{
-    ApplyPatchMetadata, ContextBlock, MessageSender, PendingInferenceResponse, ToolCall,
-    ToolCallId, ToolResult, ToolSpec,
-};
+use rho_inference::types::{ContextBlock, MessageSender, PendingInferenceResponse, ToolSpec};
 use senax_encoder::{Decode, Encode};
 
 use crate::db::{AgentEventPos, AgentRuntime, AgentSpawnedBy, ClaudeRewind, SessionBinding};
@@ -375,24 +370,24 @@ pub struct TranscriptCall {
     pub arguments: String,
 }
 
-/// A text-only, durably committed transcript source for the presentation
-/// sidecar.
+pub use rho_agents_client::protocol::transcript::{
+    InferenceState, RuntimeState, StreamingResponse,
+};
 
-/// What a loop publishes about itself: its phase, and how much input
-/// waits. Everything else a reader wants is in the log.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+/// Replaceable live state. Neither runtime occupancy nor partial responses
+/// belong in durable history.
+#[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
 pub struct AgentStatus {
-    pub kind: AgentStateKind,
+    pub runtime: RuntimeState,
+    pub response: Option<StreamingResponse>,
     /// Inputs waiting to enter model context.
     pub queued: usize,
 }
 
 impl AgentStatus {
-    /// Snapshot says nothing is running or queued. Remote snapshots may be
-    /// stale; retiring a runtime additionally requires its serialized
-    /// admission fence.
+    /// The serialized retirement fence still checks the worker's own state.
     pub fn settled(&self) -> bool {
-        !self.kind.is_working() && self.queued == 0
+        !self.runtime.is_working() && self.queued == 0
     }
 }
 
@@ -406,7 +401,7 @@ pub struct AgentState {
     pub blocks: Vec<Arc<ContextBlock>>,
     /// Inputs waiting to enter model context, in arrival order.
     pub queued_inputs: InputQueues,
-    pub kind: AgentStateKind,
+    pub kind: InferenceState,
     /// Tokens occupying the model's context window after the latest
     /// response (all input, cached or not, plus that response's output).
     /// `None` until the agent's first response reports usage.
@@ -453,103 +448,6 @@ impl InputQueues {
     pub fn retain(&mut self, pred: impl FnMut(&QueuedInput) -> bool) {
         self.items.retain(pred);
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-// should be cheap to clone, it is cloned a lot
-pub enum AgentStateKind {
-    /// Native Python source while the provider is writing it. This is not a
-    /// user-facing message and does not imply the cell has finished.
-    Writing {
-        call: Option<rho_inference::step::Call>,
-    },
-    ApiStreaming {
-        pending_response: PendingInferenceResponse,
-        previous_attempt: Option<FailedInferenceResponse>,
-    },
-    /// Calls are running, or the model asked to be left alone until
-    /// `waiting`.
-    ToolCalling {
-        previews: BTreeMap<ToolCallId, ToolPreview>,
-        /// Results of the calls that have finished so far. The Rho runtime
-        /// reports results through its blocks; this is for runtimes that
-        /// hold them back.
-        results: Vec<ToolResult>,
-        /// When the model's `wait` runs out, if it asked for one.
-        waiting: Option<UnixMs>,
-    },
-    /// Loaded from a log that ended with calls nobody answered: the next
-    /// request owes them placeholder results and a note.
-    UnfinishedTurn {
-        outstanding_calls: Arc<[rho_inference::types::ExecId]>,
-    },
-    // Permanent error, thread is paused
-    Error(FailedInferenceResponse),
-    Idle,
-}
-
-/// Tells the log that a turn started or stopped. Both runtimes cross the
-/// same edge (working, then not working), and a head's `turn_running` is
-/// the fold of the two events.
-pub(crate) fn turn_edge(
-    previous: &AgentStateKind,
-    current: &AgentStateKind,
-    attempt_started: bool,
-) -> Option<TurnEdge> {
-    if !previous.is_working() && current.is_working() {
-        Some(TurnEdge::Started)
-    } else if execution_settled(previous, current, attempt_started) {
-        Some(TurnEdge::Ended(match current {
-            AgentStateKind::Error(failed) => TurnOutcome::Errored {
-                message: failed.error.to_string(),
-            },
-            _ => TurnOutcome::Completed,
-        }))
-    } else {
-        None
-    }
-}
-
-/// A reliable state-machine transition that returns execution to the user's
-/// court. A queued successor remains working and therefore does not settle
-/// between turns; entering Error settles even when initialization failed
-/// before a working snapshot was published.
-pub(crate) fn execution_settled(
-    previous: &AgentStateKind,
-    current: &AgentStateKind,
-    attempt_started: bool,
-) -> bool {
-    (previous.is_working() && !current.is_working()) || (attempt_started && !current.is_working())
-}
-
-impl AgentStateKind {
-    /// Whether the agent is actively executing a turn.
-    pub fn is_working(&self) -> bool {
-        matches!(
-            self,
-            Self::Writing { .. } | Self::ApiStreaming { .. } | Self::ToolCalling { .. }
-        )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct ToolPreview {
-    pub call: ToolCall,
-    pub started_at: UnixMs,
-    pub metadata: Option<ToolPreviewMetadata>,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum ToolPreviewMetadata {
-    ShellCommand { output_tail: String },
-    ApplyPatch(ApplyPatchMetadata),
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct FailedInferenceResponse {
-    pub partial_response: PendingInferenceResponse,
-    pub attempt_count: NonZeroU64,
-    pub error: Arc<String>,
 }
 
 /// An agent's view of its workset. One value per agent: the mount
@@ -673,7 +571,7 @@ mod encoding_tests {
             }),
             AgentEvent::Cleared { at: UnixMs(11) },
             AgentEvent::Turn {
-                edge: TurnEdge::Ended(TurnOutcome::Errored {
+                edge: TurnEdge::Ended(rho_agent_types::TurnOutcome::Errored {
                     message: "boom".to_owned(),
                 }),
                 at: UnixMs(12),

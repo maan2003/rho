@@ -119,7 +119,8 @@ pub enum Entry {
         at: UnixMs,
         since: Option<UnixMs>,
     },
-    /// Snapshot of notebook activity, independent of messages and human waits.
+    /// Legacy snapshot, decoded for existing logs only. New runtimes publish
+    /// live state.
     Activity {
         at: UnixMs,
         responding: bool,
@@ -186,28 +187,6 @@ impl Entry {
             | Entry::Activity { at, .. }
             | Entry::Notice { at, .. }
             | Entry::CompactionTrigger { at, .. } => *at,
-        }
-    }
-}
-
-/// Runtime activity is independent of the messages it sends and whether a task
-/// awaits the person. Kept separately so snapshots compare without timestamps.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Activity {
-    pub responding: bool,
-    pub running_tasks: u32,
-    pub checkin_at: Option<UnixMs>,
-    pub archived: bool,
-}
-
-impl Activity {
-    pub fn entry(self, at: UnixMs) -> Entry {
-        Entry::Activity {
-            at,
-            responding: self.responding,
-            running_tasks: self.running_tasks,
-            checkin_at: self.checkin_at,
-            archived: self.archived,
         }
     }
 }

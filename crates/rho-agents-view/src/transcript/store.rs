@@ -111,6 +111,11 @@ impl Transcripts {
         fold.delta()
     }
 
+    /// Remove ephemeral live state while retaining mirrored history.
+    pub fn disconnect(&mut self, agent_id: AgentId) -> FrameSummary {
+        self.store.disconnect(agent_id)
+    }
+
     /// Lands one frame on an agent's rendered state.
     pub fn apply(&mut self, agent_id: AgentId, frame: TranscriptFrame) -> FrameChange {
         let context_before = self.context_used(&agent_id);

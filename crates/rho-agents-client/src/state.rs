@@ -15,8 +15,8 @@ pub struct UiAgentState {
     /// row copies pointers, never text.
     pub blocks: Vec<std::sync::Arc<UiBlock>>,
     pub status: UiAgentStatus,
-    /// Durable notebook snapshot; None for legacy runtimes.
-    pub notebook: Option<UiNotebookActivity>,
+    /// Latest ephemeral runtime snapshot; absent when disconnected.
+    pub runtime: Option<crate::protocol::transcript::RuntimeState>,
     pub awaiting_human: Option<UnixMs>,
     /// Tokens occupying the model's context window after the latest
     /// response; `None` until the agent's first response.
@@ -83,6 +83,9 @@ pub enum UiBlock {
 pub enum UiAgentStatus {
     Idle,
     Streaming,
+    Retrying {
+        at: UnixMs,
+    },
     ToolCalling {
         /// Deadline of the batch's armed `wait` call, if one is parked
         /// until mail arrives or the wall clock passes it.

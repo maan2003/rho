@@ -15,7 +15,7 @@ use rho_agent_types::{
 use crate::HostId;
 use crate::protocol::AgentUsageBucket;
 use crate::protocol::transcript::{
-    RuntimeKind, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
+    RuntimeKind, RuntimeState, SpawnedBy, Speaker, ToolOutcome, ToolStatus, TranscriptEvent,
 };
 use crate::state::{
     UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiNotebookActivity, UiToolStatus,
@@ -44,7 +44,7 @@ pub struct Verdict {
 }
 
 /// What of a digest attention is decided from.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttentionFacts {
     pub turn_running: bool,
     /// Where the last turn died, if nothing has happened since.
@@ -53,7 +53,7 @@ pub struct AttentionFacts {
     pub wants_at: Option<AgentPos>,
     pub awaiting_at: Option<AgentPos>,
     pub sent_at: Option<AgentPos>,
-    pub notebook: Option<UiNotebookActivity>,
+    pub runtime: Option<RuntimeState>,
 }
 
 /// How badly an agent wants the user: the join of what its rows say and
@@ -68,17 +68,22 @@ pub fn attention(facts: AttentionFacts, verdict: Verdict) -> Attention {
     // how loudly an agent may ask and not of whether it may ask at all.
     if verdict.muted {
         Attention::Quiet
-    } else if facts.awaiting_at.is_some_and(past) {
+    } else if facts.awaiting_at.map_or_else(
+        || {
+            facts
+                .runtime
+                .as_ref()
+                .is_some_and(|state| state.awaiting_human)
+        },
+        past,
+    ) {
         Attention::NeedsInput
     } else if facts.sent_at.is_some_and(past) {
         Attention::Pending
     } else if facts.errored.is_some_and(past) {
         Attention::NeedsInput
-    } else if facts.notebook.is_some() {
-        if facts
-            .notebook
-            .is_some_and(|activity| activity.responding || activity.running_tasks > 0)
-        {
+    } else if let Some(runtime) = facts.runtime.as_ref() {
+        if runtime.is_working() {
             Attention::Working
         } else {
             Attention::Quiet
@@ -161,7 +166,7 @@ impl Digest {
             wants_at: self.wants.as_ref().map(|wants| wants.at),
             awaiting_at: self.awaiting_human.map(|(pos, _)| pos),
             sent_at: self.message_sent.map(|(pos, _)| pos),
-            notebook: self.notebook,
+            runtime: None,
         }
     }
 
@@ -207,11 +212,6 @@ impl Digest {
                 self.turn_running = false;
                 self.turn_started_at = None;
                 self.last_turn_ended = Some(*at);
-                // Legacy turn-scoped labels end with the turn; explicit
-                // notebook status survives check-in and await turn edges.
-                if self.notebook.is_none() {
-                    self.activity = None;
-                }
                 self.errored = matches!(outcome, TurnOutcome::Errored { .. }).then_some(pos);
             }
             TranscriptEvent::MessageSent { to: None, at, .. } => {
@@ -441,7 +441,6 @@ pub struct FoldDelta {
     pub from: usize,
     pub blocks: Vec<Arc<UiBlock>>,
     pub status: UiAgentStatus,
-    pub notebook: Option<UiNotebookActivity>,
     pub awaiting_human: Option<UnixMs>,
     pub context_used: Option<u64>,
     pub usage: UiAgentUsage,
@@ -498,7 +497,6 @@ impl TranscriptFold {
             from,
             blocks: self.composed_from(from),
             status: state.status,
-            notebook: state.notebook,
             awaiting_human: state.awaiting_human,
             context_used: state.context_used,
             usage: state.usage,
@@ -835,7 +833,7 @@ impl TranscriptFold {
         UiAgentState {
             exec_timings: self.exec_timings.clone(),
             blocks,
-            notebook: self.digest.notebook,
+            runtime: None,
             awaiting_human: self.digest.awaiting_human.map(|(_, since)| since),
             // Never `Streaming`: this is the mirror, not the live tail. A
             // turn that was running when the client last heard is the
@@ -843,11 +841,7 @@ impl TranscriptFold {
             status: if self.errored {
                 UiAgentStatus::Error
             } else if self.turn_running {
-                if self.digest.notebook.is_some() {
-                    UiAgentStatus::Idle
-                } else {
-                    UiAgentStatus::Unloaded
-                }
+                UiAgentStatus::Unloaded
             } else {
                 UiAgentStatus::Idle
             },
@@ -1419,7 +1413,7 @@ mod tests {
         digest.tell(AgentPos(4), &user("continue", 14));
         assert_eq!(
             attention(digest.attention_facts(), Verdict::default()),
-            Attention::Working
+            Attention::Quiet // historical activity is not current runtime state
         );
         digest.tell(AgentPos(5), &activity(false, 0, true, 15));
         assert_eq!(
@@ -1429,7 +1423,7 @@ mod tests {
         digest.tell(AgentPos(6), &activity(true, 1, false, 16));
         assert_eq!(
             attention(digest.attention_facts(), Verdict::default()),
-            Attention::Working
+            Attention::Quiet
         );
     }
 
@@ -1545,7 +1539,8 @@ mod tests {
             },
         );
         let state = fold.state();
-        assert_eq!(state.notebook.unwrap().running_tasks, 2);
+        assert!(state.runtime.is_none());
+        assert_eq!(fold.digest.notebook.unwrap().running_tasks, 2);
         let UiBlock::Tool(tool) = &*state.blocks[0] else {
             panic!("expected tool")
         };
@@ -1568,6 +1563,26 @@ mod tests {
     }
 
     #[test]
+    fn live_wait_respects_a_handled_durable_wait() {
+        let mut facts = AttentionFacts {
+            runtime: Some(RuntimeState {
+                awaiting_human: true,
+                ..RuntimeState::default()
+            }),
+            ..AttentionFacts::default()
+        };
+        let verdict = Verdict {
+            handled_through: AgentPos(8),
+            muted: false,
+        };
+        assert_eq!(attention(facts.clone(), verdict), Attention::NeedsInput);
+        facts.awaiting_at = Some(AgentPos(7));
+        assert_eq!(attention(facts.clone(), verdict), Attention::Quiet);
+        facts.awaiting_at = Some(AgentPos(8));
+        assert_eq!(attention(facts, verdict), Attention::NeedsInput);
+    }
+
+    #[test]
     fn a_muted_agent_stays_quiet_through_a_turn() {
         let muted = Verdict {
             handled_through: AgentPos(0),
@@ -1579,7 +1594,7 @@ mod tests {
             wants_at: None,
             ..AttentionFacts::default()
         };
-        assert_eq!(attention(running, muted), Attention::Quiet);
+        assert_eq!(attention(running.clone(), muted), Attention::Quiet);
         assert_eq!(
             attention(running, Verdict::default()),
             Attention::Working,

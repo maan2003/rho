@@ -299,6 +299,19 @@ async fn run_async(args: Args) -> Result<()> {
                     "agent host created more than {agent_count} agents"
                 );
             }
+            Incoming::Agents(AgentsServerFrame::Live {
+                agent_id,
+                live: rho_agents_client::protocol::transcript::Live::Snapshot { state, .. },
+            }) => {
+                if matches!(
+                    state.inference,
+                    rho_agents_client::protocol::transcript::InferenceState::Responding
+                ) {
+                    responding.insert(agent_id);
+                } else {
+                    responding.remove(&agent_id);
+                }
+            }
             Incoming::Agents(AgentsServerFrame::Log { entries }) => {
                 for entry in entries {
                     ensure!(
@@ -377,15 +390,6 @@ async fn run_async(args: Args) -> Result<()> {
                                     .await?;
                             }
                             report_at.insert(entry.agent_id, at);
-                        }
-                        TranscriptEvent::NotebookActivity {
-                            responding: active, ..
-                        } => {
-                            if active {
-                                responding.insert(entry.agent_id);
-                            } else {
-                                responding.remove(&entry.agent_id);
-                            }
                         }
                         TranscriptEvent::AwaitingHuman { since, .. } => {
                             if since.is_some() {

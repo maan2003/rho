@@ -22,7 +22,6 @@ mod agents;
 pub mod debug;
 mod desktop;
 mod host;
-mod live;
 mod realtime;
 mod secret_store;
 mod transcript;

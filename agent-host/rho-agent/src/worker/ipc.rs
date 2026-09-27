@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::AgentEvent;
 use crate::db::{AgentEventPos, AgentHead, AgentUsageBucket, ClaudeRewind, SessionBinding};
 
-pub(super) const VERSION: u32 = 10;
+pub(super) const VERSION: u32 = 11;
 
 #[derive(Encode, Decode)]
 pub(super) struct Bootstrap {
@@ -132,7 +132,6 @@ pub(super) enum Message<'a> {
     Status {
         status: crate::AgentStatus,
         queue: Option<Vec<crate::QueuedInput>>,
-        reset: bool,
     },
     HistoryBatch {
         id: u64,
@@ -195,7 +194,6 @@ struct Publication {
     queue: Mutex<Option<Vec<crate::QueuedInput>>>,
     status: Mutex<std::sync::Weak<std::sync::RwLock<crate::AgentStatus>>>,
     changed: tokio::sync::Notify,
-    full: std::sync::atomic::AtomicBool,
 }
 
 /// Worker-side services. There is no database or account manager behind this
@@ -316,9 +314,8 @@ impl Host {
                             let status = published.status.lock().expect("poison").upgrade()
                                 .map(|status| status.read().expect("poison").clone());
                             if let Some(status) = status {
-                                let reset = published.full.swap(false, Ordering::Relaxed);
                                 let queue = published.queue.lock().expect("poison").clone();
-                                writer.send(port, encode(&Message::Status { status, queue, reset })?).await?;
+                                writer.send(port, encode(&Message::Status { status, queue })?).await?;
                             }
                         }
                     }
@@ -411,7 +408,6 @@ impl Host {
     }
 
     pub(crate) fn tell_tail(&self) {
-        self.publication.full.store(true, Ordering::Relaxed);
         self.published();
     }
 

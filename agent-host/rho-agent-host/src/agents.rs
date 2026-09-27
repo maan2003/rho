@@ -3,7 +3,7 @@
 //! the journal, the live tails, new agents and the quota; requests,
 //! terminals, shells and workspace channels are streams of their own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -311,11 +311,8 @@ where
 /// seq it sent. A lagged subscription does the same. Rows the transcript
 /// leaves behind (`strip` says nothing) advance the seq without a message.
 ///
-/// Each connection tells each loop's tail itself, from the loop's status:
-/// a teller that has told nothing tells the tail whole, so a connection
-/// that just caught up, or lost statuses to a lag, starts from nothing.
-/// The loops are asked for their status once caught up, so an idle one
-/// is told too.
+/// Catch-up is followed by full live snapshots. No connection-local delta
+/// encoder is needed: repeated snapshots replace the same ephemeral state.
 fn spawn_log_follow(
     services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<rho_agents_client::protocol::ServerFrame>,
@@ -330,7 +327,6 @@ fn spawn_log_follow(
         if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
             return;
         }
-        let mut tellers = HashMap::<AgentId, crate::live::Teller>::new();
         services.pool.tell_tails().await;
         loop {
             match feed.recv().await {
@@ -338,26 +334,27 @@ fn spawn_log_follow(
                     agent_id,
                     status,
                     queue,
-                    reset,
                 }) => {
-                    let teller = tellers.entry(agent_id).or_default();
-                    if reset {
-                        teller.reset();
-                    }
-                    let queue = queue.and_then(|queue| {
-                        let items = queue
-                            .iter()
-                            .map(crate::live::queued_item)
-                            .collect::<Vec<_>>();
-                        teller.tell_queue(&items)
-                    });
-                    for live in queue.into_iter().chain(teller.tell(&status.kind)) {
+                    if let Some(queue) = queue {
+                        let live = rho_agents_client::protocol::transcript::Live::Queued {
+                            items: queue.iter().map(crate::transcript::queued_item).collect(),
+                        };
                         if outgoing_tx
                             .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
                             .is_err()
                         {
                             return;
                         }
+                    }
+                    let live = rho_agents_client::protocol::transcript::Live::Snapshot {
+                        state: status.runtime.clone(),
+                        response: status.response.clone(),
+                    };
+                    if outgoing_tx
+                        .send(rho_agents_client::protocol::ServerFrame::Live { agent_id, live })
+                        .is_err()
+                    {
+                        return;
                     }
                 }
                 Ok(Feed::Appended(appended)) => {
@@ -371,7 +368,6 @@ fn spawn_log_follow(
                     if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
                         return;
                     }
-                    tellers.clear();
                     services.pool.tell_tails().await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -1077,7 +1073,7 @@ fn agent_detail(
                 .filter_map(|slot| match slot {
                     rho_inference::types::StreamingContextItemState::Pending(item)
                     | rho_inference::types::StreamingContextItemState::Finished(item) => {
-                        crate::live::to_item(item)
+                        crate::transcript::to_item(item)
                     }
                     rho_inference::types::StreamingContextItemState::Empty => None,
                 })

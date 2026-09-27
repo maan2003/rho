@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rho_agent_types::{ToolOutputStatus, UnixMs};
+use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item, StreamingResponse};
 use rho_claude::protocol::{
     AssistantContent, AssistantMessage, OutputContent, SystemCompactMetadata, TokenUsage,
     UserOutputMessage,
@@ -112,6 +113,25 @@ impl ClaudeStreamItem {
         Ok(())
     }
 
+    /// Claude's visible live projection. Assistant prose belongs in the
+    /// committed transcript, not in the live response.
+    pub(super) fn to_live_item(&self) -> Option<Item> {
+        match self {
+            Self::Text(_) => None,
+            Self::Thinking(text) => Some(Item::Reasoning { text: text.clone() }),
+            Self::ToolUse {
+                id,
+                name,
+                arguments,
+            } => Some(Item::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                format: ArgumentsFormat::Json,
+            }),
+        }
+    }
+
     pub(super) fn to_streaming_context_item(&self) -> anyhow::Result<StreamingContextItem> {
         Ok(match self {
             Self::Text(text) => StreamingContextItem::AssistantMessage {
@@ -137,6 +157,23 @@ impl ClaudeStreamItem {
             },
         })
     }
+}
+
+/// A complete replaceable snapshot of the visible blocks of one provider
+/// response. The id belongs to the provider message, never to an item delta.
+pub(super) fn live_response(
+    id: Option<&str>,
+    items: &BTreeMap<usize, ClaudeStreamItem>,
+) -> Option<StreamingResponse> {
+    let id = id?;
+    let items: Vec<_> = items
+        .values()
+        .filter_map(ClaudeStreamItem::to_live_item)
+        .collect();
+    (!items.is_empty()).then_some(StreamingResponse {
+        id: id.to_owned(),
+        items,
+    })
 }
 
 /// What the projection remembers from one line to the next.
@@ -565,6 +602,91 @@ mod tests {
             TranscriptLine::Compacted {
                 context_used: Some(2000)
             }
+        );
+    }
+
+    #[test]
+    fn live_response_replaces_items_but_keeps_provider_message_identity() {
+        let mut blocks = BTreeMap::new();
+        blocks.insert(0, ClaudeStreamItem::Text("hidden prose".into()));
+        assert!(live_response(Some("response-a"), &blocks).is_none());
+        blocks.insert(2, ClaudeStreamItem::Thinking("first".into()));
+        let first = live_response(Some("response-a"), &blocks).unwrap();
+        assert_eq!(first.id, "response-a");
+        assert_eq!(
+            first.items,
+            vec![Item::Reasoning {
+                text: "first".into()
+            }]
+        );
+        blocks.insert(2, ClaudeStreamItem::Thinking("first and more".into()));
+        blocks.insert(
+            3,
+            ClaudeStreamItem::ToolUse {
+                id: "call-1".into(),
+                name: "exec".into(),
+                arguments: "{\"code\":\"x\"}".into(),
+            },
+        );
+        let next = live_response(Some("response-a"), &blocks).unwrap();
+        assert_eq!(next.id, first.id);
+        assert_eq!(next.items.len(), 2);
+        assert_eq!(
+            next.items[0],
+            Item::Reasoning {
+                text: "first and more".into()
+            }
+        );
+        assert!(matches!(&next.items[1], Item::ToolCall { id, .. } if id == "call-1"));
+        blocks.remove(&2);
+        assert_eq!(
+            live_response(Some("response-a"), &blocks)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        blocks.clear();
+        assert!(live_response(Some("response-a"), &blocks).is_none());
+        blocks.insert(0, ClaudeStreamItem::Thinking("new message".into()));
+        assert_eq!(
+            live_response(Some("response-b"), &blocks).unwrap().id,
+            "response-b"
+        );
+    }
+
+    #[test]
+    fn live_projection_hides_prose_and_keeps_partial_tool_json_and_reasoning() {
+        let prose = ClaudeStreamItem::Text("not for the live tail".into());
+        assert_eq!(prose.to_live_item(), None);
+
+        let mut tool = ClaudeStreamItem::from_content_block(
+            rho_claude::protocol::StreamContentBlock::ToolUse {
+                id: "tool-7".into(),
+                name: "mcp__py__exec".into(),
+                input: serde_json::Value::Null,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        tool.apply_delta(rho_claude::protocol::ContentBlockDelta::InputJsonDelta {
+            partial_json: "{\"code\":\"x=1\"}".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            tool.to_live_item(),
+            Some(Item::ToolCall {
+                id: "tool-7".into(),
+                name: "mcp__py__exec".into(),
+                arguments: "{\"code\":\"x=1\"}".into(),
+                format: ArgumentsFormat::Json,
+            })
+        );
+        assert_eq!(
+            ClaudeStreamItem::Thinking("why\nnext".into()).to_live_item(),
+            Some(Item::Reasoning {
+                text: "why\nnext".into()
+            }),
         );
     }
 

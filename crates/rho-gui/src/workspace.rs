@@ -1415,9 +1415,9 @@ impl Workspace {
                         .put_away(now)
                     && {
                         let facts = self.registry.agent_facts(*agent_id);
-                        facts.notebook.map_or(facts.turn_running, |activity| {
-                            activity.responding || activity.running_tasks > 0
-                        })
+                        facts
+                            .runtime
+                            .map_or(facts.turn_running, |activity| activity.is_working())
                     }
             })
             .collect::<Vec<_>>();
@@ -1446,12 +1446,12 @@ impl Workspace {
                         .and_then(|path| path.rsplit('/').next())
                         .unwrap_or_default()
                         .to_owned(),
-                    elapsed: if facts.notebook.is_some() {
+                    elapsed: if facts.runtime.is_some() {
                         String::new()
                     } else {
                         crate::home::running_elapsed_label(&facts, now_ms)
                     },
-                    last_line: if facts.notebook.is_some() {
+                    last_line: if facts.runtime.is_some() {
                         crate::attention::agent_state_label(
                             &facts,
                             chrono::Local::now().fixed_offset(),
@@ -1819,6 +1819,12 @@ impl Workspace {
             rho_agents_client::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
             }
+            rho_agents_client::model::ModelMsg::Runtime { agent_id, state } => {
+                if self.registry.set_runtime(agent_id, state) {
+                    self.invalidate_dealer_signals(cx);
+                    self.refresh_home(cx);
+                }
+            }
             rho_agents_client::model::ModelMsg::Live { agent_id, live } => {
                 self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
             }
@@ -1867,6 +1873,15 @@ impl Workspace {
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
+            if let TranscriptFrame::Live(
+                rho_agents_client::protocol::transcript::Live::Snapshot { state, .. },
+            ) = &frame
+            {
+                if self.registry.set_runtime(agent_id, state.clone()) {
+                    self.invalidate_dealer_signals(cx);
+                    self.refresh_home(cx);
+                }
+            }
             let Some((summary, old_context, usage_changed, became_live)) =
                 self.apply_frame_state(agent_id, frame)
             else {
@@ -1997,6 +2012,19 @@ impl Workspace {
                 self.hosts
                     .set_status(host, HostStatus::Disconnected(reason.clone()));
                 self.replay_hosts.insert(host);
+                for agent_id in self.registry.host_agents(host) {
+                    if self.transcripts.state(&agent_id).is_some() {
+                        let summary = self.transcripts.disconnect(agent_id);
+                        if let Some(view) = self.models.get(&agent_id).cloned() {
+                            self.sync_agent_model(agent_id, &view, summary, false, cx);
+                        }
+                        if let Some(view) = self.activity_models.get(&agent_id).cloned() {
+                            self.sync_agent_model(agent_id, &view, summary, false, cx);
+                        }
+                    }
+                }
+                self.registry.clear_host_runtime(host);
+                self.refresh_home(cx);
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
@@ -4949,7 +4977,7 @@ impl Workspace {
                 exec_timings: Default::default(),
                 blocks: Vec::new(),
                 status: rho_agents_client::state::UiAgentStatus::Idle,
-                notebook: None,
+                runtime: None,
                 awaiting_human: None,
                 context_used: None,
                 usage: Default::default(),

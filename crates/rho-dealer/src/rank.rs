@@ -230,9 +230,10 @@ fn rank_into(
         };
         let facts = agents.agent_facts(agent_id);
         if facts
-            .notebook
-            .is_some_and(|activity| activity.responding || activity.running_tasks > 0)
-            || (facts.notebook.is_none() && facts.turn_running)
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.is_working())
+            || (facts.runtime.is_none() && facts.turn_running)
         {
             running.insert(node.clone());
         }
@@ -242,7 +243,7 @@ fn rank_into(
             trace.input(&node, "digest newest", digest.newest.0.to_string());
             trace.input(&node, "seen through", seen.to_string());
         }
-        let code_first = facts.notebook.is_some()
+        let code_first = facts.runtime.is_some()
             || digest.awaiting_human.is_some()
             || digest.message_sent.is_some();
         let attention_at = if code_first {

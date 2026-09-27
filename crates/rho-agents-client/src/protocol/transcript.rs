@@ -274,30 +274,54 @@ pub struct LogEntry {
 /// is a row: the queue is `Message` rows no `Sent` has carried, a call
 /// runs until a `Sent` answers it, a turn ends with a `Turn` row.
 ///
-/// The runtime writes its row and then says what the tail is from the
-/// same task, so a client applies the row first and the tail after;
-/// nothing ever shows twice. A joiner is told `Requesting`, one `Item`
-/// per index, then the phase, and drops an `Appended` for an index it
-/// does not hold. Told for every agent any client is looking at, to
-/// every client.
+/// Each snapshot replaces the entire runtime state and streaming response.
+/// Durable transcript rows remain the source of committed history.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Live {
-    /// A request went out; the tail is empty. Also a retry: the partial
-    /// response went to the log as `Failed` first.
-    Requesting,
-    /// First sight of an item, or a change that is not an append.
-    Item { index: u32, item: Item },
-    /// The item's text grew by this much.
-    Appended { index: u32, text: String },
-    /// Calls are running, or the model asked to be left alone until then.
-    Waiting { until: Option<UnixMs> },
-    /// Nothing in flight.
-    Idle,
-    /// What waits to go in, whole, whenever it changes. A Claude agent's
-    /// queue lives in Claude Code's process and nothing persists it, so
-    /// it is told here and never as rows; the native runtime's queue is
-    /// its `Message` rows, and it says nothing here.
+    Snapshot {
+        state: RuntimeState,
+        response: Option<StreamingResponse>,
+    },
+    /// Claude Code holds its queue in its process, outside the mirror.
     Queued { items: Vec<QueuedItem> },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct RuntimeState {
+    pub inference: InferenceState,
+    pub running_tasks: u32,
+    pub awaiting_human: bool,
+    pub checkin_at: Option<UnixMs>,
+    pub archived: bool,
+}
+
+impl RuntimeState {
+    pub fn is_working(&self) -> bool {
+        matches!(
+            self.inference,
+            InferenceState::Responding | InferenceState::Retrying { .. }
+        ) || (!self.archived && self.running_tasks > 0)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum InferenceState {
+    #[default]
+    Idle,
+    Responding,
+    Retrying {
+        at: UnixMs,
+        error: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct StreamingResponse {
+    pub id: String,
+    pub items: Vec<Item>,
 }
 
 /// One thing waiting in an agent's queue.

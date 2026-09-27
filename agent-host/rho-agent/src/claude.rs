@@ -6,7 +6,6 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Write as _;
-use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -20,17 +19,19 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{AgentRoleSessionProfile as _, AgentRuntime, ClaudeRewind, UnixMillis};
-use crate::entry::{Activity, Block, Entry, MessageId, Notice, Party};
+use crate::entry::{Block, Entry, MessageId, Notice, Party};
 use crate::runtime::mailroom::{Mailroom, Outbound};
 use crate::{
-    AgentEvent, AgentState, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind,
-    InputQueues, QueuedInput, TranscriptLine, prompt,
+    AgentEvent, AgentState, AgentStatus, InferenceState, InputKind, InputQueues, QueuedInput,
+    RuntimeState, TranscriptLine, prompt,
 };
 
 pub(crate) mod projection;
 pub(crate) mod python_host;
 
-use projection::{ClaudeStreamItem, Projection, assistant_row, compacted_row, user_row};
+use projection::{
+    ClaudeStreamItem, Projection, assistant_row, compacted_row, live_response, user_row,
+};
 
 use crate::lazy::Lazy;
 
@@ -60,7 +61,11 @@ impl ClaudeAgent {
         head: crate::db::AgentHead,
     ) -> (Self, ClaudeLoop) {
         let status = Arc::new(RwLock::new(AgentStatus {
-            kind: state.kind.clone(),
+            runtime: RuntimeState {
+                inference: state.kind.clone(),
+                ..Default::default()
+            },
+            response: None,
             queued: state.queued_inputs.len(),
         }));
         let head = Arc::new(RwLock::new(head));
@@ -87,7 +92,6 @@ impl ClaudeAgent {
             outbox,
             awaiting: false,
             archived: false,
-            activity: None,
             pending_human: VecDeque::new(),
             pending_agent: VecDeque::new(),
             delivered: Vec::new(),
@@ -97,6 +101,7 @@ impl ClaudeAgent {
             python_wake: None,
             python_recheck: None,
             pending_response: PendingInferenceResponse::default(),
+            response_id: None,
             stream_items: BTreeMap::new(),
             response_execs: BTreeMap::new(),
             queued_turns: VecDeque::new(),
@@ -316,7 +321,6 @@ pub(crate) struct ClaudeLoop {
     outbox: mpsc::UnboundedReceiver<Outbound>,
     awaiting: bool,
     archived: bool,
-    activity: Option<Activity>,
     pending_human: VecDeque<rho_agent_types::UnixMs>,
     pending_agent: VecDeque<rho_agent_types::UnixMs>,
     delivered: Vec<(
@@ -333,6 +337,7 @@ pub(crate) struct ClaudeLoop {
     /// When the boundary said to ask it again, if it can change by itself.
     python_recheck: Option<rho_agent_types::UnixMs>,
     pending_response: PendingInferenceResponse,
+    response_id: Option<String>,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
     response_execs: BTreeMap<usize, rho_inference::types::ExecId>,
     queued_turns: VecDeque<ClaudeTurn>,
@@ -359,6 +364,36 @@ pub(crate) struct ClaudeLoop {
     /// What the projection of Claude's log keeps from one line to the
     /// next: usage already told, calls awaiting their result's times.
     projection: Projection,
+}
+
+/// The complete volatile observation made from Claude's process and notebook
+/// facts.
+fn claude_status(
+    inference: &InferenceState,
+    python: Option<&python_host::PythonHost>,
+    awaiting_human: bool,
+    archived: bool,
+    response_id: Option<&str>,
+    stream_items: &BTreeMap<usize, ClaudeStreamItem>,
+    queued: usize,
+) -> AgentStatus {
+    AgentStatus {
+        runtime: RuntimeState {
+            inference: if matches!(inference, InferenceState::Responding)
+                && python.is_some_and(python_host::PythonHost::has_pending)
+            {
+                InferenceState::Idle
+            } else {
+                inference.clone()
+            },
+            running_tasks: python.map_or(0, python_host::PythonHost::running_tasks),
+            awaiting_human,
+            checkin_at: python.and_then(python_host::PythonHost::checkin_at),
+            archived,
+        },
+        response: live_response(response_id, stream_items),
+        queued,
+    }
 }
 
 struct ClaudeTurn {
@@ -499,7 +534,7 @@ impl ClaudeLoop {
         let state = AgentState {
             blocks: Vec::new(),
             queued_inputs: InputQueues::default(),
-            kind: AgentStateKind::Idle,
+            kind: InferenceState::Idle,
             context_used: None,
             total_usage: host.usage_total().await?,
             usage_provider: match model {
@@ -559,6 +594,7 @@ impl ClaudeLoop {
                 .push_back((content, Uuid::new_v4().to_string(), sender, id));
             loop_state.pending_agent.push_back(at);
         }
+        loop_state.published();
         Ok((agent, loop_state))
     }
     fn apply_name(&mut self, named: crate::db::AgentHead) {
@@ -592,9 +628,11 @@ impl ClaudeLoop {
             })
             .await?;
         }
-        self.publish_activity().await?;
+        self.published();
         loop {
-            let initial_kind = self.state.kind.clone();
+            // The notebook can finish between iterations; compare against the
+            // last published observation rather than freshly sampled facts.
+            let initial_runtime = self.status.read().expect("poison").runtime.clone();
             let initial_execution_generation = self.execution_generation;
             if self.process.is_some() {
                 let notify = self.python.as_ref().map(|host| host.notify());
@@ -635,8 +673,7 @@ impl ClaudeLoop {
                             // An exit without a result leaves the turn open;
                             // settle it as an error so the turn end is
                             // observable (attention, parent mail).
-                            let mid_turn =
-                                matches!(self.state.kind, AgentStateKind::ApiStreaming { .. });
+                            let mid_turn = matches!(self.state.kind, InferenceState::Responding);
                             if mid_turn {
                                 self.fail(anyhow::anyhow!(
                                     "Claude Code exited before finishing the turn"
@@ -659,35 +696,45 @@ impl ClaudeLoop {
                 self.python_tick().await?;
             } else {
                 let control = tokio::select! {
-                    control = self.control_rx.recv() => control,
-                    Some(outbound) = self.outbox.recv() => { self.outbound(outbound).await?; continue; },
+                    control = self.control_rx.recv() => Some(control),
+                    Some(outbound) = self.outbox.recv() => { self.outbound(outbound).await?; None },
                     changed = self.name_updates.changed() => {
-                            changed.context("agent host naming connection closed")?;
+                        changed.context("agent host naming connection closed")?;
                         let named = self.name_updates.borrow_and_update().clone();
                         if let Some(named) = named { self.apply_name(named); self.published(); }
                         continue;
                     }
                 };
-                let Some(control) = control else {
-                    return Ok(());
-                };
-                self.handle_control(control).await?;
+                if let Some(control) = control {
+                    let Some(control) = control else {
+                        return Ok(());
+                    };
+                    self.handle_control(control).await?;
+                }
             }
             self.drain_outbox().await?;
-            self.publish_activity().await?;
-            let kind = self.state.kind.clone();
-            if let Some(edge) = crate::turn_edge(
-                &initial_kind,
-                &kind,
-                self.execution_generation != initial_execution_generation,
-            ) {
-                self.host.turn(UnixMillis::now(), edge).await?;
+            self.published();
+            let current = self.snapshot().runtime;
+            let started = !initial_runtime.is_working() && current.is_working();
+            let settled = (initial_runtime.is_working() && !current.is_working())
+                || (self.execution_generation != initial_execution_generation
+                    && !current.is_working());
+            if started {
+                self.host
+                    .turn(UnixMillis::now(), rho_agent_types::TurnEdge::Started)
+                    .await?;
+            } else if settled {
+                let outcome = match &current.inference {
+                    InferenceState::Failed { error } => rho_agent_types::TurnOutcome::Errored {
+                        message: error.clone(),
+                    },
+                    _ => rho_agent_types::TurnOutcome::Completed,
+                };
+                self.host
+                    .turn(UnixMillis::now(), rho_agent_types::TurnEdge::Ended(outcome))
+                    .await?;
             }
-            if crate::execution_settled(
-                &initial_kind,
-                &kind,
-                self.execution_generation != initial_execution_generation,
-            ) {
+            if settled {
                 self.host.settled().await?;
                 self.published();
             }
@@ -697,11 +744,7 @@ impl ClaudeLoop {
     async fn handle_control(&mut self, control: ClaudeControl) -> anyhow::Result<()> {
         match control {
             ClaudeControl::Retire(reply) => {
-                if (AgentStatus {
-                    kind: self.state.kind.clone(),
-                    queued: self.state.queued_inputs.len(),
-                })
-                .settled()
+                if self.snapshot().settled()
                     && (self.archived
                         || self
                             .python
@@ -791,7 +834,7 @@ impl ClaudeLoop {
                         host.user_spoke();
                     }
                 }
-                let busy = self.state.kind.is_working();
+                let busy = matches!(self.state.kind, InferenceState::Responding);
                 if !busy {
                     self.execution_generation = self.execution_generation.wrapping_add(1);
                 }
@@ -922,7 +965,7 @@ impl ClaudeLoop {
             }
             ClaudeControl::Cancel => {
                 let kind = self.state.kind.clone();
-                let busy = matches!(kind, AgentStateKind::ApiStreaming { .. });
+                let busy = matches!(kind, InferenceState::Responding);
                 let queued = self
                     .queued_turns
                     .iter()
@@ -947,13 +990,14 @@ impl ClaudeLoop {
                         }
                         self.close_process().await?;
                     }
-                } else if matches!(kind, AgentStateKind::Error(_)) {
+                } else if matches!(kind, InferenceState::Failed { .. }) {
                     self.close_process().await?;
                 }
                 self.cancelling = false;
                 self.pending_response = PendingInferenceResponse::default();
                 self.stream_items.clear();
-                self.set_kind(AgentStateKind::Idle);
+                self.response_id = None;
+                self.set_kind(InferenceState::Idle);
                 self.recover_pending_rewind().await?;
             }
             ClaudeControl::Rewind { turns, reply } => {
@@ -1055,10 +1099,13 @@ impl ClaudeLoop {
                 self.state.queued_inputs.clear();
                 self.pending_human.clear();
                 self.pending_agent.clear();
-                self.set_kind(AgentStateKind::Idle);
+                self.response_id = None;
+                self.stream_items.clear();
+                self.pending_response = PendingInferenceResponse::default();
+                self.set_kind(InferenceState::Idle);
             }
         }
-        self.publish_activity().await?;
+        self.published();
         Ok(())
     }
 
@@ -1077,28 +1124,7 @@ impl ClaudeLoop {
             notice: Notice::FreshNotebook,
         })
         .await?;
-        self.publish_activity().await
-    }
-
-    async fn publish_activity(&mut self) -> anyhow::Result<()> {
-        let next = Activity {
-            responding: matches!(self.state.kind, AgentStateKind::ApiStreaming { .. })
-                && self.python.as_ref().is_none_or(|host| !host.has_pending()),
-            running_tasks: self
-                .python
-                .as_ref()
-                .map_or(0, python_host::PythonHost::running_tasks),
-            checkin_at: self
-                .python
-                .as_ref()
-                .and_then(python_host::PythonHost::checkin_at),
-            archived: self.archived,
-        };
-        if self.activity != Some(next) {
-            self.activity = Some(next);
-            self.entry(next.entry(rho_agent_types::UnixMs::now()))
-                .await?;
-        }
+        self.published();
         Ok(())
     }
 
@@ -1221,7 +1247,7 @@ impl ClaudeLoop {
         anyhow::ensure!(
             matches!(
                 self.state.kind,
-                AgentStateKind::Idle | AgentStateKind::Error(_)
+                InferenceState::Idle | InferenceState::Failed { .. }
             ),
             "role changes are only available while idle or errored; cancel the turn first"
         );
@@ -1317,7 +1343,7 @@ impl ClaudeLoop {
         anyhow::ensure!(
             matches!(
                 self.state.kind,
-                AgentStateKind::Idle | AgentStateKind::Error(_)
+                InferenceState::Idle | InferenceState::Failed { .. }
             ),
             ":rewind is only available while idle or errored; use :cancel first"
         );
@@ -1406,8 +1432,9 @@ impl ClaudeLoop {
         self.pending_rewind = true;
 
         self.state.queued_inputs.clear();
-        self.state.kind = AgentStateKind::Idle;
+        self.state.kind = InferenceState::Idle;
         self.state.context_used = context_used;
+        self.response_id = None;
         self.pending_response = PendingInferenceResponse::default();
         self.stream_items.clear();
         self.turn_usage = None;
@@ -1660,7 +1687,8 @@ impl ClaudeLoop {
                 if self.cancelling {
                     self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
-                    self.set_kind(AgentStateKind::Idle);
+                    self.response_id = None;
+                    self.set_kind(InferenceState::Idle);
                 } else if message.is_error {
                     self.fail(anyhow::anyhow!("{}", message.errors.join("\n")))
                         .await?;
@@ -1668,11 +1696,12 @@ impl ClaudeLoop {
                     // CLI result prose is provider output, not a message to the human.
                     // Queued sends run next inside the CLI: staying in the
                     // streaming state avoids a false turn end between them.
+                    self.pending_response = PendingInferenceResponse::default();
+                    self.stream_items.clear();
+                    self.response_id = None;
                     if self.queued_turns.is_empty() {
-                        self.set_kind(AgentStateKind::Idle);
+                        self.set_kind(InferenceState::Idle);
                     } else {
-                        self.pending_response = PendingInferenceResponse::default();
-                        self.stream_items.clear();
                         self.set_streaming_kind();
                     }
                 }
@@ -1699,10 +1728,12 @@ impl ClaudeLoop {
                     return Ok(());
                 }
                 if message_stopped && !self.stream_items.is_empty() {
-                    // Every block's row is in by now; whatever the tail
-                    // still holds goes with the message.
+                    // The SDK message ended; any remaining tail is no longer
+                    // streaming. Finished assistant rows release their own
+                    // blocks after they are committed.
                     self.stream_items.clear();
                     self.pending_response = PendingInferenceResponse::default();
+                    self.response_id = None;
                     self.set_streaming_kind();
                 }
                 if message_stopped && let Some(usage) = self.turn_usage.take() {
@@ -1834,7 +1865,7 @@ impl ClaudeLoop {
     /// model with no call open hears it at its next call or turn end.
     async fn python_tick(&mut self) -> anyhow::Result<()> {
         let now = rho_agent_types::UnixMs::now();
-        let idle = matches!(self.state.kind, AgentStateKind::Idle)
+        let idle = matches!(self.state.kind, InferenceState::Idle)
             && self.process.is_some()
             && self.queued_turns.is_empty()
             && !self.pending_rewind;
@@ -2052,7 +2083,7 @@ impl ClaudeLoop {
                 // result kept the agent streaming; the lifecycle terminal is
                 // the final authoritative opportunity to settle it.
                 if message.state == "completed" && self.queued_turns.is_empty() {
-                    self.set_kind(AgentStateKind::Idle);
+                    self.set_kind(InferenceState::Idle);
                 }
             }
             state => {
@@ -2284,15 +2315,24 @@ impl ClaudeLoop {
     /// The loop's state changed: publish the status, and say what changed
     /// in the tail if anyone is looking. Every row this loop writes is
     /// committed before the state moves, so the tail follows its row.
+    fn snapshot(&self) -> AgentStatus {
+        claude_status(
+            &self.state.kind,
+            self.python.as_ref(),
+            self.awaiting,
+            self.archived,
+            self.response_id.as_deref(),
+            &self.stream_items,
+            self.state.queued_inputs.len(),
+        )
+    }
+
     fn published(&self) {
-        *self.status.write().expect("poison") = AgentStatus {
-            kind: self.state.kind.clone(),
-            queued: self.state.queued_inputs.len(),
-        };
+        *self.status.write().expect("poison") = self.snapshot();
         self.host.published();
     }
 
-    fn set_kind(&mut self, kind: AgentStateKind) {
+    fn set_kind(&mut self, kind: InferenceState) {
         self.state.kind = kind;
         self.published();
     }
@@ -2307,10 +2347,7 @@ impl ClaudeLoop {
     }
 
     fn set_streaming_kind(&mut self) {
-        self.set_kind(AgentStateKind::ApiStreaming {
-            pending_response: self.pending_response.clone(),
-            previous_attempt: None,
-        });
+        self.set_kind(InferenceState::Responding);
     }
 
     async fn fail(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
@@ -2335,11 +2372,11 @@ impl ClaudeLoop {
                 .await?;
         }
         self.host.failed(error.to_string()).await?;
-        self.set_kind(AgentStateKind::Error(FailedInferenceResponse {
-            partial_response: partial,
-            attempt_count: NonZeroU64::MIN,
-            error: Arc::new(error.to_string()),
-        }));
+        self.response_id = None;
+        self.stream_items.clear();
+        self.set_kind(InferenceState::Failed {
+            error: error.to_string(),
+        });
         Ok(())
     }
 
@@ -2391,6 +2428,7 @@ impl ClaudeLoop {
             rho_claude::protocol::MessageStreamEvent::MessageStart { message } => {
                 self.pending_response = PendingInferenceResponse::default();
                 self.stream_items.clear();
+                self.response_id = Some(Uuid::new_v4().to_string());
                 self.turn_usage = message.usage;
                 self.set_streaming_kind();
             }
@@ -2650,6 +2688,67 @@ fn write_generated_source(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn notebook_wait_keeps_partial_response_but_is_not_model_inference() {
+        let temp = tempfile::tempdir().unwrap();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notebook = rho_notebook::Notebook::new(
+            rho_tool_shell::ShellTools::in_directory(
+                Duration::from_secs(5),
+                temp.path().to_str().unwrap().into(),
+                Default::default(),
+            ),
+            Vec::new(),
+            Arc::clone(&notify),
+        )
+        .unwrap();
+        let mut python = python_host::PythonHost::new(notebook, notify);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            4,
+            ClaudeStreamItem::ToolUse {
+                id: "call-1".into(),
+                name: "mcp__py__exec".into(),
+                arguments: "{\"code\":\"print(1)\"}".into(),
+            },
+        );
+        let before = claude_status(
+            &InferenceState::Responding,
+            Some(&python),
+            false,
+            false,
+            Some("response-1"),
+            &blocks,
+            0,
+        );
+        assert_eq!(before.runtime.inference, InferenceState::Responding);
+        assert_eq!(before.response.as_ref().unwrap().id, "response-1");
+        assert!(
+            python
+                .exec(
+                    "request".into(),
+                    serde_json::json!(1),
+                    "call-1".try_into().unwrap(),
+                    "print(1)".into(),
+                    rho_agent_types::UnixMs::now(),
+                )
+                .is_none()
+        );
+        let waiting = claude_status(
+            &InferenceState::Responding,
+            Some(&python),
+            true,
+            false,
+            Some("response-1"),
+            &blocks,
+            0,
+        );
+        assert_eq!(waiting.runtime.inference, InferenceState::Idle);
+        assert!(waiting.runtime.awaiting_human);
+        assert_eq!(waiting.response, before.response);
+        python.shutdown().await.unwrap();
+    }
+
     #[test]
     fn restart_reconciles_only_unconfirmed_active_receipts_and_defers_archived_mail() {
         let sender = AgentId::from_counter(3, &rho_agent_types::AgentIdDomain(0)).unwrap();
@@ -2782,7 +2881,7 @@ mod tests {
         let mut state = AgentState {
             blocks: Vec::new(),
             queued_inputs: InputQueues::default(),
-            kind: AgentStateKind::Idle,
+            kind: InferenceState::Idle,
             context_used: None,
             total_usage: crate::db::AgentUsageBucket::default(),
             usage_provider: crate::db::AgentUsageModel::FABLE,

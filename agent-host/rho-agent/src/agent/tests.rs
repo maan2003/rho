@@ -201,7 +201,7 @@ async fn a_message_wakes_the_model_and_what_it_sends_is_logged() {
     assert!(told(&first[0]).contains("hi"), "{}", told(&first[0]));
     // Awaiting the human is not work: the turn is over.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(handle.status().kind, AgentStateKind::Idle);
+    assert_eq!(handle.status().runtime.inference, InferenceState::Idle);
     assert_eq!(script.requests().len(), 1);
 
     // The answer ends the wait; the cell finishing wakes the model with it.
@@ -373,7 +373,10 @@ async fn failing_requests_stop_the_agent_until_a_retry() {
         })
         .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !matches!(handle.status().kind, AgentStateKind::Error { .. }) {
+    while !matches!(
+        handle.status().runtime.inference,
+        InferenceState::Failed { .. }
+    ) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "{:?}",
@@ -402,31 +405,37 @@ async fn waiting_still_checks_in_and_archive_revival_has_a_fresh_notebook() {
         );
     let (handle, _task) = harness.start(&script).await;
     say(&handle, "start").await;
-    let entries = harness.until("a live task waiting for the human", |entries| {
-        entries.iter().any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
-            && entries.iter().any(|entry| matches!(entry,
-                Entry::Activity { responding: false, running_tasks, checkin_at: Some(_), archived: false, .. }
-                if *running_tasks > 0))
-    }).await;
+    let entries = harness
+        .until("a live task waiting for the human", |entries| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Awaiting { since: Some(_), .. }))
+                && {
+                    let state = handle.status().runtime;
+                    state.inference == InferenceState::Idle
+                        && state.running_tasks > 0
+                        && state.checkin_at.is_some()
+                        && !state.archived
+                        && state.awaiting_human
+                }
+        })
+        .await;
     assert!(
         !entries
             .iter()
             .any(|entry| matches!(entry, Entry::Sent { .. }))
     );
     let entries = harness
-        .until("archive after check-in", |entries| {
-            entries.iter().any(|entry| {
-                matches!(
-                    entry,
-                    Entry::Activity {
-                        archived: true,
-                        running_tasks: 0,
-                        ..
-                    }
-                )
-            })
+        .until("archive after check-in", |_| {
+            let state = handle.status().runtime;
+            state.archived && state.running_tasks == 0
         })
         .await;
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| matches!(entry, Entry::Activity { .. }))
+    );
     assert!(entries.iter().any(|entry| matches!(
         entry,
         Entry::Woken {
@@ -469,7 +478,10 @@ async fn transient_failures_recover_beyond_three_attempts() {
     let attempts = script.requests();
     assert_eq!(attempts.len(), 5);
     assert!(told(&attempts[4]).contains("original task"));
-    assert!(!matches!(handle.status().kind, AgentStateKind::Error(_)));
+    assert!(!matches!(
+        handle.status().runtime.inference,
+        InferenceState::Failed { .. }
+    ));
 }
 
 #[tokio::test]
@@ -553,7 +565,7 @@ async fn cancel_and_messages_remain_responsive_during_long_backoff() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(script.requests().is_empty(), "cancel must not retry");
             assert!(
-                !handle.status().kind.is_working(),
+                !handle.status().runtime.is_working(),
                 "cancel must clear the pending retry"
             );
         }
@@ -592,8 +604,8 @@ async fn exhausted_retry_window_stops_without_another_request() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(script.requests().is_empty());
-    match handle.status().kind {
-        AgentStateKind::Error(error) => assert!(error.error.contains("retry window exhausted")),
+    match handle.status().runtime.inference {
+        InferenceState::Failed { error } => assert!(error.contains("retry window exhausted")),
         other => panic!("expected terminal error, got {other:?}"),
     }
     drop(handle);
@@ -625,4 +637,73 @@ async fn a_cut_after_admission_reports_the_executed_prefix_instead_of_retrying()
             .any(|item| matches!(item, Item::Step(carry) if !carry.call_ids().is_empty())),
         "the next request must record admitted code, not replay the failed request"
     );
+}
+
+#[tokio::test]
+async fn live_response_is_replaced_only_after_its_step_is_durable() {
+    let harness = Harness::new().await;
+    let mut updates = crate::journal::feed(&harness.db);
+    let script = Arc::new(Scripted::new());
+    // Enough separate streamed lines to observe several distinct snapshots.
+    let code = format!(
+        "value = 17\n{}await human.reply()",
+        "# still writing\n".repeat(40)
+    );
+    script.then(&code);
+    let (handle, task) = harness.start(&script).await;
+    say(&handle, "run").await;
+    let mut response_id = None;
+    let mut previous = String::new();
+    let mut grew = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = handle.status();
+            if let Some(response) = status.response {
+                assert_eq!(status.runtime.inference, InferenceState::Responding);
+                let first = response_id.get_or_insert_with(|| response.id.clone());
+                assert_eq!(*first, response.id);
+                if let Some(rho_agents_client::protocol::transcript::Item::ToolCall {
+                    arguments, ..
+                }) = response.items.first() {
+                    assert!(arguments.starts_with(&previous));
+                    grew |= !previous.is_empty() && arguments.len() > previous.len();
+                    previous = arguments.clone();
+                }
+            } else if response_id.is_some() {
+                assert!(harness.entries().iter().any(|entry| matches!(
+                    entry, Entry::Step { calls, .. } if calls.first().is_some_and(|call| call.code == code)
+                )), "clearing the live response must follow the durable step");
+                assert_eq!(status.runtime.inference, InferenceState::Idle);
+                assert!(status.runtime.running_tasks > 0, "the cell still awaits the human");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    // No GUI focuses this harness. Current state still reaches the host feed,
+    // but the potentially large response body is not broadcast.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_responding = false;
+        loop {
+            if let crate::journal::Feed::Status { status, .. } = updates.recv().await.unwrap() {
+                assert!(status.response.is_none(), "unfocused response bodies must stay private to the worker/host cache");
+                saw_responding |= status.runtime.inference == InferenceState::Responding;
+                if status.runtime.awaiting_human && status.runtime.inference == InferenceState::Idle {
+                    assert!(saw_responding);
+                    assert!(status.runtime.running_tasks > 0);
+                    break;
+                }
+            }
+        }
+    }).await.unwrap();
+    assert!(grew, "must exercise multiple streamed replacements");
+    assert!(
+        !harness
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Activity { .. }))
+    );
+    handle.cancel();
+    drop(handle);
+    task.await.unwrap();
 }

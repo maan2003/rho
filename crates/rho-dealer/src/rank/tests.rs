@@ -492,14 +492,13 @@ fn code_first_permanent_failure_without_message_is_blocking() {
     let mut w = world();
     let a = w.agent("a");
     let agent = World::id(&a);
-    w.log(
+    w.agents.set_runtime(
         agent,
-        TranscriptEvent::NotebookActivity {
-            responding: false,
+        rho_agents_client::protocol::transcript::RuntimeState {
             running_tasks: 0,
             checkin_at: None,
             archived: false,
-            at: UnixMs(w.ms()),
+            ..Default::default()
         },
     );
     w.errors(&a);
@@ -512,14 +511,13 @@ fn code_first_message_and_human_wait_create_cards_during_background_tasks() {
     let a = w.agent("a");
     let agent = World::id(&a);
     let at = UnixMs(w.ms());
-    w.log(
+    w.agents.set_runtime(
         agent,
-        TranscriptEvent::NotebookActivity {
-            responding: false,
+        rho_agents_client::protocol::transcript::RuntimeState {
             running_tasks: 2,
             checkin_at: Some(at),
             archived: false,
-            at,
+            ..Default::default()
         },
     );
     assert_eq!(w.hand(), "", "tasks alone do not demand user attention");
@@ -542,14 +540,13 @@ fn code_first_message_and_human_wait_create_cards_during_background_tasks() {
     assert_eq!(w.hand(), "a · waiting on you · 0m");
     w.done(&a);
     assert_eq!(w.hand(), "");
-    w.log(
+    w.agents.set_runtime(
         agent,
-        TranscriptEvent::NotebookActivity {
-            responding: false,
+        rho_agents_client::protocol::transcript::RuntimeState {
             running_tasks: 1,
             checkin_at: Some(at),
             archived: true,
-            at,
+            ..Default::default()
         },
     );
     assert_eq!(w.hand(), "", "archiving does not fabricate a new message");

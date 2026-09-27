@@ -77,10 +77,10 @@ pub struct AgentFiling {
 
 /// Uninterpreted chronology a view may read without folding the story
 /// itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     pub turn_running: bool,
-    pub notebook: Option<crate::state::UiNotebookActivity>,
+    pub runtime: Option<crate::protocol::transcript::RuntimeState>,
     pub awaiting_human: Option<rho_agent_types::UnixMs>,
     pub last_message_sent: Option<rho_agent_types::UnixMs>,
     /// When the running turn began, when the client saw it start.
@@ -110,6 +110,9 @@ pub struct AgentMap {
     /// this and the digest, never stored.
     verdicts: BTreeMap<AgentId, Verdict>,
     activities: BTreeMap<AgentId, String>,
+    /// Ephemeral snapshots, never part of the mirror or persisted filing.
+    runtime: BTreeMap<AgentId, crate::protocol::transcript::RuntimeState>,
+    disconnected_hosts: BTreeSet<HostId>,
     /// The mirror, folded: what every agent is and what happened to it.
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: muted agents, their labels,
@@ -150,12 +153,14 @@ pub struct AgentMap {
 impl AgentMap {
     pub fn attach_host(&mut self, host: HostId, name: String) {
         self.hosts.entry(host).or_default().name = name;
+        self.disconnected_hosts.remove(&host);
     }
 
     /// A host this client is no longer attached to: everything it told us
     /// goes with it. Returns the agents that departed, so the window can
     /// move the point off one it was in.
     pub fn detach_host(&mut self, host: HostId) -> BTreeSet<AgentId> {
+        self.disconnected_hosts.remove(&host);
         if self.hosts.remove(&host).is_none() {
             return BTreeSet::new();
         }
@@ -173,6 +178,9 @@ impl AgentMap {
             )
             .collect::<BTreeSet<_>>();
         self.forget_agents(&departed);
+        for agent_id in &departed {
+            self.runtime.remove(agent_id);
+        }
         departed
     }
 
@@ -553,7 +561,26 @@ impl AgentMap {
     /// Derived from the digest and the verdict, never stored.
     pub fn attention(&self, agent_id: AgentId) -> Attention {
         match self.agent_digest(agent_id) {
-            Some(digest) => attention(digest.attention_facts(), self.agent_verdict(agent_id)),
+            Some(digest) => {
+                let mut facts = digest.attention_facts();
+                facts.runtime = self.runtime.get(&agent_id).cloned();
+                if let Some(state) = &facts.runtime {
+                    if !state.awaiting_human {
+                        facts.awaiting_at = None;
+                    }
+                    if state.is_working() {
+                        facts.turn_running = true;
+                        facts.errored = None;
+                    }
+                } else if self
+                    .host_of_agent(agent_id)
+                    .is_some_and(|host| self.disconnected_hosts.contains(&host))
+                {
+                    facts.turn_running = false;
+                    facts.awaiting_at = None;
+                }
+                attention(facts, self.agent_verdict(agent_id))
+            }
             None => Attention::Quiet,
         }
     }
@@ -710,9 +737,16 @@ impl AgentMap {
             return AgentFacts::default();
         };
         AgentFacts {
-            turn_running: digest.turn_running,
-            notebook: digest.notebook,
-            awaiting_human: digest.awaiting_human.map(|(_, since)| since),
+            turn_running: digest.turn_running
+                && !self
+                    .host_of_agent(agent_id)
+                    .is_some_and(|host| self.disconnected_hosts.contains(&host)),
+            runtime: self.runtime.get(&agent_id).cloned(),
+            awaiting_human: digest.awaiting_human.map(|(_, since)| since).filter(|_| {
+                self.runtime
+                    .get(&agent_id)
+                    .is_some_and(|state| state.awaiting_human)
+            }),
             last_message_sent: digest.message_sent.map(|(_, at)| at),
             turn_started_at: digest.turn_started_at,
             last_turn_ended: digest.last_turn_ended,
@@ -784,11 +818,32 @@ impl AgentMap {
             entry.insert(AgentLife::Known);
         }
     }
+    pub fn set_runtime(
+        &mut self,
+        agent_id: AgentId,
+        state: crate::protocol::transcript::RuntimeState,
+    ) -> bool {
+        let changed = self.runtime.insert(agent_id, state.clone()).as_ref() != Some(&state);
+        if let Some(host) = self.host_of_agent(agent_id) {
+            self.disconnected_hosts.remove(&host);
+        }
+        changed
+    }
+
+    pub fn clear_host_runtime(&mut self, host: HostId) {
+        self.disconnected_hosts.insert(host);
+        let agents = self.by_host.get(&host).cloned().unwrap_or_default();
+        for agent_id in agents {
+            self.runtime.remove(&agent_id);
+        }
+    }
+
     pub fn mark_live(&mut self, agent_id: AgentId) -> bool {
         let previous = self.agents.insert(agent_id, AgentLife::Live);
         previous != Some(AgentLife::Live)
     }
     pub fn mark_not_live(&mut self, agent_id: AgentId) {
+        self.runtime.remove(&agent_id);
         self.agents.insert(agent_id, AgentLife::Known);
     }
     /// The agent `delta` steps from the one the user is in, through the
@@ -891,6 +946,72 @@ mod tests {
                 event,
             })
             .collect()
+    }
+
+    #[test]
+    fn runtime_status_replaces_stale_durable_activity_and_disconnect_clears_it() {
+        use crate::protocol::transcript::{InferenceState, RuntimeState};
+        let host = HostId::default();
+        let mut map = AgentMap::default();
+        map.tell(
+            host,
+            &log(
+                agent(1),
+                0,
+                vec![
+                    created(1),
+                    TranscriptEvent::Turn {
+                        edge: TurnEdge::Started,
+                        at: UnixMs(2),
+                    },
+                    TranscriptEvent::AwaitingHuman {
+                        since: Some(UnixMs(3)),
+                        at: UnixMs(3),
+                    },
+                    TranscriptEvent::NotebookActivity {
+                        responding: true,
+                        running_tasks: 9,
+                        checkin_at: None,
+                        archived: false,
+                        at: UnixMs(4),
+                    },
+                ],
+            ),
+        );
+        map.set_runtime(
+            agent(1),
+            RuntimeState {
+                inference: InferenceState::Retrying {
+                    at: UnixMs(10),
+                    error: "temporary".into(),
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(map.attention(agent(1)), Attention::Working);
+        assert_eq!(map.agent_facts(agent(1)).awaiting_human, None);
+        map.set_runtime(
+            agent(1),
+            RuntimeState {
+                awaiting_human: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(map.attention(agent(1)), Attention::NeedsInput);
+        map.set_runtime(agent(1), RuntimeState::default());
+        assert_eq!(map.attention(agent(1)), Attention::Quiet);
+        map.set_runtime(
+            agent(1),
+            RuntimeState {
+                running_tasks: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(map.attention(agent(1)), Attention::Working);
+        map.clear_host_runtime(host);
+        assert_eq!(map.attention(agent(1)), Attention::Quiet);
+        assert!(!map.agent_facts(agent(1)).turn_running);
+        assert!(map.agent_facts(agent(1)).runtime.is_none());
     }
 
     #[test]

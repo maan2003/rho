@@ -13,18 +13,16 @@ mod persistence;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rho_agent_types::{
     AgentId, AgentRole, ContentPart, EngineerIntelligence, TurnEdge, TurnOutcome, UnixMs,
 };
+use rho_agents_client::protocol::transcript::{ArgumentsFormat, Item};
 use rho_inference::Inference;
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::step::{CacheKey, Call, CallId, Carry, Image, Model, Stream, Usage};
-use rho_inference::types::{PendingInferenceResponse, ToolCall, ToolName, ToolType};
 use rho_notebook::{CellHandle, Notebook};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -35,7 +33,7 @@ use crate::runtime::mailroom::{Mailroom, Outbound};
 use crate::runtime::wake::{Decision, Facts};
 use crate::runtime::{Progress, tools, wake};
 use crate::{
-    AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, ToolPreview, View, prompt,
+    AgentEvent, AgentStatus, InferenceState, RuntimeState, StreamingResponse, View, prompt,
 };
 
 /// Retries are volatile: restarting never resumes work without fresh input.
@@ -273,7 +271,6 @@ enum Control {
 struct Latest {
     cell: CellHandle,
     call: Call,
-    started_at: UnixMs,
 }
 
 /// The call of the step in progress, as its code arrives.
@@ -314,13 +311,13 @@ pub(crate) struct Agent {
     /// Whether the last published state counted as a running turn, so the
     /// turn's edges are told once each.
     working: bool,
-    activity: Option<crate::entry::Activity>,
 
     archived: bool,
     /// The next wake says the notebook is new.
     fresh: bool,
     responding: bool,
     writing: Option<Call>,
+    response_id: String,
     /// The latest cell and its call. Older ones live on in the notebook's
     /// sources.
     cell: Option<Latest>,
@@ -366,10 +363,7 @@ impl Agent {
             })
             .collect();
         let (mailroom, outbox) = Mailroom::new();
-        let status = Arc::new(RwLock::new(AgentStatus {
-            kind: AgentStateKind::Idle,
-            queued: 0,
-        }));
+        let status = Arc::new(RwLock::new(AgentStatus::default()));
         let head = Arc::new(RwLock::new(head));
         let (control, control_rx) = mpsc::unbounded_channel();
         host.observe(&status);
@@ -392,11 +386,11 @@ impl Agent {
             head: Arc::clone(&head),
             draining: None,
             working: false,
-            activity: None,
             archived: false,
             fresh: false,
             responding: false,
             writing: None,
+            response_id: String::new(),
             cell: None,
             interrupted: false,
             unread: Vec::new(),
@@ -413,7 +407,7 @@ impl Agent {
             compaction_reply: false,
         };
         agent.resume().await?;
-        agent.publish(None).await?;
+        agent.publish().await?;
         Ok((
             AgentHandle {
                 control,
@@ -492,7 +486,7 @@ impl Agent {
         loop {
             self.writer.check()?;
             if self.draining.is_some() && !self.responding {
-                self.publish(None).await?;
+                self.publish().await?;
                 self.flush().await?;
                 let _ = self.draining.take().expect("checked above").send(());
                 // Frozen like a retired loop; the driver cancels this future
@@ -529,7 +523,7 @@ impl Agent {
                 }
                 Decision::Later(recheck) => recheck,
             };
-            self.publish(recheck).await?;
+            self.publish().await?;
             let sleep = async {
                 match recheck {
                     Some(at) => tokio::time::sleep(until(at)).await,
@@ -1136,8 +1130,9 @@ impl Agent {
 
         let previous_backoff = self.backoff.take();
         self.responding = true;
+        self.response_id = uuid::Uuid::new_v4().to_string();
         self.writing = None;
-        self.publish(None).await?;
+        self.publish().await?;
         let step = {
             let model = Arc::clone(&self.model);
             // The call's code, as it arrives, runs as it arrives.
@@ -1167,7 +1162,11 @@ impl Agent {
                             Some(control) => self.control(control).await?,
                             None => return Ok(()),
                         },
-                        Some(outbound) = self.outbox.recv() => self.outbound(outbound).await?,
+                        Some(outbound) = self.outbox.recv() => {
+                            self.outbound(outbound).await?;
+                            self.publish().await?;
+                        },
+                        () = self.wake.notified() => self.publish().await?,
                     }
                 }
             };
@@ -1256,11 +1255,7 @@ impl Agent {
             (Some(call), None) => {
                 self.progress.prose = 0;
                 let cell = self.notebook().await?.run(call.code.clone());
-                self.cell = Some(Latest {
-                    cell,
-                    call,
-                    started_at: at,
-                });
+                self.cell = Some(Latest { cell, call });
                 self.progress.told_returned = false;
             }
             (None, streaming) => {
@@ -1338,7 +1333,6 @@ impl Agent {
                     id: id.clone(),
                     code: String::new(),
                 },
-                started_at: UnixMs::now(),
             });
             self.progress.told_returned = false;
             *streaming = Some(Streaming {
@@ -1363,80 +1357,66 @@ impl Agent {
 
     /// What a reader sees, built from the loop's own state.
     fn status(&self) -> AgentStatus {
-        let kind = if let Some(backoff) = &self.backoff {
-            AgentStateKind::ToolCalling {
-                previews: BTreeMap::new(),
-                results: Vec::new(),
-                waiting: Some(backoff.at),
+        let inference = if let Some(backoff) = &self.backoff {
+            InferenceState::Retrying {
+                at: backoff.at,
+                error: backoff.error.clone(),
             }
         } else if self.responding {
-            AgentStateKind::Writing {
-                call: self.writing.clone(),
-            }
+            InferenceState::Responding
         } else if let Some(Stopped::Failed(error)) = &self.stopped {
-            AgentStateKind::Error(FailedInferenceResponse {
-                partial_response: PendingInferenceResponse::default(),
-                attempt_count: NonZeroU64::MIN,
-                error: Arc::new(error.to_string()),
-            })
-        } else if self.cell_running() && !self.awaiting && !self.archived {
-            let latest = self.cell.as_ref().expect("running");
-            let id = rho_inference::types::ExecId::try_from(latest.call.id.as_str().to_owned())
-                .unwrap_or_else(|_| "exec".try_into().expect("valid id"));
-            let preview = ToolPreview {
-                call: ToolCall {
-                    id: id.clone(),
-                    name: ToolName::try_from("exec").expect("valid tool name"),
-                    tool_type: ToolType::Custom,
-                    arguments: latest.call.code.clone(),
-                },
-                started_at: latest.started_at,
-                metadata: None,
-            };
-            AgentStateKind::ToolCalling {
-                previews: BTreeMap::from([(id, preview)]),
-                results: Vec::new(),
-                waiting: None,
+            InferenceState::Failed {
+                error: error.to_string(),
             }
         } else {
-            AgentStateKind::Idle
+            InferenceState::Idle
         };
         AgentStatus {
-            kind,
+            runtime: RuntimeState {
+                inference,
+                running_tasks: self.notebook.as_ref().map_or(0, |notebook| {
+                    notebook
+                        .facts()
+                        .iter()
+                        .filter(|source| {
+                            matches!(
+                                source.kind,
+                                rho_notebook::Kind::Cell | rho_notebook::Kind::Task
+                            ) && source.finished.is_none()
+                        })
+                        .count() as u32
+                }),
+                awaiting_human: self.awaiting,
+                checkin_at: if self.archived || self.stopped.is_some() {
+                    None
+                } else {
+                    self.facts().checkin
+                },
+                archived: self.archived,
+            },
+            response: self.responding.then(|| StreamingResponse {
+                id: self.response_id.clone(),
+                items: self
+                    .writing
+                    .iter()
+                    .map(|call| Item::ToolCall {
+                        id: call.id.as_str().to_owned(),
+                        name: "exec".to_owned(),
+                        arguments: call.code.clone(),
+                        format: ArgumentsFormat::Text,
+                    })
+                    .collect(),
+            }),
             queued: self.unread.len(),
         }
     }
 
-    /// Publish, and tell the log when the turn's edge moved: started when
-    /// the agent begins working, ended when it hands back.
-    async fn publish(&mut self, _recheck: Option<UnixMs>) -> anyhow::Result<()> {
-        let activity = crate::entry::Activity {
-            responding: self.responding,
-            running_tasks: self.notebook.as_ref().map_or(0, |notebook| {
-                notebook
-                    .facts()
-                    .iter()
-                    .filter(|source| {
-                        matches!(
-                            source.kind,
-                            rho_notebook::Kind::Cell | rho_notebook::Kind::Task
-                        ) && source.finished.is_none()
-                    })
-                    .count() as u32
-            }),
-            checkin_at: if self.archived || self.stopped.is_some() {
-                None
-            } else {
-                self.facts().checkin
-            },
-            archived: self.archived,
-        };
-        if self.activity != Some(activity) {
-            self.append(activity.entry(UnixMs::now())).await?;
-            self.activity = Some(activity);
-        }
+    /// Durable history is committed before replacing the live response.
+    /// Current occupancy is published directly, never appended to history.
+    async fn publish(&mut self) -> anyhow::Result<()> {
+        self.flush().await?;
         let status = self.status();
-        let working = status.kind.is_working();
+        let working = status.runtime.is_working();
         if working != self.working {
             let edge = if working {
                 TurnEdge::Started

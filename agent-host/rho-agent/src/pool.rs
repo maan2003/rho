@@ -452,21 +452,18 @@ impl AgentPool {
         agent.tell_tail();
     }
 
-    /// Every loaded live agent tells its tail whole again: a connection
-    /// just caught up from the journal and holds nothing of the tails.
+    /// A reconnect gets current state for every loaded agent. Only focused
+    /// agents include a response body; runtime occupancy is useful everywhere.
     pub async fn tell_tails(&self) {
-        let live = self
-            .live
-            .lock()
-            .expect("poison")
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
         let agents = self.agents.lock().await;
-        for agent_id in live {
-            if let Some(agent) = agents.get(&agent_id) {
-                agent.tell_tail();
+        for (agent_id, agent) in agents.iter() {
+            let mut status = agent.status();
+            if !self.is_live(*agent_id) {
+                status.response = None;
             }
+            crate::journal::tell_status(&self.db, *agent_id, Arc::new(status), None);
+            // Claude's queue is held by the worker, so ask it to republish too.
+            agent.tell_tail();
         }
     }
 
@@ -744,7 +741,7 @@ impl AgentPool {
         let working_children = children
             .into_iter()
             .filter_map(|id| agents.get(&id))
-            .filter(|agent| agent.status().kind.is_working())
+            .filter(|agent| agent.status().runtime.is_working())
             .count();
         if working_children >= MAX_WORKING_CHILDREN {
             anyhow::bail!(

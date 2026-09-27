@@ -7,13 +7,13 @@
 use rho_agent::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
 use rho_agent::entry::{Block, Entry, Notice, Party, Wake};
 use rho_agent::{AgentEvent, InputKind, QueuedInput};
-use rho_agent_types::PresentationField;
 #[cfg(test)]
 use rho_agent_types::UnixMs;
+use rho_agent_types::{ContentPart, PresentationField};
 use rho_agents_client::protocol::transcript::{
-    ArgumentsFormat, Item, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
+    ArgumentsFormat, Item, QueuedItem, RuntimeKind, SpawnedBy, TranscriptEvent, Usage,
 };
-use rho_inference::types::{MessageSender, ToolType};
+use rho_inference::types::{AStr, MessageSender, StreamingContextItem, ToolType};
 
 pub fn runtime_kind(runtime: &AgentRuntime) -> RuntimeKind {
     match runtime {
@@ -497,5 +497,79 @@ mod tests {
                 at: UnixMs(17),
             })
         );
+    }
+}
+
+/// The item as a client draws it. Compaction and unknown items have no
+/// face; their index is never told.
+pub fn to_item(item: &StreamingContextItem) -> Option<Item> {
+    Some(match item {
+        StreamingContextItem::AssistantMessage { .. } => return None,
+        StreamingContextItem::RawReasoning {
+            content, summary, ..
+        } => Item::Reasoning {
+            text: reasoning_text(content, summary),
+        },
+        StreamingContextItem::EncryptedReasoning { summary, .. } => {
+            if summary.is_empty() {
+                return None;
+            }
+            Item::Reasoning {
+                text: join(summary),
+            }
+        }
+        StreamingContextItem::ToolCall {
+            id,
+            name,
+            arguments,
+            tool_type,
+            ..
+        } => Item::ToolCall {
+            id: id.as_str().to_owned(),
+            name: name.as_str().to_owned(),
+            arguments: arguments.to_string(),
+            format: crate::transcript::arguments_format(*tool_type),
+        },
+        StreamingContextItem::Compaction { .. } | StreamingContextItem::Unknown { .. } => {
+            return None;
+        }
+    })
+}
+
+fn reasoning_text(content: &AStr, summary: &[AStr]) -> String {
+    if summary.is_empty() {
+        content.to_string()
+    } else {
+        join(summary)
+    }
+}
+
+fn join(parts: &[AStr]) -> String {
+    parts
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A queued input as the wire tells it.
+pub fn queued_item(input: &QueuedInput) -> QueuedItem {
+    match &input.kind {
+        InputKind::Message { content } => QueuedItem::Message {
+            from: match input.source {
+                rho_inference::types::MessageSender::User => None,
+                rho_inference::types::MessageSender::Agent { id } => Some(id),
+            },
+            text: content
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => text.as_str(),
+                    ContentPart::Image { .. } => "[image]",
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            delivery: input.delivery,
+        },
+        InputKind::Compaction => QueuedItem::Compaction,
     }
 }

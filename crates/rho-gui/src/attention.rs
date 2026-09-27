@@ -1028,44 +1028,87 @@ pub(crate) fn agent_state_label(
     facts: &rho_agents_client::AgentFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> Option<String> {
+    if facts
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.awaiting_human)
+        && facts.awaiting_human.is_none()
+    {
+        return Some("waiting on you".to_owned());
+    }
     if let Some(since) = facts.awaiting_human {
         let mut label = format!(
             "waiting on you · {}",
             crate::home::elapsed_label(since.0 as i64, now.timestamp_millis())
         );
-        if let Some(notebook) = facts.notebook {
-            if notebook.archived {
-                label.push_str(" · archived");
-            } else if notebook.running_tasks > 0 {
-                label.push_str(&format!(
-                    " · {} running task{}",
-                    notebook.running_tasks,
-                    if notebook.running_tasks == 1 { "" } else { "s" }
-                ));
-            } else if notebook.responding {
-                label.push_str(" · responding");
+        if let Some(runtime) = facts.runtime.as_ref() {
+            match &runtime.inference {
+                rho_agents_client::protocol::transcript::InferenceState::Retrying {
+                    at, ..
+                } => label.push_str(&format!(
+                    " · retrying in {}",
+                    crate::home::elapsed_label(now.timestamp_millis(), at.0 as i64)
+                )),
+                rho_agents_client::protocol::transcript::InferenceState::Responding => {
+                    label.push_str(" · responding")
+                }
+                rho_agents_client::protocol::transcript::InferenceState::Failed { .. } => {
+                    label.push_str(" · errored")
+                }
+                rho_agents_client::protocol::transcript::InferenceState::Idle
+                    if runtime.archived =>
+                {
+                    label.push_str(" · archived")
+                }
+                rho_agents_client::protocol::transcript::InferenceState::Idle
+                    if runtime.running_tasks > 0 =>
+                {
+                    label.push_str(&format!(
+                        " · {} running task{}",
+                        runtime.running_tasks,
+                        if runtime.running_tasks == 1 { "" } else { "s" }
+                    ))
+                }
+                _ => {}
             }
         }
         return Some(label);
     }
-    if facts.errored {
+    if facts.errored && facts.runtime.is_none() {
         return Some("errored".to_owned());
     }
-    if let Some(notebook) = facts.notebook {
-        if notebook.archived {
-            return Some("archived".to_owned());
-        }
-        if notebook.responding {
+    if let Some(runtime) = facts.runtime.as_ref() {
+        if matches!(
+            runtime.inference,
+            rho_agents_client::protocol::transcript::InferenceState::Responding
+        ) {
             return Some("responding".to_owned());
         }
-        if notebook.running_tasks > 0 {
+        if let rho_agents_client::protocol::transcript::InferenceState::Retrying { at, .. } =
+            &runtime.inference
+        {
             return Some(format!(
-                "{} running task{}",
-                notebook.running_tasks,
-                if notebook.running_tasks == 1 { "" } else { "s" }
+                "retrying in {}",
+                crate::home::elapsed_label(now.timestamp_millis(), at.0 as i64)
             ));
         }
-        if let Some(checkin) = notebook.checkin_at {
+        if matches!(
+            runtime.inference,
+            rho_agents_client::protocol::transcript::InferenceState::Failed { .. }
+        ) {
+            return Some("errored".to_owned());
+        }
+        if runtime.archived {
+            return Some("archived".to_owned());
+        }
+        if runtime.running_tasks > 0 {
+            return Some(format!(
+                "{} running task{}",
+                runtime.running_tasks,
+                if runtime.running_tasks == 1 { "" } else { "s" }
+            ));
+        }
+        if let Some(checkin) = runtime.checkin_at {
             let now_ms = now.timestamp_millis();
             return Some(if checkin.0 as i64 > now_ms {
                 format!(
