@@ -549,13 +549,6 @@ impl AgentPool {
         tokio::spawn(async move {
             let slot = pool.execution_slot(&start.place.workset).await;
             let admission = slot.admission.clone().read_owned().await;
-            anyhow::ensure!(
-                pool.db
-                    .read()
-                    .workset_mode(&start.place.workset)
-                    .is_none_or(|stored| stored == Some(start.place.mode)),
-                "new agents must use the workset's filesystem mode"
-            );
             let mode = config.session_profile();
             let runtime = match mode {
                 SessionBinding::ClaudeFable { .. }
@@ -569,6 +562,16 @@ impl AgentPool {
             };
             let StartPlace { view, place, .. } = start;
             let mut write = pool.db.write().await;
+            // Shared workset admission lets independent creators race. Check
+            // after taking the DB writer so the first committed mode is visible
+            // to the second before either allocates an ID or appends a log.
+            anyhow::ensure!(
+                pool.db
+                    .read()
+                    .workset_mode(&place.workset)
+                    .is_none_or(|stored| stored == Some(place.mode)),
+                "new agents must use the workset's filesystem mode"
+            );
             let agent_id = write.alloc_agent_id();
             let lock = pool
                 .load_locks
@@ -1089,6 +1092,66 @@ mod tests {
         )
         .await;
         (pool, view)
+    }
+
+    #[tokio::test]
+    async fn conflicting_first_creators_return_a_mode_error_not_a_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, view) = test_pool(directory.path()).await;
+        let workset = view.workset_id().to_owned();
+        let exposed = pool
+            .worksets
+            .open_workset(&workset)
+            .await
+            .unwrap()
+            .enter(
+                Mode::from_workset_mode(WorksetMode::Exposed),
+                camino::Utf8Path::new("/src"),
+            )
+            .unwrap();
+        let writer = pool.db.write().await;
+        let slot = pool.execution_slot(&workset).await;
+        let first = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.create(AgentRole::default(), None, StartPlace::new(view, None))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slot.admission.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.create(AgentRole::default(), None, StartPlace::new(exposed, None))
+                    .await
+            }
+        });
+        // Both creators hold shared admission while the DB writer stalls
+        // them; the second must see the first creator's committed mode.
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        drop(writer);
+        let (id, _first_agent) = first.await.unwrap().unwrap();
+        assert!(
+            second
+                .await
+                .unwrap()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("filesystem mode")
+        );
+        assert_eq!(pool.db.read().list_agent_ids(), [id]);
+        assert_eq!(
+            pool.db.read().workset_mode(&workset),
+            Some(Some(WorksetMode::View))
+        );
     }
 
     #[tokio::test]
