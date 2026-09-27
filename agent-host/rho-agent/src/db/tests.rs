@@ -486,7 +486,7 @@ async fn a_mode_change_folds_into_the_agents_place() {
     assert_eq!(before.mode, WorksetMode::View);
 
     let mut write = db.write().await;
-    write.set_agent_mode(agent_id, WorksetMode::Exposed);
+    write.set_workset_mode(&before.workset, WorksetMode::Exposed);
     write.commit();
     let after = db.read().get_agent(agent_id).config.place.clone();
     assert_eq!(after.mode, WorksetMode::Exposed);
@@ -578,9 +578,11 @@ async fn init_agent_tables_stamps_current_db_format() {
 
 #[test]
 fn migration_accepts_only_the_live_source_format() {
-    assert_eq!(AGENT_DB_MIGRATIONS.len(), 1);
+    assert_eq!(AGENT_DB_MIGRATIONS.len(), 2);
     assert_eq!(AGENT_DB_MIGRATIONS[0].from, "a7e43d91");
-    assert_eq!(AGENT_DB_MIGRATIONS[0].to, CURRENT_AGENT_DB_FORMAT);
+    assert_eq!(AGENT_DB_MIGRATIONS[0].to, "e31bcf82");
+    assert_eq!(AGENT_DB_MIGRATIONS[1].from, "e31bcf82");
+    assert_eq!(AGENT_DB_MIGRATIONS[1].to, CURRENT_AGENT_DB_FORMAT);
 }
 
 #[tokio::test]
@@ -1119,4 +1121,139 @@ fn legacy_output(output: &rho_inference::types::ExecOutput) -> rho_inference::ty
             at: *at,
         }),
     }
+}
+
+#[tokio::test]
+async fn workset_modes_are_independent_and_transition_only_their_members() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rho.redb");
+    let db = RhoDb::open(&path);
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let mut ids = Vec::new();
+    for (workset, mode) in [
+        ("first", WorksetMode::View),
+        ("second", WorksetMode::Exposed),
+        ("first", WorksetMode::View),
+    ] {
+        let id = write.alloc_agent_id();
+        write.create_agent(
+            UnixMs(1),
+            id,
+            None,
+            Place {
+                workset: workset.into(),
+                mode,
+                ..test_workspace()
+            },
+            AgentRole::default(),
+            AgentRole::default().session_profile(),
+            test_agent_runtime(),
+            AgentOrigin::User,
+        );
+        ids.push(id);
+    }
+    write.commit();
+    assert_eq!(
+        db.read().workset_mode("first"),
+        Some(Some(WorksetMode::View))
+    );
+    assert_eq!(
+        db.read().workset_mode("second"),
+        Some(Some(WorksetMode::Exposed))
+    );
+    let mut write = db.write().await;
+    let mut first_members = vec![ids[0], ids[2]];
+    first_members.sort();
+    assert_eq!(
+        write.set_workset_mode("first", WorksetMode::Exposed),
+        first_members
+    );
+    write.commit();
+    drop(db);
+    let reopened = RhoDb::open(&path);
+    let read = reopened.read();
+    assert_eq!(read.workset_mode("first"), Some(Some(WorksetMode::Exposed)));
+    assert_eq!(read.workset_agents("first"), first_members);
+    assert_eq!(read.workset_agents("second"), vec![ids[1]]);
+    assert_eq!(
+        ids.iter()
+            .map(|id| read.get_agent(*id).place().mode)
+            .collect::<Vec<_>>(),
+        [
+            WorksetMode::Exposed,
+            WorksetMode::Exposed,
+            WorksetMode::Exposed
+        ]
+    );
+}
+
+#[tokio::test]
+async fn migration_marks_legacy_mixed_modes_until_explicit_transition() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rho.redb");
+    let db = RhoDb::open(&path);
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let ids = (0..2)
+        .map(|_| {
+            let id = write.alloc_agent_id();
+            write.create_agent(
+                UnixMs(1),
+                id,
+                None,
+                test_workspace(),
+                AgentRole::default(),
+                AgentRole::default().session_profile(),
+                test_agent_runtime(),
+                AgentOrigin::User,
+            );
+            id
+        })
+        .collect::<Vec<_>>();
+    // Simulate the previous format: its agent heads could disagree and it had
+    // no workset tables. Its log is retained exactly as originally recorded.
+    write.append_agent_event(
+        ids[1],
+        &AgentEvent::ModeChanged {
+            mode: WorksetMode::Exposed,
+            at: UnixMs(2),
+        },
+    );
+    for id in &ids {
+        write
+            .open_table(WORKSET_AGENTS)
+            .remove(&(test_workspace().workset, *id));
+    }
+    write
+        .open_table(WORKSET_MODES)
+        .remove(&test_workspace().workset);
+    write.open_table(FORMAT).insert(&(), &"e31bcf82".to_owned());
+    write.commit();
+    drop(db);
+    let reopened = RhoDb::open(&path);
+    let mut write = reopened.write().await;
+    write.init_agent_tables();
+    write.commit();
+    assert_eq!(
+        reopened.read().workset_mode(&test_workspace().workset),
+        Some(None)
+    );
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(
+        reopened.read().workset_agents(&test_workspace().workset),
+        sorted
+    );
+    let mut write = reopened.write().await;
+    write.set_workset_mode(&test_workspace().workset, WorksetMode::View);
+    write.commit();
+    assert_eq!(
+        reopened.read().workset_mode(&test_workspace().workset),
+        Some(Some(WorksetMode::View))
+    );
+    assert!(
+        ids.iter()
+            .all(|id| reopened.read().get_agent(*id).place().mode == WorksetMode::View)
+    );
 }

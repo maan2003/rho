@@ -41,6 +41,14 @@ const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_log");
 /// Current heads, derived from the log in the same transaction as every append.
 const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> = TableDefinition::new("agent_heads");
+/// The workset's authoritative mode. `None` marks legacy mixed-mode members
+/// until an explicit ChangeMode resolves them.
+const WORKSET_MODES: TableDefinition<String, Sen<Option<WorksetMode>>> =
+    TableDefinition::new("workset_modes");
+/// Membership changes only at creation; ordered by workset for mode
+/// transitions.
+const WORKSET_AGENTS: TableDefinition<(String, AgentId), ()> =
+    TableDefinition::new("workset_agents");
 /// The order every append landed in, across agents: `seq -> (agent, pos)`,
 /// written in the same transaction as the row it names. What a client
 /// follows to stay current.
@@ -60,7 +68,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "e31bcf82";
+const CURRENT_AGENT_DB_FORMAT: &str = "7f24a9d3";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -69,11 +77,43 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "a7e43d91",
-    to: "e31bcf82",
-    migrate: code_first_migration::migrate,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "a7e43d91",
+        to: "e31bcf82",
+        migrate: code_first_migration::migrate,
+    },
+    AgentDbMigration {
+        from: "e31bcf82",
+        to: "7f24a9d3",
+        migrate: migrate_workset_modes,
+    },
+];
+
+fn migrate_workset_modes(write: &mut WriteTxn) {
+    let members = write
+        .open_table(AGENT_HEADS)
+        .iter()
+        .map(|(id, head)| (id.value(), head.value().into_owned().place().clone()))
+        .collect::<Vec<_>>();
+    for (id, place) in members {
+        write
+            .open_table(WORKSET_AGENTS)
+            .insert(&(place.workset.clone(), id), &());
+        let previous = write
+            .open_table(WORKSET_MODES)
+            .get(&place.workset)
+            .map(|value| value.value().into_owned());
+        let mode = match previous {
+            None => Some(place.mode),
+            Some(Some(existing)) if existing == place.mode => Some(existing),
+            Some(_) => None,
+        };
+        write
+            .open_table(WORKSET_MODES)
+            .insert(&place.workset, SenValue::borrowed(&mode));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -630,6 +670,10 @@ pub trait AgentReadTxnExt {
     fn list_agent_ids(&self) -> Vec<AgentId>;
     /// Every agent's fold: the whole store. For conversions and tools.
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
+    /// `None` means an unclaimed workset; `Some(None)` means legacy mixed
+    /// modes.
+    fn workset_mode(&self, workset: &str) -> Option<Option<WorksetMode>>;
+    fn workset_agents(&self, workset: &str) -> Vec<AgentId>;
     /// Who spawned an agent, read from its creation alone.
     fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId>;
     /// The agent that spawned this one: its parent, or the Engineer that
@@ -689,6 +733,8 @@ pub trait AgentWriteTxnExt {
     fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid);
 
     fn alloc_agent_id(&mut self) -> AgentId;
+    /// Changes the mode and all member projections in the same transaction.
+    fn set_workset_mode(&mut self, workset: &str, mode: WorksetMode) -> Vec<AgentId>;
 
     /// Applies an update only when its source is still visible. The
     /// returned cache is the acknowledged source of truth for a sidecar
@@ -750,8 +796,6 @@ pub(crate) trait AgentProfileWriteTxnExt {
     );
 
     fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding);
-    /// The agent sees the filesystem in `mode` from its next load on.
-    fn set_agent_mode(&mut self, agent_id: AgentId, mode: WorksetMode);
 }
 
 impl AgentProfileWriteTxnExt for WriteTxn {
@@ -812,16 +856,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             },
         );
     }
-
-    fn set_agent_mode(&mut self, agent_id: AgentId, mode: WorksetMode) {
-        self.append_agent_event(
-            agent_id,
-            &AgentEvent::ModeChanged {
-                mode,
-                at: UnixMillis::now(),
-            },
-        );
-    }
 }
 
 impl AgentReadTxnExt for ReadTxn {
@@ -865,6 +899,20 @@ impl AgentReadTxnExt for ReadTxn {
         self.open_table(AGENT_HEADS)
             .iter()
             .map(|(id, head)| (id.value(), head.value().into_owned()))
+            .collect()
+    }
+
+    fn workset_mode(&self, workset: &str) -> Option<Option<WorksetMode>> {
+        self.open_table(WORKSET_MODES)
+            .get(&workset.to_owned())
+            .map(|value| value.value().into_owned())
+    }
+
+    fn workset_agents(&self, workset: &str) -> Vec<AgentId> {
+        let workset = workset.to_owned();
+        self.open_table(WORKSET_AGENTS)
+            .range((workset.clone(), AgentId::MIN)..=(workset, AgentId::MAX))
+            .map(|(key, _)| key.value().1)
             .collect()
     }
 
@@ -1055,6 +1103,8 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(FORMAT);
         self.open_table(AGENT_LOG);
         self.open_table(AGENT_HEADS);
+        self.open_table(WORKSET_MODES);
+        self.open_table(WORKSET_AGENTS);
         self.open_table(JOURNAL);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(QUOTA_OBSERVATIONS);
@@ -1096,6 +1146,23 @@ impl AgentWriteTxnExt for WriteTxn {
         };
         self.open_table(AGENT_HEADS)
             .insert(&agent_id, SenValue::borrowed(&head));
+        if pos == AgentEventPos::ZERO {
+            let place = head.place();
+            let previous = self
+                .open_table(WORKSET_MODES)
+                .get(&place.workset)
+                .map(|value| value.value().into_owned());
+            assert!(
+                previous.is_none() || previous == Some(Some(place.mode)),
+                "new agents must use the workset's filesystem mode"
+            );
+            if previous.is_none() {
+                self.open_table(WORKSET_MODES)
+                    .insert(&place.workset, SenValue::borrowed(&Some(place.mode)));
+            }
+            self.open_table(WORKSET_AGENTS)
+                .insert(&(place.workset.clone(), agent_id), &());
+        }
         let seq = {
             let mut journal = self.open_table(JOURNAL);
             let seq = journal
@@ -1160,6 +1227,27 @@ impl AgentWriteTxnExt for WriteTxn {
                 at: UnixMillis::now(),
             },
         );
+    }
+
+    fn set_workset_mode(&mut self, workset: &str, mode: WorksetMode) -> Vec<AgentId> {
+        let workset_key = workset.to_owned();
+        let ids = self
+            .open_table(WORKSET_AGENTS)
+            .range((workset_key.clone(), AgentId::MIN)..=(workset_key.clone(), AgentId::MAX))
+            .map(|(key, _)| key.value().1)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.append_agent_event(
+                *id,
+                &AgentEvent::ModeChanged {
+                    mode,
+                    at: UnixMillis::now(),
+                },
+            );
+        }
+        self.open_table(WORKSET_MODES)
+            .insert(&workset_key, SenValue::borrowed(&Some(mode)));
+        ids
     }
 
     fn alloc_agent_id(&mut self) -> AgentId {

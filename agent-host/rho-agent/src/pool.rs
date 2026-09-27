@@ -222,12 +222,7 @@ impl AgentPool {
         view: &crate::View,
     ) -> anyhow::Result<Arc<crate::worker::Process>> {
         anyhow::ensure!(
-            self.db
-                .read()
-                .list_agents()
-                .iter()
-                .filter(|(_, head)| head.place().workset == view.workset_id())
-                .all(|(_, head)| head.place().mode == view.workset_mode()),
+            self.db.read().workset_mode(view.workset_id()) == Some(Some(view.workset_mode())),
             "workset contains mixed filesystem modes; explicitly select a workset mode first"
         );
         let slot = self.execution_slot(view.workset_id()).await;
@@ -557,10 +552,8 @@ impl AgentPool {
             anyhow::ensure!(
                 pool.db
                     .read()
-                    .list_agents()
-                    .iter()
-                    .filter(|(_, head)| head.place().workset == start.place.workset)
-                    .all(|(_, head)| head.place().mode == start.place.mode),
+                    .workset_mode(&start.place.workset)
+                    .is_none_or(|stored| stored == Some(start.place.mode)),
                 "new agents must use the workset's filesystem mode"
             );
             let mode = config.session_profile();
@@ -827,7 +820,11 @@ impl AgentPool {
         place: &Place,
     ) -> anyhow::Result<(Workset, Mode, Utf8PathBuf)> {
         let workset = self.worksets.open_workset(&place.workset).await?;
-        let mode = Mode::from_workset_mode(place.mode);
+        let stored = self.db.read().workset_mode(&place.workset);
+        let mode = stored.flatten().context(
+            "workset contains mixed filesystem modes; explicitly select a workset mode first",
+        )?;
+        let mode = Mode::from_workset_mode(mode);
         let host_cwd = workset.host_path(&place.cwd)?;
         Ok((workset, mode, host_cwd))
     }
@@ -862,14 +859,7 @@ impl AgentPool {
             let workset = pool.db.read().get_agent(agent_id).place().workset.clone();
             let slot = pool.execution_slot(&workset).await;
             let _admission = slot.admission.clone().write_owned().await;
-            let records = pool
-                .db
-                .read()
-                .list_agents()
-                .into_iter()
-                .filter(|(_, head)| head.place().workset == workset)
-                .collect::<Vec<_>>();
-            if records.iter().all(|(_, head)| head.place().mode == mode) {
+            if pool.db.read().workset_mode(&workset) == Some(Some(mode)) {
                 return Ok(Vec::new());
             }
             let mut process = slot.process.lock().await;
@@ -879,7 +869,7 @@ impl AgentPool {
                     "close every terminal and shell in the workset before changing its mode"
                 );
             }
-            let ids = records.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let ids = pool.db.read().workset_agents(&workset);
             let locks = {
                 let mut locks = pool.load_locks.lock().await;
                 ids.iter()
@@ -916,9 +906,7 @@ impl AgentPool {
                 process.shutdown().await;
             }
             let mut write = pool.db.write().await;
-            for id in &ids {
-                write.set_agent_mode(*id, mode);
-            }
+            write.set_workset_mode(&workset, mode);
             write.commit();
             Ok(ids)
         })
@@ -1101,6 +1089,98 @@ mod tests {
         )
         .await;
         (pool, view)
+    }
+
+    #[tokio::test]
+    async fn workset_mode_admission_and_transition_are_serialized() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pool, view) = test_pool(directory.path()).await;
+        let workset = view.workset_id().to_owned();
+        let mut write = pool.db.write().await;
+        let id = write.alloc_agent_id();
+        write.create_agent(
+            rho_agent_types::UnixMs::now(),
+            id,
+            None,
+            Place {
+                workset: workset.clone(),
+                cwd: "/src".into(),
+                mode: WorksetMode::View,
+                origin: None,
+            },
+            AgentRole::default(),
+            AgentRole::default().session_profile(),
+            AgentRuntime::Rho {
+                prompt_cache_key: rho_inference::PromptCacheKey::generate(),
+            },
+            AgentOrigin::User,
+        );
+        write.commit();
+        let exposed = pool
+            .worksets
+            .open_workset(&workset)
+            .await
+            .unwrap()
+            .enter(
+                Mode::from_workset_mode(WorksetMode::Exposed),
+                camino::Utf8Path::new("/src"),
+            )
+            .unwrap();
+        assert!(
+            pool.create(
+                AgentRole::default(),
+                None,
+                StartPlace::new(exposed.clone(), None)
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("filesystem mode")
+        );
+        assert!(
+            pool.process(&exposed)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("mixed filesystem modes")
+        );
+        let slot = pool.execution_slot(&workset).await;
+        let guard = slot.admission.read().await;
+        let transition = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.change_mode(id, WorksetMode::Exposed).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slot.admission.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !transition.is_finished(),
+            "mode transition must wait for admission"
+        );
+        drop(guard);
+        assert_eq!(transition.await.unwrap().unwrap(), vec![id]);
+        assert_eq!(
+            pool.db.read().workset_mode(&workset),
+            Some(Some(WorksetMode::Exposed))
+        );
+        assert_eq!(
+            pool.db.read().get_agent(id).place().mode,
+            WorksetMode::Exposed
+        );
+        assert!(
+            pool.create(AgentRole::default(), None, StartPlace::new(view, None))
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("filesystem mode")
+        );
     }
 
     #[tokio::test]
@@ -1498,7 +1578,7 @@ mod tests {
                 pool.trim(1).await;
             }
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while sender_lock.try_lock().is_ok() {
                 tokio::task::yield_now().await;
             }
@@ -1615,7 +1695,7 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while slot.admission.try_write().is_ok() {
                 tokio::task::yield_now().await;
             }
