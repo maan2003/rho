@@ -1787,6 +1787,21 @@ pub async fn delete_agents(db: &rho_db::RhoDb, agents: &[AgentId]) -> Vec<(Agent
         write.open_table(AGENT_USAGE_TOTALS).remove(&agent_id);
     }
 
+    // Deletion also handles heads this build cannot decode. Inspect only the
+    // index keys rather than reading an agent head to discover its workset.
+    let mut members = write.open_table(WORKSET_AGENTS);
+    let keys = members
+        .iter()
+        .map(|(key, _)| key.value())
+        .filter(|(_, id)| doomed.contains(id))
+        .collect::<Vec<_>>();
+    for key in &keys {
+        members.remove(key);
+    }
+    drop(members);
+    // Mode belongs to the workset, not its agents. Retain it even when the
+    // last member is deleted so future creation cannot silently change it.
+
     let mut journal = write.open_table(JOURNAL);
     let seqs = journal
         .iter()

@@ -890,6 +890,64 @@ async fn deleting_an_agent_removes_every_row_it_owns() {
 }
 
 #[tokio::test]
+async fn deletion_removes_membership_but_retains_the_workset_mode_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rho.redb");
+    let db = RhoDb::open(&path);
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let first = create(&mut write, None, None);
+    let second = create(&mut write, None, None);
+    let workset = test_workspace().workset;
+    write.commit();
+
+    assert_eq!(delete_agents(&db, &[first]).await, [(first, 1)]);
+    assert_eq!(db.read().workset_agents(&workset), [second]);
+    let mut write = db.write().await;
+    assert_eq!(
+        write.set_workset_mode(&workset, WorksetMode::Exposed),
+        [second]
+    );
+    write.commit();
+    assert_eq!(
+        db.read().get_agent(second).place().mode,
+        WorksetMode::Exposed
+    );
+    assert_eq!(delete_agents(&db, &[second]).await, [(second, 2)]);
+    drop(db);
+
+    let reopened = RhoDb::open(&path);
+    assert!(reopened.read().workset_agents(&workset).is_empty());
+    assert_eq!(
+        reopened.read().workset_mode(&workset),
+        Some(Some(WorksetMode::Exposed))
+    );
+    let mut write = reopened.write().await;
+    write.init_agent_tables();
+    let replacement = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(3),
+        replacement,
+        None,
+        Place {
+            workset: workset.clone(),
+            mode: WorksetMode::Exposed,
+            ..test_workspace()
+        },
+        AgentRole::default(),
+        AgentRole::default().session_profile(),
+        test_agent_runtime(),
+        AgentOrigin::User,
+    );
+    write.commit();
+    assert_eq!(reopened.read().workset_agents(&workset), [replacement]);
+    assert_eq!(
+        reopened.read().workset_mode(&workset),
+        Some(Some(WorksetMode::Exposed))
+    );
+}
+
+#[tokio::test]
 async fn the_journal_names_every_row_in_write_order() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
